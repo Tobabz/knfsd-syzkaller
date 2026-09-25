@@ -1,4 +1,4 @@
-# knfsd-fuzz forward-port
+# knfsd-syzkaller
 
 핸드오프 패치 시리즈(kernel 11 + syzkaller 15)를 신규 커널/syzkaller rc로
 **전진 이식**하는 자동화 파이프라인입니다. 설계 계약은 `report/design-spec.md`

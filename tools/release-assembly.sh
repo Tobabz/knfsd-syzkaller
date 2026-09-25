@@ -12,7 +12,7 @@
 #   - 기본: 3항목 + 패치 시리즈(`patches/{kernel,syzkaller}`, 각 디렉토리
 #     SHA256SUMS로 검증) + `LICENSE`·`THIRD-PARTY-LICENSES.md`.
 #
-# 출력: $WORK_ROOT/dist/knfsd-fuzz-forward-port-<stamp>.tar.gz (+ dist/SHA256SUMS)
+# 출력: $WORK_ROOT/dist/knfsd-syzkaller-forward-port-<stamp>.tar.gz (+ dist/SHA256SUMS)
 # 경로 관례: 자기 위치 유도 + KOOV_WORK_ROOT 오버라이드 (tools/README.md 환경 변수 표).
 set -eu
 
@@ -26,7 +26,7 @@ WORK_ROOT="${KOOV_WORK_ROOT:-$(dirname "$TOOLS")}"
 BUNDLE="$WORK_ROOT/bundle"
 DIST="${KOOV_DIST_DIR:-$WORK_ROOT/dist}"
 STAMP="$(date +%Y%m%d)"
-ARCHIVE="$DIST/knfsd-fuzz-forward-port-$STAMP$SUFFIX.tar.gz"
+ARCHIVE="$DIST/knfsd-syzkaller-forward-port-$STAMP$SUFFIX.tar.gz"
 mkdir -p "$DIST"
 
 echo "=== 1) verify bundle/SHA256SUMS (fixed items) ==="
@@ -59,7 +59,7 @@ fi
 echo "raw excluded (no base image / keys shipped): OK"
 
 echo "=== 4) record archive checksums (all in dist/) ==="
-( cd "$DIST" && sha256sum knfsd-fuzz-forward-port-*.tar.gz | tee SHA256SUMS )
+( cd "$DIST" && sha256sum knfsd-syzkaller-forward-port-*.tar.gz | tee SHA256SUMS )
 
 echo
 echo "release archive: $ARCHIVE"

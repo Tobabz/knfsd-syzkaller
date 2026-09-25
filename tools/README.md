@@ -1,4 +1,4 @@
-# tools/ — knfsd-fuzz 포워드포트 도구
+# tools/ — knfsd-syzkaller 포워드포트 도구
 
 핸드오프 패치 시리즈(`bundle/patches/`: kernel 11패치 + syzkaller 15패치)를 **신규
 커널/syzkaller rc로 전진 이식**하는 자동화 파이프라인입니다.
@@ -139,7 +139,7 @@ bash tools/fport-evidence.sh             # 도구·문서 수정 후 해시 재�
 - 커밋된 부트스트랩 입력은 `bundle/SHA256SUMS`(고정 **3항목**:
   `guest-deps.tar.gz`·`patches/kernel.config`·`README-HANDOFF.md`)로 핀.
 - (선택) `bash tools/release-assembly.sh` → 유지보수용 스냅샷
-  `dist/knfsd-fuzz-forward-port-<날짜>[-minimal].tar.gz` (배포 아님);
+  `dist/knfsd-syzkaller-forward-port-<날짜>[-minimal].tar.gz` (배포 아님);
   `--minimal`은 정확히 3항목만. AB 하네스 `run-ab.sh`는 생성 키를
   `KOOV_SSH_KEY`로 넘긴다.
 
