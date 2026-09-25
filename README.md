@@ -23,9 +23,13 @@ against the design-contract gates **R1..R6** (`tools/fport-design-gate.sh`).
 
 ## Host requirements
 
-- Linux with KVM (`/dev/kvm`) and QEMU, sudo, `git`, `python3`, `sha256sum`, `qemu-img`
-- Kernel build toolchain (gcc/make, `flex`, `bison`, `libelf`, ...) and Go >= 1.23 for syzkaller
-- ~30 GiB free disk — the bootstrap clones upstream at pinned refs (kernel `v7.3-rc4`, syzkaller `801f09666`) and builds from source
+Build prerequisites are exactly those of the upstream components — this repo adds nothing to them:
+
+- **Linux kernel**: toolchain and libraries per `Documentation/process/changes.rst` in the kernel tree
+  (mirror: <https://www.kernel.org/doc/html/latest/process/changes.html>).
+- **syzkaller**: Go, gcc, and VM prerequisites per [docs/linux/setup.md](https://github.com/google/syzkaller/blob/master/docs/linux/setup.md).
+
+On top of that, this repo needs network access to `git.kernel.org` and `github.com` for the pinned source clones, and ~30 GiB of working space.
 
 ## Usage — commands, inputs, outputs
 
