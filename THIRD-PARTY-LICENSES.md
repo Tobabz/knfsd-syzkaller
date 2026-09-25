@@ -5,9 +5,9 @@ This repository distributes the following components with their own licensing:
 | Component | Origin | License |
 |---|---|---|
 | `bundle/patches/kernel/` (11 patches) | Linux kernel (series targets `v7.3-rc4`) | **GPL-2.0** (derivative) |
-| `bundle/patches/syzkaller/` (15 patches) | syzkaller @ `801f09666` | **MIT** (derivative; upstream license by Google LLC) |
-| `bundle/src/linux-v7.3-rc4.tar.xz` | kernel.org | GPL-2.0 (full text inside archive: `COPYING`) |
-| `bundle/src/syzkaller-801f09666.tar.gz` | syzkaller repo | MIT (full text inside archive: `LICENSE`) |
+| `bundle/patches/syzkaller/` (15 patches) | syzkaller @ `801f09666` | **Apache-2.0** (derivative; upstream license by Google LLC) |
+| Linux kernel source (cloned by bootstrap @ `v7.3-rc4`, git.kernel.org) | kernel.org (torvalds/linux) | GPL-2.0 (full text: kernel `COPYING`) |
+| syzkaller source (cloned by bootstrap @ `801f09666`, github.com/google/syzkaller) | syzkaller repo | Apache-2.0 (full text: `LICENSE`) |
 | `bundle/src/bookworm-base.img[.gz]` | Debian bookworm (cloud/base image) | DFSG-free; individual package licenses live inside the image |
 | `bundle/src/guest-deps.tar.gz` | Debian nfs-utils + deps extraction | DFSG-free package licenses |
 | `bundle/src/bookworm.id_rsa[.pub]` | generated guest keypair | see note below |
@@ -15,8 +15,8 @@ This repository distributes the following components with their own licensing:
 
 ## Notes
 
-- The base image and shipped guest keypair are produced by the bundled
-  syzkaller `tools/create-image.sh` (Apache-2.0 script, per its header);
+- The base image and shipped guest keypair are produced by the pinned
+  syzkaller tree's `tools/create-image.sh` (Apache-2.0 script, per its header);
   provenance recipe in `bundle/README-HANDOFF.md` 'Base image
   provenance'. The pair was regenerated together with the base on
   2026-09-26 (rotation); the base embeds its own pubkey.

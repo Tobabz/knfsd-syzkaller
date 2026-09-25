@@ -9,7 +9,7 @@
 | 경로 | 내용 |
 |---|---|
 | `tools/` | 파이프라인 P0..P7·게이트 R1..R6·AB 하네스·배포 조립 (`tools/README.md`) |
-| `bundle/` | 불변 입력 — 패치 시리즈·픽스처·매니페스트 (`bundle/README-HANDOFF.md`); `src/` 대용량 이진은 릴리스 자산으로 별도 배포 |
+| `bundle/` | 불변 입력 — 패치·픽스처·생성물(베이스 gz 등)·매니페스트 (`bundle/README-HANDOFF.md`); 상류 소스는 bootstrap이 핀 ref에서 클론 |
 | `report/` | 설계 계약·검증 결과·변경 대장 (증거 해시 `report/evidence-forward-port.sha256`) |
 | `LICENSE` · `THIRD-PARTY-LICENSES.md` | MIT + 벤더 컴포넌트 귀속 |
 
@@ -27,8 +27,11 @@ bash tools/fport-evidence.sh                # 도구·문서 수정 후 증거 �
 
 ## 배포 자산
 
-`bundle/src/`(커널·syzkaller 소스, 베이스 이미지, 키쌍)는 git에 트래킹하지
-않습니다. `bundle/SHA256SUMS`로 핀하고, 릴리스 자산으로 배포합니다:
+상류 소스(커널 `v7.3-rc4`, syzkaller `801f09666`)는 배포하지 않습니다 —
+bootstrap이 `--kernel-repo`/`--syz-repo` 핀 ref에서 **클론**합니다
+(오프라인 약속 철회 2026-09-26). `bundle/`에는 프로젝트 생성물만
+`bundle/SHA256SUMS`(6항목)로 핀되어 있으며, 대용량 이진(베이스 gz 등)은
+별도 자산으로 배포합니다:
 
 ```sh
 bash tools/release-assembly.sh       # dist/knfsd-fuzz-forward-port-<날짜>.tar.gz
@@ -40,5 +43,5 @@ bash tools/release-assembly.sh       # dist/knfsd-fuzz-forward-port-<날짜>.tar
 
 ## 라이선스
 
-MIT (`LICENSE`) — 커널 시리즈 GPL-2.0(파생)·syzkaller 시리즈 MIT 등
+MIT (`LICENSE`) — 커널 시리즈 GPL-2.0(파생)·syzkaller 시리즈 Apache-2.0 등
 벤더 컴포넌트 귀속은 `THIRD-PARTY-LICENSES.md`.

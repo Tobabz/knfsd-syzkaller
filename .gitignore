@@ -2,19 +2,16 @@
 env/
 evidence/
 runs/
-
 # --- Release assets — assembled by tools/release-assembly.sh at release time ---
 dist/
-
 # --- Large binary inputs — pinned by bundle/SHA256SUMS, shipped as release
 # --- assets (dist/ tar.gz); excluded from git history (and the raw base image
 # --- is never distributed by policy — release-assembly aborts on leak).
 bundle/src/
-
 # --- Python caches ---
 __pycache__/
 *.pyc
-
 # --- OS / editor noise ---
 *.swp
 .DS_Store
+cache/

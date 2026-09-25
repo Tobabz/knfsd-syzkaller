@@ -1,15 +1,19 @@
-# Handoff bundle — offline reproduction of the knfsd KCOV environment
+# Handoff bundle — reproduction of the knfsd KCOV environment
 
-No git remote access is required. Everything below expands from this
-directory. The bundle is **independent**: it no longer mirrors the
-handoff repo's internal layout (`repo/` tree removed 2026-09-25).
+Upstream sources (Linux kernel `v7.3-rc4`, syzkaller `801f09666`) are
+**cloned by the bootstrap at pinned git refs**, so a first fresh
+environment build requires network access to `git.kernel.org` and
+`github.com`. Everything else (patches, fixtures, base image, guest
+deps, keys) ships in this bundle. The bundle is **independent**: it no
+longer mirrors the handoff repo's internal layout (`repo/` tree removed
+2026-09-25).
 
 ## Contents
 
 | Path | Description | Size |
 |---|---:|---:|
-| `src/linux-v7.3-rc4.tar.xz` | pristine kernel source at `v7.3-rc4` | ~160 MB |
-| `src/syzkaller-801f09666.tar.gz` | pristine syzkaller source at `801f09666` | ~24 MB |
+| upstream kernel | cloned by bootstrap at commit `93f51579…` (= tag `v7.3-rc4`, git.kernel.org) | — |
+| upstream syzkaller | cloned by bootstrap at commit `801f09666…` (github.com/google/syzkaller) | — |
 | `src/bookworm-base.img[.gz]` | clean raw base image (never opened RW) | 2.0 GB / ~360 MB |
 | `src/guest-deps.tar.gz` | Debian nfs-utils extraction for guests | ~6 MB |
 | `src/bookworm.id_rsa[.pub]` | guest SSH keypair (fuzzing-only) | — |
@@ -19,7 +23,7 @@ handoff repo's internal layout (`repo/` tree removed 2026-09-25).
 | `ab-runner/` | AB experiment lane drivers (`run_frozen_phase*_vm.py`, lane/probe/bootstrap files, `monitor_knfsd.py`, workload prog) | — |
 | `baker/` | protocol image baking (`bake_nfs_protocol_image.py`) | — |
 | `corpus/` | fuzz corpus / candidate preparation (`audit_*`, `build_*`) | — |
-| `SHA256SUMS` | checksums of all source/VM/config assets | — |
+| `SHA256SUMS` | checksums of all shipped (project-generated) assets | — |
 
 Verify first: `sha256sum -c SHA256SUMS`.
 
@@ -36,9 +40,9 @@ Verify first: `sha256sum -c SHA256SUMS`.
 ## Base image provenance
 
 `src/bookworm-base.img` is the output of **syzkaller's official image
-builder**, `tools/create-image.sh` (bundled source
-`src/syzkaller-801f09666.tar.gz`, referenced by `docs/linux/setup.md`;
-Apache-2.0 per its header), run as:
+builder**, `tools/create-image.sh` (in the syzkaller tree at pinned
+commit `801f09666…`, referenced by `docs/linux/setup.md`; Apache-2.0
+per its header), run as:
 
 ```sh
 sudo ./create-image.sh -d bookworm    # arch amd64, default SEEK=2047
@@ -104,20 +108,22 @@ cd bundle && sha256sum -c SHA256SUMS
 
 ```sh
 # working root containing tools/ + bundle/ + env/
+# upstream refs are cloned by default (kernel v7.3-rc4, syzkaller 801f09666);
+# override with --kernel-repo/--syz-repo, or supply your own archives via
+# --kernel-tarball/--syz-tarball (pre-fetched) instead of cloning.
 python3 tools/bootstrap-kcov-env.py /work/env \
-  --kernel-tarball bundle/src/linux-v7.3-rc4.tar.xz \
-  --syz-tarball bundle/src/syzkaller-801f09666.tar.gz \
   --base-image bundle/src/bookworm-base.img \
   --ssh-key bundle/src/bookworm.id_rsa \
   --deps-tar bundle/src/guest-deps.tar.gz \
   --minor 1
 ```
 
-The run clones nothing: tarballs are extracted, committed locally,
-patched (`tools/fport-apply.sh`, series = `bundle/patches/{kernel,syzkaller}`),
-built (`bzImage`, all syzkaller binaries), baked into a manager-ready
-image, and verified (lane status). Only the target directory is written;
-`manifest.json` records every pin.
+The run clones the pinned upstream refs (git.kernel.org `v7.3-rc4` /
+github.com `801f09666…`), then patches
+(`tools/fport-apply.sh`, series = `bundle/patches/{kernel,syzkaller}`),
+builds (`bzImage`, all syzkaller binaries), bakes into a manager-ready
+image, and verifies (lane status). Only the target directory is written;
+`manifest.json` records every pin (git refs for upstream sources).
 
 Later updates arrive as a new bundle (or repo pull where available):
 re-run the same command with `--update` — only stages whose content
