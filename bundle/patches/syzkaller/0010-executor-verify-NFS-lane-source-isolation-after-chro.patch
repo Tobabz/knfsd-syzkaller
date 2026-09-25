@@ -1,0 +1,31 @@
+From d222e69f5ea89a86ef2e14470362b06e4ab86ca7 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 11:36:32 +0900
+Subject: [PATCH 10/15] executor: verify NFS lane source isolation after chroot
+
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 6d4c1e0ca..a0ec2533e 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -4461,6 +4461,17 @@ static void sandbox_common_mount_tmpfs(void)
+ 		fail("chroot failed");
+ 	if (chdir("/"))
+ 		fail("chdir failed");
++#if SYZ_EXECUTOR
++	// setup_nfs_fuzz_lane() deliberately imports only /nfs-lane.  Verify
++	// after chroot that the fixture source tree (and therefore every other
++	// proc's lane) is not addressable from the executor sandbox.
++	if (!access("/nfs-lane/.lane_id", F_OK)) {
++		errno = 0;
++		if (!access("/syz-nfs-lanes", F_OK) || errno != ENOENT)
++			fail("NFS fuzz lane source tree is visible inside executor chroot");
++		debug("NFS fuzz lane isolated: proc=%llu source-tree-hidden=/syz-nfs-lanes\n", procid);
++	}
++#endif
+ 	setup_gadgetfs();
+ 	setup_binderfs();
+ 	setup_fusectl();
+-- 
+2.34.1
+

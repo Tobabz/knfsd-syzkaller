@@ -1,0 +1,2085 @@
+From 1f942ea1ffa709b794491e005202f350d53370f1 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Wed, 16 Sep 2026 22:52:07 +0900
+Subject: [PATCH 07/11] kcov: aggregate NFS remote request coverage
+
+
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+index 12a302796..50605cf38 100644
+--- a/include/linux/kcov.h
++++ b/include/linux/kcov.h
+@@ -70,6 +70,100 @@ enum kcov_request_remote_start_result {
+ enum kcov_request_remote_issue {
+ 	KCOV_REQUEST_REMOTE_ISSUE_START_FAILED = 1U << 0,
+ 	KCOV_REQUEST_REMOTE_ISSUE_NESTED = 1U << 1,
++	KCOV_REQUEST_REMOTE_ISSUE_SCRATCH_OVERFLOW = 1U << 2,
++	KCOV_REQUEST_REMOTE_ISSUE_MERGE_TRUNCATED = 1U << 3,
++	KCOV_REQUEST_REMOTE_ISSUE_MERGE_FAILED = 1U << 4,
++};
++
++enum kcov_request_aggregate_state {
++	KCOV_REQUEST_AGGREGATE_POOL_FREE = 0,
++	KCOV_REQUEST_AGGREGATE_OPEN,
++	KCOV_REQUEST_AGGREGATE_CLOSING,
++	KCOV_REQUEST_AGGREGATE_COMMITTED,
++	KCOV_REQUEST_AGGREGATE_PUBLISHING,
++	KCOV_REQUEST_AGGREGATE_QUARANTINED,
++	KCOV_REQUEST_AGGREGATE_DISCARDED,
++};
++
++struct kcov_request_merge_result {
++	u64 source_entries;
++	u64 merged_entries;
++	bool truncated;
++};
++
++struct kcov_request_publish_lease {
++	struct kcov_request_generation *generation;
++	const void *area;
++	u32 size;
++	u32 mode;
++	bool held;
++};
++
++enum kcov_request_phase6_stat {
++	KCOV_REQUEST_P6_REMOTE_SECTION_CREATED = 0,
++	KCOV_REQUEST_P6_REMOTE_SECTION_COMPLETED,
++	KCOV_REQUEST_P6_REMOTE_SECTION_DISCARDED,
++	KCOV_REQUEST_P6_SCRATCH_RESERVED,
++	KCOV_REQUEST_P6_SCRATCH_ACTIVE,
++	KCOV_REQUEST_P6_SCRATCH_COMPLETED,
++	KCOV_REQUEST_P6_SCRATCH_RETURNED,
++	KCOV_REQUEST_P6_SCRATCH_OVERFLOW,
++	KCOV_REQUEST_P6_SCRATCH_ADDRESS_COLLISION,
++	KCOV_REQUEST_P6_SCRATCH_TRACE_ENTRIES,
++	KCOV_REQUEST_P6_AGGREGATE_ALLOCATED,
++	KCOV_REQUEST_P6_AGGREGATE_MERGE_STARTED,
++	KCOV_REQUEST_P6_AGGREGATE_MERGE_COMPLETED,
++	KCOV_REQUEST_P6_AGGREGATE_MERGE_TRUNCATED,
++	KCOV_REQUEST_P6_AGGREGATE_MERGE_OVERLAP,
++	KCOV_REQUEST_P6_AGGREGATE_ENTRIES_MERGED,
++	KCOV_REQUEST_P6_AGGREGATE_DIRECT_TRACE_WRITE,
++	KCOV_REQUEST_P6_LATE_MERGE_AFTER_REFS_ZERO,
++	KCOV_REQUEST_P6_AGGREGATE_COMMITTED,
++	KCOV_REQUEST_P6_AGGREGATE_QUARANTINED,
++	KCOV_REQUEST_P6_AGGREGATE_DISCARDED,
++	KCOV_REQUEST_P6_AGGREGATE_PUBLISHING,
++	KCOV_REQUEST_P6_AGGREGATE_PUBLISHED,
++	KCOV_REQUEST_P6_AGGREGATE_PUBLISH_SUPPRESSED,
++	KCOV_REQUEST_P6_AGGREGATE_ENTRIES_PUBLISHED,
++	KCOV_REQUEST_P6_AGGREGATE_REUSE_BLOCKED_READER,
++	KCOV_REQUEST_P6_AGGREGATE_REUSE_WHILE_READER,
++	KCOV_REQUEST_P6_PUBLISHER_READ_LEASE_GET,
++	KCOV_REQUEST_P6_PUBLISHER_READ_LEASE_PUT,
++	KCOV_REQUEST_P6_PUBLISH_COPY_OUTSIDE_LOCK,
++	KCOV_REQUEST_P6_PUBLISH_COPY_UNDER_GEN_LOCK,
++	KCOV_REQUEST_P6_REMOTE_REF_PUT_BEFORE_SCRATCH_RETURN,
++	KCOV_REQUEST_P6_RESULT_DEGRADE_AFTER_REF_RELEASE,
++	KCOV_REQUEST_P6_COMMIT_WITH_TOKENS,
++	KCOV_REQUEST_P6_COMMIT_WITH_REFS,
++	KCOV_REQUEST_P6_COMMIT_NONVALID,
++	KCOV_REQUEST_P6_COMMIT_BAD_STATE,
++	KCOV_REQUEST_P6_INCOMPLETE_PUBLISHED,
++	KCOV_REQUEST_P6_INVALID_PUBLISHED,
++	KCOV_REQUEST_P6_ABORTED_PUBLISHED,
++	KCOV_REQUEST_P6_FAULT_HOLD_AFTER_GRANT_ENTERED,
++	KCOV_REQUEST_P6_FAULT_HOLD_AFTER_GRANT_RELEASED,
++	KCOV_REQUEST_P6_FAULT_SCRATCH_LIMIT,
++	KCOV_REQUEST_P6_FAULT_AGGREGATE_LIMIT,
++	KCOV_REQUEST_P6_FAULT_PAUSE_PUBLISH_ENTERED,
++	KCOV_REQUEST_P6_FAULT_PAUSE_PUBLISH_RELEASED,
++	KCOV_REQUEST_P6_DESTINATION_SEED_OVERWRITTEN,
++	KCOV_REQUEST_P6_LATE_GENERIC_REMOTE_APPEND,
++	KCOV_REQUEST_P6_PUBLISH_ABORT_BLOCKED,
++	KCOV_REQUEST_P6_PUBLISH_BEGIN_BLOCKED,
++	KCOV_REQUEST_P6_PUBLISH_EXIT_RESET_DEFERRED,
++	KCOV_REQUEST_P6_PUBLISH_EXIT_RESET_COMPLETED,
++	KCOV_REQUEST_P6_SELFTEST_RUNS,
++	KCOV_REQUEST_P6_SELFTEST_FAILURES,
++	KCOV_REQUEST_P6_SELFTEST_EXCLUSIVE_SCRATCH,
++	KCOV_REQUEST_P6_SELFTEST_OVERFLOW,
++	KCOV_REQUEST_P6_SELFTEST_TRUNCATION,
++	KCOV_REQUEST_P6_SELFTEST_SERIALIZED_MERGE,
++	KCOV_REQUEST_P6_SELFTEST_RESULT_BEFORE_RELEASE,
++	KCOV_REQUEST_P6_SELFTEST_COMMIT_ELIGIBILITY,
++	KCOV_REQUEST_P6_SELFTEST_PUBLISH_LEASE,
++	KCOV_REQUEST_P6_SELFTEST_ABORT_DISCARD,
++	KCOV_REQUEST_P6_SELFTEST_MANAGED_GENERATION_ISOLATION,
++	KCOV_REQUEST_P6_STAT_COUNT,
+ };
+ 
+ enum kcov_request_phase5_stat {
+@@ -196,6 +290,36 @@ u64 kcov_request_generation_id(struct kcov_request_generation *generation);
+ u64 kcov_request_generation_owner(struct kcov_request_generation *generation);
+ bool kcov_request_generation_is_terminal(
+ 		struct kcov_request_generation *generation);
++bool kcov_request_generation_is_aborted(
++		struct kcov_request_generation *generation);
++int kcov_request_generation_remote_open(
++		struct kcov_request_generation *generation, u32 mode, u32 size);
++int kcov_request_generation_merge_scratch(
++		struct kcov_request_generation *generation, const void *scratch,
++		u32 scratch_size, u32 mode, bool overflow,
++		struct kcov_request_merge_result *result);
++int kcov_request_generation_publish_begin(
++		struct kcov_request_generation *generation,
++		struct kcov_request_publish_lease *lease);
++void kcov_request_generation_publish_end(
++		struct kcov_request_publish_lease *lease);
++void kcov_request_phase6_note(enum kcov_request_phase6_stat stat);
++void kcov_request_phase6_add(enum kcov_request_phase6_stat stat, u64 value);
++bool kcov_request_phase6_before_start(
++		struct kcov_request_generation *generation);
++void kcov_request_phase6_after_start(
++		struct kcov_request_generation *generation);
++void kcov_request_phase6_apply_scratch_fault(
++		struct kcov_request_generation *generation, void *scratch,
++		u32 scratch_size, u32 mode, bool *overflow);
++bool kcov_request_phase6_pause_publish(
++		struct kcov_request_generation *generation);
++bool kcov_request_phase6_validate_scratch(
++		struct kcov_request_generation *generation, const void *scratch);
++void kcov_request_phase6_assert_copy_unlocked(
++		struct kcov_request_generation *generation);
++bool kcov_request_phase6_publish_valid(
++		struct kcov_request_generation *generation);
+ 
+ bool kcov_request_root_init(struct kcov_request_root *root,
+ 		struct kcov_common_handle_id owner, u64 request_cookie);
+@@ -256,6 +380,7 @@ void kcov_request_phase5_live_ticket_put(void);
+ void kcov_request_phase5_live_svc_get(void);
+ void kcov_request_phase5_live_svc_put(void);
+ bool kcov_request_phase5_selftest(void);
++bool kcov_request_phase6_selftest(void);
+ int kcov_request_phase5_state_show(struct seq_file *m);
+ void kcov_request_phase5_register_transport_selftest(bool (*fn)(void));
+ 
+@@ -352,6 +477,50 @@ static inline u64 kcov_request_generation_owner(
+ 		struct kcov_request_generation *generation) { return 0; }
+ static inline bool kcov_request_generation_is_terminal(
+ 		struct kcov_request_generation *generation) { return true; }
++static inline bool kcov_request_generation_is_aborted(
++		struct kcov_request_generation *generation) { return true; }
++static inline int kcov_request_generation_remote_open(
++		struct kcov_request_generation *generation, u32 mode, u32 size)
++{
++	return -EOPNOTSUPP;
++}
++static inline int kcov_request_generation_merge_scratch(
++		struct kcov_request_generation *generation, const void *scratch,
++		u32 scratch_size, u32 mode, bool overflow,
++		struct kcov_request_merge_result *result)
++{
++	return -EOPNOTSUPP;
++}
++static inline int kcov_request_generation_publish_begin(
++		struct kcov_request_generation *generation,
++		struct kcov_request_publish_lease *lease)
++{
++	return -EOPNOTSUPP;
++}
++static inline void kcov_request_generation_publish_end(
++		struct kcov_request_publish_lease *lease) {}
++static inline void kcov_request_phase6_note(
++		enum kcov_request_phase6_stat stat) {}
++static inline void kcov_request_phase6_add(
++		enum kcov_request_phase6_stat stat, u64 value) {}
++static inline bool kcov_request_phase6_before_start(
++		struct kcov_request_generation *generation) { return true; }
++static inline void kcov_request_phase6_after_start(
++		struct kcov_request_generation *generation) {}
++static inline void kcov_request_phase6_apply_scratch_fault(
++		struct kcov_request_generation *generation, void *scratch,
++		u32 scratch_size, u32 mode, bool *overflow) {}
++static inline bool kcov_request_phase6_pause_publish(
++		struct kcov_request_generation *generation) { return false; }
++static inline bool kcov_request_phase6_validate_scratch(
++		struct kcov_request_generation *generation, const void *scratch)
++{
++	return true;
++}
++static inline void kcov_request_phase6_assert_copy_unlocked(
++		struct kcov_request_generation *generation) {}
++static inline bool kcov_request_phase6_publish_valid(
++		struct kcov_request_generation *generation) { return false; }
+ static inline bool kcov_request_root_init(struct kcov_request_root *root,
+ 		struct kcov_common_handle_id owner, u64 request_cookie)
+ {
+@@ -432,6 +601,7 @@ static inline void kcov_request_phase5_live_ticket_put(void) {}
+ static inline void kcov_request_phase5_live_svc_get(void) {}
+ static inline void kcov_request_phase5_live_svc_put(void) {}
+ static inline bool kcov_request_phase5_selftest(void) { return true; }
++static inline bool kcov_request_phase6_selftest(void) { return true; }
+ static inline int kcov_request_phase5_state_show(struct seq_file *m)
+ {
+ 	return 0;
+diff --git a/kernel/kcov.c b/kernel/kcov.c
+index 1b3312488..c164e0eb2 100644
+--- a/kernel/kcov.c
++++ b/kernel/kcov.c
+@@ -75,6 +75,7 @@ struct kcov {
+ 	u64			request_common_handle;
+ 	bool			request_generation_closed;
+ 	bool			request_generation_busy;
++	bool			request_reset_pending;
+ };
+ 
+ struct kcov_remote_area {
+@@ -108,6 +109,9 @@ struct kcov_request_remote_ticket {
+ 	atomic_t state;
+ 	bool remote_ref_held;
+ 	bool target_pinned;
++	bool scratch_overflow;
++	bool phase6_scratch_accounted;
++	bool phase6_section_accounted;
+ };
+ 
+ static DEFINE_SPINLOCK(kcov_remote_lock);
+@@ -253,6 +257,9 @@ void notrace __sanitizer_cov_trace_pc(void)
+ 		WRITE_ONCE(area[0], pos);
+ 		barrier();
+ 		area[pos] = ip;
++	} else if (t->kcov_request_remote_ticket) {
++		WRITE_ONCE(((struct kcov_request_remote_ticket *)
++			t->kcov_request_remote_ticket)->scratch_overflow, true);
+ 	}
+ }
+ EXPORT_SYMBOL(__sanitizer_cov_trace_pc);
+@@ -290,6 +297,9 @@ static void notrace write_comp_data(u64 type, u64 arg1, u64 arg2, u64 ip)
+ 		area[start_index + 1] = arg1;
+ 		area[start_index + 2] = arg2;
+ 		area[start_index + 3] = ip;
++	} else if (t->kcov_request_remote_ticket) {
++		WRITE_ONCE(((struct kcov_request_remote_ticket *)
++			t->kcov_request_remote_ticket)->scratch_overflow, true);
+ 	}
+ }
+ 
+@@ -436,6 +446,7 @@ static void kcov_reset(struct kcov *kcov)
+ 	kcov->request_common_handle = 0;
+ 	kcov->request_generation_closed = true;
+ 	kcov->request_generation_busy = false;
++	kcov->request_reset_pending = false;
+ 	kcov->t = NULL;
+ 	kcov->mode = KCOV_MODE_INIT;
+ 	kcov->remote = false;
+@@ -463,6 +474,25 @@ static void kcov_remote_reset(struct kcov *kcov)
+ 	spin_unlock_irqrestore(&kcov_remote_lock, flags);
+ }
+ 
++static void kcov_request_generation_busy_done(struct kcov *kcov)
++	__must_hold(&kcov->lock)
++{
++	bool pending = kcov->request_reset_pending;
++
++	kcov->request_generation_busy = false;
++	if (pending) {
++		if (kcov->area) {
++			if (kcov->mode == KCOV_MODE_TRACE_CMP)
++				WRITE_ONCE(*(u64 *)kcov->area, 0);
++			else
++				WRITE_ONCE(*(unsigned long *)kcov->area, 0);
++		}
++		kcov_remote_reset(kcov);
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_PUBLISH_EXIT_RESET_COMPLETED);
++	}
++}
++
+ static void kcov_disable(struct task_struct *t, struct kcov *kcov)
+ 	__must_hold(&kcov->lock)
+ {
+@@ -556,6 +586,24 @@ void kcov_task_exit(struct task_struct *t)
+ 			spin_unlock_irqrestore(&kcov->lock, flags);
+ 			return;
+ 		}
++		if (kcov->request_generation_busy) {
++			/*
++			 * A shared-fd sibling may be publishing.  Detach the dying
++			 * task now, but leave the object/maps intact until that ioctl
++			 * drops its destination lease and performs the pending reset.
++			 */
++			t->kcov_remote = NULL;
++			t->kcov_handle = 0;
++			t->kcov_handle_generation = 0;
++			t->kcov_request_generation_controller = false;
++			kcov->t = NULL;
++			kcov->request_reset_pending = true;
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_PUBLISH_EXIT_RESET_DEFERRED);
++			spin_unlock_irqrestore(&kcov->lock, flags);
++			kcov_put(kcov);
++			return;
++		}
+ 		/* Just to not leave dangling references behind. */
+ 		kcov_disable(t, kcov);
+ 		spin_unlock_irqrestore(&kcov->lock, flags);
+@@ -703,6 +751,8 @@ static int kcov_ioctl_locked(struct kcov *kcov, unsigned int cmd,
+ 		/* Disable coverage for the current task. */
+ 		unused = arg;
+ 		t = current;
++		if (kcov->request_generation_busy)
++			return -EBUSY;
+ 		if (unused != 0 || (kcov != t->kcov && kcov != t->kcov_remote))
+ 			return -EINVAL;
+ 		if (WARN_ON(kcov->t != t))
+@@ -775,13 +825,122 @@ static int kcov_ioctl_locked(struct kcov *kcov, unsigned int cmd,
+ 	}
+ }
+ 
++static void kcov_request_zero_area_count(void *area, enum kcov_mode mode)
++{
++	if (!area)
++		return;
++	if (mode == KCOV_MODE_TRACE_CMP)
++		WRITE_ONCE(*(u64 *)area, 0);
++	else
++		WRITE_ONCE(*(unsigned long *)area, 0);
++}
++
++static void kcov_request_clear_published_area(struct kcov *kcov)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&kcov->lock, flags);
++	kcov_request_zero_area_count(kcov->area, kcov->mode);
++	/* Retire any legacy section that started before this terminal event. */
++	kcov->sequence++;
++	spin_unlock_irqrestore(&kcov->lock, flags);
++}
++
++static int kcov_request_publish_generation(struct kcov *kcov,
++		struct kcov_request_generation *generation)
++{
++	struct kcov_request_publish_lease lease;
++	void *destination;
++	unsigned int destination_mode;
++	unsigned long flags;
++	u64 count_size, entries, entry_size, old_entries;
++	int ret;
++
++	ret = kcov_request_generation_publish_begin(generation, &lease);
++	if (ret == -ENODATA) {
++		kcov_request_clear_published_area(kcov);
++		return 0;
++	}
++	if (ret)
++		return ret;
++	if (!kcov_request_phase6_publish_valid(generation)) {
++		kcov_request_generation_publish_end(&lease);
++		return -EUCLEAN;
++	}
++
++	spin_lock_irqsave(&kcov->lock, flags);
++	if (kcov->request_generation != generation || !kcov->area ||
++	    kcov->mode != lease.mode || kcov->size < lease.size) {
++		spin_unlock_irqrestore(&kcov->lock, flags);
++		kcov_request_generation_publish_end(&lease);
++		return -ESTALE;
++	}
++	destination = kcov->area;
++	destination_mode = kcov->mode;
++	old_entries = destination_mode == KCOV_MODE_TRACE_PC ?
++		READ_ONCE(*(unsigned long *)destination) :
++		READ_ONCE(*(u64 *)destination);
++	kcov_request_zero_area_count(destination, destination_mode);
++	kcov->sequence++;
++	spin_unlock_irqrestore(&kcov->lock, flags);
++
++	/* The lease pins the immutable source while the large copy is unlocked. */
++	kcov_request_phase6_pause_publish(generation);
++	spin_lock_irqsave(&kcov->lock, flags);
++	if (kcov->request_reset_pending) {
++		kcov_request_zero_area_count(kcov->area, kcov->mode);
++		spin_unlock_irqrestore(&kcov->lock, flags);
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_AGGREGATE_PUBLISH_SUPPRESSED);
++		kcov_request_generation_publish_end(&lease);
++		return 0;
++	}
++	spin_unlock_irqrestore(&kcov->lock, flags);
++	entries = destination_mode == KCOV_MODE_TRACE_PC ?
++		READ_ONCE(*(unsigned long *)lease.area) :
++		READ_ONCE(*(u64 *)lease.area);
++	count_size = destination_mode == KCOV_MODE_TRACE_PC ?
++		sizeof(unsigned long) : sizeof(u64);
++	entry_size = destination_mode == KCOV_MODE_TRACE_PC ?
++		sizeof(unsigned long) : sizeof(u64) * KCOV_WORDS_PER_CMP;
++	memcpy(destination + count_size, lease.area + count_size,
++	       entries * entry_size);
++	smp_wmb();
++	if (destination_mode == KCOV_MODE_TRACE_PC)
++		WRITE_ONCE(*(unsigned long *)destination, entries);
++	else
++		WRITE_ONCE(*(u64 *)destination, entries);
++	spin_lock_irqsave(&kcov->lock, flags);
++	if (kcov->request_reset_pending)
++		kcov_request_zero_area_count(kcov->area, kcov->mode);
++	ret = kcov->request_reset_pending ? -ECANCELED : 0;
++	spin_unlock_irqrestore(&kcov->lock, flags);
++	if (ret) {
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_AGGREGATE_PUBLISH_SUPPRESSED);
++		kcov_request_generation_publish_end(&lease);
++		return 0;
++	}
++	if (old_entries)
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_DESTINATION_SEED_OVERWRITTEN);
++	kcov_request_phase6_assert_copy_unlocked(generation);
++	kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_PUBLISHED);
++	kcov_request_phase6_add(KCOV_REQUEST_P6_AGGREGATE_ENTRIES_PUBLISHED,
++			entries);
++	kcov_request_generation_publish_end(&lease);
++	return 0;
++}
++
+ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		unsigned int cmd, void __user *uarg)
+ {
+ 	struct kcov_remote_generation arg;
+ 	struct kcov_request_generation *gen = NULL, *old = NULL;
+ 	unsigned long flags;
++	unsigned int generation_mode = 0, generation_size = 0;
+ 	u64 owner;
++	bool request_busy;
+ 	int ret;
+ 
+ 	/* BIND workers never own whole-generation exit-time ABORT authority. */
+@@ -804,19 +963,25 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		if (arg.generation || arg.timeout_ms)
+ 			return -EINVAL;
+ 		spin_lock_irqsave(&kcov->lock, flags);
++		request_busy = kcov->request_generation_busy;
+ 		if (!kcov->remote || !kcov->request_common_handle ||
+-		    kcov->request_generation_busy ||
++		    request_busy ||
+ 		    (kcov->request_generation &&
+ 		     !kcov->request_generation_closed &&
+ 		     !kcov_request_generation_is_terminal(
+ 			     kcov->request_generation))) {
+ 			spin_unlock_irqrestore(&kcov->lock, flags);
++			if (request_busy)
++				kcov_request_phase6_note(
++					KCOV_REQUEST_P6_PUBLISH_BEGIN_BLOCKED);
+ 			return -EBUSY;
+ 		}
+ 		old = kcov->request_generation;
+ 		kcov->request_generation = NULL;
+ 		kcov->request_generation_busy = true;
+ 		owner = kcov->request_common_handle;
++		generation_mode = kcov->mode;
++		generation_size = kcov->size;
+ 		/* The prior terminal window is no longer controlled by this task. */
+ 		current->kcov_request_generation_controller = false;
+ 		spin_unlock_irqrestore(&kcov->lock, flags);
+@@ -828,6 +993,10 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 			gen = NULL;
+ 			goto begin_done;
+ 		}
++		ret = kcov_request_generation_remote_open(gen, generation_mode,
++				generation_size);
++		if (ret)
++			goto begin_done;
+ 		ret = kcov_request_generation_bind(owner, arg.generation);
+ 		if (ret)
+ 			goto begin_done;
+@@ -836,15 +1005,22 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ begin_done:
+ 		spin_lock_irqsave(&kcov->lock, flags);
+ 		kcov->request_generation_busy = false;
+-		if (!ret && kcov->remote &&
++		if (!ret && !kcov->request_reset_pending && kcov->remote &&
+ 		    kcov->request_common_handle == owner) {
+ 			kcov->request_generation = gen;
+ 			kcov->request_generation_closed = false;
++			/* Managed generations exclusively own the published mmap. */
++			kcov_request_zero_area_count(kcov->area, kcov->mode);
++			kcov->sequence++;
+ 			current->kcov_request_generation_controller = true;
+ 			gen = NULL;
+ 		} else {
++			if (!ret)
++				ret = -ESTALE;
+ 			current->kcov_handle_generation = 0;
+ 		}
++		if (kcov->request_reset_pending)
++			kcov_remote_reset(kcov);
+ 		spin_unlock_irqrestore(&kcov->lock, flags);
+ 		if (gen) {
+ 			kcov_request_generation_abort(gen);
+@@ -869,18 +1045,26 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		return kcov_request_generation_bind(owner, 0);
+ 	}
+ 	if (cmd == KCOV_REMOTE_GENERATION_ABORT && !arg.generation) {
+-		if (arg.timeout_ms || !kcov->request_generation ||
++		request_busy = kcov->request_generation_busy;
++		if (arg.timeout_ms || request_busy ||
++		    !kcov->request_generation ||
+ 		    !kcov_request_generation_get(kcov->request_generation)) {
+ 			spin_unlock_irqrestore(&kcov->lock, flags);
+-			return arg.timeout_ms ? -EINVAL : -ESTALE;
++			if (!arg.timeout_ms && request_busy)
++				kcov_request_phase6_note(
++					KCOV_REQUEST_P6_PUBLISH_ABORT_BLOCKED);
++			return arg.timeout_ms ? -EINVAL :
++				request_busy ? -EBUSY : -ESTALE;
+ 		}
+ 		gen = kcov->request_generation;
++		kcov->request_generation_busy = true;
+ 		spin_unlock_irqrestore(&kcov->lock, flags);
+ 		ret = kcov_request_generation_abort(gen);
+ 		if (ret == -ESTALE &&
+-		    kcov_request_generation_is_terminal(gen))
++		    kcov_request_generation_is_aborted(gen))
+ 			ret = 0;
+ 		if (!ret) {
++			kcov_request_clear_published_area(kcov);
+ 			spin_lock_irqsave(&kcov->lock, flags);
+ 			if (kcov->request_generation == gen)
+ 				kcov->request_generation_closed = true;
+@@ -889,9 +1073,21 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 			current->kcov_request_generation_controller = false;
+ 			kcov_request_generation_note_fd_abort();
+ 		}
++		spin_lock_irqsave(&kcov->lock, flags);
++		kcov_request_generation_busy_done(kcov);
++		spin_unlock_irqrestore(&kcov->lock, flags);
+ 		kcov_request_generation_put(gen);
+ 		return ret;
+ 	}
++	if ((cmd == KCOV_REMOTE_GENERATION_FINISH ||
++	     cmd == KCOV_REMOTE_GENERATION_ABORT) &&
++	    kcov->request_generation_busy) {
++		spin_unlock_irqrestore(&kcov->lock, flags);
++		if (cmd == KCOV_REMOTE_GENERATION_ABORT)
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_PUBLISH_ABORT_BLOCKED);
++		return -EBUSY;
++	}
+ 	if (!kcov->request_generation ||
+ 	    kcov_request_generation_id(kcov->request_generation) !=
+ 		arg.generation ||
+@@ -902,6 +1098,9 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		return -ESTALE;
+ 	}
+ 	gen = kcov->request_generation;
++	if (cmd == KCOV_REMOTE_GENERATION_FINISH ||
++	    cmd == KCOV_REMOTE_GENERATION_ABORT)
++		kcov->request_generation_busy = true;
+ 	spin_unlock_irqrestore(&kcov->lock, flags);
+ 
+ 	switch (cmd) {
+@@ -914,6 +1113,8 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		break;
+ 	case KCOV_REMOTE_GENERATION_FINISH:
+ 		ret = kcov_request_generation_finish(gen, arg.timeout_ms);
++		if (!ret)
++			ret = kcov_request_publish_generation(kcov, gen);
+ 		/*
+ 		 * A fault hook can have aborted this exact window before FINISH.
+ 		 * Close the fd window whenever that exact generation is terminal,
+@@ -934,9 +1135,10 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		else
+ 			ret = kcov_request_generation_abort(gen);
+ 		if (ret == -ESTALE &&
+-		    kcov_request_generation_is_terminal(gen))
++		    kcov_request_generation_is_aborted(gen))
+ 			ret = 0;
+ 		if (!ret) {
++			kcov_request_clear_published_area(kcov);
+ 			spin_lock_irqsave(&kcov->lock, flags);
+ 			if (kcov->request_generation == gen)
+ 				kcov->request_generation_closed = true;
+@@ -948,6 +1150,12 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 	default:
+ 		ret = -ENOTTY;
+ 	}
++	if (cmd == KCOV_REMOTE_GENERATION_FINISH ||
++	    cmd == KCOV_REMOTE_GENERATION_ABORT) {
++		spin_lock_irqsave(&kcov->lock, flags);
++		kcov_request_generation_busy_done(kcov);
++		spin_unlock_irqrestore(&kcov->lock, flags);
++	}
+ 	kcov_request_generation_put(gen);
+ 	return ret;
+ }
+@@ -1113,6 +1321,11 @@ static void kcov_remote_softirq_stop(struct task_struct *t)
+ 	}
+ }
+ 
++static bool kcov_request_legacy_merge_allowed(struct kcov *kcov)
++{
++	return !READ_ONCE(kcov->request_generation);
++}
++
+ void kcov_remote_start(u64 handle)
+ {
+ 	struct task_struct *t = current;
+@@ -1162,6 +1375,13 @@ void kcov_remote_start(u64 handle)
+ 	kcov = remote->kcov;
+ 	/* Put in kcov_remote_stop(). */
+ 	kcov_get(kcov);
++	/* A managed request generation exclusively owns its publish mmap. */
++	if (!kcov_request_legacy_merge_allowed(kcov)) {
++		spin_unlock(&kcov_remote_lock);
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		kcov_put(kcov);
++		return;
++	}
+ 	/*
+ 	 * Read kcov fields before unlocking kcov_remote_lock to prevent races
+ 	 * with KCOV_DISABLE and kcov_remote_reset(); cannot acquire kcov->lock
+@@ -1320,7 +1540,8 @@ void kcov_remote_stop(void)
+ 	 * KCOV_DISABLE could have been called between kcov_remote_start()
+ 	 * and kcov_remote_stop(), hence the sequence check.
+ 	 */
+-	if (sequence == kcov->sequence && kcov->remote)
++	if (sequence == kcov->sequence && kcov->remote &&
++	    kcov_request_legacy_merge_allowed(kcov))
+ 		kcov_move_area(kcov->mode, kcov->area, kcov->size, area);
+ 	spin_unlock(&kcov->lock);
+ 
+@@ -1347,6 +1568,8 @@ static void kcov_request_remote_scratch_put(
+ 	spin_unlock_irqrestore(&kcov_remote_lock, flags);
+ 	ticket->scratch = NULL;
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_SCRATCH_RETURNED);
++	if (ticket->phase6_scratch_accounted)
++		kcov_request_phase6_note(KCOV_REQUEST_P6_SCRATCH_RETURNED);
+ }
+ 
+ static void kcov_request_remote_target_put(
+@@ -1363,10 +1586,26 @@ static void kcov_request_remote_target_put(
+ static void kcov_request_remote_finish_ticket(
+ 		struct kcov_request_remote_ticket *ticket, bool canceled)
+ {
+-	/* Phase 6 owns scratch-to-aggregate merge; Phase 5 only discards. */
++	struct kcov_request_merge_result merge = {};
++	int ret = -ECANCELED;
++
++	if (!canceled) {
++		if (ticket->phase6_section_accounted)
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_SCRATCH_COMPLETED);
++		kcov_request_phase6_apply_scratch_fault(ticket->generation,
++			ticket->scratch, ticket->scratch_size, ticket->mode,
++			&ticket->scratch_overflow);
++		ret = kcov_request_generation_merge_scratch(ticket->generation,
++			ticket->scratch, ticket->scratch_size, ticket->mode,
++			ticket->scratch_overflow, &merge);
++	}
+ 	kcov_request_remote_scratch_put(ticket);
+ 	kcov_request_remote_target_put(ticket);
+ 	if (ticket->remote_ref_held) {
++		if (WARN_ON_ONCE(ticket->scratch))
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_REMOTE_REF_PUT_BEFORE_SCRATCH_RETURN);
+ 		ticket->remote_ref_held = false;
+ 		kcov_request_remote_ref_put(ticket->generation);
+ 	}
+@@ -1374,6 +1613,10 @@ static void kcov_request_remote_finish_ticket(
+ 		kcov_request_token_complete_once(ticket->token);
+ 	atomic_set(&ticket->state, KCOV_REQUEST_TICKET_DONE);
+ 	kcov_request_phase5_live_ticket_put();
++	if (ticket->phase6_section_accounted)
++		kcov_request_phase6_note(!ret && !merge.truncated ?
++			KCOV_REQUEST_P6_REMOTE_SECTION_COMPLETED :
++			KCOV_REQUEST_P6_REMOTE_SECTION_DISCARDED);
+ 	kcov_request_phase5_note(canceled ?
+ 		KCOV_REQUEST_P5_TICKET_CANCELED :
+ 		KCOV_REQUEST_P5_TICKET_COMPLETED);
+@@ -1402,8 +1645,14 @@ int kcov_request_remote_try_grant(u64 request_cookie,
+ 	if (!request_cookie || !owner.val || !owner.generation || !token)
+ 		return -EINVAL;
+ 	ticket = kzalloc(sizeof(*ticket), GFP_KERNEL);
+-	if (!ticket)
++	if (!ticket) {
++		if (token->generation &&
++		    !kcov_request_remote_was_aborted(token->generation))
++			kcov_request_remote_degrade(token->generation,
++				KCOV_REQUEST_REMOTE_INCOMPLETE,
++				KCOV_REQUEST_REMOTE_ISSUE_START_FAILED);
+ 		return -ENOMEM;
++	}
+ 
+ 	/* Provisional target pin: no generation lock is held here. */
+ 	spin_lock_irqsave(&kcov_remote_lock, flags);
+@@ -1448,8 +1697,10 @@ int kcov_request_remote_try_grant(u64 request_cookie,
+ 	}
+ 	ticket->scratch = scratch;
+ 	ticket->scratch_size = size;
+-	*(unsigned long *)ticket->scratch = 0;
++	kcov_request_zero_area_count(ticket->scratch, mode);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_SCRATCH_RESERVED);
++	ticket->phase6_scratch_accounted = true;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SCRATCH_RESERVED);
+ 	ticket->generation = token->generation;
+ 	ticket->token = token;
+ 	ticket->mode = mode;
+@@ -1459,6 +1710,11 @@ int kcov_request_remote_try_grant(u64 request_cookie,
+ 	ticket->remote_ref_held = true;
+ 	refcount_set(&ticket->refs, 1);
+ 	atomic_set(&ticket->state, KCOV_REQUEST_TICKET_START_GRANTED);
++	if (!kcov_request_phase6_validate_scratch(ticket->generation,
++			ticket->scratch)) {
++		ret = -EINVAL;
++		goto out_scratch;
++	}
+ 
+ 	/*
+ 	 * Lock order is kcov->lock -> generation->lock.  All provisional
+@@ -1489,6 +1745,8 @@ int kcov_request_remote_try_grant(u64 request_cookie,
+ 	kcov_request_phase5_live_ticket_get();
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_TICKET_CREATED);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_START_GRANTED);
++	kcov_request_phase6_note(KCOV_REQUEST_P6_REMOTE_SECTION_CREATED);
++	ticket->phase6_section_accounted = true;
+ 	*ticketp = ticket;
+ 	return 0;
+ 
+@@ -1497,6 +1755,11 @@ int kcov_request_remote_try_grant(u64 request_cookie,
+ out_target:
+ 	kcov_request_remote_target_put(ticket);
+ out_free:
++	if (token->generation &&
++	    !kcov_request_remote_was_aborted(token->generation))
++		kcov_request_remote_degrade(token->generation,
++			KCOV_REQUEST_REMOTE_INCOMPLETE,
++			KCOV_REQUEST_REMOTE_ISSUE_START_FAILED);
+ 	kfree(ticket);
+ 	return ret;
+ }
+@@ -1516,6 +1779,11 @@ enum kcov_request_remote_start_result kcov_request_remote_start_checked(
+ 	    atomic_read(&ticket->state) !=
+ 		KCOV_REQUEST_TICKET_START_GRANTED)
+ 		return KCOV_REQUEST_REMOTE_START_FAILURE;
++	if (!kcov_request_phase6_validate_scratch(ticket->generation,
++			ticket->scratch))
++		return KCOV_REQUEST_REMOTE_START_FAILURE;
++	if (!kcov_request_phase6_before_start(ticket->generation))
++		return KCOV_REQUEST_REMOTE_START_FAILURE;
+ 
+ 	fault = kcov_request_phase5_before_start(ticket->generation);
+ 	if (fault == KCOV_REQUEST_P5_FAULT_START_FAIL) {
+@@ -1566,6 +1834,8 @@ enum kcov_request_remote_start_result kcov_request_remote_start_checked(
+ 	kcov_start(t, ticket->kcov, ticket->scratch_size, ticket->scratch,
+ 		ticket->mode, ticket->sequence);
+ 	local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++	if (ticket->phase6_section_accounted)
++		kcov_request_phase6_note(KCOV_REQUEST_P6_SCRATCH_ACTIVE);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_START_OK);
+ 	if (inject_same_nested) {
+ 		/* Fault probe observes a genuinely active exact incumbent. */
+@@ -1577,6 +1847,7 @@ enum kcov_request_remote_start_result kcov_request_remote_start_checked(
+ 		kcov_request_phase5_note(KCOV_REQUEST_P5_START_AFTER_ABORT_OK);
+ 	}
+ 	kcov_request_phase5_after_start(ticket->generation);
++	kcov_request_phase6_after_start(ticket->generation);
+ 	return KCOV_REQUEST_REMOTE_START_SUCCESS;
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_remote_start_checked);
+@@ -1716,6 +1987,9 @@ static bool kcov_request_phase5_test_init(
+ 	ctx->kcov->sequence = 1;
+ 	ctx->kcov->request_generation = ctx->generation;
+ 	ctx->kcov->request_common_handle = owner;
++	if (kcov_request_generation_remote_open(ctx->generation,
++			KCOV_MODE_TRACE_PC, 64))
++		return false;
+ 	return true;
+ }
+ 
+@@ -1767,6 +2041,10 @@ static bool kcov_request_phase5_test_grant(
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_SCRATCH_RESERVED);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_TICKET_CREATED);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_START_GRANTED);
++	ticket->phase6_scratch_accounted = true;
++	ticket->phase6_section_accounted = true;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_REMOTE_SECTION_CREATED);
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SCRATCH_RESERVED);
+ 	return true;
+ out_scratch:
+ 	vfree(ticket->scratch);
+@@ -1897,6 +2175,227 @@ bool kcov_request_phase5_selftest(void)
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_phase5_selftest);
+ 
++struct kcov_request_phase6_test_ctx {
++	struct kcov_request_generation *generation;
++	struct kcov_request_root root;
++	struct kcov_request_token token;
++	struct kcov_common_handle_id owner;
++	u64 cookie;
++	void *scratch;
++	u32 scratch_size;
++	u32 aggregate_size;
++	enum kcov_mode mode;
++	bool remote_ref_held;
++};
++
++static bool kcov_request_phase6_test_init(
++		struct kcov_request_phase6_test_ctx *ctx, u64 owner,
++		enum kcov_mode mode, u32 aggregate_size, u32 scratch_size,
++		u64 entries)
++{
++	struct kcov_request_generation *granted;
++	u64 generation, i;
++
++	memset(ctx, 0, sizeof(*ctx));
++	ctx->generation = kcov_request_generation_begin(owner, &generation);
++	if (IS_ERR(ctx->generation)) {
++		ctx->generation = NULL;
++		return false;
++	}
++	ctx->owner = (struct kcov_common_handle_id){
++		.val = owner, .generation = generation };
++	ctx->cookie = owner ^ 0x60000001;
++	ctx->mode = mode;
++	ctx->aggregate_size = aggregate_size;
++	if (kcov_request_generation_remote_open(ctx->generation, mode,
++			aggregate_size) ||
++	    !kcov_request_root_init(&ctx->root, ctx->owner, ctx->cookie) ||
++	    !kcov_request_try_get_child_token(&ctx->root,
++			KCOV_REQUEST_TOKEN_WIRE, &ctx->token) ||
++	    !kcov_request_wire_token_set_identity(&ctx->token, ctx->owner,
++			ctx->cookie))
++		return false;
++	ctx->scratch_size = scratch_size;
++	ctx->scratch = vzalloc(array_size(scratch_size,
++					     sizeof(unsigned long)));
++	if (!ctx->scratch)
++		return false;
++	if (mode == KCOV_MODE_TRACE_PC) {
++		entries = min_t(u64, entries,
++			scratch_size > 0 ? scratch_size - 1 : 0);
++		*(unsigned long *)ctx->scratch = entries;
++		for (i = 0; i < entries; i++)
++			((unsigned long *)ctx->scratch)[i + 1] = owner + i;
++	} else {
++		entries = min_t(u64, entries,
++			(((u64)scratch_size * sizeof(unsigned long)) -
++			 sizeof(u64)) / (sizeof(u64) * KCOV_WORDS_PER_CMP));
++		*(u64 *)ctx->scratch = entries;
++		for (i = 0; i < entries * KCOV_WORDS_PER_CMP; i++)
++			((u64 *)ctx->scratch)[i + 1] = owner + i;
++	}
++	granted = kcov_request_remote_admit(ctx->cookie, ctx->owner,
++			&ctx->token);
++	if (IS_ERR(granted))
++		return false;
++	ctx->remote_ref_held = true;
++	return granted == ctx->generation;
++}
++
++static void kcov_request_phase6_test_release(
++		struct kcov_request_phase6_test_ctx *ctx)
++{
++	if (ctx->scratch) {
++		vfree(ctx->scratch);
++		ctx->scratch = NULL;
++	}
++	if (ctx->remote_ref_held) {
++		ctx->remote_ref_held = false;
++		kcov_request_remote_ref_put(ctx->generation);
++	}
++	if (ctx->token.generation)
++		kcov_request_token_complete_once(&ctx->token);
++	if (ctx->root.generation)
++		kcov_request_root_finish(&ctx->root);
++}
++
++static void kcov_request_phase6_test_cleanup(
++		struct kcov_request_phase6_test_ctx *ctx)
++{
++	kcov_request_phase6_test_release(ctx);
++	if (ctx->generation) {
++		kcov_request_generation_abort(ctx->generation);
++		kcov_request_generation_put(ctx->generation);
++		ctx->generation = NULL;
++	}
++}
++
++static bool kcov_request_phase6_test_publish(
++		struct kcov_request_phase6_test_ctx *ctx, u64 seed,
++		u64 expected)
++{
++	struct kcov fake = {};
++	bool pass;
++
++	spin_lock_init(&fake.lock);
++	fake.remote = true;
++	fake.mode = ctx->mode;
++	fake.size = ctx->aggregate_size;
++	fake.area = vzalloc(array_size(fake.size, sizeof(unsigned long)));
++	if (!fake.area)
++		return false;
++	fake.request_generation = ctx->generation;
++	if (fake.mode == KCOV_MODE_TRACE_PC)
++		*(unsigned long *)fake.area = seed;
++	else
++		*(u64 *)fake.area = seed;
++	pass = !kcov_request_publish_generation(&fake, ctx->generation) &&
++		(fake.mode == KCOV_MODE_TRACE_PC ?
++		 READ_ONCE(*(unsigned long *)fake.area) :
++		 READ_ONCE(*(u64 *)fake.area)) == expected &&
++		!kcov_request_legacy_merge_allowed(&fake);
++	vfree(fake.area);
++	return pass;
++}
++
++bool kcov_request_phase6_selftest(void)
++{
++	struct kcov_request_phase6_test_ctx normal = {}, overflow = {};
++	struct kcov_request_phase6_test_ctx truncated = {};
++	struct kcov_request_phase6_test_ctx comparison = {};
++	struct kcov_request_generation *aborted = NULL;
++	struct kcov_request_merge_result merge;
++	void *scratch_a = NULL, *scratch_b = NULL;
++	u64 generation;
++	bool pass = false;
++
++	if (kcov_mode_enabled(READ_ONCE(current->kcov_mode)))
++		return false;
++	scratch_a = vmalloc(64 * sizeof(unsigned long));
++	scratch_b = vmalloc(64 * sizeof(unsigned long));
++	if (!scratch_a || !scratch_b || scratch_a == scratch_b)
++		goto out;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_EXCLUSIVE_SCRATCH);
++
++	if (!kcov_request_phase6_test_init(&normal, 0xf6000011,
++			KCOV_MODE_TRACE_PC, 16, 16, 3) ||
++	    kcov_request_generation_merge_scratch(normal.generation,
++			normal.scratch, normal.scratch_size,
++			KCOV_MODE_TRACE_PC, false, &merge) ||
++	    merge.truncated || merge.merged_entries != 3)
++		goto out;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_SERIALIZED_MERGE);
++	kcov_request_phase6_test_release(&normal);
++	if (kcov_request_generation_finish(normal.generation, 1000))
++		goto out;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_COMMIT_ELIGIBILITY);
++	if (!kcov_request_phase6_test_publish(&normal, 7, 3))
++		goto out;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_PUBLISH_LEASE);
++	kcov_request_phase6_note(
++		KCOV_REQUEST_P6_SELFTEST_MANAGED_GENERATION_ISOLATION);
++	if (!kcov_request_phase6_test_init(&comparison, 0xf6000012,
++			KCOV_MODE_TRACE_CMP, 32, 32, 2) ||
++	    kcov_request_generation_merge_scratch(comparison.generation,
++			comparison.scratch, comparison.scratch_size,
++			comparison.mode, false, &merge) || merge.truncated ||
++	    merge.merged_entries != 2)
++		goto out;
++	kcov_request_phase6_test_release(&comparison);
++	if (kcov_request_generation_finish(comparison.generation, 1000) ||
++	    !kcov_request_phase6_test_publish(&comparison, 6, 2))
++		goto out;
++
++	if (!kcov_request_phase6_test_init(&overflow, 0xf6000021,
++			KCOV_MODE_TRACE_PC, 16, 16, 3) ||
++	    kcov_request_generation_merge_scratch(overflow.generation,
++			overflow.scratch, overflow.scratch_size,
++			KCOV_MODE_TRACE_PC, true, &merge) != -ECANCELED)
++		goto out;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_OVERFLOW);
++	kcov_request_phase6_note(
++		KCOV_REQUEST_P6_SELFTEST_RESULT_BEFORE_RELEASE);
++	kcov_request_phase6_test_release(&overflow);
++	if (kcov_request_generation_finish(overflow.generation, 1000) ||
++	    !kcov_request_phase6_test_publish(&overflow, 5, 0))
++		goto out;
++
++	if (!kcov_request_phase6_test_init(&truncated, 0xf6000031,
++			KCOV_MODE_TRACE_PC, 3, 16, 4) ||
++	    kcov_request_generation_merge_scratch(truncated.generation,
++			truncated.scratch, truncated.scratch_size,
++			KCOV_MODE_TRACE_PC, false, &merge) ||
++	    !merge.truncated || merge.merged_entries != 2)
++		goto out;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_TRUNCATION);
++	kcov_request_phase6_test_release(&truncated);
++	if (kcov_request_generation_finish(truncated.generation, 1000) ||
++	    !kcov_request_phase6_test_publish(&truncated, 4, 0))
++		goto out;
++
++	aborted = kcov_request_generation_begin(0xf6000041, &generation);
++	if (IS_ERR(aborted)) {
++		aborted = NULL;
++		goto out;
++	}
++	if (kcov_request_generation_remote_open(aborted, KCOV_MODE_TRACE_PC,
++			16) || kcov_request_generation_abort(aborted))
++		goto out;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_ABORT_DISCARD);
++	pass = true;
++out:
++	vfree(scratch_b);
++	vfree(scratch_a);
++	if (aborted)
++		kcov_request_generation_put(aborted);
++	kcov_request_phase6_test_cleanup(&comparison);
++	kcov_request_phase6_test_cleanup(&truncated);
++	kcov_request_phase6_test_cleanup(&overflow);
++	kcov_request_phase6_test_cleanup(&normal);
++	return pass;
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_selftest);
++
+ /* See the comment before kcov_remote_start() for usage details. */
+ struct kcov_common_handle_id kcov_common_handle(void)
+ {
+diff --git a/kernel/kcov_request.c b/kernel/kcov_request.c
+index 1211a2c30..75492809e 100644
+--- a/kernel/kcov_request.c
++++ b/kernel/kcov_request.c
+@@ -7,12 +7,16 @@
+ #include <linux/jiffies.h>
+ #include <linux/kcov.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/vmalloc.h>
+ #include <linux/wait.h>
+ #include <linux/workqueue.h>
+ 
++#define REQUEST_KCOV_WORDS_PER_CMP 4
++
+ enum request_stat {
+ 	REQUEST_GENERATION_CREATED,
+ 	REQUEST_GENERATION_BEGIN,
+@@ -140,6 +144,11 @@ enum request_token_completion {
+ 	REQUEST_TOKEN_ABORT_CANCELED,
+ };
+ 
++struct request_aggregate_buffer {
++	struct work_struct free_work;
++	unsigned long area[];
++};
++
+ struct kcov_request_generation {
+ 	struct list_head all;
+ 	spinlock_t lock;
+@@ -153,11 +162,35 @@ struct kcov_request_generation {
+ 	unsigned int active_roots;
+ 	unsigned int remote_refs;
+ 	unsigned int remote_issues;
++	struct mutex aggregate_merge_lock;
++	struct request_aggregate_buffer *aggregate_buffer;
++	void *aggregate_area;
++	unsigned int aggregate_size;
++	unsigned int aggregate_mode;
++	unsigned int aggregate_entries;
++	unsigned int publish_readers;
++	atomic_t aggregate_merging;
+ 	enum kcov_request_generation_state state;
+ 	enum kcov_request_remote_result remote_result;
++	enum kcov_request_aggregate_state aggregate_state;
++	bool publish_suppressed;
+ 	bool debug_owned;
+ };
+ 
++static void request_aggregate_free_work(struct work_struct *work)
++{
++	struct request_aggregate_buffer *buffer = container_of(work,
++			struct request_aggregate_buffer, free_work);
++
++	vfree(buffer);
++}
++
++static void request_aggregate_free(struct request_aggregate_buffer *buffer)
++{
++	if (buffer)
++		schedule_work(&buffer->free_work);
++}
++
+ enum request_fault {
+ 	REQUEST_FAULT_NONE,
+ 	REQUEST_FAULT_CLOSE_FIRST_CHILD,
+@@ -193,6 +226,96 @@ static bool request_phase5_cross_attempted_seen;
+ static bool request_phase5_cross_canceled;
+ static bool (*request_phase5_transport_selftest)(void);
+ 
++enum request_phase6_fault {
++	REQUEST_P6_FAULT_NONE = 0,
++	REQUEST_P6_FAULT_HOLD_AFTER_GRANT,
++	REQUEST_P6_FAULT_SCRATCH_LIMIT,
++	REQUEST_P6_FAULT_AGGREGATE_LIMIT,
++	REQUEST_P6_FAULT_PAUSE_PUBLISH,
++};
++
++static atomic64_t request_phase6_stats[KCOV_REQUEST_P6_STAT_COUNT];
++static atomic_t request_phase6_live_scratch = ATOMIC_INIT(0);
++static atomic_t request_phase6_live_sections = ATOMIC_INIT(0);
++static atomic_t request_phase6_scratch_peak = ATOMIC_INIT(0);
++static DEFINE_SPINLOCK(request_phase6_fault_lock);
++static enum request_phase6_fault request_phase6_fault;
++static u64 request_phase6_fault_owner;
++static u64 request_phase6_fault_generation;
++static unsigned int request_phase6_fault_limit;
++static unsigned int request_phase6_fault_count;
++static bool request_phase6_fault_released;
++static DECLARE_WAIT_QUEUE_HEAD(request_phase6_fault_wait);
++
++static const char *const request_phase6_stat_names[] = {
++	[KCOV_REQUEST_P6_REMOTE_SECTION_CREATED] = "remote_section_created",
++	[KCOV_REQUEST_P6_REMOTE_SECTION_COMPLETED] = "remote_section_completed",
++	[KCOV_REQUEST_P6_REMOTE_SECTION_DISCARDED] = "remote_section_discarded",
++	[KCOV_REQUEST_P6_SCRATCH_RESERVED] = "scratch_reserved",
++	[KCOV_REQUEST_P6_SCRATCH_ACTIVE] = "scratch_active",
++	[KCOV_REQUEST_P6_SCRATCH_COMPLETED] = "scratch_completed",
++	[KCOV_REQUEST_P6_SCRATCH_RETURNED] = "scratch_returned",
++	[KCOV_REQUEST_P6_SCRATCH_OVERFLOW] = "scratch_overflow",
++	[KCOV_REQUEST_P6_SCRATCH_ADDRESS_COLLISION] = "scratch_address_collision",
++	[KCOV_REQUEST_P6_SCRATCH_TRACE_ENTRIES] = "scratch_trace_entries",
++	[KCOV_REQUEST_P6_AGGREGATE_ALLOCATED] = "aggregate_allocated",
++	[KCOV_REQUEST_P6_AGGREGATE_MERGE_STARTED] = "aggregate_merge_started",
++	[KCOV_REQUEST_P6_AGGREGATE_MERGE_COMPLETED] = "aggregate_merge_completed",
++	[KCOV_REQUEST_P6_AGGREGATE_MERGE_TRUNCATED] = "aggregate_merge_truncated",
++	[KCOV_REQUEST_P6_AGGREGATE_MERGE_OVERLAP] = "aggregate_merge_overlap",
++	[KCOV_REQUEST_P6_AGGREGATE_ENTRIES_MERGED] = "aggregate_entries_merged",
++	[KCOV_REQUEST_P6_AGGREGATE_DIRECT_TRACE_WRITE] = "aggregate_direct_trace_write",
++	[KCOV_REQUEST_P6_LATE_MERGE_AFTER_REFS_ZERO] = "late_merge_after_refs_zero",
++	[KCOV_REQUEST_P6_AGGREGATE_COMMITTED] = "aggregate_committed",
++	[KCOV_REQUEST_P6_AGGREGATE_QUARANTINED] = "aggregate_quarantined",
++	[KCOV_REQUEST_P6_AGGREGATE_DISCARDED] = "aggregate_discarded",
++	[KCOV_REQUEST_P6_AGGREGATE_PUBLISHING] = "aggregate_publishing",
++	[KCOV_REQUEST_P6_AGGREGATE_PUBLISHED] = "aggregate_published",
++	[KCOV_REQUEST_P6_AGGREGATE_PUBLISH_SUPPRESSED] = "aggregate_publish_suppressed",
++	[KCOV_REQUEST_P6_AGGREGATE_ENTRIES_PUBLISHED] = "aggregate_entries_published",
++	[KCOV_REQUEST_P6_AGGREGATE_REUSE_BLOCKED_READER] = "aggregate_reuse_blocked_reader",
++	[KCOV_REQUEST_P6_AGGREGATE_REUSE_WHILE_READER] = "aggregate_reuse_while_reader",
++	[KCOV_REQUEST_P6_PUBLISHER_READ_LEASE_GET] = "publisher_read_lease_get",
++	[KCOV_REQUEST_P6_PUBLISHER_READ_LEASE_PUT] = "publisher_read_lease_put",
++	[KCOV_REQUEST_P6_PUBLISH_COPY_OUTSIDE_LOCK] = "publish_copy_outside_lock",
++	[KCOV_REQUEST_P6_PUBLISH_COPY_UNDER_GEN_LOCK] = "publish_copy_under_gen_lock",
++	[KCOV_REQUEST_P6_REMOTE_REF_PUT_BEFORE_SCRATCH_RETURN] = "remote_ref_put_before_scratch_return",
++	[KCOV_REQUEST_P6_RESULT_DEGRADE_AFTER_REF_RELEASE] = "result_degrade_after_ref_release",
++	[KCOV_REQUEST_P6_COMMIT_WITH_TOKENS] = "commit_with_tokens",
++	[KCOV_REQUEST_P6_COMMIT_WITH_REFS] = "commit_with_refs",
++	[KCOV_REQUEST_P6_COMMIT_NONVALID] = "commit_nonvalid",
++	[KCOV_REQUEST_P6_COMMIT_BAD_STATE] = "commit_bad_state",
++	[KCOV_REQUEST_P6_INCOMPLETE_PUBLISHED] = "incomplete_published",
++	[KCOV_REQUEST_P6_INVALID_PUBLISHED] = "invalid_published",
++	[KCOV_REQUEST_P6_ABORTED_PUBLISHED] = "aborted_published",
++	[KCOV_REQUEST_P6_FAULT_HOLD_AFTER_GRANT_ENTERED] = "fault_hold_after_grant_entered",
++	[KCOV_REQUEST_P6_FAULT_HOLD_AFTER_GRANT_RELEASED] = "fault_hold_after_grant_released",
++	[KCOV_REQUEST_P6_FAULT_SCRATCH_LIMIT] = "fault_scratch_limit",
++	[KCOV_REQUEST_P6_FAULT_AGGREGATE_LIMIT] = "fault_aggregate_limit",
++	[KCOV_REQUEST_P6_FAULT_PAUSE_PUBLISH_ENTERED] = "fault_pause_publish_entered",
++	[KCOV_REQUEST_P6_FAULT_PAUSE_PUBLISH_RELEASED] = "fault_pause_publish_released",
++	[KCOV_REQUEST_P6_DESTINATION_SEED_OVERWRITTEN] = "destination_seed_overwritten",
++	[KCOV_REQUEST_P6_LATE_GENERIC_REMOTE_APPEND] = "late_generic_remote_append",
++	[KCOV_REQUEST_P6_PUBLISH_ABORT_BLOCKED] = "publish_abort_blocked",
++	[KCOV_REQUEST_P6_PUBLISH_BEGIN_BLOCKED] = "publish_begin_blocked",
++	[KCOV_REQUEST_P6_PUBLISH_EXIT_RESET_DEFERRED] =
++		"publish_exit_reset_deferred",
++	[KCOV_REQUEST_P6_PUBLISH_EXIT_RESET_COMPLETED] =
++		"publish_exit_reset_completed",
++	[KCOV_REQUEST_P6_SELFTEST_RUNS] = "selftest_runs",
++	[KCOV_REQUEST_P6_SELFTEST_FAILURES] = "selftest_failures",
++	[KCOV_REQUEST_P6_SELFTEST_EXCLUSIVE_SCRATCH] = "selftest_exclusive_scratch",
++	[KCOV_REQUEST_P6_SELFTEST_OVERFLOW] = "selftest_overflow",
++	[KCOV_REQUEST_P6_SELFTEST_TRUNCATION] = "selftest_truncation",
++	[KCOV_REQUEST_P6_SELFTEST_SERIALIZED_MERGE] = "selftest_serialized_merge",
++	[KCOV_REQUEST_P6_SELFTEST_RESULT_BEFORE_RELEASE] = "selftest_result_before_release",
++	[KCOV_REQUEST_P6_SELFTEST_COMMIT_ELIGIBILITY] = "selftest_commit_eligibility",
++	[KCOV_REQUEST_P6_SELFTEST_PUBLISH_LEASE] = "selftest_publish_lease",
++	[KCOV_REQUEST_P6_SELFTEST_ABORT_DISCARD] = "selftest_abort_discard",
++	[KCOV_REQUEST_P6_SELFTEST_MANAGED_GENERATION_ISOLATION] =
++		"selftest_managed_generation_isolation",
++};
++
+ static const char *const request_phase5_stat_names[] = {
+ 	[KCOV_REQUEST_P5_GRANT_ATTEMPT] = "remote_grant_attempt",
+ 	[KCOV_REQUEST_P5_START_GRANTED] = "remote_start_granted",
+@@ -290,6 +413,41 @@ void kcov_request_phase5_note(enum kcov_request_phase5_stat stat)
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_phase5_note);
+ 
++void kcov_request_phase6_note(enum kcov_request_phase6_stat stat)
++{
++	int in_use, peak;
++
++	if (stat >= KCOV_REQUEST_P6_STAT_COUNT)
++		return;
++	atomic64_inc(&request_phase6_stats[stat]);
++	if (stat == KCOV_REQUEST_P6_REMOTE_SECTION_CREATED)
++		atomic_inc(&request_phase6_live_sections);
++	else if (stat == KCOV_REQUEST_P6_REMOTE_SECTION_COMPLETED ||
++		 stat == KCOV_REQUEST_P6_REMOTE_SECTION_DISCARDED)
++		atomic_dec(&request_phase6_live_sections);
++	else if (stat == KCOV_REQUEST_P6_SCRATCH_RESERVED) {
++		in_use = atomic_inc_return(&request_phase6_live_scratch);
++		do {
++			peak = atomic_read(&request_phase6_scratch_peak);
++			if (peak >= in_use)
++				break;
++		} while (atomic_cmpxchg(&request_phase6_scratch_peak,
++				peak, in_use) != peak);
++	} else if (stat == KCOV_REQUEST_P6_SCRATCH_RETURNED) {
++		if (WARN_ON_ONCE(atomic_dec_return(
++				&request_phase6_live_scratch) < 0))
++			atomic_set(&request_phase6_live_scratch, 0);
++	}
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_note);
++
++void kcov_request_phase6_add(enum kcov_request_phase6_stat stat, u64 value)
++{
++	if (stat < KCOV_REQUEST_P6_STAT_COUNT)
++		atomic64_add(value, &request_phase6_stats[stat]);
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_add);
++
+ void kcov_request_phase5_live_ticket_get(void)
+ {
+ 	atomic_inc(&request_phase5_live_tickets);
+@@ -356,6 +514,7 @@ EXPORT_SYMBOL_GPL(kcov_request_generation_get);
+ 
+ void kcov_request_generation_put(struct kcov_request_generation *gen)
+ {
++	struct request_aggregate_buffer *aggregate_buffer;
+ 	unsigned long flags;
+ 
+ 	if (!gen || !refcount_dec_and_test(&gen->object_refs))
+@@ -366,7 +525,11 @@ void kcov_request_generation_put(struct kcov_request_generation *gen)
+ 	spin_unlock(&gen->lock);
+ 	list_del(&gen->all);
+ 	spin_unlock_irqrestore(&request_generations_lock, flags);
++	aggregate_buffer = gen->aggregate_buffer;
++	gen->aggregate_buffer = NULL;
++	gen->aggregate_area = NULL;
+ 	request_stat_inc(REQUEST_GENERATION_DEAD);
++	request_aggregate_free(aggregate_buffer);
+ 	kfree(gen);
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_generation_put);
+@@ -405,6 +568,8 @@ kcov_request_generation_begin(u64 owner, u64 *generation)
+ 		id = atomic64_inc_return(&request_generation_id);
+ 	} while (unlikely(!id));
+ 	spin_lock_init(&gen->lock);
++	mutex_init(&gen->aggregate_merge_lock);
++	atomic_set(&gen->aggregate_merging, 0);
+ 	refcount_set(&gen->object_refs, 1);
+ 	INIT_LIST_HEAD(&gen->roots);
+ 	INIT_LIST_HEAD(&gen->tokens);
+@@ -413,6 +578,7 @@ kcov_request_generation_begin(u64 owner, u64 *generation)
+ 	gen->id = id;
+ 	gen->state = KCOV_REQUEST_GEN_OPEN;
+ 	gen->remote_result = KCOV_REQUEST_REMOTE_VALID;
++	gen->aggregate_state = KCOV_REQUEST_AGGREGATE_POOL_FREE;
+ 	spin_lock_irqsave(&request_generations_lock, flags);
+ 	list_add_tail(&gen->all, &request_generations);
+ 	spin_unlock_irqrestore(&request_generations_lock, flags);
+@@ -436,6 +602,317 @@ u64 kcov_request_generation_owner(struct kcov_request_generation *gen)
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_generation_owner);
+ 
++static void request_aggregate_quarantine_locked(
++		struct kcov_request_generation *gen)
++{
++	if (gen->aggregate_state == KCOV_REQUEST_AGGREGATE_POOL_FREE ||
++	    gen->aggregate_state == KCOV_REQUEST_AGGREGATE_DISCARDED ||
++	    gen->aggregate_state == KCOV_REQUEST_AGGREGATE_QUARANTINED)
++		return;
++	if (gen->aggregate_state == KCOV_REQUEST_AGGREGATE_PUBLISHING) {
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_AGGREGATE_REUSE_BLOCKED_READER);
++		return;
++	}
++	gen->aggregate_state = KCOV_REQUEST_AGGREGATE_QUARANTINED;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_QUARANTINED);
++	if (!gen->publish_suppressed) {
++		gen->publish_suppressed = true;
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_AGGREGATE_PUBLISH_SUPPRESSED);
++	}
++}
++
++/* Caller must free the returned vmalloc allocation after dropping gen->lock. */
++static struct request_aggregate_buffer *request_aggregate_discard_locked(
++		struct kcov_request_generation *gen)
++{
++	struct request_aggregate_buffer *buffer;
++
++	if (gen->aggregate_state != KCOV_REQUEST_AGGREGATE_QUARANTINED ||
++	    gen->remote_refs || gen->publish_readers)
++		return NULL;
++	gen->aggregate_state = KCOV_REQUEST_AGGREGATE_DISCARDED;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_DISCARDED);
++	buffer = gen->aggregate_buffer;
++	gen->aggregate_buffer = NULL;
++	gen->aggregate_area = NULL;
++	gen->aggregate_size = 0;
++	gen->aggregate_entries = 0;
++	gen->aggregate_state = KCOV_REQUEST_AGGREGATE_POOL_FREE;
++	return buffer;
++}
++
++static void request_aggregate_discard_ready(
++		struct kcov_request_generation *gen)
++{
++	struct request_aggregate_buffer *buffer;
++
++	spin_lock(&gen->lock);
++	buffer = request_aggregate_discard_locked(gen);
++	spin_unlock(&gen->lock);
++	request_aggregate_free(buffer);
++}
++
++int kcov_request_generation_remote_open(struct kcov_request_generation *gen,
++		u32 mode, u32 size)
++{
++	struct request_aggregate_buffer *buffer;
++	int ret = 0;
++
++	if (!gen || (mode != KCOV_MODE_TRACE_PC &&
++		       mode != KCOV_MODE_TRACE_CMP) || size < 2 ||
++	    size > UINT_MAX / sizeof(unsigned long))
++		return -EINVAL;
++	buffer = vzalloc(struct_size(buffer, area, size));
++	if (!buffer)
++		return -ENOMEM;
++	INIT_WORK(&buffer->free_work, request_aggregate_free_work);
++	spin_lock(&gen->lock);
++	if (gen->state != KCOV_REQUEST_GEN_OPEN || gen->aggregate_area ||
++	    gen->aggregate_state != KCOV_REQUEST_AGGREGATE_POOL_FREE) {
++		ret = -ESTALE;
++	} else {
++		gen->aggregate_buffer = buffer;
++		gen->aggregate_area = buffer->area;
++		gen->aggregate_size = size;
++		gen->aggregate_mode = mode;
++		gen->aggregate_entries = 0;
++		gen->aggregate_state = KCOV_REQUEST_AGGREGATE_OPEN;
++		buffer = NULL;
++		kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_ALLOCATED);
++	}
++	spin_unlock(&gen->lock);
++	request_aggregate_free(buffer);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(kcov_request_generation_remote_open);
++
++static u64 request_area_capacity(u32 size, u32 mode)
++{
++	u64 bytes = (u64)size * sizeof(unsigned long);
++
++	if (mode == KCOV_MODE_TRACE_PC)
++		return size > 0 ? size - 1 : 0;
++	if (mode == KCOV_MODE_TRACE_CMP && bytes >= sizeof(u64))
++		return (bytes - sizeof(u64)) /
++			(sizeof(u64) * REQUEST_KCOV_WORDS_PER_CMP);
++	return 0;
++}
++
++static u64 request_area_entries(const void *area, u32 mode)
++{
++	return mode == KCOV_MODE_TRACE_PC ?
++		READ_ONCE(*(unsigned long *)area) : READ_ONCE(*(u64 *)area);
++}
++
++static void request_area_set_entries(void *area, u32 mode, u64 entries)
++{
++	if (mode == KCOV_MODE_TRACE_PC)
++		WRITE_ONCE(*(unsigned long *)area, entries);
++	else
++		WRITE_ONCE(*(u64 *)area, entries);
++}
++
++static bool request_phase6_fault_matches(enum request_phase6_fault fault,
++		struct kcov_request_generation *gen, unsigned int *limit)
++{
++	bool match;
++
++	spin_lock(&request_phase6_fault_lock);
++	match = request_phase6_fault == fault && gen &&
++		request_phase6_fault_owner == gen->owner &&
++		request_phase6_fault_generation == gen->id;
++	if (match && limit)
++		*limit = request_phase6_fault_limit;
++	spin_unlock(&request_phase6_fault_lock);
++	return match;
++}
++
++int kcov_request_generation_merge_scratch(
++		struct kcov_request_generation *gen, const void *scratch,
++		u32 scratch_size, u32 mode, bool overflow,
++		struct kcov_request_merge_result *result)
++{
++	u64 src_entries, src_capacity, dst_entries, dst_capacity;
++	u64 entry_size, count_size, entries;
++	void *aggregate;
++	unsigned int aggregate_size;
++	unsigned int fault_limit;
++	bool copied = false;
++	int ret = 0;
++
++	if (!gen || !scratch || !result)
++		return -EINVAL;
++	memset(result, 0, sizeof(*result));
++	src_capacity = request_area_capacity(scratch_size, mode);
++	if (!src_capacity)
++		return -EINVAL;
++	src_entries = request_area_entries(scratch, mode);
++	if (src_entries > src_capacity) {
++		src_entries = src_capacity;
++		overflow = true;
++	}
++	result->source_entries = src_entries;
++	kcov_request_phase6_add(KCOV_REQUEST_P6_SCRATCH_TRACE_ENTRIES,
++			src_entries);
++	if (overflow) {
++		kcov_request_phase6_note(KCOV_REQUEST_P6_SCRATCH_OVERFLOW);
++		kcov_request_remote_degrade(gen,
++			KCOV_REQUEST_REMOTE_INCOMPLETE,
++			KCOV_REQUEST_REMOTE_ISSUE_SCRATCH_OVERFLOW);
++	}
++
++	mutex_lock(&gen->aggregate_merge_lock);
++	if (atomic_xchg(&gen->aggregate_merging, 1))
++		kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_MERGE_OVERLAP);
++	spin_lock(&gen->lock);
++	if (!gen->remote_refs) {
++		kcov_request_phase6_note(KCOV_REQUEST_P6_LATE_MERGE_AFTER_REFS_ZERO);
++		ret = -ESTALE;
++		goto unlock_state;
++	}
++	if (gen->remote_result != KCOV_REQUEST_REMOTE_VALID ||
++	    gen->state == KCOV_REQUEST_GEN_ABORTED ||
++	    (gen->aggregate_state != KCOV_REQUEST_AGGREGATE_OPEN &&
++	     gen->aggregate_state != KCOV_REQUEST_AGGREGATE_CLOSING)) {
++		ret = -ECANCELED;
++		goto unlock_state;
++	}
++	if (gen->aggregate_mode != mode || !gen->aggregate_area) {
++		ret = -EINVAL;
++		goto unlock_state;
++	}
++	aggregate = gen->aggregate_area;
++	aggregate_size = gen->aggregate_size;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_MERGE_STARTED);
++	spin_unlock(&gen->lock);
++
++	dst_capacity = request_area_capacity(aggregate_size, mode);
++	if (request_phase6_fault_matches(REQUEST_P6_FAULT_AGGREGATE_LIMIT,
++			gen, &fault_limit)) {
++		dst_capacity = min_t(u64, dst_capacity, fault_limit);
++		kcov_request_phase6_note(KCOV_REQUEST_P6_FAULT_AGGREGATE_LIMIT);
++	}
++	dst_entries = request_area_entries(aggregate, mode);
++	if (dst_entries > dst_capacity)
++		dst_entries = dst_capacity;
++	entries = min(src_entries, dst_capacity - dst_entries);
++	count_size = mode == KCOV_MODE_TRACE_PC ? sizeof(unsigned long) :
++			sizeof(u64);
++	entry_size = mode == KCOV_MODE_TRACE_PC ? sizeof(unsigned long) :
++			sizeof(u64) * REQUEST_KCOV_WORDS_PER_CMP;
++	memcpy(aggregate + count_size + dst_entries * entry_size,
++	       scratch + count_size, entries * entry_size);
++	smp_wmb();
++	request_area_set_entries(aggregate, mode, dst_entries + entries);
++	copied = true;
++	result->merged_entries = entries;
++	result->truncated = entries < src_entries;
++
++	spin_lock(&gen->lock);
++	if (gen->remote_result == KCOV_REQUEST_REMOTE_VALID &&
++	    gen->state != KCOV_REQUEST_GEN_ABORTED &&
++	    (gen->aggregate_state == KCOV_REQUEST_AGGREGATE_OPEN ||
++	     gen->aggregate_state == KCOV_REQUEST_AGGREGATE_CLOSING)) {
++		gen->aggregate_entries = dst_entries + entries;
++	}
++unlock_state:
++	spin_unlock(&gen->lock);
++	atomic_set(&gen->aggregate_merging, 0);
++	mutex_unlock(&gen->aggregate_merge_lock);
++
++	if (result->truncated) {
++		kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_MERGE_TRUNCATED);
++		kcov_request_remote_degrade(gen,
++			KCOV_REQUEST_REMOTE_INCOMPLETE,
++			KCOV_REQUEST_REMOTE_ISSUE_MERGE_TRUNCATED);
++	}
++	if (copied) {
++		kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_MERGE_COMPLETED);
++		kcov_request_phase6_add(KCOV_REQUEST_P6_AGGREGATE_ENTRIES_MERGED,
++				entries);
++	}
++	if (ret && ret != -ECANCELED)
++		kcov_request_remote_degrade(gen,
++			ret == -ESTALE ? KCOV_REQUEST_REMOTE_INVALID :
++				KCOV_REQUEST_REMOTE_INCOMPLETE,
++			KCOV_REQUEST_REMOTE_ISSUE_MERGE_FAILED);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(kcov_request_generation_merge_scratch);
++
++int kcov_request_generation_publish_begin(
++		struct kcov_request_generation *gen,
++		struct kcov_request_publish_lease *lease)
++{
++	int ret = 0;
++
++	if (!gen || !lease)
++		return -EINVAL;
++	memset(lease, 0, sizeof(*lease));
++	spin_lock(&gen->lock);
++	if (gen->state == KCOV_REQUEST_GEN_ABORTED) {
++		ret = -ENODATA;
++	} else if (gen->remote_result != KCOV_REQUEST_REMOTE_VALID) {
++		ret = -ENODATA;
++	} else if (gen->state != KCOV_REQUEST_GEN_COMMITTED ||
++		   gen->aggregate_state != KCOV_REQUEST_AGGREGATE_COMMITTED ||
++		   gen->outstanding_tokens || gen->remote_refs) {
++		ret = -ESTALE;
++	} else {
++		gen->aggregate_state = KCOV_REQUEST_AGGREGATE_PUBLISHING;
++		gen->publish_readers++;
++		refcount_inc(&gen->object_refs);
++		lease->generation = gen;
++		lease->area = gen->aggregate_area;
++		lease->size = gen->aggregate_size;
++		lease->mode = gen->aggregate_mode;
++		lease->held = true;
++		kcov_request_phase6_note(KCOV_REQUEST_P6_AGGREGATE_PUBLISHING);
++		kcov_request_phase6_note(KCOV_REQUEST_P6_PUBLISHER_READ_LEASE_GET);
++	}
++	if (ret && !gen->publish_suppressed) {
++		gen->publish_suppressed = true;
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_AGGREGATE_PUBLISH_SUPPRESSED);
++	}
++	spin_unlock(&gen->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(kcov_request_generation_publish_begin);
++
++void kcov_request_generation_publish_end(
++		struct kcov_request_publish_lease *lease)
++{
++	struct kcov_request_generation *gen;
++	struct request_aggregate_buffer *buffer = NULL;
++
++	if (!lease || !lease->held || !(gen = lease->generation))
++		return;
++	spin_lock(&gen->lock);
++	if (WARN_ON_ONCE(!gen->publish_readers)) {
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_AGGREGATE_REUSE_WHILE_READER);
++	} else {
++		gen->publish_readers--;
++		kcov_request_phase6_note(KCOV_REQUEST_P6_PUBLISHER_READ_LEASE_PUT);
++		if (!gen->publish_readers &&
++		    gen->aggregate_state == KCOV_REQUEST_AGGREGATE_PUBLISHING) {
++			buffer = gen->aggregate_buffer;
++			gen->aggregate_buffer = NULL;
++			gen->aggregate_area = NULL;
++			gen->aggregate_size = 0;
++			gen->aggregate_state = KCOV_REQUEST_AGGREGATE_POOL_FREE;
++		}
++	}
++	spin_unlock(&gen->lock);
++	lease->held = false;
++	request_aggregate_free(buffer);
++	kcov_request_generation_put(gen);
++}
++EXPORT_SYMBOL_GPL(kcov_request_generation_publish_end);
++
+ bool kcov_request_generation_is_terminal(struct kcov_request_generation *gen)
+ {
+ 	bool terminal;
+@@ -451,6 +928,19 @@ bool kcov_request_generation_is_terminal(struct kcov_request_generation *gen)
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_generation_is_terminal);
+ 
++bool kcov_request_generation_is_aborted(struct kcov_request_generation *gen)
++{
++	bool aborted;
++
++	if (!gen)
++		return true;
++	spin_lock(&gen->lock);
++	aborted = gen->state == KCOV_REQUEST_GEN_ABORTED;
++	spin_unlock(&gen->lock);
++	return aborted;
++}
++EXPORT_SYMBOL_GPL(kcov_request_generation_is_aborted);
++
+ static bool request_generation_drained(struct kcov_request_generation *gen)
+ {
+ 	bool drained;
+@@ -552,6 +1042,7 @@ static void request_abort_locked(struct kcov_request_generation *gen)
+ 	if (gen->state == KCOV_REQUEST_GEN_ABORTED)
+ 		return;
+ 	gen->state = KCOV_REQUEST_GEN_ABORTED;
++	request_aggregate_quarantine_locked(gen);
+ 	request_stat_inc(REQUEST_GENERATION_ABORTED);
+ 	list_for_each_entry(root, &gen->roots, node)
+ 		root->state = KCOV_REQUEST_ROOT_CANCELED;
+@@ -571,6 +1062,7 @@ int kcov_request_generation_abort(struct kcov_request_generation *gen)
+ 	}
+ 	request_abort_locked(gen);
+ 	spin_unlock(&gen->lock);
++	request_aggregate_discard_ready(gen);
+ 	wake_up_all(&gen->drain_wait);
+ 	return 0;
+ }
+@@ -589,6 +1081,8 @@ int kcov_request_generation_finish(struct kcov_request_generation *gen,
+ 		struct kcov_request_root *root;
+ 
+ 		gen->state = KCOV_REQUEST_GEN_CLOSING;
++		if (gen->aggregate_state == KCOV_REQUEST_AGGREGATE_OPEN)
++			gen->aggregate_state = KCOV_REQUEST_AGGREGATE_CLOSING;
+ 		list_for_each_entry(root, &gen->roots, node)
+ 			root->retry_deadline = jiffies +
+ 				msecs_to_jiffies(timeout_ms);
+@@ -611,6 +1105,24 @@ int kcov_request_generation_finish(struct kcov_request_generation *gen,
+ 	    !gen->outstanding_tokens && !gen->active_roots &&
+ 	    !gen->remote_refs) {
+ 		gen->state = KCOV_REQUEST_GEN_COMMITTED;
++		if (gen->remote_result == KCOV_REQUEST_REMOTE_VALID &&
++		    gen->aggregate_state == KCOV_REQUEST_AGGREGATE_CLOSING) {
++			gen->aggregate_state = KCOV_REQUEST_AGGREGATE_COMMITTED;
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_AGGREGATE_COMMITTED);
++		} else {
++			if (gen->outstanding_tokens)
++				kcov_request_phase6_note(
++					KCOV_REQUEST_P6_COMMIT_WITH_TOKENS);
++			if (gen->remote_refs)
++				kcov_request_phase6_note(
++					KCOV_REQUEST_P6_COMMIT_WITH_REFS);
++			if (gen->remote_result != KCOV_REQUEST_REMOTE_VALID)
++				request_aggregate_quarantine_locked(gen);
++			else
++				kcov_request_phase6_note(
++					KCOV_REQUEST_P6_COMMIT_BAD_STATE);
++		}
+ 		request_stat_inc(REQUEST_GENERATION_COMMITTED);
+ 	} else if (left <= 0) {
+ 		request_abort_locked(gen);
+@@ -619,6 +1131,7 @@ int kcov_request_generation_finish(struct kcov_request_generation *gen,
+ 		ret = -ESTALE;
+ 	}
+ 	spin_unlock(&gen->lock);
++	request_aggregate_discard_ready(gen);
+ 	wake_up_all(&gen->drain_wait);
+ 	return ret;
+ }
+@@ -714,7 +1227,10 @@ struct kcov_request_generation *kcov_request_remote_admit(
+ 	spin_lock(&gen->lock);
+ 	if (gen->owner != owner.val || gen->id != owner.generation ||
+ 	    (gen->state != KCOV_REQUEST_GEN_OPEN &&
+-	     gen->state != KCOV_REQUEST_GEN_CLOSING)) {
++	     gen->state != KCOV_REQUEST_GEN_CLOSING) ||
++	    !gen->aggregate_area ||
++	    (gen->aggregate_state != KCOV_REQUEST_AGGREGATE_OPEN &&
++	     gen->aggregate_state != KCOV_REQUEST_AGGREGATE_CLOSING)) {
+ 		kcov_request_phase5_note(
+ 			KCOV_REQUEST_P5_GRANT_REJECTED_GENERATION);
+ 		goto stale;
+@@ -749,6 +1265,7 @@ EXPORT_SYMBOL_GPL(kcov_request_remote_admit);
+ void kcov_request_remote_ref_put(struct kcov_request_generation *gen)
+ {
+ 	bool held = false, wake = false;
++	struct request_aggregate_buffer *discard = NULL;
+ 
+ 	if (!gen)
+ 		return;
+@@ -760,6 +1277,8 @@ void kcov_request_remote_ref_put(struct kcov_request_generation *gen)
+ 		gen->remote_refs--;
+ 		held = true;
+ 		wake = gen->remote_refs == 0;
++		if (wake)
++			discard = request_aggregate_discard_locked(gen);
+ 	}
+ 	spin_unlock(&gen->lock);
+ 	if (!held)
+@@ -767,6 +1286,7 @@ void kcov_request_remote_ref_put(struct kcov_request_generation *gen)
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_REMOTE_REF_PUT);
+ 	if (wake)
+ 		wake_up_all(&gen->drain_wait);
++	request_aggregate_free(discard);
+ 	kcov_request_generation_put(gen);
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_remote_ref_put);
+@@ -775,6 +1295,7 @@ void kcov_request_remote_degrade(struct kcov_request_generation *gen,
+ 		enum kcov_request_remote_result result, unsigned int issue)
+ {
+ 	bool changed = false;
++	struct request_aggregate_buffer *discard;
+ 
+ 	if (!gen)
+ 		return;
+@@ -783,8 +1304,18 @@ void kcov_request_remote_degrade(struct kcov_request_generation *gen,
+ 		gen->remote_result = result;
+ 		changed = true;
+ 	}
++	if (changed && issue != KCOV_REQUEST_REMOTE_ISSUE_START_FAILED &&
++	    !gen->remote_refs &&
++	    (gen->state == KCOV_REQUEST_GEN_OPEN ||
++	     gen->state == KCOV_REQUEST_GEN_CLOSING))
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_RESULT_DEGRADE_AFTER_REF_RELEASE);
+ 	gen->remote_issues |= issue;
++	if (gen->remote_result != KCOV_REQUEST_REMOTE_VALID)
++		request_aggregate_quarantine_locked(gen);
++	discard = request_aggregate_discard_locked(gen);
+ 	spin_unlock(&gen->lock);
++	request_aggregate_free(discard);
+ 	if (!changed)
+ 		return;
+ 	if (result == KCOV_REQUEST_REMOTE_INCOMPLETE)
+@@ -981,6 +1512,140 @@ void kcov_request_phase5_note_active_nested(
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_phase5_note_active_nested);
+ 
++bool kcov_request_phase6_before_start(struct kcov_request_generation *gen)
++{
++	bool hold = false;
++
++	if (!gen)
++		return false;
++	spin_lock(&request_phase6_fault_lock);
++	if (request_phase6_fault == REQUEST_P6_FAULT_HOLD_AFTER_GRANT &&
++	    request_phase6_fault_owner == gen->owner &&
++	    request_phase6_fault_generation == gen->id &&
++	    request_phase6_fault_count) {
++		request_phase6_fault_count--;
++		hold = true;
++	}
++	spin_unlock(&request_phase6_fault_lock);
++	if (!hold)
++		return true;
++	kcov_request_phase6_note(
++		KCOV_REQUEST_P6_FAULT_HOLD_AFTER_GRANT_ENTERED);
++	wait_event_timeout(request_phase6_fault_wait,
++		READ_ONCE(request_phase6_fault_released),
++		msecs_to_jiffies(5000));
++	kcov_request_phase6_note(
++		KCOV_REQUEST_P6_FAULT_HOLD_AFTER_GRANT_RELEASED);
++	return true;
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_before_start);
++
++void kcov_request_phase6_after_start(struct kcov_request_generation *gen)
++{
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_after_start);
++
++void kcov_request_phase6_apply_scratch_fault(
++		struct kcov_request_generation *gen, void *scratch,
++		u32 scratch_size, u32 mode, bool *overflow)
++{
++	unsigned int limit;
++	u64 entries;
++
++	if (!gen || !scratch || !overflow ||
++	    !request_phase6_fault_matches(REQUEST_P6_FAULT_SCRATCH_LIMIT,
++			gen, &limit))
++		return;
++	entries = min_t(u64, request_area_entries(scratch, mode),
++			request_area_capacity(scratch_size, mode));
++	if (entries > limit)
++		request_area_set_entries(scratch, mode, limit);
++	*overflow = true;
++	kcov_request_phase6_note(KCOV_REQUEST_P6_FAULT_SCRATCH_LIMIT);
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_apply_scratch_fault);
++
++bool kcov_request_phase6_pause_publish(struct kcov_request_generation *gen)
++{
++	if (!request_phase6_fault_matches(REQUEST_P6_FAULT_PAUSE_PUBLISH,
++			gen, NULL))
++		return false;
++	kcov_request_phase6_note(
++		KCOV_REQUEST_P6_FAULT_PAUSE_PUBLISH_ENTERED);
++	wait_event_timeout(request_phase6_fault_wait,
++		READ_ONCE(request_phase6_fault_released),
++		msecs_to_jiffies(5000));
++	kcov_request_phase6_note(
++		KCOV_REQUEST_P6_FAULT_PAUSE_PUBLISH_RELEASED);
++	return true;
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_pause_publish);
++
++bool kcov_request_phase6_validate_scratch(
++		struct kcov_request_generation *gen, const void *scratch)
++{
++	bool valid;
++
++	if (!gen || !scratch)
++		return false;
++	spin_lock(&gen->lock);
++	valid = scratch != gen->aggregate_area;
++	spin_unlock(&gen->lock);
++	if (!valid)
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_AGGREGATE_DIRECT_TRACE_WRITE);
++	return valid;
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_validate_scratch);
++
++void kcov_request_phase6_assert_copy_unlocked(
++		struct kcov_request_generation *gen)
++{
++#ifdef CONFIG_LOCKDEP
++	if (lockdep_is_held(&gen->lock)) {
++		kcov_request_phase6_note(
++			KCOV_REQUEST_P6_PUBLISH_COPY_UNDER_GEN_LOCK);
++		return;
++	}
++#endif
++	lockdep_assert_not_held(&gen->lock);
++	kcov_request_phase6_note(KCOV_REQUEST_P6_PUBLISH_COPY_OUTSIDE_LOCK);
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_assert_copy_unlocked);
++
++bool kcov_request_phase6_publish_valid(struct kcov_request_generation *gen)
++{
++	bool valid;
++
++	if (!gen)
++		return false;
++	spin_lock(&gen->lock);
++	valid = gen->state == KCOV_REQUEST_GEN_COMMITTED &&
++		gen->remote_result == KCOV_REQUEST_REMOTE_VALID &&
++		gen->aggregate_state == KCOV_REQUEST_AGGREGATE_PUBLISHING &&
++		!gen->outstanding_tokens && !gen->remote_refs &&
++		gen->publish_readers;
++	if (!valid) {
++		if (gen->state == KCOV_REQUEST_GEN_ABORTED)
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_ABORTED_PUBLISHED);
++		if (gen->remote_result == KCOV_REQUEST_REMOTE_INCOMPLETE)
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_INCOMPLETE_PUBLISHED);
++		else if (gen->remote_result == KCOV_REQUEST_REMOTE_INVALID)
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_INVALID_PUBLISHED);
++		if (gen->remote_result != KCOV_REQUEST_REMOTE_VALID &&
++		    (gen->aggregate_state == KCOV_REQUEST_AGGREGATE_COMMITTED ||
++		     gen->aggregate_state == KCOV_REQUEST_AGGREGATE_PUBLISHING))
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_COMMIT_NONVALID);
++	}
++	spin_unlock(&gen->lock);
++	return valid;
++}
++EXPORT_SYMBOL_GPL(kcov_request_phase6_publish_valid);
++
+ static enum request_fault request_take_fault(u64 owner, u64 generation)
+ {
+ 	enum request_fault fault = REQUEST_FAULT_NONE;
+@@ -1045,6 +1710,8 @@ bool kcov_request_try_get_child_token(struct kcov_request_root *root,
+ 		struct kcov_request_root *iter;
+ 
+ 		gen->state = KCOV_REQUEST_GEN_CLOSING;
++		if (gen->aggregate_state == KCOV_REQUEST_AGGREGATE_OPEN)
++			gen->aggregate_state = KCOV_REQUEST_AGGREGATE_CLOSING;
+ 		list_for_each_entry(iter, &gen->roots, node)
+ 			iter->retry_deadline = jiffies + msecs_to_jiffies(5000);
+ 		request_stat_inc(REQUEST_GENERATION_CLOSING);
+@@ -1823,6 +2490,184 @@ static const struct file_operations request_phase5_control_fops = {
+ 	.llseek = noop_llseek,
+ };
+ 
++static const char *request_aggregate_state_name(
++		enum kcov_request_aggregate_state state)
++{
++	switch (state) {
++	case KCOV_REQUEST_AGGREGATE_POOL_FREE: return "POOL_FREE";
++	case KCOV_REQUEST_AGGREGATE_OPEN: return "OPEN";
++	case KCOV_REQUEST_AGGREGATE_CLOSING: return "CLOSING";
++	case KCOV_REQUEST_AGGREGATE_COMMITTED: return "COMMITTED";
++	case KCOV_REQUEST_AGGREGATE_PUBLISHING: return "PUBLISHING";
++	case KCOV_REQUEST_AGGREGATE_QUARANTINED: return "QUARANTINED";
++	case KCOV_REQUEST_AGGREGATE_DISCARDED: return "DISCARDED";
++	}
++	return "UNKNOWN";
++}
++
++static int request_phase6_stats_show(struct seq_file *m, void *v)
++{
++	struct kcov_request_generation *gen;
++	unsigned long flags;
++	unsigned int remote_refs = 0, publish_readers = 0;
++	unsigned int i;
++
++	for (i = 0; i < KCOV_REQUEST_P6_STAT_COUNT; i++)
++		seq_printf(m, "%s %lld\n", request_phase6_stat_names[i],
++			   atomic64_read(&request_phase6_stats[i]));
++	spin_lock_irqsave(&request_generations_lock, flags);
++	list_for_each_entry(gen, &request_generations, all) {
++		spin_lock(&gen->lock);
++		remote_refs += gen->remote_refs;
++		publish_readers += gen->publish_readers;
++		spin_unlock(&gen->lock);
++	}
++	spin_unlock_irqrestore(&request_generations_lock, flags);
++	seq_printf(m, "remote_refs %u\n", remote_refs);
++	seq_printf(m, "scratch_in_use %d\n",
++		   atomic_read(&request_phase6_live_scratch));
++	seq_printf(m, "scratch_peak %d\n",
++		   atomic_read(&request_phase6_scratch_peak));
++	seq_printf(m, "publish_readers %u\n", publish_readers);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(request_phase6_stats);
++
++static int request_phase6_state_show(struct seq_file *m, void *v)
++{
++	struct kcov_request_generation *gen;
++	unsigned long flags;
++	unsigned int remote_refs = 0, publish_readers = 0;
++
++	spin_lock_irqsave(&request_generations_lock, flags);
++	list_for_each_entry(gen, &request_generations, all) {
++		spin_lock(&gen->lock);
++		remote_refs += gen->remote_refs;
++		publish_readers += gen->publish_readers;
++		seq_printf(m,
++			"owner %llu generation %llu gen_state %s remote_result %s aggregate_state %s entries %u remote_refs %u publish_readers %u\n",
++			gen->owner, gen->id, request_state_name(gen->state),
++			request_remote_result_name(gen->remote_result),
++			request_aggregate_state_name(gen->aggregate_state),
++			gen->aggregate_entries, gen->remote_refs,
++			gen->publish_readers);
++		spin_unlock(&gen->lock);
++	}
++	spin_unlock_irqrestore(&request_generations_lock, flags);
++	seq_printf(m,
++		"live_scratch %d live_sections %d remote_refs %u publish_readers %u\n",
++		atomic_read(&request_phase6_live_scratch),
++		atomic_read(&request_phase6_live_sections), remote_refs,
++		publish_readers);
++	seq_printf(m, "pool scratch_in_use %d scratch_peak %d\n",
++		atomic_read(&request_phase6_live_scratch),
++		atomic_read(&request_phase6_scratch_peak));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(request_phase6_state);
++
++static void request_phase6_reset(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < KCOV_REQUEST_P6_STAT_COUNT; i++)
++		atomic64_set(&request_phase6_stats[i], 0);
++	atomic_set(&request_phase6_scratch_peak,
++		   atomic_read(&request_phase6_live_scratch));
++	spin_lock(&request_phase6_fault_lock);
++	request_phase6_fault = REQUEST_P6_FAULT_NONE;
++	request_phase6_fault_owner = 0;
++	request_phase6_fault_generation = 0;
++	request_phase6_fault_limit = 0;
++	request_phase6_fault_count = 0;
++	WRITE_ONCE(request_phase6_fault_released, true);
++	spin_unlock(&request_phase6_fault_lock);
++	wake_up_all(&request_phase6_fault_wait);
++}
++
++static ssize_t request_phase6_control_write(struct file *file,
++		const char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct kcov_request_generation *gen;
++	char command[160];
++	u64 owner = 0, generation = 0;
++	unsigned int value = 0;
++	enum request_phase6_fault fault = REQUEST_P6_FAULT_NONE;
++	size_t len = min(count, sizeof(command) - 1);
++	bool blocked = false;
++
++	if (!count || copy_from_user(command, ubuf, len))
++		return count ? -EFAULT : -EINVAL;
++	command[len] = '\0';
++	if (sysfs_streq(command, "reset")) {
++		request_phase6_reset();
++		return count;
++	}
++	if (sysfs_streq(command, "selftest")) {
++		kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_RUNS);
++		if (!kcov_request_phase6_selftest()) {
++			kcov_request_phase6_note(KCOV_REQUEST_P6_SELFTEST_FAILURES);
++			return -EIO;
++		}
++		return count;
++	}
++	if (sysfs_streq(command, "fault-release hold-after-grant") ||
++	    sysfs_streq(command, "fault-release pause-publish")) {
++		WRITE_ONCE(request_phase6_fault_released, true);
++		wake_up_all(&request_phase6_fault_wait);
++		return count;
++	}
++	if (sscanf(command, "probe-reuse %llu %llu", &owner,
++		   &generation) == 2) {
++		gen = request_generation_lookup(owner, generation);
++		if (!gen)
++			return -ESTALE;
++		spin_lock(&gen->lock);
++		if (gen->publish_readers) {
++			blocked = true;
++			kcov_request_phase6_note(
++				KCOV_REQUEST_P6_AGGREGATE_REUSE_BLOCKED_READER);
++		}
++		spin_unlock(&gen->lock);
++		kcov_request_generation_put(gen);
++		return blocked ? count : -EAGAIN;
++	}
++	if (sscanf(command,
++		   "fault-arm hold-after-grant %llu %llu %u",
++		   &owner, &generation, &value) == 3)
++		fault = REQUEST_P6_FAULT_HOLD_AFTER_GRANT;
++	else if (sscanf(command, "fault-arm scratch-limit %llu %llu %u",
++			&owner, &generation, &value) == 3)
++		fault = REQUEST_P6_FAULT_SCRATCH_LIMIT;
++	else if (sscanf(command,
++			"fault-arm aggregate-limit %llu %llu %u",
++			&owner, &generation, &value) == 3)
++		fault = REQUEST_P6_FAULT_AGGREGATE_LIMIT;
++	else if (sscanf(command, "fault-arm pause-publish %llu %llu",
++			&owner, &generation) == 2)
++		fault = REQUEST_P6_FAULT_PAUSE_PUBLISH;
++	else
++		return -EINVAL;
++	if (!owner || !generation ||
++	    (fault == REQUEST_P6_FAULT_HOLD_AFTER_GRANT && !value))
++		return -EINVAL;
++	spin_lock(&request_phase6_fault_lock);
++	request_phase6_fault = fault;
++	request_phase6_fault_owner = owner;
++	request_phase6_fault_generation = generation;
++	request_phase6_fault_limit = value;
++	request_phase6_fault_count = value;
++	WRITE_ONCE(request_phase6_fault_released, false);
++	spin_unlock(&request_phase6_fault_lock);
++	return count;
++}
++
++static const struct file_operations request_phase6_control_fops = {
++	.owner = THIS_MODULE,
++	.write = request_phase6_control_write,
++	.llseek = noop_llseek,
++};
++
+ void kcov_request_debugfs_init(struct dentry *root)
+ {
+ 	if (!root)
+@@ -1837,6 +2682,12 @@ void kcov_request_debugfs_init(struct dentry *root)
+ 			&request_phase5_stats_fops);
+ 	debugfs_create_file("phase5_control", 0200, root, NULL,
+ 			&request_phase5_control_fops);
++	debugfs_create_file("phase6_stats", 0400, root, NULL,
++			&request_phase6_stats_fops);
++	debugfs_create_file("phase6_state", 0400, root, NULL,
++			&request_phase6_state_fops);
++	debugfs_create_file("phase6_control", 0200, root, NULL,
++			&request_phase6_control_fops);
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_debugfs_init);
+ 
+-- 
+2.34.1
+

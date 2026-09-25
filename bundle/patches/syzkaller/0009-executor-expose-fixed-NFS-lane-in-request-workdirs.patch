@@ -1,0 +1,33 @@
+From 52d6002613575b4c09acb65f022adb1b86267a29 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 11:06:20 +0900
+Subject: [PATCH 09/15] executor: expose fixed NFS lane in request workdirs
+
+
+diff --git a/executor/common.h b/executor/common.h
+index 31a469df5..8d9b62866 100644
+--- a/executor/common.h
++++ b/executor/common.h
+@@ -628,6 +628,19 @@ static void loop(void)
+ 		sprintf(cwdbuf, "./%d", iter);
+ 		if (mkdir(cwdbuf, 0777))
+ 			fail("failed to mkdir");
++#if SYZ_EXECUTOR && GOOS_linux
++		// setup_nfs_fuzz_lane() binds only this proc's immutable lane into
++		// /nfs-lane.  Test programs run from a fresh per-request workdir, so
++		// provide a stable sandbox-safe relative path without exposing the
++		// fixture's /syz-nfs-lanes source tree inside the chroot.
++		if (!access("/nfs-lane/.lane_id", F_OK)) {
++			char lane_link[64];
++			if (snprintf(lane_link, sizeof(lane_link), "%s/nfs-lane", cwdbuf) >= (int)sizeof(lane_link))
++				fail("NFS fuzz lane workdir path is too long");
++			if (symlink("/nfs-lane", lane_link))
++				fail("failed to link NFS fuzz lane into workdir");
++		}
++#endif
+ #endif
+ #if SYZ_HAVE_RESET_LOOP
+ 		reset_loop();
+-- 
+2.34.1
+

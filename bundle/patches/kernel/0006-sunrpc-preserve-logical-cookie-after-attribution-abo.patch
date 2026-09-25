@@ -1,0 +1,144 @@
+From 4bab3cf27070b2d179ab8095a3eb078c741d0e52 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Wed, 16 Sep 2026 22:13:59 +0900
+Subject: [PATCH 06/11] sunrpc: preserve logical cookie after attribution abort
+
+
+diff --git a/net/sunrpc/fuzz.c b/net/sunrpc/fuzz.c
+index a6aad1a37..bf1fe4c2b 100644
+--- a/net/sunrpc/fuzz.c
++++ b/net/sunrpc/fuzz.c
+@@ -41,6 +41,7 @@ enum sunrpc_fuzz_stat {
+ 	SUNRPC_FUZZ_STAT_SELFTEST_BACKCHANNEL_REUSE_CLEAN,
+ 	SUNRPC_FUZZ_STAT_SELFTEST_ORIGIN_LATTICE,
+ 	SUNRPC_FUZZ_STAT_SELFTEST_BACKGROUND_OWNER_NONE,
++	SUNRPC_FUZZ_STAT_SELFTEST_ABORT_COOKIE_OWNER_DEMOTED,
+ 	SUNRPC_FUZZ_STAT_COUNT,
+ };
+ 
+@@ -72,6 +73,8 @@ static const char *const sunrpc_fuzz_stat_names[SUNRPC_FUZZ_STAT_COUNT] = {
+ 		"selftest_origin_lattice",
+ 	[SUNRPC_FUZZ_STAT_SELFTEST_BACKGROUND_OWNER_NONE] =
+ 		"selftest_background_owner_none",
++	[SUNRPC_FUZZ_STAT_SELFTEST_ABORT_COOKIE_OWNER_DEMOTED] =
++		"selftest_abort_cookie_owner_demoted",
+ };
+ 
+ static atomic64_t sunrpc_fuzz_stats[SUNRPC_FUZZ_STAT_COUNT];
+@@ -311,13 +314,21 @@ void sunrpc_fuzz_rqst_bind(struct sunrpc_fuzz_rqst *rqst,
+ 		memset(rqst, 0, sizeof(*rqst));
+ 	}
+ 
+-	/* ABORT leaves rpc_task alive, but all later slots are ownerless. */
+-	if (logical->active &&
+-	    kcov_request_root_attributable(&logical->root)) {
++	/*
++	 * ABORT ends attribution, not the logical rpc_task identity.  Preserve
++	 * the kernel cookie and root anchor across later request-slot/XID reuse,
++	 * but fail closed by carrying no authoritative owner.
++	 */
++	if (logical->active) {
+ 		rqst->request_cookie = logical->request_cookie;
+-		rqst->owner = logical->owner;
+-		rqst->origin_state = logical->origin_state;
+ 		rqst->root = &logical->root;
++		if (kcov_request_root_attributable(&logical->root)) {
++			rqst->owner = logical->owner;
++			rqst->origin_state = logical->origin_state;
++		} else {
++			rqst->owner = sunrpc_fuzz_owner_none();
++			rqst->origin_state = SUNRPC_FUZZ_ORIGIN_UNATTRIBUTED;
++		}
+ 	}
+ 	sunrpc_fuzz_stat_inc(SUNRPC_FUZZ_STAT_RQST_INITIALIZED);
+ }
+@@ -331,6 +342,45 @@ void sunrpc_fuzz_rqst_reset(struct sunrpc_fuzz_rqst *rqst,
+ 		sunrpc_fuzz_stat_inc(SUNRPC_FUZZ_STAT_BACKCHANNEL_RESET);
+ }
+ 
++#ifdef CONFIG_KCOV
++static bool sunrpc_fuzz_selftest_abort_cookie_demotion(u64 owner_val)
++{
++	struct sunrpc_fuzz_origin origin = {
++		.state = SUNRPC_FUZZ_ORIGIN_UNIQUE,
++		.owner = { .val = owner_val },
++	};
++	struct sunrpc_fuzz_logical_rpc logical;
++	struct sunrpc_fuzz_rqst rqst = {};
++	struct kcov_request_generation *generation;
++	u64 generation_id, cookie;
++	bool pass = false;
++
++	generation = kcov_request_generation_begin(owner_val, &generation_id);
++	if (IS_ERR(generation))
++		return false;
++	origin.owner.generation = generation_id;
++	sunrpc_fuzz_logical_init(&logical, &origin);
++	if (!logical.active || !logical.request_cookie)
++		goto out_generation;
++	cookie = logical.request_cookie;
++	if (kcov_request_generation_abort(generation))
++		goto out_logical;
++
++	/* A fresh rpc_rqst after ABORT keeps identity but has no authority. */
++	sunrpc_fuzz_rqst_bind(&rqst, &logical);
++	pass = rqst.request_cookie == cookie && rqst.root == &logical.root &&
++		rqst.origin_state == SUNRPC_FUZZ_ORIGIN_UNATTRIBUTED &&
++		!sunrpc_fuzz_owner_valid(rqst.owner);
++	sunrpc_fuzz_rqst_reset(&rqst, SUNRPC_FUZZ_RQST_RESET_RELEASE);
++out_logical:
++	sunrpc_fuzz_logical_complete(&logical);
++out_generation:
++	kcov_request_generation_abort(generation);
++	kcov_request_generation_put(generation);
++	return pass;
++}
++#endif
++
+ static bool sunrpc_fuzz_phase2_selftest(void)
+ {
+ #ifdef CONFIG_KCOV
+@@ -360,6 +410,7 @@ static bool sunrpc_fuzz_phase2_selftest(void)
+ 	struct kcov_request_generation *generation;
+ 	u64 generation_id;
+ 	u64 cookie;
++	u64 demotion_test_owner = a.owner.val;
+ 	__be32 first_xid = cpu_to_be32(10);
+ 	__be32 second_xid = cpu_to_be32(25);
+ 
+@@ -475,6 +526,10 @@ static bool sunrpc_fuzz_phase2_selftest(void)
+ 		return false;
+ 	}
+ 	kcov_request_generation_put(generation);
++	if (!sunrpc_fuzz_selftest_abort_cookie_demotion(demotion_test_owner))
++		return false;
++	sunrpc_fuzz_stat_inc(
++		SUNRPC_FUZZ_STAT_SELFTEST_ABORT_COOKIE_OWNER_DEMOTED);
+ 	return true;
+ fail_logical:
+ 	sunrpc_fuzz_logical_cancel(&logical);
+diff --git a/net/sunrpc/fuzz_conn.c b/net/sunrpc/fuzz_conn.c
+index d81bddb54..9ddd4fd71 100644
+--- a/net/sunrpc/fuzz_conn.c
++++ b/net/sunrpc/fuzz_conn.c
+@@ -912,7 +912,16 @@ bool sunrpc_fuzz_wire_token_acquire(
+ 	reservation->request_work = work;
+ 	return true;
+ owner_none:
+-	reservation->request_cookie = 0;
++	/*
++	 * A generation ABORT demotes ownership but does not create a different
++	 * logical RPC.  Keep the cookie/root identity for retry diagnostics and
++	 * always clear the authoritative owner before the send continues.  With
++	 * no child token there is no wire mapping, so the cookie alone can never
++	 * authorize server-side remote attribution.
++	 */
++	reservation->request_cookie = rqst->request_cookie;
++	rqst->owner = (struct kcov_common_handle_id){};
++	rqst->origin_state = SUNRPC_FUZZ_ORIGIN_UNATTRIBUTED;
+ 	return false;
+ }
+ 
+-- 
+2.34.1
+

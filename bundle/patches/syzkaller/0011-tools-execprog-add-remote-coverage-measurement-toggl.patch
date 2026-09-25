@@ -1,0 +1,42 @@
+From 3fd76250c6d0798a7c11cb82d84276f85fae4901 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 12:19:55 +0900
+Subject: [PATCH 11/15] tools/execprog: add remote coverage measurement toggle
+
+
+diff --git a/tools/syz-execprog/execprog.go b/tools/syz-execprog/execprog.go
+index f647bcb67..f0228ae82 100644
+--- a/tools/syz-execprog/execprog.go
++++ b/tools/syz-execprog/execprog.go
+@@ -36,11 +36,13 @@ import (
+ )
+ 
+ var (
+-	flagOS         = flag.String("os", runtime.GOOS, "target os")
+-	flagArch       = flag.String("arch", runtime.GOARCH, "target arch")
+-	flagVMArch     = flag.String("vmarch", "", "target VM arch (if different from -arch)")
+-	flagType       = flag.String("type", "", "target VM type")
+-	flagCoverFile  = flag.String("coverfile", "", "write coverage to the file")
++	flagOS          = flag.String("os", runtime.GOOS, "target os")
++	flagArch        = flag.String("arch", runtime.GOARCH, "target arch")
++	flagVMArch      = flag.String("vmarch", "", "target VM arch (if different from -arch)")
++	flagType        = flag.String("type", "", "target VM type")
++	flagCoverFile   = flag.String("coverfile", "", "write coverage to the file")
++	flagRemoteCover = flag.Bool("remote-cover", true,
++		"collect extra/remote coverage (equivalent to experimental.remote_cover)")
+ 	flagRepeat     = flag.Int("repeat", 1, "repeat execution that many times (0 for infinite loop)")
+ 	flagProcs      = flag.Int("procs", 2*runtime.NumCPU(), "number of parallel processes to execute programs")
+ 	flagOutput     = flag.Bool("output", false, "write programs and results to stdout")
+@@ -107,6 +109,9 @@ func main() {
+ 			features &= ^feat
+ 		}
+ 	}
++	if !*flagRemoteCover {
++		features &= ^flatrpc.FeatureExtraCoverage
++	}
+ 
+ 	var requestedSyscalls []int
+ 	if *flagStress {
+-- 
+2.34.1
+

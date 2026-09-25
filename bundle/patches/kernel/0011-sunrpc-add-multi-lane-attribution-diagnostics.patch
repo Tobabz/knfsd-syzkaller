@@ -1,0 +1,151 @@
+From d811350e130d9412f0d144f31b8962738b2e5da1 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 10:32:49 +0900
+Subject: [PATCH 11/11] sunrpc: add multi-lane attribution diagnostics
+
+
+diff --git a/net/sunrpc/fuzz_conn.c b/net/sunrpc/fuzz_conn.c
+index 194b215e9..cffc32d84 100644
+--- a/net/sunrpc/fuzz_conn.c
++++ b/net/sunrpc/fuzz_conn.c
+@@ -196,6 +196,17 @@ enum sunrpc_fuzz_phase8_stat {
+ 	P8_STAT_COUNT,
+ };
+ 
++enum sunrpc_fuzz_phase9_stat {
++	P9_OWNER_LANE_MATCH,
++	P9_CROSS_LANE_ATTRIBUTION,
++	P9_STAT_COUNT,
++};
++
++static const char *const phase9_stat_names[P9_STAT_COUNT] = {
++	[P9_OWNER_LANE_MATCH] = "owner_lane_match",
++	[P9_CROSS_LANE_ATTRIBUTION] = "cross_lane_attribution",
++};
++
+ static const char *const phase7_stat_names[P7_STAT_COUNT] = {
+ 	[P7_RAW_SOCKET_ENABLE_OK] = "raw_socket_enable_ok",
+ 	[P7_RAW_SOCKET_ENABLE_REJECTED] = "raw_socket_enable_rejected",
+@@ -363,6 +374,8 @@ static atomic64_t next_conn_cookie = ATOMIC64_INIT(0);
+ static atomic64_t phase3_stats[P3_STAT_COUNT];
+ static atomic64_t phase7_stats[P7_STAT_COUNT];
+ static atomic64_t phase8_stats[P8_STAT_COUNT];
++static atomic64_t phase9_stats[P9_STAT_COUNT];
++static atomic64_t phase9_lane_seen_mask = ATOMIC64_INIT(0);
+ static atomic_t phase8_live_saved = ATOMIC_INIT(0);
+ static atomic_t phase8_abort_next_deferred = ATOMIC_INIT(0);
+ static atomic_t phase8_abort_next_async = ATOMIC_INIT(0);
+@@ -404,6 +417,11 @@ static void phase8_stat_inc(enum sunrpc_fuzz_phase8_stat stat)
+ 	atomic64_inc(&phase8_stats[stat]);
+ }
+ 
++static void phase9_stat_inc(enum sunrpc_fuzz_phase9_stat stat)
++{
++	atomic64_inc(&phase9_stats[stat]);
++}
++
+ void sunrpc_fuzz_note_record_class(bool background, bool backchannel)
+ {
+ 	if (background)
+@@ -1148,11 +1166,21 @@ bool sunrpc_fuzz_wire_token_acquire(
+ 		struct sunrpc_fuzz_rqst *rqst)
+ {
+ 	struct sunrpc_fuzz_wire_work *work;
++	bool owner_lane_match;
++	u32 lane_id;
+ 
+ 	if (!reservation->pending || reservation->request_work || !rqst->root ||
+-	    !rqst->root->generation)
++	    !rqst->root->generation || !reservation->conn)
+ 		return false;
+ 	reservation->request_work_decided = true;
++	lane_id = reservation->conn->key.lane_id;
++	/*
++	 * The frozen multi-proc contract binds proc N (common owner N + 1) to
++	 * lane N.  Validate at the point where an attributed wire attempt gains
++	 * its delivery token so Gate 9 can reject any cross-lane attribution.
++	 */
++	owner_lane_match = lane_id < 64 &&
++		rqst->owner.val == (u64)lane_id + 1;
+ 	work = kzalloc(sizeof(*work), GFP_ATOMIC);
+ 	if (!work)
+ 		goto owner_none;
+@@ -1171,6 +1199,12 @@ bool sunrpc_fuzz_wire_token_acquire(
+ 		goto owner_none;
+ 	}
+ 	reservation->request_work = work;
++	if (owner_lane_match) {
++		phase9_stat_inc(P9_OWNER_LANE_MATCH);
++		atomic64_or(BIT_ULL(lane_id), &phase9_lane_seen_mask);
++	} else {
++		phase9_stat_inc(P9_CROSS_LANE_ATTRIBUTION);
++	}
+ 	return true;
+ owner_none:
+ 	/*
+@@ -2260,6 +2294,19 @@ static int phase8_stats_show(struct seq_file *m, void *v)
+ }
+ DEFINE_SHOW_ATTRIBUTE(phase8_stats);
+ 
++static int phase9_stats_show(struct seq_file *m, void *v)
++{
++	unsigned int i;
++
++	for (i = 0; i < P9_STAT_COUNT; i++)
++		seq_printf(m, "%s %lld\n", phase9_stat_names[i],
++			   atomic64_read(&phase9_stats[i]));
++	seq_printf(m, "lane_seen_mask %#llx\n",
++		   atomic64_read(&phase9_lane_seen_mask));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(phase9_stats);
++
+ static int domain_show(struct seq_file *m, void *v)
+ {
+ 	struct sunrpc_fuzz_net *fnet;
+@@ -2711,6 +2758,31 @@ static const struct file_operations phase8_control_fops = {
+ 	.llseek = noop_llseek,
+ };
+ 
++static ssize_t phase9_control_write(struct file *file,
++		const char __user *buf, size_t count, loff_t *ppos)
++{
++	char command[16];
++	unsigned int i;
++
++	if (!count || count >= sizeof(command))
++		return -EINVAL;
++	if (copy_from_user(command, buf, count))
++		return -EFAULT;
++	command[count] = '\0';
++	if (!sysfs_streq(command, "reset"))
++		return -EOPNOTSUPP;
++	for (i = 0; i < P9_STAT_COUNT; i++)
++		atomic64_set(&phase9_stats[i], 0);
++	atomic64_set(&phase9_lane_seen_mask, 0);
++	return count;
++}
++
++static const struct file_operations phase9_control_fops = {
++	.owner = THIS_MODULE,
++	.write = phase9_control_write,
++	.llseek = noop_llseek,
++};
++
+ int sunrpc_fuzz_phase3_init(struct dentry *root)
+ {
+ 	int ret;
+@@ -2741,6 +2813,10 @@ int sunrpc_fuzz_phase3_init(struct dentry *root)
+ 				    &phase8_stats_fops);
+ 		debugfs_create_file("phase8_control", 0200, root, NULL,
+ 				    &phase8_control_fops);
++		debugfs_create_file("phase9_stats", 0400, root, NULL,
++				    &phase9_stats_fops);
++		debugfs_create_file("phase9_control", 0200, root, NULL,
++				    &phase9_control_fops);
+ 		debugfs_create_file("phase3_control", 0200, root, NULL,
+ 				    &phase3_control_fops);
+ 		debugfs_create_file("phase3_connections", 0400, root, NULL,
+-- 
+2.34.1
+

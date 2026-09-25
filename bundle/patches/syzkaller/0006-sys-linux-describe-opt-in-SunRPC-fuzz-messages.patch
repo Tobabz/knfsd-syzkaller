@@ -1,0 +1,1262 @@
+From ed9a930f06b3268043f3a639cf62013a85c0767d Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 09:17:56 +0900
+Subject: [PATCH 06/15] sys/linux: describe opt-in SunRPC fuzz messages
+
+
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+new file mode 100644
+index 000000000..b335a143a
+--- /dev/null
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -0,0 +1,195 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package linux_test
++
++import (
++	"reflect"
++	"testing"
++
++	"github.com/google/syzkaller/prog"
++	_ "github.com/google/syzkaller/sys"
++)
++
++func TestNFSSunRPCFuzzABI(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for name, want := range map[string]uint64{
++		"TCP_SUNRPC_FUZZ":               47,
++		"TCP_SUNRPC_FUZZ_VERSION":       1,
++		"TCP_SUNRPC_FUZZ_F_NEW":         1,
++		"TCP_SUNRPC_FUZZ_F_RETRY":       2,
++		"TCP_SUNRPC_FUZZ_F_CANCEL":      8,
++		"TCP_SUNRPC_FUZZ_F_NEW_FINAL":   5,
++		"TCP_SUNRPC_FUZZ_F_RETRY_FINAL": 6,
++	} {
++		if got := target.GetConst(name); got != want {
++			t.Errorf("%s=%d, want %d", name, got, want)
++		}
++	}
++
++	socket := requireNFSFuzzCall(t, target, "socket$inet_nfs_fuzz_tcp")
++	if socket.CallName != "socket" {
++		t.Fatalf("socket variant calls %s, want ordinary socket", socket.CallName)
++	}
++	ret, ok := socket.Ret.(*prog.ResourceType)
++	if !ok || ret.Desc.Name != "sock_nfs_fuzz_tcp" {
++		t.Fatalf("socket return type is %T %v, want sock_nfs_fuzz_tcp", socket.Ret, socket.Ret)
++	}
++
++	setopt := requireNFSFuzzCall(t, target, "setsockopt$inet_nfs_fuzz")
++	if setopt.CallName != "setsockopt" {
++		t.Fatalf("setsockopt variant calls %s, want ordinary setsockopt", setopt.CallName)
++	}
++	requireConst(t, setopt.Args[1].Type, 6, "setsockopt level")
++	requireConst(t, setopt.Args[2].Type, 47, "setsockopt optname")
++	optval, ok := setopt.Args[3].Type.(*prog.PtrType)
++	if !ok {
++		t.Fatalf("setsockopt optval is %T, want pointer", setopt.Args[3].Type)
++	}
++	requireConst(t, optval.Elem, 1, "setsockopt optval")
++
++	connect := requireNFSFuzzCall(t, target, "connect$inet_nfs_fuzz")
++	if connect.CallName != "connect" {
++		t.Fatalf("connect variant calls %s, want ordinary connect", connect.CallName)
++	}
++	addr, ok := connect.Args[1].Type.(*prog.PtrType)
++	if !ok || addr.Elem.TemplateName() != "sockaddr_in" {
++		t.Fatalf("connect address is %T %v, want sockaddr_in pointer", connect.Args[1].Type, connect.Args[1].Type)
++	}
++
++	dataCalls := map[string]uint64{
++		"sendmsg$inet_nfs_fuzz_new":         1,
++		"sendmsg$inet_nfs_fuzz_new_final":   5,
++		"sendmsg$inet_nfs_fuzz_retry":       2,
++		"sendmsg$inet_nfs_fuzz_retry_final": 6,
++	}
++	for name, flags := range dataCalls {
++		call := requireNFSFuzzCall(t, target, name)
++		if call.CallName != "sendmsg" {
++			t.Fatalf("%s calls %s, want ordinary sendmsg", name, call.CallName)
++		}
++		requireNFSFuzzCmsg(t, call, flags)
++		header := requireStruct(t, call, "nfs_fuzz_send_msghdr")
++		iov := requireField(t, header, "msg_iov")
++		ptr, ok := iov.Type.(*prog.PtrType)
++		if !ok || ptr.Elem.TemplateName() != "iovec" {
++			t.Fatalf("%s msg_iov is %T %v, want one iovec pointer", name, iov.Type, iov.Type)
++		}
++		requireConst(t, requireField(t, header, "msg_iovlen").Type, 1, name+" msg_iovlen")
++		requireSingleCmsg(t, call, header)
++		requireSingleRPCRecords(t, call)
++	}
++
++	cancel := requireNFSFuzzCall(t, target, "sendmsg$inet_nfs_fuzz_cancel")
++	if cancel.CallName != "sendmsg" {
++		t.Fatalf("CANCEL calls %s, want ordinary sendmsg", cancel.CallName)
++	}
++	requireNFSFuzzCmsg(t, cancel, 8)
++	cancelHeader := requireStruct(t, cancel, "nfs_fuzz_cancel_msghdr")
++	requireConst(t, requireField(t, cancelHeader, "msg_iov").Type, 0, "CANCEL msg_iov")
++	requireConst(t, requireField(t, cancelHeader, "msg_iovlen").Type, 0, "CANCEL msg_iovlen")
++	requireSingleCmsg(t, cancel, cancelHeader)
++}
++
++func requireNFSFuzzCall(t *testing.T, target *prog.Target, name string) *prog.Syscall {
++	t.Helper()
++	call := target.SyscallMap[name]
++	if call == nil {
++		t.Fatalf("missing syscall %s", name)
++	}
++	return call
++}
++
++func requireNFSFuzzCmsg(t *testing.T, call *prog.Syscall, flags uint64) {
++	t.Helper()
++	cmsg := requireStruct(t, call, "tcp_sunrpc_fuzz")
++	wantNames := []string{"version", "flags", "user_tag"}
++	var gotNames []string
++	for _, field := range cmsg.Fields {
++		gotNames = append(gotNames, field.Name)
++	}
++	if !reflect.DeepEqual(gotNames, wantNames) {
++		t.Fatalf("%s CMSG fields are %v, want %v", call.Name, gotNames, wantNames)
++	}
++	if cmsg.Size() != 16 {
++		t.Fatalf("%s CMSG payload size is %d, want 16", call.Name, cmsg.Size())
++	}
++	requireConst(t, cmsg.Fields[0].Type, 1, call.Name+" version")
++	requireConst(t, cmsg.Fields[1].Type, flags, call.Name+" flags")
++	tag, ok := cmsg.Fields[2].Type.(*prog.ProcType)
++	if !ok || tag.Size() != 8 || tag.ValuesStart != 1 || tag.ValuesPerProc != 1 {
++		t.Fatalf("%s user_tag is %#v, want nonzero per-process int64", call.Name, cmsg.Fields[2].Type)
++	}
++}
++
++func requireSingleRPCRecords(t *testing.T, call *prog.Syscall) {
++	t.Helper()
++	for _, name := range []string{"rpc_tcp_nfs3_single_call", "rpc_tcp_nfs4_single_call"} {
++		record := requireStruct(t, call, name)
++		last := requireField(t, record, "last_frag")
++		requireConst(t, last.Type, 1, call.Name+" "+name+" last_frag")
++		if last.Type.BitfieldLength() != 1 {
++			t.Fatalf("%s %s last_frag is %d bits, want 1", call.Name, name, last.Type.BitfieldLength())
++		}
++	}
++}
++
++func requireSingleCmsg(t *testing.T, call *prog.Syscall, header *prog.StructType) {
++	t.Helper()
++	control := requireField(t, header, "msg_control")
++	ptr, ok := control.Type.(*prog.PtrType)
++	if !ok || ptr.Elem.TemplateName() != "cmsghdr_t" {
++		t.Fatalf("%s msg_control is %T %v, want one typed cmsghdr pointer", call.Name, control.Type, control.Type)
++	}
++	outer, ok := ptr.Elem.(*prog.StructType)
++	if !ok || len(outer.Fields) != 1 {
++		t.Fatalf("%s control wrapper is %#v, want one cmsghdr", call.Name, ptr.Elem)
++	}
++	inner, ok := outer.Fields[0].Type.(*prog.StructType)
++	if !ok || inner.TemplateName() != "cmsghdr_unaligned" {
++		t.Fatalf("%s control payload is %#v, want cmsghdr_unaligned", call.Name, outer.Fields[0].Type)
++	}
++	requireConst(t, requireField(t, inner, "cmsg_level").Type, 6, call.Name+" CMSG level")
++	requireConst(t, requireField(t, inner, "cmsg_type").Type, 47, call.Name+" CMSG type")
++}
++
++func requireStruct(t *testing.T, call *prog.Syscall, name string) *prog.StructType {
++	t.Helper()
++	var found *prog.StructType
++	prog.ForeachCallType(call, func(typ prog.Type, ctx *prog.TypeCtx) {
++		if typ.TemplateName() != name {
++			return
++		}
++		st, ok := typ.(*prog.StructType)
++		if !ok {
++			t.Fatalf("%s type %s is %T, want struct", call.Name, name, typ)
++		}
++		found = st
++	})
++	if found == nil {
++		t.Fatalf("%s does not contain %s", call.Name, name)
++	}
++	return found
++}
++
++func requireField(t *testing.T, st *prog.StructType, name string) prog.Field {
++	t.Helper()
++	for _, field := range st.Fields {
++		if field.Name == name {
++			return field
++		}
++	}
++	t.Fatalf("struct %s has no field %s", st.Name(), name)
++	return prog.Field{}
++}
++
++func requireConst(t *testing.T, typ prog.Type, want uint64, what string) {
++	t.Helper()
++	value, ok := typ.(*prog.ConstType)
++	if !ok || value.Val != want {
++		t.Fatalf("%s is %T %v, want const %d", what, typ, typ, want)
++	}
++}
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+new file mode 100644
+index 000000000..dce77ea84
+--- /dev/null
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -0,0 +1,1022 @@
++# Copyright 2026 syzkaller project authors. All rights reserved.
++# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++include <uapi/linux/in.h>
++include <uapi/linux/tcp.h>
++include <uapi/asm-generic/socket.h>
++include <linux/net.h>
++include <linux/socket.h>
++
++# NFS (SunRPC / XDR / NFSv3 / NFSv4) definitions
++
++resource sock_nfs_fuzz_tcp[sock]
++
++# TCP_SUNRPC_FUZZ must be enabled before connect.  The dedicated resource keeps
++# this opt-in lane separate from ordinary TCP sockets; the kernel still checks
++# the actual setsockopt state.
++socket$inet_nfs_fuzz_tcp(domain const[AF_INET], type const[SOCK_STREAM], proto const[IPPROTO_TCP]) sock_nfs_fuzz_tcp
++setsockopt$inet_nfs_fuzz(fd sock_nfs_fuzz_tcp, level const[SOL_TCP], optname const[TCP_SUNRPC_FUZZ], optval ptr[in, const[1, int32]], optlen len[optval])
++connect$inet_nfs_fuzz(fd sock_nfs_fuzz_tcp, addr ptr[in, sockaddr_in], addrlen len[addr])
++
++define TCP_SUNRPC_FUZZ_F_NEW_FINAL	TCP_SUNRPC_FUZZ_F_NEW | TCP_SUNRPC_FUZZ_F_FINAL
++define TCP_SUNRPC_FUZZ_F_RETRY_FINAL	TCP_SUNRPC_FUZZ_F_RETRY | TCP_SUNRPC_FUZZ_F_FINAL
++
++# NEW and RETRY are exclusive operations.  FINAL is their only valid modifier;
++# CANCEL is a standalone, zero-data operation.
++sendmsg$inet_nfs_fuzz_new(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_NEW]], f const[0])
++sendmsg$inet_nfs_fuzz_new_final(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_NEW_FINAL]], f const[0])
++sendmsg$inet_nfs_fuzz_retry(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_RETRY]], f const[0])
++sendmsg$inet_nfs_fuzz_retry_final(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_RETRY_FINAL]], f const[0])
++sendmsg$inet_nfs_fuzz_cancel(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_cancel_msghdr], f const[0])
++recvfrom$inet_nfs_fuzz_tcp(fd sock_nfs_fuzz_tcp, buf buffer[out], len len[buf], f flags[recv_flags], addr const[0], addrlen const[0])
++
++type nfs_fuzz_send_msghdr[MSG, FLAGS] {
++	msg_name	const[0, intptr]
++	msg_namelen	const[0, int32]
++	msg_iov		ptr[in, iovec[in, MSG]]
++	msg_iovlen	const[1, intptr]
++	msg_control	ptr[in, cmsghdr_t[SOL_TCP, TCP_SUNRPC_FUZZ, tcp_sunrpc_fuzz[FLAGS]]]
++	msg_controllen	bytesize[msg_control, intptr]
++	msg_flags	const[0, int32]
++}
++
++nfs_fuzz_cancel_msghdr {
++	msg_name	const[0, intptr]
++	msg_namelen	const[0, int32]
++	msg_iov		const[0, intptr]
++	msg_iovlen	const[0, intptr]
++	msg_control	ptr[in, cmsghdr_t[SOL_TCP, TCP_SUNRPC_FUZZ, tcp_sunrpc_fuzz[TCP_SUNRPC_FUZZ_F_CANCEL]]]
++	msg_controllen	bytesize[msg_control, intptr]
++	msg_flags	const[0, int32]
++}
++
++type tcp_sunrpc_fuzz[FLAGS] {
++	version		const[TCP_SUNRPC_FUZZ_VERSION, int32]
++	flags		const[FLAGS, int32]
++	user_tag	proc[1, 1, int64]
++}
++
++# Known NFS export paths & filenames dictionary
++nfs_path_names = "export", "tmp", "root", "test", "mnt", "home", "var", "dev", "etc", "testfile", "file1", "dir1", "share", "pub", "user.test", "system.nfs4_acl", "security.selinux"
++
++# RPC Auth definitions
++rpc_auth_none {
++	flavor	const[0, int32be]
++	length	const[0, int32be]
++} [packed]
++
++rpc_auth_sys {
++	flavor	const[1, int32be]
++	length	len[data, int32be]
++	data	rpc_auth_sys_data
++} [packed]
++
++rpc_auth_sys_data {
++	stamp		int32be
++	machinename	stringnoz
++	uid		int32be
++	gid		int32be
++	gids_len	len[gids, int32be]
++	gids		array[int32be, 0:4]
++} [packed]
++
++rpcsec_gss_proc = 0, 1, 2, 3
++
++rpc_auth_gss {
++	flavor	const[6, int32be]
++	length	len[data, int32be]
++	data	rpc_auth_gss_data
++} [packed]
++
++rpc_auth_gss_data {
++	version		const[1, int32be]
++	gss_proc	flags[rpcsec_gss_proc, int32be]
++	seq_num		int32be
++	service		int32be[1:3]
++	handle_len	len[handle, int32be]
++	handle		array[int8, 0:32]
++} [packed]
++
++rpc_auth_flavors = 0, 1, 2, 3, 6, 390003, 390004, 390005
++
++rpc_auth_generic {
++	flavor	flags[rpc_auth_flavors, int32be]
++	length	len[data, int32be]
++	data	array[int8, 0:64]
++} [packed]
++
++rpc_auth [
++	none	rpc_auth_none
++	sys	rpc_auth_sys
++	gss	rpc_auth_gss
++	raw	rpc_auth_generic
++] [varlen]
++
++# NFS File Handles
++nfs_fh3 {
++	length	len[data, int32be]
++	data	array[int8, 0:64]
++} [packed]
++
++nfs_fh4 {
++	length	len[data, int32be]
++	data	array[int8, 0:128]
++} [packed]
++
++# NFSv3 Calls
++rpc_nfs3_call {
++	xid	int32be
++	mtype	const[0, int32be]
++	rpcvers	const[2, int32be]
++	prog	const[100003, int32be]
++	vers	const[3, int32be]
++	body	nfs3_call_bodies
++} [packed]
++
++nfs3_call_bodies [
++	null_call	nfs3_null_call
++	getattr		nfs3_getattr_call
++	setattr		nfs3_setattr_call
++	lookup		nfs3_lookup_call
++	access		nfs3_access_call
++	read		nfs3_read_call
++	write		nfs3_write_call
++	create		nfs3_create_call
++	mkdir		nfs3_mkdir_call
++	symlink		nfs3_symlink_call
++	mknod		nfs3_mknod_call
++	remove		nfs3_remove_call
++	rmdir		nfs3_rmdir_call
++	rename		nfs3_rename_call
++	link		nfs3_link_call
++	readdir		nfs3_readdir_call
++	readdirplus	nfs3_readdirplus_call
++	fsstat		nfs3_fsstat_call
++	fsinfo		nfs3_fsinfo_call
++	pathconf	nfs3_pathconf_call
++	commit		nfs3_commit_call
++] [varlen]
++
++type nfs3_call_t[PROC, ARGS] {
++	proc	const[PROC, int32be]
++	cred	rpc_auth
++	verf	rpc_auth
++	args	ARGS
++} [packed]
++
++type nfs3_null_call nfs3_call_t[0, nfs3_null_args]
++type nfs3_getattr_call nfs3_call_t[1, nfs3_getattr_args]
++type nfs3_setattr_call nfs3_call_t[2, nfs3_setattr_args]
++type nfs3_lookup_call nfs3_call_t[3, nfs3_lookup_args]
++type nfs3_access_call nfs3_call_t[4, nfs3_access_args]
++type nfs3_read_call nfs3_call_t[6, nfs3_read_args]
++type nfs3_write_call nfs3_call_t[7, nfs3_write_args]
++type nfs3_create_call nfs3_call_t[8, nfs3_create_args]
++type nfs3_mkdir_call nfs3_call_t[9, nfs3_mkdir_args]
++type nfs3_symlink_call nfs3_call_t[10, nfs3_symlink_args]
++type nfs3_mknod_call nfs3_call_t[11, nfs3_mknod_args]
++type nfs3_remove_call nfs3_call_t[12, nfs3_remove_args]
++type nfs3_rmdir_call nfs3_call_t[13, nfs3_rmdir_args]
++type nfs3_rename_call nfs3_call_t[14, nfs3_rename_args]
++type nfs3_link_call nfs3_call_t[15, nfs3_link_args]
++type nfs3_readdir_call nfs3_call_t[16, nfs3_readdir_args]
++type nfs3_readdirplus_call nfs3_call_t[17, nfs3_readdirplus_args]
++type nfs3_fsstat_call nfs3_call_t[18, nfs3_fsstat_args]
++type nfs3_fsinfo_call nfs3_call_t[19, nfs3_fsinfo_args]
++type nfs3_pathconf_call nfs3_call_t[20, nfs3_pathconf_args]
++type nfs3_commit_call nfs3_call_t[21, nfs3_commit_args]
++
++nfs3_null_args {
++	dummy	const[0, int32be]
++} [packed]
++
++nfs3_getattr_args {
++	fh	nfs_fh3
++} [packed]
++
++nfs3_setattr_args {
++	fh		nfs_fh3
++	mode_set	int32be[0:1]
++	mode		int32be
++	uid_set		int32be[0:1]
++	uid		int32be
++	gid_set		int32be[0:1]
++	gid		int32be
++	size_set	int32be[0:1]
++	size		int64be
++	atime_set	int32be[0:2]
++	atime_sec	int32be
++	atime_nsec	int32be
++	mtime_set	int32be[0:2]
++	mtime_sec	int32be
++	mtime_nsec	int32be
++	guard_check	int32be[0:1]
++	guard_sec	int32be
++	guard_nsec	int32be
++} [packed]
++
++nfs3_lookup_args {
++	dir	nfs_fh3
++	name	stringnoz[nfs_path_names]
++} [packed]
++
++nfs3_access_args {
++	fh	nfs_fh3
++	access	flags[nfs3_access_flags, int32be]
++} [packed]
++
++nfs3_access_flags = 0x1, 0x2, 0x4, 0x8, 0x10, 0x20
++
++nfs3_read_args {
++	fh	nfs_fh3
++	offset	int64be
++	count	int32be
++} [packed]
++
++nfs3_write_args {
++	fh	nfs_fh3
++	offset	int64be
++	count	len[data, int32be]
++	stable	flags[nfs3_stable_how, int32be]
++	data	array[int8]
++} [packed]
++
++nfs3_stable_how = 0, 1, 2
++
++nfs3_create_args {
++	dir		nfs_fh3
++	name		stringnoz[nfs_path_names]
++	create_mode	flags[nfs3_create_mode, int32be]
++	verf		array[int8, 8]
++} [packed]
++
++nfs3_create_mode = 0, 1, 2
++
++nfs3_mkdir_args {
++	dir	nfs_fh3
++	name	stringnoz[nfs_path_names]
++} [packed]
++
++nfs3_symlink_args {
++	dir	nfs_fh3
++	name	stringnoz[nfs_path_names]
++	target	stringnoz[nfs_path_names]
++} [packed]
++
++nfs3_mknod_args {
++	dir	nfs_fh3
++	name	stringnoz[nfs_path_names]
++	type	flags[nfs3_ftypes, int32be]
++	major	int32be
++	minor	int32be
++} [packed]
++
++nfs3_ftypes = 1, 2, 3, 4, 5, 6, 7
++
++nfs3_remove_args {
++	dir	nfs_fh3
++	name	stringnoz[nfs_path_names]
++} [packed]
++
++nfs3_rmdir_args {
++	dir	nfs_fh3
++	name	stringnoz[nfs_path_names]
++} [packed]
++
++nfs3_rename_args {
++	from_dir	nfs_fh3
++	from_name	stringnoz[nfs_path_names]
++	to_dir		nfs_fh3
++	to_name		stringnoz[nfs_path_names]
++} [packed]
++
++nfs3_link_args {
++	fh	nfs_fh3
++	dir	nfs_fh3
++	name	stringnoz[nfs_path_names]
++} [packed]
++
++nfs3_readdir_args {
++	dir		nfs_fh3
++	cookie		int64be
++	cookieverf	array[int8, 8]
++	count		int32be
++} [packed]
++
++nfs3_readdirplus_args {
++	dir		nfs_fh3
++	cookie		int64be
++	cookieverf	array[int8, 8]
++	dircount	int32be
++	maxcount	int32be
++} [packed]
++
++nfs3_fsstat_args {
++	fh	nfs_fh3
++} [packed]
++
++nfs3_fsinfo_args {
++	fh	nfs_fh3
++} [packed]
++
++nfs3_pathconf_args {
++	fh	nfs_fh3
++} [packed]
++
++nfs3_commit_args {
++	fh	nfs_fh3
++	offset	int64be
++	count	int32be
++} [packed]
++
++# NFSv4 Compound Call
++rpc_nfs4_call {
++	xid	int32be
++	mtype	const[0, int32be]
++	rpcvers	const[2, int32be]
++	prog	const[100003, int32be]
++	vers	const[4, int32be]
++	proc	const[1, int32be]
++	cred	rpc_auth
++	verf	rpc_auth
++	body	nfs4_compound_args
++} [packed]
++
++# Tagged data actions deliberately expose only a complete, single-fragment RPC
++# record.  Fragmented or batched records are rejected by the kernel ABI.
++rpc_tcp_nfs3_single_call {
++	frag_len	bytesize[msg, int32be:31]
++	last_frag	const[1, int32be:1]
++	msg		rpc_nfs3_call
++} [packed]
++
++rpc_tcp_nfs4_single_call {
++	frag_len	bytesize[msg, int32be:31]
++	last_frag	const[1, int32be:1]
++	msg		rpc_nfs4_call
++} [packed]
++
++rpc_tcp_nfs_single_call [
++	nfs3	rpc_tcp_nfs3_single_call
++	nfs4	rpc_tcp_nfs4_single_call
++] [varlen]
++
++nfs4_compound_args {
++	tag		nfs4_compound_tag
++	minorversion	flags[nfs4_minorversions, int32be]
++	argarray_len	len[argarray, int32be]
++	argarray	array[nfs4_op_arg, 1:8]
++} [packed]
++
++nfs4_compound_tag [
++	empty	const[0, int32be]
++	named	nfs4_utf8string
++] [varlen]
++
++nfs4_utf8string {
++	len	len[data, int32be]
++	data	stringnoz[nfs4_path_names]
++} [packed]
++
++nfs4_path_names = "test", "root", "tmp1", "dir1", "mnt1", "home", "file", "pub1", "var1", "etc1", "testfile", "file0001", "dir00001"
++
++nfs4_minorversions = 0, 1, 2
++
++nfs4_stateid [
++	zero	nfs4_stateid_zero
++	one	nfs4_stateid_one
++	current	nfs4_stateid_current
++	close	nfs4_stateid_close
++	generic	nfs4_stateid_generic
++] [size[16]]
++
++nfs4_stateid_zero {
++	seqid	const[0, int32be]
++	other	array[const[0, int8], 12]
++} [packed]
++
++nfs4_stateid_one {
++	seqid	const[0xffffffff, int32be]
++	other	array[const[0xff, int8], 12]
++} [packed]
++
++nfs4_stateid_current {
++	seqid	const[1, int32be]
++	other	array[const[0, int8], 12]
++} [packed]
++
++nfs4_stateid_close {
++	seqid	const[0xffffffff, int32be]
++	other	array[const[0, int8], 12]
++} [packed]
++
++nfs4_stateid_generic {
++	seqid	int32be
++	other	array[int8, 12]
++} [packed]
++
++nfs4_op_arg [
++	op_access		nfs4_op_access
++	op_close		nfs4_op_close
++	op_commit		nfs4_op_commit
++	op_create		nfs4_op_create
++	op_delegreturn		nfs4_op_delegreturn
++	op_getattr		nfs4_op_getattr
++	op_getfh		nfs4_op_getfh
++	op_link			nfs4_op_link
++	op_lock			nfs4_op_lock
++	op_lockt		nfs4_op_lockt
++	op_locku		nfs4_op_locku
++	op_lookup		nfs4_op_lookup
++	op_lookupp		nfs4_op_lookupp
++	op_nverify		nfs4_op_nverify
++	op_open			nfs4_op_open
++	op_open_confirm		nfs4_op_open_confirm
++	op_open_downgrade	nfs4_op_open_downgrade
++	op_putfh		nfs4_op_putfh
++	op_putpubfh		nfs4_op_putpubfh
++	op_putrootfh		nfs4_op_putrootfh
++	op_read			nfs4_op_read
++	op_readdir		nfs4_op_readdir
++	op_readlink		nfs4_op_readlink
++	op_remove		nfs4_op_remove
++	op_rename		nfs4_op_rename
++	op_renew		nfs4_op_renew
++	op_restorefh		nfs4_op_restorefh
++	op_savefh		nfs4_op_savefh
++	op_secinfo		nfs4_op_secinfo
++	op_setattr		nfs4_op_setattr
++	op_setclientid		nfs4_op_setclientid
++	op_setclientid_confirm	nfs4_op_setclientid_confirm
++	op_verify		nfs4_op_verify
++	op_write		nfs4_op_write
++	op_release_lockowner	nfs4_op_release_lockowner
++	op_backchannel_ctl	nfs4_op_backchannel_ctl
++	op_bind_conn_to_session	nfs4_op_bind_conn_to_session
++	op_exchange_id		nfs4_op_exchange_id
++	op_create_session	nfs4_op_create_session
++	op_destroy_session	nfs4_op_destroy_session
++	op_free_stateid		nfs4_op_free_stateid
++	op_get_dir_delegation	nfs4_op_get_dir_delegation
++	op_getdeviceinfo	nfs4_op_getdeviceinfo
++	op_layoutcommit		nfs4_op_layoutcommit
++	op_layoutget		nfs4_op_layoutget
++	op_layoutreturn		nfs4_op_layoutreturn
++	op_secinfo_no_name	nfs4_op_secinfo_no_name
++	op_sequence		nfs4_op_sequence
++	op_test_stateid		nfs4_op_test_stateid
++	op_destroy_clientid	nfs4_op_destroy_clientid
++	op_reclaim_complete	nfs4_op_reclaim_complete
++	op_allocate		nfs4_op_allocate
++	op_copy			nfs4_op_copy
++	op_copy_notify		nfs4_op_copy_notify
++	op_deallocate		nfs4_op_deallocate
++	op_offload_status	nfs4_op_offload_status
++	op_read_plus		nfs4_op_read_plus
++	op_seek			nfs4_op_seek
++	op_clone		nfs4_op_clone
++	op_getxattr		nfs4_op_getxattr
++	op_setxattr		nfs4_op_setxattr
++	op_listxattrs		nfs4_op_listxattrs
++	op_removexattr		nfs4_op_removexattr
++	op_delegpurge		nfs4_op_delegpurge
++	op_openattr		nfs4_op_openattr
++	op_want_delegation	nfs4_op_want_delegation
++	op_io_advise		nfs4_op_io_advise
++	op_offload_cancel	nfs4_op_offload_cancel
++	op_illegal		nfs4_op_illegal
++] [varlen]
++
++type nfs4_op_t[OPNUM, ARGS] {
++	opnum	const[OPNUM, int32be]
++	args	ARGS
++} [packed]
++
++type nfs4_op_access nfs4_op_t[3, nfs4_access_args]
++type nfs4_op_close nfs4_op_t[4, nfs4_close_args]
++type nfs4_op_commit nfs4_op_t[5, nfs4_commit_args]
++type nfs4_op_create nfs4_op_t[6, nfs4_create_args]
++type nfs4_op_delegreturn nfs4_op_t[8, nfs4_delegreturn_args]
++type nfs4_op_getattr nfs4_op_t[9, nfs4_getattr_args]
++type nfs4_op_getfh nfs4_op_t[10, nfs4_null_args]
++type nfs4_op_link nfs4_op_t[11, nfs4_link_args]
++type nfs4_op_lock nfs4_op_t[12, nfs4_lock_args]
++type nfs4_op_lockt nfs4_op_t[13, nfs4_lockt_args]
++type nfs4_op_locku nfs4_op_t[14, nfs4_locku_args]
++type nfs4_op_lookup nfs4_op_t[15, nfs4_lookup_args]
++type nfs4_op_lookupp nfs4_op_t[16, nfs4_null_args]
++type nfs4_op_nverify nfs4_op_t[17, nfs4_verify_args]
++type nfs4_op_open nfs4_op_t[18, nfs4_open_args]
++type nfs4_op_open_confirm nfs4_op_t[20, nfs4_open_confirm_args]
++type nfs4_op_open_downgrade nfs4_op_t[21, nfs4_open_downgrade_args]
++type nfs4_op_putfh nfs4_op_t[22, nfs4_putfh_args]
++type nfs4_op_putpubfh nfs4_op_t[23, nfs4_null_args]
++type nfs4_op_putrootfh nfs4_op_t[24, nfs4_null_args]
++type nfs4_op_read nfs4_op_t[25, nfs4_read_args]
++type nfs4_op_readdir nfs4_op_t[26, nfs4_readdir_args]
++type nfs4_op_readlink nfs4_op_t[27, nfs4_null_args]
++type nfs4_op_remove nfs4_op_t[28, nfs4_remove_args]
++type nfs4_op_rename nfs4_op_t[29, nfs4_rename_args]
++type nfs4_op_renew nfs4_op_t[30, nfs4_renew_args]
++type nfs4_op_restorefh nfs4_op_t[31, nfs4_null_args]
++type nfs4_op_savefh nfs4_op_t[32, nfs4_null_args]
++type nfs4_op_secinfo nfs4_op_t[33, nfs4_secinfo_args]
++type nfs4_op_setattr nfs4_op_t[34, nfs4_setattr_args]
++type nfs4_op_setclientid nfs4_op_t[35, nfs4_setclientid_args]
++type nfs4_op_setclientid_confirm nfs4_op_t[36, nfs4_setclientid_confirm_args]
++type nfs4_op_verify nfs4_op_t[37, nfs4_verify_args]
++type nfs4_op_write nfs4_op_t[38, nfs4_write_args]
++type nfs4_op_release_lockowner nfs4_op_t[39, nfs4_release_lockowner_args]
++type nfs4_op_backchannel_ctl nfs4_op_t[40, nfs4_backchannel_ctl_args]
++type nfs4_op_bind_conn_to_session nfs4_op_t[41, nfs4_bind_conn_to_session_args]
++type nfs4_op_exchange_id nfs4_op_t[42, nfs4_exchange_id_args]
++type nfs4_op_create_session nfs4_op_t[43, nfs4_create_session_args]
++type nfs4_op_destroy_session nfs4_op_t[44, nfs4_destroy_session_args]
++type nfs4_op_free_stateid nfs4_op_t[45, nfs4_free_stateid_args]
++type nfs4_op_get_dir_delegation nfs4_op_t[46, nfs4_get_dir_delegation_args]
++type nfs4_op_getdeviceinfo nfs4_op_t[47, nfs4_getdeviceinfo_args]
++type nfs4_op_layoutcommit nfs4_op_t[49, nfs4_layoutcommit_args]
++type nfs4_op_layoutget nfs4_op_t[50, nfs4_layoutget_args]
++type nfs4_op_layoutreturn nfs4_op_t[51, nfs4_layoutreturn_args]
++type nfs4_op_secinfo_no_name nfs4_op_t[52, nfs4_secinfo_no_name_args]
++type nfs4_op_sequence nfs4_op_t[53, nfs4_sequence_args]
++type nfs4_op_test_stateid nfs4_op_t[55, nfs4_test_stateid_args]
++type nfs4_op_destroy_clientid nfs4_op_t[57, nfs4_destroy_clientid_args]
++type nfs4_op_reclaim_complete nfs4_op_t[58, nfs4_reclaim_complete_args]
++type nfs4_op_allocate nfs4_op_t[59, nfs4_allocate_args]
++type nfs4_op_copy nfs4_op_t[60, nfs4_copy_args]
++type nfs4_op_copy_notify nfs4_op_t[61, nfs4_copy_notify_args]
++type nfs4_op_deallocate nfs4_op_t[62, nfs4_deallocate_args]
++type nfs4_op_offload_status nfs4_op_t[67, nfs4_offload_status_args]
++type nfs4_op_read_plus nfs4_op_t[68, nfs4_read_args]
++type nfs4_op_seek nfs4_op_t[69, nfs4_seek_args]
++type nfs4_op_clone nfs4_op_t[71, nfs4_clone_args]
++type nfs4_op_getxattr nfs4_op_t[72, nfs4_getxattr_args]
++type nfs4_op_setxattr nfs4_op_t[73, nfs4_setxattr_args]
++type nfs4_op_listxattrs nfs4_op_t[74, nfs4_listxattrs_args]
++type nfs4_op_removexattr nfs4_op_t[75, nfs4_removexattr_args]
++type nfs4_op_delegpurge nfs4_op_t[7, nfs4_delegpurge_args]
++type nfs4_op_openattr nfs4_op_t[19, nfs4_openattr_args]
++type nfs4_op_want_delegation nfs4_op_t[56, nfs4_want_delegation_args]
++type nfs4_op_io_advise nfs4_op_t[63, nfs4_io_advise_args]
++type nfs4_op_offload_cancel nfs4_op_t[66, nfs4_offload_cancel_args]
++type nfs4_op_illegal nfs4_op_t[10044, nfs4_null_args]
++
++nfs4_delegpurge_args {
++	clientid	int64be
++} [packed]
++
++nfs4_openattr_args {
++	createdir	int32be[0:1]
++} [packed]
++
++nfs4_want_delegation_args {
++	want	int32be
++	claim	int32be[0:3]
++} [packed]
++
++nfs4_io_advise_args {
++	stateid	nfs4_stateid
++	offset	int64be
++	count	int64be
++	hints	int32be
++} [packed]
++
++nfs4_offload_cancel_args {
++	stateid	nfs4_stateid
++} [packed]
++
++nfs4_null_args {
++	dummy	const[0, int32be]
++} [packed]
++
++nfs4_access_args {
++	access	flags[nfs3_access_flags, int32be]
++} [packed]
++
++nfs4_close_args {
++	seqid	int32be
++	stateid	nfs4_stateid
++} [packed]
++
++nfs4_commit_args {
++	offset	int64be
++	count	int32be
++} [packed]
++
++nfs4_create_args {
++	type	flags[nfs3_ftypes, int32be]
++	name	nfs4_utf8string
++} [packed]
++
++nfs4_delegreturn_args {
++	stateid	nfs4_stateid
++} [packed]
++
++nfs4_getattr_args {
++	bitmap_len	len[bitmap, int32be]
++	bitmap		array[int32be, 2:3]
++} [packed]
++
++nfs4_link_args {
++	name	nfs4_utf8string
++} [packed]
++
++nfs4_locker [
++	new_lock	nfs4_open_to_lock_owner
++	exist_lock	nfs4_exist_lock_owner
++] [varlen]
++
++nfs4_open_to_lock_owner {
++	is_new		const[1, int32be]
++	open_seqid	int32be
++	open_stateid	nfs4_stateid
++	lock_seqid	int32be
++	owner_clientid	int64be
++	owner_id_len	len[owner_id, int32be]
++	owner_id	array[int8, 0:32]
++} [packed]
++
++nfs4_exist_lock_owner {
++	is_new		const[0, int32be]
++	stateid		nfs4_stateid
++	lock_seqid	int32be
++} [packed]
++
++nfs4_lock_args {
++	type	int32be[1:4]
++	reclaim	int32be[0:1]
++	offset	int64be
++	length	int64be
++	locker	nfs4_locker
++} [packed]
++
++nfs4_lockt_args {
++	type		int32be[1:4]
++	offset		int64be
++	length		int64be
++	owner_clientid	int64be
++	owner_id_len	len[owner_id, int32be]
++	owner_id	array[int8, 16]
++} [packed]
++
++nfs4_locku_args {
++	type	int32be[1:4]
++	seqid	int32be
++	stateid	nfs4_stateid
++	offset	int64be
++	length	int64be
++} [packed]
++
++nfs4_lookup_args {
++	name	nfs4_utf8string
++} [packed]
++
++nfs4_open_flag [
++	nocreate	nfs4_open_nocreate
++	create_uncheck	nfs4_open_create_unchecked
++	create_excl	nfs4_open_create_exclusive
++] [varlen]
++
++nfs4_open_nocreate {
++	op_create	const[0, int32be]
++} [packed]
++
++nfs4_open_create_unchecked {
++	op_create	const[1, int32be]
++	how		const[0, int32be]
++	bitmap_words	const[0, int32be]
++	attr_len	const[0, int32be]
++} [packed]
++
++nfs4_open_create_exclusive {
++	op_create	const[1, int32be]
++	how		const[2, int32be]
++	verifier	int64be
++} [packed]
++
++nfs4_open_claim [
++	null_claim	nfs4_claim_null
++	prev_claim	nfs4_claim_prev
++	cur_deleg	nfs4_claim_cur_deleg
++	fh_claim	nfs4_claim_fh
++] [varlen]
++
++nfs4_claim_null {
++	claimtype	const[0, int32be]
++	file		nfs4_utf8string
++} [packed]
++
++nfs4_claim_prev {
++	claimtype	const[1, int32be]
++	deleg_type	int32be[0:2]
++} [packed]
++
++nfs4_claim_cur_deleg {
++	claimtype	const[2, int32be]
++	stateid		nfs4_stateid
++	file		nfs4_utf8string
++} [packed]
++
++nfs4_claim_fh {
++	claimtype	const[4, int32be]
++} [packed]
++
++nfs4_open_args {
++	seqid		int32be
++	share_access	flags[nfs4_share_access, int32be]
++	share_deny	flags[nfs4_share_deny, int32be]
++	owner_clientid	int64be
++	owner_id_len	len[owner_id, int32be]
++	owner_id	array[int8, 16]
++	openflag	nfs4_open_flag
++	claim		nfs4_open_claim
++} [packed]
++
++nfs4_share_access = 1, 2, 3
++nfs4_share_deny = 0, 1, 2, 3
++
++nfs4_open_confirm_args {
++	stateid	nfs4_stateid
++	seqid	int32be
++} [packed]
++
++nfs4_open_downgrade_args {
++	stateid		nfs4_stateid
++	seqid		int32be
++	share_access	flags[nfs4_share_access, int32be]
++	share_deny	flags[nfs4_share_deny, int32be]
++} [packed]
++
++nfs4_putfh_args {
++	fh	nfs_fh4
++} [packed]
++
++nfs4_read_args {
++	stateid	nfs4_stateid
++	offset	int64be
++	count	int32be
++} [packed]
++
++nfs4_readdir_args {
++	cookie		int64be
++	cookieverf	array[int8, 8]
++	dircount	int32be
++	maxcount	int32be
++	bitmap_len	len[bitmap, int32be]
++	bitmap		array[int32be, 2:3]
++} [packed]
++
++nfs4_remove_args {
++	name	nfs4_utf8string
++} [packed]
++
++nfs4_rename_args {
++	oldname	nfs4_utf8string
++	newname	nfs4_utf8string
++} [packed]
++
++nfs4_renew_args {
++	clientid	int64be
++} [packed]
++
++nfs4_secinfo_args {
++	name	nfs4_utf8string
++} [packed]
++
++nfs4_setattr_args {
++	stateid		nfs4_stateid
++	bitmap_len	len[bitmap, int32be]
++	bitmap		array[int32be, 2:3]
++	attr_len	len[attrvals, int32be]
++	attrvals	array[int8]
++} [packed]
++
++nfs4_setclientid_args {
++	verf		array[int8, 8]
++	id_len		len[id, int32be]
++	id		array[int8, 16]
++	cb_prog		const[100003, int32be]
++	cb_netid	nfs4_utf8string
++	cb_addr		nfs4_utf8string
++	cb_ident	int32be
++} [packed]
++
++nfs4_setclientid_confirm_args {
++	clientid	int64be
++	verf		array[int8, 8]
++} [packed]
++
++nfs4_verify_args {
++	bitmap_len	len[bitmap, int32be]
++	bitmap		array[int32be, 2:3]
++	attr_len	len[attrvals, int32be]
++	attrvals	array[int8]
++} [packed]
++
++nfs4_write_args {
++	stateid		nfs4_stateid
++	offset		int64be
++	stable		flags[nfs3_stable_how, int32be]
++	data_len	len[data, int32be]
++	data		array[int8]
++} [packed]
++
++nfs4_release_lockowner_args {
++	owner_clientid	int64be
++	owner_id_len	len[owner_id, int32be]
++	owner_id	array[int8, 16]
++} [packed]
++
++nfs4_backchannel_ctl_args {
++	cb_program	const[100003, int32be]
++	sec_flavor	const[0, int32be]
++} [packed]
++
++nfs4_bind_conn_to_session_args {
++	sessionid	array[int8, 16]
++	dir		int32be[0:2]
++	rdma_mode	int32be[0:1]
++} [packed]
++
++nfs4_exchange_id_args {
++	verifier	array[int8, 8]
++	owner_id_len	len[owner_id, int32be]
++	owner_id	array[int8, 16]
++	flags		flags[nfs4_exchange_id_flags, int32be]
++	state_protect	int32be[0:2]
++} [packed]
++
++nfs4_exchange_id_flags = 0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x20000, 0x40000, 0x80000
++
++nfs4_create_session_args {
++	clientid		int64be
++	seqid			int32be
++	flags			int32be
++	fore_headerpad		int32be
++	fore_maxreqsize		int32be
++	fore_maxrespsize	int32be
++	fore_maxresp_cached	int32be
++	fore_maxops		int32be
++	fore_maxreqs		int32be
++	fore_rdma_args		array[int32be, 0:1]
++	back_headerpad		int32be
++	back_maxreqsize		int32be
++	back_maxrespsize	int32be
++	back_maxresp_cached	int32be
++	back_maxops		int32be
++	back_maxreqs		int32be
++	back_rdma_args		array[int32be, 0:1]
++	cb_program		const[100003, int32be]
++	sec_parms_len		len[sec_parms, int32be]
++	sec_parms		array[int32be, 0:2]
++} [packed]
++
++nfs4_destroy_session_args {
++	sessionid	array[int8, 16]
++} [packed]
++
++nfs4_free_stateid_args {
++	stateid	nfs4_stateid
++} [packed]
++
++nfs4_get_dir_delegation_args {
++	seqid		int32be
++	stateid		nfs4_stateid
++	bitmap_len	len[bitmap, int32be]
++	bitmap		array[int32be, 2:3]
++} [packed]
++
++nfs4_getdeviceinfo_args {
++	deviceid		array[int8, 16]
++	layout_type		int32be
++	maxcount		int32be
++	notify_types_len	len[notify_types, int32be]
++	notify_types		array[int32be, 0:1]
++} [packed]
++
++nfs4_layoutcommit_args {
++	offset		int64be
++	length		int64be
++	reclaim		int32be[0:1]
++	stateid		nfs4_stateid
++	newoffset	int32be[0:1]
++	last_wr		int64be
++	time_set	int32be[0:1]
++	time_sec	int32be
++	time_nsec	int32be
++	layout_type	int32be
++} [packed]
++
++nfs4_layoutget_args {
++	signal		int32be[0:1]
++	layout_type	int32be
++	iomode		int32be[1:3]
++	offset		int64be
++	length		int64be
++	minlength	int64be
++	stateid		nfs4_stateid
++	maxcount	int32be
++} [packed]
++
++nfs4_layoutreturn_args {
++	reclaim		int32be[0:1]
++	layout_type	int32be
++	iomode		int32be[1:3]
++	return_type	int32be[1:3]
++	offset		int64be
++	length		int64be
++	stateid		nfs4_stateid
++} [packed]
++
++nfs4_secinfo_no_name_args {
++	style	int32be[0:1]
++} [packed]
++
++nfs4_sequence_args {
++	sessionid	array[int8, 16]
++	seqid		int32be[0:64]
++	slotid		int32be[0:32]
++	highest_slotid	int32be[0:32]
++	cachethis	int32be[0:1]
++} [packed]
++
++nfs4_test_stateid_args {
++	num_stateids	len[stateids, int32be]
++	stateids	array[nfs4_stateid, 1:4]
++} [packed]
++
++nfs4_destroy_clientid_args {
++	clientid	int64be
++} [packed]
++
++nfs4_reclaim_complete_args {
++	one_fs	int32be[0:1]
++} [packed]
++
++nfs4_allocate_args {
++	stateid	nfs4_stateid
++	offset	int64be
++	length	int64be
++} [packed]
++
++nfs4_copy_args {
++	src_stateid	nfs4_stateid
++	src_offset	int64be
++	dst_stateid	nfs4_stateid
++	dst_offset	int64be
++	count		int64be
++	consecutive	int32be[0:1]
++	synchronous	int32be[0:1]
++	servers_count	const[0, int32be]
++} [packed]
++
++nfs4_copy_notify_args {
++	stateid	nfs4_stateid
++	netid	nfs4_utf8string
++	addr	nfs4_utf8string
++} [packed]
++
++nfs4_deallocate_args {
++	stateid	nfs4_stateid
++	offset	int64be
++	length	int64be
++} [packed]
++
++nfs4_offload_status_args {
++	stateid	nfs4_stateid
++} [packed]
++
++nfs4_seek_args {
++	stateid	nfs4_stateid
++	offset	int64be
++	whence	int32be[0:2]
++} [packed]
++
++nfs4_clone_args {
++	src_stateid	nfs4_stateid
++	dst_stateid	nfs4_stateid
++	src_offset	int64be
++	dst_offset	int64be
++	count		int64be
++} [packed]
++
++nfs4_getxattr_args {
++	name	nfs4_utf8string
++} [packed]
++
++nfs4_setxattr_args {
++	flags	int32be[0:2]
++	name	nfs4_utf8string
++	val_len	len[val, int32be]
++	val	array[int8]
++} [packed]
++
++nfs4_listxattrs_args {
++	dircookie	int64be
++	maxcount	int32be
++} [packed]
++
++nfs4_removexattr_args {
++	name	nfs4_utf8string
++} [packed]
+diff --git a/sys/linux/socket_inet_nfs.txt.const b/sys/linux/socket_inet_nfs.txt.const
+new file mode 100644
+index 000000000..93ed94383
+--- /dev/null
++++ b/sys/linux/socket_inet_nfs.txt.const
+@@ -0,0 +1,18 @@
++# Code generated by syz-sysgen. DO NOT EDIT.
++arches = 386, amd64
++AF_INET = 2
++IPPROTO_TCP = 6
++SOCK_STREAM = 1
++SOL_TCP = 6
++TCP_SUNRPC_FUZZ = 47
++TCP_SUNRPC_FUZZ_F_CANCEL = 8
++TCP_SUNRPC_FUZZ_F_NEW = 1
++TCP_SUNRPC_FUZZ_F_NEW_FINAL = 5
++TCP_SUNRPC_FUZZ_F_RETRY = 2
++TCP_SUNRPC_FUZZ_F_RETRY_FINAL = 6
++TCP_SUNRPC_FUZZ_VERSION = 1
++__NR_connect = 386:362, amd64:42
++__NR_recvfrom = 386:371, amd64:45
++__NR_sendmsg = 386:370, amd64:46
++__NR_setsockopt = 386:366, amd64:54
++__NR_socket = 386:359, amd64:41
+-- 
+2.34.1
+

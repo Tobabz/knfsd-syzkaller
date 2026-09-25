@@ -1,0 +1,263 @@
+From d5150333098221e3fbb19c43b04f135b8931a002 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 10 Sep 2026 10:42:15 +0900
+Subject: [PATCH 01/11] sunrpc: add KCOV remote coverage support for SunRPC and
+ knfsd
+
+Enable Syzkaller to collect remote coverage from knfsd kernel threads
+handling incoming RPCs:
+1. Propagate caller KCOV common handle from rpc_init_task to rpc_task.
+2. In xprt_request_transmit, temporarily set current->kcov_handle to
+   ensure client skbs carry the KCOV handle.
+3. In svc_data_ready and svc_tcp_sock_recvmsg, extract KCOV handle from
+   peeked skb into svc_sock as soon as data arrives.
+4. In svc_udp_recvfrom and svc_tcp_recvfrom, assign rqstp->rq_kcov_handle.
+5. In svc_process and svc_process_bc, wrap request processing with
+   kcov_remote_start_common() and kcov_remote_stop(), with automatic
+   fallback to Syzkaller common handle (1) to guarantee coverage collection.
+
+diff --git a/include/linux/sunrpc/sched.h b/include/linux/sunrpc/sched.h
+index 0dbdf3722..c8f4995f6 100644
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@ -17,6 +17,7 @@
+ #include <linux/wait_bit.h>
+ #include <linux/workqueue.h>
+ #include <linux/sunrpc/xdr.h>
++#include <linux/kcov.h>
+ 
+ /*
+  * This is the actual RPC procedure call info.
+@@ -99,6 +100,9 @@ struct rpc_task {
+ 	unsigned char		tk_priority : 2,/* Task priority */
+ 				tk_garb_retry : 2,
+ 				tk_cred_retry : 2;
++#ifdef CONFIG_KCOV
++	struct kcov_common_handle_id tk_kcov_handle;
++#endif
+ };
+ 
+ typedef void			(*rpc_action)(struct rpc_task *);
+diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
+index 2db1b9ec5..824e4b5ee 100644
+--- a/include/linux/sunrpc/svc.h
++++ b/include/linux/sunrpc/svc.h
+@@ -22,6 +22,7 @@
+ #include <linux/mm.h>
+ #include <linux/folio_batch.h>
+ #include <linux/kthread.h>
++#include <linux/kcov.h>
+ 
+ /*
+  *
+@@ -257,6 +258,9 @@ struct svc_rqst {
+ 	struct net		*rq_bc_net;	/* pointer to backchannel's
+ 						 * net namespace
+ 						 */
++#ifdef CONFIG_KCOV
++	struct kcov_common_handle_id rq_kcov_handle;
++#endif
+ 
+ 	int			rq_err;		/* Thread sets this to inidicate
+ 						 * initialisation success.
+diff --git a/include/linux/sunrpc/svcsock.h b/include/linux/sunrpc/svcsock.h
+index 372a00882..d9d5137f4 100644
+--- a/include/linux/sunrpc/svcsock.h
++++ b/include/linux/sunrpc/svcsock.h
+@@ -43,6 +43,10 @@ struct svc_sock {
+ 
+ 	struct completion	sk_handshake_done;
+ 
++#ifdef CONFIG_KCOV
++	struct kcov_common_handle_id sk_kcov_handle;
++#endif
++
+ 	/* received data */
+ 	unsigned long		sk_maxpages;
+ 	struct page *		sk_pages[] __counted_by(sk_maxpages);
+diff --git a/net/sunrpc/sched.c b/net/sunrpc/sched.c
+index 016f16ca5..28a098245 100644
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@ -1121,6 +1121,10 @@ static void rpc_init_task(struct rpc_task *task, const struct rpc_task_setup *ta
+ 	if (task->tk_ops->rpc_call_prepare != NULL)
+ 		task->tk_action = rpc_prepare_task;
+ 
++#ifdef CONFIG_KCOV
++	task->tk_kcov_handle = kcov_common_handle();
++#endif
++
+ 	rpc_init_task_statistics(task);
+ }
+ 
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index 8297bad2b..ddc1c4a8b 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -30,6 +30,7 @@
+ #include <linux/sunrpc/bc_xprt.h>
+ 
+ #include <trace/events/sunrpc.h>
++#include <linux/kcov.h>
+ 
+ #include "fail.h"
+ #include "sunrpc.h"
+@@ -1647,6 +1648,13 @@ void svc_process(struct svc_rqst *rqstp)
+ 	struct kvec		*resv = &rqstp->rq_res.head[0];
+ 	__be32 *p;
+ 
++#ifdef CONFIG_KCOV
++	struct kcov_common_handle_id kcov_id = rqstp->rq_kcov_handle;
++	if (!kcov_id.val)
++		kcov_id.val = 1;
++	kcov_remote_start_common(kcov_id);
++#endif
++
+ #if IS_ENABLED(CONFIG_FAIL_SUNRPC)
+ 	if (!fail_sunrpc.ignore_server_disconnect &&
+ 	    should_fail(&fail_sunrpc.attr, 1))
+@@ -1685,7 +1693,7 @@ void svc_process(struct svc_rqst *rqstp)
+ 	}
+ 	svc_send(rqstp);
+ 	svc_release_rqst(rqstp);
+-	return;
++	goto out_kcov;
+ 
+ out_baddir:
+ 	svc_printk(rqstp, "bad direction 0x%08x, dropping request\n",
+@@ -1694,6 +1702,11 @@ void svc_process(struct svc_rqst *rqstp)
+ 		rqstp->rq_server->sv_stats->rpcbadfmt++;
+ out_drop:
+ 	svc_drop(rqstp);
++out_kcov:
++#ifdef CONFIG_KCOV
++	kcov_remote_stop();
++	rqstp->rq_kcov_handle.val = 0;
++#endif
+ }
+ 
+ #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+@@ -1746,8 +1759,14 @@ void svc_process_bc(struct rpc_rqst *req, struct svc_rqst *rqstp)
+ 	if (!xdr_inline_decode(&rqstp->rq_arg_stream, XDR_UNIT * 2))
+ 		return;
+ 
++#ifdef CONFIG_KCOV
++	kcov_remote_start_common((struct kcov_common_handle_id){ .val = 1 });
++#endif
+ 	/* Parse and execute the bc call */
+ 	proc_error = svc_process_common(rqstp);
++#ifdef CONFIG_KCOV
++	kcov_remote_stop();
++#endif
+ 
+ 	atomic_dec(&req->rq_xprt->bc_slot_count);
+ 	if (!proc_error) {
+diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
+index 50e5e7f5b..a7f7d34aa 100644
+--- a/net/sunrpc/svcsock.c
++++ b/net/sunrpc/svcsock.c
+@@ -303,6 +303,17 @@ svc_tcp_sock_recvmsg(struct svc_sock *svsk, struct msghdr *msg)
+ 	int ret;
+ 	struct socket *sock = svsk->sk_sock;
+ 
++#ifdef CONFIG_KCOV
++	if (sock && sock->sk) {
++		struct sk_buff *skb = skb_peek(&sock->sk->sk_receive_queue);
++		if (skb) {
++			struct kcov_common_handle_id h = skb_get_kcov_handle(skb);
++			if (h.val)
++				svsk->sk_kcov_handle = h;
++		}
++	}
++#endif
++
+ 	ret = sock_recvmsg(sock, msg, MSG_DONTWAIT);
+ 	if (msg->msg_flags & MSG_CTRUNC) {
+ 		msg->msg_flags &= ~(MSG_CTRUNC | MSG_EOR);
+@@ -407,6 +418,16 @@ static void svc_data_ready(struct sock *sk)
+ 	if (svsk) {
+ 		/* Refer to svc_setup_socket() for details. */
+ 		rmb();
++#ifdef CONFIG_KCOV
++		if (sk) {
++			struct sk_buff *skb = skb_peek(&sk->sk_receive_queue);
++			if (skb) {
++				struct kcov_common_handle_id h = skb_get_kcov_handle(skb);
++				if (h.val)
++					svsk->sk_kcov_handle = h;
++			}
++		}
++#endif
+ 		svsk->sk_odata(sk);
+ 		trace_svcsock_data_ready(&svsk->sk_xprt, 0);
+ 		if (test_bit(XPT_HANDSHAKE, &svsk->sk_xprt.xpt_flags))
+@@ -645,6 +666,10 @@ static int svc_udp_recvfrom(struct svc_rqst *rqstp)
+ 	if (!skb)
+ 		goto out_recv_err;
+ 
++#ifdef CONFIG_KCOV
++	rqstp->rq_kcov_handle = skb_get_kcov_handle(skb);
++#endif
++
+ 	len = svc_addr_len(svc_addr(rqstp));
+ 	rqstp->rq_addrlen = len;
+ 	if (skb->tstamp == 0) {
+@@ -971,6 +996,16 @@ static struct svc_xprt *svc_tcp_accept(struct svc_xprt *xprt)
+ 				 (SVC_SOCK_ANONYMOUS | SVC_SOCK_TEMPORARY));
+ 	if (IS_ERR(newsvsk))
+ 		goto failed;
++#ifdef CONFIG_KCOV
++	if (newsock && newsock->sk) {
++		struct sk_buff *skb = skb_peek(&newsock->sk->sk_receive_queue);
++		if (skb) {
++			struct kcov_common_handle_id h = skb_get_kcov_handle(skb);
++			if (h.val)
++				newsvsk->sk_kcov_handle = h;
++		}
++	}
++#endif
+ 	svc_xprt_set_remote(&newsvsk->sk_xprt, sin, slen);
+ 	err = kernel_getsockname(newsock, sin);
+ 	slen = err;
+@@ -1190,6 +1225,10 @@ static int svc_tcp_recvfrom(struct svc_rqst *rqstp)
+ 
+ 	rqstp->rq_xprt_ctxt   = NULL;
+ 	rqstp->rq_prot	      = IPPROTO_TCP;
++
++#ifdef CONFIG_KCOV
++	rqstp->rq_kcov_handle = svsk->sk_kcov_handle;
++#endif
+ 	if (test_bit(XPT_LOCAL, &svsk->sk_xprt.xpt_flags))
+ 		set_bit(RQ_LOCAL, &rqstp->rq_flags);
+ 	else
+diff --git a/net/sunrpc/xprt.c b/net/sunrpc/xprt.c
+index 48a3618cb..7c248f68e 100644
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@ -53,6 +53,7 @@
+ #include <linux/sched/mm.h>
+ 
+ #include <trace/events/sunrpc.h>
++#include <linux/kcov.h>
+ 
+ #include "sunrpc.h"
+ #include "sysfs.h"
+@@ -1575,7 +1576,15 @@ xprt_request_transmit(struct rpc_rqst *req, struct rpc_task *snd_task)
+ 
+ 	trace_rpc_xdr_sendto(task, &req->rq_snd_buf);
+ 	connect_cookie = xprt->connect_cookie;
++#ifdef CONFIG_KCOV
++	u64 saved_kcov_handle = current->kcov_handle;
++	if (!current->kcov_handle && task->tk_kcov_handle.val)
++		current->kcov_handle = task->tk_kcov_handle.val;
++#endif
+ 	status = xprt->ops->send_request(req);
++#ifdef CONFIG_KCOV
++	current->kcov_handle = saved_kcov_handle;
++#endif
+ 	if (status != 0) {
+ 		req->rq_ntrans--;
+ 		trace_xprt_transmit(req, status);
+-- 
+2.34.1
+

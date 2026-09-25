@@ -1,0 +1,42 @@
+From 4e2345ff7cc70c65e0d5f5a6dd45ea372bd44725 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 12:21:38 +0900
+Subject: [PATCH 12/15] tools/execprog: timestamp coverage samples
+
+
+diff --git a/tools/syz-execprog/execprog.go b/tools/syz-execprog/execprog.go
+index f0228ae82..a98365c48 100644
+--- a/tools/syz-execprog/execprog.go
++++ b/tools/syz-execprog/execprog.go
+@@ -163,6 +163,7 @@ func main() {
+ 		hints:     *flagHints,
+ 		stress:    *flagStress,
+ 		repeat:    *flagRepeat,
++		startedAt: time.Now(),
+ 		defaultOpts: flatrpc.ExecOpts{
+ 			EnvFlags:   env,
+ 			ExecFlags:  exec,
+@@ -222,6 +223,7 @@ type Context struct {
+ 	completed   atomic.Uint64
+ 	resultIndex atomic.Int64
+ 	lastPrint   time.Time
++	startedAt   time.Time
+ }
+ 
+ func (ctx *Context) machineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) queue.Source {
+@@ -381,6 +383,12 @@ func (ctx *Context) dumpCoverage(info *flatrpc.ProgInfo) {
+ 		log.Logf(0, "extra: signal %v, coverage %v", len(info.Extra.Signal), len(info.Extra.Cover))
+ 		ctx.dumpCallCoverage(fmt.Sprintf("%v.extra", coverFile), info.Extra)
+ 	}
++	now := time.Now()
++	metadata := fmt.Sprintf("completed_unix_nano %d\nelapsed_nano %d\n",
++		now.UnixNano(), now.Sub(ctx.startedAt).Nanoseconds())
++	if err := osutil.WriteFile(coverFile+".meta", []byte(metadata)); err != nil {
++		log.Fatalf("failed to write coverage metadata: %v", err)
++	}
+ }
+ 
+ func (ctx *Context) getProgramIndex() int {
+-- 
+2.34.1
+

@@ -1,0 +1,90 @@
+From fb9dfbea2a646c9d6090274f3aaa040a7f7eedcf Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Wed, 16 Sep 2026 22:23:27 +0900
+Subject: [PATCH 05/15] executor: publish managed remote coverage before fd
+ cleanup
+
+
+diff --git a/executor/executor.cc b/executor/executor.cc
+index 167a6edf3..a2cf2b27e 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -1203,8 +1203,8 @@ void execute_one()
+ 		uint64 generation = remote_generation.load(std::memory_order_acquire);
+ 		if (generation) {
+ 			// FINISH performs the bounded kernel-side root/token drain.  It is the
+-			// publication barrier for remote extra coverage.  This must happen
+-			// before close_fds(), which closes kExtraCoverFd as well.
++			// publication barrier for remote extra coverage and synchronously
++			// materializes the committed snapshot before userspace consumes it.
+ 			bool finished = cover_finish_remote_generation(generation, 1000 * slowdown_scale);
+ 			valid = finished && valid;
+ 			generation_resolved = finished;
+@@ -1220,12 +1220,19 @@ void execute_one()
+ 			output_data->kcov_generation.store(0, std::memory_order_release);
+ 	}
+ 
++	// FINISH has synchronously copied the committed generation aggregate into
++	// extra_cov. Consume that snapshot before close_fds(), which intentionally
++	// triggers legacy USB remote coverage that does not belong to this
++	// Generation. Preserve close-before-collect for unmanaged extra coverage.
++	if (remote_generation_managed)
++		write_extra_output();
++
+ #if SYZ_HAVE_CLOSE_FDS
+ 	close_fds();
+ #endif
+ 
+-	write_extra_output();
+ 	if (flag_extra_coverage && !remote_generation_managed) {
++		write_extra_output();
+ 		// Check for new extra coverage in small intervals to avoid situation
+ 		// that we were killed on timeout before we write any.
+ 		// Check for extra coverage is very cheap, effectively a memory load.
+diff --git a/executor/generation_publication_test.go b/executor/generation_publication_test.go
+new file mode 100644
+index 000000000..8ea9ac81b
+--- /dev/null
++++ b/executor/generation_publication_test.go
+@@ -0,0 +1,38 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package executor
++
++import (
++	"bytes"
++	"os"
++	"testing"
++)
++
++func TestGenerationPublicationPrecedesFDCleanup(t *testing.T) {
++	source, err := os.ReadFile("executor.cc")
++	if err != nil {
++		t.Fatal(err)
++	}
++	start := bytes.Index(source, []byte("void execute_one()"))
++	if start < 0 {
++		t.Fatal("failed to locate execute_one")
++	}
++	end := bytes.Index(source[start:], []byte("thread_t* schedule_call"))
++	if end < 0 {
++		t.Fatal("failed to locate end of execute_one")
++	}
++	body := source[start : start+end]
++	finish := bytes.Index(body, []byte("cover_finish_remote_generation(generation"))
++	managed := bytes.Index(body, []byte("if (remote_generation_managed)\n\t\twrite_extra_output();"))
++	close := bytes.Index(body, []byte("close_fds();"))
++	unmanaged := bytes.Index(body, []byte("if (flag_extra_coverage && !remote_generation_managed) {\n\t\twrite_extra_output();"))
++	if finish < 0 || managed < 0 || close < 0 || unmanaged < 0 {
++		t.Fatalf("missing publication markers: finish=%d managed=%d close=%d unmanaged=%d",
++			finish, managed, close, unmanaged)
++	}
++	if !(finish < managed && managed < close && close < unmanaged) {
++		t.Fatalf("bad publication order: finish=%d managed=%d close=%d unmanaged=%d",
++			finish, managed, close, unmanaged)
++	}
++}
+-- 
+2.34.1
+

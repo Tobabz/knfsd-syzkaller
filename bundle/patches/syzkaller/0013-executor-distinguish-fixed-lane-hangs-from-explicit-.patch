@@ -1,0 +1,55 @@
+From b15d0c8ed683681f61fa20162fa5b327ab89ea36 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Fri, 18 Sep 2026 11:19:01 +0900
+Subject: [PATCH 13/15] executor: distinguish fixed-lane hangs from explicit
+ failures
+
+
+diff --git a/executor/executor_runner.h b/executor/executor_runner.h
+index d464e460c..231c9b87e 100644
+--- a/executor/executor_runner.h
++++ b/executor/executor_runner.h
+@@ -298,7 +298,12 @@ private:
+ 				while (ReadOutput())
+ 					;
+ 			}
+-			bool hanged = SYZ_EXECUTOR_USES_FORK_SERVER && state_ == State::Executing;
++			// kFailStatus is an explicit executor failure (feature probes use it
++			// with ReturnError), not evidence that an execution remains alive and
++			// pins its proc-scoped lane.  Only an unexpectedly terminated executing
++			// subprocess needs fixed-lane hang recovery.
++			bool hanged = SYZ_EXECUTOR_USES_FORK_SERVER &&
++			      state_ == State::Executing && status != kFailStatus;
+ 			HandleCompletion(status, hanged);
+ 			if (hanged) {
+ 				// A Frozen NFS attribution fixture gives every proc id one
+diff --git a/executor/lane_hang_test.go b/executor/lane_hang_test.go
+new file mode 100644
+index 000000000..2b6dc4cf0
+--- /dev/null
++++ b/executor/lane_hang_test.go
+@@ -0,0 +1,21 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package executor
++
++import (
++	"bytes"
++	"os"
++	"testing"
++)
++
++func TestFixedLaneDoesNotTreatExplicitFailureAsHang(t *testing.T) {
++	source, err := os.ReadFile("executor_runner.h")
++	if err != nil {
++		t.Fatal(err)
++	}
++	condition := []byte("state_ == State::Executing && status != kFailStatus")
++	if !bytes.Contains(source, condition) {
++		t.Fatalf("fixed-lane hang test does not exclude explicit kFailStatus")
++	}
++}
+-- 
+2.34.1
+

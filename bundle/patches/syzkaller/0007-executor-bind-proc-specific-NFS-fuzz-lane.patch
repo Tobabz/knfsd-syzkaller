@@ -1,0 +1,74 @@
+From a163718b6269b7fe565339690add52f93df3a5a5 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 10:21:59 +0900
+Subject: [PATCH 07/15] executor: bind proc-specific NFS fuzz lane
+
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index f9b1e7a9d..6d4c1e0ca 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -4340,6 +4340,49 @@ static void initialize_cgroups()
+ static void setup_gadgetfs();
+ static void setup_binderfs();
+ static void setup_fusectl();
++#if SYZ_EXECUTOR
++// Bind the NFS fuzz lane selected by the executor handshake into the sandbox.
++// The fixture deliberately keeps /syz-nfs-lanes itself outside of newroot, so
++// a program can reach only the proc-specific lane selected here.
++static void setup_nfs_fuzz_lane(const char* newroot)
++{
++	const char* enabled = "/syz-nfs-lanes/enabled";
++	if (access(enabled, F_OK)) {
++		if (errno == ENOENT)
++			return;
++		failmsg("access NFS fuzz lane enable marker failed", "path=%s", enabled);
++	}
++
++	char source[128];
++	char marker[160];
++	char expected[32];
++	char actual[32] = {};
++	if (snprintf(source, sizeof(source), "/syz-nfs-lanes/proc-%llu", procid) >= (int)sizeof(source))
++		fail("NFS fuzz lane source path is too long");
++	if (snprintf(marker, sizeof(marker), "%s/.lane_id", source) >= (int)sizeof(marker))
++		fail("NFS fuzz lane marker path is too long");
++	int expected_len = snprintf(expected, sizeof(expected), "%llu\n", procid);
++	if (expected_len <= 0 || expected_len >= (int)sizeof(expected))
++		fail("NFS fuzz lane id is too long");
++
++	int marker_fd = open(marker, O_RDONLY);
++	if (marker_fd == -1)
++		failmsg("open NFS fuzz lane marker failed", "path=%s", marker);
++	ssize_t marker_len = read(marker_fd, actual, sizeof(actual));
++	close(marker_fd);
++	if (marker_len != expected_len || memcmp(actual, expected, expected_len))
++		failmsg("NFS fuzz lane marker mismatch", "proc=%llu", procid);
++
++	char target[128];
++	if (snprintf(target, sizeof(target), "%s/nfs-lane", newroot) >= (int)sizeof(target))
++		fail("NFS fuzz lane target path is too long");
++	if (mkdir(target, 0700))
++		failmsg("mkdir NFS fuzz lane target failed", "path=%s", target);
++	if (mount(source, target, NULL, MS_BIND | MS_REC, NULL))
++		failmsg("mount NFS fuzz lane failed", "proc=%llu", procid);
++	debug("NFS fuzz lane bound: proc=%llu source=%s target=/nfs-lane\n", procid, source);
++}
++#endif
+ // Mount tmpfs and chroot into it in sandbox=none and sandbox=namespace.
+ // This is to prevent persistent changes to the root file system (e.g. setting attributes) that may
+ // hinder fuzzing.
+@@ -4394,6 +4437,10 @@ static void sandbox_common_mount_tmpfs(void)
+ 	if (mount("/syz-inputs", "./syz-tmp/newroot/syz-inputs", NULL, bind_mount_flags | MS_RDONLY, NULL) && errno != ENOENT)
+ 		fail("mount(syz-inputs) failed");
+ 
++#if SYZ_EXECUTOR
++	setup_nfs_fuzz_lane("./syz-tmp/newroot");
++#endif
++
+ #if SYZ_EXECUTOR || SYZ_CGROUPS
+ 	initialize_cgroups();
+ #endif
+-- 
+2.34.1
+

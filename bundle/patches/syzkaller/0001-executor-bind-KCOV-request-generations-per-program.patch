@@ -1,0 +1,306 @@
+From 56191f00761b38f35e92e17f1233c60f16cc98f6 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Wed, 16 Sep 2026 20:04:06 +0900
+Subject: [PATCH 01/15] executor: bind KCOV request generations per program
+
+
+diff --git a/executor/common.h b/executor/common.h
+index e7e02ffb2..83a7b0ffa 100644
+--- a/executor/common.h
++++ b/executor/common.h
+@@ -79,7 +79,7 @@ static unsigned long long procid;
+ #include <signal.h>
+ #include <string.h>
+ 
+-#if GOOS_linux
++#if SYZ_EXECUTOR && GOOS_linux
+ #include <sys/syscall.h>
+ #endif
+ 
+@@ -729,9 +729,29 @@ static void loop(void)
+ 				continue;
+ #endif
+ 			debug("killing hanging pid %d\n", pid);
++#if GOOS_linux
++			// The KCOV fd is inherited from this fork-server process.  The child
++			// publishes its exact generation in shared output memory immediately
++			// after BEGIN, which lets the watchdog close the attribution window
++			// before killing an unresponsive child.
++			uint64 orphan_generation = output_data->kcov_generation.load(std::memory_order_acquire);
++			if (orphan_generation) {
++				cover_abort_remote_generation(orphan_generation, true);
++				output_data->kcov_generation.store(0, std::memory_order_release);
++			}
++#endif
+ 			kill_and_wait(pid, &status);
+ 			break;
+ 		}
++#if SYZ_EXECUTOR && GOOS_linux
++		// Also cover crashes/exits between BEGIN and FINISH.  Normal completion
++		// clears this slot with a release store before the child exits.
++		uint64 orphan_generation = output_data->kcov_generation.load(std::memory_order_acquire);
++		if (orphan_generation) {
++			cover_abort_remote_generation(orphan_generation, true);
++			output_data->kcov_generation.store(0, std::memory_order_release);
++		}
++#endif
+ #if SYZ_EXECUTOR
+ 		if (WEXITSTATUS(status) == kFailStatus) {
+ 			errno = 0;
+diff --git a/executor/executor.cc b/executor/executor.cc
+index c7d58adc4..858360e27 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -111,6 +111,9 @@ void debug_dump_data(const char* data, int length);
+ static void receive_execute();
+ static void reply_execute(uint32 status);
+ static void receive_handshake();
++#if GOOS_linux
++static bool cover_abort_remote_generation(uint64 generation, bool best_effort);
++#endif
+ 
+ #if SYZ_EXECUTOR_USES_FORK_SERVER
+ static void SnapshotPrepareParent();
+@@ -146,6 +149,10 @@ struct alignas(8) OutputData {
+ 	std::atomic<uint32> consumed;
+ 	std::atomic<uint32> completed;
+ 	std::atomic<uint32> num_calls;
++	// Exact KCOV request-attribution generation owned by the executing child.
++	// This lives in shared memory so the fork-server watchdog can abort a
++	// generation left behind by a killed child.
++	std::atomic<uint64> kcov_generation;
+ 	std::atomic<flatbuffers::Offset<flatbuffers::Vector<uint8_t>>> result_offset;
+ 	struct {
+ 		// Call index in the test program (they may be out-of-order is some syscalls block).
+@@ -160,6 +167,7 @@ struct alignas(8) OutputData {
+ 		consumed.store(0, std::memory_order_relaxed);
+ 		completed.store(0, std::memory_order_relaxed);
+ 		num_calls.store(0, std::memory_order_relaxed);
++		kcov_generation.store(0, std::memory_order_relaxed);
+ 		result_offset.store(0, std::memory_order_relaxed);
+ 	}
+ };
+@@ -263,6 +271,13 @@ static bool flag_sandbox_setuid;
+ static bool flag_sandbox_namespace;
+ static bool flag_sandbox_android;
+ static bool flag_extra_coverage;
++// The extra KCOV fd owns the kernel-side Generation.  These variables only
++// describe the single program currently executing in this process.
++static std::atomic<uint64> remote_generation;
++static std::atomic<bool> remote_generation_bind_failed;
++static bool remote_generation_managed;
++static bool remote_generation_publishable;
++static bool remote_generation_published;
+ static bool flag_net_injection;
+ static bool flag_net_devices;
+ static bool flag_net_reset;
+@@ -961,12 +976,33 @@ void execute_one()
+ 	output_builder.emplace(output_data, output_size, !flag_snapshot);
+ 	uint64 start = current_time_ms();
+ 	uint8* input_pos = input_data;
++	remote_generation_managed = false;
++	remote_generation_publishable = false;
++	remote_generation_published = false;
++	remote_generation.store(0, std::memory_order_relaxed);
++	output_data->kcov_generation.store(0, std::memory_order_relaxed);
+ 
+ 	if (cover_collection_required()) {
+ 		if (!flag_threaded)
+ 			cover_enable(&threads[0].cov, flag_comparisons, false);
+-		if (flag_extra_coverage)
++		// Extra comparison coverage is not consumed by the fuzzer.  Keep the
++		// request-attribution ABI disabled for comparison-only executions just
++		// as write_extra_output() is disabled for them.
++		if (flag_extra_coverage && !flag_comparisons) {
+ 			cover_reset(&extra_cov);
++			remote_generation_managed = true;
++			remote_generation_publishable = false;
++			remote_generation_published = false;
++			remote_generation_bind_failed.store(false, std::memory_order_relaxed);
++#if GOOS_linux
++			uint64 generation = cover_begin_remote_generation();
++			remote_generation.store(generation, std::memory_order_release);
++			if (!generation)
++				remote_generation_bind_failed.store(true, std::memory_order_release);
++			// Publish only after BEGIN has completely initialized the kernel object.
++			output_data->kcov_generation.store(generation, std::memory_order_release);
++#endif
++		}
+ 	}
+ 
+ 	int call_index = 0;
+@@ -1164,8 +1200,26 @@ void execute_one()
+ 	close_fds();
+ #endif
+ 
++	if (remote_generation_managed) {
++		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
++#if GOOS_linux
++		uint64 generation = remote_generation.load(std::memory_order_acquire);
++		if (generation) {
++			// FINISH performs the bounded kernel-side root/token drain.  It is the
++			// publication barrier for remote extra coverage.
++			valid = cover_finish_remote_generation(generation, 1000 * slowdown_scale) && valid;
++			if (!valid)
++				cover_abort_remote_generation(generation, false);
++		}
++#endif
++		remote_generation_publishable = valid;
++		remote_generation.store(0, std::memory_order_release);
++		// A zero value tells the fork-server parent no orphan cleanup is needed.
++		output_data->kcov_generation.store(0, std::memory_order_release);
++	}
++
+ 	write_extra_output();
+-	if (flag_extra_coverage) {
++	if (flag_extra_coverage && !remote_generation_managed) {
+ 		// Check for new extra coverage in small intervals to avoid situation
+ 		// that we were killed on timeout before we write any.
+ 		// Check for extra coverage is very cheap, effectively a memory load.
+@@ -1449,10 +1503,20 @@ void write_extra_output()
+ {
+ 	if (!cover_collection_required() || !flag_extra_coverage || flag_comparisons)
+ 		return;
++	// Generation-scoped remote coverage is quarantined until FINISH succeeds.
++	// In particular, handle_completion() must never publish a partial window.
++	if (remote_generation_managed &&
++	    (!remote_generation_publishable || remote_generation_published))
++		return;
+ 	cover_collect(&extra_cov);
+-	if (!extra_cov.size)
++	if (!extra_cov.size) {
++		if (remote_generation_managed)
++			remote_generation_published = true;
+ 		return;
++	}
+ 	write_output(-1, &extra_cov, rpc::CallFlag::NONE, 997, all_extra_signal);
++	if (remote_generation_managed)
++		remote_generation_published = true;
+ 	cover_reset(&extra_cov);
+ }
+ 
+@@ -1565,12 +1629,28 @@ void execute_call(thread_t* th)
+ 
+ 	if (cover_collection_required())
+ 		cover_reset(&th->cov);
++
++#if GOOS_linux
++	// Workers are persistent within a program and across snapshot restores.
++	// Bind the exact generation immediately before every program syscall; a
++	// zero generation explicitly clears stale state after snapshot restore or a
++	// failed BEGIN.  Never infer it from the kernel's currently active handle.
++	uint64 generation = remote_generation.load(std::memory_order_acquire);
++	if (flag_extra_coverage && !cover_bind_remote_generation(generation))
++		remote_generation_bind_failed.store(true, std::memory_order_release);
++#endif
+ 	// For pseudo-syscalls and user-space functions NONFAILING can abort before assigning to th->res.
+ 	// Arrange for res = -1 and errno = EFAULT result for such case.
+ 	th->res = -1;
+ 	errno = EFAULT;
+ 	NONFAILING(th->res = execute_syscall(call, th->args));
+ 	th->reserrno = errno;
++#if GOOS_linux
++	// Do not let executor event/futex bookkeeping inherit a program owner.  A
++	// zero-generation BIND is the kernel ABI's explicit unbind operation.
++	if (flag_extra_coverage && !cover_bind_remote_generation(0))
++		remote_generation_bind_failed.store(true, std::memory_order_release);
++#endif
+ 	// Our pseudo-syscalls may misbehave.
+ 	if ((th->res == -1 && th->reserrno == 0) || call->attrs.ignore_return)
+ 		th->reserrno = EINVAL;
+diff --git a/executor/executor_linux.h b/executor/executor_linux.h
+index cb23350d5..5a803fee8 100644
+--- a/executor/executor_linux.h
++++ b/executor/executor_linux.h
+@@ -82,12 +82,23 @@ struct kcov_remote_arg {
+ 	uint64 handles[N];
+ };
+ 
++struct kcov_remote_generation {
++	uint64 generation;
++	uint32 timeout_ms;
++	uint32 flags;
++};
++static_assert(sizeof(kcov_remote_generation) == 16);
++
+ #define KCOV_INIT_TRACE32 _IOR('c', 1, uint32)
+ #define KCOV_INIT_TRACE64 _IOR('c', 1, uint64)
+ #define KCOV_ENABLE _IO('c', 100)
+ #define KCOV_DISABLE _IO('c', 101)
+ #define KCOV_REMOTE_ENABLE _IOW('c', 102, kcov_remote_arg<0>)
+ #define KCOV_RESET_TRACE _IO('c', 104)
++#define KCOV_REMOTE_GENERATION_BEGIN _IOWR('c', 109, kcov_remote_generation)
++#define KCOV_REMOTE_GENERATION_BIND _IOW('c', 110, kcov_remote_generation)
++#define KCOV_REMOTE_GENERATION_FINISH _IOW('c', 111, kcov_remote_generation)
++#define KCOV_REMOTE_GENERATION_ABORT _IOW('c', 112, kcov_remote_generation)
+ 
+ #define KCOV_SUBSYSTEM_COMMON (0x00ull << 56)
+ #define KCOV_SUBSYSTEM_USB (0x01ull << 56)
+@@ -254,6 +265,64 @@ static void cover_enable(cover_t* cov, bool collect_comps, bool extra)
+ 	cov->enabled = true;
+ }
+ 
++static uint64 cover_begin_remote_generation()
++{
++	kcov_remote_generation arg = {};
++	if (ioctl(extra_cov.fd, KCOV_REMOTE_GENERATION_BEGIN, &arg)) {
++		// Instrumentation admission must not prevent the real program from
++		// running.  The caller suppresses remote extra while preserving normal
++		// per-call coverage.
++		debug("KCOV generation begin failed: errno=%d\n", errno);
++		return 0;
++	}
++	if (!arg.generation) {
++		debug("KCOV generation begin returned generation zero\n");
++		return 0;
++	}
++	return arg.generation;
++}
++
++static bool cover_bind_remote_generation(uint64 generation)
++{
++	kcov_remote_generation arg = {
++	    .generation = generation,
++	};
++	if (!ioctl(extra_cov.fd, KCOV_REMOTE_GENERATION_BIND, &arg))
++		return true;
++	// Attribution failure must not change whether the real syscall executes.
++	debug("KCOV generation bind failed: generation=%llu errno=%d\n", generation, errno);
++	return false;
++}
++
++static bool cover_finish_remote_generation(uint64 generation, uint64 timeout_ms)
++{
++	kcov_remote_generation arg = {
++	    .generation = generation,
++	    // The downstream ABI intentionally bounds one FINISH drain at 5s.
++	    .timeout_ms = timeout_ms > 5000 ? 5000 : (uint32)timeout_ms,
++	};
++	if (!ioctl(extra_cov.fd, KCOV_REMOTE_GENERATION_FINISH, &arg))
++		return true;
++	debug("KCOV generation finish failed: generation=%llu errno=%d\n", generation, errno);
++	return false;
++}
++
++// best_effort is used by the fork-server watchdog after an executing child was
++// killed.  Such cleanup must not turn a target hang into an executor failure.
++static bool cover_abort_remote_generation(uint64 generation, bool best_effort)
++{
++	if (!generation)
++		return true;
++	kcov_remote_generation arg = {
++	    .generation = generation,
++	};
++	if (!ioctl(extra_cov.fd, KCOV_REMOTE_GENERATION_ABORT, &arg))
++		return true;
++	if (!best_effort)
++		debug("KCOV generation abort failed: generation=%llu errno=%d\n", generation, errno);
++	return false;
++}
++
+ static void cover_reset(cover_t* cov)
+ {
+ 	// Callers in common_linux.h don't check this flag.
+-- 
+2.34.1
+

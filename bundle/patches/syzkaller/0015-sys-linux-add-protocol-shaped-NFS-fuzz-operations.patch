@@ -1,0 +1,905 @@
+From b59716d550514ce5174910d6df9b8a391659ed11 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Fri, 18 Sep 2026 15:55:46 +0900
+Subject: [PATCH 15/15] sys/linux: add protocol-shaped NFS fuzz operations
+
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 295ca84b6..55a7e93f4 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2824,6 +2824,123 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+ #include "common_usb_linux.h"
+ #endif
+ 
++#if SYZ_EXECUTOR || __NR_syz_open_nfs_lane || __NR_syz_socket_connect_nfs || \
++    __NR_syz_send_nfs_fuzz
++#include <fcntl.h>
++#include <sched.h>
++#include <stdio.h>
++#include <sys/socket.h>
++
++static int nfs_fuzz_netns_fds[2] = {-1, -1};
++static uint32 nfs_fuzz_server_addrs[2];
++
++static long syz_open_nfs_lane(volatile long a0)
++{
++	// syz_open_nfs_lane(client const[0:1]) fd_nfs_dir
++	unsigned long client = a0;
++	if (client > 1) {
++		errno = EINVAL;
++		return -1;
++	}
++	char path[32];
++	int len = snprintf(path, sizeof(path), "/nfs-lane/client%lu", client);
++	if (len <= 0 || len >= (int)sizeof(path)) {
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++}
++
++static long syz_socket_connect_nfs(volatile long a0)
++{
++	// syz_socket_connect_nfs(client const[0:1]) sock_nfs_fuzz_tcp
++	unsigned long client = a0;
++	if (client > 1 || nfs_fuzz_netns_fds[client] < 0 ||
++	    !nfs_fuzz_server_addrs[client]) {
++		errno = ENODEV;
++		return -1;
++	}
++
++	int current_netns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
++	if (current_netns < 0)
++		return -1;
++	if (setns(nfs_fuzz_netns_fds[client], CLONE_NEWNET)) {
++		int saved_errno = errno;
++		close(current_netns);
++		errno = saved_errno;
++		return -1;
++	}
++
++	int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
++	int saved_errno = 0;
++	if (fd < 0)
++		saved_errno = errno;
++	if (fd >= 0) {
++		int enabled = 1;
++		if (setsockopt(fd, IPPROTO_TCP, 47, &enabled, sizeof(enabled))) {
++			saved_errno = errno;
++			close(fd);
++			fd = -1;
++		} else {
++			struct sockaddr_in addr = {};
++			addr.sin_family = AF_INET;
++			addr.sin_port = htons(2049);
++			addr.sin_addr.s_addr = nfs_fuzz_server_addrs[client];
++			if (connect(fd, (struct sockaddr*)&addr, sizeof(addr))) {
++				saved_errno = errno;
++				close(fd);
++				fd = -1;
++			}
++		}
++	}
++	if (setns(current_netns, CLONE_NEWNET))
++		fail("restore network namespace after NFS fuzz connect failed");
++	close(current_netns);
++	errno = saved_errno;
++	return fd;
++}
++
++static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
++			      volatile long a2, volatile long a3,
++			      volatile long a4)
++{
++	// syz_send_nfs_fuzz(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call],
++	//                    msglen len[msg], flags const[...], user_tag proc[...])
++	int fd = a0;
++	void* payload = (void*)a1;
++	size_t payload_len = a2;
++	uint32 flags = a3;
++	uint64 user_tag = a4;
++	if (!payload || payload_len < 8 || payload_len > 0x7fffffff || !user_tag) {
++		errno = EINVAL;
++		return -1;
++	}
++
++	uint32 marker = htonl(0x80000000U | (uint32)payload_len);
++	struct iovec iov[2] = {
++		{.iov_base = &marker, .iov_len = sizeof(marker)},
++		{.iov_base = payload, .iov_len = payload_len},
++	};
++	struct {
++		uint32 version;
++		uint32 flags;
++		uint64 user_tag;
++	} control = {1, flags, user_tag};
++	char control_buf[CMSG_SPACE(sizeof(control))] = {};
++	struct msghdr msg = {};
++	msg.msg_iov = iov;
++	msg.msg_iovlen = 2;
++	msg.msg_control = control_buf;
++	msg.msg_controllen = sizeof(control_buf);
++	struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
++	cmsg->cmsg_level = IPPROTO_TCP;
++	cmsg->cmsg_type = 47;
++	cmsg->cmsg_len = CMSG_LEN(sizeof(control));
++	memcpy(CMSG_DATA(cmsg), &control, sizeof(control));
++	return sendmsg(fd, &msg, 0);
++}
++#endif
++
+ #if SYZ_EXECUTOR || __NR_syz_open_dev
+ #include <fcntl.h>
+ #include <string.h>
+@@ -4375,6 +4492,32 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+ 	if (marker_len != expected_len || memcmp(actual, expected, expected_len))
+ 		failmsg("NFS fuzz lane marker mismatch", "proc=%llu", procid);
+ 
++	for (unsigned client = 0; client < 2; client++) {
++		char metadata[192];
++		char value[64] = {};
++		if (snprintf(metadata, sizeof(metadata), "%s/.client%u_netns", source, client) >=
++		    (int)sizeof(metadata))
++			fail("NFS fuzz lane network namespace path is too long");
++		nfs_fuzz_netns_fds[client] = open(metadata, O_RDONLY | O_CLOEXEC);
++		if (nfs_fuzz_netns_fds[client] < 0)
++			failmsg("open NFS fuzz lane client network namespace failed", "client=%u", client);
++
++		if (snprintf(metadata, sizeof(metadata), "%s/.server%u_ipv4", source, client) >=
++		    (int)sizeof(metadata))
++			fail("NFS fuzz lane server address path is too long");
++		int fd = open(metadata, O_RDONLY | O_CLOEXEC);
++		if (fd < 0)
++			failmsg("open NFS fuzz lane server address failed", "client=%u", client);
++		memset(value, 0, sizeof(value));
++		ssize_t len = read(fd, value, sizeof(value) - 1);
++		close(fd);
++		unsigned a, b, c, d;
++		if (len <= 0 || sscanf(value, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
++		    a > 255 || b > 255 || c > 255 || d > 255)
++			failmsg("invalid NFS fuzz lane server address", "client=%u", client);
++		nfs_fuzz_server_addrs[client] = htonl((a << 24) | (b << 16) | (c << 8) | d);
++	}
++
+ 	char target[128];
+ 	if (snprintf(target, sizeof(target), "%s/nfs-lane", newroot) >= (int)sizeof(target))
+ 		fail("NFS fuzz lane target path is too long");
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index b04a2113f..1acbf8bc6 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -109,6 +109,9 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_clone3":                    alwaysSupported,
+ 	"syz_pkey_set":                  linuxPkeysSupported,
+ 	"syz_socket_connect_nvme_tcp":   linuxSyzSocketConnectNvmeTCPSupported,
++	"syz_open_nfs_lane":             alwaysSupported,
++	"syz_socket_connect_nfs":        alwaysSupported,
++	"syz_send_nfs_fuzz":             alwaysSupported,
+ 	"syz_pidfd_open":                alwaysSupported,
+ 	"syz_create_resource":           alwaysSupported,
+ 	"syz_kfuzztest_run":             alwaysSupported,
+diff --git a/pkg/vminfo/nfs_fuzz_test.go b/pkg/vminfo/nfs_fuzz_test.go
+new file mode 100644
+index 000000000..13989591f
+--- /dev/null
++++ b/pkg/vminfo/nfs_fuzz_test.go
+@@ -0,0 +1,14 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package vminfo
++
++import "testing"
++
++func TestNFSFuzzPseudoSyscallChecks(t *testing.T) {
++	for _, name := range []string{"syz_open_nfs_lane", "syz_socket_connect_nfs", "syz_send_nfs_fuzz"} {
++		if linuxSyscallChecks[name] == nil {
++			t.Fatalf("%s has no Linux pseudo-syscall capability check", name)
++		}
++	}
++}
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+new file mode 100644
+index 000000000..188c15d9a
+--- /dev/null
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -0,0 +1,91 @@
++# Copyright 2026 syzkaller project authors. All rights reserved.
++# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++include <linux/fcntl.h>
++include <linux/falloc.h>
++
++# Resources rooted in the fixed, proc-specific NFS fuzz lane.  The executor
++# imports two mounts at /nfs-lane/client{0,1}; syz_open_nfs_lane is the only
++# producer of the root resource so corpus minimization cannot silently detach
++# an NFS workload from the lane.
++resource fd_nfs[fd]
++resource fd_nfs_dir[fd_dir]
++
++# Keep the kernel ABI layout of struct flock, but do not model l_pid as a
++# producer dependency.  F_SETLK/F_SETLKW ignore the input l_pid field; using
++# the generic flock type would unnecessarily require a pid-producing syscall
++# in the NFS-only campaign.
++nfs_flock {
++	type	flags[flock_type, int16]
++	whence	flags[seek_whence, int16]
++	start	intptr
++	len	intptr
++	pid	int32
++}
++
++# Keep utimensat reachable in a narrow NFS-only campaign without requiring a
++# clock_gettime producer.  These fields have the native timeval/timespec ABI
++# width, but are intentionally plain values rather than time resources.
++nfs_timeval {
++	sec	intptr
++	usec	intptr
++}
++
++nfs_itimerval {
++	interv	nfs_timeval
++	value	nfs_timeval
++}
++
++syz_open_nfs_lane$client0(client const[0]) fd_nfs_dir
++syz_open_nfs_lane$client1(client const[1]) fd_nfs_dir
++
++openat$nfs_file(fd fd_nfs_dir, file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_nfs
++openat$nfs_dir(fd fd_nfs_dir, file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_nfs_dir
++
++read$nfs(fd fd_nfs, buf buffer[out], count len[buf])
++pread64$nfs(fd fd_nfs, buf buffer[out], count len[buf], pos fileoff)
++readv$nfs(fd fd_nfs, vec ptr[in, array[iovec_out]], vlen len[vec])
++preadv2$nfs(fd fd_nfs, vec ptr[in, array[iovec_out]], vlen len[vec], off_low int32, off_high int32, flags flags[rwf_flags])
++write$nfs(fd fd_nfs, buf buffer[in], count len[buf])
++pwrite64$nfs(fd fd_nfs, buf buffer[in], count len[buf], pos fileoff)
++writev$nfs(fd fd_nfs, vec ptr[in, array[iovec_in]], vlen len[vec])
++pwritev2$nfs(fd fd_nfs, vec ptr[in, array[iovec_in]], vlen len[vec], off_low int32, off_high int32, flags flags[rwf_flags])
++lseek$nfs(fd fd_nfs, offset fileoff, whence flags[seek_whence]) (ignore_return)
++copy_file_range$nfs(fd_in fd_nfs, off_in ptr[inout, fileoff[int64], opt], fd_out fd_nfs, off_out ptr[inout, fileoff[int64], opt], len intptr, flags flags[copy_file_range_flags])
++fadvise64$nfs(fd fd_nfs, offset fileoff, len intptr, advice flags[fadvise_flags])
++readahead$nfs(fd fd_nfs, off intptr, count intptr)
++fsync$nfs(fd fd_nfs)
++fdatasync$nfs(fd fd_nfs)
++sync_file_range$nfs(fd fd_nfs, off intptr, nbytes intptr, flags flags[sync_file_flags])
++ftruncate$nfs(fd fd_nfs, len intptr)
++fallocate$nfs(fd fd_nfs, mode flags[fallocate_mode], off intptr, len intptr)
++flock$nfs(fd fd_nfs, op flags[flock_op])
++fcntl$nfs_lock(fd fd_nfs, cmd flags[fcntl_lock], lock ptr[in, nfs_flock])
++fstat$nfs(fd fd_nfs, statbuf ptr[out, stat])
++fstatfs$nfs(fd fd_nfs, buf buffer[out])
++fchmod$nfs(fd fd_nfs, mode flags[open_mode])
++fchown$nfs(fd fd_nfs, uid uid, gid gid)
++
++mkdirat$nfs(fd fd_nfs_dir, path ptr[in, filename], mode flags[open_mode])
++unlinkat$nfs(fd fd_nfs_dir, path ptr[in, filename], flags flags[unlinkat_flags])
++renameat2$nfs(oldfd fd_nfs_dir, old ptr[in, filename], newfd fd_nfs_dir, new ptr[in, filename], flags flags[renameat2_flags])
++linkat$nfs(oldfd fd_nfs_dir, old ptr[in, filename], newfd fd_nfs_dir, new ptr[in, filename], flags flags[linkat_flags])
++symlinkat$nfs(old ptr[in, filename], newfd fd_nfs_dir, new ptr[in, filename])
++readlinkat$nfs(fd fd_nfs_dir, path ptr[in, filename], buf buffer[out], siz len[buf])
++statx$nfs(fd fd_nfs_dir, file ptr[in, filename], flags flags[statx_flags], mask flags[statx_mask], statxbuf ptr[out, statx])
++faccessat2$nfs(fd fd_nfs_dir, path ptr[in, filename], mode flags[open_mode], flags flags[faccessat_flags])
++fchmodat$nfs(fd fd_nfs_dir, path ptr[in, filename], mode flags[open_mode])
++fchownat$nfs(fd fd_nfs_dir, path ptr[in, filename], uid uid, gid gid, flags flags[at_flags])
++utimensat$nfs(fd fd_nfs_dir, path ptr[in, filename], times ptr[in, nfs_itimerval], flags flags[utimensat_flags])
++
++fsetxattr$nfs(fd fd_nfs, name ptr[in, xattr_name], val ptr[in, string], size len[val], flags flags[setxattr_flags])
++fgetxattr$nfs(fd fd_nfs, name ptr[in, xattr_name], val buffer[out], size len[val])
++flistxattr$nfs(fd fd_nfs, list buffer[out], size len[list])
++fremovexattr$nfs(fd fd_nfs, name ptr[in, xattr_name])
++
++# Stable user-xattr variants make RFC 8276-backed NFSv4.2 xattr operations
++# reachable from seed programs while the generic variants retain mutation of
++# namespaces and malformed names.
++fsetxattr$nfs_user(fd fd_nfs, name ptr[in, string["user.syz"]], val ptr[in, string], size len[val], flags flags[setxattr_flags])
++fgetxattr$nfs_user(fd fd_nfs, name ptr[in, string["user.syz"]], val buffer[out], size len[val])
++fremovexattr$nfs_user(fd fd_nfs, name ptr[in, string["user.syz"]])
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index b335a143a..ede53e2eb 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -55,6 +55,29 @@ func TestNFSSunRPCFuzzABI(t *testing.T) {
+ 	if connect.CallName != "connect" {
+ 		t.Fatalf("connect variant calls %s, want ordinary connect", connect.CallName)
+ 	}
++	for _, name := range []string{
++		"syz_socket_connect_nfs$client0",
++		"syz_socket_connect_nfs$client1",
++	} {
++		call := requireNFSFuzzCall(t, target, name)
++		if call.CallName != "syz_socket_connect_nfs" {
++			t.Fatalf("%s calls %s, want syz_socket_connect_nfs", name, call.CallName)
++		}
++		ret, ok := call.Ret.(*prog.ResourceType)
++		if !ok || ret.Desc.Name != "sock_nfs_fuzz_tcp" {
++			t.Fatalf("%s return type is %T %v, want sock_nfs_fuzz_tcp", name, call.Ret, call.Ret)
++		}
++	}
++	for name, flags := range map[string]uint64{
++		"syz_send_nfs_fuzz$new": 1, "syz_send_nfs_fuzz$new_final": 5,
++		"syz_send_nfs_fuzz$retry": 2, "syz_send_nfs_fuzz$retry_final": 6,
++	} {
++		call := requireNFSFuzzCall(t, target, name)
++		if call.CallName != "syz_send_nfs_fuzz" {
++			t.Fatalf("%s calls %s, want syz_send_nfs_fuzz", name, call.CallName)
++		}
++		requireConst(t, call.Args[3].Type, flags, name+" flags")
++	}
+ 	addr, ok := connect.Args[1].Type.(*prog.PtrType)
+ 	if !ok || addr.Elem.TemplateName() != "sockaddr_in" {
+ 		t.Fatalf("connect address is %T %v, want sockaddr_in pointer", connect.Args[1].Type, connect.Args[1].Type)
+@@ -94,6 +117,64 @@ func TestNFSSunRPCFuzzABI(t *testing.T) {
+ 	requireSingleCmsg(t, cancel, cancelHeader)
+ }
+ 
++func TestNFSFixedLaneResources(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, name := range []string{
++		"syz_open_nfs_lane$client0",
++		"syz_open_nfs_lane$client1",
++	} {
++		call := requireNFSFuzzCall(t, target, name)
++		if call.CallName != "syz_open_nfs_lane" {
++			t.Fatalf("%s calls %s, want syz_open_nfs_lane", name, call.CallName)
++		}
++		ret, ok := call.Ret.(*prog.ResourceType)
++		if !ok || ret.Desc.Name != "fd_nfs_dir" {
++			t.Fatalf("%s return type is %T %v, want fd_nfs_dir", name, call.Ret, call.Ret)
++		}
++	}
++	for _, name := range []string{
++		"openat$nfs_file", "openat$nfs_dir", "read$nfs", "readv$nfs", "write$nfs", "writev$nfs",
++		"copy_file_range$nfs", "fsync$nfs", "sync_file_range$nfs", "ftruncate$nfs",
++		"flock$nfs", "fcntl$nfs_lock", "fchmod$nfs", "renameat2$nfs", "utimensat$nfs",
++		"fsetxattr$nfs",
++	} {
++		requireNFSFuzzCall(t, target, name)
++	}
++	var dir *prog.ResourceDesc
++	for _, resource := range target.Resources {
++		if resource.Name == "fd_nfs_dir" {
++			dir = resource
++			break
++		}
++	}
++	if dir == nil || !containsString(dir.Kind, "fd_dir") {
++		t.Fatalf("fd_nfs_dir kind is %#v, want fd_dir compatibility for getdents64", dir)
++	}
++	lock := requireStruct(t, requireNFSFuzzCall(t, target, "fcntl$nfs_lock"), "nfs_flock")
++	pid := requireField(t, lock, "pid")
++	if _, ok := pid.Type.(*prog.ResourceType); ok {
++		t.Fatalf("nfs_flock.pid is a resource dependency, want plain int32")
++	}
++	times := requireStruct(t, requireNFSFuzzCall(t, target, "utimensat$nfs"), "nfs_timeval")
++	for _, field := range times.Fields {
++		if _, ok := field.Type.(*prog.ResourceType); ok {
++			t.Fatalf("nfs_timeval.%s is a resource dependency, want a plain native integer", field.Name)
++		}
++	}
++}
++
++func containsString(values []string, want string) bool {
++	for _, value := range values {
++		if value == want {
++			return true
++		}
++	}
++	return false
++}
++
+ func requireNFSFuzzCall(t *testing.T, target *prog.Target, name string) *prog.Syscall {
+ 	t.Helper()
+ 	call := target.SyscallMap[name]
+@@ -129,6 +210,10 @@ func requireSingleRPCRecords(t *testing.T, call *prog.Syscall) {
+ 	t.Helper()
+ 	for _, name := range []string{"rpc_tcp_nfs3_single_call", "rpc_tcp_nfs4_single_call"} {
+ 		record := requireStruct(t, call, name)
++		if record.Fields[0].Name != "frag_len" || record.Fields[1].Name != "last_frag" {
++			t.Fatalf("%s %s Record Marker fields are %s/%s, want 31-bit length then MSB last_frag",
++				call.Name, name, record.Fields[0].Name, record.Fields[1].Name)
++		}
+ 		last := requireField(t, record, "last_frag")
+ 		requireConst(t, last.Type, 1, call.Name+" "+name+" last_frag")
+ 		if last.Type.BitfieldLength() != 1 {
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index dce77ea84..4fd907a08 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -11,6 +11,17 @@ include <linux/socket.h>
+ 
+ resource sock_nfs_fuzz_tcp[sock]
+ 
++# Create the socket in the selected fixed-lane client network namespace,
++# enable TCP_SUNRPC_FUZZ before connect, and connect it to that client's
++# direct-veth knfsd endpoint.  The endpoint is fixture metadata, not fuzzed
++# input; the RPC record and XDR body remain fully mutable.
++syz_socket_connect_nfs$client0(client const[0]) sock_nfs_fuzz_tcp
++syz_socket_connect_nfs$client1(client const[1]) sock_nfs_fuzz_tcp
++syz_send_nfs_fuzz$new(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_NEW], user_tag proc[1, 1])
++syz_send_nfs_fuzz$new_final(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_NEW_FINAL], user_tag proc[1, 1])
++syz_send_nfs_fuzz$retry(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_RETRY], user_tag proc[1, 1])
++syz_send_nfs_fuzz$retry_final(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_RETRY_FINAL], user_tag proc[1, 1])
++
+ # TCP_SUNRPC_FUZZ must be enabled before connect.  The dedicated resource keeps
+ # this opt-in lane separate from ordinary TCP sockets; the kernel still checks
+ # the actual setsockopt state.
+@@ -73,13 +84,18 @@ rpc_auth_sys {
+ 
+ rpc_auth_sys_data {
+ 	stamp		int32be
+-	machinename	stringnoz
++	machinename	xdr_machine_name
+ 	uid		int32be
+ 	gid		int32be
+ 	gids_len	len[gids, int32be]
+ 	gids		array[int32be, 0:4]
+ } [packed]
+ 
++xdr_machine_name {
++	length	len[data, int32be]
++	data	stringnoz
++} [packed, align[4]]
++
+ rpcsec_gss_proc = 0, 1, 2, 3
+ 
+ rpc_auth_gss {
+@@ -95,7 +111,7 @@ rpc_auth_gss_data {
+ 	service		int32be[1:3]
+ 	handle_len	len[handle, int32be]
+ 	handle		array[int8, 0:32]
+-} [packed]
++} [packed, align[4]]
+ 
+ rpc_auth_flavors = 0, 1, 2, 3, 6, 390003, 390004, 390005
+ 
+@@ -103,7 +119,7 @@ rpc_auth_generic {
+ 	flavor	flags[rpc_auth_flavors, int32be]
+ 	length	len[data, int32be]
+ 	data	array[int8, 0:64]
+-} [packed]
++} [packed, align[4]]
+ 
+ rpc_auth [
+ 	none	rpc_auth_none
+@@ -116,12 +132,12 @@ rpc_auth [
+ nfs_fh3 {
+ 	length	len[data, int32be]
+ 	data	array[int8, 0:64]
+-} [packed]
++} [packed, align[4]]
+ 
+ nfs_fh4 {
+ 	length	len[data, int32be]
+ 	data	array[int8, 0:128]
+-} [packed]
++} [packed, align[4]]
+ 
+ # NFSv3 Calls
+ rpc_nfs3_call {
+@@ -342,6 +358,11 @@ rpc_nfs4_call {
+ 	body	nfs4_compound_args
+ } [packed]
+ 
++rpc_nfs_call [
++	nfs3	rpc_nfs3_call
++	nfs4	rpc_nfs4_call
++] [varlen]
++
+ # Tagged data actions deliberately expose only a complete, single-fragment RPC
+ # record.  Fragmented or batched records are rejected by the kernel ABI.
+ rpc_tcp_nfs3_single_call {
+@@ -376,7 +397,7 @@ nfs4_compound_tag [
+ nfs4_utf8string {
+ 	len	len[data, int32be]
+ 	data	stringnoz[nfs4_path_names]
+-} [packed]
++} [packed, align[4]]
+ 
+ nfs4_path_names = "test", "root", "tmp1", "dir1", "mnt1", "home", "file", "pub1", "var1", "etc1", "testfile", "file0001", "dir00001"
+ 
+@@ -459,11 +480,13 @@ nfs4_op_arg [
+ 	op_free_stateid		nfs4_op_free_stateid
+ 	op_get_dir_delegation	nfs4_op_get_dir_delegation
+ 	op_getdeviceinfo	nfs4_op_getdeviceinfo
++	op_getdevicelist	nfs4_op_getdevicelist
+ 	op_layoutcommit		nfs4_op_layoutcommit
+ 	op_layoutget		nfs4_op_layoutget
+ 	op_layoutreturn		nfs4_op_layoutreturn
+ 	op_secinfo_no_name	nfs4_op_secinfo_no_name
+ 	op_sequence		nfs4_op_sequence
++	op_set_ssv		nfs4_op_set_ssv
+ 	op_test_stateid		nfs4_op_test_stateid
+ 	op_destroy_clientid	nfs4_op_destroy_clientid
+ 	op_reclaim_complete	nfs4_op_reclaim_complete
+@@ -483,7 +506,10 @@ nfs4_op_arg [
+ 	op_openattr		nfs4_op_openattr
+ 	op_want_delegation	nfs4_op_want_delegation
+ 	op_io_advise		nfs4_op_io_advise
++	op_layout_error	nfs4_op_layout_error
++	op_layout_stats	nfs4_op_layout_stats
+ 	op_offload_cancel	nfs4_op_offload_cancel
++	op_write_same		nfs4_op_write_same
+ 	op_illegal		nfs4_op_illegal
+ ] [varlen]
+ 
+@@ -535,11 +561,13 @@ type nfs4_op_destroy_session nfs4_op_t[44, nfs4_destroy_session_args]
+ type nfs4_op_free_stateid nfs4_op_t[45, nfs4_free_stateid_args]
+ type nfs4_op_get_dir_delegation nfs4_op_t[46, nfs4_get_dir_delegation_args]
+ type nfs4_op_getdeviceinfo nfs4_op_t[47, nfs4_getdeviceinfo_args]
++type nfs4_op_getdevicelist nfs4_op_t[48, nfs4_getdevicelist_args]
+ type nfs4_op_layoutcommit nfs4_op_t[49, nfs4_layoutcommit_args]
+ type nfs4_op_layoutget nfs4_op_t[50, nfs4_layoutget_args]
+ type nfs4_op_layoutreturn nfs4_op_t[51, nfs4_layoutreturn_args]
+ type nfs4_op_secinfo_no_name nfs4_op_t[52, nfs4_secinfo_no_name_args]
+ type nfs4_op_sequence nfs4_op_t[53, nfs4_sequence_args]
++type nfs4_op_set_ssv nfs4_op_t[54, nfs4_set_ssv_args]
+ type nfs4_op_test_stateid nfs4_op_t[55, nfs4_test_stateid_args]
+ type nfs4_op_destroy_clientid nfs4_op_t[57, nfs4_destroy_clientid_args]
+ type nfs4_op_reclaim_complete nfs4_op_t[58, nfs4_reclaim_complete_args]
+@@ -559,7 +587,10 @@ type nfs4_op_delegpurge nfs4_op_t[7, nfs4_delegpurge_args]
+ type nfs4_op_openattr nfs4_op_t[19, nfs4_openattr_args]
+ type nfs4_op_want_delegation nfs4_op_t[56, nfs4_want_delegation_args]
+ type nfs4_op_io_advise nfs4_op_t[63, nfs4_io_advise_args]
++type nfs4_op_layout_error nfs4_op_t[64, nfs4_layout_error_args]
++type nfs4_op_layout_stats nfs4_op_t[65, nfs4_layout_stats_args]
+ type nfs4_op_offload_cancel nfs4_op_t[66, nfs4_offload_cancel_args]
++type nfs4_op_write_same nfs4_op_t[70, nfs4_write_same_args]
+ type nfs4_op_illegal nfs4_op_t[10044, nfs4_null_args]
+ 
+ nfs4_delegpurge_args {
+@@ -586,6 +617,65 @@ nfs4_offload_cancel_args {
+ 	stateid	nfs4_stateid
+ } [packed]
+ 
++nfs4_getdevicelist_args {
++	layout_type	int32be
++	maxdevices	int32be
++	cookie		int64be
++	cookieverf	array[int8, 8]
++} [packed]
++
++nfs4_set_ssv_args {
++	ssv		nfs4_opaque64
++	digest		nfs4_opaque64
++} [packed]
++
++nfs4_opaque64 {
++	length	len[data, int32be]
++	data	array[int8, 0:64]
++} [packed, align[4]]
++
++nfs4_device_error {
++	deviceid	array[int8, 16]
++	status		int32be
++	opnum		int32be
++} [packed]
++
++nfs4_layout_error_args {
++	offset		int64be
++	length		int64be
++	stateid	nfs4_stateid
++	errors_len	len[errors, int32be]
++	errors		array[nfs4_device_error, 0:4]
++} [packed]
++
++nfs4_io_info {
++	bytes	int64be
++	count	int64be
++} [packed]
++
++nfs4_layout_stats_args {
++	offset		int64be
++	length		int64be
++	stateid	nfs4_stateid
++	read		nfs4_io_info
++	write		nfs4_io_info
++	deviceid	array[int8, 16]
++	layout_len	len[layout, int32be]
++	layout		array[int8, 0:128]
++} [packed, align[4]]
++
++nfs4_write_same_args {
++	stateid	nfs4_stateid
++	stable		flags[nfs3_stable_how, int32be]
++	offset		int64be
++	count		int64be
++	block_offset	int64be
++	block_size	int32be
++	block_count	int32be
++	pattern_len	len[pattern, int32be]
++	pattern		array[int8, 0:64]
++} [packed, align[4]]
++
+ nfs4_null_args {
+ 	dummy	const[0, int32be]
+ } [packed]
+@@ -820,7 +910,7 @@ nfs4_write_args {
+ 	stable		flags[nfs3_stable_how, int32be]
+ 	data_len	len[data, int32be]
+ 	data		array[int8]
+-} [packed]
++} [packed, align[4]]
+ 
+ nfs4_release_lockowner_args {
+ 	owner_clientid	int64be
+@@ -881,10 +971,22 @@ nfs4_free_stateid_args {
+ } [packed]
+ 
+ nfs4_get_dir_delegation_args {
+-	seqid		int32be
+-	stateid		nfs4_stateid
+-	bitmap_len	len[bitmap, int32be]
+-	bitmap		array[int32be, 2:3]
++	signal_deleg_avail	int32be[0:1]
++	notification_types	nfs4_bitmap4
++	child_attr_delay	nfs4_nfstime4
++	dir_attr_delay		nfs4_nfstime4
++	child_attributes	nfs4_bitmap4
++	dir_attributes		nfs4_bitmap4
++} [packed]
++
++nfs4_bitmap4 {
++	length	len[words, int32be]
++	words	array[int32be, 0:3]
++} [packed]
++
++nfs4_nfstime4 {
++	seconds	int64be
++	nseconds	int32be
+ } [packed]
+ 
+ nfs4_getdeviceinfo_args {
+@@ -1010,7 +1112,7 @@ nfs4_setxattr_args {
+ 	name	nfs4_utf8string
+ 	val_len	len[val, int32be]
+ 	val	array[int8]
+-} [packed]
++} [packed, align[4]]
+ 
+ nfs4_listxattrs_args {
+ 	dircookie	int64be
+diff --git a/tools/syz-nfs-corpus/syz-nfs-corpus.go b/tools/syz-nfs-corpus/syz-nfs-corpus.go
+new file mode 100644
+index 000000000..a2a667b30
+--- /dev/null
++++ b/tools/syz-nfs-corpus/syz-nfs-corpus.go
+@@ -0,0 +1,231 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++// syz-nfs-corpus validates that corpus programs retain a typed dependency on
++// the fixed NFS lane.  It deliberately parses syzkaller programs instead of
++// matching their textual serialization.
++package main
++
++import (
++	"encoding/json"
++	"flag"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	"github.com/google/syzkaller/prog"
++	_ "github.com/google/syzkaller/sys"
++)
++
++type programResult struct {
++	File       string   `json:"file"`
++	Calls      int      `json:"calls"`
++	LaneRoots  int      `json:"lane_roots"`
++	NFSOps     int      `json:"nfs_ops"`
++	RawSockets int      `json:"raw_sockets"`
++	RawRecords int      `json:"raw_records"`
++	Features   []string `json:"features,omitempty"`
++	Valid      bool     `json:"valid"`
++	Error      string   `json:"error,omitempty"`
++}
++
++type report struct {
++	Campaign string          `json:"campaign"`
++	Programs int             `json:"programs"`
++	Valid    int             `json:"valid"`
++	Invalid  int             `json:"invalid"`
++	Features []string        `json:"features"`
++	Missing  []string        `json:"missing_features,omitempty"`
++	Results  []programResult `json:"results"`
++}
++
++func main() {
++	input := flag.String("input", "", "program file or directory")
++	campaign := flag.String("campaign", "v41", "v41, v42, or raw")
++	flag.Parse()
++	if *input == "" || (*campaign != "v41" && *campaign != "v42" && *campaign != "raw") {
++		fmt.Fprintln(os.Stderr, "usage: syz-nfs-corpus -input FILE_OR_DIR -campaign v41|v42|raw")
++		os.Exit(2)
++	}
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		fail(err)
++	}
++	files, err := inputFiles(*input)
++	if err != nil {
++		fail(err)
++	}
++	rep := report{Campaign: *campaign, Programs: len(files)}
++	allFeatures := make(map[string]bool)
++	for _, file := range files {
++		res := inspect(target, file, *campaign)
++		if res.Valid {
++			rep.Valid++
++		} else {
++			rep.Invalid++
++		}
++		for _, feature := range res.Features {
++			allFeatures[feature] = true
++		}
++		rep.Results = append(rep.Results, res)
++	}
++	for feature := range allFeatures {
++		rep.Features = append(rep.Features, feature)
++	}
++	sort.Strings(rep.Features)
++	for _, feature := range requiredFeatures(*campaign) {
++		if !allFeatures[feature] {
++			rep.Missing = append(rep.Missing, feature)
++		}
++	}
++	data, err := json.MarshalIndent(rep, "", "  ")
++	if err != nil {
++		fail(err)
++	}
++	fmt.Printf("%s\n", data)
++	if rep.Programs == 0 || rep.Invalid != 0 || len(rep.Missing) != 0 {
++		os.Exit(1)
++	}
++}
++
++func requiredFeatures(campaign string) []string {
++	switch campaign {
++	case "v41":
++		return []string{"commit", "data", "lock", "metadata", "namespace", "readdir", "setattr"}
++	case "v42":
++		return []string{"commit", "copy", "data", "lock", "metadata", "namespace", "readdir", "setattr", "space", "xattr"}
++	case "raw":
++		return []string{"raw_call", "raw_reply", "raw_retry"}
++	}
++	return nil
++}
++
++func inputFiles(path string) ([]string, error) {
++	info, err := os.Stat(path)
++	if err != nil {
++		return nil, err
++	}
++	if !info.IsDir() {
++		return []string{path}, nil
++	}
++	entries, err := os.ReadDir(path)
++	if err != nil {
++		return nil, err
++	}
++	var files []string
++	for _, entry := range entries {
++		if !entry.IsDir() {
++			files = append(files, filepath.Join(path, entry.Name()))
++		}
++	}
++	sort.Strings(files)
++	return files, nil
++}
++
++func inspect(target *prog.Target, file, campaign string) programResult {
++	res := programResult{File: file}
++	data, err := os.ReadFile(file)
++	if err != nil {
++		res.Error = err.Error()
++		return res
++	}
++	// syz-db canonicalization omits auto-generated padding fields.  NonStrict
++	// accepts that canonical form; structural lane/resource validation below is
++	// still performed on the parsed Prog rather than its source text.
++	p, err := target.Deserialize(data, prog.NonStrict)
++	if err != nil {
++		res.Error = err.Error()
++		return res
++	}
++	features := make(map[string]bool)
++	for _, call := range p.Calls {
++		res.Calls++
++		name := call.Meta.Name
++		switch {
++		case strings.HasPrefix(name, "syz_open_nfs_lane$"):
++			res.LaneRoots++
++		case strings.HasPrefix(name, "syz_socket_connect_nfs$"):
++			res.RawSockets++
++		case strings.HasPrefix(name, "sendmsg$inet_nfs_fuzz_") ||
++			strings.HasPrefix(name, "syz_send_nfs_fuzz$"):
++			res.RawRecords++
++		case strings.HasSuffix(name, "$nfs") || strings.HasSuffix(name, "$nfs_file") ||
++			strings.HasSuffix(name, "$nfs_dir") || strings.HasSuffix(name, "$nfs_lock") ||
++			strings.HasSuffix(name, "$nfs_user"):
++			res.NFSOps++
++		}
++		if strings.HasPrefix(name, "fallocate$nfs") {
++			features["space"] = true
++		}
++		if name == "copy_file_range" || name == "copy_file_range$nfs" {
++			features["copy"] = true
++		}
++		if strings.Contains(name, "xattr$nfs") {
++			features["xattr"] = true
++		}
++		if strings.HasPrefix(name, "read$nfs") || strings.HasPrefix(name, "pread") ||
++			strings.HasPrefix(name, "write$nfs") || strings.HasPrefix(name, "pwrite") {
++			features["data"] = true
++		}
++		if strings.HasPrefix(name, "readv$nfs") || strings.HasPrefix(name, "writev$nfs") {
++			features["vector_io"] = true
++		}
++		if strings.HasPrefix(name, "fsync$nfs") || strings.HasPrefix(name, "fdatasync$nfs") ||
++			strings.HasPrefix(name, "sync_file_range$nfs") {
++			features["commit"] = true
++		}
++		if strings.HasPrefix(name, "statx$nfs") || strings.HasPrefix(name, "fstat$nfs") ||
++			strings.HasPrefix(name, "faccessat2$nfs") {
++			features["metadata"] = true
++		}
++		if name == "getdents64" {
++			features["readdir"] = true
++		}
++		if strings.HasPrefix(name, "mkdirat$nfs") || strings.HasPrefix(name, "unlinkat$nfs") ||
++			strings.HasPrefix(name, "renameat2$nfs") || strings.HasPrefix(name, "linkat$nfs") ||
++			strings.HasPrefix(name, "symlinkat$nfs") || strings.HasPrefix(name, "readlinkat$nfs") {
++			features["namespace"] = true
++		}
++		if strings.HasPrefix(name, "flock$nfs") || strings.HasPrefix(name, "fcntl$nfs_lock") {
++			features["lock"] = true
++		}
++		if strings.HasPrefix(name, "ftruncate$nfs") || strings.HasPrefix(name, "fchmod") ||
++			strings.HasPrefix(name, "fchown") || strings.HasPrefix(name, "utimensat$nfs") {
++			features["setattr"] = true
++		}
++		if strings.HasPrefix(name, "syz_send_nfs_fuzz$") ||
++			strings.HasPrefix(name, "sendmsg$inet_nfs_fuzz_") {
++			features["raw_call"] = true
++		}
++		if strings.HasPrefix(name, "syz_send_nfs_fuzz$retry") ||
++			strings.HasPrefix(name, "sendmsg$inet_nfs_fuzz_retry") {
++			features["raw_retry"] = true
++		}
++		if strings.HasPrefix(name, "recvfrom$inet_nfs_fuzz") {
++			features["raw_reply"] = true
++		}
++	}
++	for feature := range features {
++		res.Features = append(res.Features, feature)
++	}
++	sort.Strings(res.Features)
++	switch campaign {
++	case "v41":
++		res.Valid = res.LaneRoots > 0 && res.NFSOps > 0
++	case "v42":
++		res.Valid = res.LaneRoots > 0 && res.NFSOps > 0
++	case "raw":
++		res.Valid = res.RawSockets > 0 && res.RawRecords > 0
++	}
++	if !res.Valid {
++		res.Error = "program does not retain the required typed NFS resource graph"
++	}
++	return res
++}
++
++func fail(err error) {
++	fmt.Fprintln(os.Stderr, err)
++	os.Exit(1)
++}
+-- 
+2.34.1
+

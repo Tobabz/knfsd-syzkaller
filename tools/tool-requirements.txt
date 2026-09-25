@@ -1,0 +1,64 @@
+# tool-requirements.txt — teammate-host prerequisites
+
+`bundle/README-HANDOFF.md` "Reproduce"의 전제 조건을 정형화한 목록.
+신규 호스트에서 `tools/bootstrap-kcov-env.py` 부트스트랩 → AB 하네스
+(`tools/run-ab.sh`)까지 동작하기 위한 호스트 의존성. 루트 권한은
+필요하지 않다(모든 단계가 작업 루트 내부에서 실행됨).
+
+검증 예시는 Debian/Ubuntu 기준이며, 배포판별 패키지명은 해당 저장소에서
+확인할 것.
+
+## 1. 런타임/빌드 기본 (필수)
+
+| 의존성 | 최소 버전 | 용도 | 검증 |
+|---|---|---|---|
+| Python 3 | ≥ 3.10 | bootstrap/런너/분석 (전부 표준 라이브러리만 사용) | `python3 -V` |
+| Go | ≥ 1.23 | syzkaller `make` 빌드 (env/ 부트스트랩) | `go version` |
+| gcc | (배포판 기본) | 커널 bzImage·syzkaller executor cgo 빌드 | `gcc --version` |
+| make | — | 커널·syzkaller 빌드 | `make --version` |
+| flex / bison | — | 커널 파서 생성 | `flex --version; bison --version` |
+| bc | — | 커널 빌드 툴 | `bc --version` |
+| libssl-dev | — | 커널 빌드 헤더 | `dpkg -s libssl-dev` |
+| libelf-dev | — | 커널 vmlinux ELF 참조 | `dpkg -s libelf-dev` |
+
+배포 예: `sudo apt install python3 golang-go gcc make flex bison bc libssl-dev libelf-dev`
+
+## 2. 가상화 (필수 — AB 실험이 KVM 게스트에서 실행됨)
+
+| 의존성 | 용도 | 검증 |
+|---|---|---|
+| KVM 커널 디바이스 `/dev/kvm` | qemu-system-x86_64 `-enable-kvm -cpu host` | `[ -e /dev/kvm ] && echo ok` / `ls -l /dev/kvm` |
+| qemu-system-x86 (qemu-kvm) | 이미지 베이크·AB phase VM 실행 | `qemu-system-x86_64 --version` |
+| cpu 마이그레이션 가능 VM 호스트 | `-cpu host` KVM 실행 | `kvm-ok` (cpu-checker) |
+
+하이퍼바이저 환경(예: nested VM, 클라우드)에서 `/dev/kvm`이 없다면
+부트스트랩과 AB 실행은 실패한다 — 물리 호스트 또는 KVM 노출 인스턴스 필요.
+
+## 3. 원격/아카이브 (필수)
+
+| 의존성 | 용도 | 검증 |
+|---|---|---|
+| openssh-client | 게스트 ssh/scp (`-O` 옵션 사용, OpenSSH ≥ 9.0) | `ssh -V` |
+| tar (xz·gzip) | 아카이브 추출·배포 조립 | `tar --version` |
+| coreutils | `sha256sum` (증거 해시·배포 검증) | `sha256sum --version` |
+
+## 4. 선택/권장
+
+| 의존성 | 용도 |
+|---|---|
+| pahole (dwarves) | 커널 BTF 생성(커널 설정에 의존) |
+| libncurses-dev | `make menuconfig` 수작업 시 |
+| git | 소스 출력이 tar가 아닌 클론인 경우에만 |
+| ~30 GB 여유 디스크 | 원천 소스(184M)+raw 이미지(2 GB)+빌드 산출물 |
+| RAM ≥ 8 GB | 1 VM당 4 GB(기본), trials 병렬 시 증량 |
+
+## 5. 작업 트리 구조 (전제)
+
+- `tools/`·`bundle/`·`env/`·`evidence/`·`report/`·`runs/`가 있는 작업 루트.
+- 번들 배포본(`dist/knfsd-fuzz-forward-port-<날짜>.tar.gz`, `tools/release-assembly.sh` 산출)으로
+  `bundle/`을 확보하고, `tools/bootstrap-kcov-env.py`로 `env/`를 생성한다.
+- 하드코딩 경로는 없음 — 모든 도구가 자기 위치에서 작업 루트를 유도하며
+  `KOOV_WORK_ROOT`로 오버라이드 가능(`tools/README.md` "환경 변수" 표).
+- syzkaller 빌드를 env/ 기본값 대신 외부 빌드 루트로 쓰려면
+  `KOOV_SYZ_BIN=<빌드 루트>`(`bin/linux_amd64/` 포함) — 소비 바이너리의
+  sha256은 실험 매니페스트(`evidence/experiment_manifest.json → inputs`)에 기록된다.

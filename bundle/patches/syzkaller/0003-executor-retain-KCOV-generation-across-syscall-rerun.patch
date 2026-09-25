@@ -1,0 +1,41 @@
+From fed6aa5ed105dc89104efc6060012f368c5d9fc0 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Wed, 16 Sep 2026 20:12:55 +0900
+Subject: [PATCH 03/15] executor: retain KCOV generation across syscall reruns
+
+
+diff --git a/executor/executor.cc b/executor/executor.cc
+index 989932af1..167a6edf3 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -1651,12 +1651,6 @@ void execute_call(thread_t* th)
+ 	errno = EFAULT;
+ 	NONFAILING(th->res = execute_syscall(call, th->args));
+ 	th->reserrno = errno;
+-#if GOOS_linux
+-	// Do not let executor event/futex bookkeeping inherit a program owner.  A
+-	// zero-generation BIND is the kernel ABI's explicit unbind operation.
+-	if (flag_extra_coverage && !cover_bind_remote_generation(0))
+-		remote_generation_bind_failed.store(true, std::memory_order_release);
+-#endif
+ 	// Our pseudo-syscalls may misbehave.
+ 	if ((th->res == -1 && th->reserrno == 0) || call->attrs.ignore_return)
+ 		th->reserrno = EINVAL;
+@@ -1675,6 +1669,14 @@ void execute_call(thread_t* th)
+ 	for (int i = 0; i < th->call_props.rerun; i++)
+ 		NONFAILING(execute_syscall(call, th->args));
+ 
++#if GOOS_linux
++	// Reruns are part of the same target-program call even though only the
++	// first execution contributes local call coverage.  Keep the exact origin
++	// bound through every rerun, then clear it before executor bookkeeping.
++	if (flag_extra_coverage && !cover_bind_remote_generation(0))
++		remote_generation_bind_failed.store(true, std::memory_order_release);
++#endif
++
+ 	debug("#%d [%llums] <- %s=0x%llx",
+ 	      th->id, current_time_ms() - start_time_ms, call->name, (uint64)th->res);
+ 	if (th->res == (intptr_t)-1)
+-- 
+2.34.1
+

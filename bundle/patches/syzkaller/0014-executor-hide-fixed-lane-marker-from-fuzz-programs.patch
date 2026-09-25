@@ -1,0 +1,133 @@
+From cc76d8a229322f8badac4a66d4a41fa243c797ae Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Fri, 18 Sep 2026 11:45:47 +0900
+Subject: [PATCH 14/15] executor: hide fixed lane marker from fuzz programs
+
+
+diff --git a/executor/common.h b/executor/common.h
+index 8d9b62866..0817e121b 100644
+--- a/executor/common.h
++++ b/executor/common.h
+@@ -629,11 +629,11 @@ static void loop(void)
+ 		if (mkdir(cwdbuf, 0777))
+ 			fail("failed to mkdir");
+ #if SYZ_EXECUTOR && GOOS_linux
+-		// setup_nfs_fuzz_lane() binds only this proc's immutable lane into
++		// setup_nfs_fuzz_lane() binds only this proc's two client mounts into
+ 		// /nfs-lane.  Test programs run from a fresh per-request workdir, so
+ 		// provide a stable sandbox-safe relative path without exposing the
+-		// fixture's /syz-nfs-lanes source tree inside the chroot.
+-		if (!access("/nfs-lane/.lane_id", F_OK)) {
++		// authoritative marker or /syz-nfs-lanes source tree.
++		if (!access("/nfs-lane/client0", F_OK) && !access("/nfs-lane/client1", F_OK)) {
+ 			char lane_link[64];
+ 			if (snprintf(lane_link, sizeof(lane_link), "%s/nfs-lane", cwdbuf) >= (int)sizeof(lane_link))
+ 				fail("NFS fuzz lane workdir path is too long");
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index a0ec2533e..295ca84b6 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -4342,8 +4342,10 @@ static void setup_binderfs();
+ static void setup_fusectl();
+ #if SYZ_EXECUTOR
+ // Bind the NFS fuzz lane selected by the executor handshake into the sandbox.
+-// The fixture deliberately keeps /syz-nfs-lanes itself outside of newroot, so
+-// a program can reach only the proc-specific lane selected here.
++// The fixture deliberately keeps /syz-nfs-lanes itself outside of newroot.  In
++// particular, do not bind the proc-N parent: it contains the authoritative
++// .lane_id marker and fuzz programs must not be able to truncate or unlink it.
++// Import only the two NFS client mount trees.
+ static void setup_nfs_fuzz_lane(const char* newroot)
+ {
+ 	const char* enabled = "/syz-nfs-lanes/enabled";
+@@ -4378,9 +4380,32 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+ 		fail("NFS fuzz lane target path is too long");
+ 	if (mkdir(target, 0700))
+ 		failmsg("mkdir NFS fuzz lane target failed", "path=%s", target);
+-	if (mount(source, target, NULL, MS_BIND | MS_REC, NULL))
+-		failmsg("mount NFS fuzz lane failed", "proc=%llu", procid);
+-	debug("NFS fuzz lane bound: proc=%llu source=%s target=/nfs-lane\n", procid, source);
++
++	char source_client0[160];
++	char source_client1[160];
++	char target_client0[160];
++	char target_client1[160];
++	if (snprintf(source_client0, sizeof(source_client0), "%s/client0", source) >=
++	    (int)sizeof(source_client0) ||
++	    snprintf(source_client1, sizeof(source_client1), "%s/client1", source) >=
++	    (int)sizeof(source_client1) ||
++	    snprintf(target_client0, sizeof(target_client0), "%s/client0", target) >=
++	    (int)sizeof(target_client0) ||
++	    snprintf(target_client1, sizeof(target_client1), "%s/client1", target) >=
++	    (int)sizeof(target_client1))
++		fail("NFS fuzz lane client path is too long");
++	if (mkdir(target_client0, 0700) || mkdir(target_client1, 0700))
++		failmsg("mkdir NFS fuzz lane client target failed", "proc=%llu", procid);
++	if (mount(source_client0, target_client0, NULL, MS_BIND | MS_REC, NULL))
++		failmsg("mount NFS fuzz lane client0 failed", "proc=%llu", procid);
++	if (mount(source_client1, target_client1, NULL, MS_BIND | MS_REC, NULL)) {
++		int mount_errno = errno;
++		umount2(target_client0, MNT_DETACH);
++		errno = mount_errno;
++		failmsg("mount NFS fuzz lane client1 failed", "proc=%llu", procid);
++	}
++	debug("NFS fuzz lane bound: proc=%llu clients-only source=%s target=/nfs-lane\n",
++	      procid, source);
+ }
+ #endif
+ // Mount tmpfs and chroot into it in sandbox=none and sandbox=namespace.
+@@ -4462,14 +4487,19 @@ static void sandbox_common_mount_tmpfs(void)
+ 	if (chdir("/"))
+ 		fail("chdir failed");
+ #if SYZ_EXECUTOR
+-	// setup_nfs_fuzz_lane() deliberately imports only /nfs-lane.  Verify
+-	// after chroot that the fixture source tree (and therefore every other
+-	// proc's lane) is not addressable from the executor sandbox.
+-	if (!access("/nfs-lane/.lane_id", F_OK)) {
++	// setup_nfs_fuzz_lane() deliberately imports only this proc's two NFS
++	// client mounts.  Verify after chroot that neither the authoritative marker
++	// nor the fixture source tree (and therefore every other proc's lane) is
++	// addressable from the executor sandbox.
++	if (!access("/nfs-lane/client0", F_OK) && !access("/nfs-lane/client1", F_OK)) {
++		errno = 0;
++		if (!access("/nfs-lane/.lane_id", F_OK) || errno != ENOENT)
++			fail("NFS fuzz lane marker is visible inside executor chroot");
+ 		errno = 0;
+ 		if (!access("/syz-nfs-lanes", F_OK) || errno != ENOENT)
+ 			fail("NFS fuzz lane source tree is visible inside executor chroot");
+-		debug("NFS fuzz lane isolated: proc=%llu source-tree-hidden=/syz-nfs-lanes\n", procid);
++		debug("NFS fuzz lane isolated: proc=%llu marker-hidden source-tree-hidden=/syz-nfs-lanes\n",
++		      procid);
+ 	}
+ #endif
+ 	setup_gadgetfs();
+diff --git a/executor/lane_hang_test.go b/executor/lane_hang_test.go
+index 2b6dc4cf0..2d58ef541 100644
+--- a/executor/lane_hang_test.go
++++ b/executor/lane_hang_test.go
+@@ -19,3 +19,22 @@ func TestFixedLaneDoesNotTreatExplicitFailureAsHang(t *testing.T) {
+ 		t.Fatalf("fixed-lane hang test does not exclude explicit kFailStatus")
+ 	}
+ }
++
++func TestFixedLaneMarkerIsNotImportedIntoSandbox(t *testing.T) {
++	source, err := os.ReadFile("common_linux.h")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if bytes.Contains(source, []byte("mount(source, target, NULL, MS_BIND | MS_REC")) {
++		t.Fatalf("proc lane parent, including .lane_id, is recursively imported")
++	}
++	for _, required := range [][]byte{
++		[]byte("mount(source_client0, target_client0"),
++		[]byte("mount(source_client1, target_client1"),
++		[]byte("NFS fuzz lane marker is visible inside executor chroot"),
++	} {
++		if !bytes.Contains(source, required) {
++			t.Fatalf("missing clients-only lane isolation check %q", required)
++		}
++	}
++}
+-- 
+2.34.1
+

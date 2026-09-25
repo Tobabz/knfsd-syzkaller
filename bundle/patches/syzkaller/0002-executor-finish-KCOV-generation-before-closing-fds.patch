@@ -1,0 +1,58 @@
+From 16f475448715b3ce8eb2c1893d659589cc2c157b Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Wed, 16 Sep 2026 20:12:00 +0900
+Subject: [PATCH 02/15] executor: finish KCOV generation before closing fds
+
+
+diff --git a/executor/executor.cc b/executor/executor.cc
+index 858360e27..989932af1 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -1196,28 +1196,34 @@ void execute_one()
+ 		}
+ 	}
+ 
+-#if SYZ_HAVE_CLOSE_FDS
+-	close_fds();
+-#endif
+-
+ 	if (remote_generation_managed) {
+ 		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
++		bool generation_resolved = false;
+ #if GOOS_linux
+ 		uint64 generation = remote_generation.load(std::memory_order_acquire);
+ 		if (generation) {
+ 			// FINISH performs the bounded kernel-side root/token drain.  It is the
+-			// publication barrier for remote extra coverage.
+-			valid = cover_finish_remote_generation(generation, 1000 * slowdown_scale) && valid;
+-			if (!valid)
+-				cover_abort_remote_generation(generation, false);
++			// publication barrier for remote extra coverage.  This must happen
++			// before close_fds(), which closes kExtraCoverFd as well.
++			bool finished = cover_finish_remote_generation(generation, 1000 * slowdown_scale);
++			valid = finished && valid;
++			generation_resolved = finished;
++			if (!finished)
++				generation_resolved = cover_abort_remote_generation(generation, false);
+ 		}
+ #endif
+ 		remote_generation_publishable = valid;
+ 		remote_generation.store(0, std::memory_order_release);
+-		// A zero value tells the fork-server parent no orphan cleanup is needed.
+-		output_data->kcov_generation.store(0, std::memory_order_release);
++		// Keep an unresolved exact generation visible to the fork-server parent;
++		// its inherited KCOV fd is the final cleanup path for child-side errors.
++		if (generation_resolved)
++			output_data->kcov_generation.store(0, std::memory_order_release);
+ 	}
+ 
++#if SYZ_HAVE_CLOSE_FDS
++	close_fds();
++#endif
++
+ 	write_extra_output();
+ 	if (flag_extra_coverage && !remote_generation_managed) {
+ 		// Check for new extra coverage in small intervals to avoid situation
+-- 
+2.34.1
+

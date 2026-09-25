@@ -1,0 +1,62 @@
+From 232d7aa6539103827f7c0f50a66e751cf880a6c8 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Wed, 16 Sep 2026 20:14:58 +0900
+Subject: [PATCH 04/15] executor: close KCOV begin watchdog race
+
+
+diff --git a/executor/common.h b/executor/common.h
+index 83a7b0ffa..31a469df5 100644
+--- a/executor/common.h
++++ b/executor/common.h
+@@ -729,28 +729,19 @@ static void loop(void)
+ 				continue;
+ #endif
+ 			debug("killing hanging pid %d\n", pid);
+-#if GOOS_linux
+-			// The KCOV fd is inherited from this fork-server process.  The child
+-			// publishes its exact generation in shared output memory immediately
+-			// after BEGIN, which lets the watchdog close the attribution window
+-			// before killing an unresponsive child.
+-			uint64 orphan_generation = output_data->kcov_generation.load(std::memory_order_acquire);
+-			if (orphan_generation) {
+-				cover_abort_remote_generation(orphan_generation, true);
+-				output_data->kcov_generation.store(0, std::memory_order_release);
+-			}
+-#endif
++			// Kill and reap first.  Only then is it impossible for the child to
++			// attach a Generation after the watchdog's orphan check.
+ 			kill_and_wait(pid, &status);
+ 			break;
+ 		}
+ #if SYZ_EXECUTOR && GOOS_linux
+-		// Also cover crashes/exits between BEGIN and FINISH.  Normal completion
+-		// clears this slot with a release store before the child exits.
++		// Cover hangs, crashes, and the BEGIN-return/shared-publication race.  If
++		// the child did not publish an exact id, generation zero means "abort the
++		// current Generation attached to this inherited KCOV fd" (not BIND(0)).
+ 		uint64 orphan_generation = output_data->kcov_generation.load(std::memory_order_acquire);
+-		if (orphan_generation) {
+-			cover_abort_remote_generation(orphan_generation, true);
++		if (flag_extra_coverage &&
++		    cover_abort_remote_generation(orphan_generation, true))
+ 			output_data->kcov_generation.store(0, std::memory_order_release);
+-		}
+ #endif
+ #if SYZ_EXECUTOR
+ 		if (WEXITSTATUS(status) == kFailStatus) {
+diff --git a/executor/executor_linux.h b/executor/executor_linux.h
+index 5a803fee8..73606bd07 100644
+--- a/executor/executor_linux.h
++++ b/executor/executor_linux.h
+@@ -311,8 +311,6 @@ static bool cover_finish_remote_generation(uint64 generation, uint64 timeout_ms)
+ // killed.  Such cleanup must not turn a target hang into an executor failure.
+ static bool cover_abort_remote_generation(uint64 generation, bool best_effort)
+ {
+-	if (!generation)
+-		return true;
+ 	kcov_remote_generation arg = {
+ 	    .generation = generation,
+ 	};
+-- 
+2.34.1
+

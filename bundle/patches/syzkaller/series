@@ -1,0 +1,15 @@
+0001-executor-bind-KCOV-request-generations-per-program.patch
+0002-executor-finish-KCOV-generation-before-closing-fds.patch
+0003-executor-retain-KCOV-generation-across-syscall-rerun.patch
+0004-executor-close-KCOV-begin-watchdog-race.patch
+0005-executor-publish-managed-remote-coverage-before-fd-c.patch
+0006-sys-linux-describe-opt-in-SunRPC-fuzz-messages.patch
+0007-executor-bind-proc-specific-NFS-fuzz-lane.patch
+0008-executor-fail-closed-on-hung-fixed-NFS-lane.patch
+0009-executor-expose-fixed-NFS-lane-in-request-workdirs.patch
+0010-executor-verify-NFS-lane-source-isolation-after-chro.patch
+0011-tools-execprog-add-remote-coverage-measurement-toggl.patch
+0012-tools-execprog-timestamp-coverage-samples.patch
+0013-executor-distinguish-fixed-lane-hangs-from-explicit-.patch
+0014-executor-hide-fixed-lane-marker-from-fuzz-programs.patch
+0015-sys-linux-add-protocol-shaped-NFS-fuzz-operations.patch

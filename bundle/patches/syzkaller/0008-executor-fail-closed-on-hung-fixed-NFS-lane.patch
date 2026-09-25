@@ -1,0 +1,29 @@
+From 5bd24519af06f6f05afd88902c627901dfb4f267 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 10:32:49 +0900
+Subject: [PATCH 08/15] executor: fail closed on hung fixed NFS lane
+
+
+diff --git a/executor/executor_runner.h b/executor/executor_runner.h
+index b862d3eac..d464e460c 100644
+--- a/executor/executor_runner.h
++++ b/executor/executor_runner.h
+@@ -301,6 +301,15 @@ private:
+ 			bool hanged = SYZ_EXECUTOR_USES_FORK_SERVER && state_ == State::Executing;
+ 			HandleCompletion(status, hanged);
+ 			if (hanged) {
++				// A Frozen NFS attribution fixture gives every proc id one
++				// immutable lane.  Moving a replacement to a spare proc id
++				// would either escape the fixture or silently change lanes while
++				// the old execution can still pin NFS state.  Fail the runner so
++				// the VM/lane recovery path can quiesce and recreate the domain.
++#if GOOS_linux
++				if (!access("/syz-nfs-lanes/enabled", F_OK))
++					failmsg("NFS fuzz lane executor hung", "proc=%d", id_);
++#endif
+ 				// If the process has hanged, it may still be using per-proc resources,
+ 				// so allocate a fresh proc id.
+ 				int new_id = proc_id_pool_.Alloc(id_);
+-- 
+2.34.1
+

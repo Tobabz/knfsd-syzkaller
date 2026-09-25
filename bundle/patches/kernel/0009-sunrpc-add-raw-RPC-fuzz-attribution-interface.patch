@@ -1,0 +1,1540 @@
+From 032a639f5d6da333531ee5383ebf24d78466d923 Mon Sep 17 00:00:00 2001
+From: fuzzer <fuzzer@cesrv.local>
+Date: Thu, 17 Sep 2026 09:36:55 +0900
+Subject: [PATCH 09/11] sunrpc: add raw RPC fuzz attribution interface
+
+
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+index cc69076bf..7021f7226 100644
+--- a/include/linux/kcov.h
++++ b/include/linux/kcov.h
+@@ -53,6 +53,8 @@ struct kcov_request_root {
+ 	unsigned long retry_deadline;
+ 	atomic_t finished;
+ 	u8 state;
++	u8 auto_finish_on_closing;
++	u8 auto_finished;
+ };
+ 
+ enum kcov_request_remote_result {
+@@ -327,6 +329,8 @@ bool kcov_request_phase6_publish_valid(
+ 
+ bool kcov_request_root_init(struct kcov_request_root *root,
+ 		struct kcov_common_handle_id owner, u64 request_cookie);
++bool kcov_request_root_init_auto_finish(struct kcov_request_root *root,
++		struct kcov_common_handle_id owner, u64 request_cookie);
+ void kcov_request_root_finish(struct kcov_request_root *root);
+ bool kcov_request_root_attributable(const struct kcov_request_root *root);
+ bool kcov_request_try_get_child_token(struct kcov_request_root *root,
+@@ -530,6 +534,12 @@ static inline bool kcov_request_root_init(struct kcov_request_root *root,
+ {
+ 	return false;
+ }
++static inline bool kcov_request_root_init_auto_finish(
++		struct kcov_request_root *root,
++		struct kcov_common_handle_id owner, u64 request_cookie)
++{
++	return false;
++}
+ static inline void kcov_request_root_finish(struct kcov_request_root *root) {}
+ static inline bool kcov_request_root_attributable(
+ 		const struct kcov_request_root *root) { return false; }
+diff --git a/include/linux/sunrpc/fuzz.h b/include/linux/sunrpc/fuzz.h
+index 2bc0e59d2..2ca8ad8ea 100644
+--- a/include/linux/sunrpc/fuzz.h
++++ b/include/linux/sunrpc/fuzz.h
+@@ -84,6 +84,9 @@ bool sunrpc_fuzz_origin_is_attributable(
+ 
+ void sunrpc_fuzz_logical_init(struct sunrpc_fuzz_logical_rpc *logical,
+ 		const struct sunrpc_fuzz_origin *origin);
++void sunrpc_fuzz_logical_init_auto_finish(
++		struct sunrpc_fuzz_logical_rpc *logical,
++		const struct sunrpc_fuzz_origin *origin);
+ void sunrpc_fuzz_logical_complete(struct sunrpc_fuzz_logical_rpc *logical);
+ void sunrpc_fuzz_logical_cancel(struct sunrpc_fuzz_logical_rpc *logical);
+ void sunrpc_fuzz_logical_destroy(struct sunrpc_fuzz_logical_rpc *logical);
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 8709984f2..fa759b9fb 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -103,6 +103,8 @@ typedef struct {
+ struct sock;
+ struct proto;
+ struct net;
++struct module;
++struct tcp_sunrpc_fuzz;
+ 
+ typedef __u32 __bitwise __portpair;
+ typedef __u64 __bitwise __addrpair;
+@@ -461,9 +463,22 @@ struct sock {
+ 	void			(*sk_sunrpc_fuzz_first_byte)(struct sock *sk);
+ 	void			(*sk_sunrpc_fuzz_retransmit)(struct sock *sk,
+ 						       bool begin);
++	int			(*sk_sunrpc_fuzz_raw_sendmsg)(struct sock *sk,
++					 const struct tcp_sunrpc_fuzz *control,
++					 u32 xid, size_t size);
++	bool			(*sk_sunrpc_fuzz_raw_result)(struct sock *sk,
++					 ssize_t result, size_t size);
++	void			(*sk_sunrpc_fuzz_raw_recv)(struct sock *sk,
++					 const struct sk_buff *skb, u32 offset,
++					 size_t size);
++	void			(*sk_sunrpc_fuzz_raw_connect_result)(struct sock *sk,
++					 int status);
++	void			(*sk_sunrpc_fuzz_raw_release)(struct sock *sk);
+ 	void			*sk_sunrpc_fuzz_context;
+ 	void			*sk_sunrpc_fuzz_reservation;
+ 	void			*sk_sunrpc_fuzz_retransmit_context;
++	void			*sk_sunrpc_fuzz_raw_context;
++	struct module		*sk_sunrpc_fuzz_raw_owner;
+ 	bool			sk_sunrpc_fuzz_limit_first_copy;
+ 	bool			sk_sunrpc_fuzz_stop_after_first_copy;
+ 	bool			sk_sunrpc_fuzz_postcommit_failed;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 436495ff2..94aa57d7c 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -52,6 +52,14 @@
+ 
+ extern struct inet_hashinfo tcp_hashinfo;
+ 
++struct tcp_sunrpc_fuzz_ops {
++	struct module *owner;
++	int (*enable)(struct sock *sk);
++};
++
++int tcp_register_sunrpc_fuzz(const struct tcp_sunrpc_fuzz_ops *ops);
++void tcp_unregister_sunrpc_fuzz(const struct tcp_sunrpc_fuzz_ops *ops);
++
+ DECLARE_PER_CPU(unsigned int, tcp_orphan_count);
+ int tcp_orphan_count_sum(void);
+ 
+diff --git a/include/uapi/linux/tcp.h b/include/uapi/linux/tcp.h
+index 03772dd4d..88c75d95b 100644
+--- a/include/uapi/linux/tcp.h
++++ b/include/uapi/linux/tcp.h
+@@ -143,6 +143,21 @@ enum {
+ #define TCP_RTO_MIN_US		45	/* min rto time in us */
+ #define TCP_DELACK_MAX_US	46	/* max delayed ack time in us */
+ 
++/* Project-private raw SUNRPC fuzz attribution control. */
++#define TCP_SUNRPC_FUZZ		47
++
++#define TCP_SUNRPC_FUZZ_VERSION	1
++#define TCP_SUNRPC_FUZZ_F_NEW		(1U << 0)
++#define TCP_SUNRPC_FUZZ_F_RETRY		(1U << 1)
++#define TCP_SUNRPC_FUZZ_F_FINAL		(1U << 2)
++#define TCP_SUNRPC_FUZZ_F_CANCEL		(1U << 3)
++
++struct tcp_sunrpc_fuzz {
++	__u32	version;
++	__u32	flags;
++	__u64	user_tag;
++};
++
+ #define TCP_REPAIR_ON		1
+ #define TCP_REPAIR_OFF		0
+ #define TCP_REPAIR_OFF_NO_WP	-1	/* Turn off without window probes */
+diff --git a/kernel/kcov_request.c b/kernel/kcov_request.c
+index 507975aa5..90cfd7e25 100644
+--- a/kernel/kcov_request.c
++++ b/kernel/kcov_request.c
+@@ -1076,9 +1076,49 @@ int kcov_request_generation_abort(struct kcov_request_generation *gen)
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_generation_abort);
+ 
++/* Called with gen->lock held; returns embedded-token refs to drop unlocked. */
++static unsigned int request_auto_finish_roots_locked(
++		struct kcov_request_generation *gen)
++{
++	struct kcov_request_root *root, *tmp;
++	unsigned int token_refs = 0;
++
++	list_for_each_entry_safe(root, tmp, &gen->roots, node) {
++		struct kcov_request_token *token;
++
++		if (!root->auto_finish_on_closing ||
++		    atomic_read(&root->finished))
++			continue;
++		/*
++		 * Remove admission/accounting now, but retain the root-holder ref
++		 * until its owner destroys the embedded root.  That ref also pins
++		 * this memory against a concurrent owner teardown.
++		 */
++		list_del_init(&root->node);
++		gen->active_roots--;
++		root->state = KCOV_REQUEST_ROOT_DONE;
++		root->auto_finished = 1;
++		token = &root->root_token;
++		if (atomic_cmpxchg(&token->completed, REQUEST_TOKEN_ACTIVE,
++				   REQUEST_TOKEN_DONE) == REQUEST_TOKEN_ACTIVE) {
++			list_del_init(&token->node);
++			gen->outstanding_tokens--;
++			token->generation = NULL;
++			token_refs++;
++			request_stat_inc(REQUEST_ROOT_TOKEN_COMPLETED);
++			request_stat_inc(REQUEST_TOKEN_COMPLETED);
++		} else {
++			WARN_ON_ONCE(1);
++		}
++	}
++	return token_refs;
++}
++
+ int kcov_request_generation_finish(struct kcov_request_generation *gen,
+ 		u32 timeout_ms)
+ {
++	struct kcov_request_root *root;
++	unsigned int auto_token_refs = 0;
+ 	long left;
+ 	int ret = 0;
+ 
+@@ -1086,14 +1126,13 @@ int kcov_request_generation_finish(struct kcov_request_generation *gen,
+ 		return -EINVAL;
+ 	spin_lock(&gen->lock);
+ 	if (gen->state == KCOV_REQUEST_GEN_OPEN) {
+-		struct kcov_request_root *root;
+-
+ 		gen->state = KCOV_REQUEST_GEN_CLOSING;
+ 		if (gen->aggregate_state == KCOV_REQUEST_AGGREGATE_OPEN)
+ 			gen->aggregate_state = KCOV_REQUEST_AGGREGATE_CLOSING;
+ 		list_for_each_entry(root, &gen->roots, node)
+ 			root->retry_deadline = jiffies +
+ 				msecs_to_jiffies(timeout_ms);
++		auto_token_refs = request_auto_finish_roots_locked(gen);
+ 		request_stat_inc(REQUEST_GENERATION_CLOSING);
+ 	} else if (gen->state == KCOV_REQUEST_GEN_COMMITTED) {
+ 		spin_unlock(&gen->lock);
+@@ -1103,6 +1142,11 @@ int kcov_request_generation_finish(struct kcov_request_generation *gen,
+ 		return -ESTALE;
+ 	}
+ 	spin_unlock(&gen->lock);
++	while (auto_token_refs) {
++		auto_token_refs--;
++		kcov_request_generation_put(gen);
++	}
++	wake_up_all(&gen->drain_wait);
+ 	request_stat_inc(REQUEST_GENERATION_FINISH);
+ 
+ 	left = wait_event_interruptible_timeout(gen->drain_wait,
+@@ -1160,8 +1204,9 @@ static void request_token_init_locked(struct kcov_request_generation *gen,
+ 	request_stat_inc(REQUEST_TOKEN_CREATED);
+ }
+ 
+-bool kcov_request_root_init(struct kcov_request_root *root,
+-		struct kcov_common_handle_id owner, u64 request_cookie)
++static bool __kcov_request_root_init(struct kcov_request_root *root,
++		struct kcov_common_handle_id owner, u64 request_cookie,
++		bool auto_finish)
+ {
+ 	struct kcov_request_generation *gen;
+ 	bool ok = false;
+@@ -1183,6 +1228,7 @@ bool kcov_request_root_init(struct kcov_request_root *root,
+ 		root->request_cookie = request_cookie;
+ 		root->retry_deadline = jiffies + msecs_to_jiffies(5000);
+ 		root->state = KCOV_REQUEST_ROOT_ACTIVE;
++		root->auto_finish_on_closing = auto_finish;
+ 		list_add_tail(&root->node, &gen->roots);
+ 		gen->active_roots++;
+ 		request_token_init_locked(gen, &root->root_token,
+@@ -1200,8 +1246,21 @@ bool kcov_request_root_init(struct kcov_request_root *root,
+ 		kcov_request_generation_put(gen);
+ 	return ok;
+ }
++
++bool kcov_request_root_init(struct kcov_request_root *root,
++		struct kcov_common_handle_id owner, u64 request_cookie)
++{
++	return __kcov_request_root_init(root, owner, request_cookie, false);
++}
+ EXPORT_SYMBOL_GPL(kcov_request_root_init);
+ 
++bool kcov_request_root_init_auto_finish(struct kcov_request_root *root,
++		struct kcov_common_handle_id owner, u64 request_cookie)
++{
++	return __kcov_request_root_init(root, owner, request_cookie, true);
++}
++EXPORT_SYMBOL_GPL(kcov_request_root_init_auto_finish);
++
+ bool kcov_request_root_attributable(const struct kcov_request_root *root)
+ {
+ 	struct kcov_request_generation *gen = root->generation;
+@@ -1706,6 +1765,7 @@ bool kcov_request_try_get_child_token(struct kcov_request_root *root,
+ {
+ 	struct kcov_request_generation *gen = root->generation;
+ 	enum request_fault fault;
++	unsigned int auto_token_refs = 0;
+ 	bool ok = false, wake = false;
+ 
+ 	/* rpc_task serializes child creation against its final release hook. */
+@@ -1742,6 +1802,7 @@ bool kcov_request_try_get_child_token(struct kcov_request_root *root,
+ 			gen->aggregate_state = KCOV_REQUEST_AGGREGATE_CLOSING;
+ 		list_for_each_entry(iter, &gen->roots, node)
+ 			iter->retry_deadline = jiffies + msecs_to_jiffies(5000);
++		auto_token_refs = request_auto_finish_roots_locked(gen);
+ 		request_stat_inc(REQUEST_GENERATION_CLOSING);
+ 		wake = true;
+ 	} else if (fault == REQUEST_FAULT_ABORT_FIRST_CHILD) {
+@@ -1750,6 +1811,10 @@ bool kcov_request_try_get_child_token(struct kcov_request_root *root,
+ 	}
+ out:
+ 	spin_unlock(&gen->lock);
++	while (auto_token_refs) {
++		auto_token_refs--;
++		kcov_request_generation_put(gen);
++	}
+ 	if (wake)
+ 		wake_up_all(&gen->drain_wait);
+ 	return ok;
+@@ -1844,6 +1909,7 @@ EXPORT_SYMBOL_GPL(kcov_request_token_complete_once);
+ void kcov_request_root_finish(struct kcov_request_root *root)
+ {
+ 	struct kcov_request_generation *gen;
++	bool auto_finished;
+ 
+ 	/* Own the root-held generation ref and terminal transition exactly once. */
+ 	if (atomic_xchg(&root->finished, 1))
+@@ -1857,13 +1923,15 @@ void kcov_request_root_finish(struct kcov_request_root *root)
+ 	 * another CPU still sees an ACTIVE root and creates a retry child.
+ 	 */
+ 	spin_lock(&gen->lock);
++	auto_finished = root->auto_finished;
+ 	if (!list_empty(&root->node)) {
+ 		list_del_init(&root->node);
+ 		gen->active_roots--;
+ 	}
+ 	root->state = KCOV_REQUEST_ROOT_DONE;
+ 	spin_unlock(&gen->lock);
+-	request_token_complete(&root->root_token, true);
++	if (!auto_finished)
++		request_token_complete(&root->root_token, true);
+ 	root->generation = NULL;
+ 	wake_up_all(&gen->drain_wait);
+ 	kcov_request_generation_put(gen);
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index 6257459bc..2fed76a3b 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -1336,6 +1336,11 @@ int inet_csk_listen_start(struct sock *sk)
+ 	struct inet_sock *inet = inet_sk(sk);
+ 	int err;
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	/* An opted raw client context is single-owner and must never clone. */
++	if (sk->sk_sunrpc_fuzz_raw_context)
++		return -EINVAL;
++#endif
+ 	err = inet_ulp_can_listen(sk);
+ 	if (unlikely(err))
+ 		return err;
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 1b3ae3a0f..8fcdd3b79 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -290,6 +290,85 @@
+ 
+ #include "../core/devmem.h"
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++static DEFINE_MUTEX(tcp_sunrpc_fuzz_ops_lock);
++static const struct tcp_sunrpc_fuzz_ops __rcu *tcp_sunrpc_fuzz_ops;
++
++int tcp_register_sunrpc_fuzz(const struct tcp_sunrpc_fuzz_ops *ops)
++{
++	int ret = 0;
++
++	if (!ops || !ops->enable)
++		return -EINVAL;
++	mutex_lock(&tcp_sunrpc_fuzz_ops_lock);
++	if (rcu_access_pointer(tcp_sunrpc_fuzz_ops))
++		ret = -EBUSY;
++	else
++		rcu_assign_pointer(tcp_sunrpc_fuzz_ops, ops);
++	mutex_unlock(&tcp_sunrpc_fuzz_ops_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tcp_register_sunrpc_fuzz);
++
++void tcp_unregister_sunrpc_fuzz(const struct tcp_sunrpc_fuzz_ops *ops)
++{
++	mutex_lock(&tcp_sunrpc_fuzz_ops_lock);
++	if (rcu_access_pointer(tcp_sunrpc_fuzz_ops) == ops)
++		RCU_INIT_POINTER(tcp_sunrpc_fuzz_ops, NULL);
++	mutex_unlock(&tcp_sunrpc_fuzz_ops_lock);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL_GPL(tcp_unregister_sunrpc_fuzz);
++
++static int tcp_sunrpc_fuzz_enable(struct sock *sk)
++{
++	const struct tcp_sunrpc_fuzz_ops *ops;
++	struct module *owner;
++	int (*enable)(struct sock *sk);
++	int ret;
++
++	if (sk->sk_sunrpc_fuzz_raw_context)
++		return -EALREADY;
++	rcu_read_lock();
++	ops = rcu_dereference(tcp_sunrpc_fuzz_ops);
++	if (!ops || (ops->owner && !try_module_get(ops->owner))) {
++		rcu_read_unlock();
++		return -EOPNOTSUPP;
++	}
++	owner = ops->owner;
++	enable = ops->enable;
++	rcu_read_unlock();
++
++	ret = enable(sk);
++	if (ret) {
++		if (owner)
++			module_put(owner);
++		return ret;
++	}
++	sk->sk_sunrpc_fuzz_raw_owner = owner;
++	return 0;
++}
++
++static void tcp_sunrpc_fuzz_release(struct sock *sk)
++{
++	struct module *owner;
++	void (*release)(struct sock *sk);
++
++	release = xchg(&sk->sk_sunrpc_fuzz_raw_release, NULL);
++	if (!release)
++		return;
++	owner = xchg(&sk->sk_sunrpc_fuzz_raw_owner, NULL);
++	release(sk);
++	WRITE_ONCE(sk->sk_sunrpc_fuzz_raw_sendmsg, NULL);
++	WRITE_ONCE(sk->sk_sunrpc_fuzz_raw_result, NULL);
++	WRITE_ONCE(sk->sk_sunrpc_fuzz_raw_recv, NULL);
++	WRITE_ONCE(sk->sk_sunrpc_fuzz_raw_connect_result, NULL);
++	WRITE_ONCE(sk->sk_sunrpc_fuzz_raw_context, NULL);
++	if (owner)
++		module_put(owner);
++}
++#endif
++
+ /* Track pending CMSGs. */
+ enum {
+ 	TCP_CMSG_INQ = 1,
+@@ -1113,6 +1192,49 @@ void tcp_rate_check_app_limited(struct sock *sk)
+ }
+ EXPORT_SYMBOL_GPL(tcp_rate_check_app_limited);
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++static int tcp_sunrpc_fuzz_parse_cmsg(struct msghdr *msg,
++		struct tcp_sunrpc_fuzz *control, bool *present)
++{
++	struct cmsghdr *cmsg;
++
++	*present = false;
++	for_each_cmsghdr(cmsg, msg) {
++		if (!CMSG_OK(msg, cmsg))
++			return -EINVAL;
++		if (cmsg->cmsg_level != SOL_TCP ||
++		    cmsg->cmsg_type != TCP_SUNRPC_FUZZ)
++			continue;
++		if (*present || cmsg->cmsg_len != CMSG_LEN(sizeof(*control)))
++			return -EINVAL;
++		memcpy(control, CMSG_DATA(cmsg), sizeof(*control));
++		*present = true;
++	}
++	return 0;
++}
++
++static int tcp_sunrpc_fuzz_validate_record(struct msghdr *msg, size_t size,
++		u32 *xid)
++{
++	struct iov_iter iter = msg->msg_iter;
++	__be32 words[3];
++	u32 marker;
++
++	/* Record Marker, XID and CALL direction are the minimum exact prefix. */
++	if (size < sizeof(words) || size - sizeof(__be32) > 0x7fffffffU)
++		return -EMSGSIZE;
++	if (!copy_from_iter_full(words, sizeof(words), &iter))
++		return -EFAULT;
++	marker = be32_to_cpu(words[0]);
++	if (!(marker & BIT(31)) ||
++	    (marker & ~BIT(31)) != size - sizeof(__be32) ||
++	    words[2] != cpu_to_be32(0))
++		return -EINVAL;
++	*xid = be32_to_cpu(words[1]);
++	return 0;
++}
++#endif
++
+ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ {
+ 	struct net_devmem_dmabuf_binding *binding = NULL;
+@@ -1126,6 +1248,13 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 	int sockc_err = 0;
+ 	int zc = 0;
+ 	long timeo;
++#if IS_ENABLED(CONFIG_SUNRPC)
++	struct tcp_sunrpc_fuzz fuzz_control = {};
++	bool fuzz_present = false;
++	bool fuzz_prepared = false;
++	u32 fuzz_xid = 0;
++	int fuzz_err = 0;
++#endif
+ 
+ 	flags = msg->msg_flags;
+ 
+@@ -1137,6 +1266,58 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 		 */
+ 	}
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (msg->msg_controllen)
++		fuzz_err = tcp_sunrpc_fuzz_parse_cmsg(msg, &fuzz_control,
++				&fuzz_present);
++	if (!fuzz_err && fuzz_present) {
++		u32 action = fuzz_control.flags &
++			(TCP_SUNRPC_FUZZ_F_NEW | TCP_SUNRPC_FUZZ_F_RETRY |
++			 TCP_SUNRPC_FUZZ_F_CANCEL);
++
++		if (fuzz_control.version != TCP_SUNRPC_FUZZ_VERSION ||
++		    !fuzz_control.user_tag ||
++		    fuzz_control.flags & ~(TCP_SUNRPC_FUZZ_F_NEW |
++			TCP_SUNRPC_FUZZ_F_RETRY | TCP_SUNRPC_FUZZ_F_FINAL |
++			TCP_SUNRPC_FUZZ_F_CANCEL) ||
++		    (action != TCP_SUNRPC_FUZZ_F_NEW &&
++		     action != TCP_SUNRPC_FUZZ_F_RETRY &&
++		     action != TCP_SUNRPC_FUZZ_F_CANCEL) ||
++		    (action == TCP_SUNRPC_FUZZ_F_CANCEL &&
++		     fuzz_control.flags != TCP_SUNRPC_FUZZ_F_CANCEL) ||
++		    (action == TCP_SUNRPC_FUZZ_F_CANCEL) != (size == 0))
++			fuzz_err = -EINVAL;
++		else if (msg->msg_flags & (MSG_FASTOPEN | MSG_ZEROCOPY |
++			 MSG_SPLICE_PAGES | MSG_OOB))
++			fuzz_err = -EOPNOTSUPP;
++		else if (inet_test_bit(DEFER_CONNECT, sk) || tp->repair)
++			fuzz_err = -EOPNOTSUPP;
++		else if (action != TCP_SUNRPC_FUZZ_F_CANCEL)
++			fuzz_err = tcp_sunrpc_fuzz_validate_record(msg, size,
++					&fuzz_xid);
++		if (!fuzz_err && !sk->sk_sunrpc_fuzz_raw_sendmsg)
++			fuzz_err = -EOPNOTSUPP;
++	} else if (!fuzz_err && size && sk->sk_sunrpc_fuzz_raw_context) {
++		/* Once opted in, every data record needs exact framing metadata. */
++		fuzz_err = -EINVAL;
++	}
++	if (fuzz_err) {
++		err = fuzz_err;
++		goto out_err;
++	}
++	if (fuzz_present &&
++	    fuzz_control.flags == TCP_SUNRPC_FUZZ_F_CANCEL) {
++		if (sockc_err) {
++			err = sockc_err;
++			goto out_err;
++		}
++		err = sk->sk_sunrpc_fuzz_raw_sendmsg(sk, &fuzz_control, 0, 0);
++		if (err)
++			goto out_err;
++		return 0;
++	}
++#endif
++
+ 	if ((flags & MSG_ZEROCOPY) && size) {
+ 		if (msg->msg_ubuf) {
+ 			uarg = msg->msg_ubuf;
+@@ -1217,6 +1398,16 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 		goto out_err;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (fuzz_present) {
++		err = sk->sk_sunrpc_fuzz_raw_sendmsg(sk, &fuzz_control,
++				fuzz_xid, size);
++		if (err)
++			goto out_err;
++		fuzz_prepared = true;
++	}
++#endif
++
+ 	/* This should be in poll */
+ 	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
+ 
+@@ -1434,6 +1625,11 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 		tcp_tx_timestamp(sk, &sockc);
+ 		tcp_push(sk, flags, mss_now, tp->nonagle, size_goal);
+ 	}
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (fuzz_prepared && sk->sk_sunrpc_fuzz_raw_result(sk,
++			copied + copied_syn, size))
++		tcp_disconnect(sk, O_NONBLOCK);
++#endif
+ out_nopush:
+ 	/* msg->msg_ubuf is pinned by the caller so we don't take extra refs */
+ 	if (uarg && !msg->msg_ubuf)
+@@ -1460,6 +1656,11 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 	if (binding)
+ 		net_devmem_dmabuf_binding_put(binding);
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (fuzz_prepared && sk->sk_sunrpc_fuzz_raw_result(sk, err, size))
++		tcp_disconnect(sk, O_NONBLOCK);
++#endif
++
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(tcp_sendmsg_locked);
+@@ -1761,6 +1962,10 @@ static int __tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+ 		  sk_read_actor_t recv_actor)
+ {
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (sk->sk_sunrpc_fuzz_raw_context)
++		return -EOPNOTSUPP;
++#endif
+ 	return __tcp_read_sock(sk, desc, recv_actor, false,
+ 			       &tcp_sk(sk)->copied_seq);
+ }
+@@ -2232,6 +2437,10 @@ static int tcp_zerocopy_receive(struct sock *sk,
+ 	bool mmap_locked;
+ 	int ret;
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (sk->sk_sunrpc_fuzz_raw_context)
++		return -EOPNOTSUPP;
++#endif
+ 	zc->copybuf_len = 0;
+ 	zc->msg_flags = 0;
+ 
+@@ -2702,6 +2911,13 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
+ 	if (flags & MSG_OOB)
+ 		goto recv_urg;
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (sk->sk_sunrpc_fuzz_raw_context && (flags & MSG_SOCK_DEVMEM)) {
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++#endif
++
+ 	if (unlikely(tp->repair)) {
+ 		err = -EPERM;
+ 		if (!(flags & MSG_PEEK))
+@@ -2729,6 +2945,14 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
+ 	do {
+ 		u32 offset;
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++		if (sk->sk_sunrpc_fuzz_raw_context && unlikely(tp->urg_data)) {
++			tcp_disconnect(sk, O_NONBLOCK);
++			if (!copied)
++				copied = -EPROTO;
++			break;
++		}
++#endif
+ 		/* Are we at urgent data? Stop if we have read anything or have SIGURG pending. */
+ 		if (unlikely(tp->urg_data) && tp->urg_seq == *seq) {
+ 			if (copied)
+@@ -2833,6 +3057,14 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
+ 		used = skb->len - offset;
+ 		if (len < used)
+ 			used = len;
++#if IS_ENABLED(CONFIG_SUNRPC)
++		if (sk->sk_sunrpc_fuzz_raw_context &&
++		    !skb_frags_readable(skb)) {
++			if (!copied)
++				copied = -EOPNOTSUPP;
++			break;
++		}
++#endif
+ 
+ 		/* Do we have urgent data here? */
+ 		if (unlikely(tp->urg_data)) {
+@@ -2891,6 +3123,12 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
+ 
+ 		last_copied_dmabuf = !skb_frags_readable(skb);
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++		if (!(flags & MSG_PEEK) && used &&
++		    sk->sk_sunrpc_fuzz_raw_recv)
++			sk->sk_sunrpc_fuzz_raw_recv(sk, skb, offset, used);
++#endif
++
+ 		WRITE_ONCE(*seq, *seq + used);
+ 		copied += used;
+ 		len -= used;
+@@ -3328,6 +3566,9 @@ void __tcp_close(struct sock *sk, long timeout)
+ void tcp_close(struct sock *sk, long timeout)
+ {
+ 	lock_sock(sk);
++#if IS_ENABLED(CONFIG_SUNRPC)
++	tcp_sunrpc_fuzz_release(sk);
++#endif
+ 	__tcp_close(sk, timeout);
+ 	release_sock(sk);
+ 	if (!sk->sk_net_refcnt)
+@@ -3387,6 +3628,10 @@ int tcp_disconnect(struct sock *sk, int flags)
+ 	struct request_sock *req;
+ 	u32 seq;
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	tcp_sunrpc_fuzz_release(sk);
++#endif
++
+ 	if (old_state != TCP_CLOSE)
+ 		tcp_set_state(sk, TCP_CLOSE);
+ 
+@@ -3898,7 +4143,12 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
+ 		name[val] = 0;
+ 
+ 		sockopt_lock_sock(sk);
+-		err = tcp_set_ulp(sk, name);
++#if IS_ENABLED(CONFIG_SUNRPC)
++		if (sk->sk_sunrpc_fuzz_raw_context)
++			err = -EOPNOTSUPP;
++		else
++#endif
++			err = tcp_set_ulp(sk, name);
+ 		sockopt_release_sock(sk);
+ 		return err;
+ 	}
+@@ -3984,6 +4234,14 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
+ 	sockopt_lock_sock(sk);
+ 
+ 	switch (optname) {
++#if IS_ENABLED(CONFIG_SUNRPC)
++	case TCP_SUNRPC_FUZZ:
++		if (optlen != sizeof(val) || val != 1)
++			err = -EINVAL;
++		else
++			err = tcp_sunrpc_fuzz_enable(sk);
++		break;
++#endif
+ 	case TCP_NODELAY:
+ 		__tcp_sock_set_nodelay(sk, val);
+ 		break;
+@@ -4003,6 +4261,11 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
+ 	case TCP_REPAIR:
+ 		if (!tcp_can_repair_sock(sk))
+ 			err = -EPERM;
++#if IS_ENABLED(CONFIG_SUNRPC)
++		else if (val == TCP_REPAIR_ON &&
++			 sk->sk_sunrpc_fuzz_raw_context)
++			err = -EOPNOTSUPP;
++#endif
+ 		else if (val == TCP_REPAIR_ON) {
+ 			tp->repair = 1;
+ 			sk->sk_reuse = SK_FORCE_REUSE;
+@@ -4128,6 +4391,10 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
+ 	case TCP_FASTOPEN_CONNECT:
+ 		if (val > 1 || val < 0) {
+ 			err = -EINVAL;
++#if IS_ENABLED(CONFIG_SUNRPC)
++		} else if (val && sk->sk_sunrpc_fuzz_raw_context) {
++			err = -EOPNOTSUPP;
++#endif
+ 		} else if (READ_ONCE(net->ipv4.sysctl_tcp_fastopen) &
+ 			   TFO_CLIENT_ENABLE) {
+ 			if (sk->sk_state == TCP_CLOSE)
+@@ -5110,6 +5377,10 @@ void tcp_done(struct sock *sk)
+ {
+ 	struct request_sock *req;
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	tcp_sunrpc_fuzz_release(sk);
++#endif
++
+ 	/* We might be called with a new socket, after
+ 	 * inet_csk_prepare_forced_close() has been called
+ 	 * so we can not use lockdep_sock_is_held(sk)
+diff --git a/net/ipv4/tcp_bpf.c b/net/ipv4/tcp_bpf.c
+index 2e234d155..91b1f439f 100644
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@ -727,6 +727,10 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
+ 	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
+ 	int config = psock->progs.msg_parser   ? TCP_BPF_TX   : TCP_BPF_BASE;
+ 
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (!restore && sk->sk_sunrpc_fuzz_raw_context)
++		return -EOPNOTSUPP;
++#endif
+ 	if (psock->progs.stream_verdict || psock->progs.skb_verdict) {
+ 		config = (config == TCP_BPF_TX) ? TCP_BPF_TXRX : TCP_BPF_RX;
+ 	}
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index b96ccc890..58b7315d1 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -356,6 +356,10 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len
+ 	return 0;
+ 
+ failure:
++#if IS_ENABLED(CONFIG_SUNRPC)
++	if (sk->sk_sunrpc_fuzz_raw_connect_result)
++		sk->sk_sunrpc_fuzz_raw_connect_result(sk, err);
++#endif
+ 	/*
+ 	 * This unhashes the socket and releases the local port,
+ 	 * if necessary.
+diff --git a/net/sunrpc/fuzz.c b/net/sunrpc/fuzz.c
+index bf1fe4c2b..230b2e827 100644
+--- a/net/sunrpc/fuzz.c
++++ b/net/sunrpc/fuzz.c
+@@ -236,8 +236,9 @@ static u64 sunrpc_fuzz_alloc_cookie(void)
+ 	return cookie;
+ }
+ 
+-void sunrpc_fuzz_logical_init(struct sunrpc_fuzz_logical_rpc *logical,
+-		const struct sunrpc_fuzz_origin *origin)
++static void __sunrpc_fuzz_logical_init(
++		struct sunrpc_fuzz_logical_rpc *logical,
++		const struct sunrpc_fuzz_origin *origin, bool auto_finish)
+ {
+ 	enum sunrpc_fuzz_origin_state state;
+ 
+@@ -253,8 +254,11 @@ void sunrpc_fuzz_logical_init(struct sunrpc_fuzz_logical_rpc *logical,
+ 
+ 	logical->owner = origin->owner;
+ 	logical->request_cookie = sunrpc_fuzz_alloc_cookie();
+-	if (!kcov_request_root_init(&logical->root, logical->owner,
+-			logical->request_cookie)) {
++	if (!(auto_finish ?
++	      kcov_request_root_init_auto_finish(&logical->root,
++			logical->owner, logical->request_cookie) :
++	      kcov_request_root_init(&logical->root, logical->owner,
++			logical->request_cookie))) {
+ 		logical->request_cookie = 0;
+ 		logical->owner = sunrpc_fuzz_owner_none();
+ 		logical->origin_state = SUNRPC_FUZZ_ORIGIN_UNATTRIBUTED;
+@@ -266,6 +270,19 @@ void sunrpc_fuzz_logical_init(struct sunrpc_fuzz_logical_rpc *logical,
+ 	sunrpc_fuzz_stat_inc(SUNRPC_FUZZ_STAT_LOGICAL_CREATED);
+ }
+ 
++void sunrpc_fuzz_logical_init(struct sunrpc_fuzz_logical_rpc *logical,
++		const struct sunrpc_fuzz_origin *origin)
++{
++	__sunrpc_fuzz_logical_init(logical, origin, false);
++}
++
++void sunrpc_fuzz_logical_init_auto_finish(
++		struct sunrpc_fuzz_logical_rpc *logical,
++		const struct sunrpc_fuzz_origin *origin)
++{
++	__sunrpc_fuzz_logical_init(logical, origin, true);
++}
++
+ static bool sunrpc_fuzz_logical_finish(struct sunrpc_fuzz_logical_rpc *logical)
+ {
+ 	if (!logical->active)
+diff --git a/net/sunrpc/fuzz_conn.c b/net/sunrpc/fuzz_conn.c
+index 9042da5ed..7abbf75be 100644
+--- a/net/sunrpc/fuzz_conn.c
++++ b/net/sunrpc/fuzz_conn.c
+@@ -18,6 +18,8 @@
+ #include <linux/nsproxy.h>
+ #include <linux/refcount.h>
+ #include <linux/seq_file.h>
++#include <linux/skbuff.h>
++#include <linux/skmsg.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ 
+@@ -25,6 +27,7 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ #include <net/sock.h>
++#include <net/tcp.h>
+ 
+ #include <linux/sunrpc/fuzz.h>
+ #include <linux/sunrpc/svc.h>
+@@ -129,6 +132,64 @@ static const char *const phase3_stat_names[P3_STAT_COUNT] = {
+ 	[P3_SELFTEST_RECORD_MARKER_COMMIT] = "selftest_record_marker_commit",
+ };
+ 
++enum sunrpc_fuzz_phase7_stat {
++	P7_RAW_SOCKET_ENABLE_OK,
++	P7_RAW_SOCKET_ENABLE_REJECTED,
++	P7_RAW_SOCKET_RELEASED,
++	P7_RAW_PRECONNECT_CREATED,
++	P7_RAW_PRECONNECT_FAILED,
++	P7_RAW_CMSG_NEW,
++	P7_RAW_CMSG_NEW_FINAL,
++	P7_RAW_CMSG_RETRY,
++	P7_RAW_CMSG_RETRY_FINAL,
++	P7_RAW_CMSG_CANCEL,
++	P7_RAW_CMSG_REJECTED,
++	P7_RAW_TAG_COLLISION,
++	P7_RAW_CROSS_SOCKET_RETRY_REJECTED,
++	P7_RAW_TAG_CREATED,
++	P7_RAW_TAG_COMPLETED,
++	P7_RAW_TAG_CANCELED,
++	P7_RAW_TAG_AUTO_SEALED,
++	P7_RAW_TX_FULL,
++	P7_RAW_TX_PRECOMMIT_ROLLBACK,
++	P7_RAW_TX_POSTCOMMIT_PARTIAL,
++	P7_RAW_RETRY_SAME_COOKIE,
++	P7_RAW_RETRY_NEW_ORDINAL,
++	P7_RAW_CONNECTION_CORRUPTED,
++	P7_RAW_RX_RECORD,
++	P7_RAW_RX_PARSE_ERROR,
++	P7_STAT_COUNT,
++};
++
++static const char *const phase7_stat_names[P7_STAT_COUNT] = {
++	[P7_RAW_SOCKET_ENABLE_OK] = "raw_socket_enable_ok",
++	[P7_RAW_SOCKET_ENABLE_REJECTED] = "raw_socket_enable_rejected",
++	[P7_RAW_SOCKET_RELEASED] = "raw_socket_released",
++	[P7_RAW_PRECONNECT_CREATED] = "raw_preconnect_created",
++	[P7_RAW_PRECONNECT_FAILED] = "raw_preconnect_failed",
++	[P7_RAW_CMSG_NEW] = "raw_cmsg_new",
++	[P7_RAW_CMSG_NEW_FINAL] = "raw_cmsg_new_final",
++	[P7_RAW_CMSG_RETRY] = "raw_cmsg_retry",
++	[P7_RAW_CMSG_RETRY_FINAL] = "raw_cmsg_retry_final",
++	[P7_RAW_CMSG_CANCEL] = "raw_cmsg_cancel",
++	[P7_RAW_CMSG_REJECTED] = "raw_cmsg_rejected",
++	[P7_RAW_TAG_COLLISION] = "raw_tag_collision",
++	[P7_RAW_CROSS_SOCKET_RETRY_REJECTED] =
++		"raw_cross_socket_retry_rejected",
++	[P7_RAW_TAG_CREATED] = "raw_tag_created",
++	[P7_RAW_TAG_COMPLETED] = "raw_tag_completed",
++	[P7_RAW_TAG_CANCELED] = "raw_tag_canceled",
++	[P7_RAW_TAG_AUTO_SEALED] = "raw_tag_auto_sealed",
++	[P7_RAW_TX_FULL] = "raw_tx_full",
++	[P7_RAW_TX_PRECOMMIT_ROLLBACK] = "raw_tx_precommit_rollback",
++	[P7_RAW_TX_POSTCOMMIT_PARTIAL] = "raw_tx_postcommit_partial",
++	[P7_RAW_RETRY_SAME_COOKIE] = "raw_retry_same_cookie",
++	[P7_RAW_RETRY_NEW_ORDINAL] = "raw_retry_new_ordinal",
++	[P7_RAW_CONNECTION_CORRUPTED] = "raw_connection_corrupted",
++	[P7_RAW_RX_RECORD] = "raw_rx_record",
++	[P7_RAW_RX_PARSE_ERROR] = "raw_rx_parse_error",
++};
++
+ struct sunrpc_fuzz_net {
+ 	u32 lane_id;
+ 	u64 lane_epoch;
+@@ -189,10 +250,35 @@ struct sunrpc_fuzz_pending {
+ 	unsigned long expires;
+ };
+ 
++#define SUNRPC_FUZZ_RAW_MAX_TAGS	64
++
++struct sunrpc_fuzz_raw_tag {
++	struct list_head list;
++	u64 user_tag;
++	struct sunrpc_fuzz_logical_rpc logical;
++};
++
++struct sunrpc_fuzz_raw_sock {
++	struct list_head tags;
++	struct sunrpc_fuzz_conn *conn;
++	struct sunrpc_fuzz_raw_tag *active_tag;
++	struct sunrpc_fuzz_wire_reservation reservation;
++	size_t expected_size;
++	unsigned int nr_tags;
++	bool active_new;
++	bool active_final;
++	u8 rx_marker[sizeof(__be32)];
++	u8 rx_marker_bytes;
++	u32 rx_fragment_remaining;
++	bool rx_fragment_last;
++	bool rx_parse_failed;
++};
++
+ static unsigned int sunrpc_fuzz_net_id;
+ static atomic64_t next_lane_epoch = ATOMIC64_INIT(0);
+ static atomic64_t next_conn_cookie = ATOMIC64_INIT(0);
+ static atomic64_t phase3_stats[P3_STAT_COUNT];
++static atomic64_t phase7_stats[P7_STAT_COUNT];
+ enum phase3_fault {
+ 	P3_FAULT_NONE,
+ 	P3_FAULT_PRECOMMIT,
+@@ -216,6 +302,11 @@ static void phase3_stat_inc(enum sunrpc_fuzz_phase3_stat stat)
+ 	atomic64_inc(&phase3_stats[stat]);
+ }
+ 
++static void phase7_stat_inc(enum sunrpc_fuzz_phase7_stat stat)
++{
++	atomic64_inc(&phase7_stats[stat]);
++}
++
+ void sunrpc_fuzz_note_record_class(bool background, bool backchannel)
+ {
+ 	if (background)
+@@ -331,6 +422,8 @@ static struct sunrpc_fuzz_conn *svc_conn_get(struct svc_xprt *xprt);
+ static void conn_put(struct sunrpc_fuzz_conn *conn);
+ static void sunrpc_fuzz_wire_work_finish(
+ 		struct sunrpc_fuzz_wire_work *work, bool complete_token);
++static u64 record_received(struct sunrpc_fuzz_conn *conn,
++		enum sunrpc_fuzz_wire_direction direction);
+ 
+ static void tcp_retransmit_rpc(struct sock *sk, bool begin)
+ {
+@@ -1027,6 +1120,512 @@ void sunrpc_fuzz_svc_tx_result(struct svc_xprt *xprt,
+ 	finish_tx(reservation, sent, terminal_failure);
+ }
+ 
++static struct sunrpc_fuzz_raw_tag *raw_tag_find(
++		struct sunrpc_fuzz_raw_sock *raw, u64 user_tag)
++{
++	struct sunrpc_fuzz_raw_tag *tag;
++
++	list_for_each_entry(tag, &raw->tags, list)
++		if (tag->user_tag == user_tag)
++			return tag;
++	return NULL;
++}
++
++static void raw_tag_unlink(struct sunrpc_fuzz_raw_sock *raw,
++		struct sunrpc_fuzz_raw_tag *tag)
++{
++	list_del(&tag->list);
++	raw->nr_tags--;
++}
++
++static void raw_tag_seal(struct sunrpc_fuzz_raw_tag *tag, bool automatic)
++{
++	if (tag->logical.active) {
++		sunrpc_fuzz_logical_complete(&tag->logical);
++		phase7_stat_inc(P7_RAW_TAG_COMPLETED);
++	}
++	if (automatic)
++		phase7_stat_inc(P7_RAW_TAG_AUTO_SEALED);
++}
++
++static void raw_tag_cancel(struct sunrpc_fuzz_raw_tag *tag, bool count)
++{
++	if (READ_ONCE(tag->logical.root.auto_finished)) {
++		raw_tag_seal(tag, true);
++	} else if (tag->logical.active) {
++		sunrpc_fuzz_logical_cancel(&tag->logical);
++		if (count)
++			phase7_stat_inc(P7_RAW_TAG_CANCELED);
++	}
++}
++
++static void raw_tag_free(struct sunrpc_fuzz_raw_sock *raw,
++		struct sunrpc_fuzz_raw_tag *tag)
++{
++	raw_tag_unlink(raw, tag);
++	kfree(tag);
++}
++
++static void raw_first_byte(struct sock *sk)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_raw_context;
++
++	sk->sk_sunrpc_fuzz_first_byte = NULL;
++	if (raw) {
++		commit_tx(raw->reservation.conn, &raw->reservation);
++		if (!raw->reservation.committed)
++			return;
++		if (!raw->active_new) {
++			phase7_stat_inc(P7_RAW_RETRY_SAME_COOKIE);
++			phase7_stat_inc(P7_RAW_RETRY_NEW_ORDINAL);
++		}
++		if (raw->active_final)
++			raw_tag_seal(raw->active_tag, false);
++	}
++}
++
++static void raw_tcp_retransmit(struct sock *sk, bool begin)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_retransmit_context;
++	struct sunrpc_fuzz_conn *conn;
++	u64 ordinal;
++
++	if (!raw)
++		return;
++	conn = raw->conn;
++	if (!conn)
++		return;
++	spin_lock_bh(&conn->lock);
++	ordinal = conn->tx[SUNRPC_FUZZ_C2S];
++	spin_unlock_bh(&conn->lock);
++	if (begin) {
++		sk->sk_sunrpc_fuzz_retransmit_ordinal = ordinal;
++		return;
++	}
++	phase3_stat_inc(P3_TCP_SEGMENT_RETRANSMIT);
++	if (sk->sk_sunrpc_fuzz_retransmit_ordinal != ordinal)
++		phase3_stat_inc(P3_TCP_RETRANSMIT_ORDINAL_INCREMENT);
++}
++
++static void raw_recv(struct sock *sk, const struct sk_buff *skb, u32 offset,
++		size_t size)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_raw_context;
++
++	if (!raw || raw->rx_parse_failed)
++		return;
++	while (size) {
++		if (raw->rx_marker_bytes < sizeof(raw->rx_marker)) {
++			size_t copy = min_t(size_t, size,
++				sizeof(raw->rx_marker) - raw->rx_marker_bytes);
++			__be32 marker;
++
++			if (skb_copy_bits(skb, offset,
++					raw->rx_marker + raw->rx_marker_bytes,
++					copy)) {
++				raw->rx_parse_failed = true;
++				phase7_stat_inc(P7_RAW_RX_PARSE_ERROR);
++				return;
++			}
++			raw->rx_marker_bytes += copy;
++			offset += copy;
++			size -= copy;
++			if (raw->rx_marker_bytes < sizeof(raw->rx_marker))
++				continue;
++			memcpy(&marker, raw->rx_marker, sizeof(marker));
++			raw->rx_fragment_remaining =
++				be32_to_cpu(marker) & 0x7fffffffU;
++			raw->rx_fragment_last =
++				!!(be32_to_cpu(marker) & BIT(31));
++		}
++
++		if (raw->rx_fragment_remaining) {
++			size_t skip = min_t(size_t, size,
++				raw->rx_fragment_remaining);
++
++			raw->rx_fragment_remaining -= skip;
++			offset += skip;
++			size -= skip;
++		}
++		if (raw->rx_fragment_remaining)
++			continue;
++		if (raw->rx_fragment_last) {
++			if (!record_received(raw->conn, SUNRPC_FUZZ_S2C)) {
++				raw->rx_parse_failed = true;
++				phase7_stat_inc(P7_RAW_RX_PARSE_ERROR);
++				return;
++			}
++			phase7_stat_inc(P7_RAW_RX_RECORD);
++		}
++		raw->rx_marker_bytes = 0;
++		raw->rx_fragment_last = false;
++	}
++}
++
++static void raw_pre_connect(struct sock *sk)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_raw_context;
++	struct sunrpc_fuzz_pending *pending, *stale = NULL, *tmp;
++	struct sunrpc_fuzz_conn *conn;
++	struct sunrpc_fuzz_net *fnet;
++	struct inet_sock *inet;
++	unsigned long flags;
++
++	sk->sk_sunrpc_fuzz_preconnect = NULL;
++	if (!raw || raw->conn || sk->sk_family != AF_INET)
++		goto fail;
++	fnet = fuzz_pernet(sock_net(sk));
++	if (!READ_ONCE(fnet->valid))
++		goto fail;
++	pending = kzalloc(sizeof(*pending), GFP_ATOMIC);
++	conn = kzalloc(sizeof(*conn), GFP_ATOMIC);
++	if (!pending || !conn) {
++		kfree(pending);
++		kfree(conn);
++		goto fail;
++	}
++	inet = inet_sk(sk);
++	refcount_set(&conn->refs, 2); /* raw socket + pending registry */
++	INIT_LIST_HEAD(&conn->all);
++	INIT_LIST_HEAD(&conn->wire_work);
++	spin_lock_init(&conn->lock);
++	conn->conn_cookie = alloc_nonzero(&next_conn_cookie);
++	conn->key.lane_id = READ_ONCE(fnet->lane_id);
++	conn->key.lane_epoch = READ_ONCE(fnet->lane_epoch);
++	conn->key.protocol = IPPROTO_TCP;
++	conn->key.family = AF_INET;
++	conn->key.client_addr = inet->inet_saddr;
++	conn->key.client_port = inet->inet_sport;
++	conn->key.server_addr = inet->inet_daddr;
++	conn->key.server_port = inet->inet_dport;
++	conn->client_attached = true;
++	pending->conn = conn;
++	pending->expires = jiffies + SUNRPC_FUZZ_PENDING_TTL;
++
++	spin_lock_irqsave(&conn_lock, flags);
++	list_for_each_entry(tmp, &pending_list, list) {
++		if (key_equal(&tmp->conn->key, &conn->key)) {
++			stale = tmp;
++			list_del(&stale->list);
++			break;
++		}
++	}
++	list_add_tail(&conn->all, &conn_list);
++	list_add_tail(&pending->list, &pending_list);
++	raw->conn = conn;
++	spin_unlock_irqrestore(&conn_lock, flags);
++	if (stale) {
++		phase3_stat_inc(P3_CONNECTION_PAIR_EXPIRED);
++		conn_put(stale->conn);
++		kfree(stale);
++	}
++	sk->sk_sunrpc_fuzz_retransmit_context = raw;
++	sk->sk_sunrpc_fuzz_retransmit = raw_tcp_retransmit;
++	mod_delayed_work(system_wq, &pending_expiry_work, HZ);
++	phase7_stat_inc(P7_RAW_PRECONNECT_CREATED);
++	return;
++fail:
++	phase7_stat_inc(P7_RAW_PRECONNECT_FAILED);
++}
++
++static void raw_connect_result(struct sock *sk, int status)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_raw_context;
++	struct sunrpc_fuzz_pending *pending, *tmp, *found = NULL;
++	struct sunrpc_fuzz_conn *conn;
++	unsigned long flags;
++
++	if (!status || !raw)
++		return;
++	conn = raw->conn;
++	if (!conn)
++		return;
++	spin_lock_irqsave(&conn_lock, flags);
++	list_for_each_entry_safe(pending, tmp, &pending_list, list) {
++		if (pending->conn == conn) {
++			list_del(&pending->list);
++			found = pending;
++			break;
++		}
++	}
++	conn->client_attached = false;
++	raw->conn = NULL;
++	spin_unlock_irqrestore(&conn_lock, flags);
++	if (found) {
++		conn_put(found->conn);
++		kfree(found);
++	}
++	conn_put(conn);
++	if (sk->sk_sunrpc_fuzz_retransmit_context == raw) {
++		sk->sk_sunrpc_fuzz_retransmit_context = NULL;
++		sk->sk_sunrpc_fuzz_retransmit = NULL;
++	}
++	sk->sk_sunrpc_fuzz_preconnect = raw_pre_connect;
++	phase7_stat_inc(P7_RAW_PRECONNECT_FAILED);
++}
++
++static int raw_sendmsg(struct sock *sk,
++		const struct tcp_sunrpc_fuzz *control, u32 xid, size_t size)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_raw_context;
++	struct sunrpc_fuzz_raw_tag *tag;
++	struct sunrpc_fuzz_origin origin;
++	struct sunrpc_fuzz_rqst rqst = {};
++	u32 action = control->flags &
++		(TCP_SUNRPC_FUZZ_F_NEW | TCP_SUNRPC_FUZZ_F_RETRY |
++		 TCP_SUNRPC_FUZZ_F_CANCEL);
++	bool is_new = action == TCP_SUNRPC_FUZZ_F_NEW;
++
++	if (!raw || raw->active_tag || (!raw->conn && size))
++		goto rejected;
++	tag = raw_tag_find(raw, control->user_tag);
++	if (action == TCP_SUNRPC_FUZZ_F_CANCEL) {
++		if (!tag) {
++			phase7_stat_inc(P7_RAW_CROSS_SOCKET_RETRY_REJECTED);
++			goto rejected;
++		}
++		raw_tag_cancel(tag, true);
++		raw_tag_free(raw, tag);
++		phase7_stat_inc(P7_RAW_CMSG_CANCEL);
++		return 0;
++	}
++	if (is_new) {
++		if (tag) {
++			phase7_stat_inc(P7_RAW_TAG_COLLISION);
++			goto rejected;
++		}
++		if (raw->nr_tags >= SUNRPC_FUZZ_RAW_MAX_TAGS)
++			goto rejected;
++		tag = kzalloc(sizeof(*tag), GFP_KERNEL);
++		if (!tag)
++			return -ENOMEM;
++		sunrpc_fuzz_origin_init(&origin);
++		if (!sunrpc_fuzz_origin_capture_current(&origin)) {
++			kfree(tag);
++			goto rejected;
++		}
++		sunrpc_fuzz_logical_init_auto_finish(&tag->logical, &origin);
++		if (!tag->logical.active) {
++			kfree(tag);
++			goto rejected;
++		}
++		tag->user_tag = control->user_tag;
++		list_add_tail(&tag->list, &raw->tags);
++		raw->nr_tags++;
++		phase7_stat_inc(P7_RAW_TAG_CREATED);
++	} else {
++		struct kcov_common_handle_id current_owner;
++
++		if (!tag) {
++			phase7_stat_inc(P7_RAW_CROSS_SOCKET_RETRY_REJECTED);
++			goto rejected;
++		}
++		current_owner = kcov_common_handle();
++		if (current_owner.val != tag->logical.owner.val ||
++		    current_owner.generation != tag->logical.owner.generation)
++			goto rejected;
++	}
++	/* Count a semantically valid lifecycle attempt, including fault rollback. */
++	if (is_new) {
++		phase7_stat_inc(control->flags & TCP_SUNRPC_FUZZ_F_FINAL ?
++			P7_RAW_CMSG_NEW_FINAL : P7_RAW_CMSG_NEW);
++	} else {
++		phase7_stat_inc(control->flags & TCP_SUNRPC_FUZZ_F_FINAL ?
++			P7_RAW_CMSG_RETRY_FINAL : P7_RAW_CMSG_RETRY);
++	}
++
++	if (!reserve_tx(raw->conn, SUNRPC_FUZZ_C2S, &raw->reservation))
++		goto rollback_tag;
++	raw->reservation.request_cookie = tag->logical.request_cookie;
++	raw->reservation.xid = xid;
++	raw->reservation.record_len = size;
++	rqst.request_cookie = tag->logical.request_cookie;
++	rqst.owner = tag->logical.owner;
++	rqst.origin_state = SUNRPC_FUZZ_ORIGIN_UNIQUE;
++	rqst.root = &tag->logical.root;
++	if (!sunrpc_fuzz_wire_token_acquire(&raw->reservation, &rqst))
++		goto rollback_reservation;
++	if (sunrpc_fuzz_fault_before_rpc_send(sk,
++			raw->reservation.request_cookie))
++		goto rollback_reservation;
++	raw->active_tag = tag;
++	raw->active_new = is_new;
++	raw->active_final = control->flags & TCP_SUNRPC_FUZZ_F_FINAL;
++	raw->expected_size = size;
++	sk->sk_sunrpc_fuzz_first_byte = raw_first_byte;
++	return 0;
++
++rollback_reservation:
++	rollback_tx(&raw->reservation);
++	phase7_stat_inc(P7_RAW_TX_PRECOMMIT_ROLLBACK);
++rollback_tag:
++	if (is_new) {
++		raw_tag_cancel(tag, false);
++		raw_tag_free(raw, tag);
++	}
++rejected:
++	phase7_stat_inc(P7_RAW_CMSG_REJECTED);
++	return -ESTALE;
++}
++
++static bool raw_sendmsg_result(struct sock *sk, ssize_t result, size_t size)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_raw_context;
++	struct sunrpc_fuzz_raw_tag *tag;
++	bool full, committed, is_new, final;
++
++	if (!raw)
++		return false;
++	tag = raw->active_tag;
++	if (!tag)
++		return false;
++	sk->sk_sunrpc_fuzz_first_byte = NULL;
++	full = result == size && size == raw->expected_size;
++	committed = raw->reservation.committed;
++	is_new = raw->active_new;
++	final = raw->active_final;
++	if (result > 0 && !committed) {
++		/* The copy hook is authoritative; preserve bytes defensively. */
++		commit_tx(raw->reservation.conn, &raw->reservation);
++		committed = raw->reservation.committed;
++		if (committed && !is_new) {
++			phase7_stat_inc(P7_RAW_RETRY_SAME_COOKIE);
++			phase7_stat_inc(P7_RAW_RETRY_NEW_ORDINAL);
++		}
++		if (final)
++			raw_tag_seal(tag, false);
++	}
++	raw->active_tag = NULL;
++	raw->active_new = false;
++	raw->active_final = false;
++	raw->expected_size = 0;
++
++	if (full && committed) {
++		sunrpc_fuzz_wire_tx_complete(&raw->reservation);
++		if (final)
++			raw_tag_free(raw, tag);
++		phase7_stat_inc(P7_RAW_TX_FULL);
++		return false;
++	}
++	if (result <= 0 || !committed) {
++		finish_tx(&raw->reservation, result > 0 ? result : 0, true);
++		if (is_new) {
++			raw_tag_cancel(tag, false);
++			raw_tag_free(raw, tag);
++		}
++		phase7_stat_inc(P7_RAW_TX_PRECOMMIT_ROLLBACK);
++		return false;
++	}
++
++	/* A short write after the Record Marker byte cannot be rolled back. */
++	finish_tx(&raw->reservation, result, true);
++	phase7_stat_inc(P7_RAW_TX_POSTCOMMIT_PARTIAL);
++	phase7_stat_inc(P7_RAW_CONNECTION_CORRUPTED);
++	phase3_stat_inc(P3_CORRUPTED_CONNECTION_CLOSED);
++	return true;
++}
++
++static void raw_release(struct sock *sk)
++{
++	struct sunrpc_fuzz_raw_sock *raw =
++		sk->sk_sunrpc_fuzz_raw_context;
++	struct sunrpc_fuzz_raw_tag *tag, *tmp;
++	struct sunrpc_fuzz_pending *pending, *pending_tmp, *found = NULL;
++	struct sunrpc_fuzz_conn *conn;
++	unsigned long flags;
++
++	if (!raw)
++		return;
++	sk->sk_sunrpc_fuzz_first_byte = NULL;
++	if (raw->reservation.pending)
++		finish_tx(&raw->reservation, 0, true);
++	if (raw->rx_marker_bytes || raw->rx_fragment_remaining)
++		phase7_stat_inc(P7_RAW_RX_PARSE_ERROR);
++	list_for_each_entry_safe(tag, tmp, &raw->tags, list) {
++		if (tag->logical.active)
++			raw_tag_seal(tag, true);
++		else if (READ_ONCE(tag->logical.root.auto_finished))
++			phase7_stat_inc(P7_RAW_TAG_AUTO_SEALED);
++		raw_tag_free(raw, tag);
++	}
++	sk->sk_sunrpc_fuzz_limit_first_copy = false;
++	sk->sk_sunrpc_fuzz_stop_after_first_copy = false;
++	sk->sk_sunrpc_fuzz_postcommit_failed = false;
++	sk->sk_sunrpc_fuzz_arm_drop_on_first_byte = false;
++	sk->sk_sunrpc_fuzz_drop_next_data = false;
++	conn = raw->conn;
++	if (conn) {
++		spin_lock_irqsave(&conn_lock, flags);
++		list_for_each_entry_safe(pending, pending_tmp, &pending_list,
++				list) {
++			if (pending->conn == conn) {
++				list_del(&pending->list);
++				found = pending;
++				break;
++			}
++		}
++		conn->client_attached = false;
++		spin_unlock_irqrestore(&conn_lock, flags);
++		if (found) {
++			conn_put(found->conn);
++			kfree(found);
++		}
++		conn_put(conn);
++	}
++	if (sk->sk_sunrpc_fuzz_retransmit_context == raw) {
++		sk->sk_sunrpc_fuzz_retransmit_context = NULL;
++		sk->sk_sunrpc_fuzz_retransmit = NULL;
++	}
++	kfree(raw);
++	phase7_stat_inc(P7_RAW_SOCKET_RELEASED);
++}
++
++static int raw_enable(struct sock *sk)
++{
++	struct sunrpc_fuzz_raw_sock *raw;
++	bool has_psock;
++
++	rcu_read_lock();
++	has_psock = !!sk_psock(sk);
++	rcu_read_unlock();
++
++	if (sk->sk_family != AF_INET || sk->sk_protocol != IPPROTO_TCP ||
++	    sk->sk_kern_sock || !sk->sk_socket ||
++	    sk->sk_socket->type != SOCK_STREAM || sk->sk_state != TCP_CLOSE ||
++	    inet_csk(sk)->icsk_ulp_ops || tcp_sk(sk)->fastopen_connect ||
++	    tcp_sk(sk)->repair || has_psock ||
++	    inet_sk(sk)->inet_dport || sk->sk_sunrpc_fuzz_preconnect ||
++	    !READ_ONCE(fuzz_pernet(sock_net(sk))->valid)) {
++		phase7_stat_inc(P7_RAW_SOCKET_ENABLE_REJECTED);
++		return -EINVAL;
++	}
++	raw = kzalloc(sizeof(*raw), GFP_KERNEL);
++	if (!raw)
++		return -ENOMEM;
++	INIT_LIST_HEAD(&raw->tags);
++	sk->sk_sunrpc_fuzz_raw_context = raw;
++	sk->sk_sunrpc_fuzz_raw_sendmsg = raw_sendmsg;
++	sk->sk_sunrpc_fuzz_raw_result = raw_sendmsg_result;
++	sk->sk_sunrpc_fuzz_raw_recv = raw_recv;
++	sk->sk_sunrpc_fuzz_raw_connect_result = raw_connect_result;
++	sk->sk_sunrpc_fuzz_raw_release = raw_release;
++	sk->sk_sunrpc_fuzz_preconnect = raw_pre_connect;
++	phase7_stat_inc(P7_RAW_SOCKET_ENABLE_OK);
++	return 0;
++}
++
++static const struct tcp_sunrpc_fuzz_ops raw_tcp_ops = {
++	.owner = THIS_MODULE,
++	.enable = raw_enable,
++};
++
+ static u64 record_received(struct sunrpc_fuzz_conn *conn,
+ 		enum sunrpc_fuzz_wire_direction direction)
+ {
+@@ -1270,6 +1869,17 @@ static int phase3_stats_show(struct seq_file *m, void *v)
+ }
+ DEFINE_SHOW_ATTRIBUTE(phase3_stats);
+ 
++static int phase7_stats_show(struct seq_file *m, void *v)
++{
++	unsigned int i;
++
++	for (i = 0; i < P7_STAT_COUNT; i++)
++		seq_printf(m, "%s %lld\n", phase7_stat_names[i],
++			   atomic64_read(&phase7_stats[i]));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(phase7_stats);
++
+ static int domain_show(struct seq_file *m, void *v)
+ {
+ 	struct sunrpc_fuzz_net *fnet;
+@@ -1573,6 +2183,8 @@ static ssize_t phase3_control_write(struct file *file,
+ 	if (sysfs_streq(command, "reset")) {
+ 		for (i = 0; i < P3_STAT_COUNT; i++)
+ 			atomic64_set(&phase3_stats[i], 0);
++		for (i = 0; i < P7_STAT_COUNT; i++)
++			atomic64_set(&phase7_stats[i], 0);
+ 		atomic_set(&armed_fault, P3_FAULT_NONE);
+ 		atomic64_set(&retry_cookie, 0);
+ 		return count;
+@@ -1649,6 +2261,11 @@ int sunrpc_fuzz_phase3_init(struct dentry *root)
+ 		ret = register_pernet_subsys(&sunrpc_fuzz_net_ops);
+ 		if (ret)
+ 			return ret;
++		ret = tcp_register_sunrpc_fuzz(&raw_tcp_ops);
++		if (ret) {
++			unregister_pernet_subsys(&sunrpc_fuzz_net_ops);
++			return ret;
++		}
+ 		phase3_registered = true;
+ 		kcov_request_phase5_register_transport_selftest(
+ 				sunrpc_fuzz_phase5_transport_selftest);
+@@ -1660,6 +2277,8 @@ int sunrpc_fuzz_phase3_init(struct dentry *root)
+ 				    &domain_control_fops);
+ 		debugfs_create_file("phase3_stats", 0400, root, NULL,
+ 				    &phase3_stats_fops);
++		debugfs_create_file("phase7_stats", 0400, root, NULL,
++				    &phase7_stats_fops);
+ 		debugfs_create_file("phase3_control", 0200, root, NULL,
+ 				    &phase3_control_fops);
+ 		debugfs_create_file("phase3_connections", 0400, root, NULL,
+@@ -1680,6 +2299,7 @@ void sunrpc_fuzz_phase3_exit(void)
+ 
+ 	if (!phase3_registered)
+ 		return;
++	tcp_unregister_sunrpc_fuzz(&raw_tcp_ops);
+ 	cancel_delayed_work_sync(&pending_expiry_work);
+ 	spin_lock_irqsave(&conn_lock, flags);
+ 	list_for_each_entry_safe(pending, pending_tmp, &pending_list, list)
+-- 
+2.34.1
+
