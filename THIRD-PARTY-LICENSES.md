@@ -15,6 +15,11 @@ This repository distributes the following components with their own licensing:
 
 ## Notes
 
+- The base image and shipped guest keypair are produced by the bundled
+  syzkaller `tools/create-image.sh` (Apache-2.0 script, per its header);
+  provenance recipe in `bundle/README-HANDOFF.md` 'Base image
+  provenance'. The pair was regenerated together with the base on
+  2026-09-26 (rotation); the base embeds its own pubkey.
 - **Guest SSH keypair** (`bookworm.id_rsa`, fingerprint
   `SHA256:hp4uezultsFtRDrHSnagtgclnK3E9QI144ZlpPuS+wg`): a disposable
   syzkaller-`create-image.sh`-style credential. It grants passwordless root

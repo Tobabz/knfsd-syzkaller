@@ -33,6 +33,43 @@ Verify first: `sha256sum -c SHA256SUMS`.
 - `patches/*/SHA256SUMS` pin the series bytes; forward-port gate R6
   re-verifies them on every pipeline run.
 
+## Base image provenance
+
+`src/bookworm-base.img` is the output of **syzkaller's official image
+builder**, `tools/create-image.sh` (bundled source
+`src/syzkaller-801f09666.tar.gz`, referenced by `docs/linux/setup.md`;
+Apache-2.0 per its header), run as:
+
+```sh
+sudo ./create-image.sh -d bookworm    # arch amd64, default SEEK=2047
+```
+
+The chain:
+
+1. `debootstrap --arch=amd64 --include=openssh-server,curl,tar,gcc,libc6-dev,time,strace,sudo,less,psmisc,selinux-utils,policycoreutils,checkpolicy,selinux-policy-default,firmware-atheros,debian-ports-archive-keyring --components=main,contrib,non-free,non-free-firmware bookworm <dir>`
+2. Guest defaults: passwordless root, `ttyS0` getty, `eth0` dhcp, fstab /
+   debugfs / securityfs / configfs / binfmt_misc entries, hostname
+   `syzkaller`; `ssh-keygen -f bookworm.id_rsa` with the pubkey installed to
+   `/root/.ssh/authorized_keys` inside the image.
+3. `dd if=/dev/zero of=bookworm.img bs=1M seek=2047 count=1` -> 2 GiB raw;
+   `mkfs.ext4 -F`; loop-mount and copy the chroot in.
+
+The result is a plain ext4 image with **no partition table** (verified:
+`file` -> ext4 filesystem data, `fdisk -l` -> no partitions,
+`qemu-img info` -> raw 2 GiB / 2147483648 bytes). It is never booted RW
+after creation — the baked protocol image is produced by the bootstrap
+(from the raw) on a copy.
+
+**Regeneration is not byte-reproducible**: `debootstrap` pulls current
+mirrors and `ssh-keygen` output is random, so a fresh run yields a
+functionally equivalent but hash-different image. The exact shipped bytes
+are pinned by `SHA256SUMS` (gate R6) — use this recipe for provenance/audit,
+and the shipped archive for exact reproduction. The shipped keypair was
+regenerated together with the base on 2026-09-26 (rotation for public
+release, see `THIRD-PARTY-LICENSES.md`); the builder embeds its own pubkey,
+so key and base must stay consistent and any re-bake must use the same
+`--ssh-key`.
+
 ## Licenses and the guest key
 
 - `tools/`, `bundle/` (`ab-runner/`, `baker/`, `corpus/`), and the `report/`
