@@ -4,10 +4,13 @@ evidence/
 runs/
 # --- Release assets — assembled by tools/release-assembly.sh at release time ---
 dist/
-# --- Large binary inputs — pinned by bundle/SHA256SUMS, shipped as release
-# --- assets (dist/ tar.gz); excluded from git history (and the raw base image
-# --- is never distributed by policy — release-assembly aborts on leak).
-bundle/src/
+# --- bundle/src: only guest-deps.tar.gz is committed (asset-free model);
+# --- the base image/keypair are site-generated (tools/make-base-image.sh)
+# --- and the raw base image is never distributed (release-assembly aborts
+# --- on leak). Site-local generated artifacts live under artifacts/.
+bundle/src/*
+!bundle/src/guest-deps.tar.gz
+artifacts/
 # --- Python caches ---
 __pycache__/
 *.pyc

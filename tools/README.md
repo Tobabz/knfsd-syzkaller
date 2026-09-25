@@ -86,7 +86,8 @@ bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
 | `README-tests.md` | T1–T7 검증 배터리 체크리스트 |
 | `bootstrap-kcov-env.py` | env 부트스트랩 — 시리즈 적용은 `fport-apply.sh` 연동 |
 | `run-ab.sh`·`analyze-ab.sh`·`run_ab_adapted.py` | 일반 코퍼스 AB 하네스 (관례 절대경로 — `<root>` 구조만 준비하면 됨) |
-| `release-assembly.sh` | 배포 아카이브 조립 (SHA256SUMS 6항목 기반, raw 제외 — `--minimal`은 정확히 6항목만) |
+| `make-base-image.sh` | 사이트 로컬 베이스·키쌍 생성 (create-image.sh -d bookworm; 자산 해제 모델의 필수 선행, sudo 필요) |
+| `release-assembly.sh` | (선택) 유지보수 스냅샷 조립 (SHA256SUMS 3항목 기반, raw/베이스/키 미포함 — `--minimal`은 3항목만) |
 | `tool-requirements.txt` | 팀메이트 호스트 의존성 정형화 (README-HANDOFF 'Reproduce' 전제) |
 
 ## 검증·증거 규율
@@ -131,14 +132,16 @@ bash tools/fport-evidence.sh             # 도구·문서 수정 후 해시 재�
 
 ## 배포
 
-- 배포 정의는 `bundle/SHA256SUMS`(고정 **6항목, 프로젝트 생성물만**) — 커널·syzkaller
-  소스는 **배포하지 않는다** (bootstrap이 핀 ref에서 클론; 오프라인 약속 철회 2026-09-26).
-  raw 베이스 이미지(`src/bookworm-base.img`)는 로컬 작업 파일로 **배포에 포함되지
-  않는다**; 배포 아티팩트는 `src/bookworm-base.img.gz` (조립 시점 배제 · raw 유출 시
-  어보트 자체 점검은 `release-assembly.sh`가 수행).
-- 사용법: `bash tools/release-assembly.sh` (기본: 6항목 + 패치 시리즈 + 라이선스 문서),
-  `bash tools/release-assembly.sh --minimal` (정확히 6항목만).
-  산출물: `dist/knfsd-fuzz-forward-port-<날짜>[-minimal].tar.gz` + `dist/SHA256SUMS`.
+- **릴리스 자산 없음 (2026-09-26 자산 해제 모델)**: 상류 소스(커널·syzkaller)는
+  bootstrap이 핀 ref에서 클론(`--kernel-repo`/`--syz-repo`), 베이스·키쌍은
+  `tools/make-base-image.sh`로 **사이트별 생성** (raw `bookworm-base.img`는
+  커밋·배포 절대 금지).
+- 커밋된 부트스트랩 입력은 `bundle/SHA256SUMS`(고정 **3항목**:
+  `guest-deps.tar.gz`·`patches/kernel.config`·`README-HANDOFF.md`)로 핀.
+- (선택) `bash tools/release-assembly.sh` → 유지보수용 스냅샷
+  `dist/knfsd-fuzz-forward-port-<날짜>[-minimal].tar.gz` (배포 아님);
+  `--minimal`은 정확히 3항목만. AB 하네스 `run-ab.sh`는 생성 키를
+  `KOOV_SSH_KEY`로 넘긴다.
 
 ## 경계
 

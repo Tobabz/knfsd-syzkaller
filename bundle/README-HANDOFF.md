@@ -3,8 +3,10 @@
 Upstream sources (Linux kernel `v7.3-rc4`, syzkaller `801f09666`) are
 **cloned by the bootstrap at pinned git refs**, so a first fresh
 environment build requires network access to `git.kernel.org` and
-`github.com`. Everything else (patches, fixtures, base image, guest
-deps, keys) ships in this bundle. The bundle is **independent**: it no
+`github.com`. Everything else (patches, fixtures, guest deps) ships in
+this repository; the **base image and keypair are generated per site**
+(`tools/make-base-image.sh`) — no release assets are distributed
+(2026-09-26 asset-free model). The bundle is **independent**: it no
 longer mirrors the handoff repo's internal layout (`repo/` tree removed
 2026-09-25).
 
@@ -14,16 +16,16 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 |---|---:|---:|
 | upstream kernel | cloned by bootstrap at commit `93f51579…` (= tag `v7.3-rc4`, git.kernel.org) | — |
 | upstream syzkaller | cloned by bootstrap at commit `801f09666…` (github.com/google/syzkaller) | — |
-| `src/bookworm-base.img[.gz]` | clean raw base image (never opened RW) | 2.0 GB / ~360 MB |
-| `src/guest-deps.tar.gz` | Debian nfs-utils extraction for guests | ~6 MB |
-| `src/bookworm.id_rsa[.pub]` | guest SSH keypair (fuzzing-only) | — |
+| base image (site-generated) | `tools/make-base-image.sh` → `artifacts/bookworm-base.img` (2 GiB raw, `create-image.sh -d bookworm`) | 2 GiB |
+| `src/guest-deps.tar.gz` | Debian nfs-utils extraction for guests (committed) | ~6 MB |
+| guest keypair (site-generated) | same run: `artifacts/bookworm.id_rsa[.pub]` (pairs with your base) | — |
 | `patches/kernel/` | kernel series: 11 patches + `series` + `SHA256SUMS` | — |
 | `patches/syzkaller/` | syzkaller series: 15 patches + `series` + `SHA256SUMS` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
 | `ab-runner/` | AB experiment lane drivers (`run_frozen_phase*_vm.py`, lane/probe/bootstrap files, `monitor_knfsd.py`, workload prog) | — |
 | `baker/` | protocol image baking (`bake_nfs_protocol_image.py`) | — |
 | `corpus/` | fuzz corpus / candidate preparation (`audit_*`, `build_*`) | — |
-| `SHA256SUMS` | checksums of all shipped (project-generated) assets | — |
+| `SHA256SUMS` | checksums of committed bootstrap inputs (3 items) | — |
 
 Verify first: `sha256sum -c SHA256SUMS`.
 
@@ -39,13 +41,14 @@ Verify first: `sha256sum -c SHA256SUMS`.
 
 ## Base image provenance
 
-`src/bookworm-base.img` is the output of **syzkaller's official image
-builder**, `tools/create-image.sh` (in the syzkaller tree at pinned
-commit `801f09666…`, referenced by `docs/linux/setup.md`; Apache-2.0
-per its header), run as:
+The base image is **not shipped**; every site generates its own with
+the turnkey wrapper **`tools/make-base-image.sh`**, which runs syzkaller's
+official image builder, `tools/create-image.sh` (in the syzkaller tree at
+pinned commit `801f09666…`, referenced by `docs/linux/setup.md`;
+Apache-2.0 per its header):
 
 ```sh
-sudo ./create-image.sh -d bookworm    # arch amd64, default SEEK=2047
+sudo bash tools/make-base-image.sh --out artifacts   # arch amd64, default SEEK=2047
 ```
 
 The chain:
@@ -66,13 +69,11 @@ after creation — the baked protocol image is produced by the bootstrap
 
 **Regeneration is not byte-reproducible**: `debootstrap` pulls current
 mirrors and `ssh-keygen` output is random, so a fresh run yields a
-functionally equivalent but hash-different image. The exact shipped bytes
-are pinned by `SHA256SUMS` (gate R6) — use this recipe for provenance/audit,
-and the shipped archive for exact reproduction. The shipped keypair was
-regenerated together with the base on 2026-09-26 (rotation for public
-release, see `THIRD-PARTY-LICENSES.md`); the builder embeds its own pubkey,
-so key and base must stay consistent and any re-bake must use the same
-`--ssh-key`.
+functionally equivalent but hash-different image. There is no shipped
+base bytes — each site's generated base (and its hash) is its own
+validated artifact. The builder embeds its own pubkey, so the generated
+keypair stays paired with the generated base and any re-bake must use
+the same `--ssh-key`.
 
 ## Licenses and the guest key
 
@@ -81,28 +82,27 @@ so key and base must stay consistent and any re-bake must use the same
   distributed under the **MIT License** (see `LICENSE` at the repository
   root; provenance in `THIRD-PARTY-LICENSES.md`).
 - `patches/kernel/` derive from the Linux kernel (**GPL-2.0**),
-  `patches/syzkaller/` derive from syzkaller (**MIT**); the source archives
-  in `src/` carry their upstream licenses (`COPYING` / `LICENSE`).
-- `src/bookworm.id_rsa[.pub]` is a **disposable guest keypair** in the style
-  of syzkaller's `create-image.sh`: it grants root SSH access only to QEMU
-  guests built from the bundled image on your private network, and is not a
-  credential for any other service. Regenerate the pair and re-bake the
-  image before any non-sandboxed deployment.
+  `patches/syzkaller/` derive from syzkaller (**Apache-2.0**); upstream
+  sources are cloned by bootstrap and carry their upstream licenses
+  (`COPYING` / `LICENSE`).
+- The site-generated `bookworm.id_rsa[.pub]` is a **disposable guest
+  keypair** in the style of syzkaller's `create-image.sh`: it grants root
+  SSH access only to QEMU guests built from your generated base on your
+  private network, and is not a credential for any other service.
+  Regenerate the pair and re-bake the image before any non-sandboxed
+  deployment.
 
 ## Reproduce (teammate side)
 
 Prerequisites on the new host: KVM (`/dev/kvm`), QEMU, Go ≥1.23,
 gcc, kernel build deps (`flex bison libssl-dev libelf-dev`), ~30 GB
-free, Python 3. Root or sudo for `create-image`-style steps is not
-needed for the flow below.
+free, Python 3, **passwordless sudo** (needed once for base generation;
+the rest of the flow runs unprivileged).
 
-The distribution archive ships the base image **compressed** only
-(`bundle/src/bookworm-base.img.gz`); the bootstrap requires the raw
-twin. Restore it first, then verify against the pinned manifest:
+Generate the site base + keypair, then verify the committed manifest:
 
 ```sh
-[ -f bundle/src/bookworm-base.img ] || \
-  zcat bundle/src/bookworm-base.img.gz > bundle/src/bookworm-base.img
+sudo bash tools/make-base-image.sh --out artifacts
 cd bundle && sha256sum -c SHA256SUMS
 ```
 
@@ -112,8 +112,8 @@ cd bundle && sha256sum -c SHA256SUMS
 # override with --kernel-repo/--syz-repo, or supply your own archives via
 # --kernel-tarball/--syz-tarball (pre-fetched) instead of cloning.
 python3 tools/bootstrap-kcov-env.py /work/env \
-  --base-image bundle/src/bookworm-base.img \
-  --ssh-key bundle/src/bookworm.id_rsa \
+  --base-image artifacts/bookworm-base.img \
+  --ssh-key artifacts/bookworm.id_rsa \
   --deps-tar bundle/src/guest-deps.tar.gz \
   --minor 1
 ```
@@ -134,4 +134,5 @@ pins changed are rebuilt.
 Point a syz-manager at the baked image with the generic
 `tools/portable-env` helper of your choice; the AB harness entry points
 are `tools/run-ab.sh` / `tools/analyze-ab.sh` (evidence lands in
-`evidence/`).
+`evidence/`). The AB harness must use the generated key
+(`KOOV_SSH_KEY=artifacts/bookworm.id_rsa bash tools/run-ab.sh`).

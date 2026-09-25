@@ -23,7 +23,7 @@ fi
 python3 "$TOOLS/run_ab_adapted.py" \
 	--kernel "$KC/linux/arch/x86/boot/bzImage" \
 	--image "$KC/bookworm-kcov-fresh-v1.raw" \
-	--ssh-key "$HF/src/bookworm.id_rsa" \
+	--ssh-key "${KOOV_SSH_KEY:-$HF/src/bookworm.id_rsa}" \
 	--deps-tar "$HF/src/guest-deps.tar.gz" \
 	--vmlinux "$KC/linux/vmlinux" \
 	${SYZ_BIN_FLAG} \
