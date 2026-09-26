@@ -51,7 +51,7 @@ bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
 
 | 게이트 | 계약 | 실측 (reuse 본체) |
 |---|---|---|
-| R1 build-integrity | 부트스트랩 `status: pass` | PASS |
+| R1 build-integrity | 부트스트랩 `status: pass` + mem_sanitizer ∈ {kasan,kcsan} | PASS |
 | R2 remote-contribution | OFF fs/nfsd=0 vs ON>0, converged | PASS (0 vs 1,748) |
 | R3 throughput-bound | ON/OFF exec·RPC/s ≥ 0.90 | PASS (0.9605) |
 | R4 coverage-depth-general | `on_only ≥ 100` + 핸들러 랭킹 + `nfsd4_proc_compound` | PASS (1,748) |

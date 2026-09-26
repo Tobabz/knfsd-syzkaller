@@ -363,6 +363,48 @@ class VM:
                 self.process.wait(timeout=15)
 
 
+def _config_option_on(text, name):
+    return any(line == name + "=y" for line in text.splitlines())
+
+
+def detect_mem_sanitizer(vm, config_path):
+    """Return the compiled+active memory sanitizer: 'kasan' or 'kcsan'.
+
+    Kconfig makes KCSAN depend on !KASAN, so the two are mutually exclusive:
+    a normal build compiles at most one.  Both a build-level signal (.config)
+    and a run-time signal from the booted kernel are required; the winner is
+    recorded in the manifest.
+    """
+    cfg = Path(config_path)
+    if not cfg.is_file():
+        raise RuntimeError("kernel config missing: %s" % cfg)
+    text = cfg.read_text()
+    cfg_kasan = _config_option_on(text, "CONFIG_KASAN")
+    cfg_kcsan = _config_option_on(text, "CONFIG_KCSAN")
+    if cfg_kasan == cfg_kcsan:   # both on (impossible per Kconfig) or neither
+        raise RuntimeError(
+            "mem sanitizer not uniquely compiled in %s: kasan=%s kcsan=%s"
+            % (cfg, cfg_kasan, cfg_kcsan))
+    if cfg_kasan:
+        ok = vm.guest(
+            "dmesg 2>/dev/null | grep -q "
+            "'KernelAddressSanitizer initialized' && echo yes || echo no",
+            timeout=30).strip()
+        if ok != "yes":
+            raise RuntimeError(
+                "KASAN=y in %s but boot log has no init banner" % cfg)
+        return "kasan"
+    ok = vm.guest(
+        "grep -qE '(kcsan_setup_watchpoint|kcsan_report|"
+        "kcsan_found_watchpoint|__kcsan_check_access)' "
+        "/proc/kallsyms 2>/dev/null && echo yes || echo no",
+        timeout=30).strip()
+    if ok != "yes":
+        raise RuntimeError(
+            "KCSAN=y in %s but no KCSAN symbols in /proc/kallsyms" % cfg)
+    return "kcsan"
+
+
 def stage_verify(args, image, bzimage):
     vm = VM(image, bzimage, args.ssh_key, args.boot_timeout)
     try:
@@ -378,8 +420,13 @@ def stage_verify(args, image, bzimage):
             % (args.minor, root), timeout=90)
         if int(json.loads(lanes).get("lane_count", 0)) < 1:
             raise RuntimeError("no lanes reported")
+        sanitizer = detect_mem_sanitizer(vm,
+                                         args.target / "linux" / ".config")
         return {"mode": "base", "fixture_root": root,
-                "lane_count": int(json.loads(lanes)["lane_count"])}
+                "lane_count": int(json.loads(lanes)["lane_count"]),
+                "mem_sanitizer": sanitizer,
+                "target_kasan": sanitizer == "kasan",
+                "target_kcsan": sanitizer == "kcsan"}
     finally:
         vm.stop()
 

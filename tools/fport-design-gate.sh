@@ -37,7 +37,10 @@ def sh(cmd):
 # ---------- preconditions Psi ----------
 psi = {}
 m = read_json(HOME/"env/manifest.json")
-psi["Psi2(kasan)"] = m.get("verify", {}).get("target_kasan") is True
+_ms = m.get("verify", {}) or {}
+_mem_san = _ms.get("mem_sanitizer")
+_legacy_ms = _ms.get("target_kasan") is True or _ms.get("target_kcsan") is True
+psi["Psi2(mem-sanitizer)"] = _mem_san in ("kasan", "kcsan") or _legacy_ms
 
 # kcov in .config or vmlinux symbols
 kcov_ok = False
@@ -56,9 +59,11 @@ for k, v in psi.items():
 bundle = pathlib.Path(os.environ["BUNDLE"])
 
 # ---------- R1 build integrity ----------
+_ms_detail = _mem_san or ("kasan" if _ms.get("target_kasan") else
+                          ("kcsan" if _ms.get("target_kcsan") else "none"))
 r1 = gate("R1", "build-integrity",
-    m.get("status") == "pass" and m.get("verify", {}).get("target_kasan") is True,
-    "status=%s target_kasan=%s" % (m.get("status"), m.get("verify", {}).get("target_kasan")))
+    m.get("status") == "pass" and (_mem_san in ("kasan", "kcsan") or _legacy_ms),
+    "status=%s mem_sanitizer=%s" % (m.get("status"), _ms_detail))
 
 # ---------- R2 / R3 AB ----------
 a = read_json(HOME/"evidence/analysis_summary.json")

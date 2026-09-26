@@ -128,7 +128,7 @@ syzkaller 15종 (`bundle/patches/syzkaller/`):
 
 | 단계 | 게이트 | 스크립트 |
 |---|---|---|
-| 1 | 부트스트랩 manifest `status: pass`, `verify.target_kasan: true` | bootstrap + `verify` |
+| 1 | 부트스트랩 manifest `status: pass`, `verify.mem_sanitizer ∈ {kasan, kcsan}` | bootstrap + `verify` |
 | 2 | AB 러너 ON 트라이얼 `bindings {(0,0),(1,1)}`, `converged: true`, off fs/nfsd=0 vs on>0 | `run-ab.sh` + `analyze-ab.sh` |
 | 3 | 원격 커버리지 심도 (일반 코퍼스): fs/nfsd `on_only ≥ 100`, net/sunrpc `on_only > 0`, 핸들러 랭킹 ≥ 10행 + `nfsd4_proc_compound` | `analyze-ab.sh` 산출물 (`set_analysis` + `coverage_sets/`) |
 | 4 | 증거 연쇄: `status=PASS`, `integrity_pass=true`, 기여 지분 ≥ 95%, 커버리지 셋 6종 존재 | `analyze-ab.sh` + `coverage_sets/` |

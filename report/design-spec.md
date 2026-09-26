@@ -44,7 +44,7 @@
 | Ψ | 자연어 요구 | 기계 게이트 (오라클) |
 |---|---|---|
 | Ψ1 | 타깃 커널은 KCOV를 컴파일함 | `.config`에 `CONFIG_KCOV=y` 또는 `vmlinux`에 kcov 심볼 존재 |
-| Ψ2 | 타깃 커널은 KASAN을 컴파일함 | `manifest.verify.target_kasan == true` |
+| Ψ2 | 타깃 커널은 메모리 새니타이저(KASAN **또는** KCSAN — Kconfig `!KASAN` 상호 배타) 한 종류를 컴파일함 | `manifest.verify.mem_sanitizer ∈ {kasan, kcsan}` (레거시: `verify.target_kasan == true`) |
 | Ψ3 | NFSv4 서버 디스패치 경로가 존재 (`svc_process→nfsd_dispatch→nfsd4_proc_compound`) | R4'의 `nfsd4_proc_compound` on_only 존재 게이트 — 경로 부재 시 게이트 전체 false로 드러남 |
 | Ψ4 | 시즈컬러 원격 커버 데이터 모델 유지 (remote_cover · cover_edges) | R5' 대조 산출물·커버리지 셋이 self-consistent |
 
@@ -58,8 +58,8 @@
 **오라클(어디서 읽는가)** → **통과 기준(수치)**. 실행: `tools/fport-design-gate.sh`.
 
 ### R1 부팅·빌드 무결성
-- 자연어: 패치된 커널/시즈컬러는 부팅 가능한 이미지를 만들고 KASAN이 활성화된다.
-- 게이트: `manifest.status == "pass"` **그리고** `manifest.verify.target_kasan == true`
+- 자연어: 패치된 커널/시즈컬러는 부팅 가능한 이미지를 만들고 메모리 새니타이저(KASAN **또는** KCSAN)가 활성화된다.
+- 게이트: `manifest.status == "pass"` **그리고** `manifest.verify.mem_sanitizer ∈ {kasan, kcsan}`
 - 오라클: `~/work/env/manifest.json`
 - 통과: 두 조건 모두 참.
 
@@ -134,7 +134,7 @@ tools/fport-design-gate.sh -v         # 상세 수치 출력
 
 | 요구사항 | 게이트 수치 (요약) | 판정 |
 |---|---|---|
-| R1 | status=pass, target_kasan=true | PASS |
+| R1 | status=pass, mem_sanitizer=kasan (kcsan 허용) | PASS |
 | R2 | off fs/nfsd=0, on=1748, converged=true, controls_eq=true | PASS |
 | R3 | 9.25/9.63 = 0.9605 ≥ 0.90 | PASS |
 | R4 | set_analysis fs/nfsd on_only=1748 · net/sunrpc on_only=299 · 핸들러 15 · nfsd4_proc_compound 42 | PASS |
@@ -156,3 +156,18 @@ tools/fport-design-gate.sh -v         # 상세 수치 출력
 **경계**: `env/` 빌드 산출물(커널·syz 트리, 베이크 이미지)은 과거 부트스트랩이 만든
 것이지만 일반 코퍼스 AB 증거의 오라클로 **유지** — 신규 rc 포팅(full 모드)에서
 신선 환경으로 자연 교체된다 (증거 `T1-T10-results.md`의 주석 참조).
+
+---
+
+## 7. 메모리 새니타이저 확장: KASAN → KASAN|KCSAN (2026-09-26)
+
+전제 Ψ2와 R1은 "KASAN 단일"에서 **"KASAN 또는 KCSAN"** 으로 확장되었다
+(Kconfig `!KASAN` 배타성 — 통상 빌드는 두 종류 중 최대 하나만 컴파일된다).
+
+- `stage_verify`는 빌드 `.config`(결정적) **그리고** 런타임 증거(부팅 로그의
+  KASAN 초기화 라인 또는 `/proc/kallsyms`의 KCSAN 심볼)를 교차해 활성
+  새니타이저를 판정하고 `verify.mem_sanitizer` 로 기록한다
+  (`target_kasan`·`target_kcsan` 레거시 미러 동시 기록).
+- 게이트: `verify.mem_sanitizer ∈ {kasan, kcsan}` (레거시 `target_kasan==true` 호환).
+- KCSAN 타깃의 AB 증거(R2~R5)는 해당 커널에서 새로 산출해야 하며, KCSAN
+  리포트는 기본 panic 이 아니므로 크래시 기반 판정의 해석에 유의한다.

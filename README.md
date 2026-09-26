@@ -1,7 +1,7 @@
 # knfsd-syzkaller
 
 A tool that builds **customized syzkaller fuzzing environments for fuzzing the NFS subsystem of the Linux kernel (knfsd)**.
-It reflects a **remote KCOV coverage model** — collecting NFS server-side coverage remotely — on a KCOV/KASAN-instrumented
+It reflects a **remote KCOV coverage model** — collecting NFS server-side coverage remotely — on a KCOV + memory-sanitizer (KASAN or KCSAN) instrumented
 kernel, and automates the whole pipeline from base image to a bootable fuzz VM (instrumented kernel + syzkaller binaries +
 baked protocol image).
 
@@ -13,7 +13,7 @@ against the design-contract gates **R1..R6** (`tools/fport-design-gate.sh`).
 
 | Aspect | Description |
 |---|---|
-| Instrumentation | KCOV + KASAN boot kernel |
+| Instrumentation | KCOV + KASAN/KCSAN boot kernel |
 | Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path |
 | A/B causal check | A fuzzing experiment with remote coverage **ON/OFF as the only variable** — OFF: 0 fs/nfsd PCs, ON: 1,748 (gate R2) |
 | Fuzz lanes | Fixed 34-call NFS lane workload · mount-namespace clients 0/1 (`/nfs-lane`) |
