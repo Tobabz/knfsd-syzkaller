@@ -553,9 +553,11 @@ KOOV 변수를 참조하지 않으므로 `setup` 호출 하나에만 `env` 접�
 
 ### S4c 스파이크 판정 — dedup 적용으로 syz 채널 async COPY 계측 성립 (2026-09-26)
 
-S4b가 원인을 규명한 scratch 용량 초과를 **커널 패치로 직접 해결**했다. 같은
-커널·같은 코퍼스에서 dedup 토글만 바꿔 A/B했고, **async COPY offload hop이
-syzkaller 채널에서 계측되기 시작**했다. 게이트 판정은 `dedup=1`에서 **PASS**.
+S4b가 규명한 scratch 용량 초과를 **커널 패치로 직접 해결**했다. dedup이
+드러낸 두 번째 결함(사용자공간 출력 버퍼 6 MiB 한계)까지 규명·정렬한 결과,
+**async COPY offload hop이 syzkaller 채널에서 10/10 계측**된다. 게이트 판정은
+`dedup=1`에서 **PASS**. 원인은 두 단으로 걸려 있었다 — 둘을 함께 제거해야
+async hop이 측정된다.
 
 **패치 (kernel 0012, 신규)** — `kcov: suppress repeated PC events in remote
 coverage sections`. `kernel/kcov.c` 1개 파일 +115/-3, 4개 hunk 전부 additive:
@@ -612,19 +614,80 @@ async `copy_file_range` 32MiB) · 동일 `-slowdown=5` 러너 — **유일한 �
 COPY offload hop이 syzkaller 원격 커버리지에 실제로 계측된다** — probe 채널
 없이, S4가 실패했던 그 채널에서.
 
-**정직한 한계 (다음 스파이크 과제)**:
-1. `.extra`가 10개 중 **2개**뿐이다. 512슬롯 캐시는 *직전 반복*만 잡으므로
-   32MiB copy의 고유 PC 작업집합이 캐시보다 크면 일부 실행은 여전히 천장에
-   걸린다. 기록량은 37%만 줄었다. **10/10 복구를 위해서는 슬롯 확장(4K~16K)
-   또는 정확한 해시 집합**(고유 PC 수 × 16~32B, 상한 초과 시 append 강등)이
-   다음 단계다. 이번 패치는 "무손실·저비용"을 우선한 1st cut으로 의도적이다.
-2. dedup=1 실행에서 KCSAN 리포트 1건이 관측되었다(blk-mq 계열 기존 레이스,
-   크래시 아님 — reach 러너의 `FATAL_RE`은 KCSAN을 제외하며 게이트는 PASS).
-3. series 번호前缀: 기존 0001..0011의 `[PATCH nn/11]`은 **의도적으로
-   그대로 두었다**(SHA256SUMS가 이미 증거로 기록되어 있으므로 재작성 금지).
-   따라서 subject에 `/11`과 `/12`가 섞이며, 다음 전체 재생성 시 `/12`로
-   정규화된다. 내용 diff는 없음(기존 11개는 예전 git 2.34.1 + diffstat 제거
-   상태로, 재생성 시 `From` sha·버전 문자열·diffstat만 달라짐 — 코드 동일).
+**후속 — 출력 버퍼 6 MiB 한계 발견 및 10/10 달성**: dedup 적용 후 `.extra`가
+10회 중 **2회**만 나왔고, executor에 계측을 넣어 원인을 규명했다. 커널은
+11개 세대 전부를 게시했고(`entries_published = entries_merged`), executor도
+466k~530k를 **10회 전부 정상 판독**했다(`overflow=0`). 그런데 manager가 받은
+`extra:` 레코드는 2건뿐이었다. 계산이 1% 이내로 일치한다:
+
+```
+출력 버퍼 = 6,291,456 B (6 MiB = executor kMaxOutputCoverage = 6<<20)
+프로그램당 call 커버리지 = 280,519 × 8B = 2.24 MB
+──────────────────────────────────────────────────────────
+466k 케이스: 2.24 + 466,330×8 = 5.97 MB ≤ 6.29 MB  ✓ 통과
+528k 케이스: 2.24 + 529,000×8 = 6.47 MB > 6.29 MB  ✗ 잘림
+```
+
+원인은 **사용자공간 출력 버퍼 경계**다. 원격 extra 레코드는 출력 스트림
+**맨 뒤**에 추가되므로(`write_output(-1, ...)`), 버퍼가 꽉 차면 가장 마지막에
+붙은 extra가 **조용히 잘려 나간다**. 배제된 가설: `late_merge_after_refs_zero=0`,
+`merge_started == merge_completed == 88`, `merge_truncated=0`, `publish_readers=0`,
+`fault_scratch_limit=0` — 커널·병합·게시 경로는 무결했고 유실은 executor 출력
+경계에서만 발생했다.
+
+**수정은 출력 버퍼 상한 정렬**이다. 두 상수는 **쌍**이므로 한쪽만 키우면
+즉시 깨진다(48 MiB 시도가 `call 0 failed with errno 998`로 실패):
+```
+executor.cc  kMaxOutputCoverage = 6 << 20   (6 MiB)
+flatrpc.go   ConstMaxOutputSize = 14680064  (14 MiB, manager가 준비하는 공유메모리)
+```
+→ executor를 **이미 제공되는 14 MiB에 정렬**(Go 수정 불필요, 공유메모리 레이아웃
+그대로): `kMaxOutputCoverage = 14 << 20`. 필요 용량은 ~6.5 MB였으므로 충분하다.
+
+**최종 결과 — async 10/10** (산출물 `~/reach-bigbuf-async/`, 게이트 PASS):
+
+| 카운터 (ON, 10 executions) | dedup=0 / 6MiB | dedup=1 / 14MiB |
+|---|---|---|
+| `.extra` 파일 (기대 10) | 0 | **10** |
+| `extra_shortfall` | true | **false** |
+| `scratch_overflow` / `discarded` | 10 / 10 | **0 / 0** |
+| `remote_result_incomplete` | 10 | **0** |
+| `aggregate_entries_published` | 0 | **5,158,919** |
+| `aggregate_published` | 1 | **11** |
+| `remote_start_granted` / `ok` / `stop` | 88 / 88 / 88 | 88 / 88 / 88 (불변) |
+| `owner_lane_match` / `ordinal_mismatch` | 78 / 0 | 78 / 0 (불변) |
+| 게이트 | fail (3 checks) | **pass** |
+
+**async hop 실측 — 10개 파일 전부에서 확인**: 각 `.extra`에
+`nfsd4_do_async_copy` 20건이 포함되고(466k~530k records, 566~809 distinct
+symbols), 함께 나타난 것은 `nfsd4_copy`, `vfs_copy_file_range`,
+`nfsd_copy_file_range`. 즉 **kthread → CB_OFFLOAD leg을 포함한 async COPY
+offload hop이 syzkaller 채널에서 10/10 계측된다.**
+
+**동기 경로 무회귀**: v1 동기-only 대조군(`~/reach-bigbuf-v1/`)도
+`status=pass`, `extra_files 10/10`, `extra_shortfall=false` — dedup이 동기
+경로를 오염시키지 않는다.
+
+**재사용 규칙 (계측 재빌드 시 반드시 준수)**:
+1. **재빌드 페어링** — `syz-executor`만 재빌드하면 git revision이
+   `…f+`(dirty)로 바뀌어 manager가
+   `mismatching manager/executor git revisions for VM 0`으로 **VM 가동을
+   거부**한다. 같은 tree에서 `make executor execprog`로 둘 다 빌드해야 한다.
+2. **출력 버퍼 쌍** — `executor.kMaxOutputCoverage`는
+   `flatrpc.ConstMaxOutputSize`(14 MiB) 이하여야 한다. 원격 집계가
+   ~466k 엔트리를 넘으면 extra가 조용히 잘린다.
+3. **커널 보존** — `tools/bootstrap-kcov-env.py`는 `rm -rf ~/kcsan-env`를
+   하므로 절대 재실행하지 않는다(베이스라인 `5b22ba55` 소멸). 증분 build만.
+
+**남은 한계 (정직하게)**: dedup 캐시는 512슬롯 직접매핑이라 *직전 반복*만
+잡고, 10/10은 출력 버퍼 정렬로 얻어진 것이지 캐시 용량 여유로 얻어진 것이
+아니다. 더 큰 코드베이스·KCSAN 빌드·모듈 다수 환경에서는 512슬롯으로는
+`scratch_overflow`가 재발할 수 있어, 그 경우 슬롯 확장(4K~16K) 또는 정확한
+해시 집합(고유 PC × 16~32B, 초과 시 append 강등)이 다음 단계다. dedup=1
+실행에서 KCSAN 리포트 1건이 관측되었으나(blk-mq 계열 기존 레이스, 크래시
+아님) reach 러너의 `FATAL_RE`이 KCSAN을 제외하며 게이트는 PASS다. series
+subject의 `/11`·`/12` 혼재는 기존 11개 해시를 증거로 보존한 의도적 선택이며,
+다음 전체 재생성 시 `/12`로 정규화된다(내용 diff 없음).
 
 **판정**: dedup은 "있으면 좋은 최적화"가 아니라 **S4 증상의 직접 해법**이었다.
 근본 원인은 "필요한 것은 집합인데 커널이 로그를 준다"는 표현 불일치였고,
