@@ -97,7 +97,7 @@ fport-variant.sh kernel <repo> <new-rc-base>
 | 0011 | sunrpc: 멀티 레인 속성 진단 | R5 증거 |
 | 0012 | kcov: 원격 섹션 반복 PC 이벤트 억제 (면적을 코드 크기에 비례) | R4 수집 |
 
-syzkaller 15종 (`bundle/patches/syzkaller/`):
+syzkaller 16종 (`bundle/patches/syzkaller/`):
 
 | # | 의도 (Subject) |
 |---|---|
@@ -107,6 +107,7 @@ syzkaller 15종 (`bundle/patches/syzkaller/`):
 | 0011..0012 | execprog: 원격 커버리지 측정 토글·타임스탬프 |
 | 0013..0014 | executor: 고정 lane 행잉 구분·마커 은닉 |
 | 0015 | sys/linux: 프로토콜 형태 NFS fuzz 오퍼레이션 |
+| 0016 | executor: 원격 커버리지 영역 크기로 출력 버퍼 산정 |
 
 ### 재생성 절차 (고변동 파일 우선)
 
@@ -635,14 +636,25 @@ COPY offload hop이 syzkaller 원격 커버리지에 실제로 계측된다** �
 `fault_scratch_limit=0` — 커널·병합·게시 경로는 무결했고 유실은 executor 출력
 경계에서만 발생했다.
 
-**수정은 출력 버퍼 상한 정렬**이다. 두 상수는 **쌍**이므로 한쪽만 키우면
-즉시 깨진다(48 MiB 시도가 `call 0 failed with errno 998`로 실패):
+**수정은 출력 버퍼 상한의 파생화**이며, syzkaller 패치 **0016**으로 series에
+반영했다(`0016-executor-size-coverage-output-from-remote-cover-.patch`). 두 상수는
+**쌍**이므로 한쪽만 키우면 즉시 깨진다(48 MiB 시도가
+`call 0 failed with errno 998`로 실패):
 ```
-executor.cc  kMaxOutputCoverage = 6 << 20   (6 MiB)
+executor.cc  kMaxOutputCoverage = 6 << 20   (6 MiB)  ← 문제
 flatrpc.go   ConstMaxOutputSize = 14680064  (14 MiB, manager가 준비하는 공유메모리)
 ```
-→ executor를 **이미 제공되는 14 MiB에 정렬**(Go 수정 불필요, 공유메모리 레이아웃
-그대로): `kMaxOutputCoverage = 14 << 20`. 필요 용량은 ~6.5 MB였으므로 충분하다.
+6 MiB 상수는 **구조적으로 틀림**이다. 원격 영역은 `kExtraCoverSize`
+(= 1024<<10 엔트리)로 구조적으로 8 MiB까지 자랄 수 있는데 출력 버퍼는 6 MiB
+뿐이다. 따라서 하드코딩을 제거하고 **원격 영역 크기 + per-call 여유**로 파생시켰다:
+```c
+const int kRemoteCoverCallHeadroom = 256 << 10;  /* entries, ~2 MiB of PCs */
+const int kMaxOutputCoverage =
+        (kExtraCoverSize + kRemoteCoverCallHeadroom) * (int)sizeof(uint64_t);
+```
+파생값은 **10 MiB**로, manager가 제공하는 14 MiB 이하이므로 Go 쪽 수정과 공유메모리
+레이아웃 변경이 불필요하다. 패치 검증: 15-패치 상태(`74ad462e3`) worktree에
+적용 후 결과가 빌드된 `executor.cc`와 바이트 동일.
 
 **최종 결과 — async 10/10** (산출물 `~/reach-bigbuf-async/`, 게이트 PASS):
 
@@ -673,9 +685,10 @@ offload hop이 syzkaller 채널에서 10/10 계측된다.**
    `…f+`(dirty)로 바뀌어 manager가
    `mismatching manager/executor git revisions for VM 0`으로 **VM 가동을
    거부**한다. 같은 tree에서 `make executor execprog`로 둘 다 빌드해야 한다.
-2. **출력 버퍼 쌍** — `executor.kMaxOutputCoverage`는
-   `flatrpc.ConstMaxOutputSize`(14 MiB) 이하여야 한다. 원격 집계가
-   ~466k 엔트리를 넘으면 extra가 조용히 잘린다.
+2. **출력 버퍼 쌍** — `executor.kMaxOutputCoverage`(패치 0016으로 원격 영역
+   크기에서 파생, 현재 10 MiB)는 `flatrpc.ConstMaxOutputSize`(14 MiB) 이하라야
+   한다. 이를 넘으면 executor 자체 coverage 탐색이 errno 998로 실패한다.
+   원격 집계가 ~466k 엔트리를 넘으면(파생 전 6 MiB 기준) extra가 조용히 잘린다.
 3. **커널 보존** — `tools/bootstrap-kcov-env.py`는 `rm -rf ~/kcsan-env`를
    하므로 절대 재실행하지 않는다(베이스라인 `5b22ba55` 소멸). 증분 build만.
 

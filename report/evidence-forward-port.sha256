@@ -1,4 +1,17 @@
-# forward-port configuration artifacts (2026-09-26T20:55:00+09:00)
+# forward-port configuration artifacts (2026-09-26T21:05:00+09:00)
+# Regenerated after the S4c syzkaller 0016 patch on 2026-09-26:
+#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel.
+#   Two stacked causes removed, both now versioned patches:
+#     kernel 0012  — suppress repeated PC events in remote sections, so the
+#                     remote scratch no longer overflows (scratch_overflow 10->0)
+#     syzkaller 0016 — derive the per-request coverage output size from the
+#                     remote cover area (10 MiB) instead of a hardcoded 6 MiB;
+#                     the extra record is appended last and was silently
+#                     truncated once the aggregate passed ~466k entries
+#                     (2/10 files -> 10/10).  flatrpc.ConstMaxOutputSize (14 MiB)
+#                     must stay at or above the derived value.
+#   Evidence: reach-bigbuf-async (gate pass, 10/10 .extra, nfsd4_do_async_copy in
+#   every file) and reach-bigbuf-v1 (sync control, 10/10, no regression).
 # Regenerated after the S4c 10/10 result on 2026-09-26:
 #   PASS — async COPY offload hop is measured 10/10 in the syzkaller channel.
 #   Two stacked causes were removed: (1) kernel patch 0012 suppresses repeated
@@ -28,7 +41,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-9e6378d41f717cafeb5cf878e259955e131568b78d6fa306fb59c191707620ea  report/patch-forward-compat.md
+b02d998c850af16bf3a6b7ac3fc06d9bd64a34a6c3c474b5634d8b9080c4e357  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 b2b47a9e53f4a0babf670115601ce20cdd9da8dabdf24b3183cd342e54cd69d3  tools/ab-lane-fixture-v42.sh
@@ -49,12 +62,15 @@ ddf3a5837286c990baa7c0a81e256a16565f86e54e69520dadc187d94610014a  tools/ab-lane-
 28e32529348822b3c7f34378187f4a161f623e64c401960d94bd218baa08e634  tools/frozen-phase8-probe-window.c
 64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py
 # --- lane isolation hardening + sh -c quoting guard (Ganesha axis base) ---
-e0c656645b6ba2997c3430b2df37b208770871043b15005c54d23e6e3d395445  tools/ganesha-lane.sh
+13ce2c9da77d2eec59da6d9f03cad06f33b42ddcde13ae2c4acc1e672da7a850  tools/ganesha-lane.sh
 15957507560f964693cb1b093bb192b4c036d0ce1cf77c35575aa1d87c4504fe  tools/lane-quote-lint.sh
 9d2e8803150c277f0cd74fa39f84bf91e67794200a539683a7d3084493f127e7  tools/ganesha-lane-parity.sh
 cac7a2744ba2a95af16d175e5e6221b400700cf730f6ff029a4bb3d65056125a  tools/ganesha-lane-control.sh
 2dca411f4641bf89b2c0f91e8f847fc64c1265eda9eea5b7b9fdc85750e87ad5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
 64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py
-# --- S4c dedup spike artifacts (kernel 0012 + harness toggle) ---
 2dca411f4641bf89b2c0f91e8f847fc64c1265eda9eea5b7b9fdc85750e87ad5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
+64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py
+# --- S4c dedup spike artifacts (kernel 0012 + syzkaller 0016 + harness) ---
+2dca411f4641bf89b2c0f91e8f847fc64c1265eda9eea5b7b9fdc85750e87ad5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
+ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  bundle/patches/syzkaller/0016-executor-size-coverage-output-from-remote-cover-.patch
 64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py

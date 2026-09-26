@@ -13,3 +13,4 @@
 0013-executor-distinguish-fixed-lane-hangs-from-explicit-.patch
 0014-executor-hide-fixed-lane-marker-from-fuzz-programs.patch
 0015-sys-linux-add-protocol-shaped-NFS-fuzz-operations.patch
+0016-executor-size-coverage-output-from-remote-cover-.patch
