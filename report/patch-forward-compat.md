@@ -80,7 +80,7 @@ fport-variant.sh kernel <repo> <new-rc-base>
 
 ### 패치별 의도 인덱스 (재생성의 기준 — "패치가 무엇을 원하는가")
 
-커널 11종 (`bundle/patches/kernel/`):
+커널 12종 (`bundle/patches/kernel/`):
 
 | # | 의도 (Subject) | 해당 계약 |
 |---|---|---|
@@ -95,6 +95,7 @@ fport-variant.sh kernel <repo> <new-rc-base>
 | 0009 | sunrpc: raw RPC fuzz 속성 인터페이스 | R2/R4 |
 | 0010 | kcov: 지연·비동기 NFS 서버 작업 귀속 | R4 심도 |
 | 0011 | sunrpc: 멀티 레인 속성 진단 | R5 증거 |
+| 0012 | kcov: 원격 섹션 반복 PC 이벤트 억제 (면적을 코드 크기에 비례) | R4 수집 |
 
 syzkaller 15종 (`bundle/patches/syzkaller/`):
 
@@ -547,6 +548,88 @@ fixture는 준비됐고 게이트도 걸렸지만, 게스트 이미지에 Ganesh
 KOOV 변수를 참조하지 않으므로 `setup` 호출 하나에만 `env` 접두를 걸면 되는
 조건은 확인됨). 이 축은 S4와 교차검증 불가 — Ganesha는 v4.2 미지원이므로
 코퍼스 기준이 v4.1이다.
+
+---
+
+### S4c 스파이크 판정 — dedup 적용으로 syz 채널 async COPY 계측 성립 (2026-09-26)
+
+S4b가 원인을 규명한 scratch 용량 초과를 **커널 패치로 직접 해결**했다. 같은
+커널·같은 코퍼스에서 dedup 토글만 바꿔 A/B했고, **async COPY offload hop이
+syzkaller 채널에서 계측되기 시작**했다. 게이트 판정은 `dedup=1`에서 **PASS**.
+
+**패치 (kernel 0012, 신규)** — `kcov: suppress repeated PC events in remote
+coverage sections`. `kernel/kcov.c` 1개 파일 +115/-3, 4개 hunk 전부 additive:
+
+- 원격 섹션의 scratch는 PC **이벤트 로그**(기본블록/엣지 실행 1회당 1칸,
+  중복 제거 없음)라 면적이 *작업량*에 비례한다 → 루프하는 섹션(async COPY
+  kthread)이 천장을 채우고 fail-closed로 전량 폐기된다.
+- 티켓별 **512슬롯 직접매핑 최근-seen 캐시**(4KB `kcalloc`)를 두고, 이 섹션이
+  이미 기록한 PC는 스킵한다. 미스·충돌·이전 섹션 잔재는 **기존대로 append**
+  하므로 **구조적으로 새 PC를 누락할 수 없다**(확률적 dedup이 측정 도구로
+  부적합한 이유인 조용한 커버리지 손실이 발생하지 않는다).
+- 기본값 **off** = 패치 이전 동작 그대로. `/sys/kernel/debug/kcov_remote_dedup`
+  읽기/쓰기로 **한 부팅 안에서 A/B** 가능. 원격 섹션만 대상(토글을 먼저 검사)
+  이므로 로컬 per-thread 커버리지 계약은 불변.
+
+**패치 검증**: 11-패치 상태(`0148323cb`) worktree에 `git apply` 후 결과가
+빌드된 `kernel/kcov.c`와 **바이트 동일**. 재현성·감사 가능성 유지.
+커널 산출물: `bzImage-dedup-0012` = `ea120cbe…`, 베이스라인
+`bzImage-baseline-5b22ba55` = `5b22ba55…`(S3/S4 증거 기준선) **보존** —
+`tools/bootstrap-kcov-env.py`는 `rm -rf ~/kcsan-env`를 하므로 재실행하지
+않고 기존 트리에서 증분 build만 수행했다.
+
+**A/B 설계**: 동일 커널(`ea120cbe`) · 동일 코퍼스(`reach-copy-offload.prog`,
+async `copy_file_range` 32MiB) · 동일 `-slowdown=5` 러너 — **유일한 차이는
+`--dedup 0|1` 토글**. 산출물 `~/reach-dedup-evidence-d0/`, `-d1/`.
+
+| 카운터 (ON, 10 executions) | dedup=0 | dedup=1 | 해석 |
+|---|---|---|---|
+| `scratch_overflow` | 10 | **0** | ★ 용량 초과 사라짐 |
+| `remote_section_discarded` | 10 | **0** | 폐기 0 |
+| `remote_result_incomplete` | 10 | **0** | INCOMPLETE 강등 0 |
+| `aggregate_quarantined` / `publish_suppressed` | 10 / 10 | **0 / 0** | ★ 게시 억제 0 |
+| `aggregate_entries_published` | 0 | **5,158,711** | ★ 실제로 게시됨 |
+| `aggregate_published` | 1 | **11** | 전 세션 게시 |
+| `.extra` 파일 (기대 10) | 0 | **2** | ★ 사용자공간에 파일 생성 |
+| `aggregate_entries_merged` | 8,223,065 | 5,158,711 | −37% (dedup 효과) |
+| `remote_start_granted` / `ok` / `stop` | 88 / 88 / 88 | 88 / 88 / 88 | **불변** |
+| `mapping_exact_owner_match` / `mismatch` | 88 / 0 | 88 / 0 | **불변** |
+| `generation_begin` / `committed` / `aborted` | 11 / 11 / 0 | 11 / 11 / 0 | **불변** |
+| `ordinal_mismatch` / `cross_lane_attribution` | 0 / 0 | 0 / 0 | **불변** |
+| 게이트 | **fail** (3 checks) | **pass** (0 failed) | 판정 |
+
+**핵심 통찰 — dedup은 귀속 경로를 건드리지 않았다**: 귀속(88/88/88)·세대
+수명주기(11/11/0)·레인 귀속(78)·ordinal 정합이 **완전히 동일**하다. dedup이
+바꾼 것은 "기록이 저장되는 방식"뿐이고, 그 결과 overflow가 사라져
+**fail-closed가 발동하지 않게 되어** 게시가 살아났다. 즉 S4b의 진단
+(귀속 아님 / 윈도우 아님 / 용량 초과)이 그대로 증명되고, 그 진단이 가리킨
+위치만 고쳐 해결되었다.
+
+**async hop 실측 증거 (심볼라이즈)**: 게시된 `.extra`를 System.map으로
+해석하면 **`nfsd4_do_async_copy` 20건**이 포함된다(파일당 466,008 records /
+788 distinct symbols). 함께 나타난 것: `nfsd4_copy` 27, `vfs_copy_file_range`
+160, `nfsd_copy_file_range` 7. 즉 **kthread → CB_OFFLOAD leg을 포함한 async
+COPY offload hop이 syzkaller 원격 커버리지에 실제로 계측된다** — probe 채널
+없이, S4가 실패했던 그 채널에서.
+
+**정직한 한계 (다음 스파이크 과제)**:
+1. `.extra`가 10개 중 **2개**뿐이다. 512슬롯 캐시는 *직전 반복*만 잡으므로
+   32MiB copy의 고유 PC 작업집합이 캐시보다 크면 일부 실행은 여전히 천장에
+   걸린다. 기록량은 37%만 줄었다. **10/10 복구를 위해서는 슬롯 확장(4K~16K)
+   또는 정확한 해시 집합**(고유 PC 수 × 16~32B, 상한 초과 시 append 강등)이
+   다음 단계다. 이번 패치는 "무손실·저비용"을 우선한 1st cut으로 의도적이다.
+2. dedup=1 실행에서 KCSAN 리포트 1건이 관측되었다(blk-mq 계열 기존 레이스,
+   크래시 아님 — reach 러너의 `FATAL_RE`은 KCSAN을 제외하며 게이트는 PASS).
+3. series 번호前缀: 기존 0001..0011의 `[PATCH nn/11]`은 **의도적으로
+   그대로 두었다**(SHA256SUMS가 이미 증거로 기록되어 있으므로 재작성 금지).
+   따라서 subject에 `/11`과 `/12`가 섞이며, 다음 전체 재생성 시 `/12`로
+   정규화된다. 내용 diff는 없음(기존 11개는 예전 git 2.34.1 + diffstat 제거
+   상태로, 재생성 시 `From` sha·버전 문자열·diffstat만 달라짐 — 코드 동일).
+
+**판정**: dedup은 "있으면 좋은 최적화"가 아니라 **S4 증상의 직접 해법**이었다.
+근본 원인은 "필요한 것은 집합인데 커널이 로그를 준다"는 표현 불일치였고,
+무손실 필터로 이를 끊자 fail-closed가 사뿐히 발동하지 않아 원격 게시가
+살아났다. 부수 효과로 병합 트래픽 −37%.
 
 ---
 

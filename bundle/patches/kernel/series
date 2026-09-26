@@ -9,3 +9,4 @@
 0009-sunrpc-add-raw-RPC-fuzz-attribution-interface.patch
 0010-kcov-attribute-deferred-and-async-NFS-server-work.patch
 0011-sunrpc-add-multi-lane-attribution-diagnostics.patch
+0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch

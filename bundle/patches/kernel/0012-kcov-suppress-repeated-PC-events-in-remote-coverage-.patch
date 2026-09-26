@@ -1,0 +1,207 @@
+From 6437ed8fc08cce1014506f47062fd54c8d87ea55 Mon Sep 17 00:00:00 2001
+From: idealinsane <idealinsane@localhost>
+Date: Sat, 26 Sep 2026 19:34:04 +0900
+Subject: [PATCH] kcov: suppress repeated PC events in remote coverage sections
+
+A remote coverage section records one scratch slot per instrumented
+basic-block/edge execution, with no duplicate removal, so the area is an
+append-only event log whose size is proportional to the work performed
+rather than to the amount of distinct code reached.  A section that loops
+for a long time fills the whole ceiling with repeats of the same code
+addresses; kcov_request_generation_merge_scratch() then reports an
+overflow, the generation is degraded to KCOV_REQUEST_REMOTE_INCOMPLETE,
+and the fail-closed publication policy suppresses the aggregate.  Userspace
+then observes an empty area and no .extra file at all.
+
+The measured case is the nfsd async COPY offload kthread: on the S4
+reach corpus a 32 MiB copy_file_range fills the 1,048,575-slot remote
+scratch ceiling exactly (fault_scratch_limit = 0, so this is a real
+capacity overflow, not an injected fault), which is why the syzkaller
+channel reported extra coverage 0 while the same hop was attributed
+normally when driven through a 4 MiB copy.
+
+Add a small direct-mapped
+diff --git a/kernel/kcov.c b/kernel/kcov.c
+index 166f7a916..db605942e 100644
+--- a/kernel/kcov.c
++++ b/kernel/kcov.c
+@@ -102,6 +102,7 @@ struct kcov_request_remote_ticket {
+ 	struct kcov_request_token *token;
+ 	struct kcov *kcov;
+ 	void *scratch;
++	unsigned long *dedup_ip;
+ 	unsigned int scratch_size;
+ 	enum kcov_mode mode;
+ 	int sequence;
+@@ -228,12 +229,98 @@ static notrace unsigned long canonicalize_ip(unsigned long ip)
+ 	return ip;
+ }
+ 
++/*
++ * Repeated-PC suppression for remote coverage sections.
++ *
++ * A remote section's scratch is an append-only log of PC *events* - one slot
++ * per instrumented basic-block/edge execution, with no duplicate removal.  A
++ * section that loops for a long time (the nfsd async COPY offload kthread is
++ * the measured case) therefore fills its whole ceiling with repeats of the same
++ * code addresses.  kcov_request_generation_merge_scratch() then reports an
++ * overflow, the generation is degraded to INCOMPLETE, and the fail-closed
++ * publication policy suppresses the aggregate, so userspace observes an empty
++ * area and no .extra file at all.
++ *
++ * The filter below is a small direct-mapped "recently seen" cache.  A hit means
++ * this exact PC is already in the area, so the slot is redundant for coverage
++ * purposes and is skipped.  A miss - including a collision with a different PC,
++ * or a stale entry left by a previous section - appends exactly as before and
++ * only refreshes the table.  The transformation is lossless by construction: a
++ * filter can never suppress a PC that was not already recorded, which is the
++ * failure mode that makes a probabilistic dedup unfit for a measurement tool.
++ *
++ * Per-section storage keeps the trace path allocation-free and lock-free: the
++ * table lives on the ticket, so a new section starts from a zeroed window with
++ * no flush, and a section that migrates between CPUs keeps one table.  A zero
++ * slot can never match: canonicalized kernel text addresses are never 0.
++ */
++#define KCOV_REMOTE_DEDUP_BITS 9
++#define KCOV_REMOTE_DEDUP_SLOTS (1U << KCOV_REMOTE_DEDUP_BITS)
++
++/* Debugfs-toggled; 0 (off) is the default and the pre-patch behaviour. */
++static bool kcov_remote_dedup_enabled __read_mostly;
++
++static ssize_t kcov_remote_dedup_write(struct file *file,
++		const char __user *buf, size_t count, loff_t *ppos)
++{
++	unsigned long val;
++	int ret;
++
++	ret = kstrtoul_from_user(buf, count, 10, &val);
++	if (ret)
++		return ret;
++	kcov_remote_dedup_enabled = !!val;
++	return count;
++}
++
++static ssize_t kcov_remote_dedup_read(struct file *file, char __user *buf,
++		size_t count, loff_t *ppos)
++{
++	char tmp[16];
++	int len;
++
++	len = scnprintf(tmp, sizeof(tmp), "%u\n",
++			READ_ONCE(kcov_remote_dedup_enabled));
++	return simple_read_from_buffer(buf, count, ppos, tmp, len);
++}
++
++static const struct file_operations kcov_remote_dedup_fops = {
++	.owner	= THIS_MODULE,
++	.open	= simple_open,
++	.read	= kcov_remote_dedup_read,
++	.write	= kcov_remote_dedup_write,
++	.llseek	= noop_llseek,
++};
++
++/* Fibonacci hashing: instruction addresses are aligned, low bits are inert. */
++static __always_inline unsigned int kcov_remote_dedup_slot(unsigned long ip)
++{
++	return (unsigned int)(((u32)(ip >> 2) * 2654435761U) >>
++			      (32 - KCOV_REMOTE_DEDUP_BITS));
++}
++
++static __always_inline bool kcov_remote_dedup_seen(
++		struct kcov_request_remote_ticket *ticket, unsigned long ip)
++{
++	unsigned long *table = ticket->dedup_ip;
++	unsigned int slot;
++
++	if (unlikely(!table))
++		return false;
++	slot = kcov_remote_dedup_slot(ip);
++	if (likely(table[slot] == ip))
++		return true;
++	table[slot] = ip;
++	return false;
++}
++
+ /*
+  * Entry point from instrumented code.
+  * This is called once per basic-block/edge.
+  */
+ void notrace __sanitizer_cov_trace_pc(void)
+ {
++	struct kcov_request_remote_ticket *ticket;
+ 	struct task_struct *t;
+ 	unsigned long *area;
+ 	unsigned long ip = canonicalize_ip(_RET_IP_);
+@@ -243,10 +330,19 @@ void notrace __sanitizer_cov_trace_pc(void)
+ 	if (!check_kcov_mode(KCOV_MODE_TRACE_PC, t))
+ 		return;
+ 
++	ticket = t->kcov_request_remote_ticket;
+ 	area = t->kcov_area;
+ 	/* The first 64-bit word is the number of subsequent PCs. */
+ 	pos = READ_ONCE(area[0]) + 1;
+ 	if (likely(pos < t->kcov_size)) {
++		/*
++		 * Skip a PC this remote section already recorded.  Gated on the
++		 * runtime toggle first, so the disabled default and the local
++		 * (per-thread) coverage path are untouched.
++		 */
++		if (unlikely(kcov_remote_dedup_enabled) && ticket &&
++		    kcov_remote_dedup_seen(ticket, ip))
++			return;
+ 		/* Previously we write pc before updating pos. However, some
+ 		 * early interrupt code could bypass check_kcov_mode() check
+ 		 * and invoke __sanitizer_cov_trace_pc(). If such interrupt is
+@@ -257,9 +353,8 @@ void notrace __sanitizer_cov_trace_pc(void)
+ 		WRITE_ONCE(area[0], pos);
+ 		barrier();
+ 		area[pos] = ip;
+-	} else if (t->kcov_request_remote_ticket) {
+-		WRITE_ONCE(((struct kcov_request_remote_ticket *)
+-			t->kcov_request_remote_ticket)->scratch_overflow, true);
++	} else if (ticket) {
++		WRITE_ONCE(ticket->scratch_overflow, true);
+ 	}
+ }
+ EXPORT_SYMBOL(__sanitizer_cov_trace_pc);
+@@ -1561,6 +1656,8 @@ static void kcov_request_remote_scratch_put(
+ {
+ 	unsigned long flags;
+ 
++	kfree(ticket->dedup_ip);
++	ticket->dedup_ip = NULL;
+ 	if (!ticket->scratch)
+ 		return;
+ 	spin_lock_irqsave(&kcov_remote_lock, flags);
+@@ -1697,6 +1794,14 @@ int kcov_request_remote_try_grant(u64 request_cookie,
+ 	}
+ 	ticket->scratch = scratch;
+ 	ticket->scratch_size = size;
++	/*
++	 * Optional duplicate-suppression window for this section.  4 KiB next to
++	 * the multi-megabyte scratch, and a failed allocation only means the
++	 * section records every event exactly as before.
++	 */
++	if (unlikely(kcov_remote_dedup_enabled))
++		ticket->dedup_ip = kcalloc(KCOV_REMOTE_DEDUP_SLOTS,
++					   sizeof(unsigned long), GFP_KERNEL);
+ 	kcov_request_zero_area_count(ticket->scratch, mode);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_SCRATCH_RESERVED);
+ 	ticket->phase6_scratch_accounted = true;
+@@ -2513,6 +2618,13 @@ static int __init kcov_init(void)
+ 	 */
+ 	debugfs_create_file_unsafe("kcov", 0600, NULL, NULL, &kcov_fops);
+ 
++	/*
++	 * Runtime toggle for the repeated-PC suppression above, so the behaviour
++	 * can be A/B-ed inside a single boot (0 = off, 1 = on).
++	 */
++	debugfs_create_file_unsafe("kcov_remote_dedup", 0644, NULL, NULL,
++				   &kcov_remote_dedup_fops);
++
+ #ifdef CONFIG_KCOV_SELFTEST
+ 	selftest();
+ #endif
+-- 
+2.53.0
+

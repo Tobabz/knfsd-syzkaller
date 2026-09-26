@@ -37,6 +37,11 @@ import time
 
 REMOTE_DRIVER = "/opt/frozen-phase9"
 PHASE9_CONTROL = "/sys/kernel/debug/sunrpc_fuzz/phase9_control"
+# S4c: runtime toggle for the repeated-PC suppression added by kernel patch
+# 0012 (kcov: suppress repeated PC events in remote sections).  Default is 0,
+# which is exactly the pre-patch behaviour, so a run with --dedup 0 is the
+# frozen baseline and --dedup 1 is the treatment inside the same boot.
+DEDUP_CONTROL = "/sys/kernel/debug/kcov_remote_dedup"
 # KCSAN reports begin with "BUG: KCSAN:" (kernel/kcsan/report.c) and are
 # findings, not crashes: the kernel keeps running after reporting.
 # Excluding that banner keeps KCSAN builds able to produce AB evidence;
@@ -395,6 +400,11 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
             json.loads(setup.stdout), args.procs)
         phase9.validate_source_tree(vm, active_root, args.procs)
         vm.guest("nfs-grace", "sleep 11", timeout=20)
+        vm.guest("set-dedup",
+                 "set -eu; test -e %s; printf '%%s\\n' %s > %s; "
+                 "test \"$(cat %s)\" = %s" %
+                 (DEDUP_CONTROL, args.dedup, DEDUP_CONTROL,
+                  DEDUP_CONTROL, args.dedup), timeout=20)
         vm.guest("reset-phase9", "printf 'reset\\n' > " + PHASE9_CONTROL)
         baseline = [phase9.lane_snapshot(vm, modules, active_root, lane,
                                          "ab-baseline")
@@ -506,6 +516,7 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
             "status": "pass" if not failed else "fail",
             "completed_at": timestamp(), "fixture": fixture,
             "executor_command": command, "run_meta": run_meta,
+            "kcov_remote_dedup": args.dedup,
             "functional": functional, "coverage_export": cover,
             "coverage_members": names, "diagnostics": diagnostics,
             "metrics": metrics, "memory_samples": memory_samples,
@@ -601,6 +612,9 @@ def parse_args(argv=None):
     parser.add_argument("--memory", type=int, default=8192)
     parser.add_argument("--boot-timeout", type=int, default=180)
     parser.add_argument("--trial-timeout", type=int, default=600)
+    parser.add_argument("--dedup", choices=("0", "1"), default="0",
+                        help="kcov_remote_dedup value for the trial "
+                             "(0 = pre-patch behaviour, 1 = dedup on)")
     args = parser.parse_args(argv)
     if args.syz_bin is not None:
         args.syz_bin = args.syz_bin.resolve()
