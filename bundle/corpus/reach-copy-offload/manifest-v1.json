@@ -1,0 +1,72 @@
+{
+  "corpus": "reach-copy-offload",
+  "kind": "reach-corpus",
+  "scenario": "S4 : async COPY offload thread-hop (svc thread -> server worker kthread -> CB_OFFLOAD callback leg -> client)",
+  "purpose": "Verify remote kcov attribution continuity when the execution owner thread changes: the NFSv4.2 server async COPY is handed from the svc thread (COPY4 request) to a worker kthread (nfsd4_do_async_copy) and the completion returns to the client via a CB_OFFLOAD callback. Patch 0010 wraps the kthread in a saved-work continuation (sunrpc_fuzz_saved_work_start/stop) so its coverage still attaches to the originating remote-request flow. This corpus proves the continuation traverses the hop.",
+  "patches_under_test": [
+    "0003",
+    "0009",
+    "0010"
+  ],
+  "lane_minor": 2,
+  "trigger_detail": {
+    "client": "nfs4_copy_file_range: count 0x2000000 > 2*rsize (rsize default 1MiB) => sync=false => nfs42_proc_copy issues COPY4 with ca_synchronous=false and waits for the offload result (handle_async_copy / nfs4_copy_dequeue_callback)",
+    "server": "nfsd4_copy: async path spawns the worker kthread nfsd4_do_async_copy; 0010 hooks sunrpc_fuzz_saved_work_start at entry (fs/nfsd/nfs4proc.c:2151) and stop at exit (:2203); nfsd4_send_cb_offload() then delivers CB_OFFLOAD on the backchannel (nfsd4_run_cb/_work, nfsd4_cb_offload_done)"
+  },
+  "prog": "reach-copy-offload.prog",
+  "prog_sha256": "02010f0f4883d15442bc03bb7bd39688eac3374d1956694c1b506602797e2888",
+  "fixture": "tools/ab-lane-fixture-v42.sh (INLINE: prelude retires the baked boot fixture, exports NFS_MINOR_VERSION=2, then runs the baked lane.sh body verbatim in-process; a thin wrapper that forks /opt/frozen-phase9/lane.sh exhausts guest fork capacity during boot-fixture retirement -- fixture-setup rc=124/\"Cannot fork\"; probe evidence 2026-09-26)",
+  "runner": "tools/run-reach-copy-offload.sh",
+  "analysis": "tools/analyze-ab.sh then tools/reach-assert.py",
+  "mode": "both",
+  "trials": 2,
+  "executions": 10,
+  "procs": 2,
+  "evidence_dir": "~/reach-copy-evidence2 (KOOV_EVIDENCE_DIR; v1 first attempt aborted in ~/reach-copy-evidence)",
+  "attribution_model": {
+    "fs/nfsd": "Server code collects ONLY under ON remote kcov (off_union is empty); on_only == on_union. Sentinel membership asserted against on_only.",
+    "net/sunrpc": "Mixed client/server; the ON-attributed slice is on_only. The saved-work continuation runs only in the server kthread, so it must land in on_only.",
+    "fs/nfs": "Client code collects in both OFF and ON (executor plain kcov); on_only is empty by design. Sentinel presence asserted against on_union (proves the client legs executed during ON trials); OFF presence recorded for context."
+  },
+  "sentinel": {
+    "fs/nfsd": {
+      "rule": "on-only",
+      "required": [
+        "nfsd4_copy",
+        "nfsd4_do_async_copy",
+        "nfsd4_run_cb_work"
+      ],
+      "observed": [
+        "_nfsd_copy_file_range",
+        "nfsd4_cb_offload_done",
+        "nfsd4_run_cb"
+      ]
+    },
+    "net/sunrpc": {
+      "rule": "on-only",
+      "required": [
+        "sunrpc_fuzz_saved_work_start",
+        "sunrpc_fuzz_saved_work_stop"
+      ],
+      "observed": [
+        "sunrpc_fuzz_svc_continuation_save",
+        "sunrpc_fuzz_svc_continuation_restore"
+      ]
+    },
+    "fs/nfs": {
+      "rule": "on-union",
+      "required": [
+        "nfs42_proc_copy",
+        "nfs4_copy_dequeue_callback"
+      ],
+      "observed": [
+        "nfs4_copy_file_range"
+      ]
+    }
+  },
+  "verdict_criteria": "PASS iff every required sentinel is present under its module rule; observed are recorded for the evidence trail. A missing required sentinel is either a trigger failure (async path not taken) or an attribution gap in 0010 -- discriminate by checking the other legs before calling it a gap.",
+  "notes": [
+    "kcov_request_* helpers live in kernel/kcov_request.c which has no dedicated coverage set (module partition is fs/nfs, fs/nfsd, net/sunrpc); they are code-path evidence only.",
+    "nfsd4_send_cb_offload is inlined into nfsd4_do_async_copy (no standalone symbol); the callback leg is proven via nfsd4_cb_offload_done / nfsd4_run_cb(_work) server-side and nfs4_copy_dequeue_callback client-side."
+  ]
+}

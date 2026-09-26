@@ -159,6 +159,55 @@ syzkaller 15종 (`bundle/patches/syzkaller/`):
 - 이 구성이 "검증 가능한 재현"을 깨지 않습니다: 모든 결정·변형·적용 결과는 **해시에 고정**되어 감사 가능.
 - **검증 코퍼스 (추후 작업, 2026-09-25 결정)**: 현재 게이트는 단일 일반 NFS 코퍼스 + OFF/ON 대조군으로 판정. 패치의 도달 지점이 다방향(디스패치 NFSv4 · TCP 상관 · kcov 수집 · 지연 작업 귀속)이므로, **도달 지점별 전용 검증 코퍼스 설계**를 별도 작업으로 남겨둔다. 그 전까지 R4(경로 도달 심도)가 코퍼스 적합성의 최소 안전장치 역할을 한다.
 
+### S4 검증 코퍼스 판정 — async COPY offload hop 미귀속 (2026-09-26)
+
+검증 코퍼스 설계의 첫 이행으로 `reach-copy-offload`(S4: NFSv4.2 async COPY offload
+thread-hop, 패치 0003/0009/0010, lane_minor 2)를 OFF/ON 대조로 판정했다. 결과는
+**PASS가 아니라 정직 경계 기록**이다. 원격 kcov 채널 자체는 정상이며, **비동기
+COPY가 포함된 워크로드에서만 서버측 원격 커버리지가 전무**하다는 것이 결정적
+증거로 확정되었다.
+
+| 실행 (동일 인프라·동일 날) | workload | ON extra | 판정 근거 |
+|---|---|---|---|
+| v1 (evidence2) | 동기-only 10콜 | **10 파일 (233K+ PC)** | 채널 정상 기준선 |
+| **v1 재실행 대조 (evidence5)** | **동기-only 10콜** | **10 파일 재현 (6394 unique PC)** | 오늘 재현: 인프라 무결 |
+| v2 (evidence3) | 비동기-only 11콜 | 0 | 동기 RPC(open/pwrite/ftruncate) 처리조차 미귀속 |
+| 하이브리드 (evidence4) | 동기+비동기 19콜 | 0 | 동기 leg 클라 커버리지는 v1과 동일(CALL5 copy 3141 vs 3135)한데 extra=0 |
+
+- **채널 인프라 정상 입증**: v1(evidence2)과 동일한 kernel `5b22ba55` · image
+  `78ac48d0` · executor `2947f148` · execprog `3fef7a42` · fixture
+  `b2b47a9e...`로 오늘 재실행(evidence5)해도 ON extra=10이 재현됐다.
+  evidence5 드레인 phase8은 async 카운터 전부 0(동기만 있으므로 기대값)이고,
+  동기 sentinel(`nfsd4_copy`·`_nfsd_copy_file_range`·`nfsd4_open`·`nfsd4_write`
+  ·`svc_process_common`)이 전부 PRESENT, 비동기 sentinel은 부재 — v1과 동일한
+  정상 기준선.
+- **비동기 영향 확정**: v2(비동기-only)와 하이브리드(같은 프로그램 안에 동기
+  COPY + 비동기 COPY, 19콜) 모두 ON extra=0. 하이브리드에서 동기 leg가 클라
+  커버리지로 완전히 정상 수행됐음에도 extra=0이므로, **비동기 COPY hop이
+  존재하는 실행에서는 원격 귀속 자체가 수집되지 않는다**. 이는 단순 플레이크가
+  아니라 워크로드 특성이다(2회 재현).
+- **공식 파이프라인 재판정 (evidence5, 대조군)**: `analyze-ab.sh` +
+  `reach-assert.py`(manifest-v1.json)로 재판정한 결과 evidence2와 **완전
+  동일** — fs/nfsd on_only PC 1380(evidence2와 동일값), `nfsd4_copy`
+  asserted=True, async sentinel 전부 부재, 통합 verdict FAIL(동기-only
+  코퍼스의 기대 프로파일). 대조군 FAIL은 "async 트리거 부재"이지 채널
+  이상이 아님을 공식 판정으로 확인.
+- **async leg 발화 증명**: 하이브리드 OFF 드레인 phase8 `async_child_rejected
+  10` — continuation save가 실행당 1회 시도되어 OFF(원격 세션 없음)에서 전량
+  거부된 것. v2 OFF와 동일.
+- **경계 기록**: S4 코퍼스로는 "비동기 COPY offload hop(연속 저장 → 서버
+  worker kthread → CB_OFFLOAD 콜백 leg)의 원격 커버리지 귀속"을 **입증하지
+  못했다**. 동기 COPY 검증(v1)은 여전히 유효하므로, 이 입증 공백은
+  `sunrpc_fuzz_svc_continuation_save`/`saved_work_start|stop` 귀속 경로의
+  부재(extra=0)로 좁혀진다. 후속 조사 대상: ON 실행에서 세션이 비동기 hop
+  시점에 파괴/중단되는지(phase8 드레인이 validate 중단으로 미수집) — 실행
+  파이프라인의 ON 검증이 extra=0에서 즉시 중단되어 ON 드레인 phase8이 없으므로,
+  이 관측 공백 자체를 기록으로 남긴다.
+
+**판정 요약**: S4 = 정직 경계(비동기 hop 미귀속, PASS 불가). 인프라 문제로
+올리지 않는다 — v1 재실행(evidence5)이 같은 날·같은 인프라에서 extra=10을
+재현했기 때문.
+
 ---
 
 ## 7. 파이프라인 자동화 — `tools/fport-pipeline.sh`

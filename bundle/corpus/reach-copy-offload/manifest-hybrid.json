@@ -1,0 +1,74 @@
+{
+  "corpus": "reach-copy-offload",
+  "kind": "reach-corpus",
+  "scenario": "S4 : async COPY offload thread-hop (svc thread -> server worker kthread -> CB_OFFLOAD callback leg -> client)",
+  "purpose": "Discriminator run: same program carries BOTH a synchronous COPY (1MiB source, clamped count <= 2*rsize => sync) and an asynchronous COPY (ftruncate'd 16MiB source => ca_synchronous=false). The sync leg serves as an in-run control that the ON remote-extra channel is alive and attributes server RPC processing (nfsd4_copy/_nfsd_copy_file_range). Whether the async sentinels (nfsd4_do_async_copy, sunrpc_fuzz_saved_work_start/stop) also land in ON extra decides: extra>0 + async sentinels => v2's extra=0 (evidence3) was infra/flake, rerun v2 for PASS; extra>0 + sync only => the async COPY hop is genuinely not attributed (honest boundary); extra=0 => channel itself dead in this workload class (infra).",
+  "patches_under_test": [
+    "0003",
+    "0009",
+    "0010"
+  ],
+  "lane_minor": 2,
+  "trigger_detail": {
+    "client": "nfs4_copy_file_range: sync leg copies the 1MiB src-sync.bin (clamped count stays 1MiB <= 2*rsize) => sync=true; async leg copies ftruncate'd 16MiB src-async.bin (clamped count 16MiB > 2*rsize cap 8MiB) => sync=false => nfs42_proc_copy issues COPY4 with ca_synchronous=false and waits for the offload result (handle_async_copy / nfs4_copy_dequeue_callback)",
+    "server": "nfsd4_copy: async path spawns the worker kthread nfsd4_do_async_copy; 0010 hooks sunrpc_fuzz_saved_work_start at entry (fs/nfsd/nfs4proc.c:2151) and stop at exit (:2203); nfsd4_send_cb_offload() then delivers CB_OFFLOAD on the backchannel (nfsd4_run_cb/_work, nfsd4_cb_offload_done)"
+  },
+  "prog": "reach-copy-offload-hybrid.prog (19 calls: sync COPY leg then async COPY leg)",
+  "prog_sha256": "75d56a5b4de54717b84d161732cc35b7a440a58ad90a52921a95bc4b7f46d3fd",
+  "fixture": "tools/ab-lane-fixture-v42.sh (same as evidence2/evidence3)",
+  "runner": "tools/run-reach-copy-hybrid.sh (copy of run-reach-copy-offload.sh; workload -> hybrid prog, KOOV_EXPECTED_CALLS=19)",
+  "analysis": "tools/analyze-ab.sh then tools/reach-assert.py",
+  "mode": "both",
+  "trials": 2,
+  "executions": 10,
+  "procs": 2,
+  "evidence_dir": "~/reach-copy-evidence4 (KOOV_EVIDENCE_DIR; hybrid sync+async discriminator)",
+  "attribution_model": {
+    "fs/nfsd": "Server code collects ONLY under ON remote kcov (off_union is empty); on_only == on_union. Sentinel membership asserted against on_only.",
+    "net/sunrpc": "Mixed client/server; the ON-attributed slice is on_only. The saved-work continuation runs only in the server kthread, so it must land in on_only.",
+    "fs/nfs": "Client code collects in both OFF and ON (executor plain kcov); on_only is empty by design. Sentinel presence asserted against on_union (proves the client legs executed during ON trials); OFF presence recorded for context."
+  },
+  "sentinel": {
+    "fs/nfsd": {
+      "rule": "on-only",
+      "required": [
+        "nfsd4_copy",
+        "nfsd4_do_async_copy",
+        "nfsd4_run_cb_work"
+      ],
+      "observed": [
+        "_nfsd_copy_file_range",
+        "nfsd4_cb_offload_done",
+        "nfsd4_run_cb"
+      ]
+    },
+    "net/sunrpc": {
+      "rule": "on-only",
+      "required": [
+        "sunrpc_fuzz_saved_work_start",
+        "sunrpc_fuzz_saved_work_stop"
+      ],
+      "observed": [
+        "sunrpc_fuzz_svc_continuation_save",
+        "sunrpc_fuzz_svc_continuation_restore"
+      ]
+    },
+    "fs/nfs": {
+      "rule": "on-union",
+      "required": [
+        "nfs42_proc_copy",
+        "nfs4_copy_dequeue_callback"
+      ],
+      "observed": [
+        "nfs4_copy_file_range"
+      ]
+    }
+  },
+  "verdict_criteria": "PASS iff every required sentinel is present under its module rule. The sync leg proves the ON channel attributes server work in the same run, so a missing async sentinel in a non-empty extra is an attribution gap of the async hop, not a channel/infra failure.",
+  "notes": [
+    "v1 (sync-only prog 02010f0f...) FAIL root cause was trigger: clamped count 1MiB <= 2*rsize => sync path; no async sentinels.",
+    "v2 (async-only prog 07ea8248...) evidence3: ON extra=0 with no .extra files at all; phase8 drain for ON was never collected (validation aborted before drain). open/pwrite/ftruncate server RPC processing also absent from extra. This manifest discriminates channel-dead vs async-hop-unattributed in a single ON run.",
+    "Hybrid plan: sync COPY first (channel proof), async COPY second (hop test). If ON extra>0 with nfsd4_copy/_nfsd_copy_file_range but no nfsd4_do_async_copy/saved_work_start, the async hop is unattributed => honest boundary. If async sentinels also present, v2 extra=0 was infra => rerun v2 to claim PASS.",
+    "kcov_request_* helpers live in kernel/kcov_request.c which has no dedicated coverage set (module partition is fs/nfs, fs/nfsd, net/sunrpc); they are code-path evidence only."
+  ]
+}
