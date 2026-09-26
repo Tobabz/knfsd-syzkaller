@@ -214,3 +214,9 @@ fd090f45f9838819a6a5ec79a700d45d4123d9b040c3b54f6e011e97e728ee3f  tools/ganesha-
 1c25d93578d42604fa3b69620e6b853afcf6f5616864ce2e1666c7b80683f494  tools/nfs_remote_kcov_ganesha_v41_workload.prog
 baaa32c426ed48fef9b1cdb258e64015bddf7f5d324f7a2883cf58ed540b7eef  tools/run_ab_adapted.py
 59c33dea4674d88ed5ed7c95bdbe80627261aa419d520b46fc6f97bc6f1a3ad9  tools/README.md
+# proxy foundation: record-marking reassembly + its host test suite
+db12c8831624df19c8da4c89206e94b35ab175e3af63196ef3099f78141b12d1  tools/nfs-proxy/src/framing.h
+78ab5a678451e15b164cd72496b4fc3d51a7f961237da5180ae197336191aa6b  tools/nfs-proxy/src/framing.c
+6b856097ec85cb34dee87f9eb95ff3490381b1377d3b41983616e54e24dfbe5f  tools/nfs-proxy/test/test_framing.c
+# build + required sanitizer pass (cannot be skipped silently)
+0bfb53e36467d548ff2dbbfec5f0bd598749f7c503875e57c7bb6aef9001b756  tools/nfs-proxy/build.sh

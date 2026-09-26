@@ -18,3 +18,8 @@ __pycache__/
 *.swp
 .DS_Store
 cache/
+# --- tools/nfs-proxy: host build artifacts, never committed ---
+# The proxy is built from source by tools/nfs-proxy/build.sh on any
+# host with clang and gcc; shipping the binary would hide a build that
+# no longer works from a clean checkout.
+tools/nfs-proxy/build/
