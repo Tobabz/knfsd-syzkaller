@@ -23,6 +23,10 @@ OUT="${KOOV_EVIDENCE_DIR:-$WORK_ROOT/evidence/ganesha-lane-run}"
 
 DEPS="${KOOV_GANESHA_DEPS:-$HF/src/guest-deps-ganesha.tar.gz}"
 [ -s "$DEPS" ] || { echo "missing $DEPS -- run the packer first" >&2; exit 2; }
+ASAN_ENV=()
+if [ -n "${KOOV_GANESHA_ASAN_OPTIONS:-}" ]; then
+	ASAN_ENV=(--fixture-env "KOOV_GANESHA_ASAN_OPTIONS=$KOOV_GANESHA_ASAN_OPTIONS")
+fi
 
 python3 "$TOOLS/run_ab_adapted.py" \
 	--kernel "$KC/linux/arch/x86/boot/bzImage" \
@@ -39,6 +43,7 @@ python3 "$TOOLS/run_ab_adapted.py" \
 	--fixture-env NFS_MINOR_VERSION=1 \
 	--fixture-env KOOV_TMPFS_SIZE=256m \
 	--fixture-env KOOV_GANESHA_DEBUG="${KOOV_GANESHA_DEBUG:-NIV_DEBUG}" \
+	"${ASAN_ENV[@]}" \
 	--workload "$TOOLS/nfs_remote_kcov_ganesha_v41_workload.prog" \
 	--output "$OUT" \
 	--mode "${KOOV_GANESHA_MODE:-on}" \
@@ -47,7 +52,7 @@ python3 "$TOOLS/run_ab_adapted.py" \
 	--sample-every 1 \
 	--procs 1 \
 	--cpus 4 \
-	--memory 4096 \
+	--memory "${KOOV_GANESHA_MEMORY_MIB:-4096}" \
 	--boot-timeout 180 \
 	--trial-timeout 300
 echo "ganesha lane run complete: $OUT"

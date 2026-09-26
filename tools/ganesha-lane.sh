@@ -23,8 +23,9 @@
 #   KOOV_GANESHA_PORT Ganesha listen port (default: SERVER_PORT, or 20491 in
 #                     "both")
 #   KOOV_GANESHA_ASAN_OPTIONS / KOOV_UBSAN_OPTIONS
-#                     passed to the Ganesha process; the ASAN build needs
-#                     log_path so a crash names its own pid.
+#                     passed to the Ganesha process; with ASan requested,
+#                     keep the daemon in the foreground so its ASan reports
+#                     reach the per-lane server.log rather than /dev/null.
 #   NFS_MINOR_VERSION 1 (default) | 2
 #
 # Why "both" uses a second tmpfs and a second export path: two servers must
@@ -577,8 +578,14 @@ EOF
                     export ASAN_OPTIONS="$KOOV_GANESHA_ASAN_OPTIONS"
                 export UBSAN_OPTIONS="${KOOV_UBSAN_OPTIONS:-print_stacktrace=1}"
                 export DBUS_SYSTEM_BUS_ADDRESS="$dbus_address"
+                # daemon(0,0) closes stderr.  -F keeps ASan diagnostics in
+                # server.log and retains the same liveness/listener gates.
+                set --
+                if test -n "${KOOV_GANESHA_ASAN_OPTIONS:-}"; then
+                    set -- -F
+                fi
                 # -N takes a component name; 4.3 uses the NIV_* family.
-                exec ganesha.nfsd -f "$lane_root/server/ganesha.conf" \
+                exec ganesha.nfsd "$@" -f "$lane_root/server/ganesha.conf" \
                     -N "${KOOV_GANESHA_DEBUG:-NIV_DEBUG}" \
                     -L "$lane_root/server/ganesha.log"
             ) &

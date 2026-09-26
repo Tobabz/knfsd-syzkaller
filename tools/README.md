@@ -93,6 +93,8 @@ bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
 | `ganesha-lane.sh` | NFS-Ganesha 레인 fixture (knfsd/both/ganesha 3모드, 별도 tmpfs·별도 export) |
 | `ganesha-lane-run.sh` | Ganesha 축 러너 (fixture + 전용 deps tarball + 전용 코퍼스) |
 | `build-ganesha-deps.sh` | `guest-deps-ganesha.tar.gz` 생성 — root 불필요, `.deb`→의존성 closure→주입 트리 |
+| `build-ganesha-asan.sh`·`ganesha-asan-container.sh` | bookworm 4.3-2 소스·패치로 Ganesha 실행 파일/코어/VFS를 GCC ASan으로 빌드하고 별도 deps tar 생성 (Docker 사용) |
+| `ganesha-asan-lane-run.sh`·`run-ganesha-asan-smoke.py` | 게스트에서 ASan 실로드·NFSv4 호출 결과·로그·정리 검증 (원격 KCOV AB와 분리) |
 | `run_frozen_phase9_vm_ganesha.py` | phase9 러너 적응 사본 — 백엔드 중립 lane 게이트 |
 | `nfs_remote_kcov_ganesha_v41_workload.prog` | 두 구현이 모두 통과하는 코퍼스 (호출 수·인덱스 불변) |
 | `lane-quote-lint.sh` | `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
@@ -133,6 +135,29 @@ knfsd와 **병렬로** 수행해 퍼징 처리량을 높이는 축이다. 동시
 | 워크로드 | 34콜 × 2 = 68콜, lock 충돌 기대값 2 충족 |
 | 로컬 커버리지 레코드 | 371,608 |
 | cleanup 누출 | mount / namespace / source_tree 모두 0 |
+
+### ASan 계측 Ganesha (별도 현장 자산)
+
+```sh
+tools/build-ganesha-deps.sh           # 일반 Ganesha tarball이 아직 없다면 먼저 생성
+tools/build-ganesha-asan.sh
+tools/ganesha-asan-lane-run.sh
+```
+
+빌더는 Debian bookworm 컨테이너의 GCC 12·`libasan.so.8`을 써서 4.3-2 소스와
+Debian 패치로 실행 파일, `libganesha_nfsd.so.4.3`, VFS 플러그인을 함께 계측한다.
+`bundle/src/guest-deps-ganesha-asan.tar.gz`는 **별도 gitignored 자산**이다.
+기존 `guest-deps.tar.gz`·일반 Ganesha tarball은 보존한다. 소스 SHA·빌드 설정·
+산출물 해시는 빌더가 출력하는 작업 디렉터리의 `provenance.txt`에 남는다.
+빌더는 기존 출력 파일 덮어쓰기를 거부하며 `--out`으로 새 경로를 지정할 수 있다.
+ASan 사용 시 fixture는 Ganesha를 `-F`로 시작해 stderr 보고서를 레인 로그에
+남긴다. 스모크 게이트는 라이브 PID의 `/proc/PID/maps`에서 `libasan.so.8`을
+확인하고 두 클라이언트의 34콜×2 결과, 로그, cleanup을 판정한다.
+
+기존 Ganesha 러너에서 선택하려면 `KOOV_GANESHA_DEPS`와
+`KOOV_GANESHA_ASAN_OPTIONS`를 함께 설정하고 별도 `KOOV_EVIDENCE_DIR`을
+사용한다. 단, 그 러너의 **원격 KCOV `.extra` AB 게이트는 사용자 공간
+Ganesha에 적용되지 않으므로**, ASan 동작 판정에는 위 스모크 게이트를 쓴다.
 
 ### A-2. knfsd + Ganesha 동시 기동 (미실증)
 

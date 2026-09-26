@@ -1245,3 +1245,54 @@ provenance를 유지하되 활성 항목에서 제외하고, 후자는 커밋된
 | `fport-apply.sh` | 자체 시리즈 적용 (base match / drift=rerere+3way+변형 시드) |
 | §3 의도 인덱스 | 패치별 의도(커널 11 + syzkaller 18종) — 재생성 기준 (이 문서 §3) |
 | `fport-variant.sh` | rc 재베이스 변형 기록 (rr-cache 포함) |
+
+---
+
+### Ganesha 자체 ASan 계측 — bookworm 4.3-2 소스 빌드 (2026-09-27)
+
+`tools/build-ganesha-asan.sh`는 Debian 4.3 원본과 4.3-2 패치를 해시 고정하여
+bookworm 컨테이너의 GCC 12로 컴파일한다. 데몬, `libganesha_nfsd.so.4.3`,
+VFS 플러그인에 `-fsanitize=address`를 적용하고 bookworm `libasan.so.8`을
+함께 넣었다. 세 Ganesha 산출물의 `DT_NEEDED`/`__asan_init` 및 2.36 이후의
+glibc 심볼 부재를 빌드 게이트가 검사한다. 기존 deps tarball은 입력으로만
+사용하며, ASan tarball은 별도 사이트 생성물이다.
+
+| 자산 | SHA-256 |
+|---|---|
+| 원본 `bundle/src/guest-deps.tar.gz` (보존) | `f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8` |
+| 일반 `bundle/src/guest-deps-ganesha.tar.gz` (보존) | `bab6a9e185c7d0153cd1d25db9d81680d536a767af772ea2966091056a654b65` |
+| ASan `bundle/src/guest-deps-ganesha-asan.tar.gz` (gitignored, 게스트 스모크 입력) | `58d7f114109fcbe2573d248022896e58329be1585d13bd0fc73a360424718c5d` |
+| 원본 소스 / Debian 패치 | `d4efd020edf4dfe65abfd0f0f66eb4390613360f99dce4354467ab297e0e1c0f` / `45421606d92d9e33a25ec55e18bd8bcc8dcbe9472beba344ef60b7b2cdc635ee` |
+
+계측 페이로드(순서: 데몬, 코어, VFS, bookworm ASan 런타임)의 SHA-256:
+
+```
+fc4563dce5f45fad3dc106dcbe119c20936e5eb728d0399b8c1563510a065422
+05b77cf5c693ee229afb0c0388c10a93b90534bd2354ed49510352ed2d730e37
+03cb27a65d7f6cbf56d133ed940c37bbe61fb31e0436d0278ac03b4021e45f88
+6ac3f36b3d44aa27a85c73ef1ebc648ed52a9530cc6fbc96cc924b50cc8a3e32
+```
+
+동일 소스를 새로 풀어 재빌드했을 때 네 계측 페이로드의 SHA-256은 동일했다.
+압축 tar의 해시(`c8901e39f85e71925dddcd50a882030a451b62e5d68f109f543f69319cfcb985`)는 포장 시각 메타데이터로 달라져, 위 게스트
+증거에 사용한 tar(`58d7…`)는 덮어쓰지 않고 보존했다.
+
+`tools/ganesha-asan-lane-run.sh` → `tools/run-ganesha-asan-smoke.py`는
+기존 syz-execprog/fixture의 **두 클라이언트 × 단일 Ganesha** 경로에서
+34콜×2=68콜, 기대 lock 충돌 2회, 로컬 KCOV 102,953레코드가 모두 통과함을
+확인했다. 설정/실행 후 같은 살아 있는 Ganesha PID의 `/proc/PID/maps`에
+`libasan.so.8`과 계측 코어가 로드됐고, 비어 있지 않은 Ganesha 로그와
+stderr 보고서 경로를 수집해 **ASan 보고 0**을 확인했다. 마운트·네임스페이스·
+source-tree 정리 누출 0, 베이스 이미지 해시 불변이었다.
+
+검증 JSON: `evidence/ganesha-asan-functional3/trial_evidence.json`
+SHA-256 `edbe7809b7a5457e560ad9b2f51cef71c0fb489b127c49f8163edc36945fdd5d`.
+서버/ASan 로그: `evidence/ganesha-asan-functional3/ganesha-asan.log`
+SHA-256 `fa9eb1618df86203113294849fb0598ce1cd047d6682c42b1418303813e32270`.
+이는 **gitignored 현장 증거**이므로 활성 추적 파일 해시 장부에 넣지 않는다.
+
+원격 KCOV 중심 A/B 러너로 먼저 시도한 2-execution 실행은 실제 NFS 호출까지
+진행한 뒤 `ON extra coverage file count 0 != 2`로 실패했다. 사용자 공간
+Ganesha의 원격 `.extra=0` 제약이지 ASan 빌드 실패가 아니다. 따라서 위 스모크는
+서버 실로드·호출 결과·로그·cleanup을 판정한다. 네 NFSv4 세션과 정식
+`--executions 30 --trials 2` A/B는 이 결과에 포함되지 않는다.
