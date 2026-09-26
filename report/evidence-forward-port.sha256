@@ -113,6 +113,26 @@
 #   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
 #   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
 #   remote 795460 -> 229443 under unconditional dedup).
+#   Cliff measurement: the 512-slot suppression window is a partial filter, not
+#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
+#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
+#   .extra 0/10).  The cliff sits between the two, so enlarging the table
+#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
+#   step.
+# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
+#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
+#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
+#   unconditionally, so a forgotten setting can no longer silently reinstate the
+#   whole-section discard that produced extra coverage 0.  A debugfs surface
+#   audit found kcov_remote_dedup was the only option-style entry and there
+#   were no unused entries; everything else is an observation or control surface
+#   in active use.
+#   Patches, both verified to reproduce the built sources from the clean tree:
+#     kernel    0012  suppress repeated PC events in remote sections
+#     syzkaller 0016  derive the coverage output size from the remote cover area
+#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
+#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
+#   remote 795460 -> 229443 under unconditional dedup).
 # Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
 #   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
 #   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
@@ -192,6 +212,7 @@
 # six design rules this axis produced, each in code rather than prose
 # proxy foundation: record-marking reassembly + its host test suite
 # build + required sanitizer pass (cannot be skipped silently)
+# proxy: structural walk -- certain fields vs explicitly unclaimed regions
 # --- S4c artifacts (kernel 0012 + syzkaller 0016 + harness) ---
 5ff00be69d56bf00c2dc34da63fcf9aedfcaaf9e657abb5599f7bd7c76481ed5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
 ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  bundle/patches/syzkaller/0016-executor-size-coverage-output-from-remote-cover-.patch
@@ -208,7 +229,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-e4a7fb122bb557c09f9c5e696cd8c61c1b925382d668ab1ffa95fc767b140c61  report/patch-forward-compat.md
+a97a32e2eaeae5ddf98dac593178e7bae5fb7fbec971e0ec678687fd426a6cc9  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 b2b47a9e53f4a0babf670115601ce20cdd9da8dabdf24b3183cd342e54cd69d3  tools/ab-lane-fixture-v42.sh
@@ -239,7 +260,6 @@ baaa32c426ed48fef9b1cdb258e64015bddf7f5d324f7a2883cf58ed540b7eef  tools/run_ab_a
 db12c8831624df19c8da4c89206e94b35ab175e3af63196ef3099f78141b12d1  tools/nfs-proxy/src/framing.h
 78ab5a678451e15b164cd72496b4fc3d51a7f961237da5180ae197336191aa6b  tools/nfs-proxy/src/framing.c
 6b856097ec85cb34dee87f9eb95ff3490381b1377d3b41983616e54e24dfbe5f  tools/nfs-proxy/test/test_framing.c
-# proxy: structural walk -- certain fields vs explicitly unclaimed regions
 b9529e954658e7da27b20caa3736b995d132d4fba4da2d031245279315f1ead0  tools/nfs-proxy/src/walk.h
 06cb1b5930a4ce0084608286c0d4492e9de9fe0540aa1d71006fa086c2edf4c6  tools/nfs-proxy/src/walk.c
 b0d448924781b59fe67e41b8bf5dbda3fd71d79b9ea9ac37837af21d0c4dfdc7  tools/nfs-proxy/test/test_walk.c
