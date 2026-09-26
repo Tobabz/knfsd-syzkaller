@@ -1,0 +1,170 @@
+{
+  "existing_evidence": [
+    {
+      "compared_inputs": {
+        "deps_tar": {
+          "baseline": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "evidence": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "match": true
+        },
+        "image": {
+          "baseline": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+          "evidence": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+          "match": true
+        },
+        "kernel": {
+          "baseline": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34",
+          "evidence": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34",
+          "match": true
+        }
+      },
+      "metadata": "/home/idealinsane/frozen-gate8-baked-evidence12/phase8-evidence.json",
+      "name": "gate8-baked",
+      "path": "/home/idealinsane/frozen-gate8-baked-evidence12",
+      "reason": "missing required provenance SHA-256: vmlinux",
+      "sha_match": false
+    },
+    {
+      "compared_inputs": {
+        "deps_tar": {
+          "baseline": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "evidence": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "match": true
+        },
+        "image": {
+          "baseline": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+          "evidence": "78ac48d0ad14a0a81d37e86bfd13d7ae091fec0338e97fac7d1533edaeddd622",
+          "match": false
+        },
+        "kernel": {
+          "baseline": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34",
+          "evidence": "d983642befe82822f4a319fd874d4053125da0ab978e96210752f5fb42c4be71",
+          "match": false
+        }
+      },
+      "metadata": "/home/idealinsane/frozen-gate8-dedup16k-evidence10/phase8-evidence.json",
+      "name": "gate8-dedup16k",
+      "path": "/home/idealinsane/frozen-gate8-dedup16k-evidence10",
+      "reason": "missing required provenance SHA-256: vmlinux; SHA-256 mismatch: kernel, image",
+      "sha_match": false
+    },
+    {
+      "compared_inputs": {
+        "deps_tar": {
+          "baseline": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "evidence": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "match": true
+        },
+        "image": {
+          "baseline": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+          "evidence": "78ac48d0ad14a0a81d37e86bfd13d7ae091fec0338e97fac7d1533edaeddd622",
+          "match": false
+        },
+        "kernel": {
+          "baseline": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34",
+          "evidence": "5b22ba552f922ea2347b14c36beb87fc80bd6af0081eb529a72d7782a737f75f",
+          "match": false
+        }
+      },
+      "metadata": "/home/idealinsane/frozen-gate8-s3-evidence4/phase8-evidence.json",
+      "name": "gate8-s3",
+      "path": "/home/idealinsane/frozen-gate8-s3-evidence4",
+      "reason": "missing required provenance SHA-256: vmlinux; SHA-256 mismatch: kernel, image",
+      "sha_match": false
+    },
+    {
+      "compared_inputs": {
+        "deps_tar": {
+          "baseline": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "evidence": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8",
+          "match": true
+        },
+        "image": {
+          "baseline": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+          "evidence": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+          "match": true
+        },
+        "kernel": {
+          "baseline": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34",
+          "evidence": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34",
+          "match": true
+        },
+        "syz_execprog": {
+          "baseline": "4dc0da81e7e2fa5ce2ca53e61a1b0cdd71e9bc967512d85abffa91d69e014b84",
+          "evidence": "4dc0da81e7e2fa5ce2ca53e61a1b0cdd71e9bc967512d85abffa91d69e014b84",
+          "match": true
+        },
+        "syz_executor": {
+          "baseline": "bce9db3d2117f2f49fa51ab52296225e0b4b3bd415a348210550d5bd8a1f6eb7",
+          "evidence": "bce9db3d2117f2f49fa51ab52296225e0b4b3bd415a348210550d5bd8a1f6eb7",
+          "match": true
+        },
+        "vmlinux": {
+          "baseline": "d2a133ed2d68b2269fa32c4059fe5051efec2fce0d92eb3b595f1f9fecdfc44f",
+          "evidence": "d2a133ed2d68b2269fa32c4059fe5051efec2fce0d92eb3b595f1f9fecdfc44f",
+          "match": true
+        }
+      },
+      "metadata": "/home/idealinsane/reach-baked-async-x2-review/experiment_manifest.json",
+      "name": "reach-async-x2",
+      "path": "/home/idealinsane/reach-baked-async-x2-review",
+      "reason": "required kernel, vmlinux, and image SHA-256 values match",
+      "sha_match": true
+    },
+    {
+      "metadata": "/home/idealinsane/projects/knfsd-fuzz/artifacts/frozen-phase9-gate-2026-09-17-run13/phase9-evidence.json",
+      "name": "gate9-run13",
+      "path": "/home/idealinsane/projects/knfsd-fuzz/artifacts/frozen-phase9-gate-2026-09-17-run13",
+      "reason": "evidence directory missing",
+      "sha_match": false
+    }
+  ],
+  "gate8": {
+    "output": "/home/idealinsane/attr-scenario-evidence/_baseline-gate8",
+    "status": "pass"
+  },
+  "image_sha256_after": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+  "image_sha256_before": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd",
+  "image_unchanged": true,
+  "inputs": {
+    "deps_tar": {
+      "path": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave1/bundle/src/guest-deps.tar.gz",
+      "sha256": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8"
+    },
+    "image": {
+      "path": "/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw",
+      "sha256": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd"
+    },
+    "kernel": {
+      "path": "/home/idealinsane/kcsan-env-0012/linux/arch/x86/boot/bzImage",
+      "sha256": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34"
+    },
+    "syz_execprog": {
+      "path": "/home/idealinsane/kcsan-env-0012/syzkaller/bin/linux_amd64/syz-execprog",
+      "sha256": "4dc0da81e7e2fa5ce2ca53e61a1b0cdd71e9bc967512d85abffa91d69e014b84"
+    },
+    "syz_executor": {
+      "path": "/home/idealinsane/kcsan-env-0012/syzkaller/bin/linux_amd64/syz-executor",
+      "sha256": "bce9db3d2117f2f49fa51ab52296225e0b4b3bd415a348210550d5bd8a1f6eb7"
+    },
+    "vmlinux": {
+      "path": "/home/idealinsane/kcsan-env-0012/linux/vmlinux",
+      "sha256": "d2a133ed2d68b2269fa32c4059fe5051efec2fce0d92eb3b595f1f9fecdfc44f"
+    }
+  },
+  "reach": {
+    "assertion": "PASS",
+    "history": [
+      {
+        "assertion": "FAIL",
+        "failure": "required fs/nfsd sentinel nfsd4_run_cb_work absent from on_only in two independent exact-contract runs",
+        "runner_status": "collected",
+        "superseded_by": "/home/idealinsane/attr-scenario-evidence/_baseline-reach/reach_verdict_reach-copy-offload.json"
+      }
+    ],
+    "output": "/home/idealinsane/attr-scenario-evidence/_baseline-reach",
+    "runner_status": "collected",
+    "verdict": "/home/idealinsane/attr-scenario-evidence/_baseline-reach/reach_verdict_reach-copy-offload.json"
+  },
+  "schema": 1
+}
