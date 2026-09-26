@@ -1016,6 +1016,77 @@ fport-* 파이프라인 경로는 더 이상 절대 경로에 고정되지 않�
 
 ---
 
+### 게이트 사다리 재검증 — R6 거짓 통과 발견·수정, KCSAN 번들 DESIGN HOLDS (2026-09-26)
+
+커널 0012·syzkaller 0016을 series에 추가한 뒤, 포트의 검증 사슬이 **그 추가를
+인식하도록** 재검증했다. 결과적으로 검증 자체의 결함 하나를 찾아 고쳤다.
+
+**발견 1 — R6은 "패치 추가"를 탐지하지 못했다(거짓 통과).** 기존 R6은
+manifest의 pin 개수를 상수와 비교할 뿐이었다:
+
+```python
+ks, ss = len(m["pins"]["kernel_series"]), len(m["pins"]["syz_series"])
+r6 = gate("R6", "apply-audit", sha_ok == 2 and ks == 11 and ss == 15, ...)
+```
+series가 12/16이 되어도 `pins`가 11/15로 남아 있으면 그대로 PASS한다. 실제로
+수정 전 실행이 `kernel_pins=11/11 syz_pins=15/15`로 PASS를 보고했다.
+수정 후에는 **series 파일에서 해시를 계산해 pins와 일치를 요구**한다
+(`tools/fport-design-gate.sh`):
+
+```
+수정 전: R6 PASS  kernel_pins=11/11
+수정 후: R6 FAIL  kernel_pins=11/12 match=False syz_pins=15/16 match=False
+```
+즉 같은 상태에서 거짓 통과가 사라졌고, 검사는 개수 비교보다 **강해졌다**
+(추가·삭제·내용 변경을 모두 탐지).
+
+**발견 2 — 게이트가 검증하던 대상은 우리 번들이 아니었다.** `env/manifest.json`은
+**KASAN frozen 타깃**(11/15 pins, kernel `3757f4cc`, vmlinux `49f66489`)을 기술하고
+있었고, `evidence/analysis_summary.json`도 그 커널 산출(`vmlinux_sha256=49f66489`)이었다.
+따라서 "DESIGN HOLDS"는 frozen 타깃에 대한 진술이며, 12/16 KCSAN 번들과 무관했다.
+KCSAN 검증 기록(커밋 `820a061`)은 **11/15 · kernel `5b22ba55` 시점**에서 멈춰 있었다.
+
+**재검증 (번들 수준)**: frozen 자산을 건드리지 않고 현재 번들을 기술하는
+검증 루트 `~/kcsan-verify-0012/`를 구성해 게이트를 돌렸다.
+
+```
+env/manifest.json   pins를 series에서 재계산(12/16) + kernel.head 9ea7c803,
+                    bzImage d983642b, vmlinux a91c28f8, syzkaller.head 9316aaaa5
+env/linux/.config   현재 커널 설정(kcov/kcov 검사용)
+evidence/           아래 AB 재수집 결과 + coverage_sets
+KOOV_BUNDLE         repo의 bundle/patches (R6의 SHA256SUMS·series 검사 대상)
+```
+- **AB 재수집**: 일반 코퍼스 OFF/ON, 2 trials × 30 exec, `KOOV_ENV_DIR=~/kcsan-env`
+  (`tools/run-ab.sh` → `tools/analyze-ab.sh`), `vmlinux_sha256=a91c28f8`로 심볼라이즈.
+  결과 `status=PASS`, `off fs/nfsd=0 → on=1742`, converged/controls_equal/integrity
+  전부 true, share 100%.
+- **커버리지 집합 보존 확인**: 직전 KCSAN 산출과 비교해
+  `fs_nfsd_on_only` 1750 → **1744**, `net_sunrpc_on_only` 307 → **303**,
+  ranked rows 411 → 412 — dedup과 신 커널에도 원격 커버리지 집합이 사실상 동일하다
+  (손실 없음의 독립 확인).
+
+**게이트 판정 — 현재 KCSAN 번들에서 DESIGN HOLDS**:
+
+| 요구사항 | 판정 | 근거 |
+|---|---|---|
+| R1 build-integrity | PASS | status=pass mem_sanitizer=kcsan |
+| R2 remote-contribution | PASS | off fs/nfsd=0 on fs/nfsd=1742 converged=True controls_eq=True |
+| R4 coverage-depth-general | PASS | fs/nfsd.on_only=1744 net/sunrpc=303 ranked=411 nfsd4_proc_compound=True |
+| R5 evidence-chain-general | PASS | status=PASS integrity=True share=100% sets=6/6 |
+| R6 apply-audit | PASS | sha256 bundles=2/2 kernel_pins=**12/12 match=True** syz_pins=**16/16 match=True** |
+
+**남은 정직한 미결 — env manifest 드리프트**: `~/kcsan-env/manifest.json`은 여전히
+11/15 · `5b22ba55`를 기술한다. bake 도구(`bootstrap-kcov-env.py`)는 pins가 바뀌면
+커널 재빌드·이미지 재-bake를 강제하므로(`bake_reuse`가 `not kernel_rebuilt`를 요구),
+제자리 갱신이 설계상 불가능하고, 재-bake는 새 bzImage 해시를 만들어 S4c 증거
+(`d983642b`)와 커널을 갈라놓는다. 그래서 이번 재검증은 **번들 수준**이며, env
+bake 수준 재검증(옵션 A)은 별도 타깃에서 수행할 **미결 항목으로 기록**한다.
+bake 시점 `stage_verify`의 `/proc/kallsyms` KCSAN 검사는 이번 커널에 대해 재실행하지
+않았고, 대신 **AB 4개 트라이얼 모두 KCSAN 리포트가 관측**(1/2/1/1건)되어
+현재 커널에서 sanitizer가 살아 있음을 실측으로 대체했다.
+
+---
+
 ## 새 산출물 (tools/)
 
 | 파일 | 역할 |
