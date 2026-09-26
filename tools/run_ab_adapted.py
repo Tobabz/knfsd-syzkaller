@@ -16,8 +16,12 @@ import time
 
 REMOTE_DRIVER = "/opt/frozen-phase9"
 PHASE9_CONTROL = "/sys/kernel/debug/sunrpc_fuzz/phase9_control"
+# KCSAN reports begin with "BUG: KCSAN:" (kernel/kcsan/report.c) and are
+# findings, not crashes: the kernel keeps running after reporting.
+# Excluding that banner keeps KCSAN builds able to produce AB evidence;
+# KASAN builds never emit it, so the exclusion is a no-op there.
 FATAL_RE = re.compile(
-    r"(?:^|\n).*(?:BUG:|WARNING:|KASAN:|kernel BUG|Kernel panic|Oops:|"
+    r"(?:^|\n).*(?:BUG:(?! KCSAN:)|WARNING:|KASAN:|kernel BUG|Kernel panic|Oops:|"
     r"refcount_t:|Out of memory:|oom-kill:|Killed process)", re.IGNORECASE)
 CALL_RE = re.compile(
     r"CALL\s+(\d+):\s+signal\s+\d+,\s+coverage\s+(\d+)\s+errno\s+(\d+)"
@@ -454,7 +458,10 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
                                                 encoding="utf-8")
         if dmesg.returncode or FATAL_RE.search(dmesg.stdout + dmesg.stderr):
             failed.append("kernel_diagnostic_clean")
+        kcsan_reports = len(re.findall(r"BUG:\s*KCSAN:",
+                                        dmesg.stdout + dmesg.stderr))
         metrics = {
+            "kcsan_reports": kcsan_reports,
             "elapsed_seconds": elapsed,
             "executions": args.executions,
             "exec_per_second": args.executions / elapsed,

@@ -9,6 +9,11 @@ Only TARGET_DIR is written. Sources (patches, kernel config, seeds)
 are read from the repository this script lives in; their revisions are
 pinned in the manifest.
 
+KOOV_KCONFIG selects the kernel config pin (default: the checked-in
+bundle/patches/kernel.config). Passing bundle/patches/kernel-kcsan.config
+builds the KCSAN sanitizer variant (KASAN off, CONFIG_KCSAN=y) with the
+same pinned patch series; stage_verify records mem_sanitizer=kcsan.
+
 Usage (all paths explicit, no host defaults besides REPO auto-detect):
   bootstrap_kcov_env.py TARGET_DIR --kernel-repo URL --syz-repo URL \\
       --base-image FILE --ssh-key FILE --deps-tar FILE --minor 1|2 \\
@@ -42,7 +47,8 @@ BUNDLE = Path(os.environ.get("KOOV_BUNDLE", str(WORK / "bundle" / "patches")))
 ABRUN = Path(os.environ.get("KOOV_ABRUNNER", str(WORK / "bundle" / "ab-runner")))
 BAKER = Path(os.environ.get("KOOV_BAKER", str(WORK / "bundle" / "baker")))
 FPORT_APPLY = TOOLS / "fport-apply.sh"
-KCONFIG = BUNDLE / "kernel.config"
+KCONFIG = Path(os.environ.get("KOOV_KCONFIG",
+                              str(BUNDLE / "kernel.config")))
 
 KERNEL_URL_DEFAULT = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
 SYZ_URL_DEFAULT = "https://github.com/google/syzkaller.git"

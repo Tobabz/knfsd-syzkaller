@@ -22,6 +22,7 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 | `patches/kernel/` | kernel series: 11 patches + `series` + `SHA256SUMS` | — |
 | `patches/syzkaller/` | syzkaller series: 15 patches + `series` + `SHA256SUMS` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
+| `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); selected via `KOOV_KCONFIG`; outside the 3-item `SHA256SUMS` | — |
 | `ab-runner/` | AB experiment lane drivers (`run_frozen_phase*_vm.py`, lane/probe/bootstrap files, `monitor_knfsd.py`, workload prog) | — |
 | `baker/` | protocol image baking (`bake_nfs_protocol_image.py`) | — |
 | `corpus/` | fuzz corpus / candidate preparation (`audit_*`, `build_*`) | — |

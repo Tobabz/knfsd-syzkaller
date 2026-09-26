@@ -174,6 +174,21 @@ tools/fport-design-gate.sh -v         # 상세 수치 출력
 - KCSAN 타깃의 AB 증거(R2~R5)는 해당 커널에서 새로 산출해야 하며, KCSAN
   리포트는 기본 panic 이 아니므로 크래시 기반 판정의 해석에 유의한다.
 
+### KCSAN 타깃 절차 (2026-09-26)
+
+1. **설정 핀 선택**: `KOOV_KCONFIG=bundle/patches/kernel-kcsan.config` 로
+   bootstrap 을 실행한다 (KASAN off · `CONFIG_KCSAN=y` · `KCSAN_SELFTEST=n`).
+   동일 패치 시리즈(커널 11 · syzkaller 15)를 그대로 사용하고, manifest 의
+   `pins.kconfig` 는 변형 설정의 sha256 으로 기록된다. stage_verify 가
+   `.config`(결정적)와 `/proc/kallsyms` KCSAN 심볼(런타임)을 교차해
+   `verify.mem_sanitizer=kcsan` 을 기록한다.
+2. **AB 호환**: KCSAN 리포트는 `BUG: KCSAN:`(kernel/kcsan/report.c) 배너로
+   시작하지만 panics 이 아니다. `run_ab_adapted.py` 의 `FATAL_RE` 는 이 배너를
+   치명 진단에서 제외하고, trial 별 `metrics.kcsan_reports` 로 발견 수를
+   기록한다 (분석 요약의 `group_statistics.*.kcsan_reports` 로 집계).
+3. **증거·판정**: R2~R5 는 KCSAN 커널에서 새로 산출한 AB 증거로 평가한다.
+   같은 실행 계약(`--executions 30 --trials 2`)과 게이트 임계값이 적용된다.
+
 ---
 
 ## 8. 성능 게이트 R3 철회 (2026-09-26)

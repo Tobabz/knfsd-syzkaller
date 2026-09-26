@@ -138,6 +138,9 @@ bash tools/fport-evidence.sh             # 도구·문서 수정 후 해시 재�
   커밋·배포 절대 금지).
 - 커밋된 부트스트랩 입력은 `bundle/SHA256SUMS`(고정 **3항목**:
   `guest-deps.tar.gz`·`patches/kernel.config`·`README-HANDOFF.md`)로 핀.
+- KCSAN 변형 핀 `patches/kernel-kcsan.config`(KASAN off · `CONFIG_KCSAN=y`)는
+  **선택 입력**으로 `KOOV_KCONFIG`가 선택하며 루트 SHA256SUMS 밖 —
+  개별 무결성은 git 과 bootstrap manifest 의 `pins.kconfig` 가 핀한다.
 - (선택) `bash tools/release-assembly.sh` → 유지보수용 스냅샷
   `dist/knfsd-syzkaller-forward-port-<날짜>[-minimal].tar.gz` (배포 아님);
   `--minimal`은 정확히 3항목만. AB 하네스 `run-ab.sh`는 생성 키를

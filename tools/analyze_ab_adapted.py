@@ -431,9 +431,10 @@ def main(argv=None):
         for metric in ("exec_per_second", "rpc_per_second",
                        "cpu_utilization_percent", "memory_peak_used_kib",
                        "memory_peak_process_rss_kib", "scratch_peak",
-                       "aggregate_allocated"):
+                       "aggregate_allocated", "kcsan_reports"):
             group_stats[mode][metric] = describe(
-                [trial["evidence"]["metrics"][metric] for trial in mode_trials])
+                [trial["evidence"]["metrics"].get(metric, 0)
+                 for trial in mode_trials])
 
     coverage_sets = root / "coverage_sets"
     diagnostics_dir = root / "diagnostics"
