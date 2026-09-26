@@ -1182,6 +1182,38 @@ bundle/patches/{kernel,syzkaller} 에서 파일을 추가·삭제·변경하면
 
 ---
 
+### closure — 주 결과를 canonical env에서 재확인 (2026-09-27)
+
+세션의 주 결과(async COPY offload hop 계측)는 수동 확장 트리 커널 `d983642b`에
+묶여 있었고, bake로 검증한 canonical env 커널 `6d1cbd50`에는 일반 코퍼스 AB만
+있었다. "증거는 해시에 묶인다"는 규율상 이는 공백이므로, baked env **자신의
+커널·이미지·vmlinux·실행기**로 두 실험을 재실행했다(수동 트리는 관여하지 않음).
+
+| 실험 | 결과 | 산출물 |
+|---|---|---|
+| reach async 32MiB (11콜) | **status=pass · `.extra` 10/10** · shortfall=False · overflow/discarded/incomplete/suppressed 전부 0 · published **476,657** | `~/reach-baked-async/` |
+| frozen Gate 8 | **status=pass · 28/28 checks** · async-normal remote **88,616** · deferred-normal **11,737** · abort 4종 0 | `~/frozen-gate8-baked-evidence12/` |
+
+첫 Gate 8 시도(`-baked-evidence11/`)는 게이트 체크 28/28 통과였으나 KCSAN 배너로
+`status=fail`이었고(§S3b의 알려진 거짓 양성), 재실행으로 클린 PASS를 얻었다.
+두 baked 실행은 `async-normal remote` 88,256 vs 88,616(0.4% 차)로 서로 일관된다.
+
+**빌드 간 편차 실측 — 측정 해석 지침**: 같은 패치 내용을 두 번 빌드한 커널
+(`d983642b`, `6d1cbd50`)의 비교에서 표본 크기에 따라 편차가 다르다.
+
+```
+reach async(10회 실행 합계, 대표본)  476,771 vs 476,657  → 0.024%
+Gate 8 async-normal(시나리오 1회, 소표본) 89,709 vs 88,616 → 1.2%
+```
+즉 **대표본 합계는 빌드 간 0.02% 수준으로 안정**하고, 소표본 단일 세대 값은
+1~2% 흔들린다. 앞으로 커널 간 수치를 비교할 때 이 기준(대표본 0.02% / 소표본
+1~2%)을 벗어나는 차이는 빌드 편차가 아니라 **실질 변화**로 해석해야 한다.
+커버리지 집합 비교(on_only 1750/1744/1742)도 같은 이유로 안정 범위 안이다.
+
+**이로써**: 세션 주 결과가 **canonical env 안에서 증거로 고정**되었다.
+
+---
+
 ## 새 산출물 (tools/)
 
 | 파일 | 역할 |
