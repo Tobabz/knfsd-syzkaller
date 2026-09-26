@@ -738,8 +738,9 @@ dedup은 원격 섹션만 건드리고 로컬 per-thread 커버리지 계약은 
 (512슬롯 첫 시도 `-evidence8/`은 KCSAN 노이즈로 `status=fail`이었으나 게이트
 체크는 28/28 통과였고, 재실행으로 클린 PASS를 확보했다 — §S3b의 KCSAN 거짓 양성.)
 
-즉 위 표의 795,460·20,987은 커널 해시와 함께 **역사적 수치**가 되며, 현재
-커널(`e847a515…`)로는 재현되지 않는다. 감소 비율이 reach 채널의 기록량 감소와
+즉 위 표의 795,460·20,987은 dedup-off 커널의 **역사적 수치**다.
+512슬롯 커널 `e847a515`와 16K 커널 `d983642b`의 결과도 각각의 입력 해시에
+귀속한다. 감소 비율이 reach 채널의 기록량 감소와
 일관되어 dedup이 중복 실행 이벤트를 실제로 억제함을 Gate 8에서도 확인해 준다.
 
 **dedup 캐시 임계점 실측 (2026-09-26)**: 512슬롯 캐시가 "충분한가"를 추정하지
@@ -811,21 +812,21 @@ dedup은 원격 섹션만 건드리고 로컬 per-thread 커버리지 계약은 
 정책 변경과 짝을 이룰 때만 완결된다. 현재 측정이 보여준 이득의 대부분은 이미
 16,384슬롯으로 확보되었으므로 **보류 항목으로 기록**한다.
 
-**증거 핀 방식의 한계(기록)**: reach 증거 JSON은 qemu 명령줄을 통해 커널을
-**경로로** 핀한다(`-kernel …/bzImage-dedup-0012v2`). 해시는 리포트 산문에만
-있으므로, 같은 파일명을 다른 내용으로 덮어쓰면 증거의 핀이 조용히 어긋난다.
-현재는 커널 파일명을 용도별로 고정해 경로≈내용을 유지하고 있다
-(`bzImage-baseline-5b22ba55` · `bzImage-dedup-0012`(A/B 시대) ·
-`bzImage-dedup-0012v2`(현재)) — 이름을 재사용하지 않는 것이 유일한 방어다.
+**증거 핀 방식(정정)**: 개별 `trial_evidence.json`의 QEMU 명령줄에는
+커널 **경로**만 나오지만, 같은 실행 루트의 `experiment_manifest.json`은
+커널·이미지·vmlinux·코퍼스·lane fixture·syz-executor/execprog의 **SHA-256**을
+핀한다. 따라서 증거를 확인할 때 두 파일을 함께 읽어야 한다. 기존 파일을
+덮어쓰지 않는 규칙은 계속 유지한다. 512슬롯 cliff 커널은
+`bzImage-dedup-0012v2`(`e847a515`), 16K 곡선 커널은
+`bzImage-dedup-0012v3`(`d983642b`)이다.
 
-**남은 한계 (정직하게)**: 위 실측이 보여주듯 10/10은 출력 버퍼 정렬로 얻어진
-것이며, 캐시 용량 자체는 아직 cliff에 가깝다. 더 큰 코드베이스·KCSAN 빌드·모듈 다수 환경에서는 512슬롯으로는
-`scratch_overflow`가 재발할 수 있어, 그 경우 슬롯 확장(4K~16K) 또는 정확한
-해시 집합(고유 PC × 16~32B, 초과 시 append 강등)이 다음 단계다. dedup=1
-실행에서 KCSAN 리포트 1건이 관측되었으나(blk-mq 계열 기존 레이스, 크래시
-아님) reach 러너의 `FATAL_RE`이 KCSAN을 제외하며 게이트는 PASS다. series
-subject의 `/11`·`/12` 혼재는 기존 11개 해시를 증거로 보존한 의도적 선택이며,
-다음 전체 재생성 시 `/12`로 정규화된다(내용 diff 없음).
+**남은 한계 (현재 16K 창)**: 출력 버퍼는 10MiB로 확장했고 16K 창에서는
+유효 64MiB까지 `.extra` 10/10이지만, 무한 작업량에 대한 overflow 부재는
+보장하지 않는다. `scratch_overflow > 0` 또는 ON `.extra` shortfall이 재발하면
+위의 정책 변경을 검토한다. 과거 dedup=1 실행의 KCSAN 리포트는 reach 러너가
+치명적 크래시로 분류하지 않았다는 뜻이지 데이터 레이스 자체가 거짓이었다는
+증거는 아니다. series subject의 `/11`·`/12` 혼재는 기존 11개 해시를 증거로
+보존한 의도적 선택이며, 다음 전체 재생성 시 정규화할 수 있다.
 
 **판정**: dedup은 "있으면 좋은 최적화"가 아니라 **S4 증상의 직접 해법**이었다.
 근본 원인은 "필요한 것은 집합인데 커널이 로그를 준다"는 표현 불일치였고,
@@ -1123,17 +1124,19 @@ syzkaller base `801f0966` + **16패치**를 새로 적용·빌드·bake·verify�
 편차 ~0.5% 이내로, dedup과 패치 추가가 원격 커버리지 집합을 잃지 않음을
 독립적으로 확인해 준다.
 
-**커널 2세대 공존 — 역할 분리(문서화)**: 같은 패치 내용이라도 빌드가 달라 해시가
+**커널 세대 공존 — 역할 분리(문서화)**: 같은 패치 내용이라도 빌드가 달라 해시가
 다르므로, 증거 귀속을 다음과 같이 고정한다.
 
 ```
-d983642b (수동 확장 트리, ~/kcsan-env)
-   → S4c 판정(10/10) · Gate 8 28/28 · cliff 실측(x2/x4) · S4b/S4c 증거가 묶인 커널
-6d1cbd50 (bake, ~/kcsan-env-0012)
-   → bake + stage_verify + env 수준 게이트가 묶인 커널
+e847a515 (512슬롯, ~/kcsan-env/bzImage-dedup-0012v2)
+   → x2 통과 / x4 overflow cliff 실측과 reach-final-async의 커널
+d983642b (16K 수동 확장, ~/kcsan-env/bzImage-dedup-0012v3)
+   → x1/x2/x4 곡선 10/10 · Gate 8 28/28의 커널
+6d1cbd50 (16K bake, ~/kcsan-env-0012)
+   → bake + stage_verify + env 수준 게이트 · reach x1/x2 · Gate 8의 커널
 5b22ba55 → 최초 베이스라인(S3/S4 원 기록)
 ```
-세 커널 모두 **이름을 재사용하지 않고** 보존한다(`bzImage-baseline-5b22ba55`,
+이 커널들은 **이름을 재사용하지 않고** 보존한다(`bzImage-baseline-5b22ba55`, `bzImage-dedup-0012v2`,
 `bzImage-dedup-0012v3`, `kcsan-env-0012/linux/arch/x86/boot/bzImage`).
 `~/kcsan-env/manifest.json`은 11/15 · `5b22ba55`를 기술한 채 남지만, 이제는
 "bake 수준 주장은 `~/kcsan-env-0012`가 담당"한다고 명시함으로써 stale 상태가
@@ -1145,8 +1148,9 @@ d983642b (수동 확장 트리, ~/kcsan-env)
 
 여러 작업축(NFS/sunrpc 포트, Ganesha 축, nfs-proxy 축)이 같은 리포를 병행
 편집하므로, 정합성 검토에서 확인한 사실과 규칙을 남긴다. 코히런스는 유지되고
-있지만(검토 시점: 매니페스트 47항목 · 누락 0 · 중복 0 · 전 해시 검증,
-리포트의 Ganesha 섹션 온전), 아래 두 지점은 모르면 조용히 깨질 수 있다.
+있지만(당시의 작업 트리 해시 검사와 Ganesha 섹션 보존을 확인),
+아래 두 지점은 모르면 조용히 깨질 수 있다. **커밋된 트리**와 비교하는 별도
+검증도 필요하다(아래 최종 검토 참조).
 
 **① 공유 파일 2개 — 동시 편집 규칙**
 
@@ -1157,8 +1161,8 @@ d983642b (수동 확장 트리, ~/kcsan-env)
 
 - 매니페스트는 **집합**이므로 재생성 시 중복이 제거된다(실제로 타 축의 중복
   항목이 정리된 적이 있다 — 유익하지만 타 축 기록의 변경이므로 커밋 메시지에
-  명시한다). 현재 타 축 항목은 ganesha 8 + nfs-proxy 4가 등재되어 있고,
-  재생성 후에도 보존됨을 확인했다.
+  명시한다). 타 축 항목도 재작성 직전의 커밋된 트리에서 다시 확인하고,
+  현장 생성물은 활성 git 파일 해시 목록과 구분한다.
 - 두 파일 모두 "한쪽이 오래된 읽기를 쓰면 상대의 신규 항목/섹션이 사라지는"
   구조다. 지금까지 사고는 없었으나, 규칙은 사고 후가 아니라 사고 전에 적어둔다.
 
@@ -1184,33 +1188,51 @@ bundle/patches/{kernel,syzkaller} 에서 파일을 추가·삭제·변경하면
 
 ### closure — 주 결과를 canonical env에서 재확인 (2026-09-27)
 
-세션의 주 결과(async COPY offload hop 계측)는 수동 확장 트리 커널 `d983642b`에
-묶여 있었고, bake로 검증한 canonical env 커널 `6d1cbd50`에는 일반 코퍼스 AB만
-있었다. "증거는 해시에 묶인다"는 규율상 이는 공백이므로, baked env **자신의
-커널·이미지·vmlinux·실행기**로 두 실험을 재실행했다(수동 트리는 관여하지 않음).
+baked env의 커널 `6d1cbd50`과 **자체 이미지·vmlinux·syz 실행기**로 async
+COPY와 frozen Gate 8을 다시 실행했다. reach의 실행 루트
+`experiment_manifest.json`은 위 입력들의 SHA-256을 기록하며 현 파일과 일치한다.
 
 | 실험 | 결과 | 산출물 |
 |---|---|---|
-| reach async 32MiB (11콜) | **status=pass · `.extra` 10/10** · shortfall=False · overflow/discarded/incomplete/suppressed 전부 0 · published **476,657** | `~/reach-baked-async/` |
-| frozen Gate 8 | **status=pass · 28/28 checks** · async-normal remote **88,616** · deferred-normal **11,737** · abort 4종 0 | `~/frozen-gate8-baked-evidence12/` |
+| 기본 코퍼스 — COPY **요청 32MiB, 유효 16MiB**(소스 EOF) | `status=pass`, `.extra` **10/10**, overflow/discarded/incomplete/suppressed 0, published **476,657** | `~/reach-baked-async/` |
+| x2 코퍼스 — **유효 32MiB** | `status=pass`, `.extra` **10/10**, overflow/discarded/incomplete/suppressed 0, published **732,778**; 10개 `.extra` 각각 `nfsd4_do_async_copy` PC 20개 | `~/reach-baked-async-x2-review/` |
+| frozen Gate 8 | `status=pass`, **28/28 checks**, async-normal remote **88,616**, deferred-normal **11,737**, abort 4종 0 | `~/frozen-gate8-baked-evidence12/` |
 
-첫 Gate 8 시도(`-baked-evidence11/`)는 게이트 체크 28/28 통과였으나 KCSAN 배너로
-`status=fail`이었고(§S3b의 알려진 거짓 양성), 재실행으로 클린 PASS를 얻었다.
-두 baked 실행은 `async-normal remote` 88,256 vs 88,616(0.4% 차)로 서로 일관된다.
-
-**빌드 간 편차 실측 — 측정 해석 지침**: 같은 패치 내용을 두 번 빌드한 커널
-(`d983642b`, `6d1cbd50`)의 비교에서 표본 크기에 따라 편차가 다르다.
+원본 증거 JSON SHA-256(각 디렉토리는 기존 증거를 덮어쓰지 않고 보존):
 
 ```
-reach async(10회 실행 합계, 대표본)  476,771 vs 476,657  → 0.024%
-Gate 8 async-normal(시나리오 1회, 소표본) 89,709 vs 88,616 → 1.2%
+eff44fd1eeb514329164796060703fdf11d2e1162f0e19c3a840ccf4dd5d3667  reach-baked-async/experiment_manifest.json
+f7e9f05168c80fd71e2b86b0816f00750fb3f2a9205f7d922ddec395a0368ff6  reach-baked-async-x2-review/experiment_manifest.json
+c4546b2d835c154dafb0ea00c9eec346101ec64c72fccf37f600e4fff917b742  reach-baked-async/remote_on/trial_01/trial_evidence.json
+8acc62ae5fcbbd99611da25e51601a40f73eecb9174ba31cfc1a9e888389f94d  reach-baked-async-x2-review/remote_on/trial_01/trial_evidence.json
+a413edd5295dd93aab243d7c7f9cd95484fc1893336dc207bcc7af24ff2bbd7e  frozen-gate8-baked-evidence12/phase8-evidence.json
 ```
-즉 **대표본 합계는 빌드 간 0.02% 수준으로 안정**하고, 소표본 단일 세대 값은
-1~2% 흔들린다. 앞으로 커널 간 수치를 비교할 때 이 기준(대표본 0.02% / 소표본
-1~2%)을 벗어나는 차이는 빌드 편차가 아니라 **실질 변화**로 해석해야 한다.
-커버리지 집합 비교(on_only 1750/1744/1742)도 같은 이유로 안정 범위 안이다.
 
-**이로써**: 세션 주 결과가 **canonical env 안에서 증거로 고정**되었다.
+첫 baked Gate 8 시도(`~/frozen-gate8-baked-evidence11/`)는 28/28 체크가
+참이었지만 `BUG: KCSAN: data-race in xas_clear_mark / xas_find_marked`가
+`FATAL_KERNEL_RE`의 `BUG:`에 걸려 **status=fail**이었다. 재실행은 클린 PASS.
+첫 시도의 *치명적 진단 분류*가 과민하다는 뜻이지, KCSAN 레이스 보고 자체가
+거짓이라는 판정은 아니다.
+
+같은 패치 내용의 수동/베이크 환경 사이에서 **이번에 관측한** 엔트리 차이는
+유효 16MiB에서 476,771 대 476,657(**0.024%**), 유효 32MiB에서
+733,197 대 732,778(**0.057%**), Gate 8 async-normal 89,709 대
+88,616(**1.2%**)였다. 이미지·실행기 빌드와 런 간 변동도 달라서 이 단일
+비교들로 **보편적인 빌드 편차 상한이나 변화 판정 임계값을 정할 수 없다**.
+일반 코퍼스의 `on_only` 개수(1750/1744/1742)가 비슷한 것도 집합의 원소가
+같다는 증명은 아니다. 이 수치들은 관측값으로만 해석한다.
+
+**메타데이터 주의**: 기존 reach `experiment_manifest.json`의
+`controls.nfs_version=4.1`은 고정 문자열이었으나, 실제 S4 fixture
+`ab-lane-fixture-v42.sh`는 `NFS_MINOR_VERSION=2`를 강제한다. 기존 증거 JSON은
+보존하고 이 불일치를 명시했다. 앞으로의 실행에는 fixture에 따른 버전을
+기록하도록 러너를 수정했다.
+
+**최종 검토에서 고친 커밋 정합성**: 예전 `report/evidence-forward-port.sha256`에는
+gitignored 현장 생성물 `bundle/src/guest-deps-ganesha.tar.gz`가 활성 항목으로
+포함되고, proxy의 미커밋 `build.sh` 해시가 기록돼 있었다. 전자는 주석으로
+provenance를 유지하되 활성 항목에서 제외하고, 후자는 커밋된 파일 해시로 갱신했다.
+현재 리포와 env-bake 수준의 증거는 이 구별 하에서 검증한다.
 
 ---
 

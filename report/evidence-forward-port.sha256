@@ -1,216 +1,11 @@
-# forward-port configuration artifacts (2026-09-26T21:55:00+09:00)
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-#   Cliff measurement: the 512-slot suppression window is a partial filter, not
-#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
-#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
-#   .extra 0/10).  The cliff sits between the two, so enlarging the table
-#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
-#   step.
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-#   Cliff measurement: the 512-slot suppression window is a partial filter, not
-#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
-#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
-#   .extra 0/10).  The cliff sits between the two, so enlarging the table
-#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
-#   step.
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-#   Cliff measurement: the 512-slot suppression window is a partial filter, not
-#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
-#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
-#   .extra 0/10).  The cliff sits between the two, so enlarging the table
-#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
-#   step.
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-#   Cliff measurement: the 512-slot suppression window is a partial filter, not
-#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
-#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
-#   .extra 0/10).  The cliff sits between the two, so enlarging the table
-#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
-#   step.
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-#   Cliff measurement: the 512-slot suppression window is a partial filter, not
-#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
-#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
-#   .extra 0/10).  The cliff sits between the two, so enlarging the table
-#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
-#   step.
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-#   Cliff measurement: the 512-slot suppression window is a partial filter, not
-#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
-#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
-#   .extra 0/10).  The cliff sits between the two, so enlarging the table
-#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
-#   step.
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-#   Cliff measurement: the 512-slot suppression window is a partial filter, not
-#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
-#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
-#   .extra 0/10).  The cliff sits between the two, so enlarging the table
-#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
-#   step.
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard that produced extra coverage 0.  A debugfs surface
-#   audit found kcov_remote_dedup was the only option-style entry and there
-#   were no unused entries; everything else is an observation or control surface
-#   in active use.
-#   Patches, both verified to reproduce the built sources from the clean tree:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
-#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
-#   remote 795460 -> 229443 under unconditional dedup).
-# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
-#   the A/B switch is gone: kernel 0012 now applies duplicate suppression
-#   unconditionally, so a forgotten setting can no longer silently reinstate the
-#   whole-section discard.  A debugfs surface audit found kcov_remote_dedup was
-#   the only option-style entry (0 unused entries); the remaining debugfs
-#   entries are observation and control surfaces in active use.
-#   Patches, both versioned and both verified to reproduce the built sources:
-#     kernel    0012  suppress repeated PC events in remote sections
-#     syzkaller 0016  derive the coverage output size from the remote cover area
-#   Evidence: reach-final-async (10/10), reach-final-v1 (sync control 10/10),
-#   frozen-gate8-dedupfinal (gate 28/28; async-normal remote 795460 -> 232905).
-# Regenerated after the S4c syzkaller 0016 patch on 2026-09-26:
-#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel.
-#   Two stacked causes removed, both now versioned patches:
-#     kernel 0012  — suppress repeated PC events in remote sections, so the
-#                     remote scratch no longer overflows (scratch_overflow 10->0)
-#     syzkaller 0016 — derive the per-request coverage output size from the
-#                     remote cover area (10 MiB) instead of a hardcoded 6 MiB;
-#                     the extra record is appended last and was silently
-#                     truncated once the aggregate passed ~466k entries
-#                     (2/10 files -> 10/10).  flatrpc.ConstMaxOutputSize (14 MiB)
-#                     must stay at or above the derived value.
-#   Evidence: reach-bigbuf-async (gate pass, 10/10 .extra, nfsd4_do_async_copy in
-#   every file) and reach-bigbuf-v1 (sync control, 10/10, no regression).
-# Regenerated after the S4c 10/10 result on 2026-09-26:
-#   PASS — async COPY offload hop is measured 10/10 in the syzkaller channel.
-#   Two stacked causes were removed: (1) kernel patch 0012 suppresses repeated
-#   PC events so the remote scratch no longer overflows (scratch_overflow
-#   10 -> 0); (2) the userspace output buffer was aligned to the shared-memory
-#   region the manager already provides (kMaxOutputCoverage 6 MiB -> 14 MiB),
-#   because the extra record is appended last and was being silently truncated
-#   once the aggregate passed ~466k entries.  Evidence: reach-bigbuf-async
-#   (gate pass, 10/10 .extra, nfsd4_do_async_copy in every file) and
-#   reach-bigbuf-v1 (sync control, 10/10, no regression).
-# Regenerated after S4c dedup verdict on 2026-09-26:
-#   PASS — kernel patch 0012 (lossless repeated-PC suppression in remote
-#   sections) makes the syzkaller channel measure the async COPY offload hop.
-#   A/B on one kernel (ea120cbe) with only the kcov_remote_dedup knob
-#   differing: scratch_overflow 10 -> 0, entries_published 0 -> 5,158,711,
-#   .extra files 0 -> 2 containing nfsd4_do_async_copy; attribution counters
-#   (88/88/88) and generation lifecycle (11/11/0) unchanged.
-#   S4b diagnosis, S3b extended-window PASS, S3 deferred-resume PASS and the
-#   S4 honest boundary (now fixed at the representation level) all stand.
+# forward-port configuration artifacts (2026-09-27)
+# S4c current: unconditional 16K remote repeated-PC suppression (kernel 0012),
+# 10MiB derived syzkaller coverage output (0016), and baked-env async COPY
+# x1/x2 10/10 plus Gate 8 28/28. Details and evidence JSON hashes are in
+# report/patch-forward-compat.md. Historical 512-slot cliff: e847a515;
+# 16K curve: d983642b; baked env: 6d1cbd50.
+# Active checksum entries must exist in the committed git tree. Site-generated,
+# gitignored artifacts are provenance comments, not committed file records.
 # --- S3 deferred-resume spike artifacts (frozen Gate 8) ---
 # --- S3b extended-generation-window spike artifacts (frozen Gate 8) ---
 # --- lane isolation hardening + sh -c quoting guard (Ganesha axis base) ---
@@ -237,7 +32,7 @@
 # --- S4c artifacts (kernel 0012 + syzkaller 0016 + harness) ---
 5ff00be69d56bf00c2dc34da63fcf9aedfcaaf9e657abb5599f7bd7c76481ed5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
 ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  bundle/patches/syzkaller/0016-executor-size-coverage-output-from-remote-cover-.patch
-c59a4a7c64b226d3a2e2761934b95ab05534905fc3c1250ae3af25ad71859271  tools/run-reach-adapted-window.py
+c3e74e26b6372da569410f4876c08528f8380770d3b0ef3ef4a0025ac33b11f6  tools/run-reach-adapted-window.py
 b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068  bundle/corpus/reach-copy-offload/reach-copy-offload-x2.prog
 46d0f4a323f1a69e57be0b81261d67dc0e6082f03a913367570c4f12f0153f79  bundle/corpus/reach-copy-offload/reach-copy-offload-x4.prog
 636d8cbeb22988d656f3937b57f8cab3baecdb2bf0d4bd7da7ab7642d5b830e7  tools/fport-patch-hygiene.py
@@ -250,7 +45,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-962382d61f40b9bb29f94d098c033351df6436731e8171805f3fd4660d1b36ae  report/patch-forward-compat.md
+a72bc381351c6e1a498ea1181a46d2590d7768d151751b7ce803f690af4ef970  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 b2b47a9e53f4a0babf670115601ce20cdd9da8dabdf24b3183cd342e54cd69d3  tools/ab-lane-fixture-v42.sh
@@ -271,7 +66,6 @@ c08af80220080bec887e56127751a64f26fd2aa0e1cdf3b08cf5f70bfbc00e68  tools/ganesha-
 a555bdb3d2f8c68b7246831e8fbb010f7b7904e2926e19a1fc8a148e98bf9b8b  tools/lane-quote-lint.sh
 9d2e8803150c277f0cd74fa39f84bf91e67794200a539683a7d3084493f127e7  tools/ganesha-lane-parity.sh
 cac7a2744ba2a95af16d175e5e6221b400700cf730f6ff029a4bb3d65056125a  tools/ganesha-lane-control.sh
-bab6a9e185c7d0153cd1d25db9d81680d536a767af772ea2966091056a654b65  bundle/src/guest-deps-ganesha.tar.gz
 96a6c4f73c24cf1ac1a24113978a3c5811897a4b824d3cd1303e0f17af94c377  tools/build-ganesha-deps.sh
 fd090f45f9838819a6a5ec79a700d45d4123d9b040c3b54f6e011e97e728ee3f  tools/ganesha-lane-run.sh
 924dfb52d7bdd0dd2e24ac3c3ca654b98dbdd17e288ed74b1d1737df2551f0c6  tools/run_frozen_phase9_vm_ganesha.py
@@ -288,3 +82,5 @@ b0d448924781b59fe67e41b8bf5dbda3fd71d79b9ea9ac37837af21d0c4dfdc7  tools/nfs-prox
 caeed2f72c44e428230051094ea50003a9d3769a718aa03f55b94393531f20ce  tools/nfs-proxy/src/delta.c
 bc2e856f62dacbd54cc21ba9f998cc9154b107d4e63caece439da9c3a6024287  tools/nfs-proxy/test/test_delta.c
 184c37335294c9a7ef3267e9d25a600ab3e631c1773060a3be42064d993ffb54  tools/nfs-proxy/build.sh
+# --- committed evidence verifier ---
+c4eca075d45b45aa0a67925760527c04a8b6dd899e24ab7c2c27316ebac32fb1  tools/verify-forward-evidence.py

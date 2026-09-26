@@ -637,6 +637,17 @@ def parse_args(argv=None):
     return args
 
 
+def fixture_nfs_version(path):
+    """Report the minor version selected by an inline lane fixture.
+
+    The standard fixture defaults to NFSv4.1; the async COPY fixture has an
+    unconditional NFS_MINOR_VERSION=2 assignment before its lane body.
+    """
+    forced = re.findall(r"^NFS_MINOR_VERSION=([12])$",
+                        path.read_text(encoding="utf-8"), re.MULTILINE)
+    return "4." + forced[-1] if forced else "4.1"
+
+
 def main(argv=None):
     args = parse_args(argv)
     phase1 = load_module("ab_phase1", args.phase1_runner)
@@ -665,7 +676,8 @@ def main(argv=None):
             "trials_per_mode": args.trials, "executions_per_trial": args.executions,
             "sample_every_executions": args.sample_every, "procs": args.procs,
             "lanes": args.procs, "cpus": args.cpus, "memory_mib": args.memory,
-            "nfs_version": "4.1", "transport": "tcp", "localio": "disabled",
+            "nfs_version": fixture_nfs_version(args.lane_fixture),
+            "transport": "tcp", "localio": "disabled",
             "kaslr": "disabled (nokaslr)", "mutation": "disabled",
             "threaded_executor": False,
             "selected_mode": args.mode,
