@@ -43,7 +43,7 @@ bash tools/fport-pipeline.sh --mode full --kind kernel \
 | P6 evidence | 일반 코퍼스 AB 증거 (reuse: 기존 증거 재사용) |
 | P7 report | `runs/port-<kind>-<stamp>/` 런 매니페스트 + `port-run.md` |
 
-## 설계 게이트 R1..R6
+## 설계 게이트 R1..R6 (R3 철회)
 
 ```sh
 bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
@@ -53,7 +53,7 @@ bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
 |---|---|---|
 | R1 build-integrity | 부트스트랩 `status: pass` + mem_sanitizer ∈ {kasan,kcsan} | PASS |
 | R2 remote-contribution | OFF fs/nfsd=0 vs ON>0, converged | PASS (0 vs 1,748) |
-| R3 throughput-bound | ON/OFF exec·RPC/s ≥ 0.90 | PASS (0.9605) |
+| ~~R3 throughput-bound~~ | ~~ON/OFF exec·RPC/s ≥ 0.90~~ — 2026-09-26 철회 (환경 의존 가짜 실패; 비율은 증거에 기록 유지) | — |
 | R4 coverage-depth-general | `on_only ≥ 100` + 핸들러 랭킹 + `nfsd4_proc_compound` | PASS (1,748) |
 | R5 evidence-chain-general | status/integrity/지분 ≥ 95%, 셋 6종 | PASS (100%, 6/6) |
 | R6 apply-audit | 번들 2종 SHA256SUMS 자기 일치 + 핀 11/15 | PASS (2/2 · 11/11 · 15/15) |

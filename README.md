@@ -82,7 +82,7 @@ bash tools/fport-design-gate.sh -v
 ```
 
 - **Input**: `env/manifest.json` + `evidence/` analysis
-- **Output**: R1..R6 verdict — **exit 0 = DESIGN HOLDS** (1 = gate failure, 2 = precondition violation)
+- **Output**: R1..R6 verdict (R3 retired) — **exit 0 = DESIGN HOLDS** (1 = gate failure, 2 = precondition violation)
 
 ### 5. Forward-port a new RC (kernel/syzkaller)
 
@@ -101,7 +101,7 @@ bash tools/fport-pipeline.sh --mode full --kind kernel \
 | Base image | `sudo bash tools/make-base-image.sh --out artifacts` | sudo + debootstrap → `artifacts/bookworm-base.img` + keypair |
 | Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 1` | base · key · deps + upstream → `env/` (bzImage, binaries, image, manifest) |
 | A/B | `KOOV_SSH_KEY=... bash tools/run-ab.sh && bash tools/analyze-ab.sh` | `env/` → `evidence/` (OFF/ON coverage, metrics) |
-| Gates | `bash tools/fport-design-gate.sh -v` | manifest + evidence → R1..R6 (0 = HOLDS) |
+| Gates | `bash tools/fport-design-gate.sh -v` | manifest + evidence → R1..R6, R3 retired (0 = HOLDS) |
 | RC port | `bash tools/fport-pipeline.sh --mode full --kind kernel --target ... --new-base <hash>` | new RC → `runs/port-*` report |
 | Portability | `bash tools/portability-check.sh` | syntax check + relocated execution + batch gates (0 = pass) |
 | Evidence refresh | `bash tools/fport-evidence.sh` | re-record evidence hashes after tool/doc changes |

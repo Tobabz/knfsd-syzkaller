@@ -52,7 +52,7 @@
 
 ---
 
-## 2. 요구사항 R1..R6 — 자연어 계약 + 기계 게이트
+## 2. 요구사항 R1..R6 — 자연어 계약 + 기계 게이트 (R3는 2026-09-26 철회, §8)
 
 각 요구사항은 4열로 닫힌다: **자연어(무엇이 참이어야 하는가)** → **게이트(어떻게 확인하는가)** →
 **오라클(어디서 읽는가)** → **통과 기준(수치)**. 실행: `tools/fport-design-gate.sh`.
@@ -72,11 +72,13 @@
 - 오라클: `~/work/evidence/analysis_summary.json`
 - 통과: 4조건 모두 참. (실측: off 0, on 1,748 → remote 기여 100%)
 
-### R3 스루풋 회귀 상한
-- 자연어: remote 활성화가 퍼징 실행 스루풋을 파괴하면 안 된다 (상한 회귀).
-- 게이트: `on.exec_per_second.mean / off.exec_per_second.mean ≥ 0.90`
-- 오라클: `analysis_summary.json.group_statistics.{on,off}.exec_per_second.mean`
-- 통과: 비율 ≥ 0.90. (실측: 9.25/9.63 = 0.9605 → pass)
+### R3 스루풋 회귀 상한 — 2026-09-26 철회 (요구사항 범위 밖)
+- ~~게이트: `on.exec_per_second.mean / off.exec_per_second.mean ≥ 0.90`~~
+- 철회 사유: ON/OFF 비율(같은 타깃·같은 실행 내 정규화)은 호스트의 공유 부하·트라이얼
+  잡음에 따라 실행 간 크게 흔들려(실측 0.96 → 1.23, 약 ±28%) 환경 의존적 가짜 실패를
+  유발한다. 성능은 이 계약의 보장 범위 밖으로 선언한다.
+- 잔존 기록: `analysis_summary.json.group_statistics.{on,off}.exec_per_second.mean` 은
+  증거로 계속 산출·기록되어 참고 수치로 남는다 (판정에는 미사용).
 
 ### R4 원격 커버리지 심도 (일반 코퍼스·속성 폭)
 - 자연어: **일반 NFS 코퍼스(AB 워크로드)**가 서버 실행에 도달해 원격 커버리지가 폭넓은 심볼
@@ -171,3 +173,14 @@ tools/fport-design-gate.sh -v         # 상세 수치 출력
 - 게이트: `verify.mem_sanitizer ∈ {kasan, kcsan}` (레거시 `target_kasan==true` 호환).
 - KCSAN 타깃의 AB 증거(R2~R5)는 해당 커널에서 새로 산출해야 하며, KCSAN
   리포트는 기본 panic 이 아니므로 크래시 기반 판정의 해석에 유의한다.
+
+---
+
+## 8. 성능 게이트 R3 철회 (2026-09-26)
+
+R3(스루풋 회귀 상한, ON/OFF `exec_per_second ≥ 0.90`)는 계약 요구사항에서 **철회**되었다.
+
+- 사유: 실행 간 비율 잡음(실측 약 ±28%)에 의한 환경 의존적 가짜 실패.
+- 판정: 활성 게이트는 **R1, R2, R4, R5, R6** — `fport-design-gate.sh`가 이 목록만 검사한다.
+- 스루풋 비율은 증거(`analysis_summary.json`의 `group_statistics.*.exec_per_second`)에
+  참고 수치로 계속 기록된다.
