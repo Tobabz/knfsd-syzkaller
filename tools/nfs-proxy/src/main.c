@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "proxy.h"
+#include "control.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -46,9 +47,10 @@ static void print_stats(const struct nfsp_proxy_stats *stats, const char *phase)
 
 static void maybe_snapshot(const struct nfsp_proxy_stats *stats, void *arg)
 {
-	(void)arg;
-	if (atomic_exchange(&snapshot_requested, 0))
+	if (atomic_exchange(&snapshot_requested, 0)) {
 		print_stats(stats, "snapshot");
+		nfsp_control_report((struct nfsp_control *)arg);
+	}
 }
 
 static int endpoint(const char *arg, char ip[INET_ADDRSTRLEN], uint16_t *port)
@@ -83,19 +85,36 @@ static void usage(const char *program)
 {
 	fprintf(stderr,
 		"Usage: %s CLIENT0_IP CLIENT1_IP K_LISTEN_IP:PORT "
-		"G_LISTEN_IP:PORT K_BACKEND_IP:PORT G_BACKEND_IP:PORT\n"
-		"Relay-only stage: one listener per backend; client identity is "
-		"the TCP source IP.\n", program);
+		"G_LISTEN_IP:PORT K_BACKEND_IP:PORT G_BACKEND_IP:PORT "
+		"[--control PATH --delta-dir DIR | --replay DELTA_FILE]\n"
+		"One listener per backend; client identity is the TCP source IP. "
+		"An arm rule is active only while its control FD remains open.\n", program);
 }
 
 int main(int argc, char **argv)
 {
 	struct nfsp_proxy_cfg cfg = {0};
 	struct nfsp_proxy_stats stats;
+	struct nfsp_control *control = NULL;
+	const char *control_path = NULL, *delta_dir = NULL, *replay = NULL;
 	char ips[4][INET_ADDRSTRLEN];
 	struct in_addr src[2];
 	int rc;
-	if (argc != 7) { usage(argv[0]); return 2; }
+	if (argc != 7 && argc != 9 && argc != 11) {
+		usage(argv[0]); return 2;
+	}
+	for (int i = 7; i < argc; i += 2) {
+		if (i + 1 >= argc) { usage(argv[0]); return 2; }
+		if (strcmp(argv[i], "--control") == 0 && control_path == NULL)
+			control_path = argv[i + 1];
+		else if (strcmp(argv[i], "--delta-dir") == 0 && delta_dir == NULL)
+			delta_dir = argv[i + 1];
+		else if (strcmp(argv[i], "--replay") == 0 && replay == NULL)
+			replay = argv[i + 1];
+		else { usage(argv[0]); return 2; }
+	}
+	if ((control_path == NULL) != (delta_dir == NULL) ||
+	    (replay != NULL && control_path != NULL)) { usage(argv[0]); return 2; }
 	if (inet_pton(AF_INET, argv[1], &src[0]) != 1 ||
 	    inet_pton(AF_INET, argv[2], &src[1]) != 1 ||
 	    src[0].s_addr == src[1].s_addr ||
@@ -114,6 +133,16 @@ int main(int argc, char **argv)
 	cfg.route[1].backend_ip = ips[3];
 	cfg.stop = &stop_requested;
 	cfg.on_stats = maybe_snapshot;
+	if (control_path != NULL || replay != NULL) {
+		if (nfsp_control_open(&control, control_path, delta_dir, replay) != 0) {
+			perror("open control or replay"); return 1;
+		}
+		cfg.on_tick = nfsp_control_tick;
+		cfg.on_tick_arg = control;
+		cfg.on_record = nfsp_control_record;
+		cfg.on_record_arg = control;
+	}
+	cfg.on_stats_arg = control;
 	if (!atomic_is_lock_free(&stop_requested) ||
 	    !atomic_is_lock_free(&snapshot_requested)) {
 		fprintf(stderr, "signal stop flag must be lock-free on this host\n");
@@ -123,7 +152,9 @@ int main(int argc, char **argv)
 	signal(SIGTERM, stop_signal);
 	signal(SIGUSR1, snapshot_signal);
 	rc = nfsp_proxy_run(&cfg, &stats, ready, NULL);
-	if (rc != 0) { fprintf(stderr, "proxy setup or poll failed\n"); return 1; }
 	print_stats(&stats, "final");
+	nfsp_control_report(control);
+	if (nfsp_control_close(control) != 0) rc = -1;
+	if (rc != 0) { fprintf(stderr, "proxy setup, poll or replay failed\n"); return 1; }
 	return 0;
 }

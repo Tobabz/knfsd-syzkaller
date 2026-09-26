@@ -120,6 +120,7 @@ export deps
 # export so the assignment propagates.  Matched as a whole line: a
 # substring test for "export server_ns" also matches the E12 label above.
 export server_ns
+export executor_root
 export KOOV_GANESHA_ASAN_OPTIONS KOOV_UBSAN_OPTIONS KOOV_GANESHA_DEBUG
 
 valid_count()
@@ -362,6 +363,12 @@ setup_lane()
         "$setup_lane_root/server/state/nfs" \
         "$setup_lane_root/server/state/rpcbind" \
         "$setup_lane_root/client0/mnt" "$setup_lane_root/client1/mnt"
+    if [ "$server_impl" = both ]; then
+        # Bind only this directory, not the proc-N parent with .lane_id,
+        # into the executor sandbox at /nfs-lane/control.
+        mkdir -m 0700 -p "$executor_root/proc-$setup_lane_id/control" \
+            "$setup_lane_root/server/deltas"
+    fi
 
     ip netns add "$setup_server_ns"
     ip netns add "$setup_client0_ns"
@@ -689,6 +696,8 @@ EOF
             nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
                 "10.89.$lane.1:$server_port" "10.89.$lane.5:$server_port" \
                 "10.89.$lane.1:$knfsd_port" "10.89.$lane.5:$ganesha_port" \
+                --control "$executor_root/proc-$lane/control/arm.sock" \
+                --delta-dir "$lane_root/server/deltas" \
                 > "$lane_root/server/proxy.log" 2>&1 &
             proxy_pid=$!
             printf "%s\n" "$proxy_pid" > "$lane_root/server/proxy.pid"
@@ -756,6 +765,22 @@ expose_lane_to_executor()
     # The executor bind-mounts only this selected subtree into its sandbox.
     mount --bind "$expose_lane_root/client0/mnt" "$expose_source/client0"
     mount --bind "$expose_lane_root/client1/mnt" "$expose_source/client1"
+    if [ "$server_impl" = both ]; then
+        for expose_client in 0 1; do
+            for expose_backend in knfsd ganesha; do
+                mkdir "$expose_source/client$expose_client-$expose_backend"
+                if [ "$expose_client:$expose_backend" = 0:knfsd ] || \
+                   [ "$expose_client:$expose_backend" = 1:ganesha ]; then
+                    expose_mount="$expose_lane_root/client$expose_client/mnt"
+                else
+                    expose_mount="$expose_lane_root/client$expose_client/$expose_backend"
+                fi
+                mount --bind "$expose_mount" \
+                    "$expose_source/client$expose_client-$expose_backend"
+            done
+        done
+        test -S "$expose_source/control/arm.sock"
+    fi
     touch "$expose_source/.client0_netns" "$expose_source/.client1_netns"
     mount --bind "/run/netns/$(lane_client_ns "$expose_lane" 0)" \
         "$expose_source/.client0_netns"
@@ -830,10 +855,16 @@ cleanup_fixture()
                 fi
             done
             for cleanup_client_mount in \
+                "$cleanup_source/client0-knfsd" \
+                "$cleanup_source/client0-ganesha" \
+                "$cleanup_source/client1-knfsd" \
+                "$cleanup_source/client1-ganesha" \
                 "$cleanup_source/client0" "$cleanup_source/client1"; do
-                timeout 30s umount "$cleanup_client_mount" 2>/dev/null || true
                 if nfs_mount_exists "$cleanup_client_mount"; then
-                    cleanup_mount_leaks=$((cleanup_mount_leaks + 1))
+                    timeout 30s umount "$cleanup_client_mount" 2>/dev/null || true
+                    if nfs_mount_exists "$cleanup_client_mount"; then
+                        cleanup_mount_leaks=$((cleanup_mount_leaks + 1))
+                    fi
                 fi
             done
             cleanup_lane=$((cleanup_lane + 1))
@@ -977,6 +1008,12 @@ cleanup_fixture()
                 "$cleanup_source/.client0_pid" "$cleanup_source/.client1_pid" \
                 "$cleanup_source/.client0_netns" "$cleanup_source/.client1_netns" \
                 "$cleanup_source/.server0_ipv4" "$cleanup_source/.server1_ipv4"
+            rm -f "$cleanup_source/control/arm.sock"
+            rmdir "$cleanup_source/control" 2>/dev/null || true
+            rmdir "$cleanup_source/client0-knfsd" \
+                "$cleanup_source/client0-ganesha" \
+                "$cleanup_source/client1-knfsd" \
+                "$cleanup_source/client1-ganesha" 2>/dev/null || true
             rmdir "$cleanup_source/client0" "$cleanup_source/client1" \
                 "$cleanup_source" 2>/dev/null || cleanup_source_tree_leaks=1
             cleanup_lane=$((cleanup_lane + 1))
@@ -1160,7 +1197,20 @@ status_fixture()
         test "$(cat "$status_source/.lane_id")" -eq "$status_lane"
         status_source_entries=$(find "$status_source" -mindepth 1 \
             -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
-        test "$status_source_entries" = "$(printf '.client0_netns\n.client0_pid\n.client1_netns\n.client1_pid\n.lane_id\n.server0_ipv4\n.server1_ipv4\nclient0\nclient1\n')"
+        if [ "$server_impl" = both ]; then
+            test "$status_source_entries" = "$(printf '.client0_netns\n.client0_pid\n.client1_netns\n.client1_pid\n.lane_id\n.server0_ipv4\n.server1_ipv4\nclient0\nclient0-ganesha\nclient0-knfsd\nclient1\nclient1-ganesha\nclient1-knfsd\ncontrol\n')"
+            test -S "$status_source/control/arm.sock"
+            for status_bind in client0-knfsd client0-ganesha \
+                client1-knfsd client1-ganesha; do
+                nfs_mount_exists "$status_source/$status_bind"
+            done
+            test "$(findmnt -n -o SOURCE -- "$status_source/client0-knfsd")" = "10.89.$status_lane.1:/"
+            test "$(findmnt -n -o SOURCE -- "$status_source/client1-knfsd")" = "10.89.$status_lane.1:/"
+            test "$(findmnt -n -o SOURCE -- "$status_source/client0-ganesha")" = "10.89.$status_lane.5:/"
+            test "$(findmnt -n -o SOURCE -- "$status_source/client1-ganesha")" = "10.89.$status_lane.5:/"
+        else
+            test "$status_source_entries" = "$(printf '.client0_netns\n.client0_pid\n.client1_netns\n.client1_pid\n.lane_id\n.server0_ipv4\n.server1_ipv4\nclient0\nclient1\n')"
+        fi
         mountpoint -q "$status_source/.client0_netns"
         mountpoint -q "$status_source/.client1_netns"
         test "$(cat "$status_source/.client0_pid")" -eq "$status_client0_pid"

@@ -47,6 +47,10 @@ struct nfsp_proxy_cfg {
 	 * pointer is an in-thread snapshot; do not retain it after return. */
 	void (*on_stats)(const struct nfsp_proxy_stats *, void *arg);
 	void *on_stats_arg;
+	/* Control IPC is pumped by the same event loop that invokes on_record.
+	 * Thus an arm ACK is a registration barrier with no cross-thread race. */
+	void (*on_tick)(void *arg);
+	void *on_tick_arg;
 };
 
 /* on_ready runs after BOTH listeners bind.  Its stats pointer is valid until

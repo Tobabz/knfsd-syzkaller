@@ -1327,3 +1327,91 @@ SHA-256 `ccbff14f98993d54314b4f5e488fbf35fcfa22a4564bd617466dd4cec51914c6`.
 이 검증은 **마운트/릴레이 4조합**이다. syzkaller executor의 네 조합 선택,
 변조 적용, 정식 `--executions 30 --trials 2` A/B는 이 JSON의 판정에
 포함되지 않는다.
+
+### syzkaller 4연결·C2S/S2C 변조·실제 게스트 델타 replay
+
+`bundle/patches/syzkaller/0017-executor-route-four-nfs-pairs-and-arm-scoped-proxy.patch`는
+기존 16개 패치 뒤에 적용되는 `git am` 시리즈 패치다. `series`와
+`SHA256SUMS`를 갱신했고, 원래 16개 패치와 `bundle/src/guest-deps.tar.gz`,
+기존 bundle 실행 스크립트는 유지했다. `tools/nfs-proxy/build-syzkaller.sh`는
+이미 포워드포트된 `KOOV_SYZ_TARGET`에 이 패치만 적용·빌드한다. 이 도구로
+executor·execprog를
+생성하고, `tools/nfs-proxy/build-guest.sh --out ...`으로 bookworm ABI
+프록시를 빌드한다. 고정 `SOCK_SEQPACKET` 경로는 executor 샌드박스의
+`/nfs-lane/control/arm.sock`; 호스트 fixture의 원본 경로는
+`/syz-nfs-lanes/proc-N/control/arm.sock`으로 proc별 독립이다. 등록 성공은
+전달 성공을 뜻하지 않는다. 프로세스가 규칙 FD를 닫으면 프록시가 해제한다.
+
+검증 명령은 `KOOV_NFS_PROXY_GUEST`와 `KOOV_SYZ_FOUR_WORKLOAD`를 지정해
+`tools/nfs-proxy/ganesha-asan-relay-run.sh`를 호출한다. 원격 KCOV를
+`-remote-cover=true`로 활성화해야 tagged raw RPC의 `kcov_common_handle`
+소유자가 유효하여 송신이 `ESTALE`로 거부되지 않는다. 게이트는 executor
+4개 mount open·connect·send·recv 성공과 `raw_tx_full 4` 및
+`raw_rx_record 4`, 네 튜플의 양방향 와이어 기록/전송을 함께 판정한다.
+`guest-syzkaller-mutate.prog`은 client0→Ganesha의 XID만 C2S
+`0x22222222→0x22222223`, S2C `0x22222223→0x22222222`로 바꾼다.
+규칙은 생성 파일에 원본과 대체 바이트, 스코프, 적용 횟수 `1`을 각각
+기록한다. `--replay` 프로세스 둘은 저장된 각 델타를 **생성 경로와 같은
+`nfsp_apply_rule`**로 재적용했다. 각각 실제 Ganesha 요청/응답 1회,
+`expected=applied=1`, 원본 불일치/relay/변조 오류 0, 회신 XID 기대값을
+확인했다. 일반 C2S/S2C 스모크와 ASan 로드·무보고, cleanup 누출 0도
+동시에 통과했다.
+
+원본 불일치 음성 게이트는 기록한 C2S 델타의 **사본에서 anchor만** 다른
+XID(`0x22222224`)로 변경하고 원본·대체 바이트 및 기대 적용 횟수는
+유지했다. 게스트 프록시 `--replay`의 같은 적용 함수에서 anchor가 맞는
+요청이 원본과 달라 `applied=0`, `refused_orig=1`로 집계되고 수정 없이
+Ganesha에 전달돼 `0x22222224` 응답을 받았다. replay 프로세스는
+`expected=1, applied=0`이므로 의도대로 비정상 종료했다. 원래의 두
+델타와 정상 replay는 그대로 통과했다.
+
+게스트 증거 JSON은 `evidence/ganesha-asan-relay-refusal-final/trial_evidence.json`
+SHA-256 `6fae9f8efaf35052f44e8dc29d2209e339caad192248ba73019b583ac898c6e1`.
+델타 두 개 SHA-256은
+`42350d9b6483eaf26d1df200f6e55408aa929660c911d458c594ba55a3cbfc23`,
+`97dc4237d57aeb4cb3900812b6d68a4cd153b14d533a19ea82d12b1eefc65849`.
+불일치 델타 사본 SHA-256은
+`3b02b7126a32ed461e8d2b7140ae6792513c2d457c7127a047a015561e34b7b8`.
+bookworm 프록시 해시 `c86e685bff5bcb0ec25c4abbc74a9792f204dbfd435822810d7eb94e5fac8282`.
+증거와 바이너리는 gitignored 현장 산출물이며 배포하지 않는다.
+`tools/nfs-proxy/build.sh`는 호스트 clang 및 GCC ASan/UBSan에서
+framing/walk/delta/relay/control 2,064체크를 각각 통과한다.
+
+이 게이트는 한 번의 executor 프로그램이다. 정식 A/B 결과는 아래에 분리했다.
+
+### 변조 OFF/ON 네 경로 정식 A/B (30 executions × 2 trials)
+
+`tools/nfs-proxy/ganesha-asan-relay-ab-run.sh`가
+`tools/convert-ab-image.sh` 실행 후 fresh `-snapshot` VM을 ABBA 순서로
+기동했다. syzkaller 파서의 정규화 출력에서 OFF 25콜과 ON 29콜은 arm
+등록 두 번·FD 닫기 두 번을 제외하면 네 RPC와 나머지 호출이 같다.
+양 그룹 모두 500 ms 응답 대기, 네 마운트의
+공유/격리 확인 및 ASan Ganesha를 사용한다. ON에만 syzkaller 프로그램의
+scoped `arm` 두 개와 규칙 FD 닫기 두 개를 추가했다. 네 trial의 executor
+각 30회 모두 네 TCP 연결과 요청/응답을 마쳤다. OFF 제어 카운터는
+`armed=expired=applied=0`, ON 두 trial은 각각 `60/60/60`, 원본 불일치·
+레이아웃 거부·relay 오류 0이었다. ON마다 델타 파일 60개, 첫/끝 각 방향
+샘플의 적용 횟수 1을 검사했다. 마운트/namespace/source-tree cleanup 누출과
+ASan 보고 모두 0이었다.
+
+executor 단계의 중앙 처리율은 OFF 0.63251 exec/s, ON 0.59396 exec/s
+(ON 대 OFF -6.10%). 500 ms 대기와 `arm` 등록 두 번을 포함하는 이 워크로드의
+종단 간 처리율이며 프록시만의 지연·일반 corpus 성능은 아니다. manifest:
+`evidence/ganesha-asan-relay-ab-formal/experiment_manifest.json`.
+Manifest SHA-256 `33f461023558aee6516392c27152954caf0b3b5ae0cfb2d45d02996e7f37356c`.
+이 판정은 **arm OFF/ON의 네 경로 게스트 실험**이다. Ganesha의 처리 여부는
+실제 NFS 응답·ASan 서버 신호로 판단하며 사용자 공간 서버에는 커널 원격
+KCOV `.extra` 증가를 기대하지 않는다.
+
+### 기존 knfsd 원격-KCOV A/B 회귀
+
+`tools/convert-ab-image.sh` 실행 후 원본 `bundle/src/guest-deps.tar.gz`,
+기존 `tools/ab-lane-fixture.sh`와 34-call workload로 `tools/run-ab.sh`
+(`--executions 30 --trials 2`, OFF/ON 각각 2 trial), `tools/analyze-ab.sh`를
+다시 실행했다. 4개 trial과 분석 모두 PASS. 고유 심볼화 KCOV PC의
+`fs/nfsd` 중앙값은 OFF 0 → ON 1,748개, throughput 변화는 -4.19%였다.
+manifest는 `evidence/ab-formal-regression-post-proxy/experiment_manifest.json`
+SHA-256 `1510e21bf65a7d8c2b656d53d7cf2c17b0b55a4eb0890c00660cbb3d9375ebd5`,
+분석 JSON SHA-256
+`ae4adc1b7a1da65012bdfab4bcbd083e52f6ac69c518f934f3fa09ea4feefa56`.
+이 값은 **변조를 끈 기존 knfsd 전용 원격-KCOV 실험**의 회귀 결과다.

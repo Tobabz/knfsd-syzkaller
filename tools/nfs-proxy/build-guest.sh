@@ -3,7 +3,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-out=${KOOV_NFS_PROXY_GUEST:-$repo/bundle/src/nfs-proxy-guest}
+out=${KOOV_NFS_PROXY_GUEST:-$repo/bundle/src/nfs-proxy-control-guest}
 work=${KOOV_NFS_PROXY_GUEST_WORK:-${TMPDIR:-/tmp}/nfs-proxy-guest-build}
 while [ "$#" -gt 0 ]; do
     case "$1" in

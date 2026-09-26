@@ -14,3 +14,4 @@ e2747e19a651e8fc00fda6e4fc7e60cff5969866aeaf5bb27c8d75889d647d48  0012-tools-exe
 da62bfbb6b5a2db6075f45a160b5a0043621409dde6b7a655c3d23f28d7357c4  0014-executor-hide-fixed-lane-marker-from-fuzz-programs.patch
 8634a82ea39df8b2df2435b69905e18ab8c9f2f15ea8c576b508d07f6a8da54b  0015-sys-linux-add-protocol-shaped-NFS-fuzz-operations.patch
 ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  0016-executor-size-coverage-output-from-remote-cover-.patch
+da4cc320510a3308ee82abfd33226eb44d3153ac47e016d985b72e6bca48469c  0017-executor-route-four-nfs-pairs-and-arm-scoped-proxy.patch

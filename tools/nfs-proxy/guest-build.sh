@@ -9,7 +9,8 @@ apt-get install -qq -y --no-install-recommends gcc libc6-dev binutils \
 gcc -std=c11 -O2 -g -pthread -Wall -Wextra -Werror -Wshadow \
     -Wconversion -Wsign-conversion -Wpointer-arith -Wcast-qual \
     -Wwrite-strings -Wmissing-prototypes -Wstrict-prototypes -Wformat=2 \
-    -I/src -o /work/nfs-proxy /src/main.c /src/proxy.c /src/framing.c
+    -I/src -o /work/nfs-proxy /src/main.c /src/proxy.c /src/framing.c \
+    /src/control.c /src/delta.c /src/walk.c
 if readelf --version-info /work/nfs-proxy | \
     grep -E 'Name: GLIBC_2\.(3[7-9]|[4-9][0-9])'; then
     echo 'the relay needs a newer glibc than the bookworm guest' >&2
@@ -20,7 +21,9 @@ if readelf -d /work/nfs-proxy | grep -E 'NEEDED.*libasan|NEEDED.*libubsan'; then
     exit 1
 fi
 {
-    sha256sum /src/main.c /src/proxy.c /src/proxy.h /src/framing.c /src/framing.h
+    sha256sum /src/main.c /src/proxy.c /src/proxy.h /src/framing.c /src/framing.h \
+        /src/control.c /src/control.h /src/delta.c /src/delta.h \
+        /src/walk.c /src/walk.h
     sha256sum /work/nfs-proxy
     gcc --version | head -1
 } > /work/provenance.txt

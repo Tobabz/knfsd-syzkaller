@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* ---- big-endian helpers --------------------------------------------------
@@ -135,6 +136,8 @@ struct nfsp_delta_writer {
 	int	fd;
 	uint64_t	seed;
 	long	count;
+	off_t	*offsets;
+	size_t	capacity;
 	int	saved_errno;
 };
 
@@ -154,7 +157,7 @@ int nfsp_delta_write_open(struct nfsp_delta_writer **out, const char *path,
 
 	/* O_SYNC: every write below is durable when it returns.  See the header
 	 * for why the last mutation before a crash must survive. */
-	w->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, 0644);
+	w->fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_SYNC, 0644);
 	if (w->fd < 0) {
 		w->saved_errno = errno;
 		free(w);
@@ -181,10 +184,25 @@ int nfsp_delta_write_rule(struct nfsp_delta_writer *w,
 	uint8_t rec[NFSP_DELTA_REC_HDR_LEN + NFSP_DELTA_ANCHOR_MAX +
 		    2u * NFSP_DELTA_PATCH_MAX];
 	size_t n = 0;
+	off_t pos;
 
 	if (w == NULL || r == NULL)
 		return -1;
 	if (!nfsp_rule_valid(r))
+		return -1;
+	if ((size_t)w->count == w->capacity) {
+		size_t capacity = w->capacity ? w->capacity * 2u : 16u;
+		off_t *offsets;
+		if (capacity < w->capacity || capacity > SIZE_MAX / sizeof(*offsets))
+			return -1;
+		offsets = realloc(w->offsets, capacity * sizeof(*offsets));
+		if (offsets == NULL)
+			return -1;
+		w->offsets = offsets;
+		w->capacity = capacity;
+	}
+	pos = lseek(w->fd, 0, SEEK_END);
+	if (pos < 0)
 		return -1;
 
 	put32(rec + n, r->dir);			n += 4;
@@ -211,7 +229,26 @@ int nfsp_delta_write_rule(struct nfsp_delta_writer *w,
 		w->saved_errno = errno;
 		return -1;
 	}
+	w->offsets[w->count] = pos;
 	w->count++;
+	return 0;
+}
+
+int nfsp_delta_write_applied_count(struct nfsp_delta_writer *w,
+				   long index, uint32_t applied_count)
+{
+	uint8_t count[4];
+	off_t pos;
+	if (w == NULL || index < 0 || index >= w->count)
+		return -1;
+	/* The tenth header word, after nine u32 fields.  It must be updated in
+	 * place, not appended as a duplicate rule (which would replay twice). */
+	pos = w->offsets[index] + 9u * 4u;
+	put32(count, applied_count);
+	if (pwrite(w->fd, count, sizeof(count), pos) != (ssize_t)sizeof(count)) {
+		w->saved_errno = errno;
+		return -1;
+	}
 	return 0;
 }
 
@@ -230,6 +267,7 @@ long nfsp_delta_write_close(struct nfsp_delta_writer *w)
 	if (fsync(w->fd) != 0 && w->saved_errno == 0)
 		w->saved_errno = errno;
 	close(w->fd);
+	free(w->offsets);
 	free(w);
 	return n;
 }

@@ -148,6 +148,11 @@ int nfsp_delta_write_open(struct nfsp_delta_writer **out, const char *path,
 			  uint64_t seed);
 int nfsp_delta_write_rule(struct nfsp_delta_writer *w,
 			  const struct nfsp_rule *r);
+/* Persist the observed application count in an already-written record.
+ * O_SYNC makes a crash between two matches leave the last completed count.
+ * index is zero-based, in the same order as write_rule calls. */
+int nfsp_delta_write_applied_count(struct nfsp_delta_writer *w,
+				   long index, uint32_t applied_count);
 /* Flush and close.  Returns the number of records written, or -1. */
 long nfsp_delta_write_close(struct nfsp_delta_writer *w);
 long nfsp_delta_write_count(const struct nfsp_delta_writer *w);

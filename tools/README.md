@@ -175,10 +175,41 @@ tools/nfs-proxy/build-guest.sh
 tools/nfs-proxy/ganesha-asan-relay-run.sh
 ```
 
-이 게이트는 **마운트·프록시 릴레이**를 검증한다. 현재 실행 파일은 relay-only이며
-syzkaller의 `(client,backend)` 선택과 변조 `arm` IPC는 별도 통합 대상이다.
-정식 A/B 실행/속도 결론으로 해석하지 않는다. 게스트 증거의 재현 명령·해시는
-`report/patch-forward-compat.md`의 릴레이 절에 있다.
+syzkaller 변경은 기존 시리즈 뒤에 `bundle/patches/syzkaller/0017-*.patch`로
+추가됐다. `tools/nfs-proxy/build-syzkaller.sh`가 이미 포워드포트된
+`KOOV_SYZ_TARGET`(기본 `env/syzkaller`)에 해당 패치를 적용·빌드한다.
+`syz_open_nfs_lane_pair(client,backend)`와
+`syz_socket_connect_nfs_pair(client,backend)`는 4조합을 고르고 기존
+단일 백엔드 pseudo-call은 별칭으로 남는다. 샌드박스에는 해당 proc의 네
+마운트와 **`/nfs-lane/control/arm.sock`만** 추가한다. `syz_arm_nfs_proxy`
+규칙은 syzkaller 프로그램 바이트에 포함된다. 등록 ACK는 적용 성공이 아니며
+규칙 FD를 닫거나 프로그램이 끝나면 해제된다. 와이어 레코드의 확정된 필드와
+COMPOUND 본문 raw region만 선택·변조하며, 프록시 PRNG는 없다.
+
+```sh
+tools/nfs-proxy/build-syzkaller.sh
+KOOV_NFS_PROXY_GUEST=bundle/src/nfs-proxy-control-guest \
+KOOV_SYZ_FOUR_WORKLOAD=tools/nfs-proxy/test/guest-syzkaller-mutate.prog \
+KOOV_EVIDENCE_DIR=evidence/ganesha-asan-relay-replay \
+    tools/nfs-proxy/ganesha-asan-relay-run.sh
+```
+
+게스트에서는 executor가 4연결로 각각 실제 RPC를 보내고 응답을 받는다.
+`(client0,Ganesha)`의 C2S/S2C XID를 한 번씩 변조한 델타를 원본·대체
+바이트와 함께 저장한 후, 각 델타를 별도 게스트 프록시 `--replay`에 공급해
+같은 백엔드 응답에서 재적용을 확인한다. ASan·마운트 공유/격리·정리 검사도
+함께 실행한다. 저장된 델타 사본의 anchor만 변경한 원본 불일치 음성 게이트는
+`refused_orig=1`, 적용 0, replay 실패와 원본 응답을 게스트에서 확인한다.
+상세 판정과 증거 해시는 `report/patch-forward-compat.md`
+릴레이 절을 참조한다. 이 단일 실행을 정식 30×2 A/B 속도 결론으로
+해석하지 않는다.
+
+`tools/nfs-proxy/ganesha-asan-relay-ab-run.sh`는 이미지 변환 확인 후
+arm OFF/ON 각각 30회 × 2 trial의 네 경로·ASan A/B를 수행한다. 실제
+네 trial이 모두 통과했고, ON은 trial마다 두 방향 각 30개 델타를 적용했다.
+executor 처리율 중앙값은 OFF 0.63251 → ON 0.59396 exec/s(-6.10%).
+별도의 기존 knfsd 원격-KCOV 정식 A/B 회귀도 4 trial·분석 PASS였다.
+실험 정의·해시는 보고서에 있다.
 
 ### B. 실증된 설계 (병렬 부작용 완화)
 
@@ -220,7 +251,8 @@ ON 그룹에서 원격 커버리지 파일이 **0개**다(executions=2, 기대 2
 쓸 수 없다.** 그래서 보조 백엔드 검증은 프로세스 존재 + 리스너 + **백엔드 자체
 신호**(처리한 RPC 수 등)로 구성해야 한다. 별도 게스트 릴레이 스모크에서는
 서버의 실제 NFSv4 응답·트리 I/O와 프록시 귀속 카운터를 함께 게이트한다.
-syzkaller 변조·A/B 측정에는 아직 적용하지 않았다.
+syzkaller 변조에서는 전후 로그의 네 요청/응답 및 2개 델타의 적용·재생
+횟수도 확인한다. A/B 측정은 별도 판정한다.
 
 ### 두 구현의 실제 행동 차이 (관찰 자료)
 

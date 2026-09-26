@@ -1,0 +1,312 @@
+From e9fb0212c084bd3e6601ed3012d957c850d39328 Mon Sep 17 00:00:00 2001
+From: idealinsane <idealinsane@localhost>
+Date: Sun, 27 Sep 2026 04:19:08 +0900
+Subject: [PATCH] executor: route four NFS pairs and arm scoped wire rules
+
+---
+ executor/common_linux.h       | 109 +++++++++++++++++++++++++++++++---
+ pkg/vminfo/linux_syscalls.go  |   3 +
+ sys/linux/fs_nfs_fuzz.txt     |  33 ++++++++++
+ sys/linux/nfs_fuzz_test.go    |  44 ++++++++++++++
+ sys/linux/socket_inet_nfs.txt |  13 ++--
+ 5 files changed, 190 insertions(+), 12 deletions(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 55a7e93f4..cba4f4623 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2825,11 +2825,14 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+ #endif
+ 
+ #if SYZ_EXECUTOR || __NR_syz_open_nfs_lane || __NR_syz_socket_connect_nfs || \
+-    __NR_syz_send_nfs_fuzz
++    __NR_syz_open_nfs_lane_pair || __NR_syz_socket_connect_nfs_pair || \
++    __NR_syz_arm_nfs_proxy || __NR_syz_send_nfs_fuzz
+ #include <fcntl.h>
+ #include <sched.h>
+ #include <stdio.h>
+ #include <sys/socket.h>
++#include <sys/time.h>
++#include <sys/un.h>
+ 
+ static int nfs_fuzz_netns_fds[2] = {-1, -1};
+ static uint32 nfs_fuzz_server_addrs[2];
+@@ -2851,12 +2854,29 @@ static long syz_open_nfs_lane(volatile long a0)
+ 	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+ }
+ 
+-static long syz_socket_connect_nfs(volatile long a0)
++static long syz_open_nfs_lane_pair(volatile long a0, volatile long a1)
+ {
+-	// syz_socket_connect_nfs(client const[0:1]) sock_nfs_fuzz_tcp
+-	unsigned long client = a0;
+-	if (client > 1 || nfs_fuzz_netns_fds[client] < 0 ||
+-	    !nfs_fuzz_server_addrs[client]) {
++	// Select BOTH axes.  The primary clientN alias above is retained for
++	// existing NFS-only corpora; the four pair mounts are separate binds.
++	unsigned long client = a0, backend = a1;
++	if (client > 1 || backend > 1) {
++		errno = EINVAL;
++		return -1;
++	}
++	char path[48];
++	int len = snprintf(path, sizeof(path), "/nfs-lane/client%lu-%s", client,
++			   backend == 0 ? "knfsd" : "ganesha");
++	if (len <= 0 || len >= (int)sizeof(path)) {
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++}
++
++static long nfs_socket_connect_pair(unsigned long client, unsigned long backend)
++{
++	if (client > 1 || backend > 1 || nfs_fuzz_netns_fds[client] < 0 ||
++	    !nfs_fuzz_server_addrs[backend]) {
+ 		errno = ENODEV;
+ 		return -1;
+ 	}
+@@ -2885,7 +2905,7 @@ static long syz_socket_connect_nfs(volatile long a0)
+ 			struct sockaddr_in addr = {};
+ 			addr.sin_family = AF_INET;
+ 			addr.sin_port = htons(2049);
+-			addr.sin_addr.s_addr = nfs_fuzz_server_addrs[client];
++			addr.sin_addr.s_addr = nfs_fuzz_server_addrs[backend];
+ 			if (connect(fd, (struct sockaddr*)&addr, sizeof(addr))) {
+ 				saved_errno = errno;
+ 				close(fd);
+@@ -2900,6 +2920,51 @@ static long syz_socket_connect_nfs(volatile long a0)
+ 	return fd;
+ }
+ 
++static long syz_socket_connect_nfs(volatile long a0)
++{
++	// Backward-compatible primary alias; use the pair form for four routes.
++	return nfs_socket_connect_pair(a0, a0);
++}
++
++static long syz_socket_connect_nfs_pair(volatile long a0, volatile long a1)
++{
++	return nfs_socket_connect_pair(a0, a1);
++}
++
++static long syz_arm_nfs_proxy(volatile long a0)
++{
++	// Registration is an ACKed configuration call.  The FD is a lifetime
++	// handle, not proof that an RPC was subsequently mutated and delivered.
++	// Returning it as a resource keeps the rule alive until close(program).
++	const void* rule = (const void*)a0;
++	if (!rule) {
++		errno = EINVAL;
++		return -1;
++	}
++	int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++	if (fd < 0)
++		return -1;
++	struct timeval tv = {.tv_sec = 2};
++	struct sockaddr_un addr = {.sun_family = AF_UNIX};
++	strcpy(addr.sun_path, "/nfs-lane/control/arm.sock");
++	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) ||
++	    connect(fd, (struct sockaddr*)&addr, sizeof(addr)) ||
++	    send(fd, rule, 140, MSG_NOSIGNAL) != 140) {
++		int saved_errno = errno;
++		close(fd);
++		errno = saved_errno;
++		return -1;
++	}
++	uint8 ack = 255;
++	if (recv(fd, &ack, 1, 0) != 1 || ack != 0) {
++		int saved_errno = errno ? errno : EPROTO;
++		close(fd);
++		errno = saved_errno;
++		return -1;
++	}
++	return fd;
++}
++
+ static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
+ 			      volatile long a2, volatile long a3,
+ 			      volatile long a4)
+@@ -4462,7 +4527,7 @@ static void setup_fusectl();
+ // The fixture deliberately keeps /syz-nfs-lanes itself outside of newroot.  In
+ // particular, do not bind the proc-N parent: it contains the authoritative
+ // .lane_id marker and fuzz programs must not be able to truncate or unlink it.
+-// Import only the two NFS client mount trees.
++// Import only the client mount trees and a separate control directory.
+ static void setup_nfs_fuzz_lane(const char* newroot)
+ {
+ 	const char* enabled = "/syz-nfs-lanes/enabled";
+@@ -4547,6 +4612,34 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+ 		errno = mount_errno;
+ 		failmsg("mount NFS fuzz lane client1 failed", "proc=%llu", procid);
+ 	}
++	// Only the both-backend fixture creates this directory.  The original
++	// single-backend fixture retains its exact two-mount sandbox layout.
++	char source_control[160];
++	if (snprintf(source_control, sizeof(source_control), "%s/control", source) >=
++	    (int)sizeof(source_control))
++		fail("NFS proxy control source path is too long");
++	if (!access(source_control, F_OK)) {
++		char target_control[160];
++		if (snprintf(target_control, sizeof(target_control), "%s/control", target) >=
++		    (int)sizeof(target_control))
++			fail("NFS proxy control target path is too long");
++		if (mkdir(target_control, 0700) ||
++		    mount(source_control, target_control, NULL, MS_BIND, NULL))
++			fail("mount proc-scoped NFS proxy control failed");
++		for (unsigned client = 0; client < 2; client++) {
++			for (unsigned backend = 0; backend < 2; backend++) {
++				char src[160], dst[160];
++				const char* name = backend ? "ganesha" : "knfsd";
++				if (snprintf(src, sizeof(src), "%s/client%u-%s", source, client, name) >=
++				    (int)sizeof(src) ||
++				    snprintf(dst, sizeof(dst), "%s/client%u-%s", target, client, name) >=
++				    (int)sizeof(dst))
++					fail("NFS pair mount path is too long");
++				if (mkdir(dst, 0700) || mount(src, dst, NULL, MS_BIND | MS_REC, NULL))
++					fail("mount NFS client/backend pair failed");
++			}
++		}
++	}
+ 	debug("NFS fuzz lane bound: proc=%llu clients-only source=%s target=/nfs-lane\n",
+ 	      procid, source);
+ }
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index 1acbf8bc6..826e88e1a 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -111,6 +111,9 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_socket_connect_nvme_tcp":   linuxSyzSocketConnectNvmeTCPSupported,
+ 	"syz_open_nfs_lane":             alwaysSupported,
+ 	"syz_socket_connect_nfs":        alwaysSupported,
++	"syz_socket_connect_nfs_pair":   alwaysSupported,
++	"syz_open_nfs_lane_pair":        alwaysSupported,
++	"syz_arm_nfs_proxy":             alwaysSupported,
+ 	"syz_send_nfs_fuzz":             alwaysSupported,
+ 	"syz_pidfd_open":                alwaysSupported,
+ 	"syz_create_resource":           alwaysSupported,
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+index 188c15d9a..407fcbf7b 100644
+--- a/sys/linux/fs_nfs_fuzz.txt
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -38,6 +38,39 @@ nfs_itimerval {
+ 
+ syz_open_nfs_lane$client0(client const[0]) fd_nfs_dir
+ syz_open_nfs_lane$client1(client const[1]) fd_nfs_dir
++syz_open_nfs_lane_pair$client0_knfsd(client const[0], backend const[0]) fd_nfs_dir
++syz_open_nfs_lane_pair$client0_ganesha(client const[0], backend const[1]) fd_nfs_dir
++syz_open_nfs_lane_pair$client1_knfsd(client const[1], backend const[0]) fd_nfs_dir
++syz_open_nfs_lane_pair$client1_ganesha(client const[1], backend const[1]) fd_nfs_dir
++
++# One registration per FD.  Bytes are an explicit versioned wire packet:
++# magic; dir, backend, client, first_opcode, anchor_off, anchor_len,
++# patch_off, patch_w, flags; then 64 anchor, 16 original and 16 replacement
++# bytes.  It is scoped to the selected client/backend and lives until FD close
++# or end of the executor program.  Success means registered, not applied.
++resource fd_nfs_proxy_rule[fd]
++syz_arm_nfs_proxy$scoped(arm ptr[in, nfs_proxy_arm]) fd_nfs_proxy_rule
++close$nfs_proxy_arm(fd fd_nfs_proxy_rule)
++
++nfs_proxy_arm {
++    magic       const[0x4e46535041524d31, int64be]
++    direction   flags[nfs_proxy_direction, int32be]
++    backend     flags[nfs_proxy_backend, int32be]
++    client      flags[nfs_proxy_client, int32be]
++    first_opcode int32be
++    anchor_off  int32be
++    anchor_len  int32be
++    patch_off   int32be
++    patch_w     int32be
++    reserved    const[0, int32be]
++    anchor      array[int8, 64]
++    original    array[int8, 16]
++    replacement array[int8, 16]
++} [packed]
++
++nfs_proxy_direction = 0, 1
++nfs_proxy_backend = 0, 1
++nfs_proxy_client = 0, 1
+ 
+ openat$nfs_file(fd fd_nfs_dir, file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_nfs
+ openat$nfs_dir(fd fd_nfs_dir, file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_nfs_dir
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index ede53e2eb..1e65fb4e9 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -278,3 +278,47 @@ func requireConst(t *testing.T, typ prog.Type, want uint64, what string) {
+ 		t.Fatalf("%s is %T %v, want const %d", what, typ, typ, want)
+ 	}
+ }
++
++func TestNFSFourRoutesAndScopedArm(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, pair := range []struct {
++		name            string
++		client, backend uint64
++	}{
++		{"client0_knfsd", 0, 0}, {"client0_ganesha", 0, 1},
++		{"client1_knfsd", 1, 0}, {"client1_ganesha", 1, 1},
++	} {
++		for _, prefix := range []string{"syz_open_nfs_lane_pair", "syz_socket_connect_nfs_pair"} {
++			call := requireNFSFuzzCall(t, target, prefix+"$"+pair.name)
++			if call.CallName != prefix || len(call.Args) != 2 {
++				t.Fatalf("%s has wrong dispatch or arity", call.Name)
++			}
++			requireConst(t, call.Args[0].Type, pair.client, call.Name+" client")
++			requireConst(t, call.Args[1].Type, pair.backend, call.Name+" backend")
++		}
++	}
++	arm := requireNFSFuzzCall(t, target, "syz_arm_nfs_proxy$scoped")
++	if arm.CallName != "syz_arm_nfs_proxy" || len(arm.Args) != 1 {
++		t.Fatalf("arm dispatch or arity is wrong: %s", arm.Name)
++	}
++	ret, ok := arm.Ret.(*prog.ResourceType)
++	if !ok || ret.Desc.Name != "fd_nfs_proxy_rule" {
++		t.Fatalf("arm return is %T %v, want lifetime FD", arm.Ret, arm.Ret)
++	}
++	packet := requireStruct(t, arm, "nfs_proxy_arm")
++	if packet.Size() != 140 {
++		t.Fatalf("arm wire packet is %d bytes, want 140", packet.Size())
++	}
++	requireConst(t, requireField(t, packet, "magic").Type,
++		0x4e46535041524d31, "arm wire magic")
++	requireConst(t, requireField(t, packet, "reserved").Type, 0,
++		"reserved arm flags")
++	closeCall := requireNFSFuzzCall(t, target, "close$nfs_proxy_arm")
++	closeFD, ok := closeCall.Args[0].Type.(*prog.ResourceType)
++	if closeCall.CallName != "close" || !ok || closeFD.Desc.Name != "fd_nfs_proxy_rule" {
++		t.Fatalf("close cannot release scoped arm FD: %s", closeCall.Name)
++	}
++}
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index 4fd907a08..b61a846ed 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -11,12 +11,17 @@ include <linux/socket.h>
+ 
+ resource sock_nfs_fuzz_tcp[sock]
+ 
+-# Create the socket in the selected fixed-lane client network namespace,
+-# enable TCP_SUNRPC_FUZZ before connect, and connect it to that client's
+-# direct-veth knfsd endpoint.  The endpoint is fixture metadata, not fuzzed
+-# input; the RPC record and XDR body remain fully mutable.
++# Create the socket in the chosen fixed-lane client network namespace, then
++# enable TCP_SUNRPC_FUZZ before connecting.  The original clientN variants
++# retain their primary destination; the pair variants select .1 (knfsd) or
++# .5 (Ganesha) independently, both at the deterministic proxy's :2049.
++# Destinations are fixture metadata, not fuzzed input; RPC/XDR remains mutable.
+ syz_socket_connect_nfs$client0(client const[0]) sock_nfs_fuzz_tcp
+ syz_socket_connect_nfs$client1(client const[1]) sock_nfs_fuzz_tcp
++syz_socket_connect_nfs_pair$client0_knfsd(client const[0], backend const[0]) sock_nfs_fuzz_tcp
++syz_socket_connect_nfs_pair$client0_ganesha(client const[0], backend const[1]) sock_nfs_fuzz_tcp
++syz_socket_connect_nfs_pair$client1_knfsd(client const[1], backend const[0]) sock_nfs_fuzz_tcp
++syz_socket_connect_nfs_pair$client1_ganesha(client const[1], backend const[1]) sock_nfs_fuzz_tcp
+ syz_send_nfs_fuzz$new(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_NEW], user_tag proc[1, 1])
+ syz_send_nfs_fuzz$new_final(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_NEW_FINAL], user_tag proc[1, 1])
+ syz_send_nfs_fuzz$retry(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_RETRY], user_tag proc[1, 1])
+-- 
+2.53.0
+
