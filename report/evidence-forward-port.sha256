@@ -1,7 +1,7 @@
-# forward-port configuration artifacts (2026-09-26T15:10:00+09:00)
-# Regenerated after S4 reach-corpus verdict on 2026-09-26:
-#   honest boundary — async COPY offload hop unattributed (PASS not claimable;
-#   channel infrastructure proven healthy by v1 sync-only control rerun).
+# forward-port configuration artifacts (2026-09-26T15:08:00+09:00)
+# Regenerated after S3 spike verdict on 2026-09-26:
+#   PASS — sunrpc deferred-resume hop attributed normally (frozen Gate 8,
+#   evidence4); S4 honest boundary stands for async COPY offload hop only.
 # Entries use repo-relative paths (tools/, report/, bundle/).  Root
 # README.md and LICENSE are intentionally OUTSIDE this evidence list
 # (root README/LICENSE lists are not hashed here).
@@ -16,7 +16,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-09cbb0184a3c73b6283475b9861fce451adb8ce2a95fd4decaddb9a5af3fc1a0  report/patch-forward-compat.md
+37b0b827f6cd38b7c216e6426ecc46a1a05e1ae9e4e53b629b0e8490674dea06  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 # --- S4 reach-corpus artifacts (reach-copy-offload) ---
@@ -32,3 +32,5 @@ a2437feb2cc2a4c3f7d383d4c59cc605d4e46c5fdd815860da671af80aa88881  tools/run-reac
 02010f0f4883d15442bc03bb7bd39688eac3374d1956694c1b506602797e2888  bundle/corpus/reach-copy-offload/reach-copy-offload-v1.prog
 07ea8248482a9bfa649821162e29ce68fb76c12b726d3e01c086623d05bf8afd  bundle/corpus/reach-copy-offload/reach-copy-offload.prog
 75d56a5b4de54717b84d161732cc35b7a440a58ad90a52921a95bc4b7f46d3fd  bundle/corpus/reach-copy-offload/reach-copy-offload-hybrid.prog
+# --- S3 deferred-resume spike artifacts (frozen Gate 8) ---
+ddf3a5837286c990baa7c0a81e256a16565f86e54e69520dadc187d94610014a  tools/ab-lane-fixture-gate8.sh

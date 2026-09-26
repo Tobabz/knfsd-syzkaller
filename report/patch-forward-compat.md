@@ -209,6 +209,65 @@ COPY가 포함된 워크로드에서만 서버측 원격 커버리지가 전무*
 재현했기 때문.
 
 ---
+### S3 스파이크 판정 — sunrpc 계속형(deferred-resume) hop 귀속 정상 (2026-09-26)
+
+deferred-resume hop(`svc_defer` → `svc_deferred_recv` 재생)의 원격 커버리지
+귀속을 독립 스파이크(Gate 8)로 판정했다. 결과는 **PASS — 귀속 정상**이다.
+이는 S4의 "async COPY hop 미귀속"이 saved-work 공통 결함이 아니라
+**연속 저장 계열 전체가 정상이고 async COPY hop에만 한정된 특이**로 좁힌다.
+
+**사용 가능한 트리거 — V2(export flush) 하나뿐**: NFSv4의 gid/idmap 지연은
+`nfs4xdr.c:6785`의 `clear_bit(RQ_USEDEFERRAL)`(NFSv4 decode 후 명시적 해제)과
+`nfs4idmap.c:666/704`의 `WARN_ON_ONCE(RQ_USEDEFERRAL)`로 문서상 원천
+불가능하다. 남은 유일한 경로는 mountd SIGSTOP + (nfsd.export·auth.unix.ip)
+cache flush로 강제한 캐시 미스 → `rqst_exp_get_by_name`(export.c:1920-1930)
+→ `cache_check` → `svc_defer`(svc_xprt.c:1320) → mountd SIGCONT →
+`svc_deferred_recv`(svc_xprt.c:1355) 재생이다.
+
+**게이트 실행 — frozen Gate 8 (첫 실행)**: `run_frozen_phase8_vm.py`를
+수정 없이 실행했다(산출물 `~/frozen-gate8-s3-evidence4/`). 실행 인자/해시:
+kernel `5b22ba55` · image `78ac48d0` ·
+lane `tools/ab-lane-fixture-gate8.sh`(`ddf3a583…`) · bootstrap
+`frozen_phase3_bootstrap.sh`(`4e8414c0…`) · deps `f214e8f4…` — S4
+evidence5와 같은 기준선 인프라. `--lane-script`에 **phase9-fixture
+retirement prelude + `frozen_phase1_lane.sh` 본문 바이트 동일** 래퍼를
+주입했다. 이미지가 부팅 시 4-lane fixture를 자동 기동해 게이트 8의
+`create 0`을 충돌시키므로(`printf: I/O error`로 1·2차가 실패), S4의
+`tools/ab-lane-fixture-v42.sh`와 같은 prelude로 fixture를 먼저 정리했다.
+
+**판정 계약 (validate_gate, 전 항목 True)**:
+- `deferred-normal_probe_contract` = True — `status=pass`,
+  `local_entries=31449`, **`remote_entries=20975 (>0)`**: deferred-normal
+  스파이크에서 원격 세션이 실제로 수집됨 → **hop 귀속 정상 판정식**.
+- `real_deferred_replay_completed` = True — `deferred_child_created=1` 이고
+  `deferred_restored`/`grant_ok`/`start_ok`/`completed` 각각 =1, 비정상
+  카운터 전부 0: `svc_defer`→재생→grant→start→complete 생애주기 완결.
+- deferred-abort-2종: `remote_entries=0`(요구값) — abort-before-grant는
+  restored→abort_before_grant→owner_none→dropped, abort-after-grant는
+  restored→grant_ok→start_ok→pause_entered→pause_released→completed,
+  각각 생애주기 정확. **abort 계열은 미귀속이 기대값과 일치**.
+- 부수 발견 — **async-normal도 remote_entries=791265**: 게이트 8의
+  KCOV_REMOTE_ENABLE(common_handle, 5000ms) 계측으로는 async COPY hop도
+  귀속된다. S4의 extra=0은 어트리뷰션 결함이 아니라
+  syz-executor 기반 채널 특이로 재해석 여지가 생긴다(후속 확인 대상).
+- phase3 도메인 스냅샷: `domain_created=1, domain_joined=2,
+  domain_retired=4, lane_epoch_collision=0`. 게이트 lane0(epoch 5)이
+  단일 도메인으로 깨끗하게 할당됐고(충돌 0), 부팅 fixture의 4-lane이
+  retired 상태로 정리됐으며 최종 연결은 epoch 5(10.77.0.x) 2개뿐 —
+  **래퍼 prelude가 부팅 fixture를 실제로 retirement했다는 기계적 증거**.
+  `isolated_lane_is_nfsv42`, `wire_ordinals_aligned`,
+  phase4/5/6 exact drain, lifecycle/controls clean 전부 True. 최종
+  `cleanup_returncode=0, validation_returncode=0`.
+
+**결론**: sunrpc 계속형(deferred-resume) hop은 원격 커버리지 귀속이
+**정상 동작**한다(V2 export-flush 트리거에서 시작해 재생·수집까지 완결).
+S4의 관측(비동기 COPY만 extra=0, 동기-only 대조는 extra=10)은
+"연속 저장 hop 귀속 경로 부재"가 아니라 **async COPY offload hop에 한정된
+특이**로 판정 범위가 좁혀졌다. 후속 과제: async 특이를 별도 스파이크로
+격리해 원인(세션 파괴/중단 시점)을 좁힌다(S4 후속으로 이미 기록됨).
+
+---
+
 
 ## 7. 파이프라인 자동화 — `tools/fport-pipeline.sh`
 
