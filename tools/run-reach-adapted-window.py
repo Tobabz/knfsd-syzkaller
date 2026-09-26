@@ -34,6 +34,7 @@ import shlex
 import subprocess
 import tarfile
 import time
+from typing import Protocol
 
 
 REMOTE_DRIVER = "/opt/frozen-phase9"
@@ -53,6 +54,10 @@ BIND_RE = re.compile(
     r"target=/nfs-lane")
 EXPECTED_CALLS = int(os.environ.get("KOOV_EXPECTED_CALLS", "34"))
 CONFLICT_CALL = int(os.environ.get("KOOV_CONFLICT_CALL", "14"))
+
+
+class TraceGuest(Protocol):
+    def guest(self, stage: str, command: str) -> subprocess.CompletedProcess[str]: ...
 
 
 def load_module(name, path):
@@ -403,6 +408,38 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
         cpu_before = cpu_snapshot(vm, "cpu-before")
         memory_samples = [phase9.memory_snapshot(vm, "memory-before")]
 
+        # Separate physical callback delivery from remote KCOV ownership.
+        # Arm only after fixture setup; the snapshot VM owns this trace instance.
+        def callback_trace(stage: str, command: str, save: bool = False,
+                           guest: TraceGuest = vm, output: Path = trial_dir) -> None:
+            """Keep the dynamically loaded VM behind its typed trace interface."""
+            result = guest.guest(stage, command)
+            if save:
+                _ = (output / "callback-trace.txt").write_text(result.stdout, encoding="utf-8")
+
+        callback_trace("callback-trace-start", """set -eu
+mountpoint -q /sys/kernel/tracing || mount -t tracefs tracefs /sys/kernel/tracing
+mkdir /sys/kernel/tracing/instances/reach_callback
+cd /sys/kernel/tracing/instances/reach_callback
+echo 0 > tracing_on
+echo global > trace_clock
+echo 1024 > buffer_size_kb
+for event in nfsd/nfsd_cb_offload nfsd/nfsd_cb_queue nfsd/nfsd_cb_start nfsd/nfsd_cb_offload_done nfs4/nfs4_copy nfs4/nfs4_cb_offload; do
+    cat events/$event/format
+    echo 1 > events/$event/enable
+done
+address=$(awk '$3 == "nfsd4_run_cb_work" {print "0x" $1}' /proc/kallsyms)
+test -n "$address"
+for event in workqueue_queue_work workqueue_execute_start workqueue_execute_end; do
+    cat events/workqueue/$event/format
+    echo "function == $address" > events/workqueue/$event/filter
+    echo 1 > events/workqueue/$event/enable
+done
+echo > trace
+echo 1 > tracing_on
+echo reach-copy-begin > trace_marker
+""")
+
         command = [
             REMOTE_DRIVER + "/syz-execprog",
             "-executor=" + REMOTE_DRIVER + "/syz-executor",
@@ -469,6 +506,15 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
             "done; i=$((i + 1)); done" % args.procs)
         final = phase9.wait_for_drains(vm, modules, active_root, args.procs,
                                        timeout=45)
+        callback_trace("callback-trace-stop", """set -eu
+cd /sys/kernel/tracing/instances/reach_callback
+echo reach-copy-end > trace_marker
+echo 0 > tracing_on
+cat trace
+echo 0 > events/enable
+cd ..
+rmdir reach_callback
+""", save=True)
         post_memory = phase9.memory_snapshot(vm, "memory-after")
         diagnostics = counter_diagnostics(baseline[0], final[0])
         rpc_delta = sum(final[lane]["nfsd_rpcs"] - baseline[lane]["nfsd_rpcs"]
