@@ -1,0 +1,2 @@
+live_scratch 0 live_sections 0 remote_refs 0 publish_readers 0
+pool scratch_in_use 0 scratch_peak 1
