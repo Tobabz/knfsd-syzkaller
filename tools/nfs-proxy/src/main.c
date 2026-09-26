@@ -9,11 +9,46 @@
 #include <string.h>
 
 static _Atomic int stop_requested;
+static _Atomic int snapshot_requested;
 
 static void stop_signal(int sig)
 {
 	(void)sig;
 	atomic_store(&stop_requested, 1);
+}
+
+static void snapshot_signal(int sig)
+{
+	(void)sig;
+	atomic_store(&snapshot_requested, 1);
+}
+
+static void print_stats(const struct nfsp_proxy_stats *stats, const char *phase)
+{
+	printf("stats_begin %s\n", phase);
+	for (unsigned c = 0; c < NFSP_CLIENTS; c++) {
+		for (unsigned b = 0; b < NFSP_BACKENDS; b++) {
+			printf("client=%u backend=%u accepted=%u connected=%u "
+			       "failed=%u c2s=%u s2c=%u sent_c2s=%u sent_s2c=%u\n",
+			       c, b, stats->accepted[c][b], stats->connected[c][b],
+			       stats->connect_failed[c][b], stats->records[c][b][0],
+			       stats->records[c][b][1], stats->delivered[c][b][0],
+			       stats->delivered[c][b][1]);
+		}
+	}
+	printf("peak_active=%u active=%u framing_errors=%u relay_errors=%u "
+	       "mutation_errors=%u rejected_client=%u\n",
+	       stats->peak_active, stats->active, stats->framing_errors,
+	       stats->relay_errors, stats->mutation_errors, stats->rejected_client);
+	printf("stats_end %s\n", phase);
+	fflush(stdout);
+}
+
+static void maybe_snapshot(const struct nfsp_proxy_stats *stats, void *arg)
+{
+	(void)arg;
+	if (atomic_exchange(&snapshot_requested, 0))
+		print_stats(stats, "snapshot");
 }
 
 static int endpoint(const char *arg, char ip[INET_ADDRSTRLEN], uint16_t *port)
@@ -78,27 +113,17 @@ int main(int argc, char **argv)
 	cfg.route[0].backend_ip = ips[2];
 	cfg.route[1].backend_ip = ips[3];
 	cfg.stop = &stop_requested;
-	if (!atomic_is_lock_free(&stop_requested)) {
+	cfg.on_stats = maybe_snapshot;
+	if (!atomic_is_lock_free(&stop_requested) ||
+	    !atomic_is_lock_free(&snapshot_requested)) {
 		fprintf(stderr, "signal stop flag must be lock-free on this host\n");
 		return 2;
 	}
 	signal(SIGINT, stop_signal);
 	signal(SIGTERM, stop_signal);
+	signal(SIGUSR1, snapshot_signal);
 	rc = nfsp_proxy_run(&cfg, &stats, ready, NULL);
 	if (rc != 0) { fprintf(stderr, "proxy setup or poll failed\n"); return 1; }
-	for (unsigned c = 0; c < NFSP_CLIENTS; c++) {
-		for (unsigned b = 0; b < NFSP_BACKENDS; b++) {
-			printf("client=%u backend=%u accepted=%u connected=%u "
-			       "failed=%u c2s=%u s2c=%u sent_c2s=%u sent_s2c=%u\n",
-			       c, b, stats.accepted[c][b], stats.connected[c][b],
-			       stats.connect_failed[c][b], stats.records[c][b][0],
-			       stats.records[c][b][1], stats.delivered[c][b][0],
-			       stats.delivered[c][b][1]);
-		}
-	}
-	printf("peak_active=%u framing_errors=%u relay_errors=%u "
-	       "mutation_errors=%u rejected_client=%u\n",
-	       stats.peak_active, stats.framing_errors, stats.relay_errors,
-	       stats.mutation_errors, stats.rejected_client);
+	print_stats(&stats, "final");
 	return 0;
 }

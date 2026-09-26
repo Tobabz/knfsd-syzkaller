@@ -28,20 +28,14 @@
 #                     reach the per-lane server.log rather than /dev/null.
 #   NFS_MINOR_VERSION 1 (default) | 2
 #
-# Why "both" uses a second tmpfs and a second export path: two servers must
-# never co-own one mutable tree.  The client sees only the primary response,
-# so any secondary side effect silently rewrites the primary's answer --
-# duplicate REMOVE degrades harmlessly, but a racing RENAME can turn a
-# successful primary into ENOENT, and a shared tree that Ganesha deletes
-# leaves knfsd holding a delegation for a file that no longer exists, which
-# is a bug unreachable in production and therefore a fixture artifact.  Two
-# backends, two stores: the mirror stays honest.
+# In both mode, a listener on .1:2049 and .5:2049 sends records to knfsd
+# :20490 and Ganesha :20491 respectively.  Each of the two client namespaces
+# mounts BOTH destinations; /mnt remains the original primary alias.
 #
-# Why the secondary response is discarded rather than returned: mixing two
-# servers' stateful replies poisons the client's own v4.1 state machine
-# (sessionids, stateids, an orphaned delegation on whichever server misses the
-# DELEGRETURN).  Discarding keeps client-side contamination at zero; recording
-# both responses for offline comparison is the safe way to get the benefit.
+# Why "both" uses two tmpfs trees: knfsd and Ganesha must never co-own mutable
+# filesystem state.  Both clients see the same tree within a backend, while
+# the two backends remain independent.  The proxy selects ONE backend from
+# the destination IP and returns that backend's own v4.1 response.
 
 set -eu
 action=${1:-}
@@ -154,6 +148,16 @@ lane_link()
 namespace_exists()
 {
     ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$1"
+}
+
+# mountpoint(1) stat()s the NFS root.  An intermittently slow/failed GETATTR
+# can make it report "not mounted" while the mount still exists; cleanup must
+# never walk such a mount with rm -rf.  The kernel mount table is authoritative
+# for this fixture's fixed (space-free) paths.
+nfs_mount_exists()
+{
+    awk -v target="$1" '$2 == target && $3 == "nfs4" { found = 1 }
+        END { exit !found }' /proc/mounts
 }
 
 namespace_pids()
@@ -320,6 +324,22 @@ setup_client()
     kill -0 "$client_pid"
 }
 
+setup_cross_mount()
+{
+    cross_lane=$1
+    cross_client=$2
+    cross_ns=$3
+    cross_backend=$4
+    cross_ip=$5
+    cross_mount=$root/lane$cross_lane/client$cross_client/$cross_backend
+    mkdir -p "$cross_mount"
+    nsenter --net="/run/netns/$cross_ns" -- \
+        mount.nfs4 -o "vers=4.$nfs_minor_version,minorversion=$nfs_minor_version,proto=tcp,port=$server_port,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
+        "$cross_ip:/" "$cross_mount"
+    grep -F " $cross_mount nfs4 " /proc/mounts > \
+        "$root/lane$cross_lane/client$cross_client.$cross_backend.mount"
+}
+
 setup_lane()
 {
     setup_lane_id=$1
@@ -366,6 +386,15 @@ setup_lane()
     ip -n "$setup_client1_ns" addr add "$setup_client1_ip/30" dev "$setup_client1_link"
     ip -n "$setup_client1_ns" link set "$setup_client1_link" up
 
+    if [ "$server_impl" = both ]; then
+        # The two destinations belong to one server namespace.  A packet
+        # from .2 to .5 enters through .1; no L3 forwarding or NAT is used.
+        ip -n "$setup_client0_ns" route add \
+            "10.89.$setup_lane_id.4/30" via "$setup_server0_ip"
+        ip -n "$setup_client1_ns" route add \
+            "10.89.$setup_lane_id.0/30" via "$setup_server1_ip"
+    fi
+
     # The immutable correlation domain must exist in all three network
     # namespaces before knfsd starts or either client creates a connection.
     create_domain "$setup_lane_id" "$setup_server_ns" \
@@ -406,11 +435,8 @@ setup_lane()
         printf "tcp $knfsd_port\n" > /proc/fs/nfsd/portlist
         printf "4\n" > /proc/fs/nfsd/threads
         fi
-        # KOOV: Ganesha backend.  Separate tmpfs and separate export path on
-        # purpose -- two servers must never co-own one mutable tree, because
-        # the client sees only the primary response, so any side effect of the
-        # secondary silently rewrites the primary answer.  A separate tree
-        # keeps the mirror honest; see tools/README.md.
+        # KOOV: Ganesha backend has its own tmpfs and export path.  Both
+        # clients share this tree, but knfsd never accesses it.
         #
         # NOTE: no apostrophe may appear anywhere in this block.  It is one
         # single-quoted argument to sh -c, and a stray quote in a comment
@@ -428,9 +454,11 @@ setup_lane()
             # Ganesha registers itself with rpcbind for every enabled protocol
             # and treats a failed registration as fatal, so the daemon needs
             # rpcbind even though a client mounting a pinned port never queries
-            # it.  The knfsd branch above already runs rpcbind -w; it is left
-            # outside that branch for exactly this reason.
-            rpcbind -w
+            # it.  The knfsd branch already starts it in both mode, so only
+            # the Ganesha-only mode starts another rpcbind process here.
+            if [ "$server_impl" = ganesha ]; then
+                rpcbind -w
+            fi
             mkdir -p /var/lib/nfs/ganesha /run/ganesha
             mount -t tmpfs -o mode=0755,size="$tmpfs_size" \
                 "frozen-phase9-lane$lane-ganesha" \
@@ -653,6 +681,29 @@ EOF
             printf "%s\n" "$ganesha_pid" > "$lane_root/server/ganesha.pid"
             touch "$lane_root/server/ganesha.ready"
         fi
+        if [ "$server_impl" = both ]; then
+            command -v nfs-proxy >/dev/null 2>&1 || {
+                echo "KOOV: guest relay not on PATH" >&2
+                exit 1
+            }
+            nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
+                "10.89.$lane.1:$server_port" "10.89.$lane.5:$server_port" \
+                "10.89.$lane.1:$knfsd_port" "10.89.$lane.5:$ganesha_port" \
+                > "$lane_root/server/proxy.log" 2>&1 &
+            proxy_pid=$!
+            printf "%s\n" "$proxy_pid" > "$lane_root/server/proxy.pid"
+            proxy_wait=0
+            while ! grep -q "^relay ready:" "$lane_root/server/proxy.log"; do
+                if ! kill -0 "$proxy_pid" 2>/dev/null || \
+                    test "$proxy_wait" -ge 100; then
+                    echo "KOOV: relay failed to bind both destinations" >&2
+                    cat "$lane_root/server/proxy.log" >&2
+                    exit 1
+                fi
+                proxy_wait=$((proxy_wait + 1))
+                sleep 0.1
+            done
+        fi
         touch "$lane_root/server.ready"
         exec sleep 86400
     ' sh "$root" "$setup_lane_id" "10.89.$setup_lane_id.0/29" \
@@ -667,8 +718,20 @@ EOF
         "$setup_server0_ip" >/dev/null
     ip netns exec "$setup_client1_ns" ping -c 1 -W 2 \
         "$setup_server1_ip" >/dev/null
+    if [ "$server_impl" = both ]; then
+        ip netns exec "$setup_client0_ns" ping -c 1 -W 2 \
+            "$setup_server1_ip" >/dev/null
+        ip netns exec "$setup_client1_ns" ping -c 1 -W 2 \
+            "$setup_server0_ip" >/dev/null
+    fi
     setup_client "$setup_lane_id" 0 "$setup_client0_ns" "$setup_server0_ip" "$nfs_minor_version" "$server_port"
     setup_client "$setup_lane_id" 1 "$setup_client1_ns" "$setup_server1_ip" "$nfs_minor_version" "$server_port"
+    if [ "$server_impl" = both ]; then
+        setup_cross_mount "$setup_lane_id" 0 "$setup_client0_ns" \
+            ganesha "$setup_server1_ip"
+        setup_cross_mount "$setup_lane_id" 1 "$setup_client1_ns" \
+            knfsd "$setup_server0_ip"
+    fi
 
     # A fixed fuzzer process N enters only lane N's primary client mount
     # namespace.  Its peer alias preserves the second Phase 1 client for
@@ -712,6 +775,9 @@ expose_lane_to_executor()
 
 cleanup_fixture()
 {
+    if test -e "$root/relay.cleanup.trace"; then
+        echo "KOOV cleanup trace: enter" >&2
+    fi
     cleanup_count=4
     if test -s "$root/fixture.count"; then
         cleanup_saved_count=$(cat "$root/fixture.count")
@@ -766,7 +832,7 @@ cleanup_fixture()
             for cleanup_client_mount in \
                 "$cleanup_source/client0" "$cleanup_source/client1"; do
                 timeout 30s umount "$cleanup_client_mount" 2>/dev/null || true
-                if mountpoint -q "$cleanup_client_mount" 2>/dev/null; then
+                if nfs_mount_exists "$cleanup_client_mount"; then
                     cleanup_mount_leaks=$((cleanup_mount_leaks + 1))
                 fi
             done
@@ -777,19 +843,49 @@ cleanup_fixture()
 
     while test "$cleanup_lane" -lt "$cleanup_count"; do
         cleanup_lane_root=$root/lane$cleanup_lane
+        if test -e "$root/relay.cleanup.trace"; then
+            echo "KOOV cleanup trace: cross mounts lane=$cleanup_lane" >&2
+        fi
+        for cleanup_cross_mount in \
+            "$cleanup_lane_root/client0/ganesha" \
+            "$cleanup_lane_root/client1/knfsd"; do
+            if nfs_mount_exists "$cleanup_cross_mount"; then
+                if test -e "$root/relay.cleanup.trace"; then
+                    echo "KOOV cleanup trace: umount $cleanup_cross_mount" >&2
+                fi
+                timeout 30s umount "$cleanup_cross_mount" 2>/dev/null || true
+                if nfs_mount_exists "$cleanup_cross_mount"; then
+                    cleanup_mount_leaks=$((cleanup_mount_leaks + 1))
+                fi
+            fi
+        done
         cleanup_client=0
+        if test -e "$root/relay.cleanup.trace"; then
+            echo "KOOV cleanup trace: primary mounts lane=$cleanup_lane" >&2
+        fi
         while test "$cleanup_client" -lt 2; do
             cleanup_mount=$cleanup_lane_root/client$cleanup_client/mnt
-            if mountpoint -q "$cleanup_mount" 2>/dev/null; then
+            if nfs_mount_exists "$cleanup_mount"; then
+                if test -e "$root/relay.cleanup.trace"; then
+                    echo "KOOV cleanup trace: umount $cleanup_mount" >&2
+                fi
                 timeout 30s umount "$cleanup_mount" 2>/dev/null || true
-                if mountpoint -q "$cleanup_mount" 2>/dev/null; then
+                if nfs_mount_exists "$cleanup_mount"; then
                     cleanup_mount_leaks=$((cleanup_mount_leaks + 1))
                 fi
             fi
             cleanup_client=$((cleanup_client + 1))
         done
 
+        if test "$cleanup_mount_leaks" -ne 0; then
+            echo "KOOV: NFS mounts still present; refusing to traverse $root" >&2
+            return 1
+        fi
+
         cleanup_server_ns=$(lane_server_ns "$cleanup_lane")
+        if test -e "$root/relay.cleanup.trace"; then
+            echo "KOOV cleanup trace: server resources lane=$cleanup_lane" >&2
+        fi
         if test -s "$cleanup_lane_root/server.pid"; then
             cleanup_server_pid=$(cat "$cleanup_lane_root/server.pid")
             if pid_in_named_netns "$cleanup_server_pid" "$cleanup_server_ns"; then
@@ -841,10 +937,19 @@ cleanup_fixture()
 
         stop_namespace "$cleanup_client0_ns" || \
             cleanup_namespace_leaks=$((cleanup_namespace_leaks + 1))
+        if test -e "$root/relay.cleanup.trace"; then
+            echo "KOOV cleanup trace: client0 stopped lane=$cleanup_lane" >&2
+        fi
         stop_namespace "$cleanup_client1_ns" || \
             cleanup_namespace_leaks=$((cleanup_namespace_leaks + 1))
+        if test -e "$root/relay.cleanup.trace"; then
+            echo "KOOV cleanup trace: client1 stopped lane=$cleanup_lane" >&2
+        fi
         stop_namespace "$cleanup_server_ns" || \
             cleanup_namespace_leaks=$((cleanup_namespace_leaks + 1))
+        if test -e "$root/relay.cleanup.trace"; then
+            echo "KOOV cleanup trace: server stopped lane=$cleanup_lane" >&2
+        fi
         namespace_exists "$cleanup_client0_ns" && \
             cleanup_namespace_leaks=$((cleanup_namespace_leaks + 1))
         namespace_exists "$cleanup_client1_ns" && \
@@ -880,6 +985,9 @@ cleanup_fixture()
             "$executor_root/.frozen_phase9_fixture"
         rmdir "$executor_root" 2>/dev/null || cleanup_source_tree_leaks=1
     fi
+    if test -e "$root/relay.cleanup.trace"; then
+        echo "KOOV cleanup trace: rm root=$root" >&2
+    fi
     rm -rf "$root"
     printf '{"lane_count":%s,"mount_leaks":%s,"namespace_leaks":%s,"nfsd_resource_leaks":%s,"veth_leaks":%s,"domain_retire_failures":%s,"source_tree_leaks":%s,"active_executor_mounts":%s}\n' \
         "$cleanup_count" "$cleanup_mount_leaks" "$cleanup_namespace_leaks" \
@@ -897,6 +1005,9 @@ cleanup_fixture()
 
 status_fixture()
 {
+    if test -e "$root/relay.status.trace"; then
+        set -x
+    fi
     test -s "$root/fixture.count"
     status_count=$(cat "$root/fixture.count")
     valid_count "$status_count"
@@ -934,8 +1045,6 @@ status_fixture()
 
         for status_client in 0 1; do
             status_pid=$(cat "$status_lane_root/client$status_client.pid")
-            nsenter -t "$status_pid" -m -n -- mountpoint -q \
-                "$status_lane_root/client$status_client/mnt"
             nsenter -t "$status_pid" -m -n -- grep -Eq \
                 " $status_lane_root/client$status_client/mnt nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
                 /proc/mounts
@@ -1008,6 +1117,21 @@ status_fixture()
                    exit 1 ;;
             esac
         fi
+        if [ "$server_impl" = both ]; then
+            status_relay_pid=$(cat "$status_lane_root/server/proxy.pid")
+            pid_in_named_netns "$status_relay_pid" "$status_server_ns"
+            test "$status_connections" -ge 4
+            nsenter -t "$status_client0_pid" -m -n -- grep -Eq \
+                " $status_lane_root/client0/ganesha nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
+                /proc/mounts
+            nsenter -t "$status_client1_pid" -m -n -- grep -Eq \
+                " $status_lane_root/client1/knfsd nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
+                /proc/mounts
+            test "$(findmnt -n -o SOURCE -- "$status_lane_root/client0/ganesha")" = \
+                "10.89.$status_lane.5:/"
+            test "$(findmnt -n -o SOURCE -- "$status_lane_root/client1/knfsd")" = \
+                "10.89.$status_lane.1:/"
+        fi
         status_backing_type=$(nsenter -t "$status_server_pid" -m -n -- \
             findmnt -n -o FSTYPE -- "$status_lane_root/server/export")
         status_backing_source=$(nsenter -t "$status_server_pid" -m -n -- \
@@ -1043,8 +1167,8 @@ status_fixture()
         test "$(cat "$status_source/.client1_pid")" -eq "$status_client1_pid"
         test "$(cat "$status_source/.server0_ipv4")" = "10.89.$status_lane.1"
         test "$(cat "$status_source/.server1_ipv4")" = "10.89.$status_lane.5"
-        mountpoint -q "$status_source/client0"
-        mountpoint -q "$status_source/client1"
+        nfs_mount_exists "$status_source/client0"
+        nfs_mount_exists "$status_source/client1"
         test "$(findmnt -n -o FSTYPE -- "$status_source/client0")" = nfs4
         test "$(findmnt -n -o FSTYPE -- "$status_source/client1")" = nfs4
         test "$(findmnt -n -o SOURCE -- "$status_source/client0")" = \
@@ -1072,6 +1196,9 @@ status_fixture()
         status_lane=$((status_lane + 1))
     done
     printf ']}\n'
+    if test -e "$root/relay.status.trace"; then
+        set +x
+    fi
 }
 
 case "$action" in

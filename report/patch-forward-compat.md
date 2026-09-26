@@ -1296,3 +1296,34 @@ SHA-256 `fa9eb1618df86203113294849fb0598ce1cd047d6682c42b1418303813e32270`.
 Ganesha의 원격 `.extra=0` 제약이지 ASan 빌드 실패가 아니다. 따라서 위 스모크는
 서버 실로드·호출 결과·로그·cleanup을 판정한다. 네 NFSv4 세션과 정식
 `--executions 30 --trials 2` A/B는 이 결과에 포함되지 않는다.
+
+### ASan Ganesha를 통한 네 게스트 NFSv4 릴레이 (2026-09-27)
+
+`tools/nfs-proxy/build-guest.sh`가 전체 호스트 게이트(클랭 기본 빌드와 GCC
+ASan/UBSan)를 통과한 뒤 Debian bookworm 컨테이너에서 게스트 프록시를 빌드했다.
+게스트 바이너리 SHA-256은
+`262386b2502ff506511ea471bc3786817272306d8c3678bc787fbe6a9686b3c3`.
+`tools/nfs-proxy/ganesha-asan-relay-run.sh`는 `KOOV_GANESHA_DEPS`(기본값
+ASan 자산)와 `KOOV_NFS_PROXY_GUEST`를 게스트에 주입하고 기존 이미지에
+`-snapshot`으로 부팅한다.
+
+`SERVER_IMPL=both`에서 각 클라이언트의 knfsd·Ganesha 마운트 4개 모두
+NFSv4.1이며, 두 클라이언트가 백엔드별 파일 생성·읽기·삭제를 공유하고
+다른 백엔드에서 파일이 보이지 않음을 확인했다. 프록시 라이브 스냅샷은
+네 튜플 모두 `accepted=connected=1`, `failed=0`, 양방향 기록·전송 모두
+양수, `peak_active=active=4`, framing/relay/mutation/rejected 오류 0을
+보였다. Ganesha 라이브 PID의 ASan 런타임/코어 로드가 전후 확인됐고
+ASan 보고 0, 정리 누출 0, 베이스 이미지 해시 불변이었다.
+
+검증 JSON: `evidence/ganesha-asan-relay-final/trial_evidence.json`
+SHA-256 `ccbff14f98993d54314b4f5e488fbf35fcfa22a4564bd617466dd4cec51914c6`.
+서버 ASan 로그 SHA-256 `7fd72424ec8b8da490e2b49b93250f6960091fb478b72cd44d4972b7547c1f25`.
+프록시 스냅샷 로그 SHA-256 `db0e893f08f524531731383798ad684d4f27714e6a71a0f1ecadcb41c7cdd098`.
+현장 증거는 gitignored이며 배포 자산이 아니다. 앞선 시도에서는 NFS
+`mountpoint(1)`가 실제 `/proc/mounts` 항목과 달리 실패한 뒤 정리 단계의
+`rm -rf`가 지연됐다. 상태·정리 게이트는 커널 마운트 테이블을 사용하며,
+남은 NFS 마운트가 있으면 경로를 재귀 삭제하지 않고 거부한다.
+
+이 검증은 **마운트/릴레이 4조합**이다. syzkaller executor의 네 조합 선택,
+변조 적용, 정식 `--executions 30 --trials 2` A/B는 이 JSON의 판정에
+포함되지 않는다.

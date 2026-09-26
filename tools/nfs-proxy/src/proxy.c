@@ -344,6 +344,8 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 		nfds_t count = 0;
 		int n;
 		uint64_t now = now_ms();
+		if (cfg->on_stats != NULL)
+			cfg->on_stats(stats, cfg->on_stats_arg);
 		for (b = 0; b < NFSP_BACKENDS; b++) {
 			pfd[count] = (struct pollfd){s->listeners[b], POLLIN, 0};
 			owner[count] = -1;

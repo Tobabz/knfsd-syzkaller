@@ -95,6 +95,7 @@ bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
 | `build-ganesha-deps.sh` | `guest-deps-ganesha.tar.gz` 생성 — root 불필요, `.deb`→의존성 closure→주입 트리 |
 | `build-ganesha-asan.sh`·`ganesha-asan-container.sh` | bookworm 4.3-2 소스·패치로 Ganesha 실행 파일/코어/VFS를 GCC ASan으로 빌드하고 별도 deps tar 생성 (Docker 사용) |
 | `ganesha-asan-lane-run.sh`·`run-ganesha-asan-smoke.py` | 게스트에서 ASan 실로드·NFSv4 호출 결과·로그·정리 검증 (원격 KCOV AB와 분리) |
+| `nfs-proxy/build-guest.sh`·`nfs-proxy/ganesha-asan-relay-run.sh` | Debian bookworm ABI 프록시와 2클라이언트 × 2백엔드 ASan 게스트 릴레이 게이트 |
 | `run_frozen_phase9_vm_ganesha.py` | phase9 러너 적응 사본 — 백엔드 중립 lane 게이트 |
 | `nfs_remote_kcov_ganesha_v41_workload.prog` | 두 구현이 모두 통과하는 코퍼스 (호출 수·인덱스 불변) |
 | `lane-quote-lint.sh` | `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
@@ -159,13 +160,25 @@ ASan 사용 시 fixture는 Ganesha를 `-F`로 시작해 stderr 보고서를 레�
 사용한다. 단, 그 러너의 **원격 KCOV `.extra` AB 게이트는 사용자 공간
 Ganesha에 적용되지 않으므로**, ASan 동작 판정에는 위 스모크 게이트를 쓴다.
 
-### A-2. knfsd + Ganesha 동시 기동 (미실증)
+### A-2. knfsd + ASan Ganesha 동시 릴레이 — 네 게스트 NFSv4 마운트 확인
 
-`SERVER_IMPL=both`는 **한 번도 실행되지 않았다.** 이 모드에서 knfsd는 20490,
-Ganesha는 20491에 서는데 **클라이언트가 마운트하는 2049에 아무도 리슨하지 않는다.**
-클라이언트는 `port=2049`로 고정이라 애초에 마운트를 못 한다. 병렬 모드 성립에는
-**2049에서 분기하는 프록시가 선행**이다 — 그래서 A-1이 통과했다고 A가 통과한 것은
-아니다.
+`SERVER_IMPL=both`에서 `.1:2049`·`.5:2049` 프록시가 각각 knfsd `:20490`·
+Ganesha `:20491`로 고정 라우팅한다. 클라이언트 `.2`·`.6`에 반대편 `/30`
+목적지 경로를 추가해 각자 두 백엔드를 마운트한다. 두 클라이언트는 **같은 백엔드의
+트리를 공유**하고 **백엔드 간 저장소는 다르다**. 게스트의 교차 읽기·쓰기·삭제로
+이를 확인하고, 프록시 스냅샷의 네 `(client,backend)` 카운터에서 C2S/S2C
+왕복과 동시 활성 연결 4개를 확인했다. ASan Ganesha의 실로드, 생존,
+ASan 보고 0, fixture 정리 누출 0도 통과했다.
+
+```sh
+tools/nfs-proxy/build-guest.sh
+tools/nfs-proxy/ganesha-asan-relay-run.sh
+```
+
+이 게이트는 **마운트·프록시 릴레이**를 검증한다. 현재 실행 파일은 relay-only이며
+syzkaller의 `(client,backend)` 선택과 변조 `arm` IPC는 별도 통합 대상이다.
+정식 A/B 실행/속도 결론으로 해석하지 않는다. 게스트 증거의 재현 명령·해시는
+`report/patch-forward-compat.md`의 릴레이 절에 있다.
 
 ### B. 실증된 설계 (병렬 부작용 완화)
 
@@ -185,7 +198,7 @@ ganesha_backing_source  = frozen-phase9-lane0-ganesha     ← 실제로 다름 (
 **tmpfs 상한 — 실측.** 두 백엔드 모두 `size=262144k`로 상한이 걸려 있다. 한 백엔드가
 메모리를 먹어도 다른 백엔드가 죽지 않도록 게이트로 강제하고 증거 JSON에 기록한다.
 
-**죽은 보조 서버 탐지 — 부분 확보, 아직 부족.** 병렬 퍼징의 핵심 위험은 **두 번째
+**죽은 보조 서버 탐지 — 실시간 릴레이 검증 확보.** 병렬 퍼징의 핵심 위험은 **두 번째
 서버가 조용히 죽어도 결과가 정상처럼 나오는 것**인데, 이 축이 고친 계측기 결함이
 정확히 그 지점에 걸려 있었다.
 
@@ -205,8 +218,9 @@ ON 그룹에서 원격 커버리지 파일이 **0개**다(executions=2, 기대 2
 이건 **축의 실패가 아니다** — 그 채널을 재려고 했던 축이 아니었다. 다만 실제 제약이
 하나 생긴다: **원격 KCOV를 "두 번째 서버가 실제로 트래픽을 처리하는가"의 검증 수단으로
 쓸 수 없다.** 그래서 보조 백엔드 검증은 프로세스 존재 + 리스너 + **백엔드 자체
-신호**(처리한 RPC 수 등)로 구성해야 한다. 앞의 두 항목은 넣었고 백엔드 자체 신호는
-미구현이다.
+신호**(처리한 RPC 수 등)로 구성해야 한다. 별도 게스트 릴레이 스모크에서는
+서버의 실제 NFSv4 응답·트리 I/O와 프록시 귀속 카운터를 함께 게이트한다.
+syzkaller 변조·A/B 측정에는 아직 적용하지 않았다.
 
 ### 두 구현의 실제 행동 차이 (관찰 자료)
 
@@ -233,8 +247,8 @@ NFSv4 pseudoroot에 엔트리를 만드는 쓰기에서 knfsd는 0, Ganesha 4.3�
 
 ### 다음 작업
 
-**프록시 구현이 A의 선행 조건이다.** 요구사항(2049 분기, 결정적 분기, 관찰 전용,
-원본 바이트 기록, 조용한 폴백 금지, 분기 증명 게이트)은 §6 참조.
+**프록시 게스트 릴레이는 확인됐다.** 다음은 샌드박스 고정 경로의 `arm` IPC,
+생성/재생 델타, syzkaller `(client,backend)` 연결 선택의 실제 통합이다.
 
 ## 문서 맵
 

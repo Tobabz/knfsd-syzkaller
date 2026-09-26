@@ -43,6 +43,10 @@ struct nfsp_proxy_cfg {
 	int (*on_record)(unsigned client, unsigned backend, int dir,
 			 uint8_t *record, size_t len, void *arg);
 	void *on_record_arg;
+	/* Called by the relay event loop, never from a signal handler.  The
+	 * pointer is an in-thread snapshot; do not retain it after return. */
+	void (*on_stats)(const struct nfsp_proxy_stats *, void *arg);
+	void *on_stats_arg;
 };
 
 /* on_ready runs after BOTH listeners bind.  Its stats pointer is valid until
