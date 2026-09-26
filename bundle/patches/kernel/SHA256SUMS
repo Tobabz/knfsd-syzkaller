@@ -9,4 +9,4 @@ fceb548a7e7016154447e34d6a6058fe300082c2a149b5ef24109265142c50c3  0006-sunrpc-pr
 959f8e0f86274090901f198cd5a00e94c817bd3f2503e7fe54b039b912c74e45  0009-sunrpc-add-raw-RPC-fuzz-attribution-interface.patch
 6b4904532b376011bb9230cfaa776d87e67b95fb850cb211d7761e821e17d45a  0010-kcov-attribute-deferred-and-async-NFS-server-work.patch
 e98c8f11de4e6e1d5c4c1761f55e6e4ffa01782f692711aa5e338bafcad4f0a2  0011-sunrpc-add-multi-lane-attribution-diagnostics.patch
-2dca411f4641bf89b2c0f91e8f847fc64c1265eda9eea5b7b9fdc85750e87ad5  0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
+eb84e5944cca447406d779c5b226ce293973fb728f67f685e5ad8bd68bf8e5f0  0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch

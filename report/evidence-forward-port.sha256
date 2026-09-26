@@ -1,4 +1,30 @@
-# forward-port configuration artifacts (2026-09-26T21:05:00+09:00)
+# forward-port configuration artifacts (2026-09-26T21:55:00+09:00)
+# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
+#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
+#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
+#   unconditionally, so a forgotten setting can no longer silently reinstate the
+#   whole-section discard that produced extra coverage 0.  A debugfs surface
+#   audit found kcov_remote_dedup was the only option-style entry and there
+#   were no unused entries; everything else is an observation or control surface
+#   in active use.
+#   Patches, both verified to reproduce the built sources from the clean tree:
+#     kernel    0012  suppress repeated PC events in remote sections
+#     syzkaller 0016  derive the coverage output size from the remote cover area
+#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
+#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
+#   remote 795460 -> 229443 under unconditional dedup).
+# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
+#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
+#   the A/B switch is gone: kernel 0012 now applies duplicate suppression
+#   unconditionally, so a forgotten setting can no longer silently reinstate the
+#   whole-section discard.  A debugfs surface audit found kcov_remote_dedup was
+#   the only option-style entry (0 unused entries); the remaining debugfs
+#   entries are observation and control surfaces in active use.
+#   Patches, both versioned and both verified to reproduce the built sources:
+#     kernel    0012  suppress repeated PC events in remote sections
+#     syzkaller 0016  derive the coverage output size from the remote cover area
+#   Evidence: reach-final-async (10/10), reach-final-v1 (sync control 10/10),
+#   frozen-gate8-dedupfinal (gate 28/28; async-normal remote 795460 -> 232905).
 # Regenerated after the S4c syzkaller 0016 patch on 2026-09-26:
 #   PASS 10/10 — async COPY offload hop measured in the syzkaller channel.
 #   Two stacked causes removed, both now versioned patches:
@@ -31,6 +57,29 @@
 #   (88/88/88) and generation lifecycle (11/11/0) unchanged.
 #   S4b diagnosis, S3b extended-window PASS, S3 deferred-resume PASS and the
 #   S4 honest boundary (now fixed at the representation level) all stand.
+# --- S3 deferred-resume spike artifacts (frozen Gate 8) ---
+# --- S3b extended-generation-window spike artifacts (frozen Gate 8) ---
+# --- lane isolation hardening + sh -c quoting guard (Ganesha axis base) ---
+# --- NFS-Ganesha axis (2026-09-26): fixture proven, reach premise rejected ---
+# The deps tarball is a SITE-GENERATED asset and is gitignored; the
+# builder below is its provenance and reproduces the content exactly (the
+# archive bytes differ because tar embeds mtimes).  The original
+# bundle/src/guest-deps.tar.gz is NOT modified and stays the input to the
+# already-recorded AB / S3 / S4 evidence.
+# bab6a9e185c7d0153cd1d25db9d81680d536a767af772ea2966091056a654b65  bundle/src/guest-deps-ganesha.tar.gz
+# builder: root-free .deb -> dependency closure -> injection tree
+# lane fixture: 13 KOOV edits, SERVER_IMPL=knfsd|ganfsd|both
+# gate for the sh -c region: no apostrophe AND it must parse
+# runner: fixture + dedicated deps tarball + portable corpus
+# adapted phase9 validator: knfsd threads OR ganesha live+listening
+# corpus: marker file under shared/ so both servers honour the contract
+# runner gained --fixture-env K=V (how a multi-mode fixture is selected)
+# documentation: axis verdict, the EROFS/pseudoroot divergence, and the
+# six design rules this axis produced, each in code rather than prose
+# --- S4c artifacts (kernel 0012 + syzkaller 0016 + harness) ---
+eb84e5944cca447406d779c5b226ce293973fb728f67f685e5ad8bd68bf8e5f0  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
+ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  bundle/patches/syzkaller/0016-executor-size-coverage-output-from-remote-cover-.patch
+c59a4a7c64b226d3a2e2761934b95ab05534905fc3c1250ae3af25ad71859271  tools/run-reach-adapted-window.py
 636d8cbeb22988d656f3937b57f8cab3baecdb2bf0d4bd7da7ab7642d5b830e7  tools/fport-patch-hygiene.py
 07ec9e2880d961bb116d5951f0a439041e9e0b371e5703232e7dc52b79d584d6  tools/fport-patch-risk.py
 5b0860890526c6e2e35495f34adb385f0a1a73486317a0916adad22d4658cf41  tools/fport-apply.sh
@@ -41,7 +90,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-eafa56e42a60eddcc985e1edb514660c9b0f35c2aea74e531e9ec9efab916b08  report/patch-forward-compat.md
+cf8180e00a4952632f2072a2c4776a202b091e87a64340cb543421ed8a94f6b9  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 b2b47a9e53f4a0babf670115601ce20cdd9da8dabdf24b3183cd342e54cd69d3  tools/ab-lane-fixture-v42.sh
@@ -56,49 +105,16 @@ a2437feb2cc2a4c3f7d383d4c59cc605d4e46c5fdd815860da671af80aa88881  tools/run-reac
 02010f0f4883d15442bc03bb7bd39688eac3374d1956694c1b506602797e2888  bundle/corpus/reach-copy-offload/reach-copy-offload-v1.prog
 07ea8248482a9bfa649821162e29ce68fb76c12b726d3e01c086623d05bf8afd  bundle/corpus/reach-copy-offload/reach-copy-offload.prog
 75d56a5b4de54717b84d161732cc35b7a440a58ad90a52921a95bc4b7f46d3fd  bundle/corpus/reach-copy-offload/reach-copy-offload-hybrid.prog
-# --- S3 deferred-resume spike artifacts (frozen Gate 8) ---
 ddf3a5837286c990baa7c0a81e256a16565f86e54e69520dadc187d94610014a  tools/ab-lane-fixture-gate8.sh
-# --- S3b extended-generation-window spike artifacts (frozen Gate 8) ---
 28e32529348822b3c7f34378187f4a161f623e64c401960d94bd218baa08e634  tools/frozen-phase8-probe-window.c
-64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py
-# --- lane isolation hardening + sh -c quoting guard (Ganesha axis base) ---
 c08af80220080bec887e56127751a64f26fd2aa0e1cdf3b08cf5f70bfbc00e68  tools/ganesha-lane.sh
 a555bdb3d2f8c68b7246831e8fbb010f7b7904e2926e19a1fc8a148e98bf9b8b  tools/lane-quote-lint.sh
 9d2e8803150c277f0cd74fa39f84bf91e67794200a539683a7d3084493f127e7  tools/ganesha-lane-parity.sh
 cac7a2744ba2a95af16d175e5e6221b400700cf730f6ff029a4bb3d65056125a  tools/ganesha-lane-control.sh
-2dca411f4641bf89b2c0f91e8f847fc64c1265eda9eea5b7b9fdc85750e87ad5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
-64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py
-2dca411f4641bf89b2c0f91e8f847fc64c1265eda9eea5b7b9fdc85750e87ad5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
-64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py
-# --- S4c dedup spike artifacts (kernel 0012 + syzkaller 0016 + harness) ---
-2dca411f4641bf89b2c0f91e8f847fc64c1265eda9eea5b7b9fdc85750e87ad5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
-ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  bundle/patches/syzkaller/0016-executor-size-coverage-output-from-remote-cover-.patch
-64c56389d928cbd44b35af6f12e5b8c12c185a5c401fc44671f87ef72a2edfb5  tools/run-reach-adapted-window.py
 bab6a9e185c7d0153cd1d25db9d81680d536a767af772ea2966091056a654b65  bundle/src/guest-deps-ganesha.tar.gz
-
-
-# --- NFS-Ganesha axis (2026-09-26): fixture proven, reach premise rejected ---
-# The deps tarball is a SITE-GENERATED asset and is gitignored; the
-# builder below is its provenance and reproduces the content exactly (the
-# archive bytes differ because tar embeds mtimes).  The original
-# bundle/src/guest-deps.tar.gz is NOT modified and stays the input to the
-# already-recorded AB / S3 / S4 evidence.
-# bab6a9e185c7d0153cd1d25db9d81680d536a767af772ea2966091056a654b65  bundle/src/guest-deps-ganesha.tar.gz
-# builder: root-free .deb -> dependency closure -> injection tree
 96a6c4f73c24cf1ac1a24113978a3c5811897a4b824d3cd1303e0f17af94c377  tools/build-ganesha-deps.sh
-# lane fixture: 13 KOOV edits, SERVER_IMPL=knfsd|ganfsd|both
-c08af80220080bec887e56127751a64f26fd2aa0e1cdf3b08cf5f70bfbc00e68  tools/ganesha-lane.sh
-# gate for the sh -c region: no apostrophe AND it must parse
-a555bdb3d2f8c68b7246831e8fbb010f7b7904e2926e19a1fc8a148e98bf9b8b  tools/lane-quote-lint.sh
-# runner: fixture + dedicated deps tarball + portable corpus
 fd090f45f9838819a6a5ec79a700d45d4123d9b040c3b54f6e011e97e728ee3f  tools/ganesha-lane-run.sh
-# adapted phase9 validator: knfsd threads OR ganesha live+listening
 924dfb52d7bdd0dd2e24ac3c3ca654b98dbdd17e288ed74b1d1737df2551f0c6  tools/run_frozen_phase9_vm_ganesha.py
-# corpus: marker file under shared/ so both servers honour the contract
 1c25d93578d42604fa3b69620e6b853afcf6f5616864ce2e1666c7b80683f494  tools/nfs_remote_kcov_ganesha_v41_workload.prog
-# runner gained --fixture-env K=V (how a multi-mode fixture is selected)
 baaa32c426ed48fef9b1cdb258e64015bddf7f5d324f7a2883cf58ed540b7eef  tools/run_ab_adapted.py
-# documentation: axis verdict, the EROFS/pseudoroot divergence, and the
 59c33dea4674d88ed5ed7c95bdbe80627261aa419d520b46fc6f97bc6f1a3ad9  tools/README.md
-# six design rules this axis produced, each in code rather than prose
-eafa56e42a60eddcc985e1edb514660c9b0f35c2aea74e531e9ec9efab916b08  report/patch-forward-compat.md

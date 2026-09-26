@@ -556,9 +556,9 @@ KOOV 변수를 참조하지 않으므로 `setup` 호출 하나에만 `env` 접�
 
 S4b가 규명한 scratch 용량 초과를 **커널 패치로 직접 해결**했다. dedup이
 드러낸 두 번째 결함(사용자공간 출력 버퍼 6 MiB 한계)까지 규명·정렬한 결과,
-**async COPY offload hop이 syzkaller 채널에서 10/10 계측**된다. 게이트 판정은
-`dedup=1`에서 **PASS**. 원인은 두 단으로 걸려 있었다 — 둘을 함께 제거해야
-async hop이 측정된다.
+**async COPY offload hop이 syzkaller 채널에서 10/10 계측**된다. 원인은 두 단으로
+걸려 있었다 — 둘을 함께 제거해야 async hop이 측정된다. 판정 후 A/B용 런타임
+토글은 **제거**했고(아래 "토글 제거" 참조), 이제 조건 없이 항상 적용된다.
 
 **패치 (kernel 0012, 신규)** — `kcov: suppress repeated PC events in remote
 coverage sections`. `kernel/kcov.c` 1개 파일 +115/-3, 4개 hunk 전부 additive:
@@ -570,9 +570,11 @@ coverage sections`. `kernel/kcov.c` 1개 파일 +115/-3, 4개 hunk 전부 additi
   이미 기록한 PC는 스킵한다. 미스·충돌·이전 섹션 잔재는 **기존대로 append**
   하므로 **구조적으로 새 PC를 누락할 수 없다**(확률적 dedup이 측정 도구로
   부적합한 이유인 조용한 커버리지 손실이 발생하지 않는다).
-- 기본값 **off** = 패치 이전 동작 그대로. `/sys/kernel/debug/kcov_remote_dedup`
-  읽기/쓰기로 **한 부팅 안에서 A/B** 가능. 원격 섹션만 대상(토글을 먼저 검사)
-  이므로 로컬 per-thread 커버리지 계약은 불변.
+- 원격 섹션만 대상으로 하며, 로컬 per-thread 커버리지 계약은 불변.
+- **런타임 토글 없음(무조건 적용).** A/B로 효과가 확정된 뒤 제거했다. 안전한
+  설정을 "명시적으로 요청해야만" 켜지는 스위치는 그 자체가 함정이며, 이를
+  잊으면 이 패치가 없애려던 전량 폐기가 조용히 되살아난다(실제로 그 함정을
+  여러 번 밟았다). 대조 상태는 series에서 이 패치를 빼면 그대로 재현된다.
 
 **패치 검증**: 11-패치 상태(`0148323cb`) worktree에 `git apply` 후 결과가
 빌드된 `kernel/kcov.c`와 **바이트 동일**. 재현성·감사 가능성 유지.
@@ -581,9 +583,13 @@ coverage sections`. `kernel/kcov.c` 1개 파일 +115/-3, 4개 hunk 전부 additi
 `tools/bootstrap-kcov-env.py`는 `rm -rf ~/kcsan-env`를 하므로 재실행하지
 않고 기존 트리에서 증분 build만 수행했다.
 
-**A/B 설계**: 동일 커널(`ea120cbe`) · 동일 코퍼스(`reach-copy-offload.prog`,
-async `copy_file_range` 32MiB) · 동일 `-slowdown=5` 러너 — **유일한 차이는
-`--dedup 0|1` 토글**. 산출물 `~/reach-dedup-evidence-d0/`, `-d1/`.
+**A/B 설계(역사적 기록)**: 당시에는 동일 커널(`ea120cbe`) · 동일 코퍼스
+(`reach-copy-offload.prog`, async `copy_file_range` 32MiB) · 동일 `-slowdown=5`
+러너에서 **유일한 차이를 `--dedup 0|1` 토글로** 두어 판정했다. 산출물
+`~/reach-dedup-evidence-d0/`(대조), `-d1/`(처리), 그리고 토글 제거 후 재검증
+`~/reach-final-async/`(10/10), `~/reach-final-v1/`(대조군 10/10). 토글은 이후
+제거되었으므로 위 표의 두 열은 **과거 재현 절차**이며, 현재 코드로 같은 비교를
+하려면 series에서 0012를 제외해 빌드해야 한다.
 
 | 카운터 (ON, 10 executions) | dedup=0 | dedup=1 | 해석 |
 |---|---|---|---|
@@ -691,6 +697,33 @@ offload hop이 syzkaller 채널에서 10/10 계측된다.**
    원격 집계가 ~466k 엔트리를 넘으면(파생 전 6 MiB 기준) extra가 조용히 잘린다.
 3. **커널 보존** — `tools/bootstrap-kcov-env.py`는 `rm -rf ~/kcsan-env`를
    하므로 절대 재실행하지 않는다(베이스라인 `5b22ba55` 소멸). 증분 build만.
+4. **설정 누락 금지 항목이 하나 줄었다** — dedup은 토글이 없어 항상 적용된다.
+   reach 러너의 `--dedup` 플래그와 게스트 `set-dedup` 단계도 제거되어, 하네스
+   경로에 남은 설정 의존성은 없다(`-slowdown=5`는 상수로 고정).
+
+**debugfs 표면 감사 (2026-09-26)**: 토글 제거와 함께 프로젝트가 만드는 debugfs
+진입점을 전수 점검했다. 결과 **옵션/스위치는 `kcov_remote_dedup` 하나뿐**이었고,
+그 외는 전부 사용 중인 관찰면(`*_stats`·`*_state`·`phase3_connections`)과 제어면
+(`*_control`·`domain_control`)이며 **미사용 항목은 0건**이었다. debugfs 밖의 유일한
+스위치는 syzkaller 0011의 `-remote-cover`(reach 러너 `--mode both/off/on`이 쓰는
+프로젝트 A/B 그 자체)이므로 유지가 맞다.
+
+**Gate 8도 재검증했다 (dedup 무조건 적용, 커널 `e847a515…`)**: probe도 같은 티켓
+경로를 쓰므로 원격 기록량이 줄어든다. `~/frozen-gate8-dedupfinal-evidence9/` —
+**status=pass, 게이트 체크 28/28, 실패 0**:
+
+| 게이트 8 시나리오 | dedup off(과거 기록) | dedup on(현재, PASS) |
+|---|---|---|
+| async-normal remote | 795,460 | **229,443** |
+| deferred-normal remote | 20,987 | **13,574** |
+| async/deferred abort remote | 0 | 0 (정확 드레인 유지) |
+
+첫 시도(`-evidence8/`)는 KCSAN 노이즈로 `status=fail`이었으나 게이트 체크는
+28/28 통과였고, 재실행으로 클린 PASS를 확보했다(§S3b의 KCSAN 거짓 양성 참조).
+
+즉 위 표의 795,460·20,987은 커널 해시와 함께 **역사적 수치**가 되며, 현재
+커널(`e847a515…`)로는 재현되지 않는다. 감소 비율이 reach 채널의 기록량 감소와
+일관되어 dedup이 중복 실행 이벤트를 실제로 억제함을 Gate 8에서도 확인해 준다.
 
 **남은 한계 (정직하게)**: dedup 캐시는 512슬롯 직접매핑이라 *직전 반복*만
 잡고, 10/10은 출력 버퍼 정렬로 얻어진 것이지 캐시 용량 여유로 얻어진 것이
