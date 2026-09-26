@@ -59,7 +59,8 @@ mkdir -p "$BUILD"
 # build and the sanitizer build then both pick them up automatically, which is
 # how a module cannot accidentally be tested without sanitizers.
 UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
-       test_walk:$TEST/test_walk.c:$SRC/walk.c"
+       test_walk:$TEST/test_walk.c:$SRC/walk.c\
+       test_delta:$TEST/test_delta.c:$SRC/delta.c"
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
 for c in "$CC" "$SANCC"; do

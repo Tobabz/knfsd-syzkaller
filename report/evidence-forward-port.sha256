@@ -263,4 +263,8 @@ db12c8831624df19c8da4c89206e94b35ab175e3af63196ef3099f78141b12d1  tools/nfs-prox
 b9529e954658e7da27b20caa3736b995d132d4fba4da2d031245279315f1ead0  tools/nfs-proxy/src/walk.h
 06cb1b5930a4ce0084608286c0d4492e9de9fe0540aa1d71006fa086c2edf4c6  tools/nfs-proxy/src/walk.c
 b0d448924781b59fe67e41b8bf5dbda3fd71d79b9ea9ac37837af21d0c4dfdc7  tools/nfs-proxy/test/test_walk.c
-8594dd3c48924fc75db40e1106c9791d4e6a9ccb5b9dc1ad2970b84bf9e3e514  tools/nfs-proxy/build.sh
+# proxy: self-contained mutation delta + the shared apply path
+57fb2024986cf32551322df2220f2bafca07add1df7e09c1bc8926912aad8d1c  tools/nfs-proxy/src/delta.h
+caeed2f72c44e428230051094ea50003a9d3769a718aa03f55b94393531f20ce  tools/nfs-proxy/src/delta.c
+bc2e856f62dacbd54cc21ba9f998cc9154b107d4e63caece439da9c3a6024287  tools/nfs-proxy/test/test_delta.c
+184c37335294c9a7ef3267e9d25a600ab3e631c1773060a3be42064d993ffb54  tools/nfs-proxy/build.sh
