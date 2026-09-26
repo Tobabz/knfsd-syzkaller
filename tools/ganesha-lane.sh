@@ -117,7 +117,15 @@ if [ -z "$ganesha_port" ]; then
     esac
 fi
 export server_port server_impl tmpfs_size knfsd_port ganesha_port
-export KOOV_GANESHA_ASAN_OPTIONS KOOV_UBSAN_OPTIONS
+# deps is needed inside the sh -c block: the Ganesha FSAL bind-mounts source
+# from the injected tree, and that path must not be hardcoded twice.
+export deps
+# server_ns is read by the ganesha failure diagnostic, which runs inside
+# the separate sh -c; setup_lane assigns it per lane and this marks it for
+# export so the assignment propagates.  Matched as a whole line: a
+# substring test for "export server_ns" also matches the E12 label above.
+export server_ns
+export KOOV_GANESHA_ASAN_OPTIONS KOOV_UBSAN_OPTIONS KOOV_GANESHA_DEBUG
 
 valid_count()
 {
@@ -316,6 +324,7 @@ setup_lane()
     setup_lane_id=$1
     setup_lane_root=$root/lane$setup_lane_id
     setup_server_ns=$(lane_server_ns "$setup_lane_id")
+    server_ns=$setup_server_ns
     setup_client0_ns=$(lane_client_ns "$setup_lane_id" 0)
     setup_client1_ns=$(lane_client_ns "$setup_lane_id" 1)
     setup_server0_link=$(lane_link "$setup_lane_id" s 0)
@@ -330,7 +339,6 @@ setup_lane()
     mkdir -p "$setup_lane_root/server/export" \
         "$setup_lane_root/server/export-ganesha" \
         "$setup_lane_root/server/state/nfs" \
-        "$setup_lane_root/server/state/ganesha" \
         "$setup_lane_root/server/state/rpcbind" \
         "$setup_lane_root/client0/mnt" "$setup_lane_root/client1/mnt"
 
@@ -408,30 +416,155 @@ setup_lane()
         # closes the string early and re-parses the rest as shell code.
         # tools/lane-quote-lint.sh enforces this.
         if [ "$server_impl" = ganesha ] || [ "$server_impl" = both ]; then
-            mkdir -p /var/lib/ganesha
-            mount --bind "$lane_root/server/state/ganesha" /var/lib/ganesha
-            mkdir -p /var/lib/ganesha
+            command -v ganesha.nfsd >/dev/null 2>&1 || {
+                echo "KOOV: ganesha.nfsd not on PATH; inject bundle/src/guest-deps-ganesha.tar.gz" >&2
+                exit 1
+            }
+            command -v dbus-daemon >/dev/null 2>&1 || {
+                echo "KOOV: dbus-daemon not on PATH; Ganesha 4.3 requires a system bus" >&2
+                exit 1
+            }
+            # Ganesha registers itself with rpcbind for every enabled protocol
+            # and treats a failed registration as fatal, so the daemon needs
+            # rpcbind even though a client mounting a pinned port never queries
+            # it.  The knfsd branch above already runs rpcbind -w; it is left
+            # outside that branch for exactly this reason.
+            rpcbind -w
+            mkdir -p /var/lib/nfs/ganesha /run/ganesha
             mount -t tmpfs -o mode=0755,size="$tmpfs_size" \
                 "frozen-phase9-lane$lane-ganesha" \
                 "$lane_root/server/export-ganesha"
             mkdir -p "$lane_root/server/export-ganesha/shared"
             printf "frozen Phase 9 lane %s Ganesha fixture\n" "$lane" > \
                 "$lane_root/server/export-ganesha/shared/fixture"
+            # A system bus, private to this lane.  Ganesha 4.3 calls
+            # dbus_bus_get(DBUS_BUS_SYSTEM) and offers no way to turn that off:
+            # with no bus it logs "DBUS not initialized, service thread
+            # exiting", the thread returns, and the server shuts down again
+            # right after printing NFS SERVER INITIALIZED.  Debian system.conf
+            # would also demand a messagebus user, which a debootstrap guest
+            # does not have, so write a minimal one with no <user> element and
+            # point Ganesha at it through DBUS_SYSTEM_BUS_ADDRESS instead of
+            # the global /run/dbus socket.  Runs as root, per lane, torn down
+            # with the namespace.
+            #
+            # Every step below is guarded rather than left to set -e.  A bare
+            # failing command under set -e kills this block with NO diagnostic
+            # at all, because the output of the block goes to server.log and
+            # the output of the command was sent to a file nothing reads.
+            # That is exactly how one run reported nothing but "lane keeper
+            # exited" and cost a whole guest boot.
+            if ! test -s /etc/machine-id; then
+                lane_machine_id=$(head -c 16 /dev/urandom 2>/dev/null \
+                    | od -An -tx1 2>/dev/null | tr -d " \n" || true)
+                if test -z "$lane_machine_id"; then
+                    lane_machine_id=0123456789abcdef0123456789abcdef
+                fi
+                if ! printf "%s\n" "$lane_machine_id" > /etc/machine-id; then
+                    echo "KOOV: cannot write /etc/machine-id for dbus-daemon" >&2
+                    exit 1
+                fi
+            fi
+            cat > "$lane_root/server/dbus-system.conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>system</type>
+  <listen>unix:path=$lane_root/server/dbus.sock</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+  </policy>
+</busconfig>
+EOF
+            if ! LD_LIBRARY_PATH="$deps/usr/lib/ganesha-extra:$LD_LIBRARY_PATH" \
+                    dbus-daemon --config-file="$lane_root/server/dbus-system.conf" \
+                    --fork --print-address=1 --print-pid=1 \
+                    >"$lane_root/server/dbus.info" 2>&1; then
+                echo "KOOV: dbus-daemon failed to start" >&2
+                test ! -f "$lane_root/server/dbus.info" || \
+                    cat "$lane_root/server/dbus.info" >&2
+                exit 1
+            fi
+            dbus_address=$(sed -n "1p" "$lane_root/server/dbus.info")
+            dbus_pid=$(sed -n "2p" "$lane_root/server/dbus.info")
+            case "$dbus_address" in
+                unix:*) ;;
+                *) echo "KOOV: dbus-daemon did not report a unix address: $dbus_address" >&2
+                   test ! -f "$lane_root/server/dbus.info" || \
+                       cat "$lane_root/server/dbus.info" >&2
+                   exit 1 ;;
+            esac
+            case "$dbus_pid" in
+                ""|*[!0-9]*) echo "KOOV: dbus-daemon pid not a number: $dbus_pid" >&2
+                   exit 1 ;;
+            esac
+            kill -0 "$dbus_pid" 2>/dev/null || {
+                echo "KOOV: dbus-daemon reported pid $dbus_pid but it is gone" >&2
+                test ! -f "$lane_root/server/dbus.info" || \
+                    cat "$lane_root/server/dbus.info" >&2
+                exit 1
+            }
+            printf "%s\n" "$dbus_pid" > "$lane_root/server/dbus.pid"
+            printf "%s\n" "$dbus_address" > "$lane_root/server/dbus.address"
+            # Every key below is verified against the 4.3 parser tables in
+            # src/support/nfs_read_conf.c, because a key in the wrong BLOCK is
+            # not visible locally -- the guest reports it as "Unknown
+            # parameter" only after boot, and silently ignores it:
+            #   * NFS_Protocols is an NFS_CORE_PARAM key (core_options).  The
+            #     export Protocols only RESTRICTS an export; it does not enable
+            #     anything at the core.  Left at its 3,4 default, Ganesha
+            #     tried "Registering NFS V3/UDP" and died there.  Set it to 4
+            #     so no v3 socket is ever allocated or registered.
+            #   * Plugins_Dir is also an NFS_CORE_PARAM key
+            #     (ganesha_modules_loc).  Ganesha 4.3 has no -p option and
+            #     fsal_manager.c builds the path as "%s/libfsal%s.so", so this
+            #     is how the injected VFS plugin is found at all -- and it
+            #     avoids mutating the guest outside this private mountns.
+            #   * Graceless / UseGetpwnam / DomainName / Only_Numeric_Owners
+            #     live in the NFSv4 block (version4_params[]), NOT in
+            #     NFS_CORE_PARAM.  UseGetpwnam must be true because
+            #     GETPWNAMDEF is false in a USE_NFSIDMAP build, and the
+            #     libnfsidmap path died with "Failed initializing ID Mapper"
+            #     (no /etc/idmapd.conf, no nfs keyring).  It is also what this
+            #     lane wants: sec=sys, no_root_squash, numeric owners.
+            #   * The export Protocols list has no 4.1 token; values are
+            #     [3, 4, NFS3, NFS4, V3, V4, NFSv3, NFSv4, 9P].  4.0 vs 4.1 is
+            #     negotiated per session by the client.
+            #   * Pseudo MUST be "/".  With the absolute export path, the 4.3
+            #     log showed "make_pseudofs_node ... CREATE export-ganesha",
+            #     i.e. a pseudo node named after the export: the client root
+            #     then held an "export-ganesha" directory instead of the tree,
+            #     and the corpus path shared/... resolved to ENOENT.  Pseudo = /
+            #     is what matches knfsd, where exportfs $net:$path exposes the
+            #     tree at the mount root.  Getting this wrong cost two guest
+            #     boots: first EROFS on a pseudoroot create, then ENOENT on
+            #     shared/, which looked like two unrelated failures.
             printf "%s\n" \
                 "NFS_CORE_PARAM {" \
                 "    Enable_NLM = false;" \
                 "    Enable_RQUOTA = false;" \
+                "    NFS_Protocols = 4;" \
                 "    NFS_Port = $ganesha_port;" \
                 "    MNT_Port = 0;" \
                 "    Rquota_Port = 0;" \
-                "    Grace_Period = 5;" \
+                "    Plugins_Dir = $deps/usr/lib/ganesha;" \
+                "}" \
+                "NFSv4 {" \
+                "    Graceless = true;" \
+                "    UseGetpwnam = true;" \
+                "    DomainName = localdomain;" \
+                "    Only_Numeric_Owners = true;" \
                 "}" \
                 "EXPORT {" \
                 "    Export_id = 1;" \
                 "    Path = $lane_root/server/export-ganesha;" \
-                "    Pseudo = $lane_root/server/export-ganesha;" \
+                "    Pseudo = /;" \
                 "    Access_Type = RW;" \
-                "    Squash = No_Root_Squash;" \
+                "    Squash = no_root_squash;" \
                 "    Protocols = 4;" \
                 "    Transports = TCP;" \
                 "    SecType = sys;" \
@@ -443,28 +576,74 @@ setup_lane()
                 test -z "${KOOV_GANESHA_ASAN_OPTIONS:-}" || \
                     export ASAN_OPTIONS="$KOOV_GANESHA_ASAN_OPTIONS"
                 export UBSAN_OPTIONS="${KOOV_UBSAN_OPTIONS:-print_stacktrace=1}"
+                export DBUS_SYSTEM_BUS_ADDRESS="$dbus_address"
+                # -N takes a component name; 4.3 uses the NIV_* family.
                 exec ganesha.nfsd -f "$lane_root/server/ganesha.conf" \
+                    -N "${KOOV_GANESHA_DEBUG:-NIV_DEBUG}" \
                     -L "$lane_root/server/ganesha.log"
             ) &
-            ganesha_pid=$!
-            printf "%s\n" "$ganesha_pid" > "$lane_root/server/ganesha.pid"
+            ganesha_shell_pid=$!
             ganesha_hex=$(printf "%04X" "$ganesha_port")
+            # ALIVENESS IS "a ganesha.nfsd PROCESS EXISTS", never "this pid
+            # exists".  The daemon forks once while starting up: a run resolved
+            # $! = pgrep -x ganesha.nfsd = 2597, that intermediate process exited
+            # 0 at once, and the real server went on to log as
+            # nfs-ganesha-2601 -- alive, bound to 2049, and listed by
+            # `ip netns pids`.  The gate watched the intermediate pid and
+            # reported "ganesha exited" for eight consecutive runs while the
+            # server was healthy the whole time.  A gate that watches the wrong
+            # process is worse than no gate: it produces a confident false
+            # negative.
             ganesha_wait=0
-            while test "$ganesha_wait" -lt 150; do
-                kill -0 "$ganesha_pid" 2>/dev/null || {
-                    echo "KOOV: ganesha exited during startup" >&2
+            ganesha_pid=
+            ganesha_listening=0
+            while test "$ganesha_wait" -lt 300; do
+                ganesha_pid=$(pgrep -x ganesha.nfsd 2>/dev/null | head -1)
+                if test -z "$ganesha_pid"; then
+                    ganesha_status=0
+                    echo "KOOV: --- last 40 log lines ---" >&2
+                    test ! -f "$lane_root/server/ganesha.log" || \
+                        tail -n 40 "$lane_root/server/ganesha.log" >&2
+                    echo "KOOV: --- markers ---" >&2
+                    if grep -q "NFS EXIT" "$lane_root/server/ganesha.log" 2>/dev/null; then
+                        echo "KOOV: graceful-exit marker PRESENT" >&2
+                    else
+                        echo "KOOV: graceful-exit marker ABSENT" >&2
+                    fi
+                    echo "KOOV: --- summary (last so tail -80 cannot drop it) ---" >&2
+                    echo "KOOV: no ganesha.nfsd process after $ganesha_wait checks" >&2
+                    echo "KOOV: subshell=$ganesha_shell_pid" >&2
+                    echo "KOOV: netns_pids=$(ip netns pids "$server_ns" 2>/dev/null | wc -l)" >&2
+                    echo "KOOV: netns_pid_list=$(ip netns pids "$server_ns" 2>/dev/null | tr "\n" " ")" >&2
                     exit 1
-                }
-                if grep -qE ":$ganesha_hex 00000000:0000 0A " /proc/net/tcp; then
+                fi
+                # Ganesha binds ":::PORT" (Bind_sockets_V6, v6disabled = 0), so
+                # its listener appears ONLY in /proc/net/tcp6.  "0+:[0]+"
+                # accepts both the 8-digit IPv4 and 32-digit IPv6 remote
+                # address fields; an ESTABLISHED row or another port does not
+                # match.
+                if grep -qE ":$ganesha_hex 0+:[0]+ 0A " \
+                        /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+                    ganesha_listening=1
                     break
                 fi
                 ganesha_wait=$((ganesha_wait + 1))
                 sleep 0.1
             done
-            test "$ganesha_wait" -lt 150 || {
-                echo "KOOV: ganesha never listened on $ganesha_port" >&2
+            if test "$ganesha_listening" -ne 1; then
+                echo "KOOV: --- port state ---" >&2
+                grep -E ":$ganesha_hex " /proc/net/tcp /proc/net/tcp6 >&2 || true
+                echo "KOOV: --- last 40 log lines ---" >&2
+                test ! -f "$lane_root/server/ganesha.log" || \
+                    tail -n 40 "$lane_root/server/ganesha.log" >&2
+                echo "KOOV: --- summary ---" >&2
+                echo "KOOV: alive (pid $ganesha_pid) but not listening on $ganesha_port" >&2
                 exit 1
-            }
+            fi
+            # Record the LIVE pid now that the listener is confirmed, so the
+            # status gate later checks a process that still exists.
+            ganesha_pid=$(pgrep -x ganesha.nfsd 2>/dev/null | head -1)
+            printf "%s\n" "$ganesha_pid" > "$lane_root/server/ganesha.pid"
             touch "$lane_root/server/ganesha.ready"
         fi
         touch "$lane_root/server.ready"
@@ -610,12 +789,24 @@ cleanup_fixture()
                 timeout 30s nsenter -t "$cleanup_server_pid" -m -n -- sh -c \
                     'test ! -e /proc/fs/nfsd/threads || printf "0\n" > /proc/fs/nfsd/threads; exportfs -au 2>/dev/null || true' \
                     2>/dev/null || cleanup_nfsd_leaks=$((cleanup_nfsd_leaks + 1))
-                cleanup_threads=$(nsenter -t "$cleanup_server_pid" -m -n -- \
-                    cat /proc/fs/nfsd/threads 2>/dev/null || printf 'invalid\n')
-                case "$cleanup_threads" in
-                    0) ;;
-                    *) cleanup_nfsd_leaks=$((cleanup_nfsd_leaks + 1)) ;;
-                esac
+                # KOOV: only look for leaked nfsd threads if there IS a kernel
+                # NFS server.  cleanup_fixture read /proc/fs/nfsd/threads and
+                # counted a leak for anything that is not the literal 0; in
+                # ganesha mode that path does not exist, the read failed, the
+                # fallback printed "invalid", and every Ganesha lane was reported
+                # as leaking nfsd resources.  A kernel NFS server that is not
+                # there cannot leak threads.  Same class of knfsd-only
+                # assumption as the runner's server_threads gate.
+                cleanup_nfsd_present=$(nsenter -t "$cleanup_server_pid" -m -n -- \
+                    test -e /proc/fs/nfsd/threads && echo 1 || echo 0)
+                if test "$cleanup_nfsd_present" = 1; then
+                    cleanup_threads=$(nsenter -t "$cleanup_server_pid" -m -n -- \
+                        cat /proc/fs/nfsd/threads 2>/dev/null || printf 'invalid\n')
+                    case "$cleanup_threads" in
+                        0) ;;
+                        *) cleanup_nfsd_leaks=$((cleanup_nfsd_leaks + 1)) ;;
+                    esac
+                fi
             elif namespace_exists "$cleanup_server_ns"; then
                 cleanup_nfsd_leaks=$((cleanup_nfsd_leaks + 1))
             fi
@@ -764,10 +955,15 @@ status_fixture()
                 cat /proc/fs/nfsd/threads)
             test "$status_threads" -ge 2
         fi
+        # Both families: a client of a dual-stack IPv6 listener gets an
+        # AF_INET6 socket, so its ESTABLISHED row lives in
+        # /proc/net/tcp6 even when the peer address is IPv4.  Summing both
+        # tables is a no-op for knfsd (v4 only) and is what makes the
+        # count meaningful for ganesha.
         status_connections=$(nsenter -t "$status_server_pid" -m -n -- awk \
             -v p="$status_port_hex" \
             '$2 ~ ":"p"$" && $4 == "01" { count++ } END { print count + 0 }' \
-            /proc/net/tcp)
+            /proc/net/tcp /proc/net/tcp6)
         test "$status_connections" -ge 2
         # KOOV: Ganesha liveness is an explicit gate.  A Ganesha that died
         # quietly would otherwise be recorded as "no bugs found", which is
@@ -782,10 +978,13 @@ status_fixture()
             test -f "$status_lane_root/server/ganesha.ready"
             status_ganesha_live=1
             status_ganesha_hex=$(printf "%04X" "$ganesha_port")
+            # Ganesha binds ":::PORT" (Bind_sockets_V6, v6disabled = 0),
+            # so its listener is in /proc/net/tcp6 and NOT in
+            # /proc/net/tcp.
             status_ganesha_listen=$(nsenter -t "$status_server_pid" -m -n -- awk \
                 -v p="$status_ganesha_hex" \
                 '$2 ~ ":"p"$" && $4 == "0A" { n++ } END { print n + 0 }' \
-                /proc/net/tcp)
+                /proc/net/tcp /proc/net/tcp6)
             test "$status_ganesha_listen" -ge 1
             status_ganesha_backing=$(nsenter -t "$status_server_pid" -m -n -- \
                 findmnt -n -o SOURCE \

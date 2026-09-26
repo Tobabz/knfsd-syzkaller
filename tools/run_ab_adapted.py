@@ -361,9 +361,20 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
         active_root = root_result.stdout.strip()
         if not re.fullmatch(r"/tmp/frozen-phase9\.[A-Za-z0-9]+", active_root):
             raise ValueError("unsafe fixture root")
+        # Reject anything that is not a bare NAME=value before it can reach a
+        # remote shell; the value may not contain whitespace, so there is no
+        # quoting question to get wrong.
+        for item in args.fixture_env:
+            name, sep, _value = item.partition("=")
+            if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) \
+                    or any(c.isspace() for c in item):
+                raise ValueError("unsafe --fixture-env entry: %r" % item)
+        setup_cmd = [REMOTE_DRIVER + "/lane.sh", "setup",
+                     active_root, str(args.procs)]
+        if args.fixture_env:
+            setup_cmd = ["env"] + list(args.fixture_env) + setup_cmd
         setup = vm.guest(
-            "fixture-setup", shlex.join([REMOTE_DRIVER + "/lane.sh", "setup",
-                                          active_root, str(args.procs)]),
+            "fixture-setup", shlex.join(setup_cmd),
             timeout=300)
         fixture = phase9.validate_fixture_status(
             json.loads(setup.stdout), args.procs)
@@ -554,6 +565,21 @@ def parse_args(argv=None):
                         default=scripts / "frozen_phase1_lane.sh")
     parser.add_argument("--lane-fixture", type=Path,
                         default=scripts / "frozen_phase9_lane.sh")
+    parser.add_argument("--fixture-env", action="append", default=[],
+                        metavar="K=V",
+                        help="Environment for the lane fixture setup "
+                             "invocation only; repeatable.  This is how a "
+                             "multi-mode fixture (tools/ganesha-lane.sh: "
+                             "SERVER_IMPL / SERVER_PORT / KOOV_TMPFS_SIZE) is "
+                             "selected without baking a value into the file. "
+                             "env(1) execs, so the guest process count is "
+                             "unchanged and the fork-capacity budget that "
+                             "tools/ganesha-lane.sh depends on is untouched. "
+                             "Only setup needs it: cleanup_fixture reads none "
+                             "of these variables, and this path never invokes "
+                             "the fixture status action.  The resulting "
+                             "command string is recorded verbatim in "
+                             "trial_evidence.json.")
     parser.add_argument("--workload", type=Path,
                         default=scripts / "nfs_remote_kcov_ab_workload.prog")
     parser.add_argument("--syz-bin", type=Path, default=None,
