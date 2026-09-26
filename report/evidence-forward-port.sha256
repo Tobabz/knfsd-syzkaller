@@ -93,6 +93,26 @@
 #   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
 #   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
 #   remote 795460 -> 229443 under unconditional dedup).
+#   Cliff measurement: the 512-slot suppression window is a partial filter, not
+#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
+#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
+#   .extra 0/10).  The cliff sits between the two, so enlarging the table
+#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
+#   step.
+# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
+#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
+#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
+#   unconditionally, so a forgotten setting can no longer silently reinstate the
+#   whole-section discard that produced extra coverage 0.  A debugfs surface
+#   audit found kcov_remote_dedup was the only option-style entry and there
+#   were no unused entries; everything else is an observation or control surface
+#   in active use.
+#   Patches, both verified to reproduce the built sources from the clean tree:
+#     kernel    0012  suppress repeated PC events in remote sections
+#     syzkaller 0016  derive the coverage output size from the remote cover area
+#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
+#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
+#   remote 795460 -> 229443 under unconditional dedup).
 # Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
 #   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
 #   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
@@ -170,6 +190,8 @@
 # runner gained --fixture-env K=V (how a multi-mode fixture is selected)
 # documentation: axis verdict, the EROFS/pseudoroot divergence, and the
 # six design rules this axis produced, each in code rather than prose
+# proxy foundation: record-marking reassembly + its host test suite
+# build + required sanitizer pass (cannot be skipped silently)
 # --- S4c artifacts (kernel 0012 + syzkaller 0016 + harness) ---
 5ff00be69d56bf00c2dc34da63fcf9aedfcaaf9e657abb5599f7bd7c76481ed5  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
 ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  bundle/patches/syzkaller/0016-executor-size-coverage-output-from-remote-cover-.patch
@@ -186,7 +208,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-52f35bd9f9ec18891a0fc11d725ad0d8cfbd80fc9492ffec8e61a588c41c202b  report/patch-forward-compat.md
+e4a7fb122bb557c09f9c5e696cd8c61c1b925382d668ab1ffa95fc767b140c61  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 b2b47a9e53f4a0babf670115601ce20cdd9da8dabdf24b3183cd342e54cd69d3  tools/ab-lane-fixture-v42.sh
@@ -214,9 +236,7 @@ fd090f45f9838819a6a5ec79a700d45d4123d9b040c3b54f6e011e97e728ee3f  tools/ganesha-
 1c25d93578d42604fa3b69620e6b853afcf6f5616864ce2e1666c7b80683f494  tools/nfs_remote_kcov_ganesha_v41_workload.prog
 baaa32c426ed48fef9b1cdb258e64015bddf7f5d324f7a2883cf58ed540b7eef  tools/run_ab_adapted.py
 59c33dea4674d88ed5ed7c95bdbe80627261aa419d520b46fc6f97bc6f1a3ad9  tools/README.md
-# proxy foundation: record-marking reassembly + its host test suite
 db12c8831624df19c8da4c89206e94b35ab175e3af63196ef3099f78141b12d1  tools/nfs-proxy/src/framing.h
 78ab5a678451e15b164cd72496b4fc3d51a7f961237da5180ae197336191aa6b  tools/nfs-proxy/src/framing.c
 6b856097ec85cb34dee87f9eb95ff3490381b1377d3b41983616e54e24dfbe5f  tools/nfs-proxy/test/test_framing.c
-# build + required sanitizer pass (cannot be skipped silently)
-0bfb53e36467d548ff2dbbfec5f0bd598749f7c503875e57c7bb6aef9001b756  tools/nfs-proxy/build.sh
+8594dd3c48924fc75db40e1106c9791d4e6a9ccb5b9dc1ad2970b84bf9e3e514  tools/nfs-proxy/build.sh
