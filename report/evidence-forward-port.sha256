@@ -13,6 +13,40 @@
 #   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
 #   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
 #   remote 795460 -> 229443 under unconditional dedup).
+#   Cliff measurement: the 512-slot suppression window is a partial filter, not
+#   a bound.  reach-stress-x2 (32 MiB effective copy) passes 10/10 with little
+#   margin; reach-stress-x4 (64 MiB) overflows again (scratch_overflow 10,
+#   .extra 0/10).  The cliff sits between the two, so enlarging the table
+#   (4K-16K slots) or moving to an exact hash set is the evidence-backed next
+#   step.
+# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
+#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
+#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
+#   unconditionally, so a forgotten setting can no longer silently reinstate the
+#   whole-section discard that produced extra coverage 0.  A debugfs surface
+#   audit found kcov_remote_dedup was the only option-style entry and there
+#   were no unused entries; everything else is an observation or control surface
+#   in active use.
+#   Patches, both verified to reproduce the built sources from the clean tree:
+#     kernel    0012  suppress repeated PC events in remote sections
+#     syzkaller 0016  derive the coverage output size from the remote cover area
+#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
+#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
+#   remote 795460 -> 229443 under unconditional dedup).
+# Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
+#   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
+#   the A/B switch is gone.  Kernel 0012 applies duplicate suppression
+#   unconditionally, so a forgotten setting can no longer silently reinstate the
+#   whole-section discard that produced extra coverage 0.  A debugfs surface
+#   audit found kcov_remote_dedup was the only option-style entry and there
+#   were no unused entries; everything else is an observation or control surface
+#   in active use.
+#   Patches, both verified to reproduce the built sources from the clean tree:
+#     kernel    0012  suppress repeated PC events in remote sections
+#     syzkaller 0016  derive the coverage output size from the remote cover area
+#   Evidence: reach-final-async (10/10 .extra), reach-final-v1 (sync control
+#   10/10), frozen-gate8-dedupfinal-evidence9 (gate pass 28/28, async-normal
+#   remote 795460 -> 229443 under unconditional dedup).
 # Regenerated after removing the S4c dedup runtime toggle on 2026-09-26:
 #   PASS 10/10 — async COPY offload hop measured in the syzkaller channel, and
 #   the A/B switch is gone: kernel 0012 now applies duplicate suppression
@@ -80,6 +114,8 @@
 eb84e5944cca447406d779c5b226ce293973fb728f67f685e5ad8bd68bf8e5f0  bundle/patches/kernel/0012-kcov-suppress-repeated-PC-events-in-remote-coverage-.patch
 ead6644e6933751fad2fed87a1b40692099fd21d921b17ec5d6ee02a6fad4d0c  bundle/patches/syzkaller/0016-executor-size-coverage-output-from-remote-cover-.patch
 c59a4a7c64b226d3a2e2761934b95ab05534905fc3c1250ae3af25ad71859271  tools/run-reach-adapted-window.py
+b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068  bundle/corpus/reach-copy-offload/reach-copy-offload-x2.prog
+46d0f4a323f1a69e57be0b81261d67dc0e6082f03a913367570c4f12f0153f79  bundle/corpus/reach-copy-offload/reach-copy-offload-x4.prog
 636d8cbeb22988d656f3937b57f8cab3baecdb2bf0d4bd7da7ab7642d5b830e7  tools/fport-patch-hygiene.py
 07ec9e2880d961bb116d5951f0a439041e9e0b371e5703232e7dc52b79d584d6  tools/fport-patch-risk.py
 5b0860890526c6e2e35495f34adb385f0a1a73486317a0916adad22d4658cf41  tools/fport-apply.sh
@@ -90,7 +126,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-cf8180e00a4952632f2072a2c4776a202b091e87a64340cb543421ed8a94f6b9  report/patch-forward-compat.md
+35806862f69a4a240fa14b617a4caf96dcb34a04aca54115a11ca35cf10f8d8c  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 b2b47a9e53f4a0babf670115601ce20cdd9da8dabdf24b3183cd342e54cd69d3  tools/ab-lane-fixture-v42.sh
