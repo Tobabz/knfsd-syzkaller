@@ -260,6 +260,33 @@ static void test_oversized_fragment_rejected(void)
 	nfsp_framing_free(&f);
 }
 
+/* A preceding non-final fragment can leave less than four bytes of the
+ * message budget.  Subtracting (offset + header) without checking first
+ * wraps size_t and admits an over-limit message. */
+static void test_fragment_header_crosses_limit(void)
+{
+	struct nfsp_framing f;
+	uint8_t msg[10];
+	size_t msglen = 0;
+	int rc;
+
+	printf("second fragment header crosses the message limit\n");
+	put_hdr(msg, 1, 0);
+	msg[4] = 0x31;
+	put_hdr(msg + 5, 1, 1);
+	msg[9] = 0x32;
+	CHECK(nfsp_framing_init(&f, 8) == 0, "init with limit 8");
+	CHECK(nfsp_framing_append(&f, msg, sizeof(msg)) == 0,
+	      "the bounded append admits 10 bytes for inspection");
+	rc = nfsp_framing_peek(&f, &msglen, NULL, NULL);
+	CHECK(rc == -1, "a 10-byte record exceeded the 8-byte limit: rc=%d", rc);
+	CHECK(f.err == NFSP_FRAMING_ERR_FRAG_LEN,
+	      "must report fragment length, not silently accept: %s",
+	      nfsp_framing_strerror(f.err));
+	CHECK(msglen == 0, "failed peek must not expose a complete message");
+	nfsp_framing_free(&f);
+}
+
 /* Append must refuse to grow without bound. */
 static void test_append_bounded(void)
 {
@@ -325,6 +352,7 @@ int main(void)
 	test_zero_length_non_final_is_rejected();
 	test_zero_length_final_is_accepted();
 	test_oversized_fragment_rejected();
+	test_fragment_header_crosses_limit();
 	test_append_bounded();
 	test_many_fragments();
 

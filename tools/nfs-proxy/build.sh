@@ -47,9 +47,9 @@ SANCC=${SANCC:-gcc}
 WARN="-Wall -Wextra -Werror -Wshadow -Wconversion -Wsign-conversion \
 	-Wpointer-arith -Wcast-qual -Wwrite-strings -Wmissing-prototypes \
 	-Wstrict-prototypes -Wformat=2"
-CFLAGS="-std=c11 -O2 -g $WARN"
+CFLAGS="-std=c11 -O2 -g -pthread $WARN"
 SANFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined \
-	-fno-omit-frame-pointer $WARN"
+	-fno-omit-frame-pointer -pthread $WARN"
 
 MODE=${1:-all}
 [ "$MODE" = "--clean" ] && { rm -rf "$BUILD"; echo "cleaned"; exit 0; }
@@ -60,7 +60,8 @@ mkdir -p "$BUILD"
 # how a module cannot accidentally be tested without sanitizers.
 UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_walk:$TEST/test_walk.c:$SRC/walk.c\
-       test_delta:$TEST/test_delta.c:$SRC/delta.c"
+       test_delta:$TEST/test_delta.c:$SRC/delta.c\
+       test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c"
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
 for c in "$CC" "$SANCC"; do
@@ -143,6 +144,13 @@ else
 	for unit in $UNITS; do
 		run_unit "${unit%%:*}"
 	done
+fi
+
+if [ "$MODE" != "--test" ]; then
+	echo "=== build: relay-only nfs-proxy executable ($CC) ==="
+	# shellcheck disable=SC2086
+	$CC $CFLAGS -I"$SRC" -o "$BUILD/nfs-proxy" \
+		"$SRC/main.c" "$SRC/proxy.c" "$SRC/framing.c"
 fi
 
 echo "=== host test suite: PASS ==="

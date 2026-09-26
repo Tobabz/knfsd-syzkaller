@@ -128,8 +128,12 @@ int nfsp_framing_peek(struct nfsp_framing *f, size_t *msglen, size_t *nfrags,
 			f->err = NFSP_FRAMING_ERR_ZERO_FRAG;
 			return -1;
 		}
-		/* Header + body must fit the message budget. */
-		if ((size_t)body_len > f->limit - (off + NFSP_FRAG_HEADER_LEN)) {
+		/* Check the header itself before subtracting.  After a non-final
+		 * fragment, off may already be too close to limit; subtraction
+		 * would underflow and incorrectly admit an oversized record. */
+		if (off > f->limit ||
+		    f->limit - off < NFSP_FRAG_HEADER_LEN ||
+		    (size_t)body_len > f->limit - off - NFSP_FRAG_HEADER_LEN) {
 			f->err = NFSP_FRAMING_ERR_FRAG_LEN;
 			return -1;
 		}

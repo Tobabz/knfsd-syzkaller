@@ -252,7 +252,7 @@ static int read_full(int fd, uint8_t *p, size_t n)
 		ssize_t r = read(fd, p + got, n - got);
 
 		if (r == 0)
-			return 0;	/* clean EOF */
+			return got == 0 ? 0 : -1;	/* short record != clean EOF */
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;

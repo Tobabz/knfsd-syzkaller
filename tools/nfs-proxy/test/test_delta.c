@@ -479,6 +479,30 @@ static void test_corrupt_file_refused(void)
 	      "a truncated record must be refused, not returned as valid");
 	nfsp_delta_read_close(rd);
 	unlink(path);
+
+	/* A short fixed-size record HEADER must not masquerade as clean EOF.
+	 * Earlier, read_full returned 0 even after reading a partial header;
+	 * the reader then accepted a crash-torn last rule as a complete file. */
+	tmpfile_path(path, sizeof(path), "partial-header");
+	{
+		struct nfsp_delta_writer *w2 = NULL;
+		FILE *af;
+
+		CHECK(nfsp_delta_write_open(&w2, path, 0) == 0,
+		      "create valid delta file header");
+		CHECK(nfsp_delta_write_close(w2) == 0,
+		      "close empty delta before appending a torn header");
+		af = fopen(path, "ab");
+		CHECK(af != NULL, "open to append torn header");
+		CHECK(fwrite("\x01\x02\x03", 1, 3, af) == 3,
+		      "append exactly three bytes of a record header");
+		CHECK(fclose(af) == 0, "close torn delta");
+	}
+	CHECK(nfsp_delta_read_open(&rd, path) == 0, "valid file header remains readable");
+	CHECK(nfsp_delta_read_rule(rd, &r) == -1,
+	      "three-byte record header is corruption, not clean EOF");
+	nfsp_delta_read_close(rd);
+	unlink(path);
 }
 
 int main(void)

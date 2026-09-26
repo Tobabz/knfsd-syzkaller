@@ -1,0 +1,55 @@
+#ifndef NFSP_PROXY_H
+#define NFSP_PROXY_H
+
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define NFSP_CLIENTS 2u
+#define NFSP_BACKENDS 2u
+#define NFSP_DIR_C2S 0
+#define NFSP_DIR_S2C 1
+
+/* One listening address per backend.  Routing is the accepting listener,
+ * never arrival order or an RPC field.  Both client source addresses must be
+ * explicit: otherwise a four-connection test could all be one client. */
+struct nfsp_route {
+	const char *listen_ip;
+	uint16_t listen_port;
+	const char *backend_ip;
+	uint16_t backend_port;
+};
+
+struct nfsp_proxy_stats {
+	uint16_t bound_port[NFSP_BACKENDS];
+	uint32_t accepted[NFSP_CLIENTS][NFSP_BACKENDS];
+	uint32_t connected[NFSP_CLIENTS][NFSP_BACKENDS];
+	uint32_t connect_failed[NFSP_CLIENTS][NFSP_BACKENDS];
+	uint32_t records[NFSP_CLIENTS][NFSP_BACKENDS][2];
+	uint32_t delivered[NFSP_CLIENTS][NFSP_BACKENDS][2];
+	uint32_t framing_errors, relay_errors, mutation_errors, rejected_client;
+	uint32_t active, peak_active;
+};
+
+struct nfsp_proxy_cfg {
+	struct nfsp_route route[NFSP_BACKENDS];
+	const char *client_ip[NFSP_CLIENTS];
+	size_t msg_limit;  /* zero chooses NFSP_MSG_LIMIT_DEFAULT */
+	unsigned connect_timeout_ms; /* zero chooses a finite default */
+	_Atomic int *stop;
+	/* The only place a complete record can be changed.  The callback must
+	 * preserve its length.  Negative means refuse this record and close this
+	 * connection, without forwarding unverified bytes.  NULL is pure relay. */
+	int (*on_record)(unsigned client, unsigned backend, int dir,
+			 uint8_t *record, size_t len, void *arg);
+	void *on_record_arg;
+};
+
+/* on_ready runs after BOTH listeners bind.  Its stats pointer is valid until
+ * run returns; callers must synchronize before reading counters concurrently. */
+int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
+		   struct nfsp_proxy_stats *stats,
+		   void (*on_ready)(const struct nfsp_proxy_stats *, void *),
+		   void *ready_arg);
+
+#endif
