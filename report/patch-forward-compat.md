@@ -1075,15 +1075,56 @@ KOOV_BUNDLE         repo의 bundle/patches (R6의 SHA256SUMS·series 검사 대�
 | R5 evidence-chain-general | PASS | status=PASS integrity=True share=100% sets=6/6 |
 | R6 apply-audit | PASS | sha256 bundles=2/2 kernel_pins=**12/12 match=True** syz_pins=**16/16 match=True** |
 
-**남은 정직한 미결 — env manifest 드리프트**: `~/kcsan-env/manifest.json`은 여전히
-11/15 · `5b22ba55`를 기술한다. bake 도구(`bootstrap-kcov-env.py`)는 pins가 바뀌면
-커널 재빌드·이미지 재-bake를 강제하므로(`bake_reuse`가 `not kernel_rebuilt`를 요구),
-제자리 갱신이 설계상 불가능하고, 재-bake는 새 bzImage 해시를 만들어 S4c 증거
-(`d983642b`)와 커널을 갈라놓는다. 그래서 이번 재검증은 **번들 수준**이며, env
-bake 수준 재검증(옵션 A)은 별도 타깃에서 수행할 **미결 항목으로 기록**한다.
-bake 시점 `stage_verify`의 `/proc/kallsyms` KCSAN 검사는 이번 커널에 대해 재실행하지
-않았고, 대신 **AB 4개 트라이얼 모두 KCSAN 리포트가 관측**(1/2/1/1건)되어
-현재 커널에서 sanitizer가 살아 있음을 실측으로 대체했다.
+**env bake 수준 재검증 — 완료 (옵션 A, 별도 타깃)**: `~/kcsan-env/manifest.json`이
+드리프트한 채로 남는다는 위 문제를, 기존 환경을 보존한 채 **별도 타깃을 재-bake**해
+해소했다. `tools/bootstrap-kcov-env.py`로 base `93f51579` + **12패치**(KCSAN config)와
+syzkaller base `801f0966` + **16패치**를 새로 적용·빌드·bake·verify했다:
+
+```
+~/kcsan-env-0012/
+  kernel.head    02102ee2…      bzImage 6d1cbd50…      vmlinux d2a133ed…
+  syzkaller.head 8c190108…
+  manifest.json  status=pass · pins 12/16 · verify: mem_sanitizer=kcsan
+                 ← bake 시점 stage_verify(/proc/kallsyms)가 이 커널에 대해 실제 실행됨
+```
+적용 내용을 baked 소스에서 직접 확인: 커널 `KCOV_REMOTE_DEDUP_BITS 14`(16384슬롯) ·
+`kvcalloc` · **런타임 토글 없음**, syzkaller `kRemoteCoverCallHeadroom` 파생식 ·
+하드코딩 6 MiB 제거 — 즉 현재 번들과 내용이 일치한다.
+
+- **AB 재수집(baked env 자신의 실행기·vmlinux)**: `status=PASS`,
+  `off fs/nfsd=0 → on=1741`, converged/controls_equal/integrity true, share 100%.
+- **게이트(env-bake 수준)**: `~/kcsan-verify-0012-baked/` (baked manifest +
+  `env/linux/.config` + 그 env의 AB evidence, `KOOV_BUNDLE`=repo):
+  R1~R6 **전부 PASS → DESIGN HOLDS**. R1은 이번에는 bake의 `status=pass`와
+  `stage_verify`를 근거로 삼는다(이전 재검증에서 대체 증거로 미뤄둔 부분).
+
+**커버리지 집합 안정성 — 세 커널 대조**: 같은 일반 코퍼스에서 `fs/nfsd on_only` /
+`net/sunrpc on_only`가 커널 세대를 넘어 안정적이다:
+
+| 커널 | 성격 | fs/nfsd on_only | net/sunrpc on_only |
+|---|---|---|---|
+| `5b22ba55` | 직전 KCSAN(11패치) | 1750 | 307 |
+| `d983642b` | 수동 확장(12패치) | 1744 | 303 |
+| `6d1cbd50` | **bake(12패치)** | **1742** | **300** |
+
+편차 ~0.5% 이내로, dedup과 패치 추가가 원격 커버리지 집합을 잃지 않음을
+독립적으로 확인해 준다.
+
+**커널 2세대 공존 — 역할 분리(문서화)**: 같은 패치 내용이라도 빌드가 달라 해시가
+다르므로, 증거 귀속을 다음과 같이 고정한다.
+
+```
+d983642b (수동 확장 트리, ~/kcsan-env)
+   → S4c 판정(10/10) · Gate 8 28/28 · cliff 실측(x2/x4) · S4b/S4c 증거가 묶인 커널
+6d1cbd50 (bake, ~/kcsan-env-0012)
+   → bake + stage_verify + env 수준 게이트가 묶인 커널
+5b22ba55 → 최초 베이스라인(S3/S4 원 기록)
+```
+세 커널 모두 **이름을 재사용하지 않고** 보존한다(`bzImage-baseline-5b22ba55`,
+`bzImage-dedup-0012v3`, `kcsan-env-0012/linux/arch/x86/boot/bzImage`).
+`~/kcsan-env/manifest.json`은 11/15 · `5b22ba55`를 기술한 채 남지만, 이제는
+"bake 수준 주장은 `~/kcsan-env-0012`가 담당"한다고 명시함으로써 stale 상태가
+검증 공백이 되지 않도록 한다.
 
 ---
 
