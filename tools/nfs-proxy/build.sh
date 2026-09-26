@@ -58,7 +58,8 @@ mkdir -p "$BUILD"
 # A unit is a name plus the sources that make it up.  Add new modules here; the
 # build and the sanitizer build then both pick them up automatically, which is
 # how a module cannot accidentally be tested without sanitizers.
-UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c"
+UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
+       test_walk:$TEST/test_walk.c:$SRC/walk.c"
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
 for c in "$CC" "$SANCC"; do

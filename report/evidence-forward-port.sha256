@@ -239,4 +239,8 @@ baaa32c426ed48fef9b1cdb258e64015bddf7f5d324f7a2883cf58ed540b7eef  tools/run_ab_a
 db12c8831624df19c8da4c89206e94b35ab175e3af63196ef3099f78141b12d1  tools/nfs-proxy/src/framing.h
 78ab5a678451e15b164cd72496b4fc3d51a7f961237da5180ae197336191aa6b  tools/nfs-proxy/src/framing.c
 6b856097ec85cb34dee87f9eb95ff3490381b1377d3b41983616e54e24dfbe5f  tools/nfs-proxy/test/test_framing.c
+# proxy: structural walk -- certain fields vs explicitly unclaimed regions
+b9529e954658e7da27b20caa3736b995d132d4fba4da2d031245279315f1ead0  tools/nfs-proxy/src/walk.h
+06cb1b5930a4ce0084608286c0d4492e9de9fe0540aa1d71006fa086c2edf4c6  tools/nfs-proxy/src/walk.c
+b0d448924781b59fe67e41b8bf5dbda3fd71d79b9ea9ac37837af21d0c4dfdc7  tools/nfs-proxy/test/test_walk.c
 8594dd3c48924fc75db40e1106c9791d4e6a9ccb5b9dc1ad2970b84bf9e3e514  tools/nfs-proxy/build.sh
