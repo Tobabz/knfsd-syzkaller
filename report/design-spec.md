@@ -189,6 +189,50 @@ tools/fport-design-gate.sh -v         # 상세 수치 출력
 3. **증거·판정**: R2~R5 는 KCSAN 커널에서 새로 산출한 AB 증거로 평가한다.
    같은 실행 계약(`--executions 30 --trials 2`)과 게이트 임계값이 적용된다.
 
+### KCSAN 타깃 실증 (2026-09-26)
+
+첫 KCSAN 타깃을 처음부터 빌드·검증했다. 검증 산출물은 사이트 로컬
+`~/kcsan-env`(빌드)·`~/kcsan-evidence`(AB 증거)이며, 재생산 절차는 위 §7 절차를
+따른다 (둘 다 `.gitignore` — 증거는 항상 재생산 가능).
+
+- **빌드**: `KOOV_KCONFIG=bundle/patches/kernel-kcsan.config` 핀(sha256
+  `7073037d1d33…`) · 커널 `93f51579` · syzkaller `801f09666` · 패치 11/11·15/15 ·
+  bake+verify 통과. `stage_verify` 판정: `verify.mem_sanitizer=kcsan`
+  (Kconfig `CONFIG_KCSAN=y` 와 `/proc/kallsyms`의 `kcsan_setup_watchpoint`
+  계열 런타임 심볼(97개) 교차 확인; `target_kcsan=true`).
+- **AB 증거** (KCSAN 커널, OFF/ON × 2 trials × 30 실행):
+
+  | 지표 | OFF | ON |
+  |---|---|---|
+  | fs/nfsd — 고유 심볼화 PC, 중앙값 | 0 | 1742 |
+  | fs/nfs — 평균 | 1810.5 | 1808 |
+  | net/sunrpc — 평균 | 594 | 877 |
+  | exec/s — 평균 | 5.63 | 5.31 |
+  | rpc/s — 평균 | 291.4 | 274.9 |
+  | KCSAN 리포트 수 — 평균 (trial 별 1/0/0/0) | 0.5 | 0 |
+
+  `all_trials_converged=true` · `controls_equal_except_remote_toggle=true`.
+  (KCSAN 계측 오버헤드로 exec/s 는 KASAN 실행보다 낮게 기록되나, R3 철회로
+  판정 입력이 아니다 — 참고 수치.)
+- **KCSAN 발견 실적**: trial off-01 의 부팅 후 12.175s 지점에서
+  `BUG: KCSAN: data-race in d_alloc_parallel / lookup_open` — VFS dcache
+  동시 `open()` 경로의 4바이트 write/read 레이스(과제 147 cpu3 / 과제 149 cpu1).
+  비치명 발견으로 trial 은 PASS 유지(수렴·게이트 무영향) — §7 주의 사항의
+  실증 사례.
+- **게이트 판정** (KCSAN 증거 — 스테이징 루트 `env/`·`evidence/`):
+
+  | 요구사항 | 판정 | 증거 |
+  |---|---|---|
+  | R1 build-integrity | PASS | status=pass mem_sanitizer=kcsan |
+  | R2 remote-contribution | PASS | off fs/nfsd=0 on fs/nfsd=1742 converged controls_eq |
+  | R4 coverage-depth-general | PASS | fs/nfsd.on_only=1742 net/sunrpc.on_only=309 ranked_rows=411 nfsd4_proc_compound |
+  | R5 evidence-chain-general | PASS | status=PASS integrity share=100% sets=6/6 |
+  | R6 apply-audit | PASS | bundles=2/2 kernel_pins=11/11 syz_pins=15/15 |
+
+  → **DESIGN HOLDS**: 전 활성 게이트 통과, `fport-pipeline.sh --mode reuse`
+  전체 PASS (exit 0). KASAN 타깃과 동일한 임계값으로 **두 새니타이저 모두
+  검증**되었다 (KASAN: fs/nfsd on=1750 · 이 KCSAN: on=1742).
+
 ---
 
 ## 8. 성능 게이트 R3 철회 (2026-09-26)
