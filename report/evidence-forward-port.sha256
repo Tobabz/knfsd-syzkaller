@@ -1,8 +1,11 @@
-# forward-port configuration artifacts (2026-09-26T16:12:00+09:00)
-# Regenerated after S3b extended-generation-window spike on 2026-09-26:
-#   PASS — async COPY offload hop stays attributed under an extended 15s
-#   GENERATION window (frozen Gate 8, evidence7; async-normal remote 795460).
-#   S3 deferred-resume PASS (evidence4) and S4 honest boundary stand.
+# forward-port configuration artifacts (2026-09-26T19:05:00+09:00)
+# Regenerated after S4b syz-channel diagnosis on 2026-09-26:
+#   DIAGNOSIS — syz-channel async COPY extra=0 is a remote scratch capacity
+#   overflow (1,048,575-entry ceiling hit exactly, fault_scratch_limit=0),
+#   not a window or admission failure (grant/start/stop 88/88, generation
+#   committed 11/11).  reach-window-evidence7.
+#   S3b extended-window PASS, S3 deferred-resume PASS, S4 honest boundary
+#   (now mechanism-localized) all stand.
 # Entries use repo-relative paths (tools/, report/, bundle/).  Root
 # README.md and LICENSE are intentionally OUTSIDE this evidence list
 # (root README/LICENSE lists are not hashed here).
@@ -17,7 +20,7 @@ b1dbe9b5b08a7348c946914a9f1748c536d9360b1c218bd486ce42b3c9467260  tools/portabil
 6023680250e6ef1f07c026f6ac237b799d5d1398cc6ca01a3177b4c25d9d2d23  tools/rename-scripts.py
 18da17cad37611e24d4a837f53c76b4ac7be747625355c581c39a857017b51ff  tools/check-rename-leftovers.sh
 196e02ac66f73190f1de6dcc8ac1926925cded784661150fa0ca1b50620d011b  tools/bootstrap-kcov-env.py
-96a718ef21152fe0ab1980809580f5c1dc2fbeebaa5c75e5491f51f17aeaf662  report/patch-forward-compat.md
+0981e141cf9087078ea37f20fb5daa670a99d3f2bd6595c9d5dfaa23ed8da691  report/patch-forward-compat.md
 115bd403e2e405fdda593d972ba4075372d6b93de4abfe95e671a24eb80f2ece  report/design-spec.md
 d6d3d0da9933841faadc790b5cf87c9e15510d823ace345fd95ed6a0196374a2  report/script-rename-map.md
 # --- S4 reach-corpus artifacts (reach-copy-offload) ---
@@ -37,3 +40,5 @@ a2437feb2cc2a4c3f7d383d4c59cc605d4e46c5fdd815860da671af80aa88881  tools/run-reac
 ddf3a5837286c990baa7c0a81e256a16565f86e54e69520dadc187d94610014a  tools/ab-lane-fixture-gate8.sh
 # --- S3b extended-generation-window spike artifacts (frozen Gate 8) ---
 28e32529348822b3c7f34378187f4a161f623e64c401960d94bd218baa08e634  tools/frozen-phase8-probe-window.c
+# --- S4b syz-channel diagnosis artifacts (extended generation window) ---
+ca3a3874dbb2924b3319c7f109ea35376897170613576e307d57c9c894778848  tools/run-reach-adapted-window.py

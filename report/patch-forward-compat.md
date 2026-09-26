@@ -336,6 +336,122 @@ S4의 syz-executor 채널 extra=0은 채널 특이(실행기 세션 수명 관�
 
 ---
 
+### S4b 스파이크 판정 — syz 채널 async COPY 미계측 원인 특정: 원격 scratch 용량 초과 (2026-09-26)
+
+S3b의 후속 질문("probe 채널이 아니라 **syz 채널**로 async COPY를 계측하고 싶다")
+에 대한 답을 experimentally 확정했다. 결론: **윈도우가 원인이 아니며, 원격
+scratch 용량 초과가 원인이다.** S4가 기록한 "정직 경계"는 이제 메커니즘 수준으로
+좁혀졌다.
+
+**Q1. 그 윈도우는 syzkaller의 윈도우인가?** → **아니다.** upstream syzkaller에는
+generation 개념이 없다. 이 저장소의 syzkaller은 §3의 syzkaller 패치 18종으로
+커널 세션 ABI(`ioctl 'c' 109~112`)를 사용하도록 패치되어 있으며, **syz-executor도
+probe와 동일한 커널 generation 세션을 구동한다.** 차이는 숫자뿐이다:
+
+| 구동자 | 세션 시작 | FINISH 드레인 | 비고 |
+|---|---|---|---|
+| frozen probe (Gate 8) | `GENERATION_BEGIN` | `5000ms` (ABI 상한) | + 선택 hold |
+| syz-executor (S4) | 프로그램마다 BEGIN | `min(1000 × slowdown, 5000)ms` | 러너가 `-slowdown=1` 하드코딩 → 1000ms |
+
+`tools/run-reach-adapted.py:388`의 `-slowdown=1`이 1000ms를 만들므로, 재빌드 없이
+플래그만으로 5000ms(ABI 최대)까지 올릴 수 있었다.
+
+**Q2. 기존 S4 로그는 무엇을 말하는가?** — 재분석 결과, **extra=0은 드레인 실패가
+아니다.** `reach-copy-evidence3/remote_on/trial_01/executor.log`(1037줄) 전문에서
+executor의 실패 진단 문자열이 **0건**이다:
+`KCOV generation begin failed` / `... begin returned generation zero` /
+`... bind failed` / `... finish failed` 모두 부재 → BEGIN·BIND·FINISH가 모두
+성공했다. `.extra` 부재는 게시 불가(abort) 경로가 아니라 **"빈 창"** 경로
+(`write_extra_output()`의 `cover_collect()` 결과 size==0)였다.
+
+**재현 실행** — `tools/run-reach-adapted-window.py`(신규 사본, 원본
+`run-reach-adapted.py` `2f3b8cea…` 대비 3곳 변경):
+1. `-slowdown=1` → `-slowdown=5` (FINISH 드레인 1000ms → 5000ms, ABI 상한)
+2. ON `.extra` 개수 부전 검사를 **raise 해제**하고 기록만 — 원래 이 raise가
+   `phase9.wait_for_drains()` **앞에서** 실행을 끊어 S4 evidence3/4에 서버측
+   드레인 카운터가 아예 없었다(관측 공백의 직접 원인)
+3. `validate_gate`의 `extra_files_exact`는 그대로 실패시키므로 판정 의미 불변
+
+코퍼스 `reach-copy-offload.prog`(11콜, async `copy_file_range` count 32MiB ←
+ftruncate 16MiB 소스), `--mode on --trials 1 --executions 10 --procs 2`,
+`KOOV_EXPECTED_CALLS=11`(첫 실행은 S4용 10 콜 설정残り 때문에 `CALL 10`에서
+로그 검증이 실패했다 — 설정 문제이며 코퍼스/채널 무관). 산출물
+`~/reach-window-evidence7/`.
+
+**판정**: `coverage_loss_zero`, `extra_files_exact`, `remote_result_integrity`
+3항목 실패(extra 여전히 0)이지만, **이번에는 드레인 카운터가 수집됐다.** 그
+카운터가 원인을 확정한다:
+
+| 카운터 (ON, 10 executions) | 값 | 해석 |
+|---|---|---|
+| `generation_begin` / `committed` / `aborted` | 11 / 11 / 0 | 세션 수명 전부 정상 종료 |
+| `mapping_exact_owner_match` / `mismatch` | 88 / 0 | 소유자 매핑 전부 일치 |
+| `remote_start_granted` / `ok` / `stop` | 88 / 88 / 88 | **귀속 자체는 88회 전부 성공** |
+| `remote_start_nested` / `incomplete` | 0 / 0 | 중첩·불완전 진입 없음 |
+| `remote_section_created` / `completed` / `discarded` | 88 / 78 / **10** | 실행당 1개가 폐기 |
+| `fault_scratch_limit` | **0** | 주입된 fault 아님 — 진짜 용량 초과 |
+| `scratch_overflow` | **10** | 실행당 1회 용량 초과 |
+| `scratch_trace_entries` | 18,709,479 | 제출된 총 엔트리 |
+| `aggregate_entries_merged` | 8,223,729 | 실제 병합된 엔트리 |
+| `aggregate_merge_truncated` | 0 | 병합 측 용량은 충분 |
+| `remote_result_valid` / `incomplete` | 11 / **10** | 10개 세션이 INCOMPLETE로 강등 |
+| `aggregate_quarantined` / `publish_suppressed` | 10 / **10** | **게시 억제(fail-closed)** |
+| `aggregate_published` / `entries_published` | 1 / **0** | 게시된 엔트리 0 |
+| `owner_lane_match` / `cross_lane_attribution` | 78 / 0 | 레인 귀속 정상 |
+| `extra_files` (expected 10) | **0** | 사용자공간에 빈 영역 → 파일 미작성 |
+
+**용량 초과 증명(정확히 일치)** — `request_area_capacity()`
+(kernel/kcov_request.c:699)는 TRACE_PC 모드에서 `size - 1`을 반환하고,
+`ticket->scratch_size = ctx->kcov->remote_size`(kernel/kcov.c:2014)이며
+`kExtraCoverSize = 1024 << 10`(executor/common_linux.h:13) = 1,048,576이다.
+
+```
+용량          = 1,048,576 - 1 = 1,048,575 엔트리
+버려진 엔트리 = 18,709,479 - 8,223,729 = 10,485,750
+초과 횟수     = 10
+10,485,750 / 10 = 1,048,575  ← 용량과 정확히 일치 ✔
+정상 섹션 평균 = 8,223,729 / 78 = 105,432 엔트리
+```
+
+즉 **async COPY kthread 섹션 하나가 원격 scratch 천장(1,048,575)을 정확히 채우고
+넘쳤다.** `kcov_request_generation_merge_scratch()`가 `src_entries`를 용량으로
+잘라 `overflow=true`를 세우고 → `kcov_request_remote_degrade(...,
+KCOV_REQUEST_REMOTE_INCOMPLETE, ..._SCRATCH_OVERFLOW)`로 세션을 강등 →
+`remote_section_discarded`·`aggregate_quarantined`·`aggregate_publish_suppressed`가
+각 10 → 사용자에게는 **빈 영역**이 전달되어 `.extra` 파일이 생성되지 않는다.
+
+**인과 사슬**:
+
+```
+async COPY kthread 섹션의 원격 기록량 > scratch 용량(1,048,575)
+   └─ merge_scratch: src_entries = capacity 로 절단, overflow=true
+        └─ remote_degrade(INCOMPLETE, SCRATCH_OVERFLOW)   ← 부분 커버리지 게시 금지 설계
+             ├─ remote_section_discarded += 1  (실행당 1회, 총 10)
+             ├─ aggregate_quarantined / publish_suppressed += 1
+             └─ aggregate_entries_published += 0
+                  └─ 사용자공간 area 비어 있음 → cover_collect().size==0
+                       └─ .extra 파일 미작성 → extra_files=0   ← S4의 관측값
+```
+
+**판정 요약**: S4의 extra=0은 (a) 윈도우 부족도, (b) 귀속 실패도 아니다 —
+**귀속은 88/88 성공했고, 기록이 scratch 용량에서 잘린 뒤 fail-closed로 게시가
+억제된 것**이다. 따라서:
+- **윈도우 확장(S3b, `-slowdown=5`)은 이 증상의 해법이 아니다** — 드레인은 이미
+  성공하고 있었다(`generation_committed=11, aborted=0`). 실행은 이 결론을
+  실증했다(extra 여전히 0, 단 드레인 카운터는 확보).
+- S4 코퍼스의 async COPY는 count 32MiB로 probe의 4MiB보다 작업량이 크다. 정상
+  RPC 섹션 평균 105,432 엔트리에 비해 async 섹션은 용량을 초과하므로, 기록량
+ (unique PC인지 반복 기록인지 포함)이 작업량에 비례하는지 여부는 아직 미구분 —
+  다음 스파이크의 대상이다.
+- 해법 후보: (i) `kExtraCoverSize` 상향(syzkaller 컴파일타임 상수 → executor
+  재빌드 필요), (ii) overflow 시 절단본 게시로 정책 변경(커널), (iii) 코퍼스
+  작업량 축소로 임계 아래로(재빌드 0, 코퍼스 사본으로 즉시 시험 가능).
+  이 문서 범위(재빌드·커널 수정 금지)에서는 (iii)만 즉시 실행 가능하다.
+
+`kcsan_reports=0`, fixture cleanup 무누수, `base_image.unchanged=true`.
+
+---
+
 ## 7. 파이프라인 자동화 — `tools/fport-pipeline.sh`
 
 체크리스트(§5) 전체를 하나의 결정적 런으로 엮는 오케스트레이터. **설계 게이트(§4)가 최종 권위**이고, 패치 적용은 그 중간 구현 단계일 뿐입니다.
