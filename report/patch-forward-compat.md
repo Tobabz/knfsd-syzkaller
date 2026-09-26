@@ -266,8 +266,75 @@ S4의 관측(비동기 COPY만 extra=0, 동기-only 대조는 extra=10)은
 특이**로 판정 범위가 좁혀졌다. 후속 과제: async 특이를 별도 스파이크로
 격리해 원인(세션 파괴/중단 시점)을 좁힌다(S4 후속으로 이미 기록됨).
 
----
+### S3b 스파이크 판정 — 확장 GENERATION 윈도우: async COPY hop 귀속 유지 (2026-09-26)
 
+S3의 후속 과제("async 특이를 별도 스파이크로 격리") 이행 — 옵션 B대로
+**GENERATION 수집 윈도우를 확장**해 async COPY offload hop이 원격 커버리지에
+잡히는지 재판정했다. 결과는 **PASS — 확장 윈도우에서도 async hop 귀속 유지**
+(async-normal remote_entries=795460).
+
+**커널 상한 발견 (FINISH 윈도우는 5000ms 하드 캡)**: probe의
+`.timeout_ms`는 소스의 상수이지만 그 값은 커널
+`kcov_request_generation_finish()`(kernel/kcov_request.c:1117-1125)가
+`timeout_ms > 5000`이면 `-EINVAL`로 거부한다. baseline probe의
+`.timeout_ms = 5000`은 이미 **커널 허용 최대값**이고, 하네스 변경만으로는
+FINISH 드레인 그레이스를 더 늘릴 수 없다(커널·패치 수정 금지). 하네스가
+실제로 건드릴 수 있는 유일한 "윈도우"는 **GENERATION_BEGIN→FINISH 구간
+(세션이 OPEN으로 남는 시간)**이다.
+
+**OPEN 윈도우 확장은 서버측 만료와 무관**: `kcov_request_root_attributable()`
+(kernel/kcov_request.c:1270-1276)은 generation이 OPEN이면
+`retry_deadline`과 무관하게 귀속을 허용한다. retry_deadline(5000ms)은
+CLOSING(FINISH 호출 후)에서만 관여하므로, **FINISH를 늦추는 방식으로 윈도우를
+확장해도 서버 세션은 만료되지 않는다**.
+
+**구현 (도구/사본만 변경)**: `tools/frozen-phase8-probe-window.c` —
+baseline `bundle/ab-runner/frozen_phase8_probe.c`(`f291ae53…`)에서
+async-normal 시나리오만 workload child 종료 후 generation을
+`GEN_WINDOW_HOLD_MS=15000`(15s) 추가로 유지한 뒤 FINISH하도록 변경.
+`.timeout_ms = 5000`(커널 cap)은 기존 코드 그대로, deferred/abort 경로
+불변, probe JSON에 `"generation_window_hold_ms": 15000`을 기록.
+입력 해시: probe `28e32529…`만 변경, 나머지(S3 evidence4 기준선과 동일 —
+kernel `5b22ba55` · image `78ac48d0` · lane `ddf3a583…` · bootstrap
+`4e8414c0…` · deps `f214e8f4…`) 그대로.
+
+**실행·결과 (Gate 8 재실행)**:
+
+| 시나리오 | S3 baseline (evidence4) | 확장 윈도우 (evidence6 1차* ) | 확장 윈도우 (evidence7 재실행) |
+|---|---|---|---|
+| async-normal remote | 791265 | 799575 | **795460** |
+| deferred-normal remote | 20975 | 20987 | 20958 |
+| async/deferred abort remote | 0 | 0 | 0 |
+| 게이트 체크 | 전부 True | 전부 True | 전부 True (status=pass) |
+
+- **async-normal remote_entries=795460(>0)**: 15s 확장 윈도우에서도 async
+  COPY offload hop(연속 저장 → worker kthread → CB_OFFLOAD leg)이 원격
+  세션에 정상 귀속된다. baseline(791265) 대비 +8310 원격 PC 기록 증가 —
+  윈도우를 길게 잡아도 귀속이 사라지지 않고 오히려 조금 더 수집된다.
+- **deferred-normal 20958**: S3와 일관(±10 수준 잡음). **abort 2종
+  remote=0**: 정확 드레인 계약 유지.
+- evidence7: 게이트 28/28 체크 True, `cleanup_returncode=0,
+  validation_returncode=0`, image 불변(`sha256_after = 78ac48d0`),
+  status=pass.
+
+**부수 발견 — phase8 러너의 KCSAN 거짓 양성 (evidence6 1차)**: 1차 실행은
+게이트 체크 전부 True였지만 **최종 dmesg 검사에서 실패 처리**됐다. dmesg에
+`BUG: KCSAN: data-race in _find_next_zero_bit / sbitmap_find_bit`
+(blk-mq sbitmap, 사전 존재·무해·크래시 아님)가 떴고, phase8 러너의
+`FATAL_KERNEL_RE`(run_frozen_phase8_vm.py:62)는 `BUG:` 앞에
+`(?! KCSAN:)` 제외가 없어(reach 러너 run-reach-adapted.py는 제외 존재)
+KCSAN 리포트를 치명 진단으로 오인했다. 실행·게이트 로직 자체는 정상이었고
+재실행(evidence7)에서 클린 PASS. 러너·커널·패치 수정 없이 spike가
+통과했으므로 보고상으로만 기록한다.
+
+**판정**: 확장 GENERATION 윈도우(GENERATION_BEGIN→FINISH 구간 + 15s hold)
+에서 async COPY offload hop 원격 커버리지 귀속이 유지된다. 윈도우 길이는
+async-hop 귀속의 제한 인자가 아니다 — S3의 부수 발견(791265)을 재확인했고,
+S4의 syz-executor 채널 extra=0은 채널 특이(실행기 세션 수명 관리)로 해석이
+강화됐다. 다만 FINISH 그레이스(5000ms)와 retry_deadline(5000ms)은 커널
+상한이라, 하네스로는 BEGIN→FINISH span만 확장 가능하다는 경계가 문서화된다.
+
+---
 
 ## 7. 파이프라인 자동화 — `tools/fport-pipeline.sh`
 
