@@ -157,8 +157,7 @@ syzkaller 15종 (`bundle/patches/syzkaller/`):
 - **"임의의 미래 메인라인에 100% as-is"는 보장 불가** — 타깃 구문 자체가 (a) 사라지거나 (b) 의미론적으로 재작성되면 어떤 수단도 실패합니다. 이때는 실패가 **크고 정확**하며, 수리는 해당 패치의 재생성 하나로 좁혀집니다(§3).
 - syzkaller(Go) 측 15+3패치도 동일 원칙: 변형 시드(fport-apply/fport-variant는 `kind`로 동일 적용) + Go AST 기반 삽입(텍스트 문맥 최소화).
 - 이 구성이 "검증 가능한 재현"을 깨지 않습니다: 모든 결정·변형·적용 결과는 **해시에 고정**되어 감사 가능.
-- **검증 코퍼스 (추후 작업, 2026-09-25 결정)**: 현재 게이트는 단일 일반 NFS 코퍼스 + OFF/ON 대조군으로 판정. 패치의 도달 지점이 다방향(디스패치 NFSv4 · TCP 상관 · kcov 수집 · 지연 작업 귀속)이므로, **도달 지점별 전용 검증 코퍼스 설계**를 별도 작업으로 남겨둔다. 그 전까지 R4(경로 도달 심도)가 코퍼스 적합성의 최소 안전장치 역할을 한다.
-
+- **검증 코퍼스 (추후 작업, 2026-09-25 결정)**: 현재 게이트는 단일 일반 NFS 코퍼스 + OFF/ON 대조군으로 판정. 패치의 도달 지점이 다방향(디스패치 NFSv4 · TCP 상관 · kcov 수집 · 지연 작업 귀속)이므로, **도달 지점별 전용 검증 코퍼스 설계**를 별도 작업으로 남겨둔다. 그 전까지 R4(경로 도달 심도)가 코퍼스 적합성의 최소 안전장치 역할을 한다. → **2026-09-26 일부 해소**: 전용 코퍼스는 `bundle/corpus/reach-copy-offload/`(S4)로 실렸고, 두 번째 축(동일 wall-clock 내 도달 코드량 확대 = NFS-Ganesha 병행)은 `tools/ganesha-lane.sh`로 토대만 마련됐다. 판정 결과는 아래 두 절 참조.
 ### S4 검증 코퍼스 판정 — async COPY offload hop 미귀속 (2026-09-26)
 
 검증 코퍼스 설계의 첫 이행으로 `reach-copy-offload`(S4: NFSv4.2 async COPY offload
@@ -374,7 +373,7 @@ executor의 실패 진단 문자열이 **0건**이다:
 
 코퍼스 `reach-copy-offload.prog`(11콜, async `copy_file_range` count 32MiB ←
 ftruncate 16MiB 소스), `--mode on --trials 1 --executions 10 --procs 2`,
-`KOOV_EXPECTED_CALLS=11`(첫 실행은 S4용 10 콜 설정残り 때문에 `CALL 10`에서
+`KOOV_EXPECTED_CALLS=11`(첫 실행은 S4용 10 콜 설정이 남아 있어 `CALL 10`에서
 로그 검증이 실패했다 — 설정 문제이며 코퍼스/채널 무관). 산출물
 `~/reach-window-evidence7/`.
 
@@ -449,6 +448,105 @@ async COPY kthread 섹션의 원격 기록량 > scratch 용량(1,048,575)
   이 문서 범위(재빌드·커널 수정 금지)에서는 (iii)만 즉시 실행 가능하다.
 
 `kcsan_reports=0`, fixture cleanup 무누수, `base_image.unchanged=true`.
+
+---
+
+### 레인 격리 하드닝 + 싱글쿼트 함정 가드 (2026-09-26)
+
+Ganesha 병행 축의 착수에 앞서, **기존 결함 하나를 실제로 고치고** 그 과정에서 나온
+**문법 검사가 못 잡는 부류의 실패**를 빌드 타임 가드로 만들었다. 둘 다 측정
+채널의 신뢰도와 직결된다.
+
+#### (a) 레인 tmpfs 무한 크기 — 기존 결함, 게이트로 승격
+
+`frozen_phase9_lane.sh`의 레인 백킹 tmpfs는 `size=` 없이 마운트된다
+(`mount -t tmpfs -o mode=0755`). runaway 코퍼스 프로그램이 게스트 RAM을 고갈하면
+VM이 OOM kill되고, 그 결과는 **커널 버그와 구분 불가**가 되어 증거 장부를 통과한다.
+Ganesha와 무관한 결함이며, 어느 지점에서든 고칠 수 있었다.
+
+`tools/ganesha-lane.sh`는 `KOOV_TMPFS_SIZE`(기본 `256m`)로 상한을 걸고, 상한이
+없으면 **기동 자체를 거부**한다:
+
+```sh
+status_backing_options=$(nsenter -t "$status_server_pid" -m -n -- \
+    findmnt -n -o OPTIONS -- "$status_lane_root/server/export")
+case "$status_backing_options" in
+    *size=*) ;;
+    *) echo "KOOV: lane tmpfs is not size-bounded (OPTIONS=$status_backing_options)" >&2
+       exit 1 ;;
+esac
+```
+
+게이트가 아니라 보고로만 남기면 "하드닝이 걸렸는지"를 증거에서 확인할 수 없다.
+그래서 상한을 status JSON에 실었다 — 게스트 실측값:
+
+```
+backing_options = rw,relatime,seclabel,size=262144k,mode=755
+```
+
+`256m`이 커널에서 `262144k`로 정규화된다. 따라서 글로브는 `*size=*`로 두어야 하며
+(`size=16M`·`size=1048576k` 통과 확인), 단위 고정 문자열 비교는 틀린다.
+
+#### (b) `sh -c '...'` 싱글쿼트 함정 — 게스트에서만 드러나는 실패
+
+레인 서버 블록 전체는 **하나의 싱글쿼트 인자**다:
+
+```sh
+ip netns exec ... unshare --mount --propagation private sh -c '
+    ... 여러 줄, 주석 포함 ...
+' sh "$root" "$lane" "10.89.$lane.0/29"
+```
+
+주석 안의 아포스트로피 하나가 이 문자열을 조용히 닫는다. 이후 줄은 outer 셸이
+셸 코드로 재파싱하고, **`sh -n`은 통과시킨다**. 실제로 겪은 사례: 주석
+`the secondary's side effects`가 `side`라는 단어를 무관한 `sh -c`의 이름 인자
+(`$0`)로 밀어내 게스트에서 아래와 같이 died:
+
+```
+side: 3: 1: parameter not set          (rc=2, dash)
+```
+
+`$0`이 `side`인 이유까지는 dash의 보고 형식으로 역추적했다 —
+`dash -c 'set -u; a=$1; ...' side`가 정확히 이 형태를 낸다. 게스트 1회 부팅
+(약 5분)을 소모해 특정됐고, **로컬 문법 검사는 한 번도 걸러내지 못했다.**
+
+`tools/lane-quote-lint.sh`가 이를 빌드 타임 실패로 만든다:
+
+1. `sh -c '...'` 영역에 아포스트로피 0개
+2. 그 영역 개수가 pristine 원본(`bundle/ab-runner/frozen_phase9_lane.sh`)과 정확히 동일
+
+| 대상 | 판정 |
+|---|---|
+| `bundle/ab-runner/frozen_phase9_lane.sh` (원본) | PASS (32행, 0개) |
+| `tools/ab-lane-fixture.sh` / `-v42.sh` | PASS (32행, 0개) |
+| `tools/ganesha-lane.sh` | PASS (106행, 0개) |
+| 아포스트로피 재주입 사본 | **FAIL — 해당 라인 지목** |
+
+#### (c) 동등성 실증 — fork는 knfsd 경로에서 무해하다
+
+원본 대비 **11개 편집**(전부 정확히 1회 매칭, diff 11 hunk, +162행). 기본값
+`SERVER_IMPL=knfsd`·`SERVER_PORT=2049`는 기존 동작을 재현한다. 검사는
+`tools/ganesha-lane-parity.sh`(fork) vs `tools/ganesha-lane-control.sh`(기존
+fixture) — runner·코퍼스·이미지·설정 전부 동일, `--lane-fixture`만 다름:
+
+| 항목 | 결과 |
+|---|---|
+| 단계 수 / 이름 | **104 / IDENTICAL** |
+| 비정상 rc | 양쪽 동일 (`executor-poll` rc=1 ×2 — 폴링 정상 동작) |
+| 공유 status 값 | 전부 일치 (`lane_epoch=5`, `backing_source='frozen-phase9-lane0'`, `server_threads=4`, `tcp_connections=2`, 식별자·IP) |
+| 신규 status 필드 | `server_port`, `ganesha_live`, `ganesha_listen`, `ganesha_backing_source`, `backing_options`, `ganesha_backing_options` (누락 0) |
+| status JSON `printf` 균형 | 원본 29/29, fork 35/35 — 정적 사전 검사로 보장 |
+
+게시 대상 게이트의 대조 실행은 `tools/ganesha-lane-control.sh`
+(`evidence/ganesha-lane-control/`)에 남아 있다.
+
+**정직한 경계**: `SERVER_IMPL=ganesha|both`은 **아직 실행 검증되지 않았다.**
+fixture는 준비됐고 게이트도 걸렸지만, 게스트 이미지에 Ganesha가 없으므로
+`ganesha.nfsd`를 실행할 수 없다. ASAN 빌드 후 bake가 선행이다. 또한
+`SERVER_IMPL`을 호스트에서 게스트로 넘길 배구는 아직 없다(`cleanup_fixture`는
+KOOV 변수를 참조하지 않으므로 `setup` 호출 하나에만 `env` 접두를 걸면 되는
+조건은 확인됨). 이 축은 S4와 교차검증 불가 — Ganesha는 v4.2 미지원이므로
+코퍼스 기준이 v4.1이다.
 
 ---
 
