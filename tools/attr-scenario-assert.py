@@ -22,6 +22,7 @@ from tools.reach_callback import callback_witness
 BAD_DMESG = re.compile(
     r"(?:BUG:|WARNING:|KASAN:|\bOops:|refcount(?:_t)?:|\bWARN(?:_ON)?\b)"
 )
+KCSAN_FINDING = re.compile(r"\bBUG:\s*KCSAN\b", re.IGNORECASE)
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 PC = re.compile(r"0x[0-9a-fA-F]+\Z")
 SCENARIO_ID = re.compile(r"B(?:0[1-9]|1[0-2])-V[1-7](?:-[1-9][0-9]*)?\Z")
@@ -416,6 +417,53 @@ def _negative_checks(manifest: JsonObject, results: Path,
            worker_supported=worker_supported, cross_lane=bool(cross_results))
 
 
+def _diagnostic_checks(results: Path, checks: Checks) -> JsonObject:
+    findings: list[JsonObject] = []
+    fatal: list[JsonObject] = []
+    missing: list[str] = []
+    malformed: list[JsonObject] = []
+    sources: list[str] = []
+    for mode in ("off", "on"):
+        for name in ("dmesg.txt", "serial.log"):
+            relative = f"remote_{mode}/trial_01/{name}"
+            path = results / relative
+            if not path.is_file():
+                missing.append(relative)
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                malformed.append({
+                    "mode": mode, "source": relative, "error": str(exc),
+                })
+                continue
+            if not text.strip(" \t\r\n\v\f\x00"):
+                malformed.append({
+                    "mode": mode, "source": relative,
+                    "error": "diagnostic log contains no text content",
+                })
+                continue
+            sources.append(relative)
+            for number, line in enumerate(text.splitlines(), 1):
+                if KCSAN_FINDING.search(line):
+                    findings.append({
+                        "mode": mode, "source": relative,
+                        "line": number, "text": line,
+                    })
+                if BAD_DMESG.search(KCSAN_FINDING.sub("", line)):
+                    fatal.append({
+                        "mode": mode, "source": relative,
+                        "line": number, "text": line,
+                    })
+    _check(checks, "dmesg_hygiene", not missing and not malformed and not fatal,
+           sources=sources, missing=missing, malformed=malformed, matches=fatal)
+    return {
+        "clean": not findings,
+        "status": "CLEAN" if not findings else "NON_CLEAN",
+        "findings": findings,
+    }
+
+
 def evaluate(document: object, manifest_path: Path, results: Path,
              vmlinux: Path) -> JsonObject:
     schema = _load_json(ROOT / "bundle/corpus/attr-scenarios/schema.json")
@@ -464,9 +512,7 @@ def evaluate(document: object, manifest_path: Path, results: Path,
     _coverage_checks(manifest, results, vmlinux, checks)
     _negative_checks(manifest, results, post, checks)
 
-    dmesg = (results / "dmesg.txt").read_text(encoding="utf-8")
-    bad_lines = [line for line in dmesg.splitlines() if BAD_DMESG.search(line)]
-    _check(checks, "dmesg_hygiene", not bad_lines, matches=bad_lines)
+    sanitizer = _diagnostic_checks(results, checks)
 
     before_sha = _captured_sha(results / "image-before.sha256")
     after_sha = _captured_sha(results / "image-after.sha256")
@@ -478,7 +524,8 @@ def evaluate(document: object, manifest_path: Path, results: Path,
            captured_input=captured_input_sha, actual=actual_image_sha)
 
     overall = "PASS" if all(item["verdict"] == "PASS" for item in checks.values()) else "FAIL"
-    return {"scenario": manifest["id"], "checks": checks, "overall": overall}
+    return {"scenario": manifest["id"], "checks": checks,
+            "sanitizer": sanitizer, "overall": overall}
 
 
 def _scenario_name(document: object) -> str:
@@ -512,8 +559,12 @@ def main() -> int:
         code = 0 if verdict["overall"] == "PASS" else 1
     except (OSError, InputError, ValueError, KeyError, TypeError,
             RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-        verdict = {"scenario": scenario_name, "checks": {
-            "input": {"verdict": "FAIL", "error": str(exc)}}, "overall": "ERROR"}
+        checks: Checks = {
+            "input": {"verdict": "FAIL", "error": str(exc)},
+        }
+        sanitizer = _diagnostic_checks(args.results, checks)
+        verdict = {"scenario": scenario_name, "checks": checks,
+                   "sanitizer": sanitizer, "overall": "ERROR"}
         code = 2
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(verdict, indent=2, sort_keys=True) + "\n", encoding="utf-8")

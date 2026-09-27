@@ -137,11 +137,12 @@ def _fixture(tmp_path: Path, polarity: str = "positive") -> tuple[Path, Path, Pa
     shutil.copytree(source / "post", results / "counters/post")
     if polarity == "negative":
         shutil.copy(source / "probe.json", results / "probe.json")
-    shutil.copy(case / "dmesg.txt", results / "dmesg.txt")
     for mode in ("on", "off"):
         target = results / f"remote_{mode}/trial_01"
         target.mkdir(parents=True)
         shutil.copy(case / f"remote_{mode}/trial_01/callback-trace.txt", target)
+        shutil.copy(case / "dmesg.txt", target / "dmesg.txt")
+        shutil.copy(case / "dmesg.txt", target / "serial.log")
     image_sha = BASE_IMAGE_SHA + "\n"
     (results / "image-before.sha256").write_text(image_sha, encoding="utf-8")
     (results / "image-after.sha256").write_text(image_sha, encoding="utf-8")
@@ -511,13 +512,154 @@ def test_schema_malformed_hooks_still_writes_named_error_verdict(tmp_path: Path)
     assert _verdict(paths)["overall"] == "ERROR"
 
 
-def test_actual_kcsan_bug_log_fails_hygiene(tmp_path: Path) -> None:
+def test_actual_kcsan_bug_log_is_non_clean_without_changing_kcov_verdict(
+        tmp_path: Path) -> None:
     paths = _fixture(tmp_path)
-    shutil.copy(KCSAN_LOG, paths[1] / "dmesg.txt")
+    shutil.copy(KCSAN_LOG, paths[1] / "remote_on/trial_01/dmesg.txt")
+    assert _run(paths).returncode == 0
+    verdict = _verdict(paths)
+    assert verdict["overall"] == "PASS"
+    assert verdict["checks"]["dmesg_hygiene"]["verdict"] == "PASS"
+    assert verdict["sanitizer"]["clean"] is False
+    assert verdict["sanitizer"]["status"] == "NON_CLEAN"
+    assert all(item["mode"] == "on" and item["source"].endswith("dmesg.txt")
+               and isinstance(item["line"], int) and "BUG: KCSAN" in item["text"]
+               for item in verdict["sanitizer"]["findings"])
+
+
+def test_off_only_kcsan_is_visible_and_nonfatal(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    off = paths[1] / "remote_off/trial_01/dmesg.txt"
+    original = off.read_text()
+    line = len(original.splitlines()) + 2
+    off.write_text(original + "\nBUG: KCSAN: data-race in off_reader / off_writer\n")
+    assert _run(paths).returncode == 0
+    verdict = _verdict(paths)
+    assert verdict["overall"] == "PASS"
+    assert verdict["sanitizer"]["clean"] is False
+    assert verdict["sanitizer"]["findings"] == [{
+        "mode": "off", "source": "remote_off/trial_01/dmesg.txt",
+        "line": line, "text": "BUG: KCSAN: data-race in off_reader / off_writer",
+    }]
+
+
+def test_off_kcsan_mixed_with_non_kcsan_bug_is_fatal(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    off = paths[1] / "remote_off/trial_01/serial.log"
+    original = off.read_text()
+    fatal_line = len(original.splitlines()) + 3
+    off.write_text(original + "\nBUG: KCSAN: data-race in a / b\nBUG: fatal off-mode fault\n")
+    assert _run(paths).returncode == 1
+    verdict = _verdict(paths)
+    assert verdict["overall"] == "FAIL"
+    assert verdict["sanitizer"]["status"] == "NON_CLEAN"
+    check = verdict["checks"]["dmesg_hygiene"]
+    assert check["verdict"] == "FAIL"
+    assert check["matches"] == [{
+        "mode": "off", "source": "remote_off/trial_01/serial.log",
+        "line": fatal_line, "text": "BUG: fatal off-mode fault",
+    }]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "malformed"])
+def test_off_diagnostic_evidence_is_required_and_well_formed(
+        tmp_path: Path, mutation: str) -> None:
+    paths = _fixture(tmp_path)
+    off = paths[1] / "remote_off/trial_01/dmesg.txt"
+    if mutation == "missing":
+        off.unlink()
+    else:
+        off.write_bytes(b"\xff")
     assert _run(paths).returncode == 1
     check = _verdict(paths)["checks"]["dmesg_hygiene"]
     assert check["verdict"] == "FAIL"
-    assert any("BUG: KCSAN" in line for line in check["matches"])
+    assert check[mutation]
+
+
+@pytest.mark.parametrize("relative", [
+    "remote_off/trial_01/dmesg.txt",
+    "remote_off/trial_01/serial.log",
+    "remote_on/trial_01/dmesg.txt",
+    "remote_on/trial_01/serial.log",
+])
+@pytest.mark.parametrize("payload", [b" \t\r\n", b"\x00" * 80],
+                         ids=["whitespace", "nul-only"])
+def test_contentless_diagnostic_log_is_malformed(
+        tmp_path: Path, relative: str, payload: bytes) -> None:
+    paths = _fixture(tmp_path)
+    (paths[1] / relative).write_bytes(payload)
+    assert _run(paths).returncode == 1
+    verdict = _verdict(paths)
+    check = verdict["checks"]["dmesg_hygiene"]
+    mode = "off" if relative.startswith("remote_off/") else "on"
+    assert check["verdict"] == "FAIL"
+    assert check["matches"] == []
+    assert check["malformed"] == [{
+        "mode": mode, "source": relative,
+        "error": "diagnostic log contains no text content",
+    }]
+    assert relative not in check["sources"]
+    assert len(check["sources"]) == 3
+
+
+def test_meaningful_diagnostic_text_is_not_rejected_for_nul_or_whitespace(
+        tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    content = b"\x00 \t\r\n[    0.000000] normal kernel boot\n\x00"
+    for mode in ("off", "on"):
+        for name in ("dmesg.txt", "serial.log"):
+            (paths[1] / f"remote_{mode}/trial_01/{name}").write_bytes(content)
+    assert _run(paths).returncode == 0
+    verdict = _verdict(paths)
+    assert verdict["overall"] == "PASS"
+    assert verdict["checks"]["dmesg_hygiene"]["malformed"] == []
+
+
+@pytest.mark.parametrize(("mutation", "expected_error"), [
+    ("coverage", "missing coverage capture:"),
+    ("counter_file", "missing counter capture: phase8_stats"),
+    ("counter_field", "missing counter: phase8_stats:async_child_created"),
+])
+def test_error_verdict_preserves_available_kcsan_findings(
+        tmp_path: Path, mutation: str, expected_error: str) -> None:
+    paths = _fixture(tmp_path)
+    shutil.copy(KCSAN_LOG, paths[1] / "remote_on/trial_01/dmesg.txt")
+    if mutation == "coverage":
+        (paths[1] / "coverage_sets/fs_nfsd_off_union.pcs").unlink()
+    elif mutation == "counter_file":
+        (paths[1] / "counters/post/phase8_stats.txt").unlink()
+    else:
+        counter = paths[1] / "counters/post/phase8_stats.txt"
+        counter.write_text("\n".join(
+            line for line in counter.read_text().splitlines()
+            if not line.startswith("async_child_created ")) + "\n")
+    assert _run(paths).returncode == 2
+    verdict = _verdict(paths)
+    assert verdict["overall"] == "ERROR"
+    assert expected_error in verdict["checks"]["input"]["error"]
+    assert verdict["checks"]["dmesg_hygiene"]["verdict"] == "PASS"
+    assert verdict["sanitizer"]["status"] == "NON_CLEAN"
+    assert verdict["sanitizer"]["findings"]
+    assert all("BUG: KCSAN" in item["text"]
+               for item in verdict["sanitizer"]["findings"])
+
+
+def test_error_verdict_preserves_non_kcsan_fatal_diagnostic(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    shutil.copy(KCSAN_LOG, paths[1] / "remote_on/trial_01/dmesg.txt")
+    serial = paths[1] / "remote_off/trial_01/serial.log"
+    serial.write_text(serial.read_text() + "\nBUG: fatal with incomplete coverage\n")
+    (paths[1] / "coverage_sets/fs_nfsd_off_union.pcs").unlink()
+    assert _run(paths).returncode == 2
+    verdict = _verdict(paths)
+    assert "missing coverage capture:" in verdict["checks"]["input"]["error"]
+    check = verdict["checks"]["dmesg_hygiene"]
+    assert check["verdict"] == "FAIL"
+    assert any(item["mode"] == "off"
+               and item["source"] == "remote_off/trial_01/serial.log"
+               and item["text"] == "BUG: fatal with incomplete coverage"
+               for item in check["matches"])
+    assert verdict["sanitizer"]["status"] == "NON_CLEAN"
 
 
 def test_malformed_counter_is_input_error(tmp_path: Path) -> None:
