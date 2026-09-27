@@ -1,0 +1,104 @@
+# tracer: nop
+#
+# entries-in-buffer/entries-written: 92/92   #P:8
+#
+#                                _-----=> irqs-off/BH-disabled
+#                               / _----=> need-resched
+#                              | / _---=> hardirq/softirq
+#                              || / _--=> preempt-depth
+#                              ||| / _-=> migrate-disable
+#                              |||| /     delay
+#           TASK-PID     CPU#  |||||  TIMESTAMP  FUNCTION
+#              | |         |   |||||     |         |
+            bash-3219    [002] ...1.    41.831566: tracing_mark_write: reach-copy-begin
+        syz.0.10-3356    [004] .....    44.182857: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:2a:4 src_fhandle=0xe225a58c dst_fileid=00:2a:5 dst_fhandle=0x2c6a8736 src_stateid=0:0xd0adc48c dst_stateid=0:0xf5c69b50 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0xe77334be res_sync=0 res_cons=1 res_count=0
+        syz.1.11-3357    [000] .....    44.190586: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:30:4 src_fhandle=0xa134de1f dst_fileid=00:30:5 dst_fhandle=0x51e688d3 src_stateid=0:0x0199442f dst_stateid=0:0x24f21bf3 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0x3647b41d res_sync=0 res_cons=1 res_count=0
+     copy thread-3358    [002] .....    44.252893: nfsd_cb_offload: addr=10.89.0.2:0 client 6ab842fa:d6372b09 stateid 00000006:00000001 fh_hash=0x2c6a8736 count=33554432 status=0
+     copy thread-3358    [002] .....    44.252901: nfsd_cb_queue: addr=10.89.0.2:0 client 6ab842fa:d6372b09 cb=00000000b50caa6d (first try) opcode=CB_OFFLOAD
+     copy thread-3358    [002] d..1.    44.252920: workqueue_queue_work: work struct=0000000063aa5100 function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:4-83      [004] .....    44.253040: workqueue_execute_start: work struct 0000000063aa5100: function nfsd4_run_cb_work
+   kworker/u32:4-83      [004] .....    44.253043: nfsd_cb_start: addr=10.89.0.2:0 client 6ab842fa:d6372b09 state=UP
+   kworker/u32:4-83      [004] .....    44.253084: workqueue_execute_end: work struct 0000000063aa5100: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [006] .....    44.253489: nfs4_cb_offload: error=0 (OK) fhandle=0x2c6a8736 cb_stateid=1:0xe77334be cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:1-62      [007] .....    44.253858: nfsd_cb_offload_done: client 6ab842fa:d6372b09 stateid 00000006:00000001 status=0
+     copy thread-3359    [005] .....    44.268403: nfsd_cb_offload: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed stateid 00000006:00000001 fh_hash=0x51e688d3 count=33554432 status=0
+     copy thread-3359    [005] .....    44.268408: nfsd_cb_queue: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed cb=000000004da28bf3 (first try) opcode=CB_OFFLOAD
+     copy thread-3359    [005] d..1.    44.268413: workqueue_queue_work: work struct=000000000971c88d function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:3-79      [002] .....    44.268669: workqueue_execute_start: work struct 000000000971c88d: function nfsd4_run_cb_work
+   kworker/u32:3-79      [002] .....    44.268673: nfsd_cb_start: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed state=UP
+   kworker/u32:3-79      [002] .....    44.268713: workqueue_execute_end: work struct 000000000971c88d: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [007] .....    44.269044: nfs4_cb_offload: error=0 (OK) fhandle=0x51e688d3 cb_stateid=1:0x3647b41d cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:1-62      [007] .....    44.269188: nfsd_cb_offload_done: client 6ab842fb:1cb9f6ed stateid 00000006:00000001 status=0
+        syz.0.12-3360    [001] .....    44.322642: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:2a:4 src_fhandle=0xe225a58c dst_fileid=00:2a:5 dst_fhandle=0x2c6a8736 src_stateid=0:0xd0adc48c dst_stateid=0:0xf5c69b50 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0x5fcf53db res_sync=0 res_cons=1 res_count=0
+        syz.1.13-3361    [007] .....    44.337173: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:30:4 src_fhandle=0xa134de1f dst_fileid=00:30:5 dst_fhandle=0x51e688d3 src_stateid=0:0x0199442f dst_stateid=0:0x24f21bf3 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0x8efbd378 res_sync=0 res_cons=1 res_count=0
+     copy thread-3362    [005] .....    44.389478: nfsd_cb_offload: addr=10.89.0.2:0 client 6ab842fa:d6372b09 stateid 00000007:00000001 fh_hash=0x2c6a8736 count=33554432 status=0
+     copy thread-3362    [005] .....    44.389484: nfsd_cb_queue: addr=10.89.0.2:0 client 6ab842fa:d6372b09 cb=00000000ee075e71 (first try) opcode=CB_OFFLOAD
+     copy thread-3362    [005] d..1.    44.389488: workqueue_queue_work: work struct=000000000655ae50 function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:1-62      [004] .....    44.389574: workqueue_execute_start: work struct 000000000655ae50: function nfsd4_run_cb_work
+   kworker/u32:1-62      [004] .....    44.389578: nfsd_cb_start: addr=10.89.0.2:0 client 6ab842fa:d6372b09 state=UP
+   kworker/u32:1-62      [004] .....    44.389603: workqueue_execute_end: work struct 000000000655ae50: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [007] .....    44.390006: nfs4_cb_offload: error=0 (OK) fhandle=0x2c6a8736 cb_stateid=1:0x5fcf53db cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:4-83      [005] .....    44.390287: nfsd_cb_offload_done: client 6ab842fa:d6372b09 stateid 00000007:00000001 status=0
+     copy thread-3363    [000] .....    44.405085: nfsd_cb_offload: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed stateid 00000007:00000001 fh_hash=0x51e688d3 count=33554432 status=0
+     copy thread-3363    [000] .....    44.405093: nfsd_cb_queue: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed cb=000000006cc88b0c (first try) opcode=CB_OFFLOAD
+     copy thread-3363    [000] d..1.    44.405096: workqueue_queue_work: work struct=00000000a1ea6ec1 function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:1-62      [007] .....    44.405127: workqueue_execute_start: work struct 00000000a1ea6ec1: function nfsd4_run_cb_work
+   kworker/u32:1-62      [007] .....    44.405132: nfsd_cb_start: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed state=UP
+   kworker/u32:1-62      [007] .....    44.405233: workqueue_execute_end: work struct 00000000a1ea6ec1: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [000] .....    44.405522: nfs4_cb_offload: error=0 (OK) fhandle=0x51e688d3 cb_stateid=1:0x8efbd378 cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:1-62      [000] .....    44.405800: nfsd_cb_offload_done: client 6ab842fb:1cb9f6ed stateid 00000007:00000001 status=0
+        syz.0.14-3364    [002] .....    44.462163: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:2a:4 src_fhandle=0xe225a58c dst_fileid=00:2a:5 dst_fhandle=0x2c6a8736 src_stateid=0:0xd0adc48c dst_stateid=0:0xf5c69b50 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0x07ac438d res_sync=0 res_cons=1 res_count=0
+        syz.1.15-3365    [000] .....    44.477633: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:30:4 src_fhandle=0xa134de1f dst_fileid=00:30:5 dst_fhandle=0x51e688d3 src_stateid=0:0x0199442f dst_stateid=0:0x24f21bf3 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0xd698c32e res_sync=0 res_cons=1 res_count=0
+     copy thread-3366    [006] .....    44.532222: nfsd_cb_offload: addr=10.89.0.2:0 client 6ab842fa:d6372b09 stateid 00000008:00000001 fh_hash=0x2c6a8736 count=33554432 status=0
+     copy thread-3366    [006] .....    44.532229: nfsd_cb_queue: addr=10.89.0.2:0 client 6ab842fa:d6372b09 cb=00000000af9d5614 (first try) opcode=CB_OFFLOAD
+     copy thread-3366    [006] d..1.    44.532237: workqueue_queue_work: work struct=000000009bdf3d4d function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:4-83      [007] .....    44.532316: workqueue_execute_start: work struct 000000009bdf3d4d: function nfsd4_run_cb_work
+   kworker/u32:4-83      [007] .....    44.532319: nfsd_cb_start: addr=10.89.0.2:0 client 6ab842fa:d6372b09 state=UP
+   kworker/u32:4-83      [007] .....    44.532373: workqueue_execute_end: work struct 000000009bdf3d4d: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [000] .....    44.532732: nfs4_cb_offload: error=0 (OK) fhandle=0x2c6a8736 cb_stateid=1:0x07ac438d cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:4-83      [005] .....    44.532920: nfsd_cb_offload_done: client 6ab842fa:d6372b09 stateid 00000008:00000001 status=0
+     copy thread-3367    [001] .....    44.544683: nfsd_cb_offload: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed stateid 00000008:00000001 fh_hash=0x51e688d3 count=33554432 status=0
+     copy thread-3367    [001] .....    44.544688: nfsd_cb_queue: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed cb=0000000001d9acae (first try) opcode=CB_OFFLOAD
+     copy thread-3367    [001] d..1.    44.544691: workqueue_queue_work: work struct=000000002abcc6f8 function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:4-83      [000] .....    44.544726: workqueue_execute_start: work struct 000000002abcc6f8: function nfsd4_run_cb_work
+   kworker/u32:4-83      [000] .....    44.544730: nfsd_cb_start: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed state=UP
+   kworker/u32:4-83      [000] .....    44.544756: workqueue_execute_end: work struct 000000002abcc6f8: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [001] .....    44.545021: nfs4_cb_offload: error=0 (OK) fhandle=0x51e688d3 cb_stateid=1:0xd698c32e cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:4-83      [001] .....    44.545135: nfsd_cb_offload_done: client 6ab842fb:1cb9f6ed stateid 00000008:00000001 status=0
+        syz.0.16-3368    [002] .....    44.602343: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:2a:4 src_fhandle=0xe225a58c dst_fileid=00:2a:5 dst_fhandle=0x2c6a8736 src_stateid=0:0xd0adc48c dst_stateid=0:0xf5c69b50 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0xbf1024e8 res_sync=0 res_cons=1 res_count=0
+        syz.1.17-3369    [004] .....    44.614215: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:30:4 src_fhandle=0xa134de1f dst_fileid=00:30:5 dst_fhandle=0x51e688d3 src_stateid=0:0x0199442f dst_stateid=0:0x24f21bf3 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0x6e24a44b res_sync=0 res_cons=1 res_count=0
+     copy thread-3371    [006] .....    44.670498: nfsd_cb_offload: addr=10.89.0.2:0 client 6ab842fa:d6372b09 stateid 00000009:00000001 fh_hash=0x2c6a8736 count=33554432 status=0
+     copy thread-3371    [006] .....    44.670522: nfsd_cb_queue: addr=10.89.0.2:0 client 6ab842fa:d6372b09 cb=000000004edfd8db (first try) opcode=CB_OFFLOAD
+     copy thread-3371    [006] d..1.    44.670528: workqueue_queue_work: work struct=00000000ac66264a function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:1-62      [003] .....    44.670650: workqueue_execute_start: work struct 00000000ac66264a: function nfsd4_run_cb_work
+   kworker/u32:1-62      [003] .....    44.670654: nfsd_cb_start: addr=10.89.0.2:0 client 6ab842fa:d6372b09 state=UP
+   kworker/u32:1-62      [003] .....    44.670682: workqueue_execute_end: work struct 00000000ac66264a: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [001] .....    44.671064: nfs4_cb_offload: error=0 (OK) fhandle=0x2c6a8736 cb_stateid=1:0xbf1024e8 cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:1-62      [004] .....    44.671379: nfsd_cb_offload_done: client 6ab842fa:d6372b09 stateid 00000009:00000001 status=0
+     copy thread-3372    [005] .....    44.679280: nfsd_cb_offload: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed stateid 00000009:00000001 fh_hash=0x51e688d3 count=33554432 status=0
+     copy thread-3372    [005] .....    44.679284: nfsd_cb_queue: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed cb=0000000053ee3de7 (first try) opcode=CB_OFFLOAD
+     copy thread-3372    [005] d..1.    44.679289: workqueue_queue_work: work struct=0000000015fb5bfb function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:1-62      [003] .....    44.679403: workqueue_execute_start: work struct 0000000015fb5bfb: function nfsd4_run_cb_work
+   kworker/u32:1-62      [003] .....    44.679408: nfsd_cb_start: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed state=UP
+   kworker/u32:1-62      [003] .....    44.679446: workqueue_execute_end: work struct 0000000015fb5bfb: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [000] .....    44.679745: nfs4_cb_offload: error=0 (OK) fhandle=0x51e688d3 cb_stateid=1:0x6e24a44b cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:1-62      [000] .....    44.679894: nfsd_cb_offload_done: client 6ab842fb:1cb9f6ed stateid 00000009:00000001 status=0
+        syz.0.18-3375    [004] .....    44.736405: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:2a:4 src_fhandle=0xe225a58c dst_fileid=00:2a:5 dst_fhandle=0x2c6a8736 src_stateid=0:0xd0adc48c dst_stateid=0:0xf5c69b50 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0xada58b06 res_sync=0 res_cons=1 res_count=0
+        syz.1.19-3376    [005] .....    44.746706: nfs4_copy: error=0 (OK) intra=1 src_fileid=00:30:4 src_fhandle=0xa134de1f dst_fileid=00:30:5 dst_fhandle=0x51e688d3 src_stateid=0:0x0199442f dst_stateid=0:0x24f21bf3 src_offset=0 dst_offset=0 len=33554432 sync=0 cb_stateid=1:0x7c910ba5 res_sync=0 res_cons=1 res_count=0
+     copy thread-3381    [002] .....    44.801370: nfsd_cb_offload: addr=10.89.0.2:0 client 6ab842fa:d6372b09 stateid 0000000a:00000001 fh_hash=0x2c6a8736 count=33554432 status=0
+     copy thread-3381    [002] .....    44.801377: nfsd_cb_queue: addr=10.89.0.2:0 client 6ab842fa:d6372b09 cb=0000000051319755 (first try) opcode=CB_OFFLOAD
+     copy thread-3381    [002] d..1.    44.801457: workqueue_queue_work: work struct=000000006cef03c0 function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:4-83      [003] .....    44.801522: workqueue_execute_start: work struct 000000006cef03c0: function nfsd4_run_cb_work
+   kworker/u32:4-83      [003] .....    44.801526: nfsd_cb_start: addr=10.89.0.2:0 client 6ab842fa:d6372b09 state=UP
+   kworker/u32:4-83      [003] .....    44.801554: workqueue_execute_end: work struct 000000006cef03c0: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [001] .....    44.801850: nfs4_cb_offload: error=0 (OK) fhandle=0x2c6a8736 cb_stateid=1:0xada58b06 cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:1-62      [002] .....    44.802417: nfsd_cb_offload_done: client 6ab842fa:d6372b09 stateid 0000000a:00000001 status=0
+     copy thread-3383    [006] .....    44.812024: nfsd_cb_offload: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed stateid 0000000a:00000001 fh_hash=0x51e688d3 count=33554432 status=0
+     copy thread-3383    [006] .....    44.812031: nfsd_cb_queue: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed cb=000000005bdbeca0 (first try) opcode=CB_OFFLOAD
+     copy thread-3383    [006] d..1.    44.812035: workqueue_queue_work: work struct=000000003d152370 function=nfsd4_run_cb_work workqueue=nfsd4_callbacks req_cpu=64 cpu=-1
+   kworker/u32:1-62      [000] .....    44.812119: workqueue_execute_start: work struct 000000003d152370: function nfsd4_run_cb_work
+   kworker/u32:1-62      [000] .....    44.812124: nfsd_cb_start: addr=10.89.1.2:0 client 6ab842fb:1cb9f6ed state=UP
+   kworker/u32:1-62      [000] .....    44.812140: workqueue_execute_end: work struct 000000003d152370: function nfsd4_run_cb_work
+  NFSv4 callback-2695    [001] .....    44.812543: nfs4_cb_offload: error=0 (OK) fhandle=0x51e688d3 cb_stateid=1:0x7c910ba5 cb_count=33554432 cb_how=FILE_SYNC
+   kworker/u32:1-62      [001] .....    44.813003: nfsd_cb_offload_done: client 6ab842fb:1cb9f6ed stateid 0000000a:00000001 status=0
+            bash-3627    [006] ...1.    50.454769: tracing_mark_write: reach-copy-end
