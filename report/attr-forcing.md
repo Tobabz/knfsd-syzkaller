@@ -30,10 +30,10 @@ must stop rather than execute an unforceable result.
 | --- | --- | --- | --- |
 | B04-V2 | `v4.abort-next-deferred` | exact `abort-next-deferred` write; require `deferred_abort_before_grant`, `deferred_owner_none`, `deferred_dropped` +1 | Kernel control and prior Gate 8 mechanism exist; no new task-6 VM run |
 | B05-V2 | `v4.abort-next-async` | exact `abort-next-async` write; require corresponding async counters +1 | Kernel control and prior Gate 8 mechanism exist; no new task-6 VM run |
-| B04-V3 | `v4.pause-release-deferred-after-grant` + `v4.generation-abort-ioctl` | arm, observe entered, invoke the guest C `_IOW('c',112,struct kcov_remote_generation)` helper on the inherited owner fd, then release | Exact helper VM run succeeded and `generation_aborted` moved +1; combined deferred pause/abort still belongs to checkbox 7 |
-| B05-V3 | `v4.pause-release-async-after-grant` + `v4.generation-abort-ioctl` | same ordered protocol for async saved work | Helper target is VM-confirmed; combined async pause/abort remains a scenario obligation |
+| B04-V3 | `v4.pause-release-deferred-after-grant` + `v4.generation-abort-ioctl` | arm, observe entered, invoke the guest C `_IOW('c',112,struct kcov_remote_generation)` helper on the inherited owner fd, then release | **UNFORCEABLE in the current checkbox-7 SSH scenario runner**: its separate guest command cannot inherit the executor's live owner fd/generation, so preflight rejects this composition. The standalone inherited-fd helper remains VM-proven (`generation_aborted` +1). |
+| B05-V3 | `v4.pause-release-async-after-grant` + `v4.generation-abort-ioctl` | same ordered protocol for async saved work | **UNFORCEABLE in the current checkbox-7 SSH scenario runner** for the same live-owner-fd reason. This runner limitation does not invalidate the VM-proven standalone inherited-fd helper or preclude a future integrated owner-fd design. |
 | B04-V4 | `v5.cancel-saved-work` | tested `ss -K` on one isolated saved request, then tested isolated nfsd service teardown | **UNFORCEABLE with current fixture**: `ss -K` returned EINVAL; service teardown dropped saved work but did not cancel the root and could not restore nfsd/cleanly drain |
-| B04-V5 | `v5.redefer-cache-revisit` | stop/flush mountd for first defer; arm after-grant pause; resume first cache response; after entered, stop responder and flush again; release; require `deferred_redeferred` +1 before cleanup resume | VM transition confirmed: re-deferred +1, entered/released +1, timed_out 0, probe PASS, resources drained; cell remains **NEW** pending full coverage oracle |
+| B04-V5 | `v5.redefer-cache-revisit` | stop/flush mountd for first defer; arm after-grant pause; resume first cache response; after entered, stop responder and flush again; release; require `deferred_redeferred` +1, then resume the second responder before executor completion/drain | Prior standalone VM transition confirmed re-deferred +1 and full drain, but the current scenario runner does not dynamically resolve the active fixture's `server_pid`; B04-V5 remains **NEW and not yet runnable** until task 8 supplies that runtime binding and a manifest. |
 | B01/B02/B03/B11/B12-V6 | `v6.retry-same-cookie-same-socket` | execute Phase 7 `retry-final`: raw NEW, RETRY, RETRY\|FINAL; LD_PRELOAD audit verifier requires one TCP `socket`, one `connect`, and three `sendmsg` calls on that fd; require raw retry counters | Exact emitted hook VM PASS: socket fd 4, one connect, three sends, no reconnect, and expected retry counter deltas; cells remain NEW pending each boundary's coverage oracle |
 | B03/B04/B05/B11-V7 | `v7.concurrent-cross-lane` | fixed Gate 9 lane 0/1 workers announce READY; coordinator issues and acknowledges GO1/DONE1 then GO2/DONE2 in lane0/lane1/lane0/lane1 order; manifest requires `owner_lane_match delta_ge 1` and `cross_lane_attribution delta_eq 0` | Task-5 run contract accepts this non-narrowed predicate; interleaver remains **NEW** pending per-lane VM counter and coverage proof |
 
@@ -56,9 +56,13 @@ All control writes target
 also mandatory cleanup. `*_pause_after_grant_timed_out` must have delta zero.
 The generation hook no longer depends on guest Python. It emits and compiles a
 small C helper using `_IOW('c', 112, struct kcov_remote_generation)` and invokes
-it on an inherited live `KCOV_FD`. A disposable VM launcher created a live
-Generation, inherited the fd into the exact hook, observed helper status 0 and
-`generation_aborted` +1, then drained and cleaned the fixture.
+it on an inherited live `KCOV_FD`. A disposable standalone VM launcher created a
+live generation, inherited the fd into the exact hook, observed helper status 0
+and `generation_aborted` +1, then drained and cleaned the fixture. The current
+checkbox-7 runner executes hooks through a separate SSH command, which cannot
+inherit the syzkaller executor's live owner fd/generation. Therefore that
+runner-specific pause+abort composition is **UNFORCEABLE** and rejected before
+boot; the classification is scoped to this interface, not to the proven helper.
 
 ### V4 cancellation result
 
@@ -76,7 +80,11 @@ ownerlessness while restoring/draining the fixture, the hook now returns typed
 
 ### V5 re-defer candidate
 
-Required environment: `ATTR_HOOK_DIR` and `ATTR_SERVER_PID`. The protocol uses
+Required environment: `ATTR_HOOK_DIR` and `ATTR_SERVER_PID`. The active server
+PID is stored at `<active_root>/lane0/server.pid`, but the current scenario
+runner renders static manifest args before boot and does not substitute that
+runtime value. Dynamic PID resolution is therefore a task-8 prerequisite; a
+literal placeholder or stale host PID is not executable evidence. The protocol uses
 the existing deferred after-grant pause as the replay barrier. Checkbox 7 must
 subscribe to `deferred_pause_after_grant_entered` before resuming the first
 cache response, perform the second cache invalidation only after entered,

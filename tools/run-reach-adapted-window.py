@@ -352,7 +352,13 @@ def validate_gate(mode, diagnostics, functional, cover, rpc_delta,
     return checks, failed
 
 
-def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
+def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir,
+              attr_plan=None):
+    # attr_plan (optional) is the single seam the attribution scenario runner
+    # (tools/attr-scenario-run.py) uses to reuse this boot path: it snapshots
+    # sunrpc_fuzz debugfs stats before the workload and after drains, and
+    # applies manifest forcing hooks, all inside the one VM this trial owns.
+    # A None plan (the reach default) leaves behaviour byte-identical.
     trial_dir.mkdir(parents=True)
     (trial_dir / "commands").mkdir()
     remote_on = mode == "on"
@@ -368,6 +374,7 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
     archive = trial_dir / "coverage.tar.gz"
     base_image_hash = sha256(args.image)
     active_root = None
+    hook_cleanup_failure = None
     try:
         vm.start()
         vm.guest("inventory",
@@ -407,6 +414,9 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir):
                     for lane in range(args.procs)]
         cpu_before = cpu_snapshot(vm, "cpu-before")
         memory_samples = [phase9.memory_snapshot(vm, "memory-before")]
+
+        if attr_plan is not None:
+            attr_plan.before_workload(vm, mode)
 
         # Separate physical callback delivery from remote KCOV ownership.
         # Arm only after fixture setup; the snapshot VM owns this trace instance.
@@ -467,6 +477,11 @@ echo reach-copy-begin > trace_marker
         supervisor = vm.guest("executor-start", launch).stdout.strip()
         if not supervisor.isdigit():
             raise ValueError("invalid supervisor PID")
+        # Hook transitions that depend on the workload must run while this
+        # executor is live. In particular, observe a pause/re-defer entered by
+        # the executor and release it before waiting for /tmp/ab-exec.done.
+        if attr_plan is not None:
+            attr_plan.during_workload(vm, mode)
         deadline = time.monotonic() + args.trial_timeout + 60
         while time.monotonic() < deadline:
             result = vm.guest("executor-poll", "test -s /tmp/ab-exec.done",
@@ -506,6 +521,8 @@ echo reach-copy-begin > trace_marker
             "done; i=$((i + 1)); done" % args.procs)
         final = phase9.wait_for_drains(vm, modules, active_root, args.procs,
                                        timeout=45)
+        if attr_plan is not None:
+            attr_plan.after_workload(vm, mode)
         callback_trace("callback-trace-stop", """set -eu
 cd /sys/kernel/tracing/instances/reach_callback
 echo reach-copy-end > trace_marker
@@ -569,6 +586,19 @@ rmdir reach_callback
         evidence["completed_at"] = timestamp()
         raise
     finally:
+        if attr_plan is not None and vm.ready:
+            try:
+                attr_plan.cleanup(vm, mode)
+            except Exception as hook_cleanup_error:
+                hook_cleanup_failure = hook_cleanup_error
+                message = str(hook_cleanup_error)
+                evidence.setdefault("cleanup_errors", []).append(message)
+                if evidence.get("status") != "fail":
+                    evidence["status"] = "fail"
+                    evidence["failure"] = {
+                        "type": type(hook_cleanup_error).__name__,
+                        "message": message,
+                    }
         if vm.ready and active_root is not None:
             try:
                 phase9.cleanup_fixture(vm, active_root, args.procs, strict=False)
@@ -592,6 +622,10 @@ rmdir reach_callback
             evidence["status"] = "fail"
             evidence.setdefault("failed_checks", []).append("base_image_unchanged")
         write_trial_evidence(trial_dir, evidence)
+    if hook_cleanup_failure is not None:
+        raise RuntimeError(
+            "attribution hook cleanup failed: %s" % hook_cleanup_failure
+        ) from hook_cleanup_failure
     return evidence
 
 
@@ -694,7 +728,7 @@ def fixture_nfs_version(path):
     return "4." + forced[-1] if forced else "4.1"
 
 
-def main(argv=None):
+def main(argv=None, attr_plan=None):
     args = parse_args(argv)
     phase1 = load_module("ab_phase1", args.phase1_runner)
     phase3 = load_module("ab_phase3", args.phase3_runner)
@@ -742,7 +776,7 @@ def main(argv=None):
             trial_dir = (args.output / ("remote_" + mode) /
                          ("trial_%02d" % trial))
             result = run_trial(args, modules, phase1, phase9, mode, trial,
-                               trial_dir)
+                               trial_dir, attr_plan=attr_plan)
             manifest["trial_order"].append({
                 "mode": mode, "trial": trial,
                 "status": result["status"],

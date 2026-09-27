@@ -1,0 +1,48 @@
+{
+  "id": "B05-V1",
+  "boundary": "B05",
+  "variant": "V1",
+  "polarity": "positive",
+  "workload": "reach-copy-offload-x2.prog",
+  "sha256": "b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068",
+  "lane_fixture": "ab-lane-fixture-v42.sh",
+  "hooks": [],
+  "mode": "both",
+  "counter_expect": [
+    {"file": "phase4_stats", "name": "generation_begin", "op": "delta_ge", "value": 1},
+    {"file": "phase4_stats", "name": "generation_committed", "op": "delta_ge", "value": 1},
+    {"file": "phase4_stats", "name": "generation_aborted", "op": "delta_eq", "value": 0},
+    {"file": "phase5_stats", "name": "remote_start_granted", "op": "delta_ge", "value": 1},
+    {"file": "phase5_stats", "name": "remote_start_ok", "op": "delta_ge", "value": 1},
+    {"file": "phase6_stats", "name": "aggregate_published", "op": "delta_ge", "value": 1},
+    {"file": "phase6_stats", "name": "aggregate_publish_suppressed", "op": "delta_eq", "value": 0},
+    {"file": "phase6_stats", "name": "scratch_overflow", "op": "delta_eq", "value": 0}
+  ],
+  "drain_keys": [
+    {"file": "phase4_stats", "name": "outstanding_tokens"},
+    {"file": "phase4_stats", "name": "object_refs"},
+    {"file": "phase5_stats", "name": "remote_refs"},
+    {"file": "phase6_stats", "name": "remote_refs"},
+    {"file": "phase6_stats", "name": "publish_readers"}
+  ],
+  "sentinel": {
+    "fs/nfsd": {
+      "rule": "on-only",
+      "required": ["nfsd4_copy", "nfsd4_do_async_copy", "nfsd4_run_cb"],
+      "observed": ["_nfsd_copy_file_range"],
+      "absent-on-only": ["nfsd4_run_cb_work"]
+    },
+    "net/sunrpc": {
+      "rule": "on-only",
+      "required": ["sunrpc_fuzz_saved_work_start", "sunrpc_fuzz_saved_work_stop"],
+      "observed": ["sunrpc_fuzz_svc_continuation_save", "sunrpc_fuzz_svc_continuation_restore"]
+    },
+    "fs/nfs": {
+      "rule": "on-union",
+      "required": ["nfs42_proc_copy", "nfs4_copy_dequeue_callback"],
+      "observed": ["nfs4_copy_file_range"]
+    }
+  },
+  "procs": 2,
+  "executions": 10
+}
