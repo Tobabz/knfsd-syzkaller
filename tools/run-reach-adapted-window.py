@@ -36,6 +36,11 @@ import tarfile
 import time
 from typing import Protocol
 
+try:
+    from tools import reach_callback
+except ModuleNotFoundError:  # direct `python3 tools/run-reach-adapted-window.py`
+    import reach_callback
+
 
 REMOTE_DRIVER = "/opt/frozen-phase9"
 PHASE9_CONTROL = "/sys/kernel/debug/sunrpc_fuzz/phase9_control"
@@ -54,6 +59,7 @@ BIND_RE = re.compile(
     r"target=/nfs-lane")
 EXPECTED_CALLS = int(os.environ.get("KOOV_EXPECTED_CALLS", "34"))
 CONFLICT_CALL = int(os.environ.get("KOOV_CONFLICT_CALL", "14"))
+B06_EXPECTED_CALLS = 15
 
 
 class TraceGuest(Protocol):
@@ -265,7 +271,7 @@ def counter_diagnostics(before, after):
     names3 = ("ordinal_tx_c2s", "ordinal_rx_c2s", "ordinal_tx_s2c",
               "ordinal_rx_s2c", "ordinal_mismatch", "connection_pair_ok",
               "connection_pair_miss", "lane_epoch_collision",
-              "lane_epoch_immutable_violation")
+              "lane_epoch_immutable_violation", "record_backchannel")
     names9 = ("owner_lane_match", "cross_lane_attribution", "lane_seen_mask")
     result = {
         "phase3": {name: delta(phase3_before, phase3_after, name)
@@ -288,6 +294,64 @@ def counter_diagnostics(before, after):
         "publish_readers": phase6_after["publish_readers"],
     }
     return result
+
+
+def remote_kcov_contains(vmlinux, directory, symbol):
+    result = subprocess.run(["nm", "-n", "--defined-only", str(vmlinux)],
+                            capture_output=True, text=True, check=True)
+    symbols = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3:
+            try:
+                symbols.append((int(fields[0], 16), fields[2]))
+            except ValueError:
+                continue
+    indexes = [index for index, (_, name) in enumerate(symbols) if name == symbol]
+    if len(indexes) != 1 or indexes[0] + 1 == len(symbols):
+        raise ValueError("cannot resolve unique symbol range: " + symbol)
+    index = indexes[0]
+    start, end = symbols[index][0], symbols[index + 1][0]
+    for path in directory.glob("cover_prog*.extra"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                pc = int(line.strip(), 0)
+            except ValueError as error:
+                raise ValueError("malformed remote KCOV PC in %s" % path) from error
+            if start <= pc < end:
+                return True
+    return False
+
+
+def b06_preflight(args):
+    checks = {
+        "observer_selected": args.callback_observer == "b06-recall",
+        "nfs_v41_fixture": fixture_nfs_version(args.lane_fixture) == "4.1",
+        "delegation_recall_workload": args.workload.name == "delegation-recall-v41-tcp.prog",
+        "single_owner": args.procs == 1,
+        "expected_calls_15": EXPECTED_CALLS == B06_EXPECTED_CALLS,
+        "all_errno_zero": CONFLICT_CALL == -1,
+    }
+    return {"status": "READY" if all(checks.values()) else "INVALID",
+            "checks": checks, "expected_calls": EXPECTED_CALLS,
+            "conflict_call": CONFLICT_CALL}
+
+
+def cleanup_callback_trace(vm):
+    return vm.guest("callback-trace-cleanup", """set -eu
+root=/sys/kernel/tracing
+if test -d "$root/instances/reach_callback"; then
+    echo 0 > "$root/instances/reach_callback/tracing_on"
+    cat "$root/instances/reach_callback/trace"
+    echo 0 > "$root/instances/reach_callback/events/enable"
+fi
+if grep -q '^p:b06/svc_process_bc_entry ' "$root/kprobe_events"; then
+    echo '-:b06/svc_process_bc_entry' >> "$root/kprobe_events"
+fi
+if test -d "$root/instances/reach_callback"; then
+    cd "$root/instances"; rmdir reach_callback
+fi
+""")
 
 
 def validate_gate(mode, diagnostics, functional, cover, rpc_delta,
@@ -362,6 +426,7 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir,
     trial_dir.mkdir(parents=True)
     (trial_dir / "commands").mkdir()
     remote_on = mode == "on"
+    callback_observer = getattr(args, "callback_observer", "copy-offload")
     evidence = {
         "schema": 1, "experiment": "nfs-remote-kcov-on-off",
         "mode": mode, "trial": trial_number, "status": "running",
@@ -375,6 +440,8 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir,
     base_image_hash = sha256(args.image)
     active_root = None
     hook_cleanup_failure = None
+    trace_cleanup_failure = None
+    trace_armed = False
     try:
         vm.start()
         vm.guest("inventory",
@@ -427,7 +494,38 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir,
             if save:
                 _ = (output / "callback-trace.txt").write_text(result.stdout, encoding="utf-8")
 
-        callback_trace("callback-trace-start", """set -eu
+        trace_armed = True
+        if callback_observer == "b06-recall":
+            callback_trace("callback-trace-start", """set -eu
+root=/sys/kernel/tracing
+mountpoint -q "$root" || mount -t tracefs tracefs "$root"
+test ! -e "$root/instances/reach_callback"
+! grep -q '^p:b06/svc_process_bc_entry ' "$root/kprobe_events"
+mkdir "$root/instances/reach_callback"
+cd "$root/instances/reach_callback"
+echo 0 > tracing_on
+echo global > trace_clock
+echo 1024 > buffer_size_kb
+for event in nfs4/nfs4_set_delegation nfsd/nfsd_cb_recall nfsd/nfsd_cb_queue nfsd/nfsd_cb_start nfs4/nfs4_cb_recall nfsd/nfsd_cb_recall_done; do
+    cat events/$event/format
+    echo 1 > events/$event/enable
+done
+address=$(awk '$3 == "nfsd4_run_cb_work" {print "0x" $1}' /proc/kallsyms)
+test -n "$address"
+for event in workqueue_queue_work workqueue_execute_start workqueue_execute_end; do
+    cat events/workqueue/$event/format
+    echo "function == $address" > events/workqueue/$event/filter
+    echo 1 > events/workqueue/$event/enable
+done
+echo 'p:b06/svc_process_bc_entry svc_process_bc' >> "$root/kprobe_events"
+cat events/b06/svc_process_bc_entry/format
+echo 1 > events/b06/svc_process_bc_entry/enable
+echo > trace
+echo 1 > tracing_on
+echo b06-recall-begin > trace_marker
+""")
+        else:
+            callback_trace("callback-trace-start", """set -eu
 mountpoint -q /sys/kernel/tracing || mount -t tracefs tracefs /sys/kernel/tracing
 mkdir /sys/kernel/tracing/instances/reach_callback
 cd /sys/kernel/tracing/instances/reach_callback
@@ -449,6 +547,20 @@ echo > trace
 echo 1 > tracing_on
 echo reach-copy-begin > trace_marker
 """)
+
+        def stop_b06_trace():
+            nonlocal trace_armed
+            callback_trace("callback-trace-stop", """set -eu
+cd /sys/kernel/tracing/instances/reach_callback
+echo b06-recall-end > trace_marker
+echo 0 > tracing_on
+cat trace
+echo 0 > events/enable
+echo '-:b06/svc_process_bc_entry' >> /sys/kernel/tracing/kprobe_events
+cd ..
+rmdir reach_callback
+""", save=True)
+            trace_armed = False
 
         command = [
             REMOTE_DRIVER + "/syz-execprog",
@@ -507,6 +619,8 @@ echo reach-copy-begin > trace_marker
         (trial_dir / "executor.log").write_text(log, encoding="utf-8")
         if run_meta.get("rc") != 0:
             raise ValueError("syz-execprog failed rc=%r" % run_meta.get("rc"))
+        if callback_observer == "b06-recall":
+            stop_b06_trace()
         pull(vm, "pull-coverage", "/tmp/ab-cover.tar.gz", archive)
         names = extract_cover(archive, trial_dir / "coverage")
         functional = validate_executor_log(log, args.executions, args.procs)
@@ -523,7 +637,8 @@ echo reach-copy-begin > trace_marker
                                        timeout=45)
         if attr_plan is not None:
             attr_plan.after_workload(vm, mode)
-        callback_trace("callback-trace-stop", """set -eu
+        if callback_observer != "b06-recall":
+            callback_trace("callback-trace-stop", """set -eu
 cd /sys/kernel/tracing/instances/reach_callback
 echo reach-copy-end > trace_marker
 echo 0 > tracing_on
@@ -532,8 +647,19 @@ echo 0 > events/enable
 cd ..
 rmdir reach_callback
 """, save=True)
+            trace_armed = False
         post_memory = phase9.memory_snapshot(vm, "memory-after")
         diagnostics = counter_diagnostics(baseline[0], final[0])
+        b06_verdict = None
+        if callback_observer == "b06-recall":
+            phase3_before = baseline[0]["phase3"]["record_backchannel"]
+            phase3_after = final[0]["phase3"]["record_backchannel"]
+            attributed = remote_kcov_contains(
+                args.vmlinux, trial_dir / "coverage", "svc_process_bc") if remote_on else False
+            b06_verdict = reach_callback.b06_recall_witness(
+                trial_dir / "callback-trace.txt", phase3_before, phase3_after,
+                60.0, remote_on, attributed)
+            write_json(trial_dir / "b06-verdict.json", b06_verdict)
         rpc_delta = sum(final[lane]["nfsd_rpcs"] - baseline[lane]["nfsd_rpcs"]
                         for lane in range(args.procs))
         elapsed = (run_meta["end_ns"] - run_meta["start_ns"]) / 1e9
@@ -541,6 +667,10 @@ rmdir reach_callback
         checks, failed = validate_gate(
             mode, diagnostics, functional, cover, rpc_delta,
             memory_samples, cpu_usage, final[0])
+        if b06_verdict is not None:
+            checks["b06_recall_observed"] = bool(b06_verdict["assert"])
+            if not b06_verdict["assert"]:
+                failed.append("b06_recall_observed")
         cleanup = phase9.cleanup_fixture(vm, active_root, args.procs, strict=True)
         active_root = None
         dmesg = vm.guest("dmesg", "dmesg", timeout=30, check=False)
@@ -577,6 +707,8 @@ rmdir reach_callback
             "checks": checks, "failed_checks": sorted(set(failed)),
             "cleanup": cleanup,
         })
+        if b06_verdict is not None:
+            evidence["b06_observer"] = b06_verdict
         if failed:
             raise ValueError("trial gate failed: " + ", ".join(sorted(set(failed))))
     except Exception as error:
@@ -586,6 +718,18 @@ rmdir reach_callback
         evidence["completed_at"] = timestamp()
         raise
     finally:
+        if vm.ready and trace_armed:
+            try:
+                cleanup_result = cleanup_callback_trace(vm)
+                if cleanup_result.stdout:
+                    (trial_dir / "callback-trace.txt").write_text(
+                        cleanup_result.stdout, encoding="utf-8")
+                trace_armed = False
+            except Exception as cleanup_error:
+                trace_cleanup_failure = cleanup_error
+                evidence.setdefault("cleanup_errors", []).append(
+                    "callback trace cleanup: %s" % cleanup_error)
+                evidence["status"] = "fail"
         if attr_plan is not None and vm.ready:
             try:
                 attr_plan.cleanup(vm, mode)
@@ -626,6 +770,10 @@ rmdir reach_callback
         raise RuntimeError(
             "attribution hook cleanup failed: %s" % hook_cleanup_failure
         ) from hook_cleanup_failure
+    if trace_cleanup_failure is not None:
+        raise RuntimeError(
+            "callback trace cleanup failed: %s" % trace_cleanup_failure
+        ) from trace_cleanup_failure
     return evidence
 
 
@@ -644,25 +792,30 @@ def parse_args(argv=None):
     parser.add_argument("--vmlinux", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--phase1-runner", type=Path,
-                        default=scripts / "run_frozen_phase1_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase1_vm.py")
     parser.add_argument("--phase3-runner", type=Path,
-                        default=scripts / "run_frozen_phase3_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase3_vm.py")
     parser.add_argument("--phase4-runner", type=Path,
-                        default=scripts / "run_frozen_phase4_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase4_vm.py")
     parser.add_argument("--phase5-runner", type=Path,
-                        default=scripts / "run_frozen_phase5_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase5_vm.py")
     parser.add_argument("--phase6-runner", type=Path,
-                        default=scripts / "run_frozen_phase6_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase6_vm.py")
     parser.add_argument("--phase8-runner", type=Path,
-                        default=scripts / "run_frozen_phase8_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase8_vm.py")
     parser.add_argument("--phase9-runner", type=Path,
-                        default=scripts / "run_frozen_phase9_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase9_vm.py")
     parser.add_argument("--lane-script", type=Path,
                         default=scripts / "frozen_phase1_lane.sh")
     parser.add_argument("--lane-fixture", type=Path,
                         default=scripts / "frozen_phase9_lane.sh")
     parser.add_argument("--workload", type=Path,
                         default=scripts / "nfs_remote_kcov_ab_workload.prog")
+    parser.add_argument("--callback-observer",
+                        choices=("copy-offload", "b06-recall"),
+                        default="copy-offload")
+    parser.add_argument("--preflight", action="store_true",
+                        help="validate inputs and observer configuration without starting a VM")
     parser.add_argument("--syz-bin", type=Path, default=None,
                         help="syzkaller build root containing "
                              "bin/linux_amd64/; derives --syz-executor and "
@@ -730,6 +883,19 @@ def fixture_nfs_version(path):
 
 def main(argv=None, attr_plan=None):
     args = parse_args(argv)
+    if args.callback_observer == "b06-recall":
+        preflight = b06_preflight(args)
+        if args.preflight:
+            print(json.dumps(preflight, sort_keys=True))
+            if preflight["status"] != "READY":
+                raise SystemExit(2)
+            return
+        if preflight["status"] != "READY":
+            raise ValueError("invalid B06 observer configuration: %r" % preflight["checks"])
+    elif args.preflight:
+        print(json.dumps({"status": "READY", "callback_observer": "copy-offload"},
+                         sort_keys=True))
+        return
     phase1 = load_module("ab_phase1", args.phase1_runner)
     phase3 = load_module("ab_phase3", args.phase3_runner)
     phase4 = load_module("ab_phase4", args.phase4_runner)
@@ -755,6 +921,7 @@ def main(argv=None, attr_plan=None):
         "controls": {
             "trials_per_mode": args.trials, "executions_per_trial": args.executions,
             "sample_every_executions": args.sample_every, "procs": args.procs,
+            "callback_observer": args.callback_observer,
             "lanes": args.procs, "cpus": args.cpus, "memory_mib": args.memory,
             "nfs_version": fixture_nfs_version(args.lane_fixture),
             "transport": "tcp", "localio": "disabled",

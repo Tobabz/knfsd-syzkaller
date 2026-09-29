@@ -1,0 +1,461 @@
+From 6dc7e1ed1305e1291ba9201729065fc6f328d98e Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Tue, 29 Sep 2026 17:26:24 +0900
+Subject: [PATCH] sunrpc: observe NFSD transport stages with remote KCOV
+
+---
+ Documentation/dev-tools/kcov.rst |  56 +++++++++
+ include/linux/kcov.h             |   3 +
+ include/uapi/linux/kcov.h        |   4 +
+ kernel/kcov.c                    | 203 +++++++++++++++++++++++++++++++
+ net/sunrpc/svc_xprt.c            |  14 ++-
+ net/sunrpc/svcsock.c             |  12 +-
+ 6 files changed, 287 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/dev-tools/kcov.rst b/Documentation/dev-tools/kcov.rst
+index 1a739290c..0cfae30da 100644
+--- a/Documentation/dev-tools/kcov.rst
++++ b/Documentation/dev-tools/kcov.rst
+@@ -383,3 +383,59 @@ local tasks spawned by the process and the global task that handles USB bus #1:
+ 		perror("close"), exit(1);
+ 	return 0;
+     }
++
++NFSD stage-presence observation (downstream NF-A1)
++------------------------------------------------
++
++``KCOV_SUBSYSTEM_NFSD_OBSERVE`` is ``0x02ull << 56``. Its only instance is 1:
++``KCOV_NFSD_OBSERVE_HANDLE == 0x0200000000000001ull``. This is one global,
++best-effort observation stream across NFSD workers, sockets and network
++namespaces. It does not establish request ownership, ordering, or a causal
++connection between PCs from different stages.
++
++The guest collector opens a separate KCOV descriptor, uses ``KCOV_INIT_TRACE``
++and ``mmap`` as above, clears the count before enabling, then supplies::
++
++    trace_mode    = KCOV_TRACE_PC
++    area_size     = scratch size in unsigned long words (at least 3)
++    num_handles   = 1
++    common_handle = 0
++    handles[0]    = KCOV_NFSD_OBSERVE_HANDLE
++
++``area_size`` must also fit the existing KCOV size limit. Three words suffice
++for the scratch-pool header on both 32-bit and 64-bit builds; practical buffers
++should be much larger. The mmap size is independently set by ``KCOV_INIT_TRACE``.
++Softirq sections use the preallocated ``CONFIG_KCOV_IRQ_AREA_SIZE`` buffers,
++not ``area_size``. Comparison mode, mixed handles, a common handle, other
++instances, reserved handle bits and undersized scratch are rejected with
++``EINVAL``. A second collector of this global handle receives ``EEXIST``.
++Do not use the request-generation ioctls on this descriptor.
++
++The annotated stages are NFSD's actual softirq ``svc_data_ready`` callback
++(including its ``svc_xprt_enqueue`` call), the dequeue portion of ``svc_recv``
++(ending before ``svc_handle_xprt``). The observer does not wrap
++``svc_process``: existing checked request tickets cover that stage after
++managed admission. Global observation never substitutes for request-attributed
++output. Task-context data-ready callbacks are deliberately not observed by
++this hook.
++
++``kcov_remote_start_nfsd_observe()`` returns true only after installing a private
++scratch buffer. Its caller invokes ``kcov_remote_stop()`` exactly once, in the
++same context, only after true. Unsupported contexts (including atomic task
++context), an attached managed ticket, incumbent KCOV, absent registration or
++unavailable scratch all cause a passive false return. It does not suspend an
++incumbent, invalidate a managed generation or issue nesting warnings. The
++original ``kcov_remote_start()`` API and the sequence-checked remote merge
++remain unchanged.
++
++For a stable snapshot, the enabling thread calls ``KCOV_DISABLE`` before reading
++the mapped count with acquire semantics and consuming that many PCs. Disable
++removes the handle; sections still in flight are discarded by the existing
++sequence check rather than drained. Reset the count only while disabled. Buffer
++exhaustion and skipped sections mean missing PCs are not evidence that a stage
++did not execute. Observed PCs are stage-presence evidence only, never proof that
++one request traversed all stages. No new overflow or completeness ABI is added.
++
++``CONFIG_KCOV_SELFTEST`` includes deterministic registration-policy, passive
++rejection, private-scratch, nesting, merge and stale-sequence checks for this
++observer. Running those boot tests is separate from compiling the patch.
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+index 415c9c44f..bfbfddbf5 100644
+--- a/include/linux/kcov.h
++++ b/include/linux/kcov.h
+@@ -277,6 +277,8 @@ do {						\
+ 
+ /* See Documentation/dev-tools/kcov.rst for usage details. */
+ void kcov_remote_start(u64 handle);
++/* Passive observer: pair with kcov_remote_stop() only when this returns true. */
++bool kcov_remote_start_nfsd_observe(void);
+ void kcov_remote_stop(void);
+ struct kcov_common_handle_id kcov_common_handle(void);
+ 
+@@ -449,6 +451,7 @@ static inline void kcov_task_exit(struct task_struct *t) {}
+ static inline void kcov_prepare_switch(struct task_struct *t) {}
+ static inline void kcov_finish_switch(struct task_struct *t) {}
+ static inline void kcov_remote_start(u64 handle) {}
++static inline bool kcov_remote_start_nfsd_observe(void) { return false; }
+ static inline void kcov_remote_stop(void) {}
+ static inline struct kcov_common_handle_id kcov_common_handle(void)
+ {
+diff --git a/include/uapi/linux/kcov.h b/include/uapi/linux/kcov.h
+index 7a3fed70d..6e2c52c58 100644
+--- a/include/uapi/linux/kcov.h
++++ b/include/uapi/linux/kcov.h
+@@ -60,6 +60,10 @@ enum {
+ 
+ #define KCOV_SUBSYSTEM_COMMON	(0x00ull << 56)
+ #define KCOV_SUBSYSTEM_USB	(0x01ull << 56)
++#define KCOV_SUBSYSTEM_NFSD_OBSERVE (0x02ull << 56)
++
++/* Global stage-presence observation, not request attribution. */
++#define KCOV_NFSD_OBSERVE_HANDLE (KCOV_SUBSYSTEM_NFSD_OBSERVE | 1ull)
+ 
+ #define KCOV_SUBSYSTEM_MASK	(0xffull << 56)
+ #define KCOV_INSTANCE_MASK	(0xffffffffull)
+diff --git a/kernel/kcov.c b/kernel/kcov.c
+index e648a0425..788cf9e32 100644
+--- a/kernel/kcov.c
++++ b/kernel/kcov.c
+@@ -779,12 +779,32 @@ static inline bool kcov_check_handle(u64 handle, bool common_valid,
+ 			common_valid : zero_valid;
+ 	case KCOV_SUBSYSTEM_USB:
+ 		return uncommon_valid;
++	case KCOV_SUBSYSTEM_NFSD_OBSERVE:
++		return uncommon_valid && handle == KCOV_NFSD_OBSERVE_HANDLE;
+ 	default:
+ 		return false;
+ 	}
+ 	return false;
+ }
+ 
++/* Never mix observational PCs with a common handle or managed generation. */
++static bool kcov_nfsd_observe_arg_valid(const struct kcov_remote_arg *arg)
++{
++	unsigned int i;
++
++	for (i = 0; i < arg->num_handles; i++) {
++		if ((arg->handles[i] & KCOV_SUBSYSTEM_MASK) !=
++		    KCOV_SUBSYSTEM_NFSD_OBSERVE)
++			continue;
++		return arg->num_handles == 1 && !arg->common_handle &&
++			arg->trace_mode == KCOV_TRACE_PC &&
++			arg->handles[i] == KCOV_NFSD_OBSERVE_HANDLE &&
++			arg->area_size >= DIV_ROUND_UP(
++				sizeof(struct kcov_remote_area), sizeof(unsigned long));
++	}
++	return true;
++}
++
+ static int kcov_ioctl_locked(struct kcov *kcov, unsigned int cmd,
+ 			     unsigned long arg)
+ 	__must_hold(&kcov->lock)
+@@ -840,6 +860,8 @@ static int kcov_ioctl_locked(struct kcov *kcov, unsigned int cmd,
+ 		if (kcov->t != NULL || t->kcov_remote != NULL)
+ 			return -EBUSY;
+ 		remote_arg = (struct kcov_remote_arg *)arg;
++		if (!kcov_nfsd_observe_arg_valid(remote_arg))
++			return -EINVAL;
+ 		mode = kcov_get_mode(remote_arg->trace_mode);
+ 		if (mode < 0)
+ 			return mode;
+@@ -1497,6 +1519,75 @@ void kcov_remote_start(u64 handle)
+ }
+ EXPORT_SYMBOL(kcov_remote_start);
+ 
++/*
++ * Best-effort global observation. Unlike kcov_remote_start(), never warn about
++ * or displace an incumbent, even in softirq context. In particular, a managed
++ * ticket must not see another scratch area through the trace callback.
++ * The caller must stop in the same context, and only after a true return.
++ */
++bool kcov_remote_start_nfsd_observe(void)
++{
++	struct task_struct *t = current;
++	struct kcov_remote *remote;
++	struct kcov *kcov;
++	void *area;
++	unsigned int size;
++	int sequence;
++	unsigned long flags;
++	bool irq = in_softirq_really();
++
++	if (!in_task() && !irq)
++		return false;
++	/* Task-context scratch allocation may sleep. */
++	if (!irq && (in_atomic() || irqs_disabled()))
++		return false;
++
++	local_lock_irqsave(&kcov_percpu_data.lock, flags);
++	if (t->kcov_request_remote_ticket || t->kcov || t->kcov_softirq ||
++	    kcov_mode_enabled(READ_ONCE(t->kcov_mode))) {
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return false;
++	}
++
++	spin_lock(&kcov_remote_lock);
++	remote = kcov_remote_find(KCOV_NFSD_OBSERVE_HANDLE);
++	if (!remote) {
++		spin_unlock(&kcov_remote_lock);
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return false;
++	}
++	kcov = remote->kcov;
++	/* Registration excludes managed generations; retain the merge guard. */
++	if (!kcov_request_legacy_merge_allowed(kcov)) {
++		spin_unlock(&kcov_remote_lock);
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return false;
++	}
++	kcov_get(kcov);
++	sequence = kcov->sequence;
++	size = irq ? CONFIG_KCOV_IRQ_AREA_SIZE : kcov->remote_size;
++	area = kcov_remote_area_get(size, irq);
++	spin_unlock(&kcov_remote_lock);
++
++	if (!area) {
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		area = irq ? NULL : vmalloc(size * sizeof(unsigned long));
++		if (!area) {
++			kcov_put(kcov);
++			return false;
++		}
++		local_lock_irqsave(&kcov_percpu_data.lock, flags);
++	}
++
++	*(unsigned long *)area = 0;
++	if (irq)
++		t->kcov_softirq = 1;
++	kcov_start(t, kcov, size, area, KCOV_MODE_TRACE_PC, sequence);
++	local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++	return true;
++}
++EXPORT_SYMBOL_GPL(kcov_remote_start_nfsd_observe);
++
+ static void kcov_move_area(enum kcov_mode mode, void *dst_area,
+ 				unsigned int dst_area_size, void *src_area)
+ {
+@@ -2546,6 +2637,116 @@ struct kcov_common_handle_id kcov_common_handle(void)
+ EXPORT_SYMBOL(kcov_common_handle);
+ 
+ #ifdef CONFIG_KCOV_SELFTEST
++static bool __init kcov_nfsd_observe_selftest(void)
++{
++	DEFINE_RAW_FLEX(struct kcov_remote_arg, arg, handles, 2);
++	static const struct {
++		u32 mode, size, nr;
++		u64 common, handles[2];
++		bool valid;
++	} cases[] = {
++		{ 0, 64, 1, 0, { KCOV_NFSD_OBSERVE_HANDLE }, true },
++		{ 1, 64, 1, 0, { KCOV_NFSD_OBSERVE_HANDLE }, false },
++		{ 0, 64, 1, 1, { KCOV_NFSD_OBSERVE_HANDLE }, false },
++		{ 0, 64, 2, 0, { KCOV_SUBSYSTEM_USB | 1,
++				 KCOV_NFSD_OBSERVE_HANDLE }, false },
++		{ 0, 64, 1, 0, { KCOV_SUBSYSTEM_NFSD_OBSERVE | 2 }, false },
++		{ 0, 64, 1, 0, { KCOV_NFSD_OBSERVE_HANDLE | BIT_ULL(32) }, false },
++		{ 0, 0, 1, 0, { KCOV_NFSD_OBSERVE_HANDLE }, false },
++		{ 0, 1, 1, 0, { KCOV_NFSD_OBSERVE_HANDLE }, false },
++		{ 1, 64, 1, 1, { KCOV_SUBSYSTEM_USB | 1 }, true },
++	};
++	unsigned long destination[64] = {};
++	struct kcov kcov = {
++		.mode = KCOV_MODE_TRACE_PC, .size = ARRAY_SIZE(destination),
++		.area = destination, .remote = true, .remote_size = 64,
++		.sequence = 1,
++	};
++	struct kcov_request_remote_ticket ticket = {};
++	struct kcov_remote *remote;
++	unsigned long flags, count;
++	unsigned long *scratch;
++	bool active = false, pass = false;
++	unsigned int i;
++
++	static_assert(KCOV_NFSD_OBSERVE_HANDLE == 0x0200000000000001ull);
++	for (i = 0; i < ARRAY_SIZE(cases); i++) {
++		arg->trace_mode = cases[i].mode;
++		arg->area_size = cases[i].size;
++		arg->num_handles = cases[i].nr;
++		arg->common_handle = cases[i].common;
++		memcpy(arg->handles, cases[i].handles, sizeof(cases[i].handles));
++		if (kcov_nfsd_observe_arg_valid(arg) != cases[i].valid)
++			return false;
++	}
++	if (!kcov_check_handle(KCOV_NFSD_OBSERVE_HANDLE, false, true, false) ||
++	    kcov_check_handle(KCOV_NFSD_OBSERVE_HANDLE, true, false, false))
++		return false;
++
++	/* Boot-only test: no observer has registered yet. No timing dependency. */
++	if (kcov_remote_start_nfsd_observe()) {
++		kcov_remote_stop();
++		return false;
++	}
++	spin_lock_init(&kcov.lock);
++	refcount_set(&kcov.refcount, 1);
++	spin_lock_irqsave(&kcov_remote_lock, flags);
++	remote = kcov_remote_add(&kcov, KCOV_NFSD_OBSERVE_HANDLE);
++	spin_unlock_irqrestore(&kcov_remote_lock, flags);
++	if (IS_ERR(remote))
++		return false;
++
++	/* A ticket alone must exclude observation, even with tracing disabled. */
++	current->kcov_request_remote_ticket = &ticket;
++	active = kcov_remote_start_nfsd_observe();
++	current->kcov_request_remote_ticket = NULL;
++	if (active)
++		goto out;
++	preempt_disable();
++	active = kcov_remote_start_nfsd_observe();
++	preempt_enable();
++	if (active)
++		goto out;
++
++	active = kcov_remote_start_nfsd_observe();
++	if (!active || current->kcov != &kcov ||
++	    current->kcov_area == destination)
++		goto out;
++	scratch = current->kcov_area;
++	/* Nested observation must leave the incumbent installed, without a stop. */
++	if (kcov_remote_start_nfsd_observe() || current->kcov_area != scratch)
++		goto out;
++	scratch[0] = 1;
++	scratch[1] = 0x1234;
++	kcov_remote_stop();
++	active = false;
++	if (destination[0] < 1 || destination[1] != 0x1234 || current->kcov ||
++	    current->kcov_request_remote_ticket || current->kcov_softirq ||
++	    refcount_read(&kcov.refcount) != 1)
++		goto out;
++
++	count = destination[0];
++	active = kcov_remote_start_nfsd_observe();
++	if (!active)
++		goto out;
++	/* A stale section must not merge into a new registration sequence. */
++	spin_lock_irqsave(&kcov.lock, flags);
++	kcov.sequence++;
++	spin_unlock_irqrestore(&kcov.lock, flags);
++	kcov_remote_stop();
++	active = false;
++	pass = destination[0] == count && !current->kcov &&
++		refcount_read(&kcov.refcount) == 1;
++out:
++	if (active)
++		kcov_remote_stop();
++	spin_lock_irqsave(&kcov_remote_lock, flags);
++	hash_del(&remote->hnode);
++	spin_unlock_irqrestore(&kcov_remote_lock, flags);
++	kfree(remote);
++	return pass;
++}
++
+ static void __init selftest(void)
+ {
+ 	unsigned long start;
+@@ -2598,6 +2799,8 @@ static int __init kcov_init(void)
+ 	debugfs_create_file_unsafe("kcov", 0600, NULL, NULL, &kcov_fops);
+ 
+ #ifdef CONFIG_KCOV_SELFTEST
++	if (!kcov_nfsd_observe_selftest())
++		panic("kcov: NFSD observation selftest failed");
+ 	selftest();
+ #endif
+ 
+diff --git a/net/sunrpc/svc_xprt.c b/net/sunrpc/svc_xprt.c
+index 525129e6c..1573a5433 100644
+--- a/net/sunrpc/svc_xprt.c
++++ b/net/sunrpc/svc_xprt.c
+@@ -9,6 +9,8 @@
+ #include <linux/sched/mm.h>
+ #include <linux/errno.h>
+ #include <linux/freezer.h>
++#include <linux/kcov.h>
++#include <linux/nfs.h>
+ #include <linux/slab.h>
+ #include <net/sock.h>
+ #include <linux/sunrpc/addr.h>
+@@ -922,7 +924,7 @@ static void svc_thread_wake_next(struct svc_rqst *rqstp)
+ int svc_recv(struct svc_rqst *rqstp, long timeo)
+ {
+ 	struct svc_pool *pool = rqstp->rq_pool;
+-	bool did_timeout;
++	bool did_timeout, observe;
+ 	int ret = 0;
+ 
+ 	if (!svc_alloc_arg(rqstp))
+@@ -941,10 +943,10 @@ int svc_recv(struct svc_rqst *rqstp, long timeo)
+ 		return ret;
+ 	}
+ 
++	observe = rqstp->rq_server->sv_programs->pg_prog == NFS_PROGRAM &&
++		kcov_remote_start_nfsd_observe();
+ 	rqstp->rq_xprt = svc_xprt_dequeue(pool);
+ 	if (rqstp->rq_xprt) {
+-		struct svc_xprt *xprt = rqstp->rq_xprt;
+-
+ 		svc_thread_wake_next(rqstp);
+ 		/* Normally we will wait up to 5 seconds for any required
+ 		 * cache information to be provided.  When there are no
+@@ -968,8 +970,12 @@ int svc_recv(struct svc_rqst *rqstp, long timeo)
+ 		}
+ 
+ 		trace_svc_xprt_dequeue(rqstp);
+-		svc_handle_xprt(rqstp, xprt);
+ 	}
++	/* End observation before receive/dispatch can acquire a managed ticket. */
++	if (observe)
++		kcov_remote_stop();
++	if (rqstp->rq_xprt)
++		svc_handle_xprt(rqstp, rqstp->rq_xprt);
+ 
+ #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+ 	if (svc_is_backchannel(rqstp)) {
+diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
+index 893718206..9fb1a57dc 100644
+--- a/net/sunrpc/svcsock.c
++++ b/net/sunrpc/svcsock.c
+@@ -37,6 +37,8 @@
+ #include <linux/file.h>
+ #include <linux/freezer.h>
+ #include <linux/bvec.h>
++#include <linux/kcov.h>
++#include <linux/nfs.h>
+ 
+ #include <net/sock.h>
+ #include <net/checksum.h>
+@@ -413,6 +415,7 @@ static void svc_sock_secure_port(struct svc_rqst *rqstp)
+ static void svc_data_ready(struct sock *sk)
+ {
+ 	struct svc_sock	*svsk = (struct svc_sock *)sk->sk_user_data;
++	bool observe = false;
+ 
+ 	trace_sk_data_ready(sk);
+ 
+@@ -420,6 +423,10 @@ static void svc_data_ready(struct sock *sk)
+ 		/* Refer to svc_setup_socket() for details. */
+ 		rmb();
+ #ifdef CONFIG_KCOV
++		/* Only the actual softirq producer, never task-side replay. */
++		if (in_serving_softirq() &&
++		    svsk->sk_xprt.xpt_server->sv_programs->pg_prog == NFS_PROGRAM)
++			observe = kcov_remote_start_nfsd_observe();
+ 		if (sk) {
+ 			struct sk_buff *skb = skb_peek(&sk->sk_receive_queue);
+ 			if (skb) {
+@@ -432,10 +439,13 @@ static void svc_data_ready(struct sock *sk)
+ 		svsk->sk_odata(sk);
+ 		trace_svcsock_data_ready(&svsk->sk_xprt, 0);
+ 		if (test_bit(XPT_HANDSHAKE, &svsk->sk_xprt.xpt_flags))
+-			return;
++			goto out;
+ 		if (!test_and_set_bit(XPT_DATA, &svsk->sk_xprt.xpt_flags))
+ 			svc_xprt_enqueue(&svsk->sk_xprt);
+ 	}
++out:
++	if (observe)
++		kcov_remote_stop();
+ }
+ 
+ /*
+-- 
+2.53.0
+

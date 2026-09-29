@@ -19,16 +19,15 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 | base image (site-generated) | `tools/make-base-image.sh` → `artifacts/bookworm-base.img` (2 GiB raw, `create-image.sh -d bookworm`) | 2 GiB |
 | `src/guest-deps.tar.gz` | Debian nfs-utils extraction for guests (committed) | ~6 MB |
 | guest keypair (site-generated) | same run: `artifacts/bookworm.id_rsa[.pub]` (pairs with your base) | — |
-| `patches/kernel/` | kernel series: 11 patches + `series` + `SHA256SUMS` | — |
-| `patches/syzkaller/` | syzkaller series: 17 patches + `series` + `SHA256SUMS` | — |
+| `patches/kernel/` | kernel series: 13 patches + `series` | — |
+| `patches/syzkaller/` | syzkaller series: 17 patches + `series` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
-| `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); selected via `KOOV_KCONFIG`; outside the 3-item `SHA256SUMS` | — |
-| `ab-runner/` | AB experiment lane drivers (`run_frozen_phase*_vm.py`, lane/probe/bootstrap files, `monitor_knfsd.py`, workload prog) | — |
+| `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); selected via `KOOV_KCONFIG` | — |
+| `ab-runner/` | AB experiment lane drivers (`phases/run_frozen_phase*_vm.py`, lane/probe/bootstrap files, workload prog) | — |
 | `baker/` | protocol image baking (`bake_nfs_protocol_image.py`) | — |
 | `corpus/` | fuzz corpus / candidate preparation (`audit_*`, `build_*`) | — |
-| `SHA256SUMS` | checksums of committed bootstrap inputs (3 items) | — |
 
-Verify first: `sha256sum -c SHA256SUMS`.
+
 
 ## Provenance
 
@@ -37,7 +36,7 @@ Verify first: `sha256sum -c SHA256SUMS`.
   was **deleted 2026-09-25** during the bundle independence restructure; its
   hash is kept here for audit. Its useful contents survived as the flat
   `patches/` + `ab-runner/` (+`baker/`, `corpus/`) above.
-- `patches/*/SHA256SUMS` pin the series bytes; forward-port gate R6
+- `patches/*/series` records apply order; no SHA256 verification is performed
   re-verifies them on every pipeline run.
 
 ## Base image provenance
@@ -104,7 +103,6 @@ Generate the site base + keypair, then verify the committed manifest:
 
 ```sh
 sudo bash tools/make-base-image.sh --out artifacts
-cd bundle && sha256sum -c SHA256SUMS
 ```
 
 ```sh

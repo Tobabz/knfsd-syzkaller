@@ -4,8 +4,8 @@ This repository distributes the following components with their own licensing:
 
 | Component | Origin | License |
 |---|---|---|
-| `bundle/patches/kernel/` (11 patches) | Linux kernel (series targets `v7.3-rc4`) | **GPL-2.0** (derivative) |
-| `bundle/patches/syzkaller/` (15 patches) | syzkaller @ `801f09666` | **Apache-2.0** (derivative; upstream license by Google LLC) |
+| `bundle/patches/kernel/` (13 patches) | Linux kernel (series targets `v7.3-rc4`) | **GPL-2.0** (derivative) |
+| `bundle/patches/syzkaller/` (17 patches) | syzkaller @ `801f09666` | **Apache-2.0** (derivative; upstream license by Google LLC) |
 | Linux kernel source (cloned by bootstrap @ `v7.3-rc4`, git.kernel.org) | kernel.org (torvalds/linux) | GPL-2.0 (full text: kernel `COPYING`) |
 | syzkaller source (cloned by bootstrap @ `801f09666`, github.com/google/syzkaller) | syzkaller repo | Apache-2.0 (full text: `LICENSE`) |
 | base image (site-generated, via `tools/make-base-image.sh`) | Debian bookworm rootfs (debootstrap) | DFSG-free; individual package licenses live inside the image |

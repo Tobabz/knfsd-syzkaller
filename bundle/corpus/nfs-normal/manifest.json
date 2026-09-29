@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "corpus": "nfs-normal",
+  "runtime_scope": "Parser success is syntax validation only. The execution_status and runtime_evidence fields name later pinned VM runs; they do not extend their results to other versions or transports.",
+  "parser": {
+    "path": "/home/idealinsane/kcsan-env-0012/syzkaller/bin/syz-prog2c",
+    "sha256": "ae5e6c3b2c31d340265088e28835103dedbb8441b7b874f281353604e59ac533",
+    "source_checkout": "8c1901085e70fcfd88acdcc934410c79fbf27e1b",
+    "argv": ["-os", "linux", "-arch", "amd64", "-prog", "ABSOLUTE_INPUT_PATH"]
+  },
+  "programs": [
+    {
+      "path": "basic-v41-tcp.prog",
+      "sha256": "59e1d766a9a15c8e1700ce055674d9d1b06dccc9167d567e06985d8d9cf69f02",
+      "source": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-normal-flow-wave1/tools/nfs_remote_kcov_ab_workload_markerhidden.prog",
+      "source_sha256": "59e1d766a9a15c8e1700ce055674d9d1b06dccc9167d567e06985d8d9cf69f02",
+      "nf_flows": ["NF-A1", "NF-A2"],
+      "nfs_version": "4.1",
+      "transport": "TCP",
+      "fixture_path": "/home/idealinsane/knfsd-syzkaller-fresh/tools/ab-lane-fixture.sh",
+      "fixture_command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 2",
+      "runner_entry": "/home/idealinsane/knfsd-syzkaller-fresh/tools/run-ab.sh",
+      "functional_oracle": "All 34 calls finish on each execution; call 14 is the deliberate peer-lock conflict and returns errno 11, every other call returns errno 0, local KCOV is positive, and create/write/read/rename/unlink effects succeed across both mounts.",
+      "execution_status": "Fresh paired v4.1/TCP VM functional and KCOV PASS for NF-A2; NF-A1 socket-to-nfsd transport handoff was not directly traced in this run.",
+      "runtime_evidence": {
+        "path": "/home/idealinsane/normal-flow-evidence/NF-A1-A2-basic-v41-tcp-v1",
+        "functional": "Both OFF and ON complete 34 calls with the expected call-14 errno 11 and 53 nfsd RPCs.",
+        "handoff": "NF-A1 unverified for this v4.1 input; operation success and PCs are not a transport trace.",
+        "kcov": "Local coverage present in both modes; remote ON coverage present."
+      },
+      "parser_result": {"exit": 0, "c_bytes": 16077, "c_sha256": "fdb7ce127d1d5e9b7b0fd7db01e30543d68a250ed9c3a9a3c1d90041f54852f7", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
+    },
+    {
+      "path": "async-copy-v42-tcp.prog",
+      "sha256": "b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068",
+      "source": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-normal-flow-wave1/bundle/corpus/attr-scenarios/B05/reach-copy-offload-x2.prog",
+      "source_sha256": "b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068",
+      "nf_flows": ["NF-A1", "NF-A2", "NF-C1", "NF-D1"],
+      "nfs_version": "4.2",
+      "transport": "TCP",
+      "fixture_path": "/home/idealinsane/knfsd-syzkaller-fresh/bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh",
+      "fixture_command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 2",
+      "runner_entry": "/usr/bin/python3 tools/attr-scenario-run.py --scenario bundle/corpus/nfs-normal/B05-V1.json --output /home/idealinsane/attr-scenario-evidence/<unique-normal-B05-run>",
+      "runner_working_directory": "/home/idealinsane/knfsd-syzkaller-fresh",
+      "runner_binding": "The corpus-local B05-V1.json consumes this copied workload and fixture. The runner does not consume bundle/corpus/nfs-normal/manifest.json.",
+      "functional_oracle": "copy_file_range returns 33554432, async execution reaches nfsd4_do_async_copy, CB_OFFLOAD completes with status 0, and destination fsync and closes finish.",
+      "execution_status": "Fresh corpus-local B05 paired v4.2/TCP VM PASS for async COPY and callback; separate NF-A1 R2 ON VM confirms a direct socket-to-nfsd handoff on the same input. Strict parser mode still rejects legacy line-7 offset strings.",
+      "runtime_evidence": {
+        "paired_copy": "/home/idealinsane/attr-scenario-evidence/NORMAL-B05-CORPUS-20260928",
+        "transport_witness": "/home/idealinsane/normal-flow-evidence/NF-A1-COPY-20260928-R2",
+        "functional": "Ten 32 MiB COPY completions per mode in B05; R2 has ten 11-call errno-zero COPY executions and ten callback deliveries.",
+        "handoff": "R2 raw trace correlates socket-ready, enqueue, dequeue, and process across distinct kworker and nfsd tasks using the same transport and request; NF-A1 confirmed for v4.2/TCP only.",
+        "kcov": "B05 ON-only fs/nfsd has 1,421 unique PCs; R2 ON has 694,531 remote PC records. Callback worker is observed in the trace but absent from on-only coverage; these aggregate PCs do not attribute the NF-A1 handoff to a request ticket.",
+        "sanitizer": "KCSAN reports retained; not sanitizer-clean."
+      },
+      "parser_result": {"exit": 0, "c_bytes": 3149730, "c_sha256": "663fd5832b0adf789b8182bd380b8149366c20ccf03824d882de81576ed9f6db", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
+    },
+    {
+      "path": "delegation-recall-v41-tcp.prog",
+      "sha256": "2a25b68396c7fbb147eedb68a3b8eaf9f5a65ba65d7463b0b88772b32f0e4978",
+      "source": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave3/bundle/corpus/attr-scenarios/B06/delegation-recall.prog",
+      "source_sha256": "2a25b68396c7fbb147eedb68a3b8eaf9f5a65ba65d7463b0b88772b32f0e4978",
+      "nf_flows": ["NF-A1", "NF-A2", "NF-D3", "NF-D1", "NF-D2"],
+      "nfs_version": "4.1",
+      "transport": "TCP",
+      "fixture_path": "/home/idealinsane/knfsd-syzkaller-fresh/tools/ab-lane-fixture.sh",
+      "fixture_command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 1",
+      "runner_entry": "KOOV_EXPECTED_CALLS=15 KOOV_CONFLICT_CALL=-1 python3 tools/run-reach-adapted-window.py --callback-observer b06-recall --kernel /home/idealinsane/kcsan-env-0012/linux/arch/x86/boot/bzImage --image /home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw --ssh-key /home/idealinsane/knfsd-syzkaller-fresh/artifacts/bookworm.id_rsa --deps-tar bundle/src/guest-deps.tar.gz --vmlinux /home/idealinsane/kcsan-env-0012/linux/vmlinux --syz-bin /home/idealinsane/kcsan-env-0012/syzkaller --lane-fixture tools/ab-lane-fixture.sh --workload bundle/corpus/nfs-normal/delegation-recall-v41-tcp.prog --output /home/idealinsane/normal-flow-evidence/B06-V1-delegation-recall-v41-$(date +%s%N) --mode both --trials 1 --executions 10 --sample-every 10 --procs 1",
+      "runner_working_directory": "/home/idealinsane/knfsd-syzkaller-fresh",
+      "functional_oracle": "First prove delegation grant; then the client1 conflict must produce ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and delegation return/close. File effects alone do not pass.",
+      "execution_status": "Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced.",
+      "runtime_evidence": {
+        "path": "/home/idealinsane/normal-flow-evidence/B06-V1-delegation-recall-v41-r3",
+        "functional": "OFF and ON each complete 150 errno-zero call results; record_backchannel increases from 0 to 20 in both trials.",
+        "handoff": "Two independently reviewed complete grant, recall, callback-work, svc_process_bc, successful ACK, and server-completion chains per trial; earlier NF-D2 receive/queue segment and DELEGRETURN remain unverified.",
+        "kcov": "OFF remote KCOV disabled. ON has ten nonempty extra files and 294,223 remote PCs, but no svc_process_bc PC: this executor is trace-observed and ownerless, not unexecuted.",
+        "sanitizer": "KCSAN OFF has one report and ON has none; not a race-freedom claim."
+      },
+      "parser_result": {"exit": 0, "c_bytes": 4906, "c_sha256": "0bec812704fb1b959fef1c744f566c18908613f24d2bc919dbde0cb8a86b6077", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
+    },
+    {
+      "path": "basic-read-v3-tcp.prog",
+      "sha256": "1c72a772432397b6b570cfcea465d9bbd854a9bafc739f3ca5f2724d54a923c1",
+      "source": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave3/bundle/corpus/attr-scenarios/B04/deferred-lookup.prog",
+      "source_sha256": "1c72a772432397b6b570cfcea465d9bbd854a9bafc739f3ca5f2724d54a923c1",
+      "nf_flows": ["NF-A1", "NF-A2"],
+      "nfs_version": "3",
+      "transport": "TCP forechannel and TCP mount protocol",
+      "fixture_path": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave3/bundle/corpus/attr-scenarios/B04/ab-lane-fixture-v3.sh",
+      "fixture_command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 1",
+      "runner_entry": null,
+      "functional_oracle": "Open nfs-lane/client0/shared/fixture, read the 30-byte fixture content into a 128-byte buffer, return 30 bytes, and close successfully. This normal input does not by itself prove NF-B1 defer/revisit.",
+      "execution_status": "Parser-only and never executed with the v3 fixture. Wave3 B04 fixture attempts r4-r11 failed setup before workload; fixture binding is an external dirty-Wave3 dependency, so functional status is blocked and unverified.",
+      "parser_result": {"exit": 0, "c_bytes": 1812, "c_sha256": "3cb1ef5ccdb5ee96b66f6f3192e7ad15fad9448daf4d9193a2a0ccf1495af323", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
+    }
+  ],
+  "excluded": [
+    {"input": "Wave3 B07", "reason": "Byte-identical duplicate of B05; distinguishing behavior is a forced owner-window runner contract, not a normal input."},
+    {"input": "Wave3 B12", "reason": "The .prog is getpid(); NFS behavior comes entirely from a forced retry hook."}
+  ],
+  "gaps": [
+    {"flows": ["NF-B1"], "reason": "No reusable .prog contract. Clean Wave1 Gate8 has a bounded historical predecode auth-unix-ip single-defer PASS through a C helper and six-case runner, but it is not a .prog or a new corpus run; B04 forced redefer is not a normal substitute."},
+    {"flows": ["NF-B2", "NF-E1", "NF-E2", "NF-E3", "NF-E3b", "NF-E4", "NF-E5"], "reason": "No source-backed syzkaller input with a concrete event-armed background-worker fixture and functional oracle."},
+    {"flows": ["NF-D2"], "reason": "B06 confirms svc_process_bc and callback ACK, but not the earlier xprtiod receive -> backchannel queue/dequeue physical transition."},
+    {"flows": ["NF-D3"], "reason": "B06 confirms delegation grant, callback work, ACK, and completion; DELEGRETURN is not separately traced."},
+    {"boundary": "NFSv2", "reason": "Disabled in the pinned build."},
+    {"boundary": "UDP", "reason": "Current fixtures are TCP-only; no UDP NFSv3 fixture/parser execution exists."},
+    {"boundary": "RPC-over-RDMA", "reason": "No device or provisioned fixture."},
+    {"boundary": "LOCALIO", "reason": "Compiled but disabled and no input/fixture exists."},
+    {"boundary": "NAT", "reason": "Direct-veth fixtures do not establish address-rewritten pairing."}
+  ]
+}
