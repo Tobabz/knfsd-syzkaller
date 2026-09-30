@@ -114,7 +114,7 @@ v4.1/v3의 미검증 범위는 그대로 별개다.
 ## Main integration and consumer entries
 
 Wave1에서 검증한 단위는 현재 main 경로에 선택적으로 통합했다. 아래 명령은
-`/home/idealinsane/knfsd-syzkaller-fresh`를 작업 디렉터리로 사용한다. Wave3 B04의 v3
+저장소 루트를 작업 디렉터리로 사용한다. Wave3 B04의 v3
 fixture는 외부·미검증 의존성으로 남으며 main에 복사하지 않았다.
 
 - B05 COPY: `/usr/bin/python3 tools/attr-scenario-run.py --scenario bundle/corpus/nfs-normal/B05-V1.json --output /home/idealinsane/attr-scenario-evidence/<unique-normal-B05-run>`. 이 descriptor는 main의 `bundle/corpus/nfs-normal/async-copy-v42-tcp.prog`와 `ab-lane-fixture-v42.sh`를 실제 소비한다.

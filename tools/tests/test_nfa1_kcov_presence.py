@@ -105,7 +105,7 @@ def test_literal_cli_preflight_loads_runner_without_creating_output(
             "--observer-binary", "/home/idealinsane/kcsan-env-0012/linux-wt/nfa1-remote-kcov/.nfa1-build/nfa1-kcov-observer",
             "--kernel", "/home/idealinsane/kcsan-env-0012/linux-wt/nfa1-remote-kcov/.nfa1-build/arch/x86/boot/bzImage",
             "--image", "/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw",
-            "--ssh-key", "/home/idealinsane/knfsd-syzkaller-fresh/artifacts/bookworm.id_rsa",
+            "--ssh-key", str(ROOT / "artifacts/bookworm.id_rsa"),
             "--deps-tar", str(ROOT / "bundle/src/guest-deps.tar.gz"),
             "--vmlinux", str(VMLINUX),
             "--lane-fixture", str(ROOT / "bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh"),

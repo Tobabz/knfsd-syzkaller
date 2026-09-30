@@ -44,7 +44,7 @@ ASSERT_TOOL = TOOLS / "attr-scenario-assert.py"
 ANALYZE_TOOL = TOOLS / "analyze_ab_adapted.py"
 REACH_RUNNER = TOOLS / "run-reach-adapted-window.py"
 MATRIX_CHECK_TOOL = TOOLS / "attr-matrix-check.py"
-SSH_KEY = Path("/home/idealinsane/knfsd-syzkaller-fresh/artifacts/bookworm.id_rsa")
+SSH_KEY = ROOT / "artifacts/bookworm.id_rsa"
 
 DEBUGFS = "/sys/kernel/debug/sunrpc_fuzz"
 JsonObject = dict[str, Any]

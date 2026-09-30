@@ -271,7 +271,7 @@ def test_literal_preflight_reports_ready_not_runtime_pass(tmp_path: Path) -> Non
         "/usr/bin/python3", str(HELPER),
         "--kernel", "/home/idealinsane/kcsan-env-0012/linux/arch/x86/boot/bzImage",
         "--image", "/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw",
-        "--ssh-key", "/home/idealinsane/knfsd-syzkaller-fresh/artifacts/bookworm.id_rsa",
+        "--ssh-key", str(ROOT / "artifacts/bookworm.id_rsa"),
         "--deps-tar", str(ROOT / "bundle/src/guest-deps.tar.gz"),
         "--vmlinux", "/home/idealinsane/kcsan-env-0012/linux/vmlinux",
         "--lane-fixture", str(ROOT / "bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh"),
