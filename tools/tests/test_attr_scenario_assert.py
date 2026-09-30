@@ -28,6 +28,11 @@ BASE_IMAGE_SHA = "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786c
 ATTR_EVIDENCE = Path(os.environ.get(
     "KOOV_ATTR_EVIDENCE", str(Path.home() / "attr-scenario-evidence")))
 KCSAN_LOG = ATTR_EVIDENCE / "_baseline-reach/remote_on/trial_01/dmesg.txt"
+
+
+def _require_kcsan_log() -> None:
+    if not KCSAN_LOG.is_file():
+        pytest.skip("retained KCSAN evidence not present: %s" % KCSAN_LOG)
 JsonObject = dict[str, Any]
 
 
@@ -519,9 +524,8 @@ def test_schema_malformed_hooks_still_writes_named_error_verdict(tmp_path: Path)
 
 def test_actual_kcsan_bug_log_is_non_clean_without_changing_kcov_verdict(
         tmp_path: Path) -> None:
-    if not KCSAN_LOG.is_file():
-        pytest.skip("retained KCSAN evidence not present: %s" % KCSAN_LOG)
     paths = _fixture(tmp_path)
+    _require_kcsan_log()
     shutil.copy(KCSAN_LOG, paths[1] / "remote_on/trial_01/dmesg.txt")
     assert _run(paths).returncode == 0
     verdict = _verdict(paths)
@@ -630,6 +634,7 @@ def test_meaningful_diagnostic_text_is_not_rejected_for_nul_or_whitespace(
 def test_error_verdict_preserves_available_kcsan_findings(
         tmp_path: Path, mutation: str, expected_error: str) -> None:
     paths = _fixture(tmp_path)
+    _require_kcsan_log()
     shutil.copy(KCSAN_LOG, paths[1] / "remote_on/trial_01/dmesg.txt")
     if mutation == "coverage":
         (paths[1] / "coverage_sets/fs_nfsd_off_union.pcs").unlink()
@@ -653,6 +658,7 @@ def test_error_verdict_preserves_available_kcsan_findings(
 
 def test_error_verdict_preserves_non_kcsan_fatal_diagnostic(tmp_path: Path) -> None:
     paths = _fixture(tmp_path)
+    _require_kcsan_log()
     shutil.copy(KCSAN_LOG, paths[1] / "remote_on/trial_01/dmesg.txt")
     serial = paths[1] / "remote_off/trial_01/serial.log"
     serial.write_text(serial.read_text() + "\nBUG: fatal with incomplete coverage\n")

@@ -124,12 +124,14 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     for field in ("base_image", "ssh_key", "deps_tar"):
         path = getattr(args, field).resolve()
-        if not path.is_file() or path.stat().st_size == 0:
-            parser.error("missing --%s: %s" % (field.replace("_", "-"), path))
-        if not os.access(path, os.R_OK):
+        if path.exists() and not os.access(path, os.R_OK):
             parser.error("--%s is not readable by the current user: %s "
                          "(created with sudo? chown it to this user)"
                          % (field.replace("_", "-"), path))
+    for field in ("base_image", "ssh_key", "deps_tar"):
+        path = getattr(args, field).resolve()
+        if not path.is_file() or path.stat().st_size == 0:
+            parser.error("missing --%s: %s" % (field.replace("_", "-"), path))
         setattr(args, field, path)
     args.variants = [v for v in VARIANTS if v in (args.variants or VARIANTS)]
     for path in (FPORT_APPLY, *(KCONFIGS[v] for v in args.variants)):

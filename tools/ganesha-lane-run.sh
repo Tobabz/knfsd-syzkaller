@@ -32,7 +32,7 @@ fi
 python3 "$TOOLS/run_ab_adapted.py" \
 	--kernel "$KC/images/$VARIANT/bzImage" \
 	--image "$KC/images/bookworm-kcov-fresh-v1.raw" \
-	--ssh-key "${KOOV_SSH_KEY:-$HF/src/bookworm.id_rsa}" \
+	--ssh-key "${KOOV_SSH_KEY:-$WORK_ROOT/artifacts/bookworm.id_rsa}" \
 	--deps-tar "$DEPS" \
 	--vmlinux "$KC/images/$VARIANT/vmlinux" \
 	--phase9-runner "$TOOLS/run_frozen_phase9_vm_ganesha.py" \
