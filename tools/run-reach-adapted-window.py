@@ -158,6 +158,32 @@ def extract_cover(archive, destination):
     return sorted(names)
 
 
+def validate_v3_source_tree(vm, root, scale):
+    command = r'''set -eu
+root=%s
+count=%d
+test "$(cat /syz-nfs-lanes/enabled)" = 1
+test "$(cat /syz-nfs-lanes/.lane_count)" -eq "$count"
+i=0
+while test "$i" -lt "$count"; do
+    source=/syz-nfs-lanes/proc-$i
+    test -d "$source/client0"; test -d "$source/client1"
+    test "$(cat "$source/.lane_id")" -eq "$i"
+    mountpoint -q "$source/.client0_netns"
+    mountpoint -q "$source/.client1_netns"
+    test "$(findmnt -n -o FSTYPE -T "$source/client0")" = nfs
+    test "$(findmnt -n -o FSTYPE -T "$source/client1")" = nfs
+    expected0="10.89.$i.1:$root/lane$i/server/export"
+    expected1="10.89.$i.5:$root/lane$i/server/export"
+    test "$(findmnt -n -o SOURCE -T "$source/client0")" = "$expected0"
+    test "$(findmnt -n -o SOURCE -T "$source/client1")" = "$expected1"
+    i=$((i + 1))
+done
+''' % (shlex.quote(root), scale)
+    return vm.guest("scale%d-v3-source-tree" % scale, command,
+                    timeout=30).stdout.splitlines()
+
+
 def validate_executor_log(log, executions, procs):
     calls = [(int(index), int(coverage), int(error), flags.strip())
              for index, coverage, error, flags in CALL_RE.findall(log)]
@@ -473,7 +499,10 @@ def run_trial(args, modules, phase1, phase9, mode, trial_number, trial_dir,
             timeout=300)
         fixture = phase9.validate_fixture_status(
             json.loads(setup.stdout), args.procs)
-        phase9.validate_source_tree(vm, active_root, args.procs)
+        if fixture_nfs_version(args.lane_fixture) == "3":
+            validate_v3_source_tree(vm, active_root, args.procs)
+        else:
+            phase9.validate_source_tree(vm, active_root, args.procs)
         vm.guest("nfs-grace", "sleep 11", timeout=20)
         vm.guest("reset-phase9", "printf 'reset\\n' > " + PHASE9_CONTROL)
         baseline = [phase9.lane_snapshot(vm, modules, active_root, lane,
@@ -871,13 +900,16 @@ def parse_args(argv=None):
 
 
 def fixture_nfs_version(path):
-    """Report the minor version selected by an inline lane fixture.
+    """Report the NFS protocol selected by an inline lane fixture.
 
-    The standard fixture defaults to NFSv4.1; the async COPY fixture has an
-    unconditional NFS_MINOR_VERSION=2 assignment before its lane body.
+    The standard fixture defaults to NFSv4.1, the async COPY fixture has an
+    unconditional NFS_MINOR_VERSION=2 assignment before its lane body, and the
+    v3 fixture uses the value 3 for NFSv3.
     """
-    forced = re.findall(r"^NFS_MINOR_VERSION=([12])$",
+    forced = re.findall(r"^NFS_MINOR_VERSION=([123])$",
                         path.read_text(encoding="utf-8"), re.MULTILINE)
+    if forced and forced[-1] == "3":
+        return "3"
     return "4." + forced[-1] if forced else "4.1"
 
 

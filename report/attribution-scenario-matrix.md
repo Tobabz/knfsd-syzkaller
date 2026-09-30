@@ -1,5 +1,9 @@
 # Attribution boundary x variant scenario matrix
 
+> Historical regression scope (2026-09-28): current corpus work follows
+> [normal-flow-corpus.md](normal-flow-corpus.md). This table retains the earlier
+> attribution-variant results; closing all its cells is not a corpus prerequisite.
+
 The rows are the complete B01-B12 inventory from `report/attribution-boundaries.md`.
 Variants are V1 normal, V2 abort before grant, V3 abort after grant, V4 cancel
 saved work, V5 re-defer, V6 retry/final, and V7 concurrent cross-lane. An

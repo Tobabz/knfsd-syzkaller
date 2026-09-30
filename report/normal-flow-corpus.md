@@ -206,6 +206,23 @@ processes. v3, UDP, RDMA, LOCALIO, and NAT remain uncovered.
 | NF-E4 nfsdcld grace-start upcall | client tracking selects nfsdcld and daemon has rpc_pipefs open | service lifecycle -> userspace daemon exchange -> same lifecycle context | caller `fs/nfsd/nfs4recover.c:1494`; blocking upcall `fs/nfsd/nfs4recover.c:1292-1305`; no workqueue executor. | Lifecycle/upcall has no request ticket. | `environment blocked` (no captured nfsdcld fixture), otherwise `unverified`. | `uninstrumented`. | nfsdcld-enabled fixture; capture daemon request/reply, kernel return and daemon version at startup. |
 | NF-E5 pNFS layout recall/fence | conflicting layout access; fencing additionally requires timeout and fence-capable layout driver | lease break -> callback worker; timeout -> `system_dfl_wq` fence worker | recall queue `fs/nfsd/nfs4layouts.c:341-356`; fence queue `fs/nfsd/nfs4layouts.c:904-922`; executor `fs/nfsd/nfs4layouts.c:793`; binding `fs/nfsd/nfs4layouts.c:266`. | Callback and coalesced fence work have no initiating ticket. | `environment blocked`: no pNFS export/device/fence backend; `unverified`. | `uninstrumented`. | Provision recorded pNFS fixture; obtain layout, trigger conflict, observe recall; test timeout/fence separately, not as prerequisite for normal recall. |
 
+### Observation drafts for E flows (from the removed Wave3 B08-B10 candidates)
+
+These are unrun drafts (`NOT_RUN`, fixture unproven) kept only as observation designs for NF-E1, NF-E2, NF-E3 and NF-E4.
+Wave3 also carried V7 cross-lane cells; they are dropped because cross-lane attribution is not a corpus prerequisite.
+Each trigger must run after subscribing to the witness and must not rely on a fixed sleep.
+Effect-only traces (for example `nfsd_mark_client_expired`, `nfsd_file_gc_removed`) and `rpc_pipefs` status do not prove worker execution.
+
+| Flow | Trigger | Direct witness | KCOV expectation |
+| --- | --- | --- | --- |
+| NF-E1 laundromat | In an auxiliary nfsd net/mount namespace whose grace is active, write `Y` to `/proc/fs/nfsd/v4_end_grace`. Stop if it returns EBUSY. | Filtered workqueue events (`workqueue_queue_work`, `workqueue_execute_start`, `workqueue_execute_end`) for the same work pointer and `laundromat_main`, resolved through kallsyms. | `laundromat_main` absent from remote coverage. |
+| NF-E4 nfsdcld grace start | Start nfsdcld and nfsd in an auxiliary server namespace. | Paired tracefs kprobe entry/return of `nfsd4_cld_grace_start` in one task, return value 0; remove both kprobe events afterwards. Nfsdcld selection and rpc_pipefs readiness are supporting evidence only. | `nfsd4_cld_grace_start` absent. |
+| NF-E3 filecache GC | NFS open/close until `nfsd_file_lru_add` fires, then wait for the next worker event. | Same-work-pointer queue and execute events for `nfsd_file_gc_worker`. | `nfsd_file_gc_worker` absent. |
+| NF-E2 state shrinker | With a delegation or courtesy client present, write `2` to `/proc/sys/vm/drop_caches`. | Same-work-pointer queue and execute events for `nfsd4_state_shrinker_worker`. | `nfsd4_state_shrinker_worker` absent. |
+| NF-D3 recall callback worker | Verify a real delegation in `/proc/fs/nfsd/clients/*/states`, then open/write from the other client. | `nfsd_cb_recall` correlated with `nfsd_cb_queue` and the `nfsd4_run_cb_work` interval. Already covered by the B06 r3 evidence. | `nfsd4_run_cb_work` absent. |
+
+Auxiliary-namespace triggers (NF-E1, NF-E4) start extra nfsd instances beside the lane fixture; they must not perturb the primary service, and the lane fixture cannot host them as is.
+
 ## Protocol and transport boundaries
 
 | Boundary | Current status and reason | Evidence needed |

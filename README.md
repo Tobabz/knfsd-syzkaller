@@ -11,6 +11,13 @@ against the functional design-contract gates **R1,R2,R4,R5** (`tools/fport-desig
 
 ## Design highlights
 
+### Normal-flow corpus work
+
+The corpus objective is to cover thread-execution flows reachable through normal
+NFS scenarios. See [scope, current evidence and completion criteria](report/normal-flow-corpus.md).
+The historical attribution boundary × seven-variant matrix is retained for later
+regression work; its closure is not a prerequisite for the normal-flow corpus.
+
 | Aspect | Description |
 |---|---|
 | Instrumentation | KCOV + KASAN/KCSAN boot kernel |

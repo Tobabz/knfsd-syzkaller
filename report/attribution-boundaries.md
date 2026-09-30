@@ -1,5 +1,10 @@
 # knfsd remote-KCOV attribution boundaries
 
+> Inventory scope (2026-09-28): these are known instrumentation/attribution
+> boundaries, not a completed inventory of all normal NFS execution flows.
+> Expand from normal operations and scheduling sites, including uninstrumented
+> transitions, as specified in [normal-flow-corpus.md](normal-flow-corpus.md).
+
 This inventory describes the kernel at `/home/idealinsane/kcsan-env-0012/linux`,
 commit `02102ee22924`. The old `kcov_remote_sunrpc.patch` is useful history but
 is not the current contract: current server coverage requires a request root,

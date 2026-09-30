@@ -58,7 +58,7 @@
     {
       "path": "delegation-recall-v41-tcp.prog",
       "sha256": "2a25b68396c7fbb147eedb68a3b8eaf9f5a65ba65d7463b0b88772b32f0e4978",
-      "source": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave3/bundle/corpus/attr-scenarios/B06/delegation-recall.prog",
+      "source": "copied by value from the former Wave3 worktree (B06/delegation-recall.prog); Wave3 removed",
       "source_sha256": "2a25b68396c7fbb147eedb68a3b8eaf9f5a65ba65d7463b0b88772b32f0e4978",
       "nf_flows": ["NF-A1", "NF-A2", "NF-D3", "NF-D1", "NF-D2"],
       "nfs_version": "4.1",
@@ -81,16 +81,17 @@
     {
       "path": "basic-read-v3-tcp.prog",
       "sha256": "1c72a772432397b6b570cfcea465d9bbd854a9bafc739f3ca5f2724d54a923c1",
-      "source": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave3/bundle/corpus/attr-scenarios/B04/deferred-lookup.prog",
+      "source": "copied by value from the former Wave3 worktree (B04/deferred-lookup.prog); Wave3 removed",
       "source_sha256": "1c72a772432397b6b570cfcea465d9bbd854a9bafc739f3ca5f2724d54a923c1",
       "nf_flows": ["NF-A1", "NF-A2"],
       "nfs_version": "3",
       "transport": "TCP forechannel and TCP mount protocol",
-      "fixture_path": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave3/bundle/corpus/attr-scenarios/B04/ab-lane-fixture-v3.sh",
+      "fixture_path": "bundle/corpus/nfs-normal/ab-lane-fixture-v3.sh",
+      "fixture_sha256": "93edf872c6173aede8a30abede8f983470123309337bb7f5fc81d42146a4a7ab",
       "fixture_command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 1",
       "runner_entry": null,
       "functional_oracle": "Open nfs-lane/client0/shared/fixture, read the 30-byte fixture content into a 128-byte buffer, return 30 bytes, and close successfully. This normal input does not by itself prove NF-B1 defer/revisit.",
-      "execution_status": "Parser-only and never executed with the v3 fixture. Wave3 B04 fixture attempts r4-r11 failed setup before workload; fixture binding is an external dirty-Wave3 dependency, so functional status is blocked and unverified.",
+      "execution_status": "UNRESOLVED. Parser-only; never executed. The v3 fixture never completes setup: in Wave3 attempts r4-r10 the NFSv3 server and lockd fail to register with rpcbind (kernel log: svc: failed to register nfsdv3/nfsaclv3/lockdv1 RPC service, errno 107), so the final rpcinfo check reports Program not registered and setup exits rc=1. Cause not established. Unverified hypothesis: the kernel rpcbind client cannot reach the lane-local rpcbind through the private /run bind mount. The vendored fixture is the Wave3 r11 file minus its tracefs hist-trigger diagnostics (those writes failed with printf I/O error, killing setup earlier than r10); it is expected to fail at the rpcbind registration check as r10 did, and that is not verified. The runner has v3 source-tree validation but runner_entry is null and no VM run has been made. No NFS-version claim, handoff witness or KCOV claim.",
       "parser_result": {"exit": 0, "c_bytes": 1812, "c_sha256": "3cb1ef5ccdb5ee96b66f6f3192e7ad15fad9448daf4d9193a2a0ccf1495af323", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
     }
   ],
