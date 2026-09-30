@@ -16,17 +16,19 @@ import importlib.util
 import json
 import shutil
 import tarfile
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+ENV_DIR = Path(os.environ.get("KOOV_ENV_DIR", str(ROOT / "env")))
 RUNNER = ROOT / "tools" / "attr-scenario-run.py"
 DATA = Path(__file__).parent / "data/attr-scenario"
 B05_DIR = ROOT / "bundle/corpus/attr-scenarios/B05"
-VMLINUX = Path("/home/idealinsane/kcsan-env-0012/linux/vmlinux")
-BASE_IMAGE = Path("/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw")
+VMLINUX = ENV_DIR / "images/kcsan/vmlinux"
+BASE_IMAGE = ENV_DIR / "images/bookworm-kcov-fresh-v1.raw"
 BASE_IMAGE_SHA = "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd"
 JsonObject = dict[str, Any]
 

@@ -128,27 +128,27 @@
   "image_unchanged": true,
   "inputs": {
     "deps_tar": {
-      "path": "/home/idealinsane/knfsd-syzkaller-fresh-wt/kcov-handle-wave1/bundle/src/guest-deps.tar.gz",
+      "path": "bundle/src/guest-deps.tar.gz",
       "sha256": "f214e8f43a0d148918b55f707293897e9f2e963e0d325f92ff8cf09d32636fb8"
     },
     "image": {
-      "path": "/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw",
+      "path": "env/images/bookworm-kcov-fresh-v1.raw",
       "sha256": "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd"
     },
     "kernel": {
-      "path": "/home/idealinsane/kcsan-env-0012/linux/arch/x86/boot/bzImage",
+      "path": "env/images/kcsan/bzImage",
       "sha256": "6d1cbd502af8df35c5d2d1a372aff251573b67249953451c931d44fdedb42a34"
     },
     "syz_execprog": {
-      "path": "/home/idealinsane/kcsan-env-0012/syzkaller/bin/linux_amd64/syz-execprog",
+      "path": "env/syzkaller/bin/linux_amd64/syz-execprog",
       "sha256": "4dc0da81e7e2fa5ce2ca53e61a1b0cdd71e9bc967512d85abffa91d69e014b84"
     },
     "syz_executor": {
-      "path": "/home/idealinsane/kcsan-env-0012/syzkaller/bin/linux_amd64/syz-executor",
+      "path": "env/syzkaller/bin/linux_amd64/syz-executor",
       "sha256": "bce9db3d2117f2f49fa51ab52296225e0b4b3bd415a348210550d5bd8a1f6eb7"
     },
     "vmlinux": {
-      "path": "/home/idealinsane/kcsan-env-0012/linux/vmlinux",
+      "path": "env/images/kcsan/vmlinux",
       "sha256": "d2a133ed2d68b2269fa32c4059fe5051efec2fce0d92eb3b595f1f9fecdfc44f"
     }
   },

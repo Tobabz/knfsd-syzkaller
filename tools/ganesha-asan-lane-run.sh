@@ -6,6 +6,7 @@ set -euo pipefail
 tools=$(cd "$(dirname "$0")" && pwd)
 repo=${KOOV_WORK_ROOT:-$(dirname "$tools")}
 env_dir=${KOOV_ENV_DIR:-$repo/env}
+VARIANT="${KOOV_VARIANT:-kasan}"
 bundle=${KOOV_BUNDLE_DIR:-$repo/bundle}
 deps=${KOOV_GANESHA_DEPS:-$bundle/src/guest-deps-ganesha-asan.tar.gz}
 out=${KOOV_EVIDENCE_DIR:-$repo/evidence/ganesha-asan-smoke}
@@ -15,8 +16,8 @@ asan_opts=${KOOV_GANESHA_ASAN_OPTIONS:-detect_leaks=0:abort_on_error=1:halt_on_e
 [ -s "$deps" ] || { echo "missing ASan deps: $deps" >&2; exit 2; }
 [ -s "$key" ] || { echo "missing SSH key: $key" >&2; exit 2; }
 python3 "$tools/run-ganesha-asan-smoke.py" \
-    --kernel "$env_dir/linux/arch/x86/boot/bzImage" \
-    --image "$env_dir/bookworm-kcov-fresh-v1.raw" \
+    --kernel "$env_dir/images/$VARIANT/bzImage" \
+    --image "$env_dir/images/bookworm-kcov-fresh-v1.raw" \
     --ssh-key "$key" --deps-tar "$deps" \
     --syz-executor "$env_dir/syzkaller/bin/linux_amd64/syz-executor" \
     --syz-execprog "$env_dir/syzkaller/bin/linux_amd64/syz-execprog" \

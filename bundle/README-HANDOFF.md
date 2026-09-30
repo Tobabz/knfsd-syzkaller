@@ -22,7 +22,7 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 | `patches/kernel/` | kernel series: 13 patches + `series` | — |
 | `patches/syzkaller/` | syzkaller series: 17 patches + `series` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
-| `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); selected via `KOOV_KCONFIG` | — |
+| `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); built by `bootstrap-kcov-env.py --variant kcsan` | — |
 | `ab-runner/` | AB experiment lane drivers (`phases/run_frozen_phase*_vm.py`, lane/probe/bootstrap files, workload prog) | — |
 | `baker/` | protocol image baking (`bake_nfs_protocol_image.py`) | — |
 | `corpus/` | fuzz corpus / candidate preparation (`audit_*`, `build_*`) | — |
@@ -120,8 +120,11 @@ python3 tools/bootstrap-kcov-env.py /work/env \
 The run clones the pinned upstream refs (git.kernel.org `v7.3-rc4` /
 github.com `801f09666…`), then patches
 (`tools/fport-apply.sh`, series = `bundle/patches/{kernel,syzkaller}`),
-builds (`bzImage`, all syzkaller binaries), bakes into a manager-ready
-image, and verifies (lane status). Only the target directory is written;
+builds (one out-of-tree `bzImage`/`vmlinux` per `--variant`, default `kasan` and
+`kcsan`, plus all syzkaller binaries), bakes one manager-ready image shared by all
+variants, and verifies every variant (lane status). Kernel images land in
+`<target>/images/<variant>/`; `<target>/build/` is disposable. Only the target
+directory is written;
 `manifest.json` records every pin (git refs for upstream sources).
 
 Later updates arrive as a new bundle (or repo pull where available):

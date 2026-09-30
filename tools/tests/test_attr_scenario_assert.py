@@ -8,6 +8,7 @@ import json
 import shutil
 import subprocess
 import sys
+import os
 from pathlib import Path
 from typing import Any
 
@@ -17,11 +18,12 @@ import pytest
 from tools.attr_hooks import hook_result
 
 ROOT = Path(__file__).resolve().parents[2]
+ENV_DIR = Path(os.environ.get("KOOV_ENV_DIR", str(ROOT / "env")))
 TOOL = ROOT / "tools" / "attr-scenario-assert.py"
 SCHEMA = ROOT / "bundle/corpus/attr-scenarios/schema.json"
 DATA = Path(__file__).parent / "data/attr-scenario"
-VMLINUX = Path("/home/idealinsane/kcsan-env-0012/linux/vmlinux")
-BASE_IMAGE = Path("/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw")
+VMLINUX = ENV_DIR / "images/kcsan/vmlinux"
+BASE_IMAGE = ENV_DIR / "images/bookworm-kcov-fresh-v1.raw"
 BASE_IMAGE_SHA = "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd"
 KCSAN_LOG = Path(
     "/home/idealinsane/attr-scenario-evidence/_baseline-reach/remote_on/trial_01/dmesg.txt"

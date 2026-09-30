@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+ENV_DIR = Path(os.environ.get("KOOV_ENV_DIR", str(ROOT / "env")))
 HELPER = ROOT / "bundle/corpus/nfs-normal/nfa1-transport-witness.py"
 RETAINED_LOG = Path(
     "/home/idealinsane/attr-scenario-evidence/NORMAL-B05-CORPUS-20260928/"
@@ -269,15 +271,15 @@ def test_literal_preflight_reports_ready_not_runtime_pass(tmp_path: Path) -> Non
     output = tmp_path / "evidence"
     command = [
         "/usr/bin/python3", str(HELPER),
-        "--kernel", "/home/idealinsane/kcsan-env-0012/linux/arch/x86/boot/bzImage",
-        "--image", "/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw",
+        "--kernel", str(ENV_DIR / "images/kcsan/bzImage"),
+        "--image", str(ENV_DIR / "images/bookworm-kcov-fresh-v1.raw"),
         "--ssh-key", str(ROOT / "artifacts/bookworm.id_rsa"),
         "--deps-tar", str(ROOT / "bundle/src/guest-deps.tar.gz"),
-        "--vmlinux", "/home/idealinsane/kcsan-env-0012/linux/vmlinux",
+        "--vmlinux", str(ENV_DIR / "images/kcsan/vmlinux"),
         "--lane-fixture", str(ROOT / "bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh"),
         "--workload", str(ROOT / "bundle/corpus/nfs-normal/async-copy-v42-tcp.prog"),
-        "--syz-executor", "/home/idealinsane/kcsan-env-0012/syzkaller/bin/linux_amd64/syz-executor",
-        "--syz-execprog", "/home/idealinsane/kcsan-env-0012/syzkaller/bin/linux_amd64/syz-execprog",
+        "--syz-executor", str(ENV_DIR / "syzkaller/bin/linux_amd64/syz-executor"),
+        "--syz-execprog", str(ENV_DIR / "syzkaller/bin/linux_amd64/syz-execprog"),
         "--mode", "on", "--trials", "1", "--executions", "10",
         "--sample-every", "10", "--procs", "2", "--cpus", "8",
         "--memory", "8192", "--output", str(output), "--preflight",

@@ -307,7 +307,7 @@ NFSv4 pseudoroot에 엔트리를 만드는 쓰기에서 knfsd는 0, Ganesha 4.3�
 - 커밋된 부트스트랩 입력은 `bundle/SHA256SUMS`(고정 **3항목**:
   `guest-deps.tar.gz`·`patches/kernel.config`·`README-HANDOFF.md`)로 핀.
 - KCSAN 변형 핀 `patches/kernel-kcsan.config`(KASAN off · `CONFIG_KCSAN=y`)는
-  **선택 입력**으로 `KOOV_KCONFIG`가 선택하며 루트 SHA256SUMS 밖 —
+  **선택 입력**으로 bootstrap의 `--variant kcsan`이 선택하며 루트 SHA256SUMS 밖 —
   개별 무결성은 git 과 bootstrap manifest 의 `pins.kconfig` 가 핀한다.
 - (선택) `bash tools/release-assembly.sh` → 유지보수용 스냅샷
   `dist/knfsd-syzkaller-forward-port-<날짜>[-minimal].tar.gz` (배포 아님);

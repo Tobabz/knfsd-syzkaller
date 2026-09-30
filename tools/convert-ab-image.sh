@@ -5,8 +5,9 @@ set -eu
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_ROOT="${KOOV_WORK_ROOT:-$(dirname "$TOOLS")}"
 KC="${KOOV_ENV_DIR:-$WORK_ROOT/env}"
-RAW="$KC/bookworm-kcov-fresh-v1.raw"
-QCOW="$KC/bookworm-kcov-fresh-v1.qcow2"
+VARIANT="${KOOV_VARIANT:-kasan}"
+RAW="$KC/images/bookworm-kcov-fresh-v1.raw"
+QCOW="$KC/images/bookworm-kcov-fresh-v1.qcow2"
 if [ ! -s "$RAW" ]; then
 	qemu-img convert -f qcow2 -O raw "$QCOW" "$RAW"
 fi

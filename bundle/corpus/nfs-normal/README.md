@@ -8,8 +8,10 @@ transport, exact fixture path/guest setup command, functional oracle, current
 execution status, exclusions, and gaps.
 
 Paths to files inside this repository, here and in `manifest.json`, are relative to the
-repository root (`runner_working_directory` is `.`); run the commands from the root. Paths to
-the external kernel/image environment (`/home/.../kcsan-env-0012`) remain absolute.
+repository root (`runner_working_directory` is `.`); run the commands from the root. The
+kernel/image environment is `env/` (`env/images/<variant>/{bzImage,vmlinux}`,
+`env/images/bookworm-kcov-fresh-v1.raw`, `env/syzkaller`); change that prefix if the
+environment lives elsewhere.
 
 Parser success only proves that the pinned syzkaller parser can deserialize an
 input. It does not prove mount setup, an NFS reply, a background transition,
@@ -38,8 +40,9 @@ below and in `manifest.json`. No generated test file is an extra corpus input.
 ## NF-A1 remote-KCOV stage presence
 
 The original request-owned remote KCOV begins inside `svc_process`, after the
-socket callback, transport enqueue and nfsd dequeue. The separate kernel
-worktree `/home/idealinsane/kcsan-env-0012/linux-wt/nfa1-remote-kcov` adds
+socket callback, transport enqueue and nfsd dequeue. The kernel series patch
+`0013-sunrpc-observe-NFSD-transport-stages-with-remote-KCOV` (previously a separate
+`nfa1-remote-kcov` worktree) adds
 global handle `0x0200000000000001` for **observational** NFSD coverage. It
 brackets softirq `svc_data_ready` through `svc_xprt_enqueue` and the nfsd
 `svc_xprt_dequeue` window; the existing checked request ticket still owns
@@ -50,21 +53,21 @@ merged into a managed generation.
 `nfa1-kcov-presence.py` adapter starts it after fixture setup, stops it after
 the workload and managed drains, and keeps its raw PCs and metadata **outside**
 the executor's `coverage/` archive. Build a static controller and use the
-rebuilt worktree kernel with the original snapshot image:
+KCSAN kernel built from the full series with the original snapshot image:
 
 ```sh
-K=/home/idealinsane/kcsan-env-0012/linux-wt/nfa1-remote-kcov/.nfa1-build
+K=env/images
 gcc -static -O2 -std=gnu11 -Wall -Wextra -Werror \
     -o "$K/nfa1-kcov-observer" bundle/corpus/nfs-normal/nfa1-kcov-observer.c
 python3 -B bundle/corpus/nfs-normal/nfa1-kcov-presence.py \
     --observer-binary "$K/nfa1-kcov-observer" \
-    --kernel "$K/arch/x86/boot/bzImage" --vmlinux "$K/vmlinux" \
-    --image /home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw \
+    --kernel "$K/kcsan/bzImage" --vmlinux "$K/kcsan/vmlinux" \
+    --image "$K/bookworm-kcov-fresh-v1.raw" \
     --ssh-key artifacts/bookworm.id_rsa \
     --deps-tar bundle/src/guest-deps.tar.gz \
     --lane-fixture bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh \
     --workload bundle/corpus/nfs-normal/async-copy-v42-tcp.prog \
-    --syz-bin /home/idealinsane/kcsan-env-0012/syzkaller \
+    --syz-bin env/syzkaller \
     --mode both --trials 1 --executions 10 --sample-every 10 \
     --procs 2 --cpus 8 --memory 8192 --output <new-absolute-output-path>
 ```
@@ -105,12 +108,12 @@ host invocation is valid because these fixtures are disposable-VM-only.
 ## Parser contract
 
 The required parser is
-`/home/idealinsane/kcsan-env-0012/syzkaller/bin/syz-prog2c`, SHA256
+`env/syzkaller/bin/syz-prog2c`, SHA256
 `ae5e6c3b2c31d340265088e28835103dedbb8441b7b874f281353604e59ac533`,
 from checkout `8c1901085e70fcfd88acdcc934410c79fbf27e1b`. Each file is checked with:
 
 ```
-/home/idealinsane/kcsan-env-0012/syzkaller/bin/syz-prog2c -os linux -arch amd64 -prog ABSOLUTE_INPUT_PATH
+env/syzkaller/bin/syz-prog2c -os linux -arch amd64 -prog ABSOLUTE_INPUT_PATH
 ```
 
 Generated C byte counts and hashes, and the exact nonfatal formatter stderr,
@@ -137,7 +140,7 @@ The bounded Gate8 reference above is
 PASS 28/28). Its exact clean-Wave1 runner command is:
 
 ```
-/usr/bin/python3 bundle/ab-runner/phases/run_frozen_phase8_vm.py --kernel /home/idealinsane/kcsan-env-0012/linux/arch/x86/boot/bzImage --image /home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw --ssh-key artifacts/bookworm.id_rsa --deps-tar bundle/src/guest-deps.tar.gz --lane-script tools/ab-lane-fixture-gate8.sh --output <unique>
+/usr/bin/python3 bundle/ab-runner/phases/run_frozen_phase8_vm.py --kernel env/images/kcsan/bzImage --image env/images/bookworm-kcov-fresh-v1.raw --ssh-key artifacts/bookworm.id_rsa --deps-tar bundle/src/guest-deps.tar.gz --lane-script tools/ab-lane-fixture-gate8.sh --output <unique>
 ```
 
 That command runs six cases and has no single-case selector. The v4.2 fixture's

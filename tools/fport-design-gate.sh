@@ -37,19 +37,24 @@ def sh(cmd):
 # ---------- preconditions Psi ----------
 psi = {}
 m = read_json(HOME/"env/manifest.json")
-_ms = m.get("verify", {}) or {}
-_mem_san = _ms.get("mem_sanitizer")
-_legacy_ms = _ms.get("target_kasan") is True or _ms.get("target_kcsan") is True
-psi["Psi2(mem-sanitizer)"] = _mem_san in ("kasan", "kcsan") or _legacy_ms
+# bootstrap verifies every kernel variant (kasan/kcsan) with the shared image
+_verify = m.get("verify")   # "skipped" when bootstrap ran with --skip-verify
+_variants = (_verify.get("variants") if isinstance(_verify, dict) else None) or {}
+_sanitizers = {v: r.get("mem_sanitizer") for v, r in _variants.items()}
+_sanitizers_ok = bool(_sanitizers) and all(
+    s in ("kasan", "kcsan") for s in _sanitizers.values())
+psi["Psi2(mem-sanitizer)"] = _sanitizers_ok
 
-# kcov in .config or vmlinux symbols
-kcov_ok = False
-cfg = HOME/"env/linux/.config"
-if cfg.exists():
-    kcov_ok = sh("grep -q '^CONFIG_KCOV=y' " + str(cfg))[0]
-if not kcov_ok:
-    kcov_ok = sh("nm " + str(HOME/"env/linux/vmlinux") + " 2>/dev/null | grep -c -m1 ' T kcov_remote_start\\| t kcov_remote_start' >/dev/null")[0] or \
-              sh("nm " + str(HOME/"env/linux/vmlinux") + " 2>/dev/null | grep -q ' kcov_remote'")[0]
+# kcov in the variant's .config or in its vmlinux symbols
+def _kcov_present(variant):
+    cfg = HOME/"env/build"/variant/".config"
+    if cfg.exists() and sh("grep -q '^CONFIG_KCOV=y' " + str(cfg))[0]:
+        return True
+    vmlinux = str(HOME/"env/images"/variant/"vmlinux")
+    return sh("nm " + vmlinux + " 2>/dev/null | grep -c -m1 ' T kcov_remote_start\\| t kcov_remote_start' >/dev/null")[0] or \
+           sh("nm " + vmlinux + " 2>/dev/null | grep -q ' kcov_remote'")[0]
+
+kcov_ok = bool(_variants) and all(_kcov_present(v) for v in _variants)
 psi["Psi1(kcov)"] = kcov_ok
 
 ok_psi = all(psi.values())
@@ -59,10 +64,9 @@ for k, v in psi.items():
 bundle = pathlib.Path(os.environ["BUNDLE"])
 
 # ---------- R1 build integrity ----------
-_ms_detail = _mem_san or ("kasan" if _ms.get("target_kasan") else
-                          ("kcsan" if _ms.get("target_kcsan") else "none"))
+_ms_detail = ",".join("%s=%s" % (v, _sanitizers[v]) for v in sorted(_sanitizers)) or "none"
 r1 = gate("R1", "build-integrity",
-    m.get("status") == "pass" and (_mem_san in ("kasan", "kcsan") or _legacy_ms),
+    m.get("status") == "pass" and _sanitizers_ok,
     "status=%s mem_sanitizer=%s" % (m.get("status"), _ms_detail))
 
 # ---------- R2 AB (R3 throughput retired 2026-09-26) ----------

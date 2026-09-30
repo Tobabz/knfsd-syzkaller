@@ -9,15 +9,25 @@ Only TARGET_DIR is written. Sources (patches, kernel config, seeds)
 are read from the repository this script lives in; their revisions are
 pinned in the manifest.
 
-KOOV_KCONFIG selects the kernel config pin (default: the checked-in
-bundle/patches/kernel.config). Passing bundle/patches/kernel-kcsan.config
-builds the KCSAN sanitizer variant (KASAN off, CONFIG_KCSAN=y) with the
-same pinned patch series; stage_verify records mem_sanitizer=kcsan.
+One patched kernel source tree serves every sanitizer variant. Each
+--variant is built out of tree from its own pinned config
+(kasan: bundle/patches/kernel.config; kcsan: bundle/patches/kernel-kcsan.config,
+KASAN off, CONFIG_KCSAN=y); the default is both. stage_verify boots every
+variant and records its mem_sanitizer.
+
+TARGET_DIR layout:
+  linux/                        patched kernel source tree (never built in)
+  syzkaller/                    patched syzkaller tree, binaries in bin/
+  build/<variant>/              out-of-tree kernel build (disposable)
+  images/<variant>/bzImage      run-time kernel image
+  images/<variant>/vmlinux      symbol source for coverage symbolization
+  images/bookworm-kcov-fresh-vN.qcow2 (+ .json)   baked VM image, shared
+  manifest.json
 
 Usage (all paths explicit, no host defaults besides REPO auto-detect):
   bootstrap_kcov_env.py TARGET_DIR --kernel-repo URL --syz-repo URL \\
       --base-image FILE --ssh-key FILE --deps-tar FILE --minor 1|2 \\
-      [--jobs N] [--skip-build] [--skip-verify]
+      [--variant kasan|kcsan ...] [--jobs N] [--skip-build] [--skip-verify]
 
   For offline handoff, replace the two --*-repo URLs with
   --kernel-tarball/--syz-tarball pristine source archives; the trees
@@ -47,8 +57,9 @@ BUNDLE = Path(os.environ.get("KOOV_BUNDLE", str(WORK / "bundle" / "patches")))
 ABRUN = Path(os.environ.get("KOOV_ABRUNNER", str(WORK / "bundle" / "ab-runner")))
 BAKER = Path(os.environ.get("KOOV_BAKER", str(WORK / "bundle" / "baker")))
 FPORT_APPLY = TOOLS / "fport-apply.sh"
-KCONFIG = Path(os.environ.get("KOOV_KCONFIG",
-                              str(BUNDLE / "kernel.config")))
+VARIANTS = ("kasan", "kcsan")
+KCONFIGS = {"kasan": BUNDLE / "kernel.config",
+            "kcsan": BUNDLE / "kernel-kcsan.config"}
 
 KERNEL_URL_DEFAULT = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
 SYZ_URL_DEFAULT = "https://github.com/google/syzkaller.git"
@@ -90,6 +101,10 @@ def parse_args(argv=None):
     parser.add_argument("--ssh-key", type=Path, required=True)
     parser.add_argument("--deps-tar", type=Path, required=True)
     parser.add_argument("--minor", choices=("1", "2"), required=True)
+    parser.add_argument("--variant", action="append", choices=VARIANTS,
+                        dest="variants",
+                        help="sanitizer kernel to build and verify; repeat "
+                        "for several (default: all)")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-verify", action="store_true")
@@ -102,7 +117,8 @@ def parse_args(argv=None):
         if not path.is_file() or path.stat().st_size == 0:
             parser.error("missing --%s: %s" % (field.replace("_", "-"), path))
         setattr(args, field, path)
-    for path in (FPORT_APPLY, KCONFIG):
+    args.variants = [v for v in VARIANTS if v in (args.variants or VARIANTS)]
+    for path in (FPORT_APPLY, *(KCONFIGS[v] for v in args.variants)):
         if not path.is_file() or path.stat().st_size == 0:
             parser.error("repo input missing: %s" % path)
     args.target = args.target.absolute()
@@ -157,18 +173,57 @@ def import_tarball(tarball, dest, kind):
          "pristine base import (%s)" % kind], timeout=600)
 
 
+def build_dir(args, variant):
+    return args.target / "build" / variant
+
+
+def image_dir(args, variant):
+    return args.target / "images" / variant
+
+
+def build_kernel_variant(args, linux, variant):
+    """Build one sanitizer variant out of tree; the source tree stays clean."""
+    out = build_dir(args, variant)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    (out / ".config").write_bytes(KCONFIGS[variant].read_bytes())
+    run(["make", "-C", str(linux), "O=%s" % out, "olddefconfig"], timeout=600)
+    run(["make", "-C", str(linux), "O=%s" % out, "-j%d" % args.jobs,
+         "bzImage"], timeout=5400)
+
+
+def export_kernel_images(args, variant):
+    """Copy the run-time kernel artifacts out of the disposable build tree."""
+    out = build_dir(args, variant)
+    images = image_dir(args, variant)
+    images.mkdir(parents=True, exist_ok=True)
+    bzimage = out / "arch" / "x86" / "boot" / "bzImage"
+    if not bzimage.is_file() or bzimage.stat().st_size == 0:
+        raise RuntimeError("bzImage missing after %s build" % variant)
+    shutil.copy2(bzimage, images / "bzImage")
+    vmlinux = out / "vmlinux"
+    if vmlinux.is_file():
+        shutil.copy2(vmlinux, images / "vmlinux")
+    return images / "bzImage", images / "vmlinux"
+
+
 def stage_kernel(args, manifest, reuse):
     linux = args.target / "linux"
-    bzimage = linux / "arch" / "x86" / "boot" / "bzImage"
-    vmlinux = linux / "vmlinux"
     rebuilt = True
-    if (reuse and bzimage.is_file() and bzimage.stat().st_size > 0
-            and kernel_sentinel(linux)):
+    if (reuse and kernel_sentinel(linux) and all(
+            (image_dir(args, v) / "bzImage").is_file()
+            and (image_dir(args, v) / "bzImage").stat().st_size > 0
+            for v in args.variants)):
         print("reusing kernel build", flush=True)
         rebuilt = False
     else:
         if linux.exists():
             shutil.rmtree(linux)
+        for variant in args.variants:
+            for stale in (build_dir(args, variant), image_dir(args, variant)):
+                if stale.exists():
+                    shutil.rmtree(stale)
         if args.kernel_tarball is not None:
             import_tarball(args.kernel_tarball, linux, "kernel")
         else:
@@ -189,22 +244,30 @@ def stage_kernel(args, manifest, reuse):
             if not git_clean(linux):
                 raise RuntimeError("linux tree not clean")
             run([str(FPORT_APPLY), "kernel", str(linux)], timeout=600)
-            (linux / ".config").write_bytes(KCONFIG.read_bytes())
-            run(["make", "-C", str(linux), "olddefconfig"], timeout=600)
-            run(["make", "-C", str(linux), "-j%d" % args.jobs, "bzImage"],
-                timeout=5400)
-        if not bzimage.is_file() or bzimage.stat().st_size == 0:
-            raise RuntimeError("bzImage missing after build")
+            for variant in args.variants:
+                build_kernel_variant(args, linux, variant)
+        for variant in args.variants:
+            export_kernel_images(args, variant)
+    kernels = {}
+    variants = {}
+    for variant in args.variants:
+        bzimage = image_dir(args, variant) / "bzImage"
+        vmlinux = image_dir(args, variant) / "vmlinux"
+        kernels[variant] = (bzimage, vmlinux)
+        variants[variant] = {
+            "config_sha256": sha256(KCONFIGS[variant]),
+            "bzImage_sha256": sha256(bzimage),
+            "vmlinux_sha256": sha256(vmlinux) if vmlinux.is_file() else None,
+        }
     manifest["kernel"] = {
         "base": KERNEL_COMMIT,
         "head": subprocess.run(
             ["git", "-C", str(linux), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=60,
             check=True).stdout.strip(),
-        "bzImage_sha256": sha256(bzimage),
-        "vmlinux_sha256": sha256(vmlinux) if vmlinux.is_file() else None,
+        "variants": variants,
     }
-    return bzimage, vmlinux, rebuilt
+    return kernels, rebuilt
 
 
 def syz_sentinel(syz):
@@ -381,7 +444,7 @@ def detect_mem_sanitizer(vm, config_path):
     return "kcsan"
 
 
-def stage_verify(args, image, bzimage):
+def stage_verify_variant(args, image, variant, bzimage):
     vm = VM(image, bzimage, args.ssh_key, args.boot_timeout)
     try:
         vm.start()
@@ -396,15 +459,28 @@ def stage_verify(args, image, bzimage):
             % (args.minor, root), timeout=90)
         if int(json.loads(lanes).get("lane_count", 0)) < 1:
             raise RuntimeError("no lanes reported")
-        sanitizer = detect_mem_sanitizer(vm,
-                                         args.target / "linux" / ".config")
-        return {"mode": "base", "fixture_root": root,
+        sanitizer = detect_mem_sanitizer(
+            vm, build_dir(args, variant) / ".config")
+        if sanitizer != variant:
+            raise RuntimeError("variant %s booted a %s kernel"
+                               % (variant, sanitizer))
+        return {"fixture_root": root,
                 "lane_count": int(json.loads(lanes)["lane_count"]),
                 "mem_sanitizer": sanitizer,
                 "target_kasan": sanitizer == "kasan",
                 "target_kcsan": sanitizer == "kcsan"}
     finally:
         vm.stop()
+
+
+def stage_verify(args, image, kernels):
+    """Boot every variant with the shared image; all must pass."""
+    variants = {variant: stage_verify_variant(args, image, variant,
+                                              kernels[variant][0])
+                for variant in args.variants}
+    first = variants[args.variants[0]]
+    return {"mode": "base", "fixture_root": first["fixture_root"],
+            "lane_count": first["lane_count"], "variants": variants}
 
 
 def main(argv=None):
@@ -415,18 +491,23 @@ def main(argv=None):
     kernel_reuse = False
     syz_reuse = False
     try:
-        bzimage, vmlinux, kernel_rebuilt = stage_kernel(
-            args, manifest, kernel_reuse)
+        kernels, kernel_rebuilt = stage_kernel(args, manifest, kernel_reuse)
         syz = stage_syzkaller(args, manifest, syz_reuse)
-        image_out = args.target / ("bookworm-kcov-fresh-v%s.qcow2"
-                                   % args.minor)
+        image_out = args.target / "images" / ("bookworm-kcov-fresh-v%s.qcow2"
+                                              % args.minor)
+        image_out.parent.mkdir(parents=True, exist_ok=True)
         if image_out.exists():
             image_out.unlink()
-        manifest["bake"] = stage_bake(args, bzimage, image_out)
+        # The image is booted with -kernel, so it does not depend on the
+        # sanitizer; bake it once with the first variant's kernel.
+        boot_variant = args.variants[0]
+        manifest["bake"] = stage_bake(args, kernels[boot_variant][0],
+                                      image_out)
+        manifest["bake"]["boot_kernel_variant"] = boot_variant
         if args.skip_verify:
             manifest["verify"] = "skipped"
         else:
-            manifest["verify"] = stage_verify(args, image_out, bzimage)
+            manifest["verify"] = stage_verify(args, image_out, kernels)
         manifest["status"] = "pass"
     except Exception as error:
         manifest["status"] = "fail"

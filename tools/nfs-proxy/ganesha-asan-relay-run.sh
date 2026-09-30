@@ -4,6 +4,7 @@ set -euo pipefail
 tools=$(cd "$(dirname "$0")" && pwd)
 repo=${KOOV_WORK_ROOT:-$(cd "$tools/../.." && pwd)}
 env_dir=${KOOV_ENV_DIR:-$repo/env}
+VARIANT="${KOOV_VARIANT:-kasan}"
 bundle=${KOOV_BUNDLE_DIR:-$repo/bundle}
 deps=${KOOV_GANESHA_DEPS:-$bundle/src/guest-deps-ganesha-asan.tar.gz}
 proxy=${KOOV_NFS_PROXY_GUEST:-$bundle/src/nfs-proxy-control-guest}
@@ -28,8 +29,8 @@ if [ -n "${KOOV_SYZ_FOUR_WORKLOAD:-}" ]; then
     fi
 fi
 python3 "$tools/run-ganesha-asan-relay-smoke.py" \
-    --kernel "$env_dir/linux/arch/x86/boot/bzImage" \
-    --image "$env_dir/bookworm-kcov-fresh-v1.raw" \
+    --kernel "$env_dir/images/$VARIANT/bzImage" \
+    --image "$env_dir/images/bookworm-kcov-fresh-v1.raw" \
     --ssh-key "$key" --deps-tar "$deps" --proxy-binary "$proxy" \
     --lane-fixture "$tools/../ganesha-lane.sh" \
     --four-mount-script "$tools/test/guest-four-mounts.sh" \

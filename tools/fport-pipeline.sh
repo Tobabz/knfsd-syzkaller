@@ -143,10 +143,17 @@ p3() {
 
 # ---------------- P4 build-check ----------------
 p4() {
-    test -f "$WORK_ROOT/env/linux/vmlinux" || { echo "vmlinux missing"; return 1; }
-    test -f "$WORK_ROOT/env/bookworm-kcov-fresh-v1.qcow2" || { echo "qcow2 missing"; return 1; }
-    echo "vmlinux=$(sha256sum "$WORK_ROOT/env/linux/vmlinux" | cut -c1-12).."
-    echo "qcow2=$(sha256sum "$WORK_ROOT/env/bookworm-kcov-fresh-v1.qcow2" | cut -c1-12).."
+    local variant found=0
+    for variant in kasan kcsan; do
+        test -d "$WORK_ROOT/env/images/$variant" || continue
+        test -f "$WORK_ROOT/env/images/$variant/bzImage" || { echo "$variant bzImage missing"; return 1; }
+        test -f "$WORK_ROOT/env/images/$variant/vmlinux" || { echo "$variant vmlinux missing"; return 1; }
+        echo "$variant vmlinux=$(sha256sum "$WORK_ROOT/env/images/$variant/vmlinux" | cut -c1-12).."
+        found=1
+    done
+    test "$found" = 1 || { echo "no kernel variant under env/images"; return 1; }
+    test -f "$WORK_ROOT/env/images/bookworm-kcov-fresh-v1.qcow2" || { echo "qcow2 missing"; return 1; }
+    echo "qcow2=$(sha256sum "$WORK_ROOT/env/images/bookworm-kcov-fresh-v1.qcow2" | cut -c1-12).."
     if test "$MODE" = full; then echo "(full mode: rebuild/bake happens in bootstrap provision)"; fi
 }
 

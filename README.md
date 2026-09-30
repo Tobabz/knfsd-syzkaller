@@ -65,10 +65,11 @@ python3 tools/bootstrap-kcov-env.py env \
 | kernel/syzkaller sources (default) | Cloned at pinned refs — kernel `v7.3-rc4` (git.kernel.org), syzkaller `801f09666` (github.com/google/syzkaller) |
 | `--kernel-repo` / `--syz-repo` (optional) | Override clone URLs |
 | `--kernel-tarball` / `--syz-tarball` (optional) | Offline source archives instead of clones |
+| `--variant kasan\|kcsan` (optional, repeatable) | Sanitizer kernels to build and verify; default: both |
 | `--jobs N` (optional) | Parallel build jobs |
 
-- **Behavior**: clone upstream → apply the series (12+17) → build `bzImage`/`vmlinux` and the syzkaller binaries → bake the bootable VM image (`bookworm-kcov-fresh-v1.raw`) → verify lane status
-- **Output**: `env/` — `env/linux/arch/x86/boot/bzImage`, `env/linux/vmlinux`, `env/syzkaller/bin/...`, `env/bookworm-kcov-fresh-v1.raw`, and **`env/manifest.json`** (records all sources, pins, and build state)
+- **Behavior**: clone upstream → apply the series (12+17) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the bootable VM image once (`bookworm-kcov-fresh-v1.qcow2`, shared by all variants) → boot every variant and verify lane status
+- **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh-v1.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records all sources, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated. The runner scripts read `env/images/$KOOV_VARIANT/` (default `kasan`; set `KOOV_VARIANT=kcsan`) and expect the raw twin of the image: run `bash tools/convert-ab-image.sh` once.
 
 ### 3. A/B fuzzing · evidence collection
 
@@ -105,7 +106,7 @@ bash tools/fport-pipeline.sh --mode full --kind kernel \
 |---|---|---|
 | Re-verify | `bash tools/fport-pipeline.sh --mode reuse` | existing evidence → gates re-run (fast, deterministic) |
 | Base image | `sudo bash tools/make-base-image.sh --out artifacts` | sudo + debootstrap → `artifacts/bookworm-base.img` + keypair |
-| Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 1` | base · key · deps + upstream → `env/` (bzImage, binaries, image, manifest) |
+| Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 1` | base · key · deps + upstream → `env/` (per-variant kernel images, binaries, image, manifest) |
 | A/B | `KOOV_SSH_KEY=... bash tools/run-ab.sh && bash tools/analyze-ab.sh` | `env/` → `evidence/` (OFF/ON coverage, metrics) |
 | Gates | `bash tools/fport-design-gate.sh -v` | manifest + evidence → R1,R2,R4,R5 (R3/R6 retired) (0 = HOLDS) |
 | RC port | `bash tools/fport-pipeline.sh --mode full --kind kernel --target ... --new-base <hash>` | new RC → `runs/port-*` report |

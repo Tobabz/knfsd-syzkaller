@@ -2,14 +2,16 @@
 
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).parents[2]
+ENV_DIR = Path(os.environ.get("KOOV_ENV_DIR", str(ROOT / "env")))
 REPORT = ROOT / "report" / "attribution-boundaries.md"
 CHECKER = ROOT / "tools" / "attr-cite-check.py"
-KERNEL = Path("/home/idealinsane/kcsan-env-0012/linux")
+KERNEL = ENV_DIR / "linux"
 VALID_TRANSMIT_CITATION = (
     "[cite:net/sunrpc/xprt.c:1604:fuzz_attributable:assign]"
 )

@@ -5,6 +5,7 @@ set -eu
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_ROOT="${KOOV_WORK_ROOT:-$(dirname "$TOOLS")}"
 KC="${KOOV_ENV_DIR:-$WORK_ROOT/env}"
+VARIANT="${KOOV_VARIANT:-kasan}"
 HF="${KOOV_BUNDLE_DIR:-$WORK_ROOT/bundle}"
 OUT="${KOOV_EVIDENCE_DIR:-$WORK_ROOT/evidence}"
 
@@ -21,11 +22,11 @@ else
 	SYZ_BIN_FLAG="--syz-executor $KC/syzkaller/bin/linux_amd64/syz-executor --syz-execprog $KC/syzkaller/bin/linux_amd64/syz-execprog"
 fi
 python3 "$TOOLS/run_ab_adapted.py" \
-	--kernel "$KC/linux/arch/x86/boot/bzImage" \
-	--image "$KC/bookworm-kcov-fresh-v1.raw" \
+	--kernel "$KC/images/$VARIANT/bzImage" \
+	--image "$KC/images/bookworm-kcov-fresh-v1.raw" \
 	--ssh-key "${KOOV_SSH_KEY:-$HF/src/bookworm.id_rsa}" \
 	--deps-tar "$HF/src/guest-deps.tar.gz" \
-	--vmlinux "$KC/linux/vmlinux" \
+	--vmlinux "$KC/images/$VARIANT/vmlinux" \
 	${SYZ_BIN_FLAG} \
 	--lane-fixture "$TOOLS/ab-lane-fixture.sh" \
 	--workload "$TOOLS/nfs_remote_kcov_ab_workload_markerhidden.prog" \

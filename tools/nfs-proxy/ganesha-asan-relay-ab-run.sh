@@ -4,11 +4,12 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=${KOOV_WORK_ROOT:-$(cd "$here/../.." && pwd)}
 env_dir=${KOOV_ENV_DIR:-$repo/env}
+VARIANT="${KOOV_VARIANT:-kasan}"
 bundle=${KOOV_BUNDLE_DIR:-$repo/bundle}
 bash "$repo/tools/convert-ab-image.sh"
 python3 "$here/run-ganesha-asan-relay-ab.py" \
-    --kernel "$env_dir/linux/arch/x86/boot/bzImage" \
-    --image "$env_dir/bookworm-kcov-fresh-v1.raw" \
+    --kernel "$env_dir/images/$VARIANT/bzImage" \
+    --image "$env_dir/images/bookworm-kcov-fresh-v1.raw" \
     --ssh-key "${KOOV_SSH_KEY:-$repo/artifacts/bookworm.id_rsa}" \
     --deps-tar "${KOOV_GANESHA_DEPS:-$bundle/src/guest-deps-ganesha-asan.tar.gz}" \
     --proxy-binary "${KOOV_NFS_PROXY_GUEST:-$bundle/src/nfs-proxy-control-guest}" \

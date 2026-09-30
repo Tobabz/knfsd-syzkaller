@@ -17,6 +17,7 @@ from typing import Any, cast
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from tools.attr_counters import drained, snapshot_from_texts
+from tools.attr_env import resolve_env_path
 from tools.reach_callback import callback_witness
 
 BAD_DMESG = re.compile(
@@ -244,7 +245,8 @@ def _validate_inputs(manifest: JsonObject, run: JsonObject, manifest_path: Path,
     image_path = captured_image.get("path")
     baseline_match = (
         isinstance(image_path, str)
-        and Path(image_path).resolve() == Path(baseline_image["path"]).resolve()
+        and Path(image_path).resolve()
+        == Path(resolve_env_path(baseline_image["path"])).resolve()
         and captured_image.get("sha256") == baseline_image.get("sha256")
     )
     details["baseline_image_match"] = baseline_match

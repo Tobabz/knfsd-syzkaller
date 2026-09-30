@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 
@@ -10,8 +11,9 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+ENV_DIR = Path(os.environ.get("KOOV_ENV_DIR", str(ROOT / "env")))
 HELPER = ROOT / "bundle/corpus/nfs-normal/nfa1-kcov-presence.py"
-VMLINUX = Path("/home/idealinsane/kcsan-env-0012/linux-wt/nfa1-remote-kcov/.nfa1-build/vmlinux")
+VMLINUX = ENV_DIR / "images/kcsan/vmlinux"
 V2_ON = Path("/home/idealinsane/normal-flow-evidence/NF-A1-KCOV-V2-20260928/remote_on/trial_01")
 spec = importlib.util.spec_from_file_location("nfa1_kcov_presence", HELPER)
 assert spec is not None and spec.loader is not None
@@ -102,15 +104,15 @@ def test_literal_cli_preflight_loads_runner_without_creating_output(
     result = subprocess.run(
         [
             "/usr/bin/python3", "-B", str(HELPER),
-            "--observer-binary", "/home/idealinsane/kcsan-env-0012/linux-wt/nfa1-remote-kcov/.nfa1-build/nfa1-kcov-observer",
-            "--kernel", "/home/idealinsane/kcsan-env-0012/linux-wt/nfa1-remote-kcov/.nfa1-build/arch/x86/boot/bzImage",
-            "--image", "/home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw",
+            "--observer-binary", str(ENV_DIR / "images/nfa1-kcov-observer"),
+            "--kernel", str(ENV_DIR / "images/kcsan/bzImage"),
+            "--image", str(ENV_DIR / "images/bookworm-kcov-fresh-v1.raw"),
             "--ssh-key", str(ROOT / "artifacts/bookworm.id_rsa"),
             "--deps-tar", str(ROOT / "bundle/src/guest-deps.tar.gz"),
             "--vmlinux", str(VMLINUX),
             "--lane-fixture", str(ROOT / "bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh"),
             "--workload", str(ROOT / "bundle/corpus/nfs-normal/async-copy-v42-tcp.prog"),
-            "--syz-bin", "/home/idealinsane/kcsan-env-0012/syzkaller",
+            "--syz-bin", str(ENV_DIR / "syzkaller"),
             "--mode", "on", "--trials", "1", "--executions", "10",
             "--sample-every", "10", "--procs", "2", "--cpus", "8",
             "--memory", "8192", "--output", str(output), "--preflight",

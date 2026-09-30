@@ -34,6 +34,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from tools.attr_counters import snapshot_from_texts  # noqa: E402
+from tools.attr_env import resolve_env_path  # noqa: E402
 from tools.attr_hooks import HOOKS, hook_result  # noqa: E402
 
 TOOLS = ROOT / "tools"
@@ -371,6 +372,8 @@ def _preflight(scenario: Path) -> tuple[JsonObject, JsonObject, list[JsonObject]
         raise PreflightError(f"environment baseline missing: {BASELINE_PATH}")
     baseline = _load_json(BASELINE_PATH)
     inputs = baseline["inputs"]
+    for entry in inputs.values():
+        entry["path"] = resolve_env_path(entry["path"])
     for name in ("kernel", "image", "vmlinux", "deps_tar",
                  "syz_execprog", "syz_executor"):
         path = Path(inputs[name]["path"])

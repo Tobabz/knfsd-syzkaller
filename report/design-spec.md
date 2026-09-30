@@ -72,5 +72,5 @@ bash tools/fport-design-gate.sh -v     # 0=HOLDS, 1=FAIL, 2=UNSUPPORTED
 
 ## 6. 메모리 새니타이저
 
-KASAN 또는 KCSAN 중 하나를 지원. `KOOV_KCONFIG`로 선택.
+KASAN 또는 KCSAN 중 하나를 지원. bootstrap의 `--variant kasan|kcsan`으로 선택(기본: 둘 다 빌드·검증).
 KCSAN 리포트는 치명 panic이 아니므로 trial 판정 시 구분 필요.

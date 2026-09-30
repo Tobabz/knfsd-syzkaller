@@ -3,7 +3,7 @@
   "corpus": "nfs-normal",
   "runtime_scope": "Parser success is syntax validation only. The execution_status and runtime_evidence fields name later pinned VM runs; they do not extend their results to other versions or transports.",
   "parser": {
-    "path": "/home/idealinsane/kcsan-env-0012/syzkaller/bin/syz-prog2c",
+    "path": "env/syzkaller/bin/syz-prog2c",
     "sha256": "ae5e6c3b2c31d340265088e28835103dedbb8441b7b874f281353604e59ac533",
     "source_checkout": "8c1901085e70fcfd88acdcc934410c79fbf27e1b",
     "argv": ["-os", "linux", "-arch", "amd64", "-prog", "ABSOLUTE_INPUT_PATH"]
@@ -65,7 +65,7 @@
       "transport": "TCP",
       "fixture_path": "tools/ab-lane-fixture.sh",
       "fixture_command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 1",
-      "runner_entry": "KOOV_EXPECTED_CALLS=15 KOOV_CONFLICT_CALL=-1 python3 tools/run-reach-adapted-window.py --callback-observer b06-recall --kernel /home/idealinsane/kcsan-env-0012/linux/arch/x86/boot/bzImage --image /home/idealinsane/kcsan-env-0012/bookworm-kcov-fresh-v1.raw --ssh-key artifacts/bookworm.id_rsa --deps-tar bundle/src/guest-deps.tar.gz --vmlinux /home/idealinsane/kcsan-env-0012/linux/vmlinux --syz-bin /home/idealinsane/kcsan-env-0012/syzkaller --lane-fixture tools/ab-lane-fixture.sh --workload bundle/corpus/nfs-normal/delegation-recall-v41-tcp.prog --output /home/idealinsane/normal-flow-evidence/B06-V1-delegation-recall-v41-$(date +%s%N) --mode both --trials 1 --executions 10 --sample-every 10 --procs 1",
+      "runner_entry": "KOOV_EXPECTED_CALLS=15 KOOV_CONFLICT_CALL=-1 python3 tools/run-reach-adapted-window.py --callback-observer b06-recall --kernel env/images/kcsan/bzImage --image env/images/bookworm-kcov-fresh-v1.raw --ssh-key artifacts/bookworm.id_rsa --deps-tar bundle/src/guest-deps.tar.gz --vmlinux env/images/kcsan/vmlinux --syz-bin env/syzkaller --lane-fixture tools/ab-lane-fixture.sh --workload bundle/corpus/nfs-normal/delegation-recall-v41-tcp.prog --output /home/idealinsane/normal-flow-evidence/B06-V1-delegation-recall-v41-$(date +%s%N) --mode both --trials 1 --executions 10 --sample-every 10 --procs 1",
       "runner_working_directory": ".",
       "functional_oracle": "First prove delegation grant; then the client1 conflict must produce ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and delegation return/close. File effects alone do not pass.",
       "execution_status": "Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced.",
