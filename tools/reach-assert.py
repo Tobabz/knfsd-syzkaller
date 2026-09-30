@@ -17,7 +17,13 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import NotRequired, TypeAlias, TypedDict
+from typing import TypeAlias, TypedDict
+try:
+    from typing import NotRequired
+except ImportError:  # Python < 3.11: these TypedDicts are annotations only,
+    class NotRequired:  # never validated at run time
+        def __class_getitem__(cls, item):
+            return item
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.reach_callback import CallbackVerdict, callback_witness

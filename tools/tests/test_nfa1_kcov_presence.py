@@ -14,7 +14,15 @@ ROOT = Path(__file__).resolve().parents[2]
 ENV_DIR = Path(os.environ.get("KOOV_ENV_DIR", str(ROOT / "env")))
 HELPER = ROOT / "bundle/corpus/nfs-normal/nfa1-kcov-presence.py"
 VMLINUX = ENV_DIR / "images/kcsan/vmlinux"
-V2_ON = Path("/home/idealinsane/normal-flow-evidence/NF-A1-KCOV-V2-20260928/remote_on/trial_01")
+NORMAL_EVIDENCE = Path(os.environ.get(
+    "KOOV_NORMAL_EVIDENCE", str(Path.home() / "normal-flow-evidence")))
+V2_ON = NORMAL_EVIDENCE / "NF-A1-KCOV-V2-20260928/remote_on/trial_01"
+
+
+def _require(*paths: Path) -> None:
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        pytest.skip("environment artifact not present: " + ", ".join(missing))
 spec = importlib.util.spec_from_file_location("nfa1_kcov_presence", HELPER)
 assert spec is not None and spec.loader is not None
 observer = importlib.util.module_from_spec(spec)
@@ -53,6 +61,7 @@ def test_observer_rejects_unowned_malformed_or_incomplete_exports(
 
 
 def test_v2_pc_samples_resolve_into_all_required_stages() -> None:
+    _require(V2_ON, VMLINUX)
     observer_pcs = observer.parse_observer(
         (V2_ON / "nfa1-observer.pcs").read_text(),
         (V2_ON / "nfa1-observer.meta").read_text(),
@@ -100,6 +109,10 @@ def test_managed_off_requires_no_managed_pcs_without_process_claim() -> None:
 
 def test_literal_cli_preflight_loads_runner_without_creating_output(
         tmp_path: Path) -> None:
+    _require(ENV_DIR / "images/nfa1-kcov-observer",
+             ENV_DIR / "images/kcsan/bzImage", ENV_DIR / "images/kcsan/vmlinux",
+             ENV_DIR / "images/bookworm-kcov-fresh-v1.raw",
+             ENV_DIR / "syzkaller/bin/linux_amd64/syz-executor")
     output = tmp_path / "evidence"
     result = subprocess.run(
         [

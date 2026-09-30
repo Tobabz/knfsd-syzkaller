@@ -70,7 +70,8 @@ r1 = gate("R1", "build-integrity",
     "status=%s mem_sanitizer=%s" % (m.get("status"), _ms_detail))
 
 # ---------- R2 AB (R3 throughput retired 2026-09-26) ----------
-a = read_json(HOME/"evidence/analysis_summary.json")
+_analysis = HOME/"evidence/analysis_summary.json"
+a = read_json(_analysis) if _analysis.exists() else {}   # absent -> R2/R4/R5 fail below
 g = a.get("group_statistics", {})
 off_fs, on_fs = g.get("off", {}).get("fs/nfsd", {}).get("mean", -1), \
                 g.get("on", {}).get("fs/nfsd", {}).get("mean", -1)

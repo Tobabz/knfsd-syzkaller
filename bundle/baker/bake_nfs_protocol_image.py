@@ -28,6 +28,10 @@ from pathlib import Path
 
 REPO = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parent.parent))
 
+# An SSH key/auth rejection never heals by waiting for the guest.
+SSH_AUTH_MARKERS = ("Permission denied", "Load key",
+                    "Too many authentication failures")
+
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -51,12 +55,38 @@ class VM:
                     "root@127.0.0.1"]
         self.scp = ["scp", "-O", *common, "-P", str(self.ssh_port)]
         self.process = None
+        self.boots = 0
+        self.log_files = []
+        self.qemu_log = None
+        self.serial_log = None
+        self.last_ssh_error = ""
+
+    def diagnostics(self):
+        parts = []
+        if self.last_ssh_error:
+            parts.append("last ssh error: %s" % self.last_ssh_error)
+        if self.serial_log is not None:
+            try:
+                tail = self.serial_log.read_text(errors="replace").splitlines()[-20:]
+                parts.append("serial log tail (%s):\n%s"
+                             % (self.serial_log, "\n".join(tail)))
+            except OSError:
+                pass
+        return "\n".join(parts)
 
     def start(self, snapshot):
+        self.boots += 1
+        prefix = "%s.boot%d" % (self.args.output.name, self.boots)
+        self.serial_log = self.args.output.with_name(prefix + ".serial.log")
+        qemu_log_path = self.args.output.with_name(prefix + ".qemu.log")
+        self.qemu_log = qemu_log_path.open("wb")
+        self.log_files += [self.serial_log, qemu_log_path]
+        self.last_ssh_error = ""
         drive = "file=%s,format=qcow2,if=ide" % self.args.output
         cmd = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
                "-m", str(self.args.memory), "-smp", str(self.args.cpus),
-               "-display", "none", "-serial", "none", "-no-reboot"]
+               "-display", "none", "-serial", "file:%s" % self.serial_log,
+               "-no-reboot"]
         if snapshot:
             cmd.append("-snapshot")
         cmd += ["-drive", drive, "-kernel", str(self.args.kernel),
@@ -66,18 +96,24 @@ class VM:
                 "-netdev", "user,id=net0,restrict=on,"
                 "hostfwd=tcp:127.0.0.1:%d-:22" % self.ssh_port]
         self.process = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
+            cmd, stdin=subprocess.DEVNULL, stdout=self.qemu_log,
+            stderr=subprocess.STDOUT)
         deadline = time.monotonic() + self.args.boot_timeout
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError("QEMU exited before SSH became ready")
+                raise RuntimeError("QEMU exited before SSH became ready\n%s"
+                                   % self.diagnostics())
             result = subprocess.run([*self.ssh, "true"], capture_output=True,
                                     text=True, timeout=8)
             if result.returncode == 0:
                 return
+            self.last_ssh_error = result.stderr.strip()
+            if any(m in self.last_ssh_error for m in SSH_AUTH_MARKERS):
+                raise RuntimeError("guest SSH rejected the key (not a boot "
+                                   "problem)\n%s" % self.diagnostics())
             time.sleep(3)
-        raise RuntimeError("timed out waiting for guest SSH")
+        raise RuntimeError("timed out waiting for guest SSH\n%s"
+                           % self.diagnostics())
 
     def guest(self, command, timeout=60):
         result = subprocess.run([*self.ssh, command], capture_output=True,
@@ -103,6 +139,8 @@ class VM:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=15)
+        if self.qemu_log is not None:
+            self.qemu_log.close()
 
 
 def parse_args(argv=None):
@@ -206,6 +244,8 @@ def main(argv=None):
         vm.stop()
     if sha256(args.base_image) != base_sha:
         raise RuntimeError("shared base image changed during bake")
+    for log in vm.log_files:  # kept only when the bake fails
+        log.unlink(missing_ok=True)
     manifest = {
         "output": str(args.output),
         "sha256": sha256(args.output),

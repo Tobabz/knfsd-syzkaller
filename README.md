@@ -46,7 +46,7 @@ sudo bash tools/make-base-image.sh --out artifacts
 ```
 
 - **Input**: host root (sudo) + debootstrap + network (runs `create-image.sh -d bookworm` from the pinned syzkaller tree)
-- **Output**: `artifacts/bookworm-base.img` (2 GiB raw ext4, kernel not included) and `artifacts/bookworm.id_rsa[.pub]` (SSH keypair, `.id_rsa` mode 0600)
+- **Output**: `artifacts/bookworm-base.img` (2 GiB raw ext4, kernel not included) and `artifacts/bookworm.id_rsa[.pub]` (SSH keypair, `.id_rsa` mode 0600; handed back to the invoking user when run through `sudo`, because bootstrap must be able to read the key)
 
 ### 2. Provision the fuzzing environment (build + bake)
 
@@ -69,7 +69,7 @@ python3 tools/bootstrap-kcov-env.py env \
 | `--jobs N` (optional) | Parallel build jobs |
 
 - **Behavior**: clone upstream → apply the series (12+17) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the bootable VM image once (`bookworm-kcov-fresh-v1.qcow2`, shared by all variants) → boot every variant and verify lane status
-- **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh-v1.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records all sources, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated. The runner scripts read `env/images/$KOOV_VARIANT/` (default `kasan`; set `KOOV_VARIANT=kcsan`) and expect the raw twin of the image: run `bash tools/convert-ab-image.sh` once.
+- **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh-v1.qcow2`, `env/images/nfa1-kcov-observer` (static NF-A1 guest controller; optional, a failed build is only recorded in the manifest), `env/syzkaller/bin/...`, and **`env/manifest.json`** (records all sources, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated. The runner scripts read `env/images/$KOOV_VARIANT/` (default `kasan`; set `KOOV_VARIANT=kcsan`) and expect the raw twin of the image: run `bash tools/convert-ab-image.sh` once.
 
 ### 3. A/B fuzzing · evidence collection
 

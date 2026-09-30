@@ -73,6 +73,12 @@ cp "$SCRATCH/bookworm.img" "$OUT/bookworm-base.img"
 cp "$SCRATCH/bookworm.id_rsa" "$OUT/bookworm.id_rsa"
 cp "$SCRATCH/bookworm.id_rsa.pub" "$OUT/bookworm.id_rsa.pub"
 chmod 600 "$OUT/bookworm.id_rsa"
+# `sudo bash` leaves these root-owned; the user who runs bootstrap must be able to
+# read the private key. Only the files are handed back, never the directory.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$OUT/bookworm-base.img" \
+        "$OUT/bookworm.id_rsa" "$OUT/bookworm.id_rsa.pub"
+fi
 
 echo
 echo "site-local base + keypair generated:"

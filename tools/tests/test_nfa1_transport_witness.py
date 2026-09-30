@@ -14,14 +14,20 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 ENV_DIR = Path(os.environ.get("KOOV_ENV_DIR", str(ROOT / "env")))
 HELPER = ROOT / "bundle/corpus/nfs-normal/nfa1-transport-witness.py"
-RETAINED_LOG = Path(
-    "/home/idealinsane/attr-scenario-evidence/NORMAL-B05-CORPUS-20260928/"
-    "remote_on/trial_01/executor.log"
-)
-RETAINED_TRACE = Path(
-    "/home/idealinsane/normal-flow-evidence/NF-A1-COPY-20260928/"
-    "remote_on/trial_01/nfa1-transport-trace.txt"
-)
+ATTR_EVIDENCE = Path(os.environ.get(
+    "KOOV_ATTR_EVIDENCE", str(Path.home() / "attr-scenario-evidence")))
+NORMAL_EVIDENCE = Path(os.environ.get(
+    "KOOV_NORMAL_EVIDENCE", str(Path.home() / "normal-flow-evidence")))
+RETAINED_LOG = ATTR_EVIDENCE / (
+    "NORMAL-B05-CORPUS-20260928/remote_on/trial_01/executor.log")
+RETAINED_TRACE = NORMAL_EVIDENCE / (
+    "NF-A1-COPY-20260928/remote_on/trial_01/nfa1-transport-trace.txt")
+
+
+def _require(*paths: Path) -> None:
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        pytest.skip("environment artifact not present: " + ", ".join(missing))
 TOKEN = "a1b2c3d4e5f6"
 XPRT = "0xffff888012340000"
 RQST = "0xffff888099990000"
@@ -119,6 +125,7 @@ def test_rejects_dynamic_process_paired_with_callback_semantic() -> None:
 
 
 def test_full_retained_guest_trace_replays_as_direct_witness() -> None:
+    _require(RETAINED_TRACE)
     verdict = nfa1.witness_trace(RETAINED_TRACE.read_text())
     assert verdict["assert"] is True
     assert verdict["checks"]["context_pairs_complete"] is True
@@ -250,6 +257,7 @@ def test_arm_owns_second_subscriber_for_static_call_dispatch(tmp_path: Path) -> 
 
 
 def test_copy_contract_accepts_actual_retained_executor_log() -> None:
+    _require(RETAINED_LOG)
     reach = nfa1._load_reach()
     assert (reach.EXPECTED_CALLS, reach.CONFLICT_CALL) == (11, -1)
     result = reach.validate_executor_log(RETAINED_LOG.read_text(), executions=10, procs=2)
@@ -268,6 +276,10 @@ def test_literal_nested_cli_help_loads_shared_runner() -> None:
 
 
 def test_literal_preflight_reports_ready_not_runtime_pass(tmp_path: Path) -> None:
+    _require(ENV_DIR / "images/kcsan/bzImage", ENV_DIR / "images/kcsan/vmlinux",
+             ENV_DIR / "images/bookworm-kcov-fresh-v1.raw",
+             ENV_DIR / "syzkaller/bin/linux_amd64/syz-executor",
+             ENV_DIR / "syzkaller/bin/linux_amd64/syz-execprog")
     output = tmp_path / "evidence"
     command = [
         "/usr/bin/python3", str(HELPER),

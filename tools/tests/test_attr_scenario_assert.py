@@ -25,9 +25,9 @@ DATA = Path(__file__).parent / "data/attr-scenario"
 VMLINUX = ENV_DIR / "images/kcsan/vmlinux"
 BASE_IMAGE = ENV_DIR / "images/bookworm-kcov-fresh-v1.raw"
 BASE_IMAGE_SHA = "cb54598517cb4646f00c3a79e9e8ff9e1ec4a5159318c568b52f1b180e786cbd"
-KCSAN_LOG = Path(
-    "/home/idealinsane/attr-scenario-evidence/_baseline-reach/remote_on/trial_01/dmesg.txt"
-)
+ATTR_EVIDENCE = Path(os.environ.get(
+    "KOOV_ATTR_EVIDENCE", str(Path.home() / "attr-scenario-evidence")))
+KCSAN_LOG = ATTR_EVIDENCE / "_baseline-reach/remote_on/trial_01/dmesg.txt"
 JsonObject = dict[str, Any]
 
 
@@ -36,6 +36,9 @@ def _sha256(path: Path) -> str:
 
 
 def _inputs(case: Path) -> JsonObject:
+    for artifact in (BASE_IMAGE, VMLINUX):
+        if not artifact.is_file():
+            pytest.skip("environment artifact not present: %s" % artifact)
     paths = {
         "image": BASE_IMAGE,
         "workload": case / "workload.prog",
@@ -516,6 +519,8 @@ def test_schema_malformed_hooks_still_writes_named_error_verdict(tmp_path: Path)
 
 def test_actual_kcsan_bug_log_is_non_clean_without_changing_kcov_verdict(
         tmp_path: Path) -> None:
+    if not KCSAN_LOG.is_file():
+        pytest.skip("retained KCSAN evidence not present: %s" % KCSAN_LOG)
     paths = _fixture(tmp_path)
     shutil.copy(KCSAN_LOG, paths[1] / "remote_on/trial_01/dmesg.txt")
     assert _run(paths).returncode == 0

@@ -195,6 +195,12 @@ def _reuse_fixture(tmp_path: Path, monkeypatch, *, overall: str = "PASS",
 
 
 def test_reuse_copies_matrix_eligible_verdict_without_boot(tmp_path: Path, monkeypatch) -> None:
+    pinned = json.loads(attr_run.BASELINE_PATH.read_text())["inputs"]
+    missing = [path for path in (attr_run.resolve_env_path(item["path"])
+                                 for item in pinned.values())
+               if not Path(path).is_file()]
+    if missing:
+        pytest.skip("baseline input not present: %s" % ", ".join(missing))
     case = _reuse_fixture(tmp_path, monkeypatch)
     output = tmp_path / "evidence"
     code = attr_run.main(["--scenario", str(case / "B05-V1.json"),

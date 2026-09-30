@@ -61,6 +61,7 @@ VARIANTS = ("kasan", "kcsan")
 KCONFIGS = {"kasan": BUNDLE / "kernel.config",
             "kcsan": BUNDLE / "kernel-kcsan.config"}
 
+OBSERVER_SOURCE = WORK / "bundle" / "corpus" / "nfs-normal" / "nfa1-kcov-observer.c"
 KERNEL_URL_DEFAULT = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
 SYZ_URL_DEFAULT = "https://github.com/google/syzkaller.git"
 KERNEL_TAG = "v7.3-rc4"
@@ -83,6 +84,15 @@ def sha256(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+SSH_AUTH_MARKERS = ("Permission denied", "Load key",
+                    "Too many authentication failures")
+
+
+def ssh_auth_failure(text):
+    """An SSH key/auth rejection never heals by waiting for the guest."""
+    return any(marker in text for marker in SSH_AUTH_MARKERS)
 
 
 def parse_args(argv=None):
@@ -116,6 +126,10 @@ def parse_args(argv=None):
         path = getattr(args, field).resolve()
         if not path.is_file() or path.stat().st_size == 0:
             parser.error("missing --%s: %s" % (field.replace("_", "-"), path))
+        if not os.access(path, os.R_OK):
+            parser.error("--%s is not readable by the current user: %s "
+                         "(created with sudo? chown it to this user)"
+                         % (field.replace("_", "-"), path))
         setattr(args, field, path)
     args.variants = [v for v in VARIANTS if v in (args.variants or VARIANTS)]
     for path in (FPORT_APPLY, *(KCONFIGS[v] for v in args.variants)):
@@ -322,6 +336,27 @@ def stage_syzkaller(args, manifest, reuse):
     return syz
 
 
+def stage_observer(args, manifest):
+    """Build the standalone NF-A1 guest KCOV controller into images/.
+
+    Optional: only the NF-A1 observation needs it, so a failed build is
+    recorded in the manifest instead of failing the whole bootstrap.
+    """
+    out = args.target / "images" / "nfa1-kcov-observer"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["gcc", "-static", "-O2", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+         "-o", str(out), str(OBSERVER_SOURCE)],
+        capture_output=True, text=True, timeout=300)
+    if result.returncode:
+        manifest["observer"] = {"status": "not built",
+                                "error": result.stderr[-500:]}
+        print("warning: nfa1-kcov-observer not built: %s"
+              % result.stderr[-200:], flush=True)
+    else:
+        manifest["observer"] = {"status": "built", "sha256": sha256(out)}
+
+
 def stage_bake(args, bzimage, image_out):
     bake = BAKER / "bake_nfs_protocol_image.py"
     run([sys.executable, str(bake), "--base-image", str(args.base_image),
@@ -368,6 +403,7 @@ class VM:
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + self.boot_timeout
+        last_error = ""
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError("QEMU exited before SSH became ready")
@@ -375,8 +411,13 @@ class VM:
                                     text=True, timeout=8)
             if result.returncode == 0:
                 return
+            last_error = result.stderr.strip()
+            if ssh_auth_failure(last_error):
+                raise RuntimeError("guest SSH rejected the key (not a boot "
+                                   "problem): %s" % last_error)
             time.sleep(3)
-        raise RuntimeError("timed out waiting for guest SSH")
+        raise RuntimeError("timed out waiting for guest SSH; last ssh "
+                           "error: %s" % (last_error or "none"))
 
     def guest(self, command, timeout=60):
         result = subprocess.run([*self.ssh, command], capture_output=True,
@@ -493,6 +534,8 @@ def main(argv=None):
     try:
         kernels, kernel_rebuilt = stage_kernel(args, manifest, kernel_reuse)
         syz = stage_syzkaller(args, manifest, syz_reuse)
+        if not args.skip_build:
+            stage_observer(args, manifest)
         image_out = args.target / "images" / ("bookworm-kcov-fresh-v%s.qcow2"
                                               % args.minor)
         image_out.parent.mkdir(parents=True, exist_ok=True)

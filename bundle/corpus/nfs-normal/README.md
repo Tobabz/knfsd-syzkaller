@@ -52,7 +52,8 @@ merged into a managed generation.
 `nfa1-kcov-observer.c` is the standalone guest KCOV controller. The
 `nfa1-kcov-presence.py` adapter starts it after fixture setup, stops it after
 the workload and managed drains, and keeps its raw PCs and metadata **outside**
-the executor's `coverage/` archive. Build a static controller and use the
+the executor's `coverage/` archive. Bootstrap already builds the static controller as
+`env/images/nfa1-kcov-observer`; the first command below rebuilds it by hand. Use the
 KCSAN kernel built from the full series with the original snapshot image:
 
 ```sh

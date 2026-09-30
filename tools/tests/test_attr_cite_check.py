@@ -1,5 +1,6 @@
 """Behavioral regression checks for mechanism-bound source citations."""
 
+import re
 import subprocess
 import sys
 import os
@@ -30,6 +31,13 @@ def run_checker(report: Path) -> subprocess.CompletedProcess[str]:
 
 
 def test_accepts_current_inventory() -> None:
+    # The citations are line-exact against one kernel commit; another tree
+    # (for example a rebuilt one) cannot validate them.
+    pinned = re.search(r"commit `([0-9a-f]{12})`", REPORT.read_text())
+    if pinned is None or subprocess.run(
+            ["git", "-C", str(KERNEL), "cat-file", "-e", pinned.group(1) + "^{commit}"],
+            capture_output=True).returncode != 0:
+        pytest.skip("kernel commit pinned by the inventory is not in %s" % KERNEL)
     # Given the checked-in current-kernel inventory
     # When the real CLI validates it
     result = run_checker(REPORT)
