@@ -5,9 +5,9 @@ It reflects a **remote KCOV coverage model** — collecting NFS server-side cove
 kernel, and automates the whole pipeline from base image to a bootable fuzz VM (instrumented kernel + syzkaller binaries +
 baked protocol image).
 
-The checked-in customization series — **11 kernel patches + 15 syzkaller patches** (`bundle/patches/`) — is re-applied and
+The checked-in customization series — **12 kernel patches + 17 syzkaller patches** (`bundle/patches/`) — is re-applied and
 rebuilt against each new kernel/syzkaller RC by the forward-port pipeline (P0..P7). Environment validity is machine-checked
-against the design-contract gates **R1..R6** (`tools/fport-design-gate.sh`).
+against the functional design-contract gates **R1,R2,R4,R5** (`tools/fport-design-gate.sh`; R3/R6 retired).
 
 ## Design highlights
 
@@ -19,7 +19,6 @@ against the design-contract gates **R1..R6** (`tools/fport-design-gate.sh`).
 | Fuzz lanes | Fixed 34-call NFS lane workload · mount-namespace clients 0/1 (`/nfs-lane`) |
 | NFS version | `--minor 1\|2` selects the NFS minor version (recorded in the manifest) |
 | Boot model | Kernel is injected **outside the image** (`-kernel`), so the base image is kernel-agnostic; each new RC only needs a rebake |
-| Apply integrity | Patches are sha-verified and applied with `git am -3` (rerere / variant fallback on drift) |
 
 ## Host requirements
 
@@ -61,7 +60,7 @@ python3 tools/bootstrap-kcov-env.py env \
 | `--kernel-tarball` / `--syz-tarball` (optional) | Offline source archives instead of clones |
 | `--jobs N` (optional) | Parallel build jobs |
 
-- **Behavior**: clone upstream → apply the series (11+15) → build `bzImage`/`vmlinux` and the syzkaller binaries → bake the bootable VM image (`bookworm-kcov-fresh-v1.raw`) → verify lane status
+- **Behavior**: clone upstream → apply the series (12+17) → build `bzImage`/`vmlinux` and the syzkaller binaries → bake the bootable VM image (`bookworm-kcov-fresh-v1.raw`) → verify lane status
 - **Output**: `env/` — `env/linux/arch/x86/boot/bzImage`, `env/linux/vmlinux`, `env/syzkaller/bin/...`, `env/bookworm-kcov-fresh-v1.raw`, and **`env/manifest.json`** (records all sources, pins, and build state)
 
 ### 3. A/B fuzzing · evidence collection
@@ -101,10 +100,9 @@ bash tools/fport-pipeline.sh --mode full --kind kernel \
 | Base image | `sudo bash tools/make-base-image.sh --out artifacts` | sudo + debootstrap → `artifacts/bookworm-base.img` + keypair |
 | Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 1` | base · key · deps + upstream → `env/` (bzImage, binaries, image, manifest) |
 | A/B | `KOOV_SSH_KEY=... bash tools/run-ab.sh && bash tools/analyze-ab.sh` | `env/` → `evidence/` (OFF/ON coverage, metrics) |
-| Gates | `bash tools/fport-design-gate.sh -v` | manifest + evidence → R1..R6, R3 retired (0 = HOLDS) |
+| Gates | `bash tools/fport-design-gate.sh -v` | manifest + evidence → R1,R2,R4,R5 (R3/R6 retired) (0 = HOLDS) |
 | RC port | `bash tools/fport-pipeline.sh --mode full --kind kernel --target ... --new-base <hash>` | new RC → `runs/port-*` report |
-| Portability | `bash tools/portability-check.sh` | syntax check + relocated execution + batch gates (0 = pass) |
-| Evidence refresh | `bash tools/fport-evidence.sh` | re-record evidence hashes after tool/doc changes |
+
 
 ## Repository layout
 
@@ -112,7 +110,7 @@ bash tools/fport-pipeline.sh --mode full --kind kernel \
 |---|---|
 | `tools/` | Pipeline P0..P7 · gates R1..R6 · A/B harness · base-image generation (usage: `tools/README.md`) |
 | `bundle/` | Immutable inputs — patch series · guest deps · kernel config · manifests (`bundle/README-HANDOFF.md`) |
-| `report/` | Design contract · verification results · change log (evidence hashes `report/evidence-forward-port.sha256`) |
+| `report/` | Design contract · verification results |
 | `LICENSE` · `THIRD-PARTY-LICENSES.md` | MIT + vendor component attribution |
 
 ## License

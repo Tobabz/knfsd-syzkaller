@@ -10,7 +10,7 @@
 #
 # Minimised on purpose: --mode off (one group), --trials 1, --executions 2,
 # --procs 1.  This is a fixture regression gate, not an experiment -- the
-# real numbers come from run-ab.sh / run-reach-copy-offload.sh.
+# real numbers come from run-ab.sh.
 set -eu
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_ROOT="${KOOV_WORK_ROOT:-$(dirname "$TOOLS")}"

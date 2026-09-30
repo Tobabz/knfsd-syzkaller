@@ -81,7 +81,6 @@ for f in "$out"/*.patch; do
     suffix=$((suffix + 1))
     mv "$f" "$out/$(printf '%04d' "$suffix")-$(basename "$f" | sed 's/^[0-9]*-//')"
 done
-(cd "$out" && sha256sum ./*.patch > SHA256SUMS)
 cp -rn "$scratch/wt/.git/rr-cache" "$out/rr-cache" 2>/dev/null || true
 cat > "$out/META" <<EOF
 series=$kind

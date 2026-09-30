@@ -1121,17 +1121,17 @@ def parse_args(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     scripts = Path(__file__).resolve().parent
     parser.add_argument("--phase1-runner", type=Path,
-                        default=scripts / "run_frozen_phase1_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase1_vm.py")
     parser.add_argument("--phase3-runner", type=Path,
-                        default=scripts / "run_frozen_phase3_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase3_vm.py")
     parser.add_argument("--phase4-runner", type=Path,
-                        default=scripts / "run_frozen_phase4_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase4_vm.py")
     parser.add_argument("--phase5-runner", type=Path,
-                        default=scripts / "run_frozen_phase5_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase5_vm.py")
     parser.add_argument("--phase6-runner", type=Path,
-                        default=scripts / "run_frozen_phase6_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase6_vm.py")
     parser.add_argument("--phase8-runner", type=Path,
-                        default=scripts / "run_frozen_phase8_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase8_vm.py")
     parser.add_argument("--phase1-lane-script", dest="lane_script", type=Path,
                         default=scripts / "frozen_phase1_lane.sh")
     parser.add_argument("--workload", type=Path,

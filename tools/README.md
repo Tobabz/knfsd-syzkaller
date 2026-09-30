@@ -4,7 +4,7 @@
 커널/syzkaller rc로 전진 이식**하는 자동화 파이프라인입니다.
 설계 계약(`report/design-spec.md` R1..R6, 기계 판정 `fport-design-gate.sh`)이 **최종 권위**이며,
 패치 적용은 그 계약을 가시화하는 구현 단계일 뿐입니다. 사람의 손이 필요한 단계는
-신규 rc 충돌 시 의도 인덱스(`patch-forward-compat.md §3`)를 보고 패치를 재생성하는 것 하나뿐입니다.
+신규 rc 충돌 시 패치를 재생성하는 것 하나뿐입니다.
 
 ## 진입점
 
@@ -78,11 +78,6 @@ bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
 | `fport-apply.sh` | 자체 시리즈 적용 — `fport-apply.sh [--dry-run] [--variant-dir DIR] <kind> <target>` |
 | `fport-variant.sh` | rc 변형 기록 — `fport-variant.sh <kind> <target> <new-base> [이름]` |
 | `fport-design-gate.sh` | R1..R6 기계 판정 — `-v` |
-| `fport-evidence.sh` | 증거 해시 기록 → `report/evidence-forward-port.sha256` |
-| `fport-patch-hygiene.py` | 패치 위생 진단 |
-| `fport-patch-risk.py` | 패치 리스크 진단 |
-| `portability-check.sh` | 이식성 검증(/tmp 이동 실행 + 게이트) |
-| `rename-scripts.py`·`check-rename-leftovers.sh` | 명칭 개명 대장·잔여 검증 |
 | `README-tests.md` | T1–T7 검증 배터리 체크리스트 |
 | `bootstrap-kcov-env.py` | env 부트스트랩 — 시리즈 적용은 `fport-apply.sh` 연동 |
 | `run-ab.sh`·`analyze-ab.sh`·`run_ab_adapted.py` | 일반 코퍼스 AB 하네스 (관례 절대경로 — `<root>` 구조만 준비하면 됨) |
@@ -102,12 +97,9 @@ bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
 ## 검증·증거 규율
 
 ```sh
-bash tools/portability-check.sh          # 구문 + /tmp 실행 + 게이트 일괄
 bash tools/fport-pipeline.sh --mode reuse
-bash tools/fport-evidence.sh             # 도구·문서 수정 후 해시 재기록 필수
 ```
 
-- 증거 해시는 `report/evidence-forward-port.sha256` — 수정하면 반드시 재기록.
 - 번들(`bundle/patches/` 2종 시리즈)은 검증 기준 — 시리즈 수정 시 게이트 R6 재확인.
 
 ---
@@ -200,9 +192,7 @@ KOOV_EVIDENCE_DIR=evidence/ganesha-asan-relay-replay \
 같은 백엔드 응답에서 재적용을 확인한다. ASan·마운트 공유/격리·정리 검사도
 함께 실행한다. 저장된 델타 사본의 anchor만 변경한 원본 불일치 음성 게이트는
 `refused_orig=1`, 적용 0, replay 실패와 원본 응답을 게스트에서 확인한다.
-상세 판정과 증거 해시는 `report/patch-forward-compat.md`
-릴레이 절을 참조한다. 이 단일 실행을 정식 30×2 A/B 속도 결론으로
-해석하지 않는다.
+상세 판정과 증거 해시는 `report/design-spec.md`를 참조한다.
 
 `tools/nfs-proxy/ganesha-asan-relay-ab-run.sh`는 이미지 변환 확인 후
 arm OFF/ON 각각 30회 × 2 trial의 네 경로·ASan A/B를 수행한다. 실제
@@ -286,10 +276,7 @@ NFSv4 pseudoroot에 엔트리를 만드는 쓰기에서 knfsd는 0, Ganesha 4.3�
 
 | 문서 | 내용 |
 |---|---|
-| `report/patch-forward-compat.md` | 해석·§3 의도 인덱스·§7 파이프라인 표/환경 이식/디렉토리 배치 |
-| `report/design-spec.md` | Ψ/R1..R6 설계 계약 + 재구현 지침 |
-| `report/script-rename-map.md` | 개명·삭제 대장 |
-| `report/T1-T10-results.md` | T1–T7 검증 결과 + 증거 해시 |
+| `report/design-spec.md` | Ψ/R1,R2,R4,R5 설계 계약 + 재구현 지침 |
 
 
 ## 환경 변수 (`KOOV_*`)
@@ -334,7 +321,7 @@ NFSv4 pseudoroot에 엔트리를 만드는 쓰기에서 knfsd는 0, Ganesha 4.3�
   `baker/`(프로비저닝) · `corpus/`(코퍼스 전처리),
   원본 `knfsd-fuzz-HEAD.tar.gz`는 해시를 `README-HANDOFF.md`에 기록 후 삭제.
 - **파이프라인 스코프**: `--kind`는 `kernel|syzkaller`만. R6는 번들 2종 검증(2/2).
-  상세는 `design-spec.md §6`·`script-rename-map.md`.
+  상세는 `design-spec.md`.
 - **env/ 빌드 산출물**은 부트스트랩이 만든 일반 코퍼스 AB 오라클 — `--mode full` 포팅 시 신선 환경으로 교체.
 
 ## 라이선스

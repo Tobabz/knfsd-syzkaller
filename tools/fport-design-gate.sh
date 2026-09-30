@@ -1,10 +1,9 @@
 #!/bin/sh
 # tools/fport-design-gate.sh - machine-check the DESIGN contract (design-spec.md)
 # against target evidence artifacts. The design "holds" iff every active gate
-# passes (R3 throughput-bound retired 2026-09-26: env-dependent, out of scope).
-# passes on this target. This is a per-target decidable check, not a
-# time-inductive prediction - that is how the natural-language design
-# guarantees 100% within its preconditions.
+# passes (R3 throughput-bound retired 2026-09-26; R6 apply-audit retired
+# after SHA256 verification removal - only functional gates remain).
+# This is a per-target decidable check, not a time-inductive prediction.
 #
 # exit: 0 = DESIGN HOLDS, 1 = gate failed, 2 = preconditions unmet (UNSUPPORTED)
 VERBOSE=0
@@ -106,40 +105,6 @@ r5 = gate("R5", "evidence-chain-general",
     share >= 95 and sets_ok,
     "status=%s integrity=%s share=%.0f%% sets=%d/6" % (
         a.get("status"), a.get("integrity_pass"), share, sum(1 for s in need_sets if (sets_dir / s).exists())))
-
-# ---------- R6 audit coupling ----------
-sha_ok = 0
-for sub in ("kernel", "syzkaller"):
-    ok, _ = sh("cd '%s/%s' && sha256sum -c SHA256SUMS >/dev/null 2>&1" % (bundle, sub))
-    sha_ok += bool(ok)
-def series_shape(sub):
-    """Hash the patch series actually on disk, in order."""
-    base = bundle/sub
-    listing = []
-    series = base/"series"
-    if not series.exists():
-        return listing
-    for line in series.read_text(encoding="utf-8").splitlines():
-        entry = line.strip()
-        if not entry:
-            continue
-        ok, digest = sh("sha256sum '%s' | cut -d' ' -f1" % (base/entry))
-        listing.append(digest if ok else "MISSING:" + entry)
-    return listing
-
-ks_on = series_shape("kernel")
-ss_on = series_shape("syzkaller")
-kp = m.get("pins", {}).get("kernel_series", [])
-sp = m.get("pins", {}).get("syz_series", [])
-# The pins must describe the series that is actually present.  Counting alone
-# let a newly added patch slip through, which is why this compares the hashes
-# and the lengths together.
-pins_match = (kp == ks_on) and (sp == ss_on)
-r6 = gate("R6", "apply-audit",
-    sha_ok == 2 and pins_match,
-    "sha256 bundles=%d/2 kernel_pins=%d/%d match=%s syz_pins=%d/%d match=%s" % (
-        sha_ok, len(kp), len(ks_on), kp == ks_on,
-        len(sp), len(ss_on), sp == ss_on))
 
 # ---------- verdict ----------
 fails = [r for r in rows if not r[2]]

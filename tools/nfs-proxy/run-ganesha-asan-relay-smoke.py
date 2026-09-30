@@ -298,7 +298,7 @@ cat "$log"
 
 def main():
     args = args_parse()
-    phase1 = ab.load_module("relay_phase1", REPO / "bundle/ab-runner/run_frozen_phase1_vm.py")
+    phase1 = ab.load_module("relay_phase1", REPO / "bundle/ab-runner/phases/run_frozen_phase1_vm.py")
     phase9 = ab.load_module("relay_phase9", TOOLS / "run_frozen_phase9_vm_ganesha.py")
     asan = ab.load_module("relay_asan", TOOLS / "run-ganesha-asan-smoke.py")
     phase1.REMOTE_DRIVER = "/opt/frozen-phase9"

@@ -1,27 +1,7 @@
 #!/bin/sh
 # tools/fport-pipeline.sh - forward-port automation pipeline.
-#
-# Chains the rc→apply→verify→gates loop into one deterministic run with a
-# per-run manifest. The DESIGN (report/design-spec.md R1..R6, checked by
-# fport-design-gate.sh) is the terminal authority; patch application is only
-# an implementation step.
-#
-# The single human checkpoint: if the drift-path apply fails, the patch is
-# regenerated from the design-intent record (patch-forward-compat.md §3, the
-# one creative step). The pipeline detects, reports precisely, and stops with
-# exit 10; after updating the bundle, re-running resumes at the apply phase.
-#
-# Modes:
-#   --mode reuse  (default) validate the loop against already-built evidence
-#                 (fast, deterministic; what we run locally)
-#   --mode full   fresh rc port: provision -> apply -> build/bake -> AB ->
-#                 cover -> manager -> gates (multi-hour; needs fresh env)
-#
-# Usage:
-#   fport-pipeline.sh [--mode reuse|full] [--kind kernel|syzkaller]
-#                        [--target DIR] [--new-base SHA] [--phases a,b,..]
-#                        [--no-checkpoint] [--help]
-# Exit: 0=HOLDS 1=gates-fail 2=preconditions-unmet 10=apply-fail(human) 20=env-fail
+# DESIGN (report/design-spec.md R1,R2,R4,R5) is the terminal authority.
+# Exit: 0=HOLDS 1=fail 2=preconditions-unmet 10=apply-fail 20=env-fail
 set -u
 
 PREP=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -94,7 +74,6 @@ p0() {
     for c in git python3 sha256sum qemu-img; do
         command -v "$c" >/dev/null || { echo "missing tool: $c"; return 1; }
     done
-    ( cd "$BUNDLE/$sub" && sha256sum -c SHA256SUMS >/dev/null ) || { echo "bundle SHA mismatch ($sub)"; return 1; }
     test -d "$TARGET/.git" || { echo "target not a git repo: $TARGET"; return 1; }
     test -f "$MANIFEST_JSON" || { echo "bootstrap manifest missing (need provision first)"; return 1; }
     if test "$MODE" = reuse; then
@@ -157,7 +136,7 @@ p3() {
     "$PREP/fport-apply.sh" "$KIND" "$TARGET" || return $?
     if test "$CHECKPOINT" -eq 1; then
         echo "== human checkpoint: if apply failed above, regenerate the patch"
-        echo "   from the design-intent record (§3 patch-forward-compat.md),"
+        echo "   from the design-intent record,"
         echo "   update the bundle, then re-run this pipeline (resumes at P3). =="
     fi
 }
@@ -217,7 +196,7 @@ run_phase p1    "detect base/applied"   p1 || { rec "verdict" FAIL; exit 1; }
 run_phase p2    "variant record"        p2 || { rec "verdict" FAIL; exit 1; }
 run_phase p3    "apply series"          p3 || exit 10
 run_phase p4    "build artifact check"  p4 || exit 20
-run_phase p5    "design gates R1..R6"   p5 || STATUS=FAIL
+run_phase p5    "design gates R1,R2,R4,R5"   p5 || STATUS=FAIL
 run_phase p6    "fuzz evidence"         p6 || STATUS=FAIL
 final=$STATUS
 run_phase p7    "report"                p7

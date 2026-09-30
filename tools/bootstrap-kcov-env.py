@@ -94,8 +94,7 @@ def parse_args(argv=None):
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument("--update", action="store_true",
-                        help="reuse stages whose pins did not change; rebuild "
-                        "only what the new pins invalidate")
+                        help="write/update manifest.json after build")
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args(argv)
     for field in ("base_image", "ssh_key", "deps_tar"):
@@ -118,35 +117,6 @@ def parse_args(argv=None):
     return args
 
 
-def series_shas(bundle):
-    bundle = Path(bundle)
-    names = (bundle / "series").read_text(encoding="utf-8").split()
-    return [sha256(bundle / name) for name in names]
-
-
-def compute_pins(args):
-    return {
-        "kernel_base": KERNEL_COMMIT,
-        "kernel_series": series_shas(BUNDLE / "kernel"),
-        "kconfig": sha256(KCONFIG),
-        "syz_base": SYZ_COMMIT,
-        "syz_series": series_shas(BUNDLE / "syzkaller"),
-        "lane_script": sha256(ABRUN / "frozen_phase9_lane.sh"),
-        "service": sha256(ABRUN / "frozen-phase9-fixture.service"),
-        "deps": sha256(args.deps_tar),
-        "base_image": sha256(args.base_image),
-        "minor": args.minor,
-    }
-
-
-def pins_match(old, new, *sections):
-    if not isinstance(old, dict):
-        return False
-    old_pins, new_pins = old.get("pins"), new.get("pins")
-    if not isinstance(old_pins, dict) or not isinstance(new_pins, dict):
-        return False
-    return all(old_pins.get(section) == new_pins.get(section)
-               for section in sections)
 
 
 def git_clean(tree):
@@ -439,46 +409,20 @@ def stage_verify(args, image, bzimage):
 
 def main(argv=None):
     args = parse_args(argv)
-    pins = compute_pins(args)
-    old_manifest = None
-    if args.update:
-        manifest_path = args.target / "manifest.json"
-        if manifest_path.is_file():
-            try:
-                old_manifest = json.loads(manifest_path.read_text())
-            except (OSError, json.JSONDecodeError):
-                old_manifest = None
     manifest = {"target": str(args.target), "minor": args.minor,
-                "repo": str(BUNDLE.parent), "pins": pins}
-    kernel_reuse = (
-        old_manifest is not None
-        and pins_match(old_manifest, manifest, "kernel_base",
-                       "kernel_series", "kconfig"))
-    syz_reuse = (
-        old_manifest is not None
-        and pins_match(old_manifest, manifest, "syz_base", "syz_series"))
+                "repo": str(BUNDLE.parent)}
+    # SHA256-based reuse removed (Option A, 2026-09-27).
+    kernel_reuse = False
+    syz_reuse = False
     try:
         bzimage, vmlinux, kernel_rebuilt = stage_kernel(
             args, manifest, kernel_reuse)
         syz = stage_syzkaller(args, manifest, syz_reuse)
         image_out = args.target / ("bookworm-kcov-fresh-v%s.qcow2"
                                    % args.minor)
-        bake_manifest_path = image_out.with_suffix(".json")
-        bake_reuse = (
-            old_manifest is not None and not kernel_rebuilt
-            and pins_match(old_manifest, manifest, "lane_script",
-                           "service", "deps", "base_image", "minor")
-            and image_out.is_file() and image_out.stat().st_size > 0
-            and bake_manifest_path.is_file())
-        if bake_reuse:
-            print("reusing baked image", flush=True)
-            manifest["bake"] = json.loads(bake_manifest_path.read_text())
-        else:
-            if image_out.exists():
-                image_out.unlink()
-            if bake_manifest_path.exists():
-                bake_manifest_path.unlink()
-            manifest["bake"] = stage_bake(args, bzimage, image_out)
+        if image_out.exists():
+            image_out.unlink()
+        manifest["bake"] = stage_bake(args, bzimage, image_out)
         if args.skip_verify:
             manifest["verify"] = "skipped"
         else:

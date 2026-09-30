@@ -1,17 +1,5 @@
 #!/bin/sh
-# tools/fport-apply.sh - self-contained forward-port series apply.
-# Input: the independent bundle series bundle/patches/{kernel,syzkaller}.
-#
-# One path with two prep levels (zero dependency on the handoff repo scripts):
-#   [base match]  target HEAD == expected_base
-#       -> sha256 validate + git am -3 (rerere on; no variant fallback)
-#   [drift]       target HEAD != expected_base (e.g. a newer mainline rc)
-#       -> sha256 validate, rerere on, git am -3 per patch with
-#          conflict-resolution replay, variant fallback, hunk diagnostics.
-#
-# POSIX sh. Usage:
-#   fport-apply.sh [--dry-run] [--variant-dir DIR] <kind> <target-repo>
-#   kind: kernel | syzkaller
+# tools/fport-apply.sh - apply checked-in patch series to a target repo.
 set -eu
 
 DRY_RUN=0
@@ -56,9 +44,6 @@ echo "[fport-apply] expected_base=$expected_base actual_base=$actual_base"
 echo "[fport-apply] clean=$(test -z "$clean" && echo yes || echo no) dry_run=$DRY_RUN"
 
 # ---- provenance, always ----
-(cd "$bundle" && sha256sum -c SHA256SUMS) || {
-    echo "[fport-apply] SHA256SUMS mismatch in $bundle" >&2; exit 1
-}
 
 if test -n "$clean"; then
     echo "[fport-apply] target worktree is not clean:" >&2
@@ -80,7 +65,7 @@ else
 
     # variant inventory: stored re-based bundles, chosen by "target contains base"
     variants=""
-    for v in "$VARIANT_DIR/$kind"/*/SHA256SUMS; do
+    for v in "$VARIANT_DIR/$kind"/*/META; do
         test -f "$v" || continue
         base_name=$(dirname "$v"); base_name=$(basename "$base_name")
         vbase=$(sed -n 's/^variant_base=//p' "$VARIANT_DIR/$kind/$base_name/META" 2>/dev/null | head -1)

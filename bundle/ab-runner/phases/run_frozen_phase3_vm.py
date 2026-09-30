@@ -580,7 +580,7 @@ def parse_args(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     scripts = Path(__file__).resolve().parent
     parser.add_argument("--phase1-runner", type=Path,
-                        default=scripts / "run_frozen_phase1_vm.py")
+                        default=scripts / "phases" / "run_frozen_phase1_vm.py")
     parser.add_argument("--lane-script", type=Path,
                         default=scripts / "frozen_phase1_lane.sh")
     parser.add_argument("--workload", type=Path,
