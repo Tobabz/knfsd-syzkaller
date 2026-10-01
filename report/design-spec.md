@@ -37,7 +37,7 @@
 
 ## 3. 시리즈를 다시 적용해야 할 때
 
-1. `fport-variant.sh`로 rc 변형을 기록하고 `fport-apply.sh`로 재적용한다.
+1. `bump-kernel.py <태그|latest>`로 시리즈를 새 커널에 이월한다(충돌은 사람이 풀고 `--export`로 반영).
 2. `bootstrap-kcov-env.py`를 다시 실행해 빌드와 variant별 검증(R1)이 통과하는지 확인한다.
 
 ---

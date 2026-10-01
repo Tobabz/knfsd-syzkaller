@@ -1,7 +1,7 @@
 # Handoff bundle — reproduction of the knfsd KCOV environment
 
 Upstream sources (Linux kernel `v7.3-rc4`, syzkaller `801f09666`) are
-**cloned by the bootstrap at pinned git refs**, so a first fresh
+**cloned by the bootstrap at the refs recorded in `bundle/patches/BASE`** (the kernel tag can be overridden with `--kernel-ref`, `latest` included), so a first fresh
 environment build requires network access to `git.kernel.org` and
 `github.com`. Everything else (patches, fixtures, guest deps) ships in
 this repository; the **base image and keypair are generated per site**
@@ -14,13 +14,14 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 
 | Path | Description | Size |
 |---|---:|---:|
-| upstream kernel | cloned by bootstrap at commit `93f51579…` (= tag `v7.3-rc4`, git.kernel.org) | — |
+| upstream kernel | cloned by bootstrap at the `BASE` tag (currently `v7.3-rc4`, commit `93f51579…`, git.kernel.org); `--kernel-ref` overrides | — |
 | upstream syzkaller | cloned by bootstrap at commit `801f09666…` (github.com/google/syzkaller) | — |
 | base image (site-generated) | `tools/make-base-image.sh` → `artifacts/bookworm-base.img` (2 GiB raw, `create-image.sh -d bookworm`) | 2 GiB |
 | `src/guest-deps.tar.gz` | Debian nfs-utils extraction for guests (committed) | ~6 MB |
 | guest keypair (site-generated) | same run: `artifacts/bookworm.id_rsa[.pub]` (pairs with your base) | — |
 | `patches/kernel/` | kernel series: 13 patches + `series` | — |
 | `patches/syzkaller/` | syzkaller series: 17 patches + `series` | — |
+| `patches/BASE` | last base the series applies to (kernel tag + commit, syzkaller commit); updated by `tools/bump-kernel.py` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
 | `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); built by `bootstrap-kcov-env.py --variant kcsan` | — |
 | `ab-runner/` | Lane fixture inputs baked into the image (`frozen_phase9_lane.sh`, `frozen_phase9_boot_fixture.sh`, `frozen-phase9-fixture.service`) | — |
@@ -128,8 +129,10 @@ directory is written;
 `manifest.json` records every pin (git refs for upstream sources).
 
 Later updates arrive as a new bundle (or repo pull where available):
-re-run the same command with `--update` — only stages whose content
-pins changed are rebuilt.
+re-run the same command with `--update` — both kernels and syzkaller are rebuilt
+(only the latest kernel images are kept), and the baked image is reused when its
+inputs are unchanged. To follow a new kernel release first run
+`python3 tools/bump-kernel.py latest`.
 
 ## Fuzzing after bootstrap
 

@@ -254,6 +254,7 @@ def main(argv=None):
         "base_sha256": base_sha,
         "nfs_minor": args.minor,
         "lane_script_sha256": sha256(args.lane_script),
+        "boot_fixture_sha256": sha256(args.boot_fixture),
         "service_sha256": sha256(args.service),
         "deps_tar_sha256": sha256(args.deps_tar),
     }

@@ -27,7 +27,8 @@ TARGET_DIR layout:
 Usage (all paths explicit, no host defaults besides REPO auto-detect):
   bootstrap_kcov_env.py TARGET_DIR --kernel-repo URL --syz-repo URL \\
       --base-image FILE --ssh-key FILE --deps-tar FILE --minor 1|2 \\
-      [--variant kasan|kcsan ...] [--jobs N] [--skip-build] [--skip-verify]
+      [--kernel-ref TAG|latest] [--variant kasan|kcsan ...] [--jobs N] \\
+      [--skip-build] [--skip-verify]
 
   For offline handoff, replace the two --*-repo URLs with
   --kernel-tarball/--syz-tarball pristine source archives; the trees
@@ -61,11 +62,16 @@ VARIANTS = ("kasan", "kcsan")
 KCONFIGS = {"kasan": BUNDLE / "kernel.config",
             "kcsan": BUNDLE / "kernel-kcsan.config"}
 
-KERNEL_URL_DEFAULT = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+sys.path.insert(0, str(TOOLS))
+import kernel_base  # noqa: E402
+
+# The last verified base lives in one file; --kernel-ref overrides the kernel part.
+BASE = kernel_base.read_base(BUNDLE / "BASE")
+KERNEL_URL_DEFAULT = kernel_base.KERNEL_URL
 SYZ_URL_DEFAULT = "https://github.com/google/syzkaller.git"
-KERNEL_TAG = "v7.3-rc4"
-KERNEL_COMMIT = "93f51579e7df248780214094418f205253383cc5"
-SYZ_COMMIT = "801f0966669a37e048adabf9e5f38ce52825ea82"
+KERNEL_TAG = BASE["kernel_tag"]
+KERNEL_COMMIT = BASE["kernel_commit"]
+SYZ_COMMIT = BASE["syzkaller_commit"]
 
 
 def run(command, timeout=3600, check=True, **kwargs):
@@ -98,10 +104,13 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", type=Path)
     parser.add_argument("--kernel-repo", default=KERNEL_URL_DEFAULT)
+    parser.add_argument("--kernel-ref", default=None,
+                        help="kernel release/rc tag to build, or 'latest' (newest tag, rc "
+                        "included); default: the BASE tag of the patch series")
     parser.add_argument("--syz-repo", default=SYZ_URL_DEFAULT)
     parser.add_argument("--kernel-tarball", type=Path, default=None,
                         help="offline alternative to --kernel-repo: pristine "
-                        "v7.3-rc4 source archive")
+                        "source archive of --kernel-ref")
     parser.add_argument("--syz-tarball", type=Path, default=None,
                         help="offline alternative to --syz-repo: pristine "
                         "801f09666 source archive")
@@ -121,6 +130,18 @@ def parse_args(argv=None):
                         help="write/update manifest.json after build")
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args(argv)
+    if args.kernel_ref is None:
+        args.kernel_ref = KERNEL_TAG
+    elif args.kernel_ref == "latest":
+        if args.kernel_tarball is not None:
+            parser.error("--kernel-ref latest needs --kernel-repo, not --kernel-tarball")
+        args.kernel_ref = kernel_base.latest_tag(args.kernel_repo)
+        print("latest kernel tag: %s" % args.kernel_ref, flush=True)
+    else:
+        try:
+            kernel_base.parse_tag(args.kernel_ref)
+        except ValueError as error:
+            parser.error(str(error))
     for field in ("base_image", "ssh_key", "deps_tar"):
         path = getattr(args, field).resolve()
         if path.exists() and not os.access(path, os.R_OK):
@@ -165,7 +186,7 @@ def kernel_sentinel(linux):
         return False
 
 
-def import_tarball(tarball, dest, kind):
+def import_tarball(tarball, dest, kind, kernel_tag=None):
     """Extract a pristine source archive and commit it as a local repo."""
     import tarfile
     dest.mkdir(parents=True, exist_ok=True)
@@ -177,12 +198,13 @@ def import_tarball(tarball, dest, kind):
         run(["git", "-C", str(dest), "config", key, value], timeout=60)
     if kind == "kernel":
         makefile = (dest / "Makefile").read_text(errors="replace")
-        fields = dict(re.findall(r"^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)\s*=\s*(\S+)",
-                                 makefile, re.MULTILINE))
-        if (fields.get("VERSION"), fields.get("PATCHLEVEL"),
-                fields.get("SUBLEVEL"), fields.get("EXTRAVERSION")) != (
-                "7", "3", "0", "-rc4"):
-            raise RuntimeError("kernel tarball is not v7.3-rc4: %r" % fields)
+        fields = dict(re.findall(
+            r"^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[ \t]*=[ \t]*(\S*)",
+            makefile, re.MULTILINE))
+        got = tuple(fields.get(key, "") for key in
+                    ("VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION"))
+        if got != kernel_base.tag_version_fields(kernel_tag):
+            raise RuntimeError("kernel tarball is not %s: %r" % (kernel_tag, fields))
     run(["git", "-C", str(dest), "add", "-A"], timeout=600)
     run(["git", "-C", str(dest), "commit", "-q", "-m",
          "pristine base import (%s)" % kind], timeout=600)
@@ -226,6 +248,7 @@ def export_kernel_images(args, variant):
 def stage_kernel(args, manifest, reuse):
     linux = args.target / "linux"
     rebuilt = True
+    base_commit = KERNEL_COMMIT if args.kernel_ref == KERNEL_TAG else None
     if (reuse and kernel_sentinel(linux) and all(
             (image_dir(args, v) / "bzImage").is_file()
             and (image_dir(args, v) / "bzImage").stat().st_size > 0
@@ -240,9 +263,9 @@ def stage_kernel(args, manifest, reuse):
                 if stale.exists():
                     shutil.rmtree(stale)
         if args.kernel_tarball is not None:
-            import_tarball(args.kernel_tarball, linux, "kernel")
+            import_tarball(args.kernel_tarball, linux, "kernel", args.kernel_ref)
         else:
-            run(["git", "clone", "--branch", KERNEL_TAG, "--depth", "1",
+            run(["git", "clone", "--branch", args.kernel_ref, "--depth", "1",
                  args.kernel_repo, str(linux)], timeout=1800)
             for key, value in (("user.email", "knfsd-fuzz@localhost"),
                                ("user.name", "knfsd-fuzz")):
@@ -252,9 +275,10 @@ def stage_kernel(args, manifest, reuse):
                 ["git", "-C", str(linux), "rev-parse", "HEAD"],
                 capture_output=True, text=True, timeout=60,
                 check=True).stdout.strip()
-            if head != KERNEL_COMMIT:
+            if args.kernel_ref == KERNEL_TAG and head != KERNEL_COMMIT:
                 raise RuntimeError("kernel base %s != %s"
                                    % (head, KERNEL_COMMIT))
+            base_commit = head
         if not args.skip_build:
             if not git_clean(linux):
                 raise RuntimeError("linux tree not clean")
@@ -275,7 +299,8 @@ def stage_kernel(args, manifest, reuse):
             "vmlinux_sha256": sha256(vmlinux) if vmlinux.is_file() else None,
         }
     manifest["kernel"] = {
-        "base": KERNEL_COMMIT,
+        "ref": args.kernel_ref,
+        "base": base_commit,
         "head": subprocess.run(
             ["git", "-C", str(linux), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=60,
@@ -335,6 +360,32 @@ def stage_syzkaller(args, manifest, reuse):
             check=True).stdout.strip(),
     }
     return syz
+
+
+def reusable_image(args, image_out):
+    """The baked image's manifest when it was made from exactly today's inputs, else None.
+
+    The image is booted with -kernel, so a new kernel alone never needs a re-bake;
+    only a change of the base image, lane fixture, service, deps or NFS minor does.
+    """
+    meta_path = image_out.with_suffix(".json")
+    if not (args.update and image_out.is_file() and meta_path.is_file()):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except ValueError:
+        return None
+    inputs = {
+        "base_sha256": sha256(args.base_image),
+        "nfs_minor": args.minor,
+        "lane_script_sha256": sha256(ABRUN / "frozen_phase9_lane.sh"),
+        "boot_fixture_sha256": sha256(ABRUN / "frozen_phase9_boot_fixture.sh"),
+        "service_sha256": sha256(ABRUN / "frozen-phase9-fixture.service"),
+        "deps_tar_sha256": sha256(args.deps_tar),
+    }
+    if any(meta.get(key) != value for key, value in inputs.items()):
+        return None
+    return meta if meta.get("sha256") == sha256(image_out) else None
 
 
 def stage_bake(args, bzimage, image_out):
@@ -517,14 +568,19 @@ def main(argv=None):
         image_out = args.target / "images" / ("bookworm-kcov-fresh-v%s.qcow2"
                                               % args.minor)
         image_out.parent.mkdir(parents=True, exist_ok=True)
-        if image_out.exists():
-            image_out.unlink()
-        # The image is booted with -kernel, so it does not depend on the
-        # sanitizer; bake it once with the first variant's kernel.
-        boot_variant = args.variants[0]
-        manifest["bake"] = stage_bake(args, kernels[boot_variant][0],
-                                      image_out)
-        manifest["bake"]["boot_kernel_variant"] = boot_variant
+        reused = reusable_image(args, image_out)
+        if reused is not None:
+            print("reusing the baked image: its inputs are unchanged", flush=True)
+            manifest["bake"] = {**reused, "reused": True}
+        else:
+            if image_out.exists():
+                image_out.unlink()
+            # The image is booted with -kernel, so it does not depend on the
+            # sanitizer; bake it once with the first variant's kernel.
+            boot_variant = args.variants[0]
+            manifest["bake"] = stage_bake(args, kernels[boot_variant][0],
+                                          image_out)
+            manifest["bake"]["boot_kernel_variant"] = boot_variant
         if args.skip_verify:
             manifest["verify"] = "skipped"
         else:

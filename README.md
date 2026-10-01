@@ -60,12 +60,13 @@ python3 tools/bootstrap-kcov-env.py env \
 | `--minor 1\|2` (required) | NFS minor version |
 | kernel/syzkaller sources (default) | Cloned at pinned refs — kernel `v7.3-rc4` (git.kernel.org), syzkaller `801f09666` (github.com/google/syzkaller) |
 | `--kernel-repo` / `--syz-repo` (optional) | Override clone URLs |
+| `--kernel-ref TAG\|latest` (optional) | Kernel release or rc tag to build; `latest` is the newest tag, rc included. Default: the tag in `bundle/patches/BASE` |
 | `--kernel-tarball` / `--syz-tarball` (optional) | Offline source archives instead of clones |
 | `--variant kasan\|kcsan` (optional, repeatable) | Sanitizer kernels to build and verify; default: both |
 | `--jobs N` (optional) | Parallel build jobs |
 
-- **Behavior**: clone upstream → apply the series (13+17) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the bootable VM image once (`bookworm-kcov-fresh-v1.qcow2`, shared by all variants) → boot every variant and verify lane status
-- **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh-v1.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records all sources, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated.
+- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (13+17) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the bootable VM image once (`bookworm-kcov-fresh-v1.qcow2`, shared by all variants) → boot every variant and verify lane status
+- **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh-v1.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records the kernel ref and resolved commit, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated.
 
 ### 3. Using the result with syz-manager
 
@@ -78,18 +79,30 @@ No runner is provided: point a syz-manager config at the outputs of step 2.
 | `procs` | the fixture's lane count (4) |
 | `experimental.remote_cover` | on/off switch for remote coverage |
 
+### 4. Moving to a newer kernel
+
+```sh
+python3 tools/bump-kernel.py latest          # or a tag, e.g. v7.4-rc1
+python3 tools/bootstrap-kcov-env.py env ... --update
+```
+
+`bump-kernel.py` applies the kernel series to a shallow clone of the tag. If it applies, `bundle/patches/BASE` moves to that tag and the patch files stay as they are. If it conflicts, the clone is left in the middle of `git am`: resolve it with git (edit, `git add`, `git am --continue`), then run `python3 tools/bump-kernel.py --export <clone>` to write the rebased series back and update `BASE`. Resolutions are remembered (git rerere) in `cache/rr-cache-kernel` and replayed on the next release.
+
+Re-running bootstrap with `--update` rebuilds both kernels and syzkaller into the same `env/`, so only the latest kernel images are kept. The baked VM image does not depend on the kernel (it is booted with `-kernel`); it is reused when the base image, lane fixture, service, deps and NFS minor are unchanged, and re-baked otherwise. Every variant is booted and verified again against the new kernel.
+
 ## Command summary
 
 | Stage | Command | Input → Output |
 |---|---|---|
 | Base image | `sudo bash tools/make-base-image.sh --out artifacts` | sudo + debootstrap → `artifacts/bookworm-base.img` + keypair |
 | Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 1` | base · key · deps + upstream → `env/` (per-variant kernel images, binaries, image, manifest) |
+| New kernel | `python3 tools/bump-kernel.py latest` then bootstrap with `--update` | newest release/rc tag → `bundle/patches/BASE` + rebuilt kernel images |
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `tools/` | Bootstrap · base-image generation · patch apply · Ganesha and NFS-proxy builds (usage: `tools/README.md`) |
+| `tools/` | Bootstrap · base-image generation · patch apply · kernel base bump · Ganesha and NFS-proxy builds (usage: `tools/README.md`) |
 | `bundle/` | Inputs — patch series · guest deps · kernel configs · lane fixture · image baker · seed corpus (`bundle/README-HANDOFF.md`) |
 | `report/` | Design notes and the normal-flow corpus audit |
 | `LICENSE` · `THIRD-PARTY-LICENSES.md` | MIT + vendor component attribution |

@@ -26,7 +26,9 @@ TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_ROOT="${KOOV_WORK_ROOT:-$(dirname "$TOOLS")}"
 OUT="${KOOV_ARTIFACTS_DIR:-$WORK_ROOT/artifacts}"
 SYZ_TREE=""
-SYZ_COMMIT="801f0966669a37e048adabf9e5f38ce52825ea82"
+# the syzkaller commit is recorded once, in bundle/patches/BASE
+SYZ_COMMIT="$(sed -n "s/^syzkaller_commit=//p" "${KOOV_BUNDLE:-$WORK_ROOT/bundle/patches}/BASE" | head -1)"
+[ -n "$SYZ_COMMIT" ] || { echo "ERROR: no syzkaller_commit in bundle/patches/BASE" >&2; exit 1; }
 SYZ_REPO="https://github.com/google/syzkaller.git"
 
 while [ $# -gt 0 ]; do

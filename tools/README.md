@@ -13,6 +13,9 @@ python3 tools/bootstrap-kcov-env.py env \
     --base-image artifacts/bookworm-base.img \
     --ssh-key artifacts/bookworm.id_rsa \
     --deps-tar bundle/src/guest-deps.tar.gz --minor 1      # env/images/<variant>/ 생성
+
+python3 tools/bump-kernel.py latest                        # 새 커널 태그(rc 포함)로 시리즈 이월 → BASE 갱신
+python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다시 빌드·검증 (최근 1개만 유지)
 ```
 
 ## 도구 목록
@@ -21,8 +24,9 @@ python3 tools/bootstrap-kcov-env.py env \
 |---|---|
 | `make-base-image.sh` | 사이트 로컬 베이스·키쌍 생성 (create-image.sh -d bookworm; sudo 필요, 산출물은 `SUDO_USER` 소유로 되돌림) |
 | `bootstrap-kcov-env.py` | env 부트스트랩 — `--variant kasan\|kcsan`별 out-of-tree 커널 빌드, syzkaller 빌드, VM 이미지 bake, variant별 부팅 검증 |
-| `fport-apply.sh` | 자체 시리즈 적용 — `fport-apply.sh [--dry-run] [--variant-dir DIR] <kind> <target>` (bootstrap이 호출) |
-| `fport-variant.sh` | rc 변형 기록 — `fport-variant.sh <kind> <target> <new-base> [이름]` |
+| `fport-apply.sh` | 시리즈 적용 — `fport-apply.sh [--dry-run] <kind> <target>` (bootstrap이 호출; BASE와 다른 베이스도 `git am -3`으로 시도) |
+| `bump-kernel.py` | 새 커널 태그로 이월 — `bump-kernel.py <태그\|latest>`; 충돌 시 손으로 해결 후 `--export <클론>` (해결 기록은 `cache/rr-cache-kernel`) |
+| `kernel_base.py` | `bundle/patches/BASE` 읽기·쓰기와 커널 태그 정렬·`latest` 조회 (bootstrap·bump가 공용) |
 | `release-assembly.sh` | (선택) 번들 스냅샷 tar 조립 |
 | `tool-requirements.txt` | 호스트 의존성 목록 |
 | `lane-quote-lint.sh` | `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
@@ -42,7 +46,6 @@ python3 tools/bootstrap-kcov-env.py env \
 | `KOOV_ABRUNNER` | `<root>/bundle/ab-runner` | bake 입력(lane 스크립트·서비스) 위치 |
 | `KOOV_BAKER` | `<root>/bundle/baker` | 이미지 baker 위치 |
 | `KOOV_ARTIFACTS_DIR` | `<root>/artifacts` | `make-base-image.sh` 출력 위치 |
-| `KOOV_PATCH_VARIANTS` | `<root>/tools/patch-variants` | rc 변형 보관 위치 |
 | `KOOV_SYZ_TARGET` | `<root>/env/syzkaller` | `nfs-proxy/build-syzkaller.sh`의 대상 트리 |
 
 Ganesha·프록시 스크립트가 읽는 `KOOV_GANESHA_*`, `KOOV_NFS_PROXY_*`, `KOOV_TMPFS_SIZE`, `KOOV_KNFS_PORT`,
@@ -58,6 +61,8 @@ Ganesha·프록시 스크립트가 읽는 `KOOV_GANESHA_*`, `KOOV_NFS_PROXY_*`, 
   `bundle/patches/kernel-kcsan.config`(KCSAN, KASAN off · `CONFIG_KCSAN=y`) — 두 config는
   bootstrap의 `--variant`가 고르며, 개별 무결성은 git과 bootstrap manifest의
   `kernel.variants.<variant>.config_sha256`가 기록합니다.
+- `bundle/patches/BASE`: 시리즈가 적용되는 것으로 확인된 마지막 베이스(커널 태그·커밋, syzkaller 커밋).
+  bootstrap과 `fport-apply.sh`가 읽고 `bump-kernel.py`가 갱신합니다. syzkaller는 고정합니다.
 - (선택) `bash tools/release-assembly.sh` → 유지보수용 번들 스냅샷 (배포 아님).
 
 ## 경계
