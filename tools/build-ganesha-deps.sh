@@ -7,7 +7,7 @@
 #
 # extracted by the runner into /opt/kcov-nfs/deps, whose usr/sbin, sbin and
 # lib trees are prepended to the guest PATH and LD_LIBRARY_PATH.  The lane
-# fixture (tools/ganesha-lane.sh) then starts ganesha.nfsd and dbus-daemon from
+# fixture (bundle/lane/lane.sh) then starts ganesha.nfsd and dbus-daemon from
 # there.  No guest image is rebuilt and no root is required anywhere.
 #
 # WHY A SEPARATE TARBALL

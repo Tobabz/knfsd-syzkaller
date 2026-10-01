@@ -4,6 +4,9 @@
 > `tools/run-*.sh`와 `phases/*`, 그리고 그 증거 디렉터리는 커밋 `7833ed3`에서 제거되었습니다.
 > 아래의 실행 방법과 경로 설명은 당시 기록이며 현재는 실행할 수 없습니다.
 > 시드는 stock syz-manager로 실행합니다(`README.md` 3절).
+> **현재 구성 (2026-10-02):** NFSv3 시드와 fixture는 제거했습니다. NFSv4 시드 4개와
+> `bundle/lane/lane.sh` 하나를 사용하며, 4.1·4.2는 bake의 `--minor 1|2`로 선택합니다.
+> 아래의 `ab-runner`와 버전별 fixture 경로는 과거 실행 기록입니다.
 
 ## 현재 목표 (2026-09-28 교정)
 
@@ -75,10 +78,11 @@ ownerless 또는 미계측 흐름은 관측된 실행과 계측 공백을 보고
 
 | 의도한 정상 시나리오 | 코퍼스 입력 · 소비 경로 | 확인된 범위 · 남은 공백 |
 | --- | --- | --- |
-| v4.1/TCP 두 클라이언트 파일 작업과 잠금 충돌 | `basic-v41-tcp.prog` · `tools/run-ab.sh` · `tools/ab-lane-fixture.sh` | NF-A2 기능 및 KCOV: OFF/ON PASS. 이 입력에 대한 NF-A1 물리적 handoff는 미관측. |
-| v4.2/TCP 비동기 COPY와 CB_OFFLOAD | `async-copy-v42-tcp.prog` · 코퍼스의 `B05-V1.json`과 `ab-lane-fixture-v42.sh`; 동일 입력의 R2 witness | NF-A2·NF-C1·COPY 완료 NF-D1의 B05 페어 실행, NF-A1의 R2 ON handoff 관측 및 remote-KCOV 수집. 콜백 worker의 on-only PC 부재는 미실행 증거가 아님. |
+| v4.1/TCP 두 클라이언트 파일 작업과 잠금 충돌 | `basic-v41-tcp.prog` · 현재 `bundle/lane/lane.sh` | 현재 KASAN v4.1 이미지에서 34개 호출 통과, raw `.extra`에 1,581개 `fs/nfsd` 위치. NF-A1 요청별 handoff는 미관측. |
+| 같은 파일 작업을 Ganesha에서 실행 | `basic-v41-ganesha-tcp.prog` · 현재 `bundle/lane/lane.sh` | 별도 KASAN v4.1 snapshot에서 34개 호출 통과. 클라이언트 커널 로컬 coverage는 있으나 Ganesha 사용자 공간 coverage는 없음. |
+| v4.2/TCP 비동기 COPY와 CB_OFFLOAD | `async-copy-v42-tcp.prog` · 현재 `bundle/lane/lane.sh`; 과거 R2 witness | 현재 KASAN v4.2 이미지에서 11개 호출과 32 MiB COPY 반환 통과, `.extra` 수집. 콜백 완료와 NF-A1 handoff는 과거 페어 실행 증거이며 현재 이미지에서 다시 추적하지 않음. |
 | v4.1/TCP delegation grant → 충돌 → CB_RECALL | `delegation-recall-v41-tcp.prog` · B06 observer와 `tools/ab-lane-fixture.sh` | r3 페어 실행에서 NF-D3 recall, NF-D1 콜백, NF-D2 `svc_process_bc` 진입 관측. ON remote-KCOV는 있으나 그 executor PC는 없음. 초기 NF-D2 ingress와 DELEGRETURN 별도 trace는 없음. |
-| v3/TCP fixture 파일의 단순 읽기 | `basic-read-v3-tcp.prog` · 외부 dirty Wave3 B04 fixture | 파서만 PASS. fixture가 workload 전에 실패해 NF-A1/NF-A2 기능·handoff·KCOV 미검증; NF-B1 재방문 입력이 아님. |
+| v3/TCP fixture 파일의 단순 읽기 | 현재 코퍼스에서 제거 | NFSv3 fixture가 프록시 환경에서 시작하지 못해 현재 범위에서 제외. |
 
 NF-B1·NF-B2·NF-E1–E5 및 미지원 버전/전송은 현재 코퍼스의 실행 시나리오로
 계산하지 않는다. 시나리오별 실행 조건, 실패 경계와 KCOV 상태는 코퍼스

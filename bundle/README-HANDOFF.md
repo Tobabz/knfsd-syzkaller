@@ -3,8 +3,8 @@
 Upstream sources (Linux kernel `v7.3-rc4`, syzkaller `801f09666`) are
 **cloned by the bootstrap at the refs recorded in `bundle/patches/BASE`** (the kernel tag can be overridden with `--kernel-ref`, `latest` included), so a first fresh
 environment build requires network access to `git.kernel.org` and
-`github.com`. Everything else (patches, fixtures, guest deps) ships in
-this repository; the **base image and keypair are generated per site**
+`github.com`. Patches, fixtures and the base nfs-utils deps ship in
+this repository; Ganesha and relay deps are built locally. The **base image and keypair are generated per site**
 (`tools/make-base-image.sh`) — no release assets are distributed
 (2026-09-26 asset-free model). The bundle is **independent**: it no
 longer mirrors the handoff repo's internal layout (`repo/` tree removed
@@ -24,9 +24,9 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 | `patches/BASE` | last base the series applies to (kernel tag + commit, syzkaller commit); updated by `tools/bump-kernel.py` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
 | `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); built by `bootstrap-kcov-env.py --variant kcsan` | — |
-| `ab-runner/` | Lane fixture inputs baked into the image (`frozen_phase9_lane.sh`, `frozen_phase9_boot_fixture.sh`, `frozen-phase9-fixture.service`) | — |
+| `lane/` | Lane fixture inputs baked into the image (`lane.sh`, `boot-fixture.sh`, `fixture.service`) | — |
 | `baker/` | protocol image baking (`bake_nfs_protocol_image.py`) | — |
-| `corpus/` | seed corpus (`nfs-normal/`: `.prog` seeds, manifest, lane fixtures for NFS v3 and v4.2) | — |
+| `corpus/` | seed corpus (`nfs-normal/`: `.prog` seeds, manifest, NFS v4.1 and v4.2 seeds) | — |
 
 
 
@@ -36,7 +36,7 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
   (sha256 `42f2789ce0dd8c2591239da100b5c08b7ae369fccb1e4e544ce65a284b438c0d`)
   was **deleted 2026-09-25** during the bundle independence restructure; its
   hash is kept here for audit. Its useful contents survived as the flat
-  `patches/` + `ab-runner/` (+`baker/`, `corpus/`) above.
+  `patches/` + `lane/` (+`baker/`, `corpus/`) above.
 - `patches/*/series` records apply order; no SHA256 verification is performed
   re-verifies them on every pipeline run.
 
@@ -78,7 +78,7 @@ the same `--ssh-key`.
 
 ## Licenses and the guest key
 
-- `tools/`, `bundle/` (`ab-runner/`, `baker/`, `corpus/`), and the `report/`
+- `tools/`, `bundle/` (`lane/`, `baker/`, `corpus/`), and the `report/`
   documents are new work,
   distributed under the **MIT License** (see `LICENSE` at the repository
   root; provenance in `THIRD-PARTY-LICENSES.md`).
@@ -100,10 +100,15 @@ gcc, kernel build deps (`flex bison libssl-dev libelf-dev`), ~30 GB
 free, Python 3, **passwordless sudo** (needed once for base generation;
 the rest of the flow runs unprivileged).
 
-Generate the site base + keypair, then verify the committed manifest:
+Generate the site base + keypair and assemble the complete lane deps (Docker is needed for the relay build):
 
 ```sh
 sudo bash tools/make-base-image.sh --out artifacts
+tools/build-ganesha-deps.sh
+tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-lane
+python3 tools/assemble-guest-deps.py \
+  --ganesha-deps bundle/src/guest-deps-ganesha.tar.gz \
+  --proxy bundle/src/nfs-proxy-lane --out bundle/src/guest-deps-lane.tar.gz
 ```
 
 ```sh
@@ -113,7 +118,7 @@ sudo bash tools/make-base-image.sh --out artifacts
 python3 tools/bootstrap-kcov-env.py /work/env \
   --base-image artifacts/bookworm-base.img \
   --ssh-key artifacts/bookworm.id_rsa \
-  --deps-tar bundle/src/guest-deps.tar.gz \
+  --deps-tar bundle/src/guest-deps-lane.tar.gz \
   --minor 1
 ```
 

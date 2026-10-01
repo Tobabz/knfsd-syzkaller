@@ -9,6 +9,22 @@ R = Path("/home/idealinsane/projects/knfsd-syzkaller")
 I = Path.home() / "prune-evidence/inputs"
 I.mkdir(parents=True, exist_ok=True)
 
+PRELUDE = """action=${1:-}
+case "$action" in
+    setup)
+        systemctl stop frozen-phase9-fixture.service >/dev/null 2>&1 || \\
+            NFS_MINOR_VERSION=${NFS_MINOR_VERSION:-1} \\
+                /opt/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.manager >/dev/null 2>&1 || true
+        ;;
+esac
+"""
+
+
+def per_run(lane_text, env=""):
+    """A per-run fixture: retire the baked boot fixture first, then run lane.sh with env set."""
+    first, rest = lane_text.split("\n", 1)
+    return first + "\n" + env + PRELUDE + rest
+
 
 def show(rev, path):
     return subprocess.run(["git", "-C", str(R), "show", "%s:%s" % (rev, path)],
@@ -17,10 +33,9 @@ def show(rev, path):
 
 (I / "run_frozen_phase1_vm.py").write_bytes(
     show("ab353b0", "bundle/ab-runner/phases/run_frozen_phase1_vm.py"))
-lane = show("HEAD", "tools/ganesha-lane.sh").decode()
-(I / "lane-direct.sh").write_text(lane)
-first, rest = lane.split("\n", 1)
-(I / "lane-proxy.sh").write_text(first + "\nSERVER_IMPL=both; export SERVER_IMPL\n" + rest)
+lane = (R / "bundle/lane/lane.sh").read_text()
+(I / "lane-direct.sh").write_text(per_run(lane, "SERVER_IMPL=knfsd; export SERVER_IMPL\n"))
+(I / "lane-proxy.sh").write_text(per_run(lane))
 for f in ("lane-direct.sh", "lane-proxy.sh"):
     os.chmod(I / f, 0o755)
 wl = show("ab353b0", "tools/nfs_remote_kcov_ganesha_v41_workload.prog").decode()
@@ -29,9 +44,9 @@ for c in ("client0", "client1"):
     wl = wl.replace("nfs-lane/%s\\x00" % c, "nfs-lane/%s-knfsd\\x00" % c)
 (I / "workload-proxy.prog").write_text(wl)
 for src, dst in (("tools/nfs-proxy/test/guest-syzkaller-four.prog", "workload-raw.prog"),
-                 ("bundle/corpus/nfs-normal/async-copy-v42-tcp.prog", "workload-copy.prog"),
-                 ("bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh", "lane-v42.sh")):
-    (I / dst).write_bytes(show("HEAD", src))
+                 ("bundle/corpus/nfs-normal/async-copy-v42-tcp.prog", "workload-copy.prog")):
+    (I / dst).write_bytes((R / src).read_bytes())
+(I / "lane-v42.sh").write_text(per_run(lane, "NFS_MINOR_VERSION=2; export NFS_MINOR_VERSION\n"))
 os.chmod(I / "lane-v42.sh", 0o755)
 # NFSP_PROXY: a proxy built with build-guest.sh --out, for testing a rebuilt proxy.
 proxy = Path(os.environ.get("NFSP_PROXY", R / "bundle/src/nfs-proxy-control-guest")).read_bytes()

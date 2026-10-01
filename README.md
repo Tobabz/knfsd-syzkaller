@@ -16,9 +16,28 @@ comes up and that the kernel carries the expected memory sanitizer.
 | Instrumentation | KCOV + KASAN/KCSAN boot kernels, built **out of tree** from one patched source tree |
 | Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path. Ownership is lane-scoped (kernel 0002): every request that reaches lane N's server counts for the program proc N is running, so attribution survives the NFS wire relay |
 | Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the baked fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count |
-| NFS version | `--minor 1\|2` selects the NFS minor version baked into the image (recorded in the manifest) |
+| NFS version | `--minor 1\|2` selects the knfsd mount version baked into the image (recorded in the manifest); Ganesha mounts use v4.1 |
 | Boot model | Kernel is injected **outside the image** (`-kernel`), so one baked image serves both sanitizer kernels |
 | Seeds | `bundle/corpus/nfs-normal/` — normal-flow syzkaller programs plus a manifest; run them with a stock syz-manager (remote coverage is the `experimental.remote_cover` setting) |
+
+The image uses `bundle/lane/lane.sh` for both NFS minor versions. Its default `SERVER_IMPL=both`
+routes both clients through the relay; `nfs-lane/client0` and `client1` select the same knfsd
+export. Explicit `client{0,1}-ganesha` paths select the separate Ganesha export.
+In a `--minor 2` image, knfsd mounts use v4.2 and Ganesha mounts remain v4.1. The
+current Ganesha v4.2 mount negotiates successfully, but reads of existing files
+and files written by another client return zero-filled data both directly and through the relay.
+The client issues `READ_PLUS`; Debian Ganesha 4.3-2 omits the `read_arg->info` pointer,
+so FSAL_VFS treats it as a normal read while the `READ_PLUS` reply uses empty metadata.
+Keep Ganesha on v4.1 until a corrected build passes guest validation.
+
+The current `env/manifest.json` records the v4.1 image and both KASAN/KCSAN boot checks.
+A separate v4.2 image, `env/images/bookworm-kcov-fresh-v2.qcow2`, was baked from
+the same lane input and records its hashes in the adjacent `.json` file. One
+KASAN snapshot run of the 11-call COPY seed returned 32 MiB and collected a
+nonempty remote `.extra`; the v4.1 knfsd and Ganesha seeds each passed 34 calls
+in separate KASAN snapshots. The two basic seeds also passed syz-manager
+`corpus-triage` admission. See `bundle/corpus/nfs-normal/README.md` for limits
+and evidence paths.
 
 The corpus objective is to cover thread-execution flows reachable through normal NFS scenarios; see
 [scope and completion criteria](report/normal-flow-corpus.md).
@@ -44,13 +63,27 @@ sudo bash tools/make-base-image.sh --out artifacts
 - **Input**: host root (sudo) + debootstrap + network (runs `create-image.sh -d bookworm` from the pinned syzkaller tree)
 - **Output**: `artifacts/bookworm-base.img` (2 GiB raw ext4, kernel not included) and `artifacts/bookworm.id_rsa[.pub]` (SSH keypair, `.id_rsa` mode 0600; handed back to the invoking user when run through `sudo`, because bootstrap must be able to read the key)
 
+### 1b. Build the lane deps (Ganesha + relay)
+
+The lane fixture starts knfsd, NFS-Ganesha and the wire relay (`nfs-proxy`) in every lane, and every
+client reaches the servers through the relay. The deps tarball therefore carries all three. Needs Docker and
+network access; the outputs are local (`bundle/src/*` is gitignored except `guest-deps.tar.gz`).
+
+```sh
+tools/build-ganesha-deps.sh                                   # bundle/src/guest-deps-ganesha.tar.gz
+tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-lane
+python3 tools/assemble-guest-deps.py \
+  --ganesha-deps bundle/src/guest-deps-ganesha.tar.gz \
+  --proxy bundle/src/nfs-proxy-lane --out bundle/src/guest-deps-lane.tar.gz
+```
+
 ### 2. Provision the fuzzing environment (build + bake)
 
 ```sh
 python3 tools/bootstrap-kcov-env.py env \
   --base-image artifacts/bookworm-base.img \
   --ssh-key artifacts/bookworm.id_rsa \
-  --deps-tar bundle/src/guest-deps.tar.gz \
+  --deps-tar bundle/src/guest-deps-lane.tar.gz \
   --minor 1
 ```
 

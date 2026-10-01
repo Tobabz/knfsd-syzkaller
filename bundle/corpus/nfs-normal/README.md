@@ -18,26 +18,55 @@ repository root. The kernel/image environment is `env/` (`env/images/<variant>/{
 Guest setup comes from the baked image: `frozen-phase9-fixture.service` runs
 `lane.sh setup /tmp/frozen-phase9.manager 4` at boot, with the NFS minor version chosen by
 `bootstrap --minor N`. Run syz-manager with `procs` equal to that lane count (4).
+The default fixture routes every mount through the relay. `nfs-lane/client0` and
+`nfs-lane/client1` remain two clients of the same knfsd export; Ganesha uses the
+explicit `client0-ganesha` and `client1-ganesha` paths. The corpus contains four
+NFSv4 inputs; NFSv3 is outside the current scope. The basic knfsd and Ganesha inputs each have one current KASAN v4.1 snapshot run.
+The COPY input has one current KASAN v4.2 snapshot run; detailed callback and
+handoff records refer to earlier fixtures.
 
 Parser success only proves that the pinned syzkaller parser can deserialize an
 input. It does not prove mount setup, an NFS reply, a background transition,
-KCOV collection, cleanup, or functional success. No kernel, image, fixture,
-descriptor, or runner source was changed while assembling this directory. VMs
-were run separately for runtime evidence; results are cited per input below.
+KCOV collection, cleanup, or functional success. The lane fixture changed after
+the historical VM runs; the basic seed has been restored to its original 34 calls.
+The current basic runs verify 34 call results on the updated v4.1 image. The
+knfsd raw `.extra` contains 77,314 PC records, including 1,581 distinct
+`fs/nfsd` source locations. Ganesha produced local client-kernel coverage
+files, but no `.extra` or Ganesha user-space coverage. These runs do not
+establish repeatability or a server-side RPC handoff trace.
+
+## Execution scope (2026-10-02)
+
+Run one backend at a time, keeping both clients of each scenario on that backend.
+The knfsd input uses the default client pair; `basic-v41-ganesha-tcp.prog`
+uses the explicit Ganesha client pair. The two 34-call inputs were executed one
+after the other in separate KASAN v4.1 VM snapshots. The shared scenario has
+no automatic paired replay or paired mutation rule. The four-mount guest check
+passed on both current v4.1 and v4.2 images, including the default aliases
+and backend isolation (`cache/four-mount-check-20261002/result.json`).
+
+The combined 34+34-call draft was withdrawn: the pinned manager rejects programs
+with more than 40 calls. Both separate 34-call inputs were packed into an isolated
+`corpus.db`; syz-manager admitted both records and completed `corpus-triage`
+with `procs=4` (exit 0). The manager may minimize inputs during fuzzing, so this admission
+does not guarantee that an unmodified 34-call oracle remains in the output corpus.
+Evidence: `cache/manager-corpus-v41-20261002/result.json` and `manager.log`.
+Proxy-managed backend selection is deferred; the existing fixed relay paths
+remain in place. See the [design decision](../../../docs/design/01-overview/01-overview.md#backend-execution-decision).
 
 ## Intended scenarios -> corpus contract
 
-Each intended scenario has one `.prog` in this directory. The baked image's fixture sets the
+Each intended scenario/backend pair has one `.prog` in this directory. The baked image's fixture sets the
 NFS version and mount topology; a parser PASS alone does not execute it.
 `NF-*` identifies targeted source flows, not proof that every transition or
 its KCOV was observed.
 
 | Intended scenario | Corpus input | Target flow and observed limit |
 | --- | --- | --- |
-| Two-client v4.1/TCP file operations and lock conflict | `basic-v41-tcp.prog` | Fresh paired v4.1/TCP VM functional and KCOV PASS for NF-A2; NF-A1 socket-to-nfsd transport handoff was not directly traced in this run. |
-| v4.2/TCP asynchronous 32 MiB COPY and CB_OFFLOAD | `async-copy-v42-tcp.prog` | Fresh corpus-local B05 paired v4.2/TCP VM PASS for async COPY and callback; separate NF-A1 R2 ON VM confirms a direct socket-to-nfsd handoff on the same input. Strict parser mode still rejects legacy line-7 offset strings. |
+| Two-client v4.1/TCP file operations and lock conflict | `basic-v41-tcp.prog` | Current KASAN v4.1 image passed all 34 calls; raw `.extra` contains 1,581 distinct `fs/nfsd` locations. Earlier fixture has separate historical evidence. |
+| Same v4.1/TCP file operations against Ganesha | `basic-v41-ganesha-tcp.prog` | One separate KASAN v4.1 snapshot run passed the 34-call errno oracle. No knfsd NF-A1/A2 or Ganesha internal-coverage claim. |
+| v4.2/TCP asynchronous 32 MiB COPY and CB_OFFLOAD | `async-copy-v42-tcp.prog` | Current KASAN v4.2 image passed one 11-call snapshot run with a 32 MiB copy return and nonempty `.extra`; callback and NF-A1 handoff evidence remain historical. Strict parser mode rejects legacy line-7 offset strings. |
 | Two-client v4.1/TCP delegation grant, conflict and CB_RECALL | `delegation-recall-v41-tcp.prog` | Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced. |
-| v3/TCP simple fixture-file read | `basic-read-v3-tcp.prog` | UNRESOLVED. Parser-only; never executed. See the v3 item under Adversarial boundary. |
 
 NF-B1, NF-B2 and NF-E1 through NF-E5 have no matching normal `.prog` and
 event-armed fixture; the exclusions and unsupported transports are enumerated
@@ -56,7 +85,8 @@ brackets softirq `svc_data_ready` through `svc_xprt_enqueue` and the nfsd
 merged into a managed generation.
 
 The standalone guest observer (`nfa1-kcov-observer.c`) and the adapter that measured stage presence
-were removed in commit `7833ed3`; the kernel patch stays in the series.
+were removed in commit `7833ed3`. This section records the earlier patch series;
+the current series is listed in `bundle/patches/kernel/series`.
 
 The last recorded paired V2 run (its evidence directory has since been removed) passed:
 OFF collected 16,053 observer PCs across the three transport stages and
@@ -76,26 +106,29 @@ therefore do not prove nonexecution.
 
 | Input | NF flow | Version / transport | Fixture and guest setup | Functional expected result | Current status |
 | --- | --- | --- | --- | --- | --- |
-| `basic-v41-tcp.prog` | NF-A1, NF-A2 | 4.1 / TCP | `bundle/ab-runner/frozen_phase9_lane.sh` — baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | All 34 calls finish on each execution; call 14 is the deliberate peer-lock conflict and returns errno 11, every other call returns errno 0, local KCOV is positive, and create/write/read/rename/unlink effects succeed across both mounts. | Fresh paired v4.1/TCP VM functional and KCOV PASS for NF-A2; NF-A1 socket-to-nfsd transport handoff was not directly traced in this run. |
-| `async-copy-v42-tcp.prog` | NF-A1, NF-A2, NF-C1, NF-D1 | 4.2 / TCP | `bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh` — baked image (bootstrap --minor 2): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | copy_file_range returns 33554432, async execution reaches nfsd4_do_async_copy, CB_OFFLOAD completes with status 0, and destination fsync and closes finish. | Fresh corpus-local B05 paired v4.2/TCP VM PASS for async COPY and callback; separate NF-A1 R2 ON VM confirms a direct socket-to-nfsd handoff on the same input. Strict parser mode still rejects legacy line-7 offset strings. |
-| `delegation-recall-v41-tcp.prog` | NF-A1, NF-A2, NF-D3, NF-D1, NF-D2 | 4.1 / TCP | `bundle/ab-runner/frozen_phase9_lane.sh` — baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | First prove delegation grant; then the client1 conflict must produce ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and delegation return/close. File effects alone do not pass. | Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced. |
-| `basic-read-v3-tcp.prog` | NF-A1, NF-A2 | 3 / TCP forechannel and TCP mount protocol | Vendored fixture `bundle/corpus/nfs-normal/ab-lane-fixture-v3.sh` (SHA-256 93edf872c6173aede8a30abede8f983470123309337bb7f5fc81d42146a4a7ab); not supported by the baked lane script, never completed setup | Open nfs-lane/client0/shared/fixture, read the 30-byte fixture content into a 128-byte buffer, return 30 bytes, and close successfully. This normal input does not by itself prove NF-B1 defer/revisit. | UNRESOLVED. Parser-only; never executed. See the v3 item under Adversarial boundary. |
+| `basic-v41-tcp.prog` | NF-A1, NF-A2 | 4.1 / TCP | `bundle/lane/lane.sh` — baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | All 34 calls finish on each execution; call 14 is the deliberate peer-lock conflict and returns errno 11, every other call returns errno 0, local KCOV is positive, and create/write/read/rename/unlink effects succeed across both mounts. | Current KASAN v4.1 image passed all 34 calls; raw `.extra` contains 77,314 records and 1,581 distinct `fs/nfsd` locations. |
+| `basic-v41-ganesha-tcp.prog` | — (Ganesha user-space server) | 4.1 / TCP | `bundle/lane/lane.sh` — same four-lane v4.1 image, explicit Ganesha client paths | All 34 calls finish; call 14 returns errno 11 and other calls return errno 0; local kernel client KCOV is present. | One 2026-10-02 KASAN v4.1 snapshot run passed the errno oracle; no Ganesha internal coverage or RPC handoff trace. |
+| `async-copy-v42-tcp.prog` | NF-A1, NF-A2, NF-C1, NF-D1 | 4.2 / TCP | `bundle/lane/lane.sh` — baked image (standalone baker --minor 2): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | copy_file_range returns 33554432, async execution reaches nfsd4_do_async_copy, CB_OFFLOAD completes with status 0, and destination fsync and closes finish. | Current KASAN v4.2 image passed 11 calls and returned 32 MiB from copy_file_range with nonempty `.extra`; callback and handoff evidence remain historical. Strict parser mode rejects legacy line-7 offset strings. |
+| `delegation-recall-v41-tcp.prog` | NF-A1, NF-A2, NF-D3, NF-D1, NF-D2 | 4.1 / TCP | `bundle/lane/lane.sh` — baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | First prove delegation grant; then the client1 conflict must produce ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and delegation return/close. File effects alone do not pass. | Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced. |
 
 The fixtures are disposable-VM-only; they run inside the baked guest, never on the host.
 
 ## Parser contract
 
-The required parser is
-`env/syzkaller/bin/syz-prog2c`, SHA256
-`ae5e6c3b2c31d340265088e28835103dedbb8441b7b874f281353604e59ac533`,
-from checkout `8c1901085e70fcfd88acdcc934410c79fbf27e1b`. Each file is checked with:
+The parser is `env/syzkaller/bin/syz-prog2c`; its binary SHA256 and source
+checkout are recorded in `manifest.json`. Each file is checked with:
 
 ```
 env/syzkaller/bin/syz-prog2c -os linux -arch amd64 -prog ABSOLUTE_INPUT_PATH
 ```
 
 Generated C byte counts and hashes, and the exact nonfatal formatter stderr,
-are stored in `manifest.json`. B05 remains byte-identical to its historical
+are stored in `manifest.json`. The 2026-10-02 run evidence is under
+`cache/backend-current-v41-20261002/{knfsd,ganesha}` and
+`cache/backend-current-v42-20261002/copy`. The v4.1 runs used
+`env/images/bookworm-kcov-fresh-v1.qcow2` and the v4.2 run used
+`env/images/bookworm-kcov-fresh-v2.qcow2`, each through a QEMU snapshot with
+one syz-execprog execution and `-threaded=false`. B05 remains byte-identical to its historical
 input. Its default-mode acceptance is the compatibility contract; strict mode
 rejects the legacy offset strings and is intentionally not made green by an
 untested behavioral rewrite.
@@ -108,7 +141,7 @@ untested behavioral rewrite.
 | NF-B2 cache cleaner; NF-E1 laundromat; NF-E2 reaper; NF-E3 filecache GC; NF-E3b disposal; NF-E4 nfsdcld; NF-E5 pNFS | There is no concrete event-armed fixture plus functional oracle. A syscall that merely waits or creates incidental state would fake coverage. |
 | NF-D2 full boundary, NF-D3 DELEGRETURN | B06 r3 OFF+ON paired PASS confirms NF-D2 svc_process_bc dispatch (svc_process_bc_entry x20, record_backchannel delta=20) and NF-D3 delegation recall chain (delegation_grant_observed, complete_recall_chain_observed, matched_recalls=2), independently confirmed by gate st_01a0e689. ON remote KCOV has 294,223 PCs; svc_process_bc absent but execution proved by trace. The full xprtiod->backchannel queue physical boundary remains a gap because the trace captures svc_process_bc_entry but not xs_stream_data_receive_workfn or xprt_complete_bc_request individually. DELEGRETURN is not separately traced. |
 | NFSv2 | Disabled in the pinned build. |
-| UDP | Fixtures are TCP-only; no source-backed UDP NFSv3 execution contract exists. |
+| UDP | Fixtures are TCP-only. |
 | RPC-over-RDMA | No device or provisioned fixture exists. |
 | LOCALIO | Compiled but disabled; no input or fixture exists. |
 | NAT | Direct-veth operation does not establish address-rewritten pairing. |
@@ -123,17 +156,12 @@ owner-window runner changes the experiment. Wave3 B12 is excluded because its
 
 ## Adversarial boundary
 
-- Known unresolved (v3): `ab-lane-fixture-v3.sh` does not complete setup. NFSv3 and lockd fail to
-  register with rpcbind (kernel `errno 107` in Wave3 attempts r4-r10), so the fixture's final
-  `rpcinfo ... 100003 3` check fails. Root cause is not established; the private-`/run` rpcbind
-  hypothesis is unverified. The vendored file is the Wave3 r11 fixture with its tracefs hist-trigger
-  diagnostics removed (SHA-256 93edf872c6173aede8a30abede8f983470123309337bb7f5fc81d42146a4a7ab). It is unrun in this tree. v3 stays out of the
-  runnable corpus until a VM run passes fixture setup and the workload.
-- Stale external Wave3 assets: B04 program bytes and its v3 fixture are now copied by value and hashed, but
-  the fixture is not called runnable. B06 uses the verified Wave1
-  fixture and has r3 paired PASS, independently confirmed by gate st_01a0e689.
-- Selective integration: Wave3 remains provenance-only and unchanged. The copied
-  artifacts now live under this directory in dirty main; their source bytes remain fingerprinted in the Wave1 gate.
+- Out of scope (v3): the NFSv3 seed and its fixture were removed. The lane carries every NFS
+  connection through the relay, which handles NFSv4 only, and the v3 fixture never completed setup
+  (rpcbind registration failed with `errno 107`; the root cause was not established).
+- Historical Wave3 assets: B04 and its v3 fixture are no longer shipped. B06's
+  recorded r3 paired PASS used the earlier Wave1 fixture and was independently
+  confirmed by gate st_01a0e689; it is provenance, not a new-image validation.
 - Misleading parser success and malformed programs: every included file must
   exit 0 under the pinned non-dry-run command, but that result is syntax only.
 - Cleanup: runtime VM attempts used the runner's strict fixture cleanup and

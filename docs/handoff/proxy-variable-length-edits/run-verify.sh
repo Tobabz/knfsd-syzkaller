@@ -29,8 +29,7 @@ for arm in "$@"; do
     direct) fix=$inputs/lane-direct.sh; w=$inputs/workload-direct.prog ;;
     proxy)  fix=$inputs/lane-proxy.sh;  w=$inputs/workload-proxy.prog ;;
     raw)    fix=$inputs/lane-proxy.sh;  w=${WORKLOAD:-$inputs/workload-raw.prog} ;;
-    copy)   fix=$inputs/lane-v42.sh;    w=$inputs/workload-copy.prog
-            deps=$repo/bundle/src/guest-deps.tar.gz ;;
+    copy)   fix=$inputs/lane-v42.sh;    w=$inputs/workload-copy.prog ;;
     *) echo "unknown arm $arm" >&2; continue ;;
   esac
   rm -rf "${out:?}/$arm"

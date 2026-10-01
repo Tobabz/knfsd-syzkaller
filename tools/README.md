@@ -12,7 +12,7 @@ sudo bash tools/make-base-image.sh --out artifacts         # 사이트별 베이
 python3 tools/bootstrap-kcov-env.py env \
     --base-image artifacts/bookworm-base.img \
     --ssh-key artifacts/bookworm.id_rsa \
-    --deps-tar bundle/src/guest-deps.tar.gz --minor 1      # env/images/<variant>/ 생성
+    --deps-tar bundle/src/guest-deps-lane.tar.gz --minor 1  # env/images/<variant>/ 생성
 
 python3 tools/bump-kernel.py latest                        # 새 커널 태그(rc 포함)로 시리즈 이월 → BASE 갱신
 python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다시 빌드·검증 (최근 1개만 유지)
@@ -29,8 +29,8 @@ python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다�
 | `kernel_base.py` | `bundle/patches/BASE` 읽기·쓰기와 커널 태그 정렬·`latest` 조회 (bootstrap·bump가 공용) |
 | `release-assembly.sh` | (선택) 번들 스냅샷 tar 조립 |
 | `tool-requirements.txt` | 호스트 의존성 목록 |
-| `lane-quote-lint.sh` | `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
-| `ganesha-lane.sh` | NFS-Ganesha 레인 fixture (knfsd/both/ganesha 3모드, 별도 tmpfs·별도 export) |
+| `lane-quote-lint.sh` | `bundle/lane/lane.sh`의 `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
+| `assemble-guest-deps.py` | Ganesha deps에 프록시 바이너리를 넣어 `guest-deps-lane.tar.gz` 생성 — bootstrap의 `--deps-tar` |
 | `build-ganesha-deps.sh` | `guest-deps-ganesha.tar.gz` 생성 — root 불필요, `.deb`→의존성 closure→주입 트리 |
 | `build-ganesha-asan.sh`·`ganesha-asan-container.sh` | bookworm 4.3-2 소스·패치로 Ganesha 실행 파일/코어/VFS를 GCC ASan으로 빌드하고 별도 deps tar 생성 (Docker 사용) |
 | `nfs-proxy/` | NFS 프록시 소스·테스트와 빌드 스크립트 (`build.sh`, `build-guest.sh`, `build-syzkaller.sh`, `guest-build.sh`) |
@@ -43,7 +43,7 @@ python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다�
 |---|---|---|
 | `KOOV_WORK_ROOT` | 스크립트 위치의 부모 | 작업 루트(파생 경로 기준) |
 | `KOOV_BUNDLE` | `<root>/bundle/patches` | 패치 시리즈 위치 |
-| `KOOV_ABRUNNER` | `<root>/bundle/ab-runner` | bake 입력(lane 스크립트·서비스) 위치 |
+| `KOOV_LANE` | `<root>/bundle/lane` | bake 입력(lane 스크립트·부팅 래퍼·서비스) 위치 |
 | `KOOV_BAKER` | `<root>/bundle/baker` | 이미지 baker 위치 |
 | `KOOV_ARTIFACTS_DIR` | `<root>/artifacts` | `make-base-image.sh` 출력 위치 |
 | `KOOV_SYZ_TARGET` | `<root>/env/syzkaller` | `nfs-proxy/build-syzkaller.sh`의 대상 트리 |
@@ -93,10 +93,36 @@ syzkaller 재사용을 도입할지는 `kernel-release` 실행에서 `syzkaller_
   bootstrap과 `fport-apply.sh`가 읽고 `bump-kernel.py`가 갱신합니다. syzkaller는 고정합니다.
 - (선택) `bash tools/release-assembly.sh` → 유지보수용 번들 스냅샷 (배포 아님).
 
+## lane 스크립트 하나
+
+lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 복사하지 않고 환경 변수로 고릅니다.
+
+| 변수 | 기본값 | 누가 정하는가 |
+|---|---|---|
+| `NFS_MINOR_VERSION` | `1` | bake가 서비스 drop-in에 씁니다 (`--minor 1\|2`). knfsd 마운트에 적용되며 Ganesha는 v4.1을 사용합니다 |
+| `SERVER_IMPL` | `both` | `both`는 lane마다 knfsd와 Ganesha를 프록시 뒤에 둡니다. `knfsd`·`ganesha`는 프록시를 거치지 않는 진단용입니다 |
+| `KOOV_TMPFS_SIZE` | `256m` | lane마다 tmpfs 상한 |
+
+`both`가 기본이라 이미지의 deps에 `ganesha.nfsd`와 `nfs-proxy`가 없으면 bootstrap이 시작 전에 거부합니다.
+부팅 래퍼(`boot-fixture.sh`)와 서비스(`fixture.service`)도 같은 디렉터리에 있습니다. 이미지 안의 경로
+(`/opt/frozen-phase9/lane.sh`)는 그대로입니다.
+
+기존 시드의 `nfs-lane/client0`·`client1`은 같은 knfsd export를 보는 두 클라이언트입니다.
+`both`에서도 이 의미를 유지하며, Ganesha는 `client0-ganesha`·`client1-ganesha`로 선택합니다.
+4.2 이미지에서 Ganesha 직접·프록시 경로 모두 v4.2 마운트는 되지만 기존 파일과 다른
+클라이언트가 쓴 파일을 0으로 읽었습니다. 클라이언트의 `READ_PLUS` 요청에서 Debian
+Ganesha 4.3-2가 `read_arg->info`를 설정하지 않아 FSAL_VFS는 일반 READ로 처리하고,
+Ganesha는 비어 있는 `READ_PLUS` 결과를 인코딩합니다. 상위 프로젝트도 [같은 결함과
+수정안](https://lists.nfs-ganesha.org/archives/list/devel@lists.nfs-ganesha.org/thread/T7RTAUMQCT4UJP5B3PDD5SNCYFSDA7NS/)을 기록했습니다.
+수정된 빌드의 게스트 검증 전까지 Ganesha 마운트는 두 클라이언트 모두 v4.1로 고정합니다.
+knfsd는 요청한 minor 버전을 사용합니다.
+호스트 입력 검사는 `python3 tools/test-lane-inputs.py`, 셸 검사는 `sh tools/lane-quote-lint.sh`로 실행합니다.
+게스트의 두 백엔드와 기본 별칭은 `tools/nfs-proxy/test/guest-four-mounts.sh`로 확인합니다.
+
 ## 경계
 
 - **번들 독립 구조** (2026-09-25): `bundle/` = `src/`(원천) · `patches/`(독립 시리즈) ·
-  `ab-runner/`(bake 입력 lane 스크립트·서비스) · `baker/`(프로비저닝) · `corpus/`(시드 코퍼스).
+  `lane/`(bake 입력: lane 스크립트 하나·부팅 래퍼·서비스) · `baker/`(프로비저닝) · `corpus/`(시드 코퍼스).
 - **파이프라인 스코프**: `fport-apply.sh`의 `--kind`는 `kernel|syzkaller`만.
 
 ## 문서 맵
@@ -108,7 +134,7 @@ syzkaller 재사용을 도입할지는 `kernel-release` 실행에서 `syzkaller_
 
 ## 라이선스
 
-- `tools/`·`bundle/`(`ab-runner/`·`baker/`·`corpus/`)·`report/` 문서: **MIT** (`LICENSE`, 작업 루트)
+- `tools/`·`bundle/`(`lane/`·`baker/`·`corpus/`)·`report/` 문서: **MIT** (`LICENSE`, 작업 루트)
 - 커널 시리즈: **GPL-2.0**(파생), syzkaller 시리즈: **MIT**(상류 소유)
   — 세부 귀속·고지는 `THIRD-PARTY-LICENSES.md`
 
@@ -120,7 +146,7 @@ syzkaller 재사용을 도입할지는 `kernel-release` 실행에서 `syzkaller_
 > (`ganesha-lane-run.sh`, `ganesha-lane-control.sh`, `ganesha-lane-parity.sh`, `ganesha-asan-lane-run.sh`,
 > `run-ganesha-asan-smoke.py`, `run_frozen_phase9_vm_ganesha.py`, `nfs-proxy/ganesha-asan-relay-run.sh`,
 > `nfs-proxy/ganesha-asan-relay-ab-run.sh`, `nfs-proxy/run-ganesha-asan-relay-*.py`)와 그 증거는
-> 커밋 `7833ed3`에서 제거되었습니다. `build-ganesha-*.sh`, `ganesha-lane.sh`, `nfs-proxy/` 소스와 빌드 스크립트는 그대로 유효합니다.
+> 커밋 `7833ed3`에서 제거되었습니다. `build-ganesha-*.sh`, `nfs-proxy/` 소스와 빌드 스크립트는 그대로 유효합니다.
 
 knfsd와 **병렬로** 수행해 퍼징 처리량을 높이는 축이다. 동시에 병렬 퍼징이 만드는
 **부작용을 완화하는 설계**를 고도화한다. 둘은 성격이 다른 작업이라 따로 판정한다.

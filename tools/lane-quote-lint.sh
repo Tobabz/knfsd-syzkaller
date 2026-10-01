@@ -36,18 +36,15 @@
 # apostrophe inside, the first line ending in `sh -c '` and the first following
 # line matching ^[ \t]*' sh  are the true delimiters.
 #
-# Usage: tools/lane-quote-lint.sh <fixture.sh> [reference.sh]
+# Usage: tools/lane-quote-lint.sh [lane.sh]   (default: bundle/lane/lane.sh)
 set -eu
 
-fixture=${1:?usage: lane-quote-lint.sh FIXTURE [REFERENCE]}
-reference=${2:-"$(dirname "$0")/../bundle/ab-runner/frozen_phase9_lane.sh"}
+fixture=${1:-"$(dirname "$0")/../bundle/lane/lane.sh"}
 
-for f in "$fixture" "$reference"; do
-    if [ ! -r "$f" ]; then
-        echo "lane-quote-lint: cannot read $f" >&2
-        exit 2
-    fi
-done
+if [ ! -r "$fixture" ]; then
+    echo "lane-quote-lint: cannot read $fixture" >&2
+    exit 2
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -61,7 +58,6 @@ extract() {
 }
 
 extract "$fixture" > "$work/region"
-extract "$reference" > "$work/reference"
 
 status=0
 region_lines=$(wc -l < "$work/region")

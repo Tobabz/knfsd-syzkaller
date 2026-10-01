@@ -1,6 +1,6 @@
 #!/bin/bash
 # tools/release-assembly.sh - assemble a minimal forward-port bundle snapshot.
-# SHA256 verification was removed; this now simply archives the committed bundle.
+# SHA256 verification was removed; this archives the current bundle inputs.
 set -eu
 
 WORK_ROOT=${KOOV_WORK_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -12,7 +12,9 @@ ARCHIVE="$DIST/knfsd-syzkaller-forward-port-${STAMP}.tar.gz"
 mkdir -p "$DIST"
 
 echo "=== Assemble bundle snapshot ==="
-tar czf "$ARCHIVE" -C "$BUNDLE"     README-HANDOFF.md     src/guest-deps.tar.gz     patches/kernel     patches/syzkaller     patches/kernel.config     ab-runner     baker     corpus
+tar czf "$ARCHIVE" --exclude=__pycache__ --exclude='*.pyc' -C "$BUNDLE" \
+    README-HANDOFF.md src/guest-deps-lane.tar.gz patches/kernel \
+    patches/syzkaller patches/kernel.config lane baker corpus
 
 echo "Archive: $ARCHIVE"
 ls -lh "$ARCHIVE"

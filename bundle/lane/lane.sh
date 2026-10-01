@@ -1,22 +1,20 @@
 #!/bin/sh
-# Multi-server lane fixture: knfsd and/or NFS-Ganesha behind one client pair
-# (porting adaptation; INLINE form).
+# The NFS lane fixture: the single lane script baked into the image.
 #
-# Same inline rationale as tools/ab-lane-fixture-v42.sh: the guest exhausts
-# fork capacity when a thin wrapper forks /opt/frozen-phase9/lane.sh during
-# the boot-fixture retirement window ("Cannot fork" / rc=124 in
-# fixture-setup).  This file IS the lane script; it does not delegate.
-#
-# Behavioural deviations from bundle/ab-runner/frozen_phase9_lane.sh are the
-# only edits, each marked "KOOV:" in the body, and each reachable through an
-# environment variable so the defaults reproduce the original behaviour:
+# Every lane has one knfsd and one NFS-Ganesha behind a wire relay (nfs-proxy),
+# and two client namespaces that mount both.  Variants are selected by
+# environment variables, never by a copy of this file.  The image baker sets
+# NFS_MINOR_VERSION in the fixture service's drop-in; everything else keeps the
+# default.  This file runs as the boot fixture's lane.sh and must not stop that
+# service itself.
 #
 #   KOOV_TMPFS_SIZE   bound the per-lane tmpfs (default 256m).  The original
 #                     mounts it with no size=, so a runaway corpus program
 #                     can exhaust guest RAM; the resulting OOM kill is then
 #                     indistinguishable from a kernel bug.  This is a
 #                     pre-existing defect, unrelated to Ganesha.
-#   SERVER_IMPL       knfsd (default) | ganesha | both
+#   SERVER_IMPL       both (default) | knfsd | ganesha.  knfsd and ganesha
+#                     skip the relay and are for diagnosis only
 #   SERVER_PORT       NFS port the clients mount (default 2049)
 #   KOOV_KNFS_PORT    knfsd listen port (default: SERVER_PORT, or 20490 in
 #                     "both", leaving 2049 for the mirror proxy)
@@ -31,32 +29,22 @@
 # In both mode, a listener on .1:2049 and .5:2049 sends records to knfsd
 # :20490 and Ganesha :20491 respectively.  Each of the two client namespaces
 # mounts BOTH destinations; /mnt remains the original primary alias.
+# The executor client0/client1 aliases both select knfsd, preserving the
+# two-client shared-filesystem contract of the normal corpus.
 #
 # Why "both" uses two tmpfs trees: knfsd and Ganesha must never co-own mutable
 # filesystem state.  Both clients see the same tree within a backend, while
 # the two backends remain independent.  The proxy selects ONE backend from
-# the destination IP and returns that backend's own v4.1 response.
+# the destination IP and returns that backend's own NFS response.
+# NFS_MINOR_VERSION=2 applies to knfsd mounts; Ganesha mounts use v4.1
+# until the zero-filled v4.2 reads observed both with and without the relay
+# are resolved.
 
-set -eu
-action=${1:-}
-case "$action" in
-    setup)
-        # Retire the baked single-tenant boot fixture before allocating this
-        # run's own trial root.
-        systemctl stop frozen-phase9-fixture.service >/dev/null 2>&1 || \
-            NFS_MINOR_VERSION=${NFS_MINOR_VERSION:-1} \
-                /opt/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.manager \
-                >/dev/null 2>&1 || true
-        ;;
-esac
-
-# ==== frozen_phase9_lane.sh body, with the KOOV edits above ====
-#!/bin/sh
-# Disposable-VM Phase 9 multi-lane fixture. Never run this on the host.
+# Disposable-VM multi-lane fixture. Never run this on the host.
 set -eu
 
-action=${1:?usage: frozen_phase9_lane.sh setup ROOT 1|2|4 | status ROOT | cleanup ROOT}
-root=${2:?usage: frozen_phase9_lane.sh setup ROOT 1|2|4 | status ROOT | cleanup ROOT}
+action=${1:?usage: lane.sh setup ROOT 1|2|4 | status ROOT | cleanup ROOT}
+root=${2:?usage: lane.sh setup ROOT 1|2|4 | status ROOT | cleanup ROOT}
 
 case "$root" in
     /tmp/frozen-phase9.*) ;;
@@ -81,14 +69,14 @@ case "$nfs_minor_version" in
     1|2) ;;
     *) echo "NFS_MINOR_VERSION must be 1 or 2" >&2; exit 2 ;;
 esac
-# KOOV: server selection + tmpfs bound.  See tools/ganesha-lane.sh header.
+# KOOV: server selection + tmpfs bound.  See the header of this file.
 server_port=${SERVER_PORT:-2049}
 case "$server_port" in
     ''|*[!0-9]*) echo "SERVER_PORT must be a number" >&2; exit 2 ;;
 esac
 test "$server_port" -ge 1 && test "$server_port" -le 65535 || {
     echo "SERVER_PORT out of range" >&2; exit 2; }
-server_impl=${SERVER_IMPL:-knfsd}
+server_impl=${SERVER_IMPL:-both}
 case "$server_impl" in
     knfsd|ganesha|both) ;;
     *) echo "SERVER_IMPL must be knfsd, ganesha, or both" >&2; exit 2 ;;
@@ -333,9 +321,13 @@ setup_cross_mount()
     cross_backend=$4
     cross_ip=$5
     cross_mount=$root/lane$cross_lane/client$cross_client/$cross_backend
+    cross_minor=$nfs_minor_version
+    if [ "$cross_backend" = ganesha ]; then
+        cross_minor=1
+    fi
     mkdir -p "$cross_mount"
     nsenter --net="/run/netns/$cross_ns" -- \
-        mount.nfs4 -o "vers=4.$nfs_minor_version,minorversion=$nfs_minor_version,proto=tcp,port=$server_port,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
+        mount.nfs4 -o "vers=4.$cross_minor,minorversion=$cross_minor,proto=tcp,port=$server_port,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
         "$cross_ip:/" "$cross_mount"
     grep -F " $cross_mount nfs4 " /proc/mounts > \
         "$root/lane$cross_lane/client$cross_client.$cross_backend.mount"
@@ -555,8 +547,9 @@ EOF
             #     anything at the core.  Left at its 3,4 default, Ganesha
             #     tried "Registering NFS V3/UDP" and died there.  Set it to 4
             #     so no v3 socket is ever allocated or registered.
-            #   * Plugins_Dir is also an NFS_CORE_PARAM key
-            #     (ganesha_modules_loc).  Ganesha 4.3 has no -p option and
+    #   * Plugins_Dir is also an NFS_CORE_PARAM key
+    #     (ganesha_modules_loc).  The -p option selects the PID lock, not
+    #     the plugin directory, and
             #     fsal_manager.c builds the path as "%s/libfsal%s.so", so this
             #     is how the injected VFS plugin is found at all -- and it
             #     avoids mutating the guest outside this private mountns.
@@ -613,36 +606,19 @@ EOF
                     export ASAN_OPTIONS="$KOOV_GANESHA_ASAN_OPTIONS"
                 export UBSAN_OPTIONS="${KOOV_UBSAN_OPTIONS:-print_stacktrace=1}"
                 export DBUS_SYSTEM_BUS_ADDRESS="$dbus_address"
-                # daemon(0,0) closes stderr.  -F keeps ASan diagnostics in
-                # server.log and retains the same liveness/listener gates.
-                set --
-                if test -n "${KOOV_GANESHA_ASAN_OPTIONS:-}"; then
-                    set -- -F
-                fi
-                # -N takes a component name; 4.3 uses the NIV_* family.
-                exec ganesha.nfsd "$@" -f "$lane_root/server/ganesha.conf" \
+                # Keep the actual daemon PID in this lane and avoid the
+                # host-wide pgrep result from another lane.
+                exec ganesha.nfsd -F -p "$lane_root/server/ganesha.lock" \
+                    -f "$lane_root/server/ganesha.conf" \
                     -N "${KOOV_GANESHA_DEBUG:-NIV_DEBUG}" \
                     -L "$lane_root/server/ganesha.log"
             ) &
-            ganesha_shell_pid=$!
+            ganesha_pid=$!
             ganesha_hex=$(printf "%04X" "$ganesha_port")
-            # ALIVENESS IS "a ganesha.nfsd PROCESS EXISTS", never "this pid
-            # exists".  The daemon forks once while starting up: a run resolved
-            # $! = pgrep -x ganesha.nfsd = 2597, that intermediate process exited
-            # 0 at once, and the real server went on to log as
-            # nfs-ganesha-2601 -- alive, bound to 2049, and listed by
-            # `ip netns pids`.  The gate watched the intermediate pid and
-            # reported "ganesha exited" for eight consecutive runs while the
-            # server was healthy the whole time.  A gate that watches the wrong
-            # process is worse than no gate: it produces a confident false
-            # negative.
             ganesha_wait=0
-            ganesha_pid=
             ganesha_listening=0
             while test "$ganesha_wait" -lt 300; do
-                ganesha_pid=$(pgrep -x ganesha.nfsd 2>/dev/null | head -1)
-                if test -z "$ganesha_pid"; then
-                    ganesha_status=0
+                if ! kill -0 "$ganesha_pid" 2>/dev/null; then
                     echo "KOOV: --- last 40 log lines ---" >&2
                     test ! -f "$lane_root/server/ganesha.log" || \
                         tail -n 40 "$lane_root/server/ganesha.log" >&2
@@ -653,8 +629,8 @@ EOF
                         echo "KOOV: graceful-exit marker ABSENT" >&2
                     fi
                     echo "KOOV: --- summary (last so tail -80 cannot drop it) ---" >&2
-                    echo "KOOV: no ganesha.nfsd process after $ganesha_wait checks" >&2
-                    echo "KOOV: subshell=$ganesha_shell_pid" >&2
+                    echo "KOOV: lane ganesha.nfsd exited after $ganesha_wait checks" >&2
+                    echo "KOOV: process=$ganesha_pid" >&2
                     echo "KOOV: netns_pids=$(ip netns pids "$server_ns" 2>/dev/null | wc -l)" >&2
                     echo "KOOV: netns_pid_list=$(ip netns pids "$server_ns" 2>/dev/null | tr "\n" " ")" >&2
                     exit 1
@@ -682,9 +658,7 @@ EOF
                 echo "KOOV: alive (pid $ganesha_pid) but not listening on $ganesha_port" >&2
                 exit 1
             fi
-            # Record the LIVE pid now that the listener is confirmed, so the
-            # status gate later checks a process that still exists.
-            ganesha_pid=$(pgrep -x ganesha.nfsd 2>/dev/null | head -1)
+            # The foreground process is this lane daemon, not a peer lane.
             printf "%s\n" "$ganesha_pid" > "$lane_root/server/ganesha.pid"
             touch "$lane_root/server/ganesha.ready"
         fi
@@ -733,8 +707,18 @@ EOF
         ip netns exec "$setup_client1_ns" ping -c 1 -W 2 \
             "$setup_server0_ip" >/dev/null
     fi
-    setup_client "$setup_lane_id" 0 "$setup_client0_ns" "$setup_server0_ip" "$nfs_minor_version" "$server_port"
-    setup_client "$setup_lane_id" 1 "$setup_client1_ns" "$setup_server1_ip" "$nfs_minor_version" "$server_port"
+    setup_client0_minor=$nfs_minor_version
+    setup_client1_minor=$nfs_minor_version
+    # Debian Ganesha 4.3-2 omits read_arg->info for READ_PLUS; FSAL_VFS
+    # reads normally, but the READ_PLUS reply is empty. Use v4.1 for now.
+    if [ "$server_impl" = ganesha ]; then
+        setup_client0_minor=1
+    fi
+    if [ "$server_impl" != knfsd ]; then
+        setup_client1_minor=1
+    fi
+    setup_client "$setup_lane_id" 0 "$setup_client0_ns" "$setup_server0_ip" "$setup_client0_minor" "$server_port"
+    setup_client "$setup_lane_id" 1 "$setup_client1_ns" "$setup_server1_ip" "$setup_client1_minor" "$server_port"
     if [ "$server_impl" = both ]; then
         setup_cross_mount "$setup_lane_id" 0 "$setup_client0_ns" \
             ganesha "$setup_server1_ip"
@@ -764,7 +748,11 @@ expose_lane_to_executor()
     # tree without sharing either client's otherwise-private mount namespace.
     # The executor bind-mounts only this selected subtree into its sandbox.
     mount --bind "$expose_lane_root/client0/mnt" "$expose_source/client0"
-    mount --bind "$expose_lane_root/client1/mnt" "$expose_source/client1"
+    expose_peer_mount=$expose_lane_root/client1/mnt
+    if [ "$server_impl" = both ]; then
+        expose_peer_mount=$expose_lane_root/client1/knfsd
+    fi
+    mount --bind "$expose_peer_mount" "$expose_source/client1"
     if [ "$server_impl" = both ]; then
         for expose_client in 0 1; do
             for expose_backend in knfsd ganesha; do
@@ -1082,8 +1070,12 @@ status_fixture()
 
         for status_client in 0 1; do
             status_pid=$(cat "$status_lane_root/client$status_client.pid")
+            status_mount_minor=$status_minor
+            case "$server_impl:$status_client" in
+                ganesha:*|both:1) status_mount_minor=1 ;;
+            esac
             nsenter -t "$status_pid" -m -n -- grep -Eq \
-                " $status_lane_root/client$status_client/mnt nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
+                " $status_lane_root/client$status_client/mnt nfs4 .*vers=4\\.$status_mount_minor.*proto=tcp" \
                 /proc/mounts
         done
         test -L "$root/proc$status_lane"
@@ -1159,7 +1151,7 @@ status_fixture()
             pid_in_named_netns "$status_relay_pid" "$status_server_ns"
             test "$status_connections" -ge 4
             nsenter -t "$status_client0_pid" -m -n -- grep -Eq \
-                " $status_lane_root/client0/ganesha nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
+                " $status_lane_root/client0/ganesha nfs4 .*vers=4\\.1.*proto=tcp" \
                 /proc/mounts
             nsenter -t "$status_client1_pid" -m -n -- grep -Eq \
                 " $status_lane_root/client1/knfsd nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
@@ -1223,8 +1215,12 @@ status_fixture()
         test "$(findmnt -n -o FSTYPE -- "$status_source/client1")" = nfs4
         test "$(findmnt -n -o SOURCE -- "$status_source/client0")" = \
             "10.89.$status_lane.1:/"
+        status_peer_ip=10.89.$status_lane.5
+        if [ "$server_impl" = both ]; then
+            status_peer_ip=10.89.$status_lane.1
+        fi
         test "$(findmnt -n -o SOURCE -- "$status_source/client1")" = \
-            "10.89.$status_lane.5:/"
+            "$status_peer_ip:/"
 
         test "$status_lane" -eq 0 || printf ','
         printf '{"lane_id":%s,"lane_epoch":%s,"proc":%s,"server_namespace":"%s","client0_namespace":"%s","client1_namespace":"%s","server0_ip":"10.89.%s.1","client0_ip":"10.89.%s.2","server1_ip":"10.89.%s.5","client1_ip":"10.89.%s.6","backing_root":"%s/lane%s/server/export","backing_source":"%s","proc_pid":%s,"proc_mount":"%s/proc%s/mnt","peer_pid":%s,"peer_mount":"%s/proc%s-peer/mnt","source_root":"%s/proc-%s","source_client0":"%s/proc-%s/client0","source_client1":"%s/proc-%s/client1","client0_identifier":"%s","client1_identifier":"%s","server_threads":%s,"tcp_connections":%s,"server_port":%s,"ganesha_live":%s,"ganesha_listen":%s,"ganesha_backing_source":"%s","backing_options":"%s","ganesha_backing_options":"%s"}' \

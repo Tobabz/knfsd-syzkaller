@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parent.parent))
+REPO = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[2]))
 
 # An SSH key/auth rejection never heals by waiting for the guest.
 SSH_AUTH_MARKERS = ("Permission denied", "Load key",
@@ -155,11 +155,11 @@ def parse_args(argv=None):
     parser.add_argument("--ssh-key", type=Path, required=True)
     parser.add_argument("--deps-tar", type=Path, required=True)
     parser.add_argument("--lane-script", type=Path,
-                        default=REPO / "scripts" / "frozen_phase9_lane.sh")
+                        default=REPO / "bundle" / "lane" / "lane.sh")
     parser.add_argument("--boot-fixture", type=Path,
-                        default=REPO / "scripts" / "frozen_phase9_boot_fixture.sh")
+                        default=REPO / "bundle" / "lane" / "boot-fixture.sh")
     parser.add_argument("--service", type=Path,
-                        default=REPO / "scripts" / "frozen-phase9-fixture.service")
+                        default=REPO / "bundle" / "lane" / "fixture.service")
     parser.add_argument("--cpus", type=int, default=4)
     parser.add_argument("--memory", type=int, default=4096)
     parser.add_argument("--boot-timeout", type=int, default=240)

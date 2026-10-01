@@ -49,7 +49,7 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent
 WORK = TOOLS.parent
 BUNDLE = Path(os.environ.get("KOOV_BUNDLE", str(WORK / "bundle" / "patches")))
-ABRUN = Path(os.environ.get("KOOV_ABRUNNER", str(WORK / "bundle" / "ab-runner")))
+LANE = Path(os.environ.get("KOOV_LANE", str(WORK / "bundle" / "lane")))
 BAKER = Path(os.environ.get("KOOV_BAKER", str(WORK / "bundle" / "baker")))
 FPORT_APPLY = TOOLS / "fport-apply.sh"
 VARIANTS = ("kasan", "kcsan")
@@ -142,6 +142,21 @@ def ssh_auth_failure(text):
     return any(marker in text for marker in SSH_AUTH_MARKERS)
 
 
+def check_lane_deps(parser, deps_tar):
+    """The lane fixture starts knfsd, Ganesha and the relay; refuse deps that lack one."""
+    import tarfile
+    needed = ("usr/sbin/ganesha.nfsd", "usr/sbin/nfs-proxy", "usr/sbin/rpc.nfsd")
+    try:
+        with tarfile.open(deps_tar) as archive:
+            names = {m.name[2:] if m.name.startswith("./") else m.name for m in archive}
+    except (OSError, tarfile.TarError) as error:
+        parser.error("--deps-tar is not a readable tarball: %s" % error)
+    missing = [n for n in needed if n not in names]
+    if missing:
+        parser.error("--deps-tar lacks %s; build it with tools/assemble-guest-deps.py"
+                     % ", ".join(missing))
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", type=Path)
@@ -187,6 +202,7 @@ def parse_args(argv=None):
         if not path.is_file() or path.stat().st_size == 0:
             parser.error("missing --%s: %s" % (field.replace("_", "-"), path))
         setattr(args, field, path)
+    check_lane_deps(parser, args.deps_tar)
     args.variants = [v for v in VARIANTS if v in (args.variants or VARIANTS)]
     for path in (FPORT_APPLY, *(KCONFIGS[v] for v in args.variants)):
         if not path.is_file() or path.stat().st_size == 0:
@@ -213,8 +229,8 @@ def git_clean(tree):
 
 def kernel_sentinel(linux):
     try:
-        return "TCP_SUNRPC_FUZZ" in (
-            linux / "include" / "uapi" / "linux" / "tcp.h"
+        return "sunrpc_fuzz_svc_remote_grant" in (
+            linux / "include" / "linux" / "sunrpc" / "fuzz.h"
         ).read_text(errors="replace")
     except OSError:
         return False
@@ -280,6 +296,8 @@ def stage_kernel(args, manifest, reuse):
         print("reusing kernel build", flush=True)
         rebuilt = False
     else:
+        if args.skip_build:
+            raise RuntimeError("--skip-build requires an existing patched kernel tree and variant bzImages")
         if linux.exists():
             shutil.rmtree(linux)
         for variant in args.variants:
@@ -356,6 +374,8 @@ def stage_syzkaller(args, manifest, reuse):
     if reuse and syz_binaries_ok(syz) and syz_sentinel(syz):
         print("reusing syzkaller build", flush=True)
     else:
+        if args.skip_build:
+            raise RuntimeError("--skip-build requires an existing patched syzkaller tree and binaries")
         if syz.exists():
             shutil.rmtree(syz)
         with timed(manifest, "syzkaller_clone"):
@@ -402,9 +422,9 @@ def reusable_image(args, image_out):
     inputs = {
         "base_sha256": sha256(args.base_image),
         "nfs_minor": args.minor,
-        "lane_script_sha256": sha256(ABRUN / "frozen_phase9_lane.sh"),
-        "boot_fixture_sha256": sha256(ABRUN / "frozen_phase9_boot_fixture.sh"),
-        "service_sha256": sha256(ABRUN / "frozen-phase9-fixture.service"),
+        "lane_script_sha256": sha256(LANE / "lane.sh"),
+        "boot_fixture_sha256": sha256(LANE / "boot-fixture.sh"),
+        "service_sha256": sha256(LANE / "fixture.service"),
         "deps_tar_sha256": sha256(args.deps_tar),
     }
     if any(meta.get(key) != value for key, value in inputs.items()):
@@ -424,9 +444,9 @@ def stage_bake(args, bzimage, image_out):
          "--output", str(image_out), "--minor", args.minor,
          "--kernel", str(bzimage), "--ssh-key", str(args.ssh_key),
          "--deps-tar", str(args.deps_tar),
-         "--lane-script", str(ABRUN / "frozen_phase9_lane.sh"),
-         "--boot-fixture", str(ABRUN / "frozen_phase9_boot_fixture.sh"),
-         "--service", str(ABRUN / "frozen-phase9-fixture.service"),
+         "--lane-script", str(LANE / "lane.sh"),
+         "--boot-fixture", str(LANE / "boot-fixture.sh"),
+         "--service", str(LANE / "fixture.service"),
          "--cpus", "4", "--memory", "4096",
          "--boot-timeout", str(args.boot_timeout)], timeout=3600)
     manifest_path = image_out.with_suffix(".json")
@@ -600,9 +620,9 @@ def main(argv=None):
     args = parse_args(argv)
     manifest = {"target": str(args.target), "minor": args.minor,
                 "repo": str(BUNDLE.parent)}
-    # SHA256-based reuse removed (Option A, 2026-09-27).
-    kernel_reuse = False
-    syz_reuse = False
+    # --skip-build reuses existing pinned build outputs; it must never delete them.
+    kernel_reuse = args.skip_build
+    syz_reuse = args.skip_build
     started = time.monotonic()
     previous = last_good_manifest(args.target)
     try:
