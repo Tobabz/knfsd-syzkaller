@@ -61,7 +61,6 @@ python3 tools/bootstrap-kcov-env.py env \
 | kernel/syzkaller sources (default) | Cloned at pinned refs — kernel `v7.3-rc4` (git.kernel.org), syzkaller `801f09666` (github.com/google/syzkaller) |
 | `--kernel-repo` / `--syz-repo` (optional) | Override clone URLs |
 | `--kernel-ref TAG\|latest` (optional) | Kernel release or rc tag to build; `latest` is the newest tag, rc included. Default: the tag in `bundle/patches/BASE` |
-| `--kernel-tarball` / `--syz-tarball` (optional) | Offline source archives instead of clones |
 | `--variant kasan\|kcsan` (optional, repeatable) | Sanitizer kernels to build and verify; default: both |
 | `--jobs N` (optional) | Parallel build jobs |
 

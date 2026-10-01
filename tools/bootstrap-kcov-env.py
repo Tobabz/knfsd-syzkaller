@@ -30,11 +30,6 @@ Usage (all paths explicit, no host defaults besides REPO auto-detect):
       [--kernel-ref TAG|latest] [--variant kasan|kcsan ...] [--jobs N] \\
       [--skip-build] [--skip-verify]
 
-  For offline handoff, replace the two --*-repo URLs with
-  --kernel-tarball/--syz-tarball pristine source archives; the trees
-  are extracted, committed locally, and patched the same way (the
-  base-hash check becomes a content check). See README-HANDOFF.
-
   --skip-build rebuilds nothing: verifies prebuilt trees only.
   --skip-verify stops after the bake (no VM run).
 """
@@ -42,13 +37,11 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
-import tarfile
 import time
 from pathlib import Path
 
@@ -108,12 +101,6 @@ def parse_args(argv=None):
                         help="kernel release/rc tag to build, or 'latest' (newest tag, rc "
                         "included); default: the BASE tag of the patch series")
     parser.add_argument("--syz-repo", default=SYZ_URL_DEFAULT)
-    parser.add_argument("--kernel-tarball", type=Path, default=None,
-                        help="offline alternative to --kernel-repo: pristine "
-                        "source archive of --kernel-ref")
-    parser.add_argument("--syz-tarball", type=Path, default=None,
-                        help="offline alternative to --syz-repo: pristine "
-                        "801f09666 source archive")
     parser.add_argument("--base-image", type=Path, required=True,
                         help="clean raw base image (never opened RW)")
     parser.add_argument("--ssh-key", type=Path, required=True)
@@ -133,8 +120,6 @@ def parse_args(argv=None):
     if args.kernel_ref is None:
         args.kernel_ref = KERNEL_TAG
     elif args.kernel_ref == "latest":
-        if args.kernel_tarball is not None:
-            parser.error("--kernel-ref latest needs --kernel-repo, not --kernel-tarball")
         args.kernel_ref = kernel_base.latest_tag(args.kernel_repo)
         print("latest kernel tag: %s" % args.kernel_ref, flush=True)
     else:
@@ -184,30 +169,6 @@ def kernel_sentinel(linux):
         ).read_text(errors="replace")
     except OSError:
         return False
-
-
-def import_tarball(tarball, dest, kind, kernel_tag=None):
-    """Extract a pristine source archive and commit it as a local repo."""
-    import tarfile
-    dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(tarball, "r:*") as archive:
-        archive.extractall(dest)
-    run(["git", "-C", str(dest), "init"], timeout=60)
-    for key, value in (("user.email", "knfsd-fuzz@localhost"),
-                       ("user.name", "knfsd-fuzz")):
-        run(["git", "-C", str(dest), "config", key, value], timeout=60)
-    if kind == "kernel":
-        makefile = (dest / "Makefile").read_text(errors="replace")
-        fields = dict(re.findall(
-            r"^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[ \t]*=[ \t]*(\S*)",
-            makefile, re.MULTILINE))
-        got = tuple(fields.get(key, "") for key in
-                    ("VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION"))
-        if got != kernel_base.tag_version_fields(kernel_tag):
-            raise RuntimeError("kernel tarball is not %s: %r" % (kernel_tag, fields))
-    run(["git", "-C", str(dest), "add", "-A"], timeout=600)
-    run(["git", "-C", str(dest), "commit", "-q", "-m",
-         "pristine base import (%s)" % kind], timeout=600)
 
 
 def build_dir(args, variant):
@@ -262,23 +223,18 @@ def stage_kernel(args, manifest, reuse):
             for stale in (build_dir(args, variant), image_dir(args, variant)):
                 if stale.exists():
                     shutil.rmtree(stale)
-        if args.kernel_tarball is not None:
-            import_tarball(args.kernel_tarball, linux, "kernel", args.kernel_ref)
-        else:
-            run(["git", "clone", "--branch", args.kernel_ref, "--depth", "1",
-                 args.kernel_repo, str(linux)], timeout=1800)
-            for key, value in (("user.email", "knfsd-fuzz@localhost"),
-                               ("user.name", "knfsd-fuzz")):
-                run(["git", "-C", str(linux), "config", key, value],
-                    timeout=60)
-            head = subprocess.run(
-                ["git", "-C", str(linux), "rev-parse", "HEAD"],
-                capture_output=True, text=True, timeout=60,
-                check=True).stdout.strip()
-            if args.kernel_ref == KERNEL_TAG and head != KERNEL_COMMIT:
-                raise RuntimeError("kernel base %s != %s"
-                                   % (head, KERNEL_COMMIT))
-            base_commit = head
+        run(["git", "clone", "--branch", args.kernel_ref, "--depth", "1",
+             args.kernel_repo, str(linux)], timeout=1800)
+        for key, value in (("user.email", "knfsd-fuzz@localhost"),
+                           ("user.name", "knfsd-fuzz")):
+            run(["git", "-C", str(linux), "config", key, value], timeout=60)
+        head = subprocess.run(
+            ["git", "-C", str(linux), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=60,
+            check=True).stdout.strip()
+        if args.kernel_ref == KERNEL_TAG and head != KERNEL_COMMIT:
+            raise RuntimeError("kernel base %s != %s" % (head, KERNEL_COMMIT))
+        base_commit = head
         if not args.skip_build:
             if not git_clean(linux):
                 raise RuntimeError("linux tree not clean")
@@ -335,16 +291,13 @@ def stage_syzkaller(args, manifest, reuse):
     else:
         if syz.exists():
             shutil.rmtree(syz)
-        if args.syz_tarball is not None:
-            import_tarball(args.syz_tarball, syz, "syzkaller")
-        else:
-            run(["git", "clone", args.syz_repo, str(syz)], timeout=3600)
-            for key, value in (("user.email", "knfsd-fuzz@localhost"),
-                               ("user.name", "knfsd-fuzz")):
-                run(["git", "-C", str(syz), "config", key, value], timeout=60)
-            subprocess.run(["git", "-C", str(syz), "fetch", "origin"],
-                           timeout=900, check=True)
-            run(["git", "-C", str(syz), "checkout", SYZ_COMMIT], timeout=300)
+        run(["git", "clone", args.syz_repo, str(syz)], timeout=3600)
+        for key, value in (("user.email", "knfsd-fuzz@localhost"),
+                           ("user.name", "knfsd-fuzz")):
+            run(["git", "-C", str(syz), "config", key, value], timeout=60)
+        subprocess.run(["git", "-C", str(syz), "fetch", "origin"],
+                       timeout=900, check=True)
+        run(["git", "-C", str(syz), "checkout", SYZ_COMMIT], timeout=300)
         if not args.skip_build:
             if not git_clean(syz):
                 raise RuntimeError("syzkaller tree not clean")

@@ -108,9 +108,8 @@ sudo bash tools/make-base-image.sh --out artifacts
 
 ```sh
 # working root containing tools/ + bundle/ + env/
-# upstream refs are cloned by default (kernel v7.3-rc4, syzkaller 801f09666);
-# override with --kernel-repo/--syz-repo, or supply your own archives via
-# --kernel-tarball/--syz-tarball (pre-fetched) instead of cloning.
+# upstream refs (bundle/patches/BASE) are cloned; override the URLs with
+# --kernel-repo/--syz-repo and the kernel tag with --kernel-ref.
 python3 tools/bootstrap-kcov-env.py /work/env \
   --base-image artifacts/bookworm-base.img \
   --ssh-key artifacts/bookworm.id_rsa \
