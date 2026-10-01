@@ -1,5 +1,5 @@
 # Last base the checked-in patch series is known to apply to.
 # Updated by tools/bump-kernel.py; read by bootstrap and fport-apply.sh.
-kernel_tag=v7.3-rc4
-kernel_commit=93f51579e7df248780214094418f205253383cc5
+kernel_tag=v7.3-rc5
+kernel_commit=72d3fcf802c45d00b300f25b848a93c3a2bd7c7e
 syzkaller_commit=801f0966669a37e048adabf9e5f38ce52825ea82
