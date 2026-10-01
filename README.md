@@ -77,6 +77,7 @@ No runner is provided: point a syz-manager config at the outputs of step 2.
 | `image`, `sshkey` | `env/images/bookworm-kcov-fresh-v1.qcow2`, `artifacts/bookworm.id_rsa` |
 | `procs` | the fixture's lane count (4) |
 | `experimental.remote_cover` | on/off switch for remote coverage |
+| `vm.cmdline` | must include `nfs.localio_enabled=N` (the baked lane fixture refuses to start otherwise, so no lane exists and fuzzing never reaches NFS); bootstrap and the baker pass it the same way. `sunrpc.lane_attribution=0` switches to request-level attribution for comparison runs |
 
 ### 4. Moving to a newer kernel
 
