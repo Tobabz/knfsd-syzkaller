@@ -192,17 +192,31 @@ def build_kernel_variant(args, linux, variant):
 
 
 def export_kernel_images(args, variant):
-    """Copy the run-time kernel artifacts out of the disposable build tree."""
+    """Copy the run-time kernel artifacts out of the disposable build tree.
+
+    The new images are staged next to the old ones and swapped in at the end, so a
+    failed build never leaves images/<variant> half written or missing.
+    """
     out = build_dir(args, variant)
     images = image_dir(args, variant)
-    images.mkdir(parents=True, exist_ok=True)
     bzimage = out / "arch" / "x86" / "boot" / "bzImage"
     if not bzimage.is_file() or bzimage.stat().st_size == 0:
         raise RuntimeError("bzImage missing after %s build" % variant)
-    shutil.copy2(bzimage, images / "bzImage")
+    staged = images.with_name(variant + ".new")
+    previous = images.with_name(variant + ".old")
+    for leftover in (staged, previous):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    staged.mkdir(parents=True)
+    shutil.copy2(bzimage, staged / "bzImage")
     vmlinux = out / "vmlinux"
     if vmlinux.is_file():
-        shutil.copy2(vmlinux, images / "vmlinux")
+        shutil.copy2(vmlinux, staged / "vmlinux")
+    if images.exists():
+        os.replace(images, previous)
+    os.replace(staged, images)
+    if previous.exists():
+        shutil.rmtree(previous)
     return images / "bzImage", images / "vmlinux"
 
 
@@ -220,9 +234,8 @@ def stage_kernel(args, manifest, reuse):
         if linux.exists():
             shutil.rmtree(linux)
         for variant in args.variants:
-            for stale in (build_dir(args, variant), image_dir(args, variant)):
-                if stale.exists():
-                    shutil.rmtree(stale)
+            if build_dir(args, variant).exists():
+                shutil.rmtree(build_dir(args, variant))
         run(["git", "clone", "--branch", args.kernel_ref, "--depth", "1",
              args.kernel_repo, str(linux)], timeout=1800)
         for key, value in (("user.email", "knfsd-fuzz@localhost"),
@@ -339,6 +352,12 @@ def reusable_image(args, image_out):
     if any(meta.get(key) != value for key, value in inputs.items()):
         return None
     return meta if meta.get("sha256") == sha256(image_out) else None
+
+
+def discard_staged_image(staging):
+    """Remove a partial staged image and its manifest (the bake logs stay for diagnosis)."""
+    for path in (staging, staging.with_suffix(".json")):
+        path.unlink(missing_ok=True)
 
 
 def stage_bake(args, bzimage, image_out):
@@ -526,14 +545,24 @@ def main(argv=None):
             print("reusing the baked image: its inputs are unchanged", flush=True)
             manifest["bake"] = {**reused, "reused": True}
         else:
-            if image_out.exists():
-                image_out.unlink()
             # The image is booted with -kernel, so it does not depend on the
-            # sanitizer; bake it once with the first variant's kernel.
+            # sanitizer; bake it once with the first variant's kernel. The bake
+            # writes a staging file that replaces the previous image only on success.
             boot_variant = args.variants[0]
-            manifest["bake"] = stage_bake(args, kernels[boot_variant][0],
-                                          image_out)
-            manifest["bake"]["boot_kernel_variant"] = boot_variant
+            staging = image_out.with_name("staging-" + image_out.name)
+            discard_staged_image(staging)
+            try:
+                stage_bake(args, kernels[boot_variant][0], staging)
+            except BaseException:
+                discard_staged_image(staging)
+                raise
+            meta_staging = staging.with_suffix(".json")
+            meta = json.loads(meta_staging.read_text())
+            meta["output"] = str(image_out)
+            os.replace(staging, image_out)
+            image_out.with_suffix(".json").write_text(json.dumps(meta, indent=2) + "\n")
+            meta_staging.unlink()
+            manifest["bake"] = {**meta, "boot_kernel_variant": boot_variant}
         if args.skip_verify:
             manifest["verify"] = "skipped"
         else:
@@ -544,8 +573,11 @@ def main(argv=None):
         manifest["error"] = "%s: %s" % (type(error).__name__, error)
         raise
     finally:
-        (args.target / "manifest.json").write_text(
+        passed = manifest.get("status") == "pass"
+        (args.target / ("manifest.json" if passed else "manifest.failed.json")).write_text(
             json.dumps(manifest, indent=2) + "\n")
+        if passed:
+            (args.target / "manifest.failed.json").unlink(missing_ok=True)
     print(json.dumps(manifest, indent=2)[:2000])
     return 0
 
