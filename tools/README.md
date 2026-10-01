@@ -51,6 +51,34 @@ python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다�
 Ganesha·프록시 스크립트가 읽는 `KOOV_GANESHA_*`, `KOOV_NFS_PROXY_*`, `KOOV_TMPFS_SIZE`, `KOOV_KNFS_PORT`,
 `KOOV_UBSAN_OPTIONS`는 각 스크립트 머리 주석을 참조합니다.
 
+## syzkaller 재빌드 조건과 두 축
+
+bootstrap은 지금 매번 syzkaller를 처음부터 빌드합니다(재사용 없음). 재빌드가 필요한 경우는 아래뿐입니다.
+`make`는 `sys/*/*.txt`·`sys/*/*.const`가 바뀌면 설명 생성(`syz-sysgen`)을 다시 하고, manager·execprog·db·executor가
+모두 그 생성물에 의존하므로 설명이 바뀌면 이들을 함께 다시 만들어야 합니다.
+
+| 축 | 언제 | syzkaller 재빌드 |
+|---|---|---|
+| **커널 릴리스** | 커널 베이스가 바뀜 (`bump-kernel.py`, `--kernel-ref`) | **불필요** — 빌드 입력은 syzkaller 트리와 도구체인뿐 |
+| **시나리오 개발** | syzlang(`sys/linux/*.txt`, `.const`), executor 의사 시스템 콜, `pkg/vminfo`, execprog 변경, 또는 syzkaller 커밋 변경 | **필수** |
+
+그 밖의 경우: 시드(`.prog`)나 syz-manager cfg만 바뀌면 불필요합니다. 커널 시리즈가 UAPI(KCOV ioctl 등)를 바꾸면
+executor가 `executor_linux.h`에 따로 둔 정의와 맞춰야 하므로 필요합니다. 이미지 재생성과는 별개이며, 새 의사 시스템
+콜이 새 게스트 구조(마운트, 소켓)를 요구할 때만 lane 스크립트와 이미지가 바뀝니다.
+
+`manifest.json`은 이 구분을 기록합니다.
+
+| 필드 | 내용 |
+|---|---|
+| `kernel.series_sha256`, `syzkaller.series_sha256` | 패치 시리즈의 파일명·내용 해시(적용 순서 포함) |
+| `changes.axis` | 직전 성공 manifest와 비교한 결과: `kernel-release`, `scenario`, `both`, `none`, `first-run`, `unknown` |
+| `changes.kernel_base` 등 | 커널 베이스·커널 시리즈·syzkaller 베이스·시리즈 각각의 변경 여부 (`syzkaller_inputs_changed`가 시나리오 축) |
+| `timing_seconds` | 단계별 소요 시간(`kernel_clone`, `kernel_apply`, `kernel_build_<variant>`, `kernel_export`, `syzkaller_clone`, `syzkaller_apply`, `syzkaller_build`, `bake`, `verify`, `total`) |
+
+`unknown`은 직전 manifest에 시리즈 해시가 없거나(이 필드가 생기기 전 실행) 실행이 기록 전에 실패한 경우입니다.
+커널 시리즈만 바뀐 경우(예: `bump-kernel.py --export` 이후)는 어느 축도 아니라서 `none`이고 `kernel_series`만 참입니다.
+syzkaller 재사용을 도입할지는 `kernel-release` 실행에서 `syzkaller_*` 시간이 얼마인지 보고 정합니다.
+
 ## 배포
 
 - **릴리스 자산 없음 (2026-09-26 자산 해제 모델)**: 상류 소스(커널·syzkaller)는

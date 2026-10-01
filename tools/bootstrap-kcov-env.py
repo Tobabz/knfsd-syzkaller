@@ -34,6 +34,7 @@ Usage (all paths explicit, no host defaults besides REPO auto-detect):
   --skip-verify stops after the bake (no VM run).
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -74,6 +75,54 @@ def run(command, timeout=3600, check=True, **kwargs):
         raise RuntimeError("command failed rc=%d: %s" % (
             result.returncode, shlex.join(str(c) for c in command)))
     return result
+
+
+@contextlib.contextmanager
+def timed(manifest, key):
+    """Record the wall-clock seconds of a stage in manifest["timing_seconds"][key]."""
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        manifest.setdefault("timing_seconds", {})[key] = round(time.monotonic() - started, 1)
+
+
+def series_fingerprint(kind):
+    """Hash of a patch series (file names and contents, in apply order)."""
+    digest = hashlib.sha256()
+    for path in sorted((BUNDLE / kind).glob("*.patch")):
+        digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def describe_changes(previous, current):
+    """Which axis this run moves, compared with the last successful manifest.
+
+    kernel-release: the kernel base commit changed (following a new release or rc).
+    scenario:       the syzkaller base or series changed (syzlang, pseudo-syscalls,
+                    executor, vminfo), the only case that needs a syzkaller rebuild.
+    """
+    if previous is None:
+        return {"axis": "first-run"}
+
+    def pick(manifest, section, key):
+        value = manifest.get(section)
+        return value.get(key) if isinstance(value, dict) else None
+
+    flags = {}
+    for name, section, key in (("kernel_base", "kernel", "base"),
+                               ("kernel_series", "kernel", "series_sha256"),
+                               ("syzkaller_base", "syzkaller", "base"),
+                               ("syzkaller_series", "syzkaller", "series_sha256")):
+        before, after = pick(previous, section, key), pick(current, section, key)
+        flags[name] = None if before is None or after is None else before != after
+    if any(value is None for value in flags.values()):
+        return {"axis": "unknown", **flags}   # run failed early, or an older manifest
+    release = flags["kernel_base"]
+    scenario = flags["syzkaller_base"] or flags["syzkaller_series"]
+    axis = ("both" if release and scenario else "kernel-release" if release
+            else "scenario" if scenario else "none")
+    return {"axis": axis, **flags, "syzkaller_inputs_changed": scenario}
 
 
 def sha256(path):
@@ -236,26 +285,30 @@ def stage_kernel(args, manifest, reuse):
         for variant in args.variants:
             if build_dir(args, variant).exists():
                 shutil.rmtree(build_dir(args, variant))
-        run(["git", "clone", "--branch", args.kernel_ref, "--depth", "1",
-             args.kernel_repo, str(linux)], timeout=1800)
-        for key, value in (("user.email", "knfsd-fuzz@localhost"),
-                           ("user.name", "knfsd-fuzz")):
-            run(["git", "-C", str(linux), "config", key, value], timeout=60)
-        head = subprocess.run(
-            ["git", "-C", str(linux), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=60,
-            check=True).stdout.strip()
+        with timed(manifest, "kernel_clone"):
+            run(["git", "clone", "--branch", args.kernel_ref, "--depth", "1",
+                 args.kernel_repo, str(linux)], timeout=1800)
+            for key, value in (("user.email", "knfsd-fuzz@localhost"),
+                               ("user.name", "knfsd-fuzz")):
+                run(["git", "-C", str(linux), "config", key, value], timeout=60)
+            head = subprocess.run(
+                ["git", "-C", str(linux), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=60,
+                check=True).stdout.strip()
         if args.kernel_ref == KERNEL_TAG and head != KERNEL_COMMIT:
             raise RuntimeError("kernel base %s != %s" % (head, KERNEL_COMMIT))
         base_commit = head
         if not args.skip_build:
             if not git_clean(linux):
                 raise RuntimeError("linux tree not clean")
-            run([str(FPORT_APPLY), "kernel", str(linux)], timeout=600)
+            with timed(manifest, "kernel_apply"):
+                run([str(FPORT_APPLY), "kernel", str(linux)], timeout=600)
             for variant in args.variants:
-                build_kernel_variant(args, linux, variant)
-        for variant in args.variants:
-            export_kernel_images(args, variant)
+                with timed(manifest, "kernel_build_" + variant):
+                    build_kernel_variant(args, linux, variant)
+        with timed(manifest, "kernel_export"):
+            for variant in args.variants:
+                export_kernel_images(args, variant)
     kernels = {}
     variants = {}
     for variant in args.variants:
@@ -270,6 +323,7 @@ def stage_kernel(args, manifest, reuse):
     manifest["kernel"] = {
         "ref": args.kernel_ref,
         "base": base_commit,
+        "series_sha256": series_fingerprint("kernel"),
         "head": subprocess.run(
             ["git", "-C", str(linux), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=60,
@@ -304,22 +358,26 @@ def stage_syzkaller(args, manifest, reuse):
     else:
         if syz.exists():
             shutil.rmtree(syz)
-        run(["git", "clone", args.syz_repo, str(syz)], timeout=3600)
-        for key, value in (("user.email", "knfsd-fuzz@localhost"),
-                           ("user.name", "knfsd-fuzz")):
-            run(["git", "-C", str(syz), "config", key, value], timeout=60)
-        subprocess.run(["git", "-C", str(syz), "fetch", "origin"],
-                       timeout=900, check=True)
-        run(["git", "-C", str(syz), "checkout", SYZ_COMMIT], timeout=300)
+        with timed(manifest, "syzkaller_clone"):
+            run(["git", "clone", args.syz_repo, str(syz)], timeout=3600)
+            for key, value in (("user.email", "knfsd-fuzz@localhost"),
+                               ("user.name", "knfsd-fuzz")):
+                run(["git", "-C", str(syz), "config", key, value], timeout=60)
+            subprocess.run(["git", "-C", str(syz), "fetch", "origin"],
+                           timeout=900, check=True)
+            run(["git", "-C", str(syz), "checkout", SYZ_COMMIT], timeout=300)
         if not args.skip_build:
             if not git_clean(syz):
                 raise RuntimeError("syzkaller tree not clean")
-            run([str(FPORT_APPLY), "syzkaller", str(syz)], timeout=600)
-            run(["make", "-C", str(syz), "-j%d" % args.jobs], timeout=3600)
+            with timed(manifest, "syzkaller_apply"):
+                run([str(FPORT_APPLY), "syzkaller", str(syz)], timeout=600)
+            with timed(manifest, "syzkaller_build"):
+                run(["make", "-C", str(syz), "-j%d" % args.jobs], timeout=3600)
         if not syz_binaries_ok(syz):
             raise RuntimeError("missing build output after build")
     manifest["syzkaller"] = {
         "base": SYZ_COMMIT,
+        "series_sha256": series_fingerprint("syzkaller"),
         "head": subprocess.run(
             ["git", "-C", str(syz), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=60,
@@ -489,6 +547,7 @@ def detect_mem_sanitizer(vm, config_path):
 
 
 def stage_verify_variant(args, image, variant, bzimage):
+    started = time.monotonic()
     vm = VM(image, bzimage, args.ssh_key, args.boot_timeout)
     try:
         vm.start()
@@ -512,7 +571,8 @@ def stage_verify_variant(args, image, variant, bzimage):
                 "lane_count": int(json.loads(lanes)["lane_count"]),
                 "mem_sanitizer": sanitizer,
                 "target_kasan": sanitizer == "kasan",
-                "target_kcsan": sanitizer == "kcsan"}
+                "target_kcsan": sanitizer == "kcsan",
+                "seconds": round(time.monotonic() - started, 1)}
     finally:
         vm.stop()
 
@@ -527,6 +587,15 @@ def stage_verify(args, image, kernels):
             "lane_count": first["lane_count"], "variants": variants}
 
 
+def last_good_manifest(target):
+    """manifest.json of the previous successful run, or None."""
+    try:
+        previous = json.loads((target / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return previous if isinstance(previous, dict) and previous.get("status") == "pass" else None
+
+
 def main(argv=None):
     args = parse_args(argv)
     manifest = {"target": str(args.target), "minor": args.minor,
@@ -534,45 +603,51 @@ def main(argv=None):
     # SHA256-based reuse removed (Option A, 2026-09-27).
     kernel_reuse = False
     syz_reuse = False
+    started = time.monotonic()
+    previous = last_good_manifest(args.target)
     try:
         kernels, kernel_rebuilt = stage_kernel(args, manifest, kernel_reuse)
         syz = stage_syzkaller(args, manifest, syz_reuse)
         image_out = args.target / "images" / ("bookworm-kcov-fresh-v%s.qcow2"
                                               % args.minor)
         image_out.parent.mkdir(parents=True, exist_ok=True)
-        reused = reusable_image(args, image_out)
-        if reused is not None:
-            print("reusing the baked image: its inputs are unchanged", flush=True)
-            manifest["bake"] = {**reused, "reused": True}
-        else:
-            # The image is booted with -kernel, so it does not depend on the
-            # sanitizer; bake it once with the first variant's kernel. The bake
-            # writes a staging file that replaces the previous image only on success.
-            boot_variant = args.variants[0]
-            staging = image_out.with_name("staging-" + image_out.name)
-            discard_staged_image(staging)
-            try:
-                stage_bake(args, kernels[boot_variant][0], staging)
-            except BaseException:
+        with timed(manifest, "bake"):
+            reused = reusable_image(args, image_out)
+            if reused is not None:
+                print("reusing the baked image: its inputs are unchanged", flush=True)
+                manifest["bake"] = {**reused, "reused": True}
+            else:
+                # The image is booted with -kernel, so it does not depend on the
+                # sanitizer; bake it once with the first variant's kernel. The bake
+                # writes a staging file that replaces the previous image only on success.
+                boot_variant = args.variants[0]
+                staging = image_out.with_name("staging-" + image_out.name)
                 discard_staged_image(staging)
-                raise
-            meta_staging = staging.with_suffix(".json")
-            meta = json.loads(meta_staging.read_text())
-            meta["output"] = str(image_out)
-            os.replace(staging, image_out)
-            image_out.with_suffix(".json").write_text(json.dumps(meta, indent=2) + "\n")
-            meta_staging.unlink()
-            manifest["bake"] = {**meta, "boot_kernel_variant": boot_variant}
+                try:
+                    stage_bake(args, kernels[boot_variant][0], staging)
+                except BaseException:
+                    discard_staged_image(staging)
+                    raise
+                meta_staging = staging.with_suffix(".json")
+                meta = json.loads(meta_staging.read_text())
+                meta["output"] = str(image_out)
+                os.replace(staging, image_out)
+                image_out.with_suffix(".json").write_text(json.dumps(meta, indent=2) + "\n")
+                meta_staging.unlink()
+                manifest["bake"] = {**meta, "boot_kernel_variant": boot_variant}
         if args.skip_verify:
             manifest["verify"] = "skipped"
         else:
-            manifest["verify"] = stage_verify(args, image_out, kernels)
+            with timed(manifest, "verify"):
+                manifest["verify"] = stage_verify(args, image_out, kernels)
         manifest["status"] = "pass"
     except Exception as error:
         manifest["status"] = "fail"
         manifest["error"] = "%s: %s" % (type(error).__name__, error)
         raise
     finally:
+        manifest.setdefault("timing_seconds", {})["total"] = round(time.monotonic() - started, 1)
+        manifest["changes"] = describe_changes(previous, manifest)
         passed = manifest.get("status") == "pass"
         (args.target / ("manifest.json" if passed else "manifest.failed.json")).write_text(
             json.dumps(manifest, indent=2) + "\n")
