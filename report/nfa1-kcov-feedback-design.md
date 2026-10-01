@@ -1,5 +1,9 @@
 # NF-A1 transport KCOV: 관측과 fuzzing 피드백의 간극
 
+> **기록 안내 (2026-10-01).** 이 문서의 수집기(`nfa1-kcov-observer.c`)와 실행 어댑터(`nfa1-kcov-presence.py`)는
+> 커밋 `7833ed3`에서 제거되었고, 커널 패치(`bundle/patches/kernel/0013-*`)만 시리즈에 남아 있습니다.
+> 설계 기록으로만 보존합니다.
+
 ## 현재 상태와 문제
 
 기존 요청별 remote KCOV는 RPC 레코드와 소유권을 확인한 뒤

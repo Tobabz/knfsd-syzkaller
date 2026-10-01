@@ -4,14 +4,20 @@ This directory is a small parser-checked corpus assembled from the reusable
 inputs audited in `report/normal-flow-corpus.md`. The `.prog` files are copied
 by value: there are no links back to the Wave1 or Wave3 source worktrees. `manifest.json` is the
 machine-readable contract and records source hashes, NF flows, protocol,
-transport, exact fixture path/guest setup command, functional oracle, current
-execution status, exclusions, and gaps.
+transport, guest setup, functional oracle, current execution status, exclusions, and gaps.
+
+> **Status note (2026-10-01).** The A/B harness, the NF-A1 and B06 observers and the attribution
+> scenario runner that produced the runtime evidence cited below were removed in commit `7833ed3`.
+> The evidence statements stay as records of what those runs showed; seeds are run with a stock
+> syz-manager.
 
 Paths to files inside this repository, here and in `manifest.json`, are relative to the
-repository root (`runner_working_directory` is `.`); run the commands from the root. The
-kernel/image environment is `env/` (`env/images/<variant>/{bzImage,vmlinux}`,
-`env/images/bookworm-kcov-fresh-v1.raw`, `env/syzkaller`); change that prefix if the
-environment lives elsewhere.
+repository root. The kernel/image environment is `env/` (`env/images/<variant>/{bzImage,vmlinux}`,
+`env/images/bookworm-kcov-fresh-v1.qcow2`, `env/syzkaller`).
+
+Guest setup comes from the baked image: `frozen-phase9-fixture.service` runs
+`lane.sh setup /tmp/frozen-phase9.manager 4` at boot, with the NFS minor version chosen by
+`bootstrap --minor N`. Run syz-manager with `procs` equal to that lane count (4).
 
 Parser success only proves that the pinned syzkaller parser can deserialize an
 input. It does not prove mount setup, an NFS reply, a background transition,
@@ -21,17 +27,17 @@ were run separately for runtime evidence; results are cited per input below.
 
 ## Intended scenarios -> corpus contract
 
-Each intended scenario has one `.prog` in this directory. Its fixture sets the
+Each intended scenario has one `.prog` in this directory. The baked image's fixture sets the
 NFS version and mount topology; a parser PASS alone does not execute it.
 `NF-*` identifies targeted source flows, not proof that every transition or
 its KCOV was observed.
 
-| Intended scenario | Corpus input and consumer | Target flow and observed limit |
+| Intended scenario | Corpus input | Target flow and observed limit |
 | --- | --- | --- |
-| Two-client v4.1/TCP file operations and lock conflict | `basic-v41-tcp.prog` via `tools/run-ab.sh` and `tools/ab-lane-fixture.sh` (2 lanes) | NF-A2 succeeds in paired VM trials (34 calls, expected conflict at call 14); local and remote KCOV collected. NF-A1's socket-to-nfsd handoff was **not** directly witnessed for this input. |
-| v4.2/TCP asynchronous 32 MiB COPY and CB_OFFLOAD | `async-copy-v42-tcp.prog` bound by `B05-V1.json` to `ab-lane-fixture-v42.sh`; R2 witness reuses the same input | NF-A2, NF-C1 and COPY-completion NF-D1 observed in paired B05 VM trials; NF-A1 transport handoff observed separately in R2 ON. Remote KCOV collected, but callback-worker PCs are absent from on-only coverage; KCSAN reports remain. |
-| Two-client v4.1/TCP delegation grant, conflict and CB_RECALL | `delegation-recall-v41-tcp.prog` via `tools/run-reach-adapted-window.py --callback-observer b06-recall` and `tools/ab-lane-fixture.sh` (1 lane) | NF-D3 recall, NF-D1 callback work and NF-D2 `svc_process_bc` dispatch observed in paired r3 VM trials; ON remote KCOV collected without a `svc_process_bc` PC. NF-A1 transport ingress, earlier NF-D2 receive/queue, and separate DELEGRETURN are **not** established. |
-| v3/TCP simple fixture-file read | `basic-read-v3-tcp.prog`; fixture vendored as `ab-lane-fixture-v3.sh` (copied from the former Wave3 B04, unverified) | NF-A1/NF-A2 are intended only. The input parses, but fixture setup failed before workload: no functional VM PASS, handoff witness or KCOV claim. It does not exercise NF-B1 defer/revisit. |
+| Two-client v4.1/TCP file operations and lock conflict | `basic-v41-tcp.prog` | Fresh paired v4.1/TCP VM functional and KCOV PASS for NF-A2; NF-A1 socket-to-nfsd transport handoff was not directly traced in this run. |
+| v4.2/TCP asynchronous 32 MiB COPY and CB_OFFLOAD | `async-copy-v42-tcp.prog` | Fresh corpus-local B05 paired v4.2/TCP VM PASS for async COPY and callback; separate NF-A1 R2 ON VM confirms a direct socket-to-nfsd handoff on the same input. Strict parser mode still rejects legacy line-7 offset strings. |
+| Two-client v4.1/TCP delegation grant, conflict and CB_RECALL | `delegation-recall-v41-tcp.prog` | Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced. |
+| v3/TCP simple fixture-file read | `basic-read-v3-tcp.prog` | UNRESOLVED. Parser-only; never executed. See the v3 item under Adversarial boundary. |
 
 NF-B1, NF-B2 and NF-E1 through NF-E5 have no matching normal `.prog` and
 event-armed fixture; the exclusions and unsupported transports are enumerated
@@ -49,32 +55,10 @@ brackets softirq `svc_data_ready` through `svc_xprt_enqueue` and the nfsd
 `svc_process` and all managed `.extra` files. No legacy observational PC is
 merged into a managed generation.
 
-`nfa1-kcov-observer.c` is the standalone guest KCOV controller. The
-`nfa1-kcov-presence.py` adapter starts it after fixture setup, stops it after
-the workload and managed drains, and keeps its raw PCs and metadata **outside**
-the executor's `coverage/` archive. Bootstrap already builds the static controller as
-`env/images/nfa1-kcov-observer`; the first command below rebuilds it by hand. Use the
-KCSAN kernel built from the full series with the original snapshot image:
+The standalone guest observer (`nfa1-kcov-observer.c`) and the adapter that measured stage presence
+were removed in commit `7833ed3`; the kernel patch stays in the series.
 
-```sh
-K=env/images
-gcc -static -O2 -std=gnu11 -Wall -Wextra -Werror \
-    -o "$K/nfa1-kcov-observer" bundle/corpus/nfs-normal/nfa1-kcov-observer.c
-python3 -B bundle/corpus/nfs-normal/nfa1-kcov-presence.py \
-    --observer-binary "$K/nfa1-kcov-observer" \
-    --kernel "$K/kcsan/bzImage" --vmlinux "$K/kcsan/vmlinux" \
-    --image "$K/bookworm-kcov-fresh-v1.raw" \
-    --ssh-key artifacts/bookworm.id_rsa \
-    --deps-tar bundle/src/guest-deps.tar.gz \
-    --lane-fixture bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh \
-    --workload bundle/corpus/nfs-normal/async-copy-v42-tcp.prog \
-    --syz-bin env/syzkaller \
-    --mode both --trials 1 --executions 10 --sample-every 10 \
-    --procs 2 --cpus 8 --memory 8192 --output <new-absolute-output-path>
-```
-
-The fresh paired V2 run at
-`/home/idealinsane/normal-flow-evidence/NF-A1-KCOV-V2-20260928/` passed:
+The last recorded paired V2 run (its evidence directory has since been removed) passed:
 OFF collected 16,053 observer PCs across the three transport stages and
 zero managed PCs; ON collected 13,065 observer PCs with all three stages
 present and 721,547 managed PCs including `svc_process`. Both observer
@@ -90,21 +74,14 @@ therefore do not prove nonexecution.
 
 ## Inputs
 
-| Input | NF flow | Version / transport | Fixture and exact guest setup | Functional expected result | Current status |
+| Input | NF flow | Version / transport | Fixture and guest setup | Functional expected result | Current status |
 | --- | --- | --- | --- | --- | --- |
-| `basic-v41-tcp.prog` | NF-A1, NF-A2 | v4.1 / TCP | `tools/ab-lane-fixture.sh`; `/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 2`; integrated entry point: `tools/run-ab.sh` | All 34 calls finish each execution; call 14 alone returns errno 11; all others return 0; positive local KCOV and the create/write/read/rename/unlink effects are required. | **VM PASS**: `/home/idealinsane/normal-flow-evidence/NF-A1-A2-basic-v41-tcp-v1/` records OFF+ON paired PASS, v4.1/TCP, 4 vCPUs, 2 lanes, 34 calls, 1 execution, expected_lock_conflicts=1, 53 nfsd RPCs each mode. Confirms NF-A2 functional success. No NF-A1 transport witness was captured, so physical handoff is not proven at v4.1. KCSAN: ON 1 report, OFF 0. Host teardown clean. |
-| `async-copy-v42-tcp.prog` | NF-A1, NF-A2, NF-C1, COPY-completion NF-D1 | v4.2 / TCP | `bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh`; `/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 2`; from the main root run `/usr/bin/python3 tools/attr-scenario-run.py --scenario bundle/corpus/nfs-normal/B05-V1.json --output /home/idealinsane/attr-scenario-evidence/<unique-normal-B05-run>` | `copy_file_range` returns 32 MiB, `nfsd4_do_async_copy` runs, CB_OFFLOAD completes with status 0, then destination fsync and closes finish. | **VM PASS**: B05 CORPUS fresh paired run at `/home/idealinsane/attr-scenario-evidence/NORMAL-B05-CORPUS-20260928/` consumed this corpus-local scenario, workload, and fixture; it records overall PASS, all 21 checks, 10 executions each mode, on-only fs/nfsd 1,421 unique PCs, remote_start_ok=68, generation_committed=11. R2 COPY at `/home/idealinsane/normal-flow-evidence/NF-A1-COPY-20260928-R2/` confirms 10x 32 MiB returns, NF-A1 transport witness (assert=true, independently confirmed by st_01a0e678), and 10/10 callback deliveries (ON-only, 8 vCPUs, 2 lanes). The runner does not consume `nfs-normal/manifest.json`; the original B05 scenario is a byte-identical alternate baseline, not this run's binding. `nfsd4_run_cb_work` absent from on-only KCOV. KCSAN: B05 CORPUS OFF 2 reports; R2 ON 2 reports. Historical B05-V1-g703-20260927 retained as audited baseline. Strict mode's known line-7 `wrong string arg` is not repaired without a VM test. |
-| `delegation-recall-v41-tcp.prog` | NF-A1, NF-A2, NF-D3, NF-D1, NF-D2 | v4.1 / TCP | Main fixture `tools/ab-lane-fixture.sh`; `/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 1` | All 15 calls (indexes 0-14) finish with errno 0. Separately prove delegation grant before conflict, then ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and return/close. File effects alone are insufficient. | **VM PASS**: r3 at `/home/idealinsane/normal-flow-evidence/B06-V1-delegation-recall-v41-r3/` records OFF+ON paired PASS, v4.1/TCP, 8 vCPUs, 1 lane, 1 proc, 15 calls, 10 executions. Both b06-verdict files show assert=true, delegation_grant_observed=true, complete_recall_chain_observed=true, matched_recalls=2, record_backchannel delta=20 (0 before, 20 after). ON status OBSERVED_OWNERLESS_KCOV: 294,223 remote PCs in ten extras; svc_process_bc absent from KCOV but execution proved by svc_process_bc_entry x20 in the trace. Functional: 150 calls, all errno 0. KCSAN: OFF 1 report, ON 0. Independently confirmed by gate st_01a0e689 (`B06-r3-runtime-gate.md`) with server-to-client stateid CRC validation. DELEGRETURN not separately traced. Full xprtiod->BC queue boundary not claimed. Parser accepts 3 malformed synthetic classes; actual r3 passes independent checks. Historical r2 OFF-only preliminary evidence superseded by this r3 paired run. |
-| `basic-read-v3-tcp.prog` | NF-A1, NF-A2 only | v3 / TCP forechannel and TCP mount protocol | Vendored fixture `bundle/corpus/nfs-normal/ab-lane-fixture-v3.sh` (SHA-256 93edf872c6173aede8a30abede8f983470123309337bb7f5fc81d42146a4a7ab); `/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.<RUNNER_RANDOM> 1` | Open `nfs-lane/client0/shared/fixture`, read its 30-byte `frozen Phase 9 lane 0 fixture\n` content into the 128-byte buffer, return 30, and close successfully. This input does not prove NF-B1. | Parser-only; Wave3 B04 fixture attempts r4-r11 failed setup before workload, and the vendored fixture remains blocked/unverified. |
+| `basic-v41-tcp.prog` | NF-A1, NF-A2 | 4.1 / TCP | `bundle/ab-runner/frozen_phase9_lane.sh` — baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | All 34 calls finish on each execution; call 14 is the deliberate peer-lock conflict and returns errno 11, every other call returns errno 0, local KCOV is positive, and create/write/read/rename/unlink effects succeed across both mounts. | Fresh paired v4.1/TCP VM functional and KCOV PASS for NF-A2; NF-A1 socket-to-nfsd transport handoff was not directly traced in this run. |
+| `async-copy-v42-tcp.prog` | NF-A1, NF-A2, NF-C1, NF-D1 | 4.2 / TCP | `bundle/corpus/nfs-normal/ab-lane-fixture-v42.sh` — baked image (bootstrap --minor 2): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | copy_file_range returns 33554432, async execution reaches nfsd4_do_async_copy, CB_OFFLOAD completes with status 0, and destination fsync and closes finish. | Fresh corpus-local B05 paired v4.2/TCP VM PASS for async COPY and callback; separate NF-A1 R2 ON VM confirms a direct socket-to-nfsd handoff on the same input. Strict parser mode still rejects legacy line-7 offset strings. |
+| `delegation-recall-v41-tcp.prog` | NF-A1, NF-A2, NF-D3, NF-D1, NF-D2 | 4.1 / TCP | `bundle/ab-runner/frozen_phase9_lane.sh` — baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot | First prove delegation grant; then the client1 conflict must produce ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and delegation return/close. File effects alone do not pass. | Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced. |
+| `basic-read-v3-tcp.prog` | NF-A1, NF-A2 | 3 / TCP forechannel and TCP mount protocol | Vendored fixture `bundle/corpus/nfs-normal/ab-lane-fixture-v3.sh` (SHA-256 93edf872c6173aede8a30abede8f983470123309337bb7f5fc81d42146a4a7ab); not supported by the baked lane script, never completed setup | Open nfs-lane/client0/shared/fixture, read the 30-byte fixture content into a 128-byte buffer, return 30 bytes, and close successfully. This normal input does not by itself prove NF-B1 defer/revisit. | UNRESOLVED. Parser-only; never executed. See the v3 item under Adversarial boundary. |
 
-Invoke the B06 runner with `KOOV_EXPECTED_CALLS=15 KOOV_CONFLICT_CALL=-1` and `--callback-observer b06-recall`; the shared AB defaults remain 34 calls with conflict call 14.
-
-`<RUNNER_RANDOM>` is the alphanumeric suffix produced by the runner's
-`mktemp -d /tmp/frozen-phase9.XXXXXX`; the resulting full path is passed
-verbatim. The host fixture is copied into the guest as
-`/opt/frozen-phase9/lane.sh` before that command. Cleanup is runner-owned and
-must call the same fixture's `cleanup` action for the allocated root; no manual
-host invocation is valid because these fixtures are disposable-VM-only.
+The fixtures are disposable-VM-only; they run inside the baked guest, never on the host.
 
 ## Parser contract
 
@@ -136,17 +113,9 @@ untested behavioral rewrite.
 | LOCALIO | Compiled but disabled; no input or fixture exists. |
 | NAT | Direct-veth operation does not establish address-rewritten pairing. |
 
-The bounded Gate8 reference above is
-`/home/idealinsane/frozen-gate8-baked-evidence12/phase8-evidence.json` (historical
-PASS 28/28). Its exact clean-Wave1 runner command is:
-
-```
-/usr/bin/python3 bundle/ab-runner/phases/run_frozen_phase8_vm.py --kernel env/images/kcsan/bzImage --image env/images/bookworm-kcov-fresh-v1.raw --ssh-key artifacts/bookworm.id_rsa --deps-tar bundle/src/guest-deps.tar.gz --lane-script tools/ab-lane-fixture-gate8.sh --output <unique>
-```
-
-That command runs six cases and has no single-case selector. The v4.2 fixture's
-presence of an `nfsdcld` binary is not an NF-E4 fixture: there is no before-fixture
-probe, so NF-E4 remains a gap.
+The bounded Gate8 reference above is historical evidence from the phase8 runner, which was removed
+in commit `7833ed3`. The v4.2 fixture's presence of an `nfsdcld` binary is not an NF-E4 fixture: there is no
+before-fixture probe, so NF-E4 remains a gap.
 
 Wave3 B07 is excluded because it is byte-identical to B05 and only its forced
 owner-window runner changes the experiment. Wave3 B12 is excluded because its

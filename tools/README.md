@@ -1,110 +1,93 @@
-# tools/ — knfsd-syzkaller 포워드포트 도구
+# tools/ — knfsd-syzkaller 환경 구축 도구
 
-핸드오프 패치 시리즈(`bundle/patches/`: kernel 11패치 + syzkaller 15패치)를 **신규
-커널/syzkaller rc로 전진 이식**하는 자동화 파이프라인입니다.
-설계 계약(`report/design-spec.md` R1..R6, 기계 판정 `fport-design-gate.sh`)이 **최종 권위**이며,
-패치 적용은 그 계약을 가시화하는 구현 단계일 뿐입니다. 사람의 손이 필요한 단계는
-신규 rc 충돌 시 패치를 재생성하는 것 하나뿐입니다.
+베이스 이미지 생성, 환경 부트스트랩(커널 두 종류·syzkaller 빌드·VM 이미지 bake·검증), 패치 시리즈 적용,
+그리고 Ganesha·NFS 프록시 빌드 도구를 모아 둔 디렉터리입니다.
+A/B 하네스, 관측기, 설계 게이트, 포워드포트 오케스트레이터(`fport-pipeline.sh`)는
+커밋 `7833ed3`에서 제거했습니다. 시드는 stock syz-manager로 실행합니다(`README.md` 3절).
 
 ## 진입점
 
 ```sh
-# 로컬 재검증 (빠름, 결정적 — 기본 모드)
-bash tools/fport-pipeline.sh --mode reuse
-
-# 신규 rc 포팅 (다시간; 신선 환경 필요)
-bash tools/fport-pipeline.sh --mode full --kind kernel \
-    --target <신선 클론> --new-base <해시>
+sudo bash tools/make-base-image.sh --out artifacts         # 사이트별 베이스 이미지 + 키쌍
+python3 tools/bootstrap-kcov-env.py env \
+    --base-image artifacts/bookworm-base.img \
+    --ssh-key artifacts/bookworm.id_rsa \
+    --deps-tar bundle/src/guest-deps.tar.gz --minor 1      # env/images/<variant>/ 생성
 ```
-
-| 옵션 | 값 | 기본 |
-|---|---|---|
-| `--mode` | `reuse` \| `full` | reuse |
-| `--kind` | `kernel` \| `syzkaller` | kernel |
-| `--target` | 대상 저장소 경로 | `<root>/env/linux` |
-| `--new-base` | 신규 rc 커밋 해시 | "" |
-| `--phases` | 실행할 페이즈 `a,b,..` | all |
-| `--no-checkpoint` | sentinel 건너뜀 | off |
-| `--help` | 사용법 출력 | - |
-
-**종료코드**: `0`=DESIGN HOLDS · `1`=게이트 실패 · `2`=전제조건 위반 ·
-`10`=적용 실패(인간 체크포인트 — bundle 갱신 후 재실행 시 P3부터 재개) · `20`=환경 실패
-
-## 페이즈 P0..P7
-
-| 페이즈 | 역할 |
-|---|---|
-| P0 provision | 도구 점검(git/python3/sha256sum/qemu-img) + WORK_ROOT 유도 |
-| P1 detect | sentinel 파일로 이미-적용 판정 — kernel: `net/sunrpc/fuzz.c`, syzkaller: `sys/linux/fs_nfs_fuzz.txt` |
-| P2 variant | `fport-variant.sh`로 rc 변형 기록 (스크래치 워크트리, target 불변) |
-| P3 apply | `fport-apply.sh` 자체 적용 — base 일치/불일치 모두 sha 검증 + `git am -3`, drift 시 rerere+변형 fallback |
-| P4 build-check | 빌드 검증 |
-| P5 gates | `fport-design-gate.sh` R1..R6 판정 (DESIGN HOLDS?) |
-| P6 evidence | 일반 코퍼스 AB 증거 (reuse: 기존 증거 재사용) |
-| P7 report | `runs/port-<kind>-<stamp>/` 런 매니페스트 + `port-run.md` |
-
-## 설계 게이트 R1..R6 (R3 철회)
-
-```sh
-bash tools/fport-design-gate.sh -v     # exit 0 = DESIGN HOLDS
-```
-
-| 게이트 | 계약 | 실측 (reuse 본체) |
-|---|---|---|
-| R1 build-integrity | 부트스트랩 `status: pass` + mem_sanitizer ∈ {kasan,kcsan} | PASS |
-| R2 remote-contribution | OFF fs/nfsd=0 vs ON>0, converged | PASS (0 vs 1,748) |
-| ~~R3 throughput-bound~~ | ~~ON/OFF exec·RPC/s ≥ 0.90~~ — 2026-09-26 철회 (환경 의존 가짜 실패; 비율은 증거에 기록 유지) | — |
-| R4 coverage-depth-general | `on_only ≥ 100` + 핸들러 랭킹 + `nfsd4_proc_compound` | PASS (1,748) |
-| R5 evidence-chain-general | status/integrity/지분 ≥ 95%, 셋 6종 | PASS (100%, 6/6) |
-| R6 apply-audit | 번들 2종 SHA256SUMS 자기 일치 + 핀 11/15 | PASS (2/2 · 11/11 · 15/15) |
-
-## 경로 이식성 (전제: `~` 구조 배치·fetch·부트스트랩 산출물)
-
-스크립트는 **자기 위치에서 WORK_ROOT를 유도**하며, 필요 시 환경변수로 오버라이드합니다:
-
-| 변수 | 의미 |
-|---|---|
-| `KOOV_WORK_ROOT` | 작업 루트 (기본: `tools/..`) |
-| `KOOV_BUNDLE` | 시리즈 경로 (기본: `<root>/bundle/patches`) |
-| `KOOV_MANIFEST` | 부트스트랩 매니페스트 (기본: `<root>/env/manifest.json`) |
-| `PORT_RUNS` | 런 기록 위치 (기본: `<root>/runs`) |
-| `KOOV_PATCH_VARIANTS` | rc 변형 보관 위치 (기본: `<root>/tools/patch-variants`) |
 
 ## 도구 목록
 
 | 도구 | 용도 |
 |---|---|
-| `fport-pipeline.sh` | 오케스트레이터 P0..P7 |
-| `fport-apply.sh` | 자체 시리즈 적용 — `fport-apply.sh [--dry-run] [--variant-dir DIR] <kind> <target>` |
+| `make-base-image.sh` | 사이트 로컬 베이스·키쌍 생성 (create-image.sh -d bookworm; sudo 필요, 산출물은 `SUDO_USER` 소유로 되돌림) |
+| `bootstrap-kcov-env.py` | env 부트스트랩 — `--variant kasan\|kcsan`별 out-of-tree 커널 빌드, syzkaller 빌드, VM 이미지 bake, variant별 부팅 검증 |
+| `fport-apply.sh` | 자체 시리즈 적용 — `fport-apply.sh [--dry-run] [--variant-dir DIR] <kind> <target>` (bootstrap이 호출) |
 | `fport-variant.sh` | rc 변형 기록 — `fport-variant.sh <kind> <target> <new-base> [이름]` |
-| `fport-design-gate.sh` | R1..R6 기계 판정 — `-v` |
-| `README-tests.md` | T1–T7 검증 배터리 체크리스트 |
-| `bootstrap-kcov-env.py` | env 부트스트랩 — 시리즈 적용은 `fport-apply.sh` 연동 |
-| `run-ab.sh`·`analyze-ab.sh`·`run_ab_adapted.py` | 일반 코퍼스 AB 하네스 (관례 절대경로 — `<root>` 구조만 준비하면 됨) |
-| `make-base-image.sh` | 사이트 로컬 베이스·키쌍 생성 (create-image.sh -d bookworm; 자산 해제 모델의 필수 선행, sudo 필요) |
-| `release-assembly.sh` | (선택) 유지보수 스냅샷 조립 (SHA256SUMS 3항목 기반, raw/베이스/키 미포함 — `--minimal`은 3항목만) |
-| `tool-requirements.txt` | 팀메이트 호스트 의존성 정형화 (README-HANDOFF 'Reproduce' 전제) |
-
+| `release-assembly.sh` | (선택) 번들 스냅샷 tar 조립 |
+| `tool-requirements.txt` | 호스트 의존성 목록 |
+| `lane-quote-lint.sh` | `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
 | `ganesha-lane.sh` | NFS-Ganesha 레인 fixture (knfsd/both/ganesha 3모드, 별도 tmpfs·별도 export) |
-| `ganesha-lane-run.sh` | Ganesha 축 러너 (fixture + 전용 deps tarball + 전용 코퍼스) |
 | `build-ganesha-deps.sh` | `guest-deps-ganesha.tar.gz` 생성 — root 불필요, `.deb`→의존성 closure→주입 트리 |
 | `build-ganesha-asan.sh`·`ganesha-asan-container.sh` | bookworm 4.3-2 소스·패치로 Ganesha 실행 파일/코어/VFS를 GCC ASan으로 빌드하고 별도 deps tar 생성 (Docker 사용) |
-| `ganesha-asan-lane-run.sh`·`run-ganesha-asan-smoke.py` | 게스트에서 ASan 실로드·NFSv4 호출 결과·로그·정리 검증 (원격 KCOV AB와 분리) |
-| `nfs-proxy/build-guest.sh`·`nfs-proxy/ganesha-asan-relay-run.sh` | Debian bookworm ABI 프록시와 2클라이언트 × 2백엔드 ASan 게스트 릴레이 게이트 |
-| `run_frozen_phase9_vm_ganesha.py` | phase9 러너 적응 사본 — 백엔드 중립 lane 게이트 |
-| `nfs_remote_kcov_ganesha_v41_workload.prog` | 두 구현이 모두 통과하는 코퍼스 (호출 수·인덱스 불변) |
-| `lane-quote-lint.sh` | `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
-## 검증·증거 규율
+| `nfs-proxy/` | NFS 프록시 소스·테스트와 빌드 스크립트 (`build.sh`, `build-guest.sh`, `build-syzkaller.sh`, `guest-build.sh`) |
 
-```sh
-bash tools/fport-pipeline.sh --mode reuse
-```
+## 환경 변수 (`KOOV_*`)
 
-- 번들(`bundle/patches/` 2종 시리즈)은 검증 기준 — 시리즈 수정 시 게이트 R6 재확인.
+스크립트의 경로는 자기 위치에서 유도합니다. 현재 코드가 읽는 주요 변수:
+
+| 변수 | 기본값 | 용도 |
+|---|---|---|
+| `KOOV_WORK_ROOT` | 스크립트 위치의 부모 | 작업 루트(파생 경로 기준) |
+| `KOOV_BUNDLE` | `<root>/bundle/patches` | 패치 시리즈 위치 |
+| `KOOV_ABRUNNER` | `<root>/bundle/ab-runner` | bake 입력(lane 스크립트·서비스) 위치 |
+| `KOOV_BAKER` | `<root>/bundle/baker` | 이미지 baker 위치 |
+| `KOOV_ARTIFACTS_DIR` | `<root>/artifacts` | `make-base-image.sh` 출력 위치 |
+| `KOOV_PATCH_VARIANTS` | `<root>/tools/patch-variants` | rc 변형 보관 위치 |
+| `KOOV_SYZ_TARGET` | `<root>/env/syzkaller` | `nfs-proxy/build-syzkaller.sh`의 대상 트리 |
+
+Ganesha·프록시 스크립트가 읽는 `KOOV_GANESHA_*`, `KOOV_NFS_PROXY_*`, `KOOV_TMPFS_SIZE`, `KOOV_KNFS_PORT`,
+`KOOV_UBSAN_OPTIONS`는 각 스크립트 머리 주석을 참조합니다.
+
+## 배포
+
+- **릴리스 자산 없음 (2026-09-26 자산 해제 모델)**: 상류 소스(커널·syzkaller)는
+  bootstrap이 핀 ref에서 클론(`--kernel-repo`/`--syz-repo`), 베이스·키쌍은
+  `tools/make-base-image.sh`로 **사이트별 생성** (raw `bookworm-base.img`는
+  커밋·배포 절대 금지).
+- 커밋된 부트스트랩 입력: `bundle/src/guest-deps.tar.gz`, `bundle/patches/kernel.config`(KASAN),
+  `bundle/patches/kernel-kcsan.config`(KCSAN, KASAN off · `CONFIG_KCSAN=y`) — 두 config는
+  bootstrap의 `--variant`가 고르며, 개별 무결성은 git과 bootstrap manifest의
+  `kernel.variants.<variant>.config_sha256`가 기록합니다.
+- (선택) `bash tools/release-assembly.sh` → 유지보수용 번들 스냅샷 (배포 아님).
+
+## 경계
+
+- **번들 독립 구조** (2026-09-25): `bundle/` = `src/`(원천) · `patches/`(독립 시리즈) ·
+  `ab-runner/`(bake 입력 lane 스크립트·서비스) · `baker/`(프로비저닝) · `corpus/`(시드 코퍼스).
+- **파이프라인 스코프**: `fport-apply.sh`의 `--kind`는 `kernel|syzkaller`만.
+
+## 문서 맵
+
+| 문서 | 내용 |
+|---|---|
+| `report/design-spec.md` | 설계 계약 기록 (활성 게이트는 manifest 기반 Ψ1·Ψ2·R1만) |
+| `report/normal-flow-corpus.md` | 정상 NFS 실행 흐름 코퍼스의 범위·감사 기록 |
+
+## 라이선스
+
+- `tools/`·`bundle/`(`ab-runner/`·`baker/`·`corpus/`)·`report/` 문서: **MIT** (`LICENSE`, 작업 루트)
+- 커널 시리즈: **GPL-2.0**(파생), syzkaller 시리즈: **MIT**(상류 소유)
+  — 세부 귀속·고지는 `THIRD-PARTY-LICENSES.md`
 
 ---
 
 ## NFS-Ganesha 병렬 축 (2026-09-26) — A 미실증(프록시 선행), B 실증
+
+> **기록 안내 (2026-10-01).** 아래는 2026-09-26 시점의 작업 기록입니다. 본문이 언급하는 러너·스모크·A/B 게이트
+> (`ganesha-lane-run.sh`, `ganesha-lane-control.sh`, `ganesha-lane-parity.sh`, `ganesha-asan-lane-run.sh`,
+> `run-ganesha-asan-smoke.py`, `run_frozen_phase9_vm_ganesha.py`, `nfs-proxy/ganesha-asan-relay-run.sh`,
+> `nfs-proxy/ganesha-asan-relay-ab-run.sh`, `nfs-proxy/run-ganesha-asan-relay-*.py`)와 그 증거는
+> 커밋 `7833ed3`에서 제거되었습니다. `build-ganesha-*.sh`, `ganesha-lane.sh`, `nfs-proxy/` 소스와 빌드 스크립트는 그대로 유효합니다.
 
 knfsd와 **병렬로** 수행해 퍼징 처리량을 높이는 축이다. 동시에 병렬 퍼징이 만드는
 **부작용을 완화하는 설계**를 고도화한다. 둘은 성격이 다른 작업이라 따로 판정한다.
@@ -271,61 +254,3 @@ NFSv4 pseudoroot에 엔트리를 만드는 쓰기에서 knfsd는 0, Ganesha 4.3�
 
 **프록시 게스트 릴레이는 확인됐다.** 다음은 샌드박스 고정 경로의 `arm` IPC,
 생성/재생 델타, syzkaller `(client,backend)` 연결 선택의 실제 통합이다.
-
-## 문서 맵
-
-| 문서 | 내용 |
-|---|---|
-| `report/design-spec.md` | Ψ/R1,R2,R4,R5 설계 계약 + 재구현 지침 |
-
-
-## 환경 변수 (`KOOV_*`)
-
-파이프라인·AB 하네스의 절대경로는 자기 위치에서 유도한다(이식 가능 트리).
-`KOOV_WORK_ROOT`로 작업 루트를 잡으면 아래 파생 경로가 함께 따라간다.
-
-| 변수 | 기본값 | 용도 |
-|---|---|---|
-| `KOOV_WORK_ROOT` | 스크립트 위치의 부모 | 작업 루트(파생 경로 기준) |
-| `KOOV_ENV_DIR` | `$WORK_ROOT/env` | 커널·이미지·syzkaller 빌드 환경 |
-| `KOOV_BUNDLE_DIR` | `$WORK_ROOT/bundle` | 불변 번들 루트 |
-| `KOOV_EVIDENCE_DIR` | `$WORK_ROOT/evidence` | AB 증거 출력 |
-| `KOOV_ABRUNNER_DIR` | `$WORK_ROOT/bundle/ab-runner` | phase 런너 소재지 |
-| `KOOV_SYZ_ROOT` | `/home/fuzzer/tools/syzkaller-frozen-attribution` | syzkaller 바이너리 기본 경로(원본 핸드오프 호스트 폴백) |
-| `KOOV_SYZ_BIN` | (미설정) | 외부 syzkaller 빌드 루트(`bin/linux_amd64/` 포함) — `run-ab.sh`가 `--syz-bin`으로 전달 |
-| `KOOV_OUT` | `$TOOLS/ab-lane-fixture.sh` | lane fixture 생성 목적지 |
-
-- `bundle/` 원본(`ab-runner/`·`corpus/`·`baker/`)의 내부 `/home/fuzzer` 기본값은 불변 정책상 유지 — 런타임 오버라이드(`KOOV_SYZ_ROOT` 등)로 대체.
-- syzkaller 바이너리 외부화: `run_ab_adapted.py --syz-bin <빌드 루트>`(또는 `run-ab.sh`의 `KOOV_SYZ_BIN`)로 env/ 기본 빌드 대신 외부 빌드를 소비. 소비 바이너리 경로·sha256은 `evidence/experiment_manifest.json`의 `inputs.syz_executor`/`inputs.syz_execprog`에 기록된다.
-
-## 배포
-
-- **릴리스 자산 없음 (2026-09-26 자산 해제 모델)**: 상류 소스(커널·syzkaller)는
-  bootstrap이 핀 ref에서 클론(`--kernel-repo`/`--syz-repo`), 베이스·키쌍은
-  `tools/make-base-image.sh`로 **사이트별 생성** (raw `bookworm-base.img`는
-  커밋·배포 절대 금지).
-- 커밋된 부트스트랩 입력은 `bundle/SHA256SUMS`(고정 **3항목**:
-  `guest-deps.tar.gz`·`patches/kernel.config`·`README-HANDOFF.md`)로 핀.
-- KCSAN 변형 핀 `patches/kernel-kcsan.config`(KASAN off · `CONFIG_KCSAN=y`)는
-  **선택 입력**으로 bootstrap의 `--variant kcsan`이 선택하며 루트 SHA256SUMS 밖 —
-  개별 무결성은 git 과 bootstrap manifest 의 `pins.kconfig` 가 핀한다.
-- (선택) `bash tools/release-assembly.sh` → 유지보수용 스냅샷
-  `dist/knfsd-syzkaller-forward-port-<날짜>[-minimal].tar.gz` (배포 아님);
-  `--minimal`은 정확히 3항목만. AB 하네스 `run-ab.sh`는 생성 키를
-  `KOOV_SSH_KEY`로 넘긴다.
-
-## 경계
-
-- **번들 독립 구조** (2026-09-25): `repo/` 트리·`apply_patch_series.sh` 의존 제거.
-  `bundle/` = `src/`(원천) · `patches/`(독립 시리즈) · `ab-runner/`(AB 런처) ·
-  `baker/`(프로비저닝) · `corpus/`(코퍼스 전처리),
-  원본 `knfsd-fuzz-HEAD.tar.gz`는 해시를 `README-HANDOFF.md`에 기록 후 삭제.
-- **파이프라인 스코프**: `--kind`는 `kernel|syzkaller`만. R6는 번들 2종 검증(2/2).
-  상세는 `design-spec.md`.
-- **env/ 빌드 산출물**은 부트스트랩이 만든 일반 코퍼스 AB 오라클 — `--mode full` 포팅 시 신선 환경으로 교체.
-
-## 라이선스
-
-- `tools/`·`bundle/`(`ab-runner/`·`baker/`·`corpus/`)·`report/` 문서: **MIT** (`LICENSE`, 작업 루트)
-- 커널 시리즈: **GPL-2.0**(파생), syzkaller 시리즈: **MIT**(상류 소유)
-  — 세부 귀속·고지는 `THIRD-PARTY-LICENSES.md`

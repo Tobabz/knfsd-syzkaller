@@ -23,9 +23,9 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 | `patches/syzkaller/` | syzkaller series: 17 patches + `series` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
 | `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); built by `bootstrap-kcov-env.py --variant kcsan` | — |
-| `ab-runner/` | AB experiment lane drivers (`phases/run_frozen_phase*_vm.py`, lane/probe/bootstrap files, workload prog) | — |
+| `ab-runner/` | Lane fixture inputs baked into the image (`frozen_phase9_lane.sh`, `frozen_phase9_boot_fixture.sh`, `frozen-phase9-fixture.service`) | — |
 | `baker/` | protocol image baking (`bake_nfs_protocol_image.py`) | — |
-| `corpus/` | fuzz corpus / candidate preparation (`audit_*`, `build_*`) | — |
+| `corpus/` | seed corpus (`nfs-normal/`: `.prog` seeds, manifest, lane fixtures for NFS v3 and v4.2) | — |
 
 
 
@@ -133,8 +133,8 @@ pins changed are rebuilt.
 
 ## Fuzzing after bootstrap
 
-Point a syz-manager at the baked image with the generic
-`tools/portable-env` helper of your choice; the AB harness entry points
-are `tools/run-ab.sh` / `tools/analyze-ab.sh` (evidence lands in
-`evidence/`). The AB harness must use the generated key
-(`KOOV_SSH_KEY=artifacts/bookworm.id_rsa bash tools/run-ab.sh`).
+Point a stock syz-manager at the outputs: `kernel` = `<target>/images/<variant>/bzImage`,
+`kernel_obj` = the directory holding `vmlinux`, `image` = `<target>/images/bookworm-kcov-fresh-v1.qcow2`,
+`sshkey` = the generated `artifacts/bookworm.id_rsa`, `procs` = the fixture's lane count (4), and
+`experimental.remote_cover` to switch remote coverage. The earlier A/B harness was removed in
+commit `7833ed3`.
