@@ -1,0 +1,402 @@
+From 39d373da71bfffdcc296033acdfc38b9ceef4de8 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Thu, 1 Oct 2026 20:21:43 +0900
+Subject: [PATCH] sys/linux, executor: send raw NFS RPCs over plain TCP
+
+The kernel no longer provides the TCP_SUNRPC_FUZZ socket option or its
+control message: NFS server coverage is attributed by lane, so a raw RPC
+needs no per-socket or per-record attribution state.
+
+syz_socket_connect_nfs*() now connect an ordinary TCP socket in the lane's
+client netns, and syz_send_nfs_fuzz() sends one record-marked call with a
+plain sendmsg().  Its flags and user_tag arguments are kept with their
+previous values so that existing programs still parse; they are ignored.
+
+Replace setsockopt$inet_nfs_fuzz and the cmsg-carrying
+sendmsg$inet_nfs_fuzz_* variants with write$inet_nfs_fuzz, which writes one
+record-marked call on the manual socket path.  The descriptions no longer
+depend on uapi/linux/tcp.h constants.
+---
+ executor/common_linux.h             |  40 +++-------
+ sys/linux/nfs_fuzz_test.go          | 120 ++++------------------------
+ sys/linux/socket_inet_nfs.txt       |  67 ++++------------
+ sys/linux/socket_inet_nfs.txt.const |  11 +--
+ 4 files changed, 43 insertions(+), 195 deletions(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index cba4f4623..a006837c4 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2896,21 +2896,14 @@ static long nfs_socket_connect_pair(unsigned long client, unsigned long backend)
+ 	if (fd < 0)
+ 		saved_errno = errno;
+ 	if (fd >= 0) {
+-		int enabled = 1;
+-		if (setsockopt(fd, IPPROTO_TCP, 47, &enabled, sizeof(enabled))) {
++		struct sockaddr_in addr = {};
++		addr.sin_family = AF_INET;
++		addr.sin_port = htons(2049);
++		addr.sin_addr.s_addr = nfs_fuzz_server_addrs[backend];
++		if (connect(fd, (struct sockaddr*)&addr, sizeof(addr))) {
+ 			saved_errno = errno;
+ 			close(fd);
+ 			fd = -1;
+-		} else {
+-			struct sockaddr_in addr = {};
+-			addr.sin_family = AF_INET;
+-			addr.sin_port = htons(2049);
+-			addr.sin_addr.s_addr = nfs_fuzz_server_addrs[backend];
+-			if (connect(fd, (struct sockaddr*)&addr, sizeof(addr))) {
+-				saved_errno = errno;
+-				close(fd);
+-				fd = -1;
+-			}
+ 		}
+ 	}
+ 	if (setns(current_netns, CLONE_NEWNET))
+@@ -2971,12 +2964,14 @@ static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
+ {
+ 	// syz_send_nfs_fuzz(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call],
+ 	//                    msglen len[msg], flags const[...], user_tag proc[...])
++	// Sends one record-marked RPC call.  Server coverage is attributed by
++	// lane, so flags and user_tag are accepted for compatibility and ignored.
+ 	int fd = a0;
+ 	void* payload = (void*)a1;
+ 	size_t payload_len = a2;
+-	uint32 flags = a3;
+-	uint64 user_tag = a4;
+-	if (!payload || payload_len < 8 || payload_len > 0x7fffffff || !user_tag) {
++	(void)a3;
++	(void)a4;
++	if (!payload || payload_len < 8 || payload_len > 0x7fffffff) {
+ 		errno = EINVAL;
+ 		return -1;
+ 	}
+@@ -2986,23 +2981,10 @@ static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
+ 		{.iov_base = &marker, .iov_len = sizeof(marker)},
+ 		{.iov_base = payload, .iov_len = payload_len},
+ 	};
+-	struct {
+-		uint32 version;
+-		uint32 flags;
+-		uint64 user_tag;
+-	} control = {1, flags, user_tag};
+-	char control_buf[CMSG_SPACE(sizeof(control))] = {};
+ 	struct msghdr msg = {};
+ 	msg.msg_iov = iov;
+ 	msg.msg_iovlen = 2;
+-	msg.msg_control = control_buf;
+-	msg.msg_controllen = sizeof(control_buf);
+-	struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+-	cmsg->cmsg_level = IPPROTO_TCP;
+-	cmsg->cmsg_type = 47;
+-	cmsg->cmsg_len = CMSG_LEN(sizeof(control));
+-	memcpy(CMSG_DATA(cmsg), &control, sizeof(control));
+-	return sendmsg(fd, &msg, 0);
++	return sendmsg(fd, &msg, MSG_NOSIGNAL);
+ }
+ #endif
+ 
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 1e65fb4e9..bf1ab5ffb 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -4,32 +4,17 @@
+ package linux_test
+ 
+ import (
+-	"reflect"
+ 	"testing"
+ 
+ 	"github.com/google/syzkaller/prog"
+ 	_ "github.com/google/syzkaller/sys"
+ )
+ 
+-func TestNFSSunRPCFuzzABI(t *testing.T) {
++func TestNFSRawRPCSend(t *testing.T) {
+ 	target, err := prog.GetTarget("linux", "amd64")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	for name, want := range map[string]uint64{
+-		"TCP_SUNRPC_FUZZ":               47,
+-		"TCP_SUNRPC_FUZZ_VERSION":       1,
+-		"TCP_SUNRPC_FUZZ_F_NEW":         1,
+-		"TCP_SUNRPC_FUZZ_F_RETRY":       2,
+-		"TCP_SUNRPC_FUZZ_F_CANCEL":      8,
+-		"TCP_SUNRPC_FUZZ_F_NEW_FINAL":   5,
+-		"TCP_SUNRPC_FUZZ_F_RETRY_FINAL": 6,
+-	} {
+-		if got := target.GetConst(name); got != want {
+-			t.Errorf("%s=%d, want %d", name, got, want)
+-		}
+-	}
+-
+ 	socket := requireNFSFuzzCall(t, target, "socket$inet_nfs_fuzz_tcp")
+ 	if socket.CallName != "socket" {
+ 		t.Fatalf("socket variant calls %s, want ordinary socket", socket.CallName)
+@@ -38,23 +23,14 @@ func TestNFSSunRPCFuzzABI(t *testing.T) {
+ 	if !ok || ret.Desc.Name != "sock_nfs_fuzz_tcp" {
+ 		t.Fatalf("socket return type is %T %v, want sock_nfs_fuzz_tcp", socket.Ret, socket.Ret)
+ 	}
+-
+-	setopt := requireNFSFuzzCall(t, target, "setsockopt$inet_nfs_fuzz")
+-	if setopt.CallName != "setsockopt" {
+-		t.Fatalf("setsockopt variant calls %s, want ordinary setsockopt", setopt.CallName)
+-	}
+-	requireConst(t, setopt.Args[1].Type, 6, "setsockopt level")
+-	requireConst(t, setopt.Args[2].Type, 47, "setsockopt optname")
+-	optval, ok := setopt.Args[3].Type.(*prog.PtrType)
+-	if !ok {
+-		t.Fatalf("setsockopt optval is %T, want pointer", setopt.Args[3].Type)
+-	}
+-	requireConst(t, optval.Elem, 1, "setsockopt optval")
+-
+ 	connect := requireNFSFuzzCall(t, target, "connect$inet_nfs_fuzz")
+ 	if connect.CallName != "connect" {
+ 		t.Fatalf("connect variant calls %s, want ordinary connect", connect.CallName)
+ 	}
++	addr, ok := connect.Args[1].Type.(*prog.PtrType)
++	if !ok || addr.Elem.TemplateName() != "sockaddr_in" {
++		t.Fatalf("connect address is %T %v, want sockaddr_in pointer", connect.Args[1].Type, connect.Args[1].Type)
++	}
+ 	for _, name := range []string{
+ 		"syz_socket_connect_nfs$client0",
+ 		"syz_socket_connect_nfs$client1",
+@@ -68,6 +44,7 @@ func TestNFSSunRPCFuzzABI(t *testing.T) {
+ 			t.Fatalf("%s return type is %T %v, want sock_nfs_fuzz_tcp", name, call.Ret, call.Ret)
+ 		}
+ 	}
++	// The flag values are kept so that existing programs still parse.
+ 	for name, flags := range map[string]uint64{
+ 		"syz_send_nfs_fuzz$new": 1, "syz_send_nfs_fuzz$new_final": 5,
+ 		"syz_send_nfs_fuzz$retry": 2, "syz_send_nfs_fuzz$retry_final": 6,
+@@ -78,43 +55,19 @@ func TestNFSSunRPCFuzzABI(t *testing.T) {
+ 		}
+ 		requireConst(t, call.Args[3].Type, flags, name+" flags")
+ 	}
+-	addr, ok := connect.Args[1].Type.(*prog.PtrType)
+-	if !ok || addr.Elem.TemplateName() != "sockaddr_in" {
+-		t.Fatalf("connect address is %T %v, want sockaddr_in pointer", connect.Args[1].Type, connect.Args[1].Type)
+-	}
+-
+-	dataCalls := map[string]uint64{
+-		"sendmsg$inet_nfs_fuzz_new":         1,
+-		"sendmsg$inet_nfs_fuzz_new_final":   5,
+-		"sendmsg$inet_nfs_fuzz_retry":       2,
+-		"sendmsg$inet_nfs_fuzz_retry_final": 6,
++	write := requireNFSFuzzCall(t, target, "write$inet_nfs_fuzz")
++	if write.CallName != "write" {
++		t.Fatalf("write variant calls %s, want ordinary write", write.CallName)
+ 	}
+-	for name, flags := range dataCalls {
+-		call := requireNFSFuzzCall(t, target, name)
+-		if call.CallName != "sendmsg" {
+-			t.Fatalf("%s calls %s, want ordinary sendmsg", name, call.CallName)
+-		}
+-		requireNFSFuzzCmsg(t, call, flags)
+-		header := requireStruct(t, call, "nfs_fuzz_send_msghdr")
+-		iov := requireField(t, header, "msg_iov")
+-		ptr, ok := iov.Type.(*prog.PtrType)
+-		if !ok || ptr.Elem.TemplateName() != "iovec" {
+-			t.Fatalf("%s msg_iov is %T %v, want one iovec pointer", name, iov.Type, iov.Type)
++	requireSingleRPCRecords(t, write)
++	for _, gone := range []string{
++		"setsockopt$inet_nfs_fuzz", "sendmsg$inet_nfs_fuzz_new",
++		"sendmsg$inet_nfs_fuzz_cancel",
++	} {
++		if target.SyscallMap[gone] != nil {
++			t.Fatalf("%s still described; lane attribution needs no kernel socket ABI", gone)
+ 		}
+-		requireConst(t, requireField(t, header, "msg_iovlen").Type, 1, name+" msg_iovlen")
+-		requireSingleCmsg(t, call, header)
+-		requireSingleRPCRecords(t, call)
+ 	}
+-
+-	cancel := requireNFSFuzzCall(t, target, "sendmsg$inet_nfs_fuzz_cancel")
+-	if cancel.CallName != "sendmsg" {
+-		t.Fatalf("CANCEL calls %s, want ordinary sendmsg", cancel.CallName)
+-	}
+-	requireNFSFuzzCmsg(t, cancel, 8)
+-	cancelHeader := requireStruct(t, cancel, "nfs_fuzz_cancel_msghdr")
+-	requireConst(t, requireField(t, cancelHeader, "msg_iov").Type, 0, "CANCEL msg_iov")
+-	requireConst(t, requireField(t, cancelHeader, "msg_iovlen").Type, 0, "CANCEL msg_iovlen")
+-	requireSingleCmsg(t, cancel, cancelHeader)
+ }
+ 
+ func TestNFSFixedLaneResources(t *testing.T) {
+@@ -184,28 +137,6 @@ func requireNFSFuzzCall(t *testing.T, target *prog.Target, name string) *prog.Sy
+ 	return call
+ }
+ 
+-func requireNFSFuzzCmsg(t *testing.T, call *prog.Syscall, flags uint64) {
+-	t.Helper()
+-	cmsg := requireStruct(t, call, "tcp_sunrpc_fuzz")
+-	wantNames := []string{"version", "flags", "user_tag"}
+-	var gotNames []string
+-	for _, field := range cmsg.Fields {
+-		gotNames = append(gotNames, field.Name)
+-	}
+-	if !reflect.DeepEqual(gotNames, wantNames) {
+-		t.Fatalf("%s CMSG fields are %v, want %v", call.Name, gotNames, wantNames)
+-	}
+-	if cmsg.Size() != 16 {
+-		t.Fatalf("%s CMSG payload size is %d, want 16", call.Name, cmsg.Size())
+-	}
+-	requireConst(t, cmsg.Fields[0].Type, 1, call.Name+" version")
+-	requireConst(t, cmsg.Fields[1].Type, flags, call.Name+" flags")
+-	tag, ok := cmsg.Fields[2].Type.(*prog.ProcType)
+-	if !ok || tag.Size() != 8 || tag.ValuesStart != 1 || tag.ValuesPerProc != 1 {
+-		t.Fatalf("%s user_tag is %#v, want nonzero per-process int64", call.Name, cmsg.Fields[2].Type)
+-	}
+-}
+-
+ func requireSingleRPCRecords(t *testing.T, call *prog.Syscall) {
+ 	t.Helper()
+ 	for _, name := range []string{"rpc_tcp_nfs3_single_call", "rpc_tcp_nfs4_single_call"} {
+@@ -222,25 +153,6 @@ func requireSingleRPCRecords(t *testing.T, call *prog.Syscall) {
+ 	}
+ }
+ 
+-func requireSingleCmsg(t *testing.T, call *prog.Syscall, header *prog.StructType) {
+-	t.Helper()
+-	control := requireField(t, header, "msg_control")
+-	ptr, ok := control.Type.(*prog.PtrType)
+-	if !ok || ptr.Elem.TemplateName() != "cmsghdr_t" {
+-		t.Fatalf("%s msg_control is %T %v, want one typed cmsghdr pointer", call.Name, control.Type, control.Type)
+-	}
+-	outer, ok := ptr.Elem.(*prog.StructType)
+-	if !ok || len(outer.Fields) != 1 {
+-		t.Fatalf("%s control wrapper is %#v, want one cmsghdr", call.Name, ptr.Elem)
+-	}
+-	inner, ok := outer.Fields[0].Type.(*prog.StructType)
+-	if !ok || inner.TemplateName() != "cmsghdr_unaligned" {
+-		t.Fatalf("%s control payload is %#v, want cmsghdr_unaligned", call.Name, outer.Fields[0].Type)
+-	}
+-	requireConst(t, requireField(t, inner, "cmsg_level").Type, 6, call.Name+" CMSG level")
+-	requireConst(t, requireField(t, inner, "cmsg_type").Type, 47, call.Name+" CMSG type")
+-}
+-
+ func requireStruct(t *testing.T, call *prog.Syscall, name string) *prog.StructType {
+ 	t.Helper()
+ 	var found *prog.StructType
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index b61a846ed..edb45aa68 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -2,7 +2,6 @@
+ # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+ 
+ include <uapi/linux/in.h>
+-include <uapi/linux/tcp.h>
+ include <uapi/asm-generic/socket.h>
+ include <linux/net.h>
+ include <linux/socket.h>
+@@ -11,67 +10,31 @@ include <linux/socket.h>
+ 
+ resource sock_nfs_fuzz_tcp[sock]
+ 
+-# Create the socket in the chosen fixed-lane client network namespace, then
+-# enable TCP_SUNRPC_FUZZ before connecting.  The original clientN variants
+-# retain their primary destination; the pair variants select .1 (knfsd) or
+-# .5 (Ganesha) independently, both at the deterministic proxy's :2049.
+-# Destinations are fixture metadata, not fuzzed input; RPC/XDR remains mutable.
++# Create a plain TCP socket in the chosen fixed-lane client network namespace
++# and connect it.  The original clientN variants retain their primary
++# destination; the pair variants select .1 (knfsd) or .5 (Ganesha)
++# independently, both at the deterministic proxy's :2049.  Destinations are
++# fixture metadata, not fuzzed input; RPC/XDR remains mutable.  Coverage of
++# the server work is attributed by lane, so no socket option is needed.
++# syz_send_nfs_fuzz adds the record marker; its flags and tag are kept only so
++# that existing programs still parse, and are ignored.
+ syz_socket_connect_nfs$client0(client const[0]) sock_nfs_fuzz_tcp
+ syz_socket_connect_nfs$client1(client const[1]) sock_nfs_fuzz_tcp
+ syz_socket_connect_nfs_pair$client0_knfsd(client const[0], backend const[0]) sock_nfs_fuzz_tcp
+ syz_socket_connect_nfs_pair$client0_ganesha(client const[0], backend const[1]) sock_nfs_fuzz_tcp
+ syz_socket_connect_nfs_pair$client1_knfsd(client const[1], backend const[0]) sock_nfs_fuzz_tcp
+ syz_socket_connect_nfs_pair$client1_ganesha(client const[1], backend const[1]) sock_nfs_fuzz_tcp
+-syz_send_nfs_fuzz$new(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_NEW], user_tag proc[1, 1])
+-syz_send_nfs_fuzz$new_final(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_NEW_FINAL], user_tag proc[1, 1])
+-syz_send_nfs_fuzz$retry(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_RETRY], user_tag proc[1, 1])
+-syz_send_nfs_fuzz$retry_final(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[TCP_SUNRPC_FUZZ_F_RETRY_FINAL], user_tag proc[1, 1])
+-
+-# TCP_SUNRPC_FUZZ must be enabled before connect.  The dedicated resource keeps
+-# this opt-in lane separate from ordinary TCP sockets; the kernel still checks
+-# the actual setsockopt state.
++syz_send_nfs_fuzz$new(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[1], user_tag proc[1, 1])
++syz_send_nfs_fuzz$new_final(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[5], user_tag proc[1, 1])
++syz_send_nfs_fuzz$retry(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[2], user_tag proc[1, 1])
++syz_send_nfs_fuzz$retry_final(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call], msglen len[msg], flags const[6], user_tag proc[1, 1])
++
++# Manual path: an ordinary TCP socket; write() sends one record-marked call.
+ socket$inet_nfs_fuzz_tcp(domain const[AF_INET], type const[SOCK_STREAM], proto const[IPPROTO_TCP]) sock_nfs_fuzz_tcp
+-setsockopt$inet_nfs_fuzz(fd sock_nfs_fuzz_tcp, level const[SOL_TCP], optname const[TCP_SUNRPC_FUZZ], optval ptr[in, const[1, int32]], optlen len[optval])
+ connect$inet_nfs_fuzz(fd sock_nfs_fuzz_tcp, addr ptr[in, sockaddr_in], addrlen len[addr])
+-
+-define TCP_SUNRPC_FUZZ_F_NEW_FINAL	TCP_SUNRPC_FUZZ_F_NEW | TCP_SUNRPC_FUZZ_F_FINAL
+-define TCP_SUNRPC_FUZZ_F_RETRY_FINAL	TCP_SUNRPC_FUZZ_F_RETRY | TCP_SUNRPC_FUZZ_F_FINAL
+-
+-# NEW and RETRY are exclusive operations.  FINAL is their only valid modifier;
+-# CANCEL is a standalone, zero-data operation.
+-sendmsg$inet_nfs_fuzz_new(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_NEW]], f const[0])
+-sendmsg$inet_nfs_fuzz_new_final(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_NEW_FINAL]], f const[0])
+-sendmsg$inet_nfs_fuzz_retry(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_RETRY]], f const[0])
+-sendmsg$inet_nfs_fuzz_retry_final(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_send_msghdr[rpc_tcp_nfs_single_call, TCP_SUNRPC_FUZZ_F_RETRY_FINAL]], f const[0])
+-sendmsg$inet_nfs_fuzz_cancel(fd sock_nfs_fuzz_tcp, msg ptr[in, nfs_fuzz_cancel_msghdr], f const[0])
++write$inet_nfs_fuzz(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs_single_call], len bytesize[buf])
+ recvfrom$inet_nfs_fuzz_tcp(fd sock_nfs_fuzz_tcp, buf buffer[out], len len[buf], f flags[recv_flags], addr const[0], addrlen const[0])
+ 
+-type nfs_fuzz_send_msghdr[MSG, FLAGS] {
+-	msg_name	const[0, intptr]
+-	msg_namelen	const[0, int32]
+-	msg_iov		ptr[in, iovec[in, MSG]]
+-	msg_iovlen	const[1, intptr]
+-	msg_control	ptr[in, cmsghdr_t[SOL_TCP, TCP_SUNRPC_FUZZ, tcp_sunrpc_fuzz[FLAGS]]]
+-	msg_controllen	bytesize[msg_control, intptr]
+-	msg_flags	const[0, int32]
+-}
+-
+-nfs_fuzz_cancel_msghdr {
+-	msg_name	const[0, intptr]
+-	msg_namelen	const[0, int32]
+-	msg_iov		const[0, intptr]
+-	msg_iovlen	const[0, intptr]
+-	msg_control	ptr[in, cmsghdr_t[SOL_TCP, TCP_SUNRPC_FUZZ, tcp_sunrpc_fuzz[TCP_SUNRPC_FUZZ_F_CANCEL]]]
+-	msg_controllen	bytesize[msg_control, intptr]
+-	msg_flags	const[0, int32]
+-}
+-
+-type tcp_sunrpc_fuzz[FLAGS] {
+-	version		const[TCP_SUNRPC_FUZZ_VERSION, int32]
+-	flags		const[FLAGS, int32]
+-	user_tag	proc[1, 1, int64]
+-}
+-
+ # Known NFS export paths & filenames dictionary
+ nfs_path_names = "export", "tmp", "root", "test", "mnt", "home", "var", "dev", "etc", "testfile", "file1", "dir1", "share", "pub", "user.test", "system.nfs4_acl", "security.selinux"
+ 
+diff --git a/sys/linux/socket_inet_nfs.txt.const b/sys/linux/socket_inet_nfs.txt.const
+index 93ed94383..7904bbf78 100644
+--- a/sys/linux/socket_inet_nfs.txt.const
++++ b/sys/linux/socket_inet_nfs.txt.const
+@@ -3,16 +3,7 @@ arches = 386, amd64
+ AF_INET = 2
+ IPPROTO_TCP = 6
+ SOCK_STREAM = 1
+-SOL_TCP = 6
+-TCP_SUNRPC_FUZZ = 47
+-TCP_SUNRPC_FUZZ_F_CANCEL = 8
+-TCP_SUNRPC_FUZZ_F_NEW = 1
+-TCP_SUNRPC_FUZZ_F_NEW_FINAL = 5
+-TCP_SUNRPC_FUZZ_F_RETRY = 2
+-TCP_SUNRPC_FUZZ_F_RETRY_FINAL = 6
+-TCP_SUNRPC_FUZZ_VERSION = 1
+ __NR_connect = 386:362, amd64:42
+ __NR_recvfrom = 386:371, amd64:45
+-__NR_sendmsg = 386:370, amd64:46
+-__NR_setsockopt = 386:366, amd64:54
+ __NR_socket = 386:359, amd64:41
++__NR_write = 386:4, amd64:1
+-- 
+2.53.0
+

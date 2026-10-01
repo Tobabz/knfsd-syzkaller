@@ -5,7 +5,7 @@ It reflects a **remote KCOV coverage model** — collecting NFS server-side cove
 kernel, and automates the whole pipeline from base image to a bootable fuzz VM (instrumented kernels + syzkaller binaries +
 one baked protocol image).
 
-The checked-in customization series — **14 kernel patches + 17 syzkaller patches** (`bundle/patches/`) — is applied by
+The checked-in customization series — **3 kernel patches + 18 syzkaller patches** (`bundle/patches/`) — is applied by
 `tools/fport-apply.sh` during bootstrap. Every bootstrap run boots each kernel variant with the baked image and checks that the NFS lane fixture
 comes up and that the kernel carries the expected memory sanitizer.
 
@@ -14,7 +14,7 @@ comes up and that the kernel carries the expected memory sanitizer.
 | Aspect | Description |
 |---|---|
 | Instrumentation | KCOV + KASAN/KCSAN boot kernels, built **out of tree** from one patched source tree |
-| Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path. Ownership is lane-scoped (kernel 0014): every request that reaches lane N's server counts for the program proc N is running, so attribution survives the NFS wire relay |
+| Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path. Ownership is lane-scoped (kernel 0002): every request that reaches lane N's server counts for the program proc N is running, so attribution survives the NFS wire relay |
 | Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the baked fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count |
 | NFS version | `--minor 1\|2` selects the NFS minor version baked into the image (recorded in the manifest) |
 | Boot model | Kernel is injected **outside the image** (`-kernel`), so one baked image serves both sanitizer kernels |
@@ -64,7 +64,7 @@ python3 tools/bootstrap-kcov-env.py env \
 | `--variant kasan\|kcsan` (optional, repeatable) | Sanitizer kernels to build and verify; default: both |
 | `--jobs N` (optional) | Parallel build jobs |
 
-- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (14+17) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the bootable VM image once (`bookworm-kcov-fresh-v1.qcow2`, shared by all variants) → boot every variant and verify lane status
+- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (3+18) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the bootable VM image once (`bookworm-kcov-fresh-v1.qcow2`, shared by all variants) → boot every variant and verify lane status
 - **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh-v1.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records the kernel ref and resolved commit, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated.
 
 ### 3. Using the result with syz-manager

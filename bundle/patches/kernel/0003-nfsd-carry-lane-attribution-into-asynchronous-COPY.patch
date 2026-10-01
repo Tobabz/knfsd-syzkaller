@@ -1,0 +1,131 @@
+From c22d8f1acf6d97e2f346e1611f91995b648818be Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Thu, 1 Oct 2026 20:20:51 +0900
+Subject: [PATCH 3/3] nfsd: carry lane attribution into asynchronous COPY
+
+An asynchronous COPY finishes in a kthread after the COMPOUND that started
+it has replied, so its work is not covered by the request's remote section.
+
+Save a continuation of the request's attribution when the async copy is
+created and start a remote section from it in nfsd4_do_async_copy().  The
+continuation belongs to the program that issued the COPY: if that program's
+generation is closed or aborted before the copy starts, the work runs
+ownerless.  Every free path cancels an unused continuation.
+---
+ fs/nfsd/nfs4proc.c  | 37 ++++++++++++++++++++++++++++++++++++-
+ fs/nfsd/nfs4state.c |  3 +++
+ fs/nfsd/xdr4.h      |  6 ++++++
+ 3 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/fs/nfsd/nfs4proc.c b/fs/nfsd/nfs4proc.c
+index 50c07561e..aae27bf52 100644
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@ -40,6 +40,7 @@
+ #include <linux/namei.h>
+ 
+ #include <linux/sunrpc/addr.h>
++#include <linux/sunrpc/fuzz.h>
+ #include <linux/nfs_ssc.h>
+ 
+ #include "attr4.h"
+@@ -2136,8 +2137,28 @@ static int nfsd4_do_async_copy(void *data)
+ {
+ 	struct nfsd4_async_copy *async = data;
+ 	struct nfsd4_copy *copy = &async->cp_copy;
++	struct sunrpc_fuzz_saved_work **savedp =
++		&async->cp_fuzz_saved_work;
++	struct kcov_request_remote_ticket *fuzz_ticket = NULL;
++	enum sunrpc_fuzz_saved_start_result fuzz_start;
+ 	__be32 nfserr = nfs_ok;
+ 
++	/*
++	 * A continuation must repeat the common START_GRANTED transaction in
++	 * this kthread.  In particular, never infer ownership from current and
++	 * never jump directly from queued work to an active KCOV section.
++	 */
++	fuzz_start = sunrpc_fuzz_saved_work_start(savedp, &fuzz_ticket);
++	if (fuzz_start == SUNRPC_FUZZ_SAVED_NESTED) {
++		/*
++		 * Match svc_process(): do not dispatch attempted work under the
++		 * incumbent section.  The shared helper has invalidated both sides
++		 * and marked the lane unhealthy; retain normal terminal bookkeeping.
++		 */
++		nfserr = nfserr_serverfault;
++		goto do_callback;
++	}
++
+ 	trace_nfsd_copy_async(copy);
+ 	if (nfsd4_ssc_is_inter(copy)) {
+ 		struct file *filp;
+@@ -2178,7 +2199,12 @@ static int nfsd4_do_async_copy(void *data)
+ 	if (copy->cp_res.wr_bytes_written > 0 && copy->attr_update)
+ 		nfsd_update_cmtime_attr(copy->nf_dst->nf_file, 0);
+ 	nfsd4_send_cb_offload(async);
+-	/* Drop the kthread's reference (taken in nfsd4_copy()); copy may be freed after this. */
++	if (fuzz_start == SUNRPC_FUZZ_SAVED_ACTIVE)
++		sunrpc_fuzz_saved_work_stop(savedp, &fuzz_ticket);
++	/*
++	 * Drop the kthread's reference (taken in nfsd4_copy()); copy may be
++	 * freed after this.
++	 */
+ 	nfs4_put_copy(async);
+ 	return 0;
+ }
+@@ -2228,6 +2254,15 @@ nfsd4_copy(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 		async_copy = nfs4_alloc_copy_stid(cstate->clp);
+ 		if (!async_copy)
+ 			goto out_err;
++		/*
++		 * Save a fresh ASYNC child while the parent svc remote section is
++		 * still START_GRANTED/active.  Failure is deliberately ownerless:
++		 * the real COPY operation must remain functional after generation
++		 * close or abort.
++		 */
++		async_copy->cp_fuzz_saved_work =
++			sunrpc_fuzz_svc_continuation_save(rqstp,
++				KCOV_REQUEST_TOKEN_ASYNC);
+ 		async_copy->cp_copy.cp_nn = nn;
+ 		INIT_LIST_HEAD(&async_copy->copies);
+ 		refcount_set(&async_copy->refcount, 1);
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 9c4adf311..b939525c0 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -41,6 +41,7 @@
+ #include <linux/ratelimit.h>
+ #include <linux/sunrpc/svcauth_gss.h>
+ #include <linux/sunrpc/addr.h>
++#include <linux/sunrpc/fuzz.h>
+ #include <linux/jhash.h>
+ #include <linux/string_helpers.h>
+ #include <linux/fsnotify.h>
+@@ -1022,6 +1023,8 @@ static void nfsd4_free_async_copy_stid(struct nfs4_stid *stid)
+ 	struct nfsd4_async_copy *copy =
+ 		container_of(stid, struct nfsd4_async_copy, cp_stid);
+ 
++	/* Covers every create/error/free path; a started worker consumes it. */
++	sunrpc_fuzz_saved_work_cancel(&copy->cp_fuzz_saved_work);
+ 	if (copy->copy_task)
+ 		put_task_struct(copy->copy_task);
+ 	kfree(copy->cp_copy.cp_src);
+diff --git a/fs/nfsd/xdr4.h b/fs/nfsd/xdr4.h
+index c7eda5bc8..8e97bda3a 100644
+--- a/fs/nfsd/xdr4.h
++++ b/fs/nfsd/xdr4.h
+@@ -783,6 +783,12 @@ struct nfsd4_copy {
+ struct nfsd4_async_copy {
+ 	struct nfs4_stid	cp_stid;	/* SC_TYPE_COPY, in cl_stateids */
+ 	struct nfsd4_copy	cp_copy;	/* operation params + result */
++	/*
++	 * A unique continuation of the attributed COPY request.  This is an
++	 * opaque SUNRPC object rather than an owner copied into shared NFS
++	 * state: the async worker consumes it exactly once before doing work.
++	 */
++	struct sunrpc_fuzz_saved_work *cp_fuzz_saved_work;
+ 
+ 	struct list_head	copies;		/* nfs4_client.async_copies */
+ 	struct task_struct	*copy_task;
+-- 
+2.53.0
+
