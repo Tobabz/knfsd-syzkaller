@@ -1,3 +1,0 @@
-live_tickets 0 live_svc_attachments 0 remote_refs 0
-global_lane_unhealthy 0
-lane_id 0 lane_epoch 0 valid 0 unhealthy 0

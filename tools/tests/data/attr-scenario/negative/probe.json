@@ -1,1 +1,0 @@
-{"status":"pass","scenario":"async-abort-before-grant","owner":3194,"generation":5,"close_mode":"abort-before-grant","operation_bytes":4194304,"content_hash":11104636164064084867,"expected_hash":11104636164064084867,"local_entries":449891,"remote_entries":0}

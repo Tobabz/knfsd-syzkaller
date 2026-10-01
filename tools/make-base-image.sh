@@ -97,6 +97,5 @@ Site-specific bytes (not reproducible) — record them and continue:
     --deps-tar bundle/src/guest-deps.tar.gz \\
     --minor 1
 
-AB runs must use the same key:
-  KOOV_SSH_KEY=$OUT/bookworm.id_rsa bash tools/run-ab.sh
+syz-manager must use the same key (the sshkey setting of its config).
 EOF
