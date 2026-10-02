@@ -104,7 +104,6 @@ Generate the site base + keypair and assemble the complete lane deps (Docker is 
 
 ```sh
 sudo bash tools/make-base-image.sh --out artifacts
-tools/build-ganesha-deps.sh
 tools/build-ganesha-v15.sh
 tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-lane
 python3 tools/assemble-guest-deps.py \

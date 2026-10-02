@@ -2,11 +2,9 @@
 # Overlay the V15.6 source build on the existing Bookworm NFS dependency set.
 set -euo pipefail
 
-tools=$(cd "$(dirname "$0")" && pwd)
-repo=$(dirname "$tools")
-base=${1:-$repo/bundle/src/guest-deps-ganesha.tar.gz}
-work=${2:-${TMPDIR:-/tmp}/ganesha-v156-build}
-out=${3:-$repo/bundle/src/guest-deps-ganesha-v15.6.tar.gz}
+base=${1:?usage: package-ganesha-v15.sh BASE_TAR WORK_DIR OUT_TAR}
+work=${2:?usage: package-ganesha-v15.sh BASE_TAR WORK_DIR OUT_TAR}
+out=${3:?usage: package-ganesha-v15.sh BASE_TAR WORK_DIR OUT_TAR}
 [ -s "$base" ] || { echo "missing baseline: $base" >&2; exit 2; }
 [ ! -e "$out" ] || { echo "output already exists: $out" >&2; exit 2; }
 build=$work/build

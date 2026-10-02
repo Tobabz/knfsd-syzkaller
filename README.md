@@ -23,19 +23,16 @@ comes up and that the kernel carries the expected memory sanitizer.
 The image uses `bundle/lane/lane.sh` for both NFS minor versions. Its default `SERVER_IMPL=both`
 routes both clients through the relay; `nfs-lane/client0` and `client1` select the same knfsd
 export. Explicit `client{0,1}-ganesha` paths select the separate Ganesha export.
-Both backends now use the selected minor version. The old Debian Ganesha 4.3-2
-build mounted v4.2 but returned zero-filled reads for `READ_PLUS` because it
-omitted `read_arg->info`. The [upstream V15.6 release](https://github.com/nfs-ganesha/nfs-ganesha/releases/tag/V15.6)
-passes that pointer to FSAL_VFS. The V15.6 FSAL_VFS excludes tmpfs exports, so
-the Ganesha lane uses a bounded ext4 loop image while knfsd keeps its tmpfs.
-The new v4.2 image passed four-mount cross-client reads and writes, a direct
-Ganesha mount, observed `READ_PLUS`, and cleanup; v4.1 passed the same checks.
-Build and guest-check commands are in [tools/README.md](tools/README.md).
+Both backends use the selected minor version. The lane exports a bounded ext4
+loop image through [Ganesha V15.6](https://github.com/nfs-ganesha/nfs-ganesha/releases/tag/V15.6)
+FSAL_VFS; knfsd keeps its tmpfs.
+The v4.1 and v4.2 images passed four-mount cross-client reads and writes,
+a direct Ganesha mount, and cleanup. Build and guest-check commands are in
+[tools/README.md](tools/README.md).
 
 The current `env/manifest.json` selects the V15.6 v4.2 image at
 `env/images/bookworm-kcov-fresh-v2.qcow2` and records KASAN/KCSAN boot checks.
-The V15.6 v4.1 image is `env/images/bookworm-kcov-v41-ganesha-v15.6.qcow2`;
-the earlier 4.3-2 v4.2 image is preserved with a `ganesha4.3-legacy` suffix.
+The V15.6 v4.1 image is `env/images/bookworm-kcov-v41-ganesha-v15.6.qcow2`.
 An earlier KASAN snapshot run of the 11-call COPY seed returned 32 MiB and collected a
 nonempty remote `.extra`; the v4.1 knfsd and Ganesha seeds each passed 34 calls
 in separate KASAN snapshots. The two basic seeds also passed syz-manager
@@ -77,7 +74,6 @@ client reaches the servers through the relay. The deps tarball therefore carries
 network access; the outputs are local (`bundle/src/*` is gitignored except `guest-deps.tar.gz`).
 
 ```sh
-tools/build-ganesha-deps.sh            # Bookworm dependency baseline
 tools/build-ganesha-v15.sh              # pinned upstream V15.6
 tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-lane
 python3 tools/assemble-guest-deps.py \

@@ -67,14 +67,10 @@ pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범�
 
 기본 이미지는 `bundle/lane/lane.sh` 하나를 사용하며 `SERVER_IMPL=both`로 두 서버를 프록시 뒤에 둔다.
 NFSv3 시드와 별도 fixture는 제거했고, bake의 `--minor 1|2`는 두 서버의 마운트 버전을 선택한다.
-기존 Debian Ganesha 4.3-2는 v4.2의 직접·프록시 경로에서 기존 파일과 다른
-클라이언트가 쓴 파일을 0으로 읽었다. 클라이언트의 `READ_PLUS` 호출이 관측됐고,
-4.3-2가 FSAL_VFS에 `read_arg->info`를 전달하지 않는 결함을 확인했다.
-현재 lane은 이 경로가 수정된 Ganesha V15.6을 사용한다. V15.6의 FSAL_VFS는
-`tmpfs` export를 제외하므로 Ganesha만 크기가 제한된 ext4 루프 저장소를 사용하고,
-knfsd는 기존 tmpfs를 유지한다. v4.1과 v4.2 게스트에서 네 마운트의 교차 읽기·쓰기,
-Ganesha 직접 연결, 정리와 루프 장치 해제를 확인했다. v4.2 프록시에서는 실제
-`READ_PLUS` 호출도 계측했다.
+현재 lane은 Ganesha V15.6을 사용한다. V15.6의 FSAL_VFS는 `tmpfs` export를
+제외하므로 Ganesha는 크기가 제한된 ext4 루프 저장소를 사용하고, knfsd는 기존
+tmpfs를 유지한다. v4.1과 v4.2 게스트에서 네 마운트의 교차 읽기·쓰기,
+Ganesha 직접 연결, 정리와 루프 장치 해제를 확인했다.
 기존 시드의 `nfs-lane/client0`·`client1`은 같은 knfsd export를 사용하는 두 클라이언트로 유지한다.
 Ganesha는 `client0-ganesha`·`client1-ganesha` 경로로 선택한다. 두 서버의 저장 공간은 분리되어 있다.
 `SERVER_IMPL=knfsd|ganesha` 직접 경로는 별도 비교 진단에만 사용하며 기본 이미지에는 적용하지 않는다.

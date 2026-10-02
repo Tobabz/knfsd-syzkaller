@@ -36,8 +36,8 @@
 # filesystem state.  Both clients see the same tree within a backend, while
 # the two backends remain independent.  The proxy selects ONE backend from
 # the destination IP and returns that backend's own NFS response.
-# NFS_MINOR_VERSION applies to both backends. The V15.6 Ganesha build carries
-# the READ_PLUS fix needed for correct v4.2 reads through FSAL_VFS.
+# NFS_MINOR_VERSION applies to both backends. Ganesha V15.6 exports its
+# separate bounded ext4 filesystem through FSAL_VFS.
 
 # Disposable-VM multi-lane fixture. Never run this on the host.
 set -eu

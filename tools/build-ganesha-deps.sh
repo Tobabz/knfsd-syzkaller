@@ -1,41 +1,11 @@
 #!/usr/bin/env bash
 # tools/build-ganesha-deps.sh -- build the guest-side NFS-Ganesha userspace.
 #
-# WHAT THIS PRODUCES
-#
-#   bundle/src/guest-deps-ganesha.tar.gz
-#
-# extracted by the runner into /opt/kcov-nfs/deps, whose usr/sbin, sbin and
-# lib trees are prepended to the guest PATH and LD_LIBRARY_PATH.  The lane
-# fixture (bundle/lane/lane.sh) then starts ganesha.nfsd and dbus-daemon from
-# there.  No guest image is rebuilt and no root is required anywhere.
-#
-# WHY A SEPARATE TARBALL
-#
-# bundle/src/guest-deps.tar.gz is an input to already-recorded AB / S3 / S4
-# evidence.  Extending it would silently redefine that evidence, so this script
-# writes a SECOND tarball that embeds the original bytes verbatim plus the
-# Ganesha delta.  Each tarball keeps its own recorded hash, and only the
-# Ganesha runner points at the new one.  bundle/src/* is gitignored except for
-# the original, so this tarball is a site-generated asset: THIS SCRIPT is its
-# provenance, which is why it lives in tools/.
-#
-# WHY THIS BASELINE USES DEBIAN PACKAGES
-#
-# The host has no development headers at all -- libtirpc, libsqlite3,
-# libjansson, libevent, libcap and the rest are absent from /usr/include -- and
-# no sudo and no pip, so a source build would mean building that entire
-# dependency chain from source.  Debian ships nfs-ganesha 4.3-2, and the
-# runner's deps-tarball mechanism carries that userspace into the guest.
-# tools/build-ganesha-v15.sh builds current upstream Ganesha in a Bookworm
-# container and overlays it on this dependency baseline.
-#
-# CONSEQUENCE: this is NOT an ASAN or UBSAN build.  ASAN was wanted to catch
-# memory bugs in Ganesha itself, but the axis measures kernel coverage, and a
-# Ganesha crash is caught by the fixture's liveness gate.  Building the
-# dependency chain from source to obtain ASAN is not a good trade.
-# ganesha.nfsd honours ASAN_OPTIONS and UBSAN_OPTIONS regardless, so a
-# sanitized build can be dropped in later without touching the fixture.
+# This extracts the Debian Bookworm package closure used as a temporary
+# dependency baseline while building Ganesha V15.6. The V15.6 builder passes
+# a temporary --out path and removes the baseline after packaging. The final
+# lane tar contains the upstream V15.6 daemon, core library, VFS plugin and
+# libntirpc. This tool needs no host root privileges.
 #
 # REQUIREMENTS: curl, dpkg-deb, xz, find, readelf.  No root, no sudo.
 # Network access to deb.debian.org.  A few hundred MiB of scratch space.

@@ -4,7 +4,7 @@ set -euo pipefail
 
 tools=$(cd "$(dirname "$0")" && pwd)
 repo=$(dirname "$tools")
-base=$repo/bundle/src/guest-deps-ganesha.tar.gz
+base=
 out=$repo/bundle/src/guest-deps-ganesha-v15.6.tar.gz
 work=${TMPDIR:-/tmp}/ganesha-v156-build
 while [ "$#" -gt 0 ]; do
@@ -12,17 +12,22 @@ while [ "$#" -gt 0 ]; do
         --base) base=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
         --work) work=$2; shift 2 ;;
-        --help) echo "Usage: $0 [--base OLD_TAR] [--out NEW_TAR] [--work DIR]"; exit 0 ;;
+        --help) echo "Usage: $0 [--base DEPENDENCY_TAR] [--out NEW_TAR] [--work DIR]"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 for cmd in docker git sha256sum tar realpath; do
     command -v "$cmd" >/dev/null || { echo "missing $cmd" >&2; exit 2; }
 done
-[ -s "$base" ] || { echo "missing baseline: $base" >&2; exit 2; }
 [ ! -e "$out" ] || { echo "output already exists: $out" >&2; exit 2; }
 mkdir -p "$work"
 work=$(realpath "$work")
+if [ -z "$base" ]; then
+    base=$work/bookworm-baseline.tar.gz
+    trap 'rm -f "$base"' EXIT
+    [ -s "$base" ] || bash "$tools/build-ganesha-deps.sh" --out "$base"
+fi
+[ -s "$base" ] || { echo "missing baseline: $base" >&2; exit 2; }
 source=$work/upstream
 commit=98eb4beb642674d4188361008495bb6d585d393d
 ntirpc_commit=848ab93b63174338ad72875bddd5680113f64b39

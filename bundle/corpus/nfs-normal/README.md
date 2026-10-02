@@ -13,7 +13,7 @@ transport, guest setup, functional oracle, current execution status, exclusions,
 
 Paths to files inside this repository, here and in `manifest.json`, are relative to the
 repository root. The kernel/image environment is `env/` (`env/images/<variant>/{bzImage,vmlinux}`,
-`env/images/bookworm-kcov-fresh-v1.qcow2`, `env/syzkaller`).
+`env/images/bookworm-kcov-fresh-v2.qcow2`, `env/syzkaller`).
 
 Guest setup comes from the baked image: `frozen-phase9-fixture.service` runs
 `lane.sh setup /tmp/frozen-phase9.manager 4` at boot, with the NFS minor version chosen by
@@ -21,8 +21,8 @@ Guest setup comes from the baked image: `frozen-phase9-fixture.service` runs
 The default fixture routes every mount through the relay. `nfs-lane/client0` and
 `nfs-lane/client1` remain two clients of the same knfsd export; Ganesha uses the
 explicit `client0-ganesha` and `client1-ganesha` paths. The corpus contains four
-NFSv4 inputs; NFSv3 is outside the current scope. The basic knfsd and Ganesha inputs each have one current KASAN v4.1 snapshot run.
-The COPY input has one current KASAN v4.2 snapshot run; detailed callback and
+NFSv4 inputs; NFSv3 is outside the current scope. The basic knfsd and Ganesha inputs each have one recorded KASAN v4.1 snapshot run.
+The COPY input has one recorded KASAN v4.2 snapshot run; detailed callback and
 handoff records refer to earlier fixtures.
 
 Parser success only proves that the pinned syzkaller parser can deserialize an
@@ -146,15 +146,14 @@ env/syzkaller/bin/syz-prog2c -os linux -arch amd64 -prog ABSOLUTE_INPUT_PATH
 Generated C byte counts and hashes, and the exact nonfatal formatter stderr,
 are stored in `manifest.json`. The 2026-10-02 run evidence is under
 `cache/backend-current-v41-20261002/{knfsd,ganesha}` and
-`cache/backend-current-v42-20261002/copy`. The v4.1 runs used
-`env/images/bookworm-kcov-fresh-v1.qcow2` and the v4.2 run used
-`env/images/bookworm-kcov-fresh-v2.qcow2`, each through a QEMU snapshot with
-one syz-execprog execution and `-threaded=false`. B05 remains byte-identical to its historical
+`cache/backend-current-v42-20261002/copy`. Those runs used earlier images that have since been removed. Each used a
+QEMU snapshot with one syz-execprog execution and `-threaded=false`.
+The current V15.6 v4.2 image is `env/images/bookworm-kcov-fresh-v2.qcow2`. B05 remains byte-identical to its historical
 input. Its default-mode acceptance is the compatibility contract; strict mode
 rejects the legacy offset strings and is intentionally not made green by an
 untested behavioral rewrite.
 
-Ganesha V15.6 검증에서는 `basic-v41-ganesha-tcp.prog`를 별도 v4.2 이미지
+Ganesha V15.6 검증에서는 `basic-v41-ganesha-tcp.prog`를 현재 v4.2 이미지
 `env/images/bookworm-kcov-fresh-v2.qcow2`에서 다시 실행했다.
 파일명은 기존 v4.1 시드의 이름을 유지하지만, 이번 실행의 두 Ganesha 마운트는
 v4.2이다. 34개 호출이 모두 완료됐고 14번 호출의 기대 errno 11을 제외한
