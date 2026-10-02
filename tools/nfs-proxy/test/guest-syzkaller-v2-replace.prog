@@ -1,0 +1,16 @@
+# Verifies the v2 arm's REPLACE growing a field (4 -> 8 bytes) with a correct
+# recorded original, anchored on this call's own xid (offset 4, the first
+# word after the record marker) so only this one record matches -- fixture
+# mount traffic has a different xid and is left untouched. Guest run
+# (2026-10-02, kasan): edit_applied=1, 0 framing/relay/mutation errors, no
+# fatal dmesg -- a length-changing REPLACE reaches knfsd without
+# desynchronising the connection.
+r2 = syz_arm_nfs_proxy_v2$scoped(&(0x7f0000001000)={0x4e46535041524d32, 0x0, 0x0, 0x0, 0xffffffff, 0x4, 0x4, 0x1, 0x1, 0x0, '\x11\x11\x11\x11', [{0x0, 0x3c, 0x4, 0x8, '\x00\x00\x00\x00', '\xaa\xaa\xaa\xaa\xbb\xbb\xbb\xbb'}]}, 0x4c)
+r0 = syz_open_nfs_lane_pair$client0_knfsd(0x0, 0x0)
+r1 = syz_socket_connect_nfs_pair$client0_knfsd(0x0, 0x0)
+syz_send_nfs_fuzz$new(r1, &(0x7f0000003000)=@nfs4={0x11111111, 0x0, 0x2, 0x186a3, 0x4, 0x1, @none={0x0, 0x0}, @none={0x0, 0x0}, {@empty=0x0, 0x1, 0x1, [@op_putrootfh={0x18, {0x0}}]}}, 0x3c, 0x1, 0x0)
+nanosleep(&(0x7f0000008000)={0x0, 0x1dcd6500}, 0x0)
+recvfrom(r1, &(0x7f0000009000)=""/256, 0x100, 0x40, 0x0, 0x0)
+close(r1)
+close(r0)
+close$nfs_proxy_arm(r2)
