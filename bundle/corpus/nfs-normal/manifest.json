@@ -1,9 +1,10 @@
 {
   "schema": 1,
   "corpus": "nfs-normal",
-  "runtime_scope": "Parser success is syntax validation only. The current KASAN v4.1 image was verified and the knfsd and Ganesha 34-call inputs each passed one separate snapshot execution. syz-manager admitted both corpus.db records and completed corpus-triage. The current KASAN v4.2 image also passed one 11-call COPY execution. These runs do not establish repeatability, RPC-level handoff attribution, or Ganesha user-space coverage.",
+  "runtime_scope": "Parser success is syntax validation only. The current KASAN v4.1 image was verified and the knfsd and Ganesha 34-call inputs each passed one separate snapshot execution. syz-manager admitted both corpus.db records and completed corpus-triage. The current KASAN v4.2 image also passed one 11-call COPY execution. A 180-second combined-manager fuzzing smoke with only the two basic seeds and their file-operation syscalls enabled completed 7,791 executions without a recorded crash; both canonical 34-call seeds remained in the saved corpus. These runs do not establish long-run stability, paired replay, RPC-level handoff attribution, or Ganesha user-space coverage.",
   "topology_evidence": {"path": "cache/four-mount-check-20261002/result.json", "status": "pass", "scope": "KASAN v4.1 and v4.2 snapshot guests: both default clients share the knfsd export; both explicit Ganesha clients share a separate export."},
   "manager_corpus_triage": {"path": "cache/manager-corpus-v41-20261002/result.json", "status": "pass", "input_records": 2, "scope": "Both records admitted and triage completed with procs=4; exact seeds may be minimized during fuzzing."},
+  "manager_fuzzing_smoke": {"path": "cache/manager-unified-v41-20261002/focused-smoke.json", "corpus_inspection": "cache/manager-unified-v41-20261002/corpus-inspection.json", "status": "bounded_pass", "procs": 4, "seconds": 180, "executions": 7791, "crashes": 0, "scope": "One manager loaded both backend seeds with only their file-operation syscalls enabled. Both canonical 34-call programs remained in corpus.db. An unrestricted trial had two executor-hung reports, with non-NFS programs in the crash logs; no long-run stability claim."},
   "parser": {
     "path": "env/syzkaller/bin/syz-prog2c",
     "sha256": "f2e525f37b17f38512885bf0ac3fd5db4ac70138d99c453176926bfb0328b410",

@@ -37,11 +37,12 @@ establish repeatability or a server-side RPC handoff trace.
 
 ## Execution scope (2026-10-02)
 
-Run one backend at a time, keeping both clients of each scenario on that backend.
+Use one syz-manager corpus with two separate 34-call inputs for v4.1 fuzzing.
 The knfsd input uses the default client pair; `basic-v41-ganesha-tcp.prog`
-uses the explicit Ganesha client pair. The two 34-call inputs were executed one
-after the other in separate KASAN v4.1 VM snapshots. The shared scenario has
-no automatic paired replay or paired mutation rule. The four-mount guest check
+uses the explicit Ganesha client pair. Each input keeps both clients on one
+backend. The original functional checks ran the two inputs sequentially in
+separate KASAN v4.1 VM snapshots. A shared manager does not provide paired
+replay or identical mutations across backends. The four-mount guest check
 passed on both current v4.1 and v4.2 images, including the default aliases
 and backend isolation (`cache/four-mount-check-20261002/result.json`).
 
@@ -51,6 +52,26 @@ with more than 40 calls. Both separate 34-call inputs were packed into an isolat
 with `procs=4` (exit 0). The manager may minimize inputs during fuzzing, so this admission
 does not guarantee that an unmodified 34-call oracle remains in the output corpus.
 Evidence: `cache/manager-corpus-v41-20261002/result.json` and `manager.log`.
+For the first bounded fuzzing run, pack only these two basic inputs into one
+`corpus.db` and use one manager with `procs=4`, the KASAN v4.1 image,
+`experimental.remote_cover=true`, and `enable_syscalls` limited to
+`open$dir`, `openat`, `getdents64`, `close`, `write`, `fsync`, `statx`,
+`lseek`, `read`, `flock`, `renameat2`, and `unlinkat`. The local configuration
+is `cache/manager-unified-v41-20261002/manager-focused.cfg`. Resume its
+corpus with:
+
+```sh
+env/syzkaller/bin/syz-manager -config cache/manager-unified-v41-20261002/manager-focused.cfg -mode fuzzing
+```
+
+A 180-second smoke completed 7,791 executions without a recorded crash or fatal error.
+The saved corpus retained both canonical 34-call seeds and additional programs
+using each backend path (`focused-smoke.json`, `corpus-inspection.json`).
+This is a bounded check, not evidence of long-run stability or equivalent
+server-side coverage. An earlier unrestricted manager run reported two fixed
+lane executor hangs; its crash logs show non-NFS programs near the failures.
+Evidence is in `fuzz-smoke.log` and the matching `workdir/crashes/` directory.
+
 Proxy-managed backend selection is deferred; the existing fixed relay paths
 remain in place. See the [design decision](../../../docs/design/01-overview/01-overview.md#backend-execution-decision).
 

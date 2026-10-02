@@ -28,8 +28,9 @@ pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범�
 | 4 | NFS 클라이언트를 대상으로 하는 취약점을 트리거하려면 서버의 응답을 변조해야 한다 | wire 프록시와 arm 규칙 (syzkaller 0017) | 설계 의도(사용자 확인). 프록시에 S2C 방향 변조가 구현되어 있음 (`tools/nfs-proxy/README.md`) |
 | 5 | 동시 퍼징 시 프로세스 간 상태가 섞이면 결과를 해석할 수 없다 | lane과 namespace 격리 (syzkaller 0007~0014) | `tools/README.md` B절 |
 
-여섯 번째 요소인 NFS-Ganesha는 추가 서버 대상이다. 2026-10-02 결정은 서버별로 하나씩 실행하는
-것이다. 병렬 처리량 이득과 프록시의 실행 대상 선택 확장은 후속 검토 범위이며, 이득은 미실증이다
+여섯 번째 요소인 NFS-Ganesha는 추가 서버 대상이다. v4.1 기본 시드는 서버별로 두 개를
+유지하되 하나의 syz-manager corpus에서 함께 퍼징한다. 병렬 처리량 이득과 프록시의 실행
+대상 선택 확장은 후속 검토 범위이며, 이득은 미실증이다
 (`tools/README.md`의 축 A "미실증").
 
 ## 구조
@@ -79,9 +80,10 @@ Ganesha는 `client0-ganesha`·`client1-ganesha` 경로로 선택한다. 두 서�
 
 ### 서버별 실행 결정 (2026-10-02)
 
-**결정됨.** knfsd와 Ganesha는 서버별로 하나씩 실행하고 결과를 별도로 기록한다. 한 시나리오의
-두 클라이언트는 같은 서버의 export를 사용한다. `basic-v41-tcp.prog`는 기본 knfsd 경로를 쓰는
-원래의 34개 호출로 유지한다. Ganesha는 별도 실행에서 해당 클라이언트 쌍을 선택한다.
+**결정됨.** knfsd와 Ganesha는 서로 다른 34호출 시드를 하나의 syz-manager corpus에
+넣어 퍼징한다. 각 시드의 두 클라이언트는 같은 서버의 export를 사용한다.
+`basic-v41-tcp.prog`는 기본 knfsd 경로를, `basic-v41-ganesha-tcp.prog`는 명시적
+Ganesha 경로를 쓴다. 기능 오라클 확인은 서버별 스냅샷에서 따로 수행했다.
 
 34개 호출을 두 번 붙인 통합안은 채택하지 않는다. 고정된 syzkaller의 `prog.MaxCalls`는 40이며
 `pkg/manager/seeds.go`의 `parseProg`가 초과 입력을 거부한다. 일반 변이와 최소화도 두 서버
@@ -95,8 +97,11 @@ Ganesha는 `client0-ganesha`·`client1-ganesha` 경로로 선택한다. 두 서�
 knfsd의 raw `.extra`에는 77,314개 PC 레코드와 1,581개의 서로 다른 `fs/nfsd`
 소스 위치가 있고, Ganesha에는 로컬 클라이언트 커널 커버리지 파일만 있다.
 두 시드는 syz-manager의 `corpus.db`에 수용되어 `corpus-triage`가 종료 코드 0으로
-끝났다. 근거는 `cache/backend-current-v41-20261002/{knfsd,ganesha}/result.json`과
-`cache/manager-corpus-v41-20261002/result.json`이다. Ganesha 사용자 공간 커버리지와
+끝났다. 3분 제한 단일 매니저 퍼징은 파일 연산 syscall만 활성화한 설정에서 크래시
+없이 7,791회를 실행했고, 두 시드의 정규화된 34호출 프로그램을 corpus에 유지했다.
+근거는 `cache/backend-current-v41-20261002/{knfsd,ganesha}/result.json`,
+`cache/manager-corpus-v41-20261002/result.json`,
+`cache/manager-unified-v41-20261002/{focused-smoke,corpus-inspection}.json`이다. Ganesha 사용자 공간 커버리지와
 요청별 RPC handoff는 이 실행에서 확인하지 않았다.
 
 ### 판정 논리

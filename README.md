@@ -36,7 +36,8 @@ the same lane input and records its hashes in the adjacent `.json` file. One
 KASAN snapshot run of the 11-call COPY seed returned 32 MiB and collected a
 nonempty remote `.extra`; the v4.1 knfsd and Ganesha seeds each passed 34 calls
 in separate KASAN snapshots. The two basic seeds also passed syz-manager
-`corpus-triage` admission. See `bundle/corpus/nfs-normal/README.md` for limits
+`corpus-triage` admission and a bounded single-manager fuzzing smoke with both
+backend paths retained in the corpus. See `bundle/corpus/nfs-normal/README.md` for limits
 and evidence paths.
 
 The corpus objective is to cover thread-execution flows reachable through normal NFS scenarios; see
