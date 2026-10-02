@@ -15,9 +15,7 @@ g1=$root/lane0/client1/mnt
 for path in "$k0" "$k1" "$g0" "$g1"; do
     mountpoint -q "$path"
     test "$(findmnt -n -o FSTYPE -- "$path")" = nfs4
-    mount_minor=$minor
-    case "$path" in "$g0"|"$g1") mount_minor=1 ;; esac
-    grep -Eq " $path nfs4 .*vers=4\.$mount_minor.*proto=tcp" /proc/mounts
+    grep -Eq " $path nfs4 .*vers=4\.$minor.*proto=tcp" /proc/mounts
 done
 test "$(findmnt -n -o SOURCE -- "$k0")" = 10.89.0.1:/
 test "$(findmnt -n -o SOURCE -- "$k1")" = 10.89.0.1:/

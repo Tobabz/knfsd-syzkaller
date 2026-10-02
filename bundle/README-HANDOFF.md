@@ -1,6 +1,6 @@
 # Handoff bundle — reproduction of the knfsd KCOV environment
 
-Upstream sources (Linux kernel `v7.3-rc4`, syzkaller `801f09666`) are
+Upstream sources (Linux kernel `v7.3-rc5`, syzkaller `801f09666`) are
 **cloned by the bootstrap at the refs recorded in `bundle/patches/BASE`** (the kernel tag can be overridden with `--kernel-ref`, `latest` included), so a first fresh
 environment build requires network access to `git.kernel.org` and
 `github.com`. Patches, fixtures and the base nfs-utils deps ship in
@@ -14,7 +14,7 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 
 | Path | Description | Size |
 |---|---:|---:|
-| upstream kernel | cloned by bootstrap at the `BASE` tag (currently `v7.3-rc4`, commit `93f51579…`, git.kernel.org); `--kernel-ref` overrides | — |
+| upstream kernel | cloned by bootstrap at the `BASE` tag (currently `v7.3-rc5`, commit `72d3fcf8…`, git.kernel.org); `--kernel-ref` overrides | — |
 | upstream syzkaller | cloned by bootstrap at commit `801f09666…` (github.com/google/syzkaller) | — |
 | base image (site-generated) | `tools/make-base-image.sh` → `artifacts/bookworm-base.img` (2 GiB raw, `create-image.sh -d bookworm`) | 2 GiB |
 | `src/guest-deps.tar.gz` | Debian nfs-utils extraction for guests (committed) | ~6 MB |
@@ -105,9 +105,10 @@ Generate the site base + keypair and assemble the complete lane deps (Docker is 
 ```sh
 sudo bash tools/make-base-image.sh --out artifacts
 tools/build-ganesha-deps.sh
+tools/build-ganesha-v15.sh
 tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-lane
 python3 tools/assemble-guest-deps.py \
-  --ganesha-deps bundle/src/guest-deps-ganesha.tar.gz \
+  --ganesha-deps bundle/src/guest-deps-ganesha-v15.6.tar.gz \
   --proxy bundle/src/nfs-proxy-lane --out bundle/src/guest-deps-lane.tar.gz
 ```
 
@@ -119,10 +120,10 @@ python3 tools/bootstrap-kcov-env.py /work/env \
   --base-image artifacts/bookworm-base.img \
   --ssh-key artifacts/bookworm.id_rsa \
   --deps-tar bundle/src/guest-deps-lane.tar.gz \
-  --minor 1
+  --minor 2
 ```
 
-The run clones the pinned upstream refs (git.kernel.org `v7.3-rc4` /
+The run clones the pinned upstream refs (git.kernel.org `v7.3-rc5` /
 github.com `801f09666…`), then patches
 (`tools/fport-apply.sh`, series = `bundle/patches/{kernel,syzkaller}`),
 builds (one out-of-tree `bzImage`/`vmlinux` per `--variant`, default `kasan` and
@@ -141,7 +142,7 @@ inputs are unchanged. To follow a new kernel release first run
 ## Fuzzing after bootstrap
 
 Point a stock syz-manager at the outputs: `kernel` = `<target>/images/<variant>/bzImage`,
-`kernel_obj` = the directory holding `vmlinux`, `image` = `<target>/images/bookworm-kcov-fresh-v1.qcow2`,
+`kernel_obj` = the directory holding `vmlinux`, `image` = `<target>/images/bookworm-kcov-fresh-v2.qcow2`,
 `sshkey` = the generated `artifacts/bookworm.id_rsa`, `procs` = the fixture's lane count (4), and
 `experimental.remote_cover` to switch remote coverage. The earlier A/B harness was removed in
 commit `7833ed3`.

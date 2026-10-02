@@ -12,7 +12,7 @@ sudo bash tools/make-base-image.sh --out artifacts         # 사이트별 베이
 python3 tools/bootstrap-kcov-env.py env \
     --base-image artifacts/bookworm-base.img \
     --ssh-key artifacts/bookworm.id_rsa \
-    --deps-tar bundle/src/guest-deps-lane.tar.gz --minor 1  # env/images/<variant>/ 생성
+    --deps-tar bundle/src/guest-deps-lane.tar.gz --minor 2  # env/images/<variant>/ 생성
 
 python3 tools/bump-kernel.py latest                        # 새 커널 태그(rc 포함)로 시리즈 이월 → BASE 갱신
 python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다시 빌드·검증 (최근 1개만 유지)
@@ -30,8 +30,10 @@ python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다�
 | `release-assembly.sh` | (선택) 번들 스냅샷 tar 조립 |
 | `tool-requirements.txt` | 호스트 의존성 목록 |
 | `lane-quote-lint.sh` | `bundle/lane/lane.sh`의 `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
-| `assemble-guest-deps.py` | Ganesha deps에 프록시 바이너리를 넣어 `guest-deps-lane.tar.gz` 생성 — bootstrap의 `--deps-tar` |
+| `assemble-guest-deps.py` | Ganesha deps에 프록시 바이너리를 넣어 lane deps tar 생성 — bootstrap의 `--deps-tar` |
 | `build-ganesha-deps.sh` | `guest-deps-ganesha.tar.gz` 생성 — root 불필요, `.deb`→의존성 closure→주입 트리 |
+| `build-ganesha-v15.sh`·`ganesha-v15-container.sh`·`package-ganesha-v15.sh` | 공식 V15.6 커밋에서 Bookworm 호환 실행 파일·VFS·libntirpc을 빌드해 별도 deps tar 생성 (Docker 사용) |
+| `check-ganesha-v15-guest.py` | 새 이미지의 v4.1/v4.2 네 마운트, `READ_PLUS`, 직접 경로, 선택적 시드, 정리 검증 |
 | `build-ganesha-asan.sh`·`ganesha-asan-container.sh` | bookworm 4.3-2 소스·패치로 Ganesha 실행 파일/코어/VFS를 GCC ASan으로 빌드하고 별도 deps tar 생성 (Docker 사용) |
 | `nfs-proxy/` | NFS 프록시 소스·테스트와 빌드 스크립트 (`build.sh`, `build-guest.sh`, `build-syzkaller.sh`, `guest-build.sh`) |
 
@@ -99,7 +101,7 @@ lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 
 
 | 변수 | 기본값 | 누가 정하는가 |
 |---|---|---|
-| `NFS_MINOR_VERSION` | `1` | bake가 서비스 drop-in에 씁니다 (`--minor 1\|2`). knfsd 마운트에 적용되며 Ganesha는 v4.1을 사용합니다 |
+| `NFS_MINOR_VERSION` | `1` | bake가 서비스 drop-in에 씁니다 (`--minor 1\|2`). knfsd와 Ganesha 마운트에 모두 적용됩니다 |
 | `SERVER_IMPL` | `both` | `both`는 lane마다 knfsd와 Ganesha를 프록시 뒤에 둡니다. `knfsd`·`ganesha`는 프록시를 거치지 않는 진단용입니다 |
 | `KOOV_TMPFS_SIZE` | `256m` | lane마다 tmpfs 상한 |
 
@@ -109,15 +111,74 @@ lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 
 
 기존 시드의 `nfs-lane/client0`·`client1`은 같은 knfsd export를 보는 두 클라이언트입니다.
 `both`에서도 이 의미를 유지하며, Ganesha는 `client0-ganesha`·`client1-ganesha`로 선택합니다.
-4.2 이미지에서 Ganesha 직접·프록시 경로 모두 v4.2 마운트는 되지만 기존 파일과 다른
-클라이언트가 쓴 파일을 0으로 읽었습니다. 클라이언트의 `READ_PLUS` 요청에서 Debian
-Ganesha 4.3-2가 `read_arg->info`를 설정하지 않아 FSAL_VFS는 일반 READ로 처리하고,
-Ganesha는 비어 있는 `READ_PLUS` 결과를 인코딩합니다. 상위 프로젝트도 [같은 결함과
-수정안](https://lists.nfs-ganesha.org/archives/list/devel@lists.nfs-ganesha.org/thread/T7RTAUMQCT4UJP5B3PDD5SNCYFSDA7NS/)을 기록했습니다.
-수정된 빌드의 게스트 검증 전까지 Ganesha 마운트는 두 클라이언트 모두 v4.1로 고정합니다.
-knfsd는 요청한 minor 버전을 사용합니다.
+두 서버 모두 요청한 minor 버전을 사용합니다.
 호스트 입력 검사는 `python3 tools/test-lane-inputs.py`, 셸 검사는 `sh tools/lane-quote-lint.sh`로 실행합니다.
 게스트의 두 백엔드와 기본 별칭은 `tools/nfs-proxy/test/guest-four-mounts.sh`로 확인합니다.
+
+### 특이사항: Ganesha의 NFSv4.2 `READ_PLUS`
+
+애플리케이션은 같은 `read(2)`를 호출하지만, **Linux NFS 클라이언트가 전송하는 NFS 연산은
+`READ`(25)와 `READ_PLUS`(68)로 다릅니다.** Ganesha는 연산별 처리 함수를 거쳐 공통
+`nfs4_read` 함수를 사용합니다 ([연산 번호](https://github.com/nfs-ganesha/nfs-ganesha/blob/V4.3/src/include/nfsv41.h),
+[Ganesha 연산 디스패치](https://github.com/nfs-ganesha/nfs-ganesha/blob/V4.3/src/Protocols/NFS/nfs4_Compound.c)).
+`READ_PLUS`는 데이터와 빈 파일 구간(hole)을 구분해
+반환하며, 읽기 전에는 hole의 존재를 알 수 없어 양쪽이 지원하면 클라이언트가 우선 사용합니다
+([RFC 7862 §6.2.1](https://www.rfc-editor.org/rfc/rfc7862.html#section-6.2.1)).
+
+커널의 `CONFIG_NFS_V4_2_READ_PLUS`는 `NFS_V4_2`가 켜졌을 때 기본값이 `y`입니다
+([Linux Kconfig](https://github.com/torvalds/linux/blob/master/fs/nfs/Kconfig)).
+이 프로젝트의 [KASAN](../bundle/patches/kernel.config)·[KCSAN](../bundle/patches/kernel-kcsan.config)
+설정도 모두 `y`입니다. Linux 클라이언트는 `NFS_CAP_READ_PLUS`가 살아 있고
+pNFS 데이터 서버 경로가 아니며 작업 버퍼 할당에 성공하면 `READ_PLUS`를 고릅니다.
+서버가 `NOTSUPP`를 반환하면
+일반 `READ`로 재시도합니다 ([Linux 클라이언트 코드](https://linux.googlesource.com/linux/kernel/git/torvalds/linux/+/315f4bd234b3b8a3ed3a71fd4c53b110cf373720/fs/nfs/nfs4proc.c)).
+
+FSAL은 Ganesha 서버 내부의 파일시스템 추상화 계층입니다. 이 lane의 FSAL_VFS는 로컬
+파일시스템을 읽습니다. Debian Ganesha 4.3-2에서는 `READ_PLUS` 요청을 받는 함수가
+`read_arg->info`를 설정하지 않습니다. 그 결과 FSAL_VFS는 일반 READ로 처리하고,
+Ganesha는 비어 있는 정보를 `READ_PLUS` 응답으로 인코딩합니다
+([Ganesha V4.3 읽기 코드](https://github.com/nfs-ganesha/nfs-ganesha/blob/V4.3/src/Protocols/NFS/nfs4_op_read.c),
+[FSAL_VFS 코드](https://github.com/nfs-ganesha/nfs-ganesha/blob/V4.3/src/FSAL/FSAL_VFS/file.c),
+[상위 프로젝트 수정안](https://lists.nfs-ganesha.org/archives/list/devel@lists.nfs-ganesha.org/thread/T7RTAUMQCT4UJP5B3PDD5SNCYFSDA7NS/)).
+서버가 `NOTSUPP`를 반환하지 않으므로 클라이언트의 일반 READ 재시도도 일어나지 않습니다.
+
+기존 Debian 4.3-2 이미지에서는 Ganesha 직접·프록시 경로 모두 v4.2 마운트는 되지만
+기존 파일과 다른 클라이언트가 쓴 파일을 0으로 읽었습니다. `client0`·`client1`은
+같은 VM 안의 별도 네트워크 네임스페이스와 NFS 마운트이며, 서버의 원본 파일과
+v4.1 읽기는 정상이었습니다. 공식 [V15.6 읽기 코드](https://github.com/nfs-ganesha/nfs-ganesha/blob/V15.6/src/Protocols/NFS/nfs4_op_read.c)는
+`read_arg->info`를 전달합니다. V15.6 소스의 FSAL_VFS는 `tmpfs` export를 제외하므로
+lane의 Ganesha 저장소를 크기가 제한된 ext4 루프 이미지로 옮겼습니다.
+
+현재 v4.2 이미지에서는 두 클라이언트의 네 마운트 교차 읽기·쓰기, Ganesha 직접
+마운트, 프록시 경로의 `READ_PLUS` 계수, lane 정리와 루프 장치 해제가 통과했습니다.
+v4.1 이미지에서도 같은 검사를 통과했습니다. 빌드와 검증 명령은 다음과 같습니다.
+
+```sh
+tools/build-ganesha-deps.sh                 # 최초 1회: Bookworm 의존성 기반
+tools/build-ganesha-v15.sh                  # guest-deps-ganesha-v15.6.tar.gz
+tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-lane
+python3 tools/assemble-guest-deps.py \
+    --ganesha-deps bundle/src/guest-deps-ganesha-v15.6.tar.gz \
+    --proxy bundle/src/nfs-proxy-lane \
+    --out bundle/src/guest-deps-lane.tar.gz
+python3 tools/bootstrap-kcov-env.py env \
+    --base-image artifacts/bookworm-base.img \
+    --ssh-key artifacts/bookworm.id_rsa \
+    --deps-tar bundle/src/guest-deps-lane.tar.gz --minor 2
+python3 tools/check-ganesha-v15-guest.py \
+    --image env/images/bookworm-kcov-fresh-v2.qcow2 \
+    --seed bundle/corpus/nfs-normal/basic-v41-ganesha-tcp.prog
+```
+
+v4.1 이미지는 bootstrap의 `--minor 1`로 생성합니다. 기존 `env/`를
+갱신하면서 컴파일 결과를 재사용할 때는 `--update --skip-build`를 지정합니다.
+빌더와 deps 조립기는 기존 출력 덮어쓰기를 거부하므로 이미 만든 자산을
+재사용하거나 새 출력 경로를 지정합니다.
+
+`build-ganesha-v15.sh`는 Ganesha 커밋 `98eb4beb642674d4188361008495bb6d585d393d`와
+libntirpc 커밋 `848ab93b63174338ad72875bddd5680113f64b39`를 확인합니다.
+이미지 입력 해시는 인접한 `.json`과 `env/manifest.json`에 기록됩니다.
+기존 4.3-2 tarball과 이미지는 `legacy` 이름으로 보존합니다.
 
 ## 경계
 
@@ -171,28 +232,24 @@ knfsd와 **병렬로** 수행해 퍼징 처리량을 높이는 축이다. 동시
 | 로컬 커버리지 레코드 | 371,608 |
 | cleanup 누출 | mount / namespace / source_tree 모두 0 |
 
-### ASan 계측 Ganesha (별도 현장 자산)
+### ASan 계측 Ganesha (기존 4.3 진단 자산)
 
 ```sh
 tools/build-ganesha-deps.sh           # 일반 Ganesha tarball이 아직 없다면 먼저 생성
 tools/build-ganesha-asan.sh
-tools/ganesha-asan-lane-run.sh
 ```
 
+이 자산은 현재 V15.6 lane 빌드와 별개이며 v4.2 기본 이미지에 주입할 대상이 아닙니다.
 빌더는 Debian bookworm 컨테이너의 GCC 12·`libasan.so.8`을 써서 4.3-2 소스와
 Debian 패치로 실행 파일, `libganesha_nfsd.so.4.3`, VFS 플러그인을 함께 계측한다.
 `bundle/src/guest-deps-ganesha-asan.tar.gz`는 **별도 gitignored 자산**이다.
 기존 `guest-deps.tar.gz`·일반 Ganesha tarball은 보존한다. 소스 SHA·빌드 설정·
 산출물 해시는 빌더가 출력하는 작업 디렉터리의 `provenance.txt`에 남는다.
 빌더는 기존 출력 파일 덮어쓰기를 거부하며 `--out`으로 새 경로를 지정할 수 있다.
-ASan 사용 시 fixture는 Ganesha를 `-F`로 시작해 stderr 보고서를 레인 로그에
-남긴다. 스모크 게이트는 라이브 PID의 `/proc/PID/maps`에서 `libasan.so.8`을
-확인하고 두 클라이언트의 34콜×2 결과, 로그, cleanup을 판정한다.
-
-기존 Ganesha 러너에서 선택하려면 `KOOV_GANESHA_DEPS`와
-`KOOV_GANESHA_ASAN_OPTIONS`를 함께 설정하고 별도 `KOOV_EVIDENCE_DIR`을
-사용한다. 단, 그 러너의 **원격 KCOV `.extra` AB 게이트는 사용자 공간
-Ganesha에 적용되지 않으므로**, ASan 동작 판정에는 위 스모크 게이트를 쓴다.
+ASan 진단 당시에는 fixture가 Ganesha를 `-F`로 시작해 stderr 보고서를 레인
+로그에 남겼고, 라이브 PID의 `/proc/PID/maps`에서 `libasan.so.8` 로드 여부와
+두 클라이언트의 34콜×2 결과, cleanup을 판정했다. 사용자 공간 Ganesha에
+원격 KCOV `.extra` 게이트는 적용되지 않는다.
 
 ### A-2. knfsd + ASan Ganesha 동시 릴레이 — 네 게스트 NFSv4 마운트 확인
 

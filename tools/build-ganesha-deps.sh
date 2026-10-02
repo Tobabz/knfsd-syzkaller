@@ -20,14 +20,15 @@
 # the original, so this tarball is a site-generated asset: THIS SCRIPT is its
 # provenance, which is why it lives in tools/.
 #
-# WHY DEBIAN PACKAGES AND NOT A SOURCE BUILD
+# WHY THIS BASELINE USES DEBIAN PACKAGES
 #
 # The host has no development headers at all -- libtirpc, libsqlite3,
 # libjansson, libevent, libcap and the rest are absent from /usr/include -- and
 # no sudo and no pip, so a source build would mean building that entire
-# dependency chain from source.  Debian already ships a working
-# nfs-ganesha 4.3-2, and the runner's existing deps-tarball mechanism is
-# precisely the sanctioned way to carry extra userspace into the guest.
+# dependency chain from source.  Debian ships nfs-ganesha 4.3-2, and the
+# runner's deps-tarball mechanism carries that userspace into the guest.
+# tools/build-ganesha-v15.sh builds current upstream Ganesha in a Bookworm
+# container and overlays it on this dependency baseline.
 #
 # CONSEQUENCE: this is NOT an ASAN or UBSAN build.  ASAN was wanted to catch
 # memory bugs in Ganesha itself, but the axis measures kernel coverage, and a

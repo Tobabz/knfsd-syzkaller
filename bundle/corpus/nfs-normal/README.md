@@ -154,6 +154,13 @@ input. Its default-mode acceptance is the compatibility contract; strict mode
 rejects the legacy offset strings and is intentionally not made green by an
 untested behavioral rewrite.
 
+Ganesha V15.6 검증에서는 `basic-v41-ganesha-tcp.prog`를 별도 v4.2 이미지
+`env/images/bookworm-kcov-fresh-v2.qcow2`에서 다시 실행했다.
+파일명은 기존 v4.1 시드의 이름을 유지하지만, 이번 실행의 두 Ganesha 마운트는
+v4.2이다. 34개 호출이 모두 완료됐고 14번 호출의 기대 errno 11을 제외한
+호출은 errno 0이었다. KCOV 커버리지도 양수였으며, 같은 스냅샷에서 프록시의
+`READ_PLUS` 호출과 직접 연결의 교차 읽기·쓰기, 정리까지 확인했다.
+
 ## Gaps and exclusions
 
 | Missing flow or boundary | Why it is a gap rather than a `.prog` |

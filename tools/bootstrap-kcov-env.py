@@ -274,6 +274,7 @@ def export_kernel_images(args, variant):
             shutil.rmtree(leftover)
     staged.mkdir(parents=True)
     shutil.copy2(bzimage, staged / "bzImage")
+    shutil.copy2(out / ".config", staged / ".config")
     vmlinux = out / "vmlinux"
     if vmlinux.is_file():
         shutil.copy2(vmlinux, staged / "vmlinux")
@@ -292,12 +293,13 @@ def stage_kernel(args, manifest, reuse):
     if (reuse and kernel_sentinel(linux) and all(
             (image_dir(args, v) / "bzImage").is_file()
             and (image_dir(args, v) / "bzImage").stat().st_size > 0
+            and (image_dir(args, v) / ".config").is_file()
             for v in args.variants)):
         print("reusing kernel build", flush=True)
         rebuilt = False
     else:
         if args.skip_build:
-            raise RuntimeError("--skip-build requires an existing patched kernel tree and variant bzImages")
+            raise RuntimeError("--skip-build requires an existing patched kernel tree, variant bzImages and configs")
         if linux.exists():
             shutil.rmtree(linux)
         for variant in args.variants:
@@ -583,7 +585,7 @@ def stage_verify_variant(args, image, variant, bzimage):
         if int(json.loads(lanes).get("lane_count", 0)) < 1:
             raise RuntimeError("no lanes reported")
         sanitizer = detect_mem_sanitizer(
-            vm, build_dir(args, variant) / ".config")
+            vm, image_dir(args, variant) / ".config")
         if sanitizer != variant:
             raise RuntimeError("variant %s booted a %s kernel"
                                % (variant, sanitizer))

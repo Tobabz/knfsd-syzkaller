@@ -4,9 +4,10 @@
 The lane fixture starts knfsd, NFS-Ganesha and the wire relay in every lane, so the
 tarball passed to bootstrap as --deps-tar must carry all three.
 
-  tools/build-ganesha-deps.sh                       -> bundle/src/guest-deps-ganesha.tar.gz
+  tools/build-ganesha-deps.sh                       -> Bookworm dependency baseline
+  tools/build-ganesha-v15.sh                        -> bundle/src/guest-deps-ganesha-v15.6.tar.gz
   tools/nfs-proxy/build-guest.sh --out FILE         -> the relay, built against the guest's glibc
-  tools/assemble-guest-deps.py --ganesha-deps bundle/src/guest-deps-ganesha.tar.gz \\
+  tools/assemble-guest-deps.py --ganesha-deps bundle/src/guest-deps-ganesha-v15.6.tar.gz \\
       --proxy FILE --out bundle/src/guest-deps-lane.tar.gz
 """
 import argparse

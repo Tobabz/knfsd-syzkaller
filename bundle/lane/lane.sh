@@ -36,9 +36,8 @@
 # filesystem state.  Both clients see the same tree within a backend, while
 # the two backends remain independent.  The proxy selects ONE backend from
 # the destination IP and returns that backend's own NFS response.
-# NFS_MINOR_VERSION=2 applies to knfsd mounts; Ganesha mounts use v4.1
-# until the zero-filled v4.2 reads observed both with and without the relay
-# are resolved.
+# NFS_MINOR_VERSION applies to both backends. The V15.6 Ganesha build carries
+# the READ_PLUS fix needed for correct v4.2 reads through FSAL_VFS.
 
 # Disposable-VM multi-lane fixture. Never run this on the host.
 set -eu
@@ -322,9 +321,6 @@ setup_cross_mount()
     cross_ip=$5
     cross_mount=$root/lane$cross_lane/client$cross_client/$cross_backend
     cross_minor=$nfs_minor_version
-    if [ "$cross_backend" = ganesha ]; then
-        cross_minor=1
-    fi
     mkdir -p "$cross_mount"
     nsenter --net="/run/netns/$cross_ns" -- \
         mount.nfs4 -o "vers=4.$cross_minor,minorversion=$cross_minor,proto=tcp,port=$server_port,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
@@ -434,8 +430,8 @@ setup_lane()
         printf "tcp $knfsd_port\n" > /proc/fs/nfsd/portlist
         printf "4\n" > /proc/fs/nfsd/threads
         fi
-        # KOOV: Ganesha backend has its own tmpfs and export path.  Both
-        # clients share this tree, but knfsd never accesses it.
+        # KOOV: Ganesha V15 VFS does not export tmpfs. Use a bounded ext4
+        # loop image for its separate tree; knfsd keeps its tmpfs.
         #
         # NOTE: no apostrophe may appear anywhere in this block.  It is one
         # single-quoted argument to sh -c, and a stray quote in a comment
@@ -447,7 +443,7 @@ setup_lane()
                 exit 1
             }
             command -v dbus-daemon >/dev/null 2>&1 || {
-                echo "KOOV: dbus-daemon not on PATH; Ganesha 4.3 requires a system bus" >&2
+                echo "KOOV: dbus-daemon not on PATH; Ganesha requires a system bus" >&2
                 exit 1
             }
             # Ganesha registers itself with rpcbind for every enabled protocol
@@ -459,13 +455,14 @@ setup_lane()
                 rpcbind -w
             fi
             mkdir -p /var/lib/nfs/ganesha /run/ganesha
-            mount -t tmpfs -o mode=0755,size="$tmpfs_size" \
-                "frozen-phase9-lane$lane-ganesha" \
+            truncate -s "$tmpfs_size" "$lane_root/server/ganesha.ext4"
+            mkfs.ext4 -F -q "$lane_root/server/ganesha.ext4"
+            mount -t ext4 -o loop "$lane_root/server/ganesha.ext4" \
                 "$lane_root/server/export-ganesha"
             mkdir -p "$lane_root/server/export-ganesha/shared"
             printf "frozen Phase 9 lane %s Ganesha fixture\n" "$lane" > \
                 "$lane_root/server/export-ganesha/shared/fixture"
-            # A system bus, private to this lane.  Ganesha 4.3 calls
+            # A system bus, private to this lane.  Ganesha calls
             # dbus_bus_get(DBUS_BUS_SYSTEM) and offers no way to turn that off:
             # with no bus it logs "DBUS not initialized, service thread
             # exiting", the thread returns, and the server shuts down again
@@ -538,7 +535,7 @@ EOF
             }
             printf "%s\n" "$dbus_pid" > "$lane_root/server/dbus.pid"
             printf "%s\n" "$dbus_address" > "$lane_root/server/dbus.address"
-            # Every key below is verified against the 4.3 parser tables in
+            # Every key below was checked against the Ganesha parser tables in
             # src/support/nfs_read_conf.c, because a key in the wrong BLOCK is
             # not visible locally -- the guest reports it as "Unknown
             # parameter" only after boot, and silently ignores it:
@@ -709,14 +706,6 @@ EOF
     fi
     setup_client0_minor=$nfs_minor_version
     setup_client1_minor=$nfs_minor_version
-    # Debian Ganesha 4.3-2 omits read_arg->info for READ_PLUS; FSAL_VFS
-    # reads normally, but the READ_PLUS reply is empty. Use v4.1 for now.
-    if [ "$server_impl" = ganesha ]; then
-        setup_client0_minor=1
-    fi
-    if [ "$server_impl" != knfsd ]; then
-        setup_client1_minor=1
-    fi
     setup_client "$setup_lane_id" 0 "$setup_client0_ns" "$setup_server0_ip" "$setup_client0_minor" "$server_port"
     setup_client "$setup_lane_id" 1 "$setup_client1_ns" "$setup_server1_ip" "$setup_client1_minor" "$server_port"
     if [ "$server_impl" = both ]; then
@@ -1070,12 +1059,8 @@ status_fixture()
 
         for status_client in 0 1; do
             status_pid=$(cat "$status_lane_root/client$status_client.pid")
-            status_mount_minor=$status_minor
-            case "$server_impl:$status_client" in
-                ganesha:*|both:1) status_mount_minor=1 ;;
-            esac
             nsenter -t "$status_pid" -m -n -- grep -Eq \
-                " $status_lane_root/client$status_client/mnt nfs4 .*vers=4\\.$status_mount_minor.*proto=tcp" \
+                " $status_lane_root/client$status_client/mnt nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
                 /proc/mounts
         done
         test -L "$root/proc$status_lane"
@@ -1134,24 +1119,29 @@ status_fixture()
             status_ganesha_backing=$(nsenter -t "$status_server_pid" -m -n -- \
                 findmnt -n -o SOURCE \
                 -- "$status_lane_root/server/export-ganesha")
-            test "$status_ganesha_backing" = \
-                frozen-phase9-lane$status_lane-ganesha
-            # KOOV: the Ganesha tmpfs needs the same size bound.
+            case "$status_ganesha_backing" in
+                /dev/loop*) ;;
+                *) echo "KOOV: Ganesha backing is not a loop device" >&2
+                   exit 1 ;;
+            esac
+            test "$(nsenter -t "$status_server_pid" -m -n -- \
+                findmnt -n -o FSTYPE -- \
+                "$status_lane_root/server/export-ganesha")" = ext4
+            status_ganesha_bytes=$(stat -c %s \
+                "$status_lane_root/server/ganesha.ext4")
+            test "$status_ganesha_bytes" -gt 0
+            test "$(blockdev --getsize64 "$status_ganesha_backing")" -eq \
+                "$status_ganesha_bytes"
             status_ganesha_backing_options=$(nsenter -t "$status_server_pid" \
                 -m -n -- findmnt -n -o OPTIONS \
                 -- "$status_lane_root/server/export-ganesha")
-            case "$status_ganesha_backing_options" in
-                *size=*) ;;
-                *) echo "KOOV: Ganesha lane tmpfs is not size-bounded (OPTIONS=$status_ganesha_backing_options)" >&2
-                   exit 1 ;;
-            esac
         fi
         if [ "$server_impl" = both ]; then
             status_relay_pid=$(cat "$status_lane_root/server/proxy.pid")
             pid_in_named_netns "$status_relay_pid" "$status_server_ns"
             test "$status_connections" -ge 4
             nsenter -t "$status_client0_pid" -m -n -- grep -Eq \
-                " $status_lane_root/client0/ganesha nfs4 .*vers=4\\.1.*proto=tcp" \
+                " $status_lane_root/client0/ganesha nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
                 /proc/mounts
             nsenter -t "$status_client1_pid" -m -n -- grep -Eq \
                 " $status_lane_root/client1/knfsd nfs4 .*vers=4\\.$status_minor.*proto=tcp" \
