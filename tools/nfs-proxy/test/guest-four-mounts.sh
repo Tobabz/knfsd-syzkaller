@@ -1,10 +1,12 @@
 #!/bin/sh
-# Guest-side NFSv4 2-client x 2-backend relay check.  The first mount for
+# Guest-side NFS 2-client x 2-backend relay check.  The first mount for
 # each client retains the legacy /mnt alias; its other backend is explicit.
 set -eu
 root=${1:?usage: guest-four-mounts.sh ROOT}
-minor=${NFS_MINOR_VERSION:-1}
-case "$minor" in 1|2) ;; *) exit 2 ;; esac
+version=${NFS_VERSION:-4.${NFS_MINOR_VERSION:-1}}
+case "$version" in 3|4.0|4.1|4.2) ;; *) exit 2 ;; esac
+mount_type=nfs4
+if [ "$version" = 3 ]; then mount_type=nfs; fi
 source_root=/syz-nfs-lanes/proc-0
 case "$root" in /tmp/frozen-phase9.*) ;; *) exit 2 ;; esac
 k0=$root/lane0/client0/mnt
@@ -14,15 +16,21 @@ g1=$root/lane0/client1/mnt
 
 for path in "$k0" "$k1" "$g0" "$g1"; do
     mountpoint -q "$path"
-    test "$(findmnt -n -o FSTYPE -- "$path")" = nfs4
-    grep -Eq " $path nfs4 .*vers=4\.$minor.*proto=tcp" /proc/mounts
+    test "$(findmnt -n -o FSTYPE -- "$path")" = "$mount_type"
+    grep -Eq " $path $mount_type .*vers=$version.*proto=tcp" /proc/mounts
 done
-test "$(findmnt -n -o SOURCE -- "$k0")" = 10.89.0.1:/
-test "$(findmnt -n -o SOURCE -- "$k1")" = 10.89.0.1:/
-test "$(findmnt -n -o SOURCE -- "$g0")" = 10.89.0.5:/
-test "$(findmnt -n -o SOURCE -- "$g1")" = 10.89.0.5:/
+knfsd_source=10.89.0.1:/
+ganesha_source=10.89.0.5:/
+if [ "$version" = 3 ]; then
+    knfsd_source=10.89.0.1:$root/lane0/server/export
+    ganesha_source=10.89.0.5:$root/lane0/server/export-ganesha
+fi
+test "$(findmnt -n -o SOURCE -- "$k0")" = "$knfsd_source"
+test "$(findmnt -n -o SOURCE -- "$k1")" = "$knfsd_source"
+test "$(findmnt -n -o SOURCE -- "$g0")" = "$ganesha_source"
+test "$(findmnt -n -o SOURCE -- "$g1")" = "$ganesha_source"
 for client in 0 1; do
-    test "$(findmnt -n -o SOURCE -- "$source_root/client$client")" = 10.89.0.1:/
+    test "$(findmnt -n -o SOURCE -- "$source_root/client$client")" = "$knfsd_source"
 done
 
 test "$(cat "$k0/shared/fixture")" = "$(cat "$k1/shared/fixture")"

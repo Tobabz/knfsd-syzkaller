@@ -33,7 +33,7 @@ def main():
                         help="optional syz-execprog seed to run before cleanup")
     args = parser.parse_args()
     vm = bootstrap.VM(args.image.resolve(), args.kernel.resolve(),
-                      args.ssh_key.resolve(), 240, str(args.minor))
+                      args.ssh_key.resolve(), 240, "4.%s" % args.minor)
     root = "/tmp/frozen-phase9.manager"
     ganesha_mount = root + "/lane0/client0/ganesha"
     try:

@@ -37,8 +37,8 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
   was **deleted 2026-09-25** during the bundle independence restructure; its
   hash is kept here for audit. Its useful contents survived as the flat
   `patches/` + `lane/` (+`baker/`, `corpus/`) above.
-- `patches/*/series` records apply order; no SHA256 verification is performed
-  re-verifies them on every pipeline run.
+- `patches/*/series` records apply order. Git tracks the checked-in patches;
+  bootstrap records their names and content hashes in `env/manifest.json`.
 
 ## Base image provenance
 
@@ -119,7 +119,7 @@ python3 tools/bootstrap-kcov-env.py /work/env \
   --base-image artifacts/bookworm-base.img \
   --ssh-key artifacts/bookworm.id_rsa \
   --deps-tar bundle/src/guest-deps-lane.tar.gz \
-  --minor 2
+  --version 4.2
 ```
 
 The run clones the pinned upstream refs (git.kernel.org `v7.3-rc5` /
@@ -143,9 +143,9 @@ inputs are unchanged. To follow a new kernel release first run
 Point a stock syz-manager at the outputs: `kernel` = `<target>/images/<variant>/bzImage`,
 `kernel_obj` = the directory holding `vmlinux`, `image` = `<target>/images/bookworm-kcov-fresh.qcow2`,
 `sshkey` = the generated `artifacts/bookworm.id_rsa`, `procs` = the fixture's lane count (4), and
-`experimental.remote_cover` to switch remote coverage. The earlier A/B harness was removed in
-commit `7833ed3`. Before starting the manager, run `tools/prepare-live-lane-config.py`
-on its base config to add the hash-pinned host lane script share and select minor 1 or 2.
+`experimental.remote_cover` to switch remote coverage. Before starting the manager, run `tools/prepare-live-lane-config.py`
+on its base config to add the hash-pinned host lane script share and select
+`--version 3|4.0|4.1|4.2`.
 
 Use separate manager configs, workdirs and `corpus.db` files for knfsd and
 Ganesha, running one manager at a time. Initialize each DB from only its backend's

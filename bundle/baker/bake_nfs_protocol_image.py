@@ -11,7 +11,7 @@ REPO_ROOT/SYZ_TREE when set so the same script ports to other hosts.
 
 Example:
   scripts/bake_nfs_protocol_image.py --base-image /path/bookworm.img \\
-      --output /path/bookworm-nfs-protocol.qcow2 --minor 2 \\
+      --output /path/bookworm-nfs-protocol.qcow2 --version 4.2 \\
       --kernel artifacts/.../bzImage --ssh-key /path/bookworm.id_rsa \\
       --deps-tar artifacts/.../guest-deps.tar.gz
 """
@@ -93,8 +93,8 @@ class VM:
                 "-device", "virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane",
                 "-drive", drive, "-kernel", str(self.args.kernel),
                 "-append", "root=/dev/sda console=ttyS0 nokaslr "
-                "nfs.localio_enabled=N koov.nfs_minor=%s koov.lane_sha256=%s"
-                % (self.args.minor, sha256(self.args.lane_script)),
+                "nfs.localio_enabled=N koov.nfs_version=%s koov.lane_sha256=%s"
+                % (self.args.version, sha256(self.args.lane_script)),
                 "-device", "e1000,netdev=net0",
                 "-netdev", "user,id=net0,restrict=on,"
                 "hostfwd=tcp:127.0.0.1:%d-:22" % self.ssh_port]
@@ -152,8 +152,11 @@ def parse_args(argv=None):
                         help="clean raw base image (never opened RW)")
     parser.add_argument("--output", type=Path, required=True,
                         help="new standalone .qcow2 image (must not exist)")
-    parser.add_argument("--minor", choices=("1", "2"), required=True,
-                        help="NFS minor version used for verification boots")
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--version", choices=("3", "4.0", "4.1", "4.2"),
+                           help="NFS version used for verification boots")
+    selection.add_argument("--minor", choices=("1", "2"),
+                           help="legacy alias for --version 4.1 or 4.2")
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--ssh-key", type=Path, required=True)
     parser.add_argument("--deps-tar", type=Path, required=True)
@@ -167,6 +170,7 @@ def parse_args(argv=None):
     parser.add_argument("--memory", type=int, default=4096)
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args(argv)
+    args.version = args.version or "4." + args.minor
     for field in ("base_image", "kernel", "ssh_key", "deps_tar",
                   "lane_script", "boot_fixture", "service"):
         path = getattr(args, field).resolve()
@@ -200,6 +204,9 @@ def main(argv=None):
         vm.guest(
             "set -eu; "
             "test ! -e /opt/frozen-phase9; test ! -e /opt/kcov-nfs; "
+            "getent passwd _rpc >/dev/null || "
+            "useradd --system --no-create-home --home-dir /run/rpcbind "
+            "--shell /usr/sbin/nologin _rpc; "
             "install -d /opt/kcov-nfs/deps /opt/frozen-phase9; "
             "tar -xzf /tmp/bake-deps.tar.gz -C /opt/kcov-nfs/deps; "
             "install -m 0755 /tmp/bake-boot-fixture.sh /opt/frozen-phase9/boot-fixture.sh; "
@@ -221,17 +228,19 @@ def main(argv=None):
         print("verification boot (RW, service must go active)", flush=True)
         vm.start(snapshot=False)
         state = vm.guest(
-            "systemctl is-active frozen-phase9-fixture.service",
+            "systemctl is-active frozen-phase9-fixture.service || true",
             timeout=60).strip()
         if state != "active":
-            raise RuntimeError("fixture service not active: %r" % state)
+            journal = vm.guest(
+                "journalctl -u frozen-phase9-fixture.service -b --no-pager -n 100 || true")
+            raise RuntimeError("fixture service %s:\n%s" % (state, journal[-10000:]))
         status = vm.guest(
-            "NFS_MINOR_VERSION=%s /run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager"
-            % args.minor, timeout=90)
+            "/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager",
+            timeout=90)
         fixture = json.loads(status)
         if int(fixture.get("lane_count", 0)) < 1 or \
-                int(fixture.get("nfs_minor", -1)) != int(args.minor):
-            raise RuntimeError("lane status or NFS minor mismatch: %s"
+                fixture.get("nfs_version") != args.version:
+            raise RuntimeError("lane status or NFS version mismatch: %s"
                                % status[:300])
         guest_lane_sha = vm.guest("sha256sum /run/frozen-phase9/lane.sh").split()[0]
         if guest_lane_sha != sha256(args.lane_script):
@@ -255,6 +264,7 @@ def main(argv=None):
         "bytes": args.output.stat().st_size,
         "base_image": str(args.base_image),
         "base_sha256": base_sha,
+        "baker_sha256": sha256(Path(__file__)),
         "boot_fixture_sha256": sha256(args.boot_fixture),
         "service_sha256": sha256(args.service),
         "deps_tar_sha256": sha256(args.deps_tar),

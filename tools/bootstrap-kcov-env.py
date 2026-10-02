@@ -26,7 +26,7 @@ TARGET_DIR layout:
 
 Usage (all paths explicit, no host defaults besides REPO auto-detect):
   bootstrap_kcov_env.py TARGET_DIR --kernel-repo URL --syz-repo URL \\
-      --base-image FILE --ssh-key FILE --deps-tar FILE --minor 1|2 \\
+      --base-image FILE --ssh-key FILE --deps-tar FILE --version 3|4.0|4.1|4.2 \\
       [--kernel-ref TAG|latest] [--variant kasan|kcsan ...] [--jobs N] \\
       [--skip-build] [--skip-verify]
 
@@ -169,7 +169,10 @@ def parse_args(argv=None):
                         help="clean raw base image (never opened RW)")
     parser.add_argument("--ssh-key", type=Path, required=True)
     parser.add_argument("--deps-tar", type=Path, required=True)
-    parser.add_argument("--minor", choices=("1", "2"), required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--version", choices=("3", "4.0", "4.1", "4.2"))
+    selection.add_argument("--minor", choices=("1", "2"),
+                           help="legacy alias for --version 4.1 or 4.2")
     parser.add_argument("--variant", action="append", choices=VARIANTS,
                         dest="variants",
                         help="sanitizer kernel to build and verify; repeat "
@@ -181,6 +184,7 @@ def parse_args(argv=None):
                         help="write/update manifest.json after build")
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args(argv)
+    args.version = args.version or "4." + args.minor
     if args.kernel_ref is None:
         args.kernel_ref = KERNEL_TAG
     elif args.kernel_ref == "latest":
@@ -423,6 +427,7 @@ def reusable_image(args, image_out):
         return None
     inputs = {
         "base_sha256": sha256(args.base_image),
+        "baker_sha256": sha256(BAKER / "bake_nfs_protocol_image.py"),
         "boot_fixture_sha256": sha256(LANE / "boot-fixture.sh"),
         "service_sha256": sha256(LANE / "fixture.service"),
         "deps_tar_sha256": sha256(args.deps_tar),
@@ -441,7 +446,7 @@ def discard_staged_image(staging):
 def stage_bake(args, bzimage, image_out):
     bake = BAKER / "bake_nfs_protocol_image.py"
     run([sys.executable, str(bake), "--base-image", str(args.base_image),
-         "--output", str(image_out), "--minor", args.minor,
+         "--output", str(image_out), "--version", args.version,
          "--kernel", str(bzimage), "--ssh-key", str(args.ssh_key),
          "--deps-tar", str(args.deps_tar),
          "--lane-script", str(LANE / "lane.sh"),
@@ -454,7 +459,7 @@ def stage_bake(args, bzimage, image_out):
 
 
 class VM:
-    def __init__(self, image, kernel, ssh_key, boot_timeout, minor):
+    def __init__(self, image, kernel, ssh_key, boot_timeout, version):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             self.ssh_port = reservation.getsockname()[1]
@@ -467,7 +472,7 @@ class VM:
         self.scp = ["scp", "-O", *common, "-P", str(self.ssh_port)]
         self.image, self.kernel = image, kernel
         self.boot_timeout = boot_timeout
-        self.minor = minor
+        self.version = version
         self.process = None
 
     def start(self):
@@ -480,8 +485,8 @@ class VM:
                "-drive", "file=%s,format=qcow2,if=ide" % self.image,
                "-kernel", str(self.kernel),
                "-append", "root=/dev/sda console=ttyS0 nokaslr "
-               "nfs.localio_enabled=N koov.nfs_minor=%s koov.lane_sha256=%s"
-               % (self.minor, sha256(LANE / "lane.sh")),
+               "nfs.localio_enabled=N koov.nfs_version=%s koov.lane_sha256=%s"
+               % (self.version, sha256(LANE / "lane.sh")),
                "-device", "e1000,netdev=net0",
                "-netdev", "user,id=net0,restrict=on,"
                "hostfwd=tcp:127.0.0.1:%d-:22" % self.ssh_port]
@@ -573,7 +578,7 @@ def detect_mem_sanitizer(vm, config_path):
 
 def stage_verify_variant(args, image, variant, bzimage):
     started = time.monotonic()
-    vm = VM(image, bzimage, args.ssh_key, args.boot_timeout, args.minor)
+    vm = VM(image, bzimage, args.ssh_key, args.boot_timeout, args.version)
     try:
         vm.start()
         state = vm.guest("systemctl is-active frozen-phase9-fixture.service",
@@ -583,12 +588,11 @@ def stage_verify_variant(args, image, variant, bzimage):
         root = vm.guest("ls -d /tmp/frozen-phase9.manager",
                         timeout=30).strip()
         lanes = vm.guest(
-            "NFS_MINOR_VERSION=%s /run/frozen-phase9/lane.sh status %s"
-            % (args.minor, root), timeout=90)
+            "/run/frozen-phase9/lane.sh status %s" % root, timeout=90)
         lane_status = json.loads(lanes)
         if int(lane_status.get("lane_count", 0)) < 1 or \
-                int(lane_status.get("nfs_minor", -1)) != int(args.minor):
-            raise RuntimeError("lane status or NFS minor does not match")
+                lane_status.get("nfs_version") != args.version:
+            raise RuntimeError("lane status or NFS version does not match")
         guest_lane_sha = vm.guest("sha256sum /run/frozen-phase9/lane.sh").split()[0]
         if guest_lane_sha != sha256(LANE / "lane.sh"):
             raise RuntimeError("guest lane script differs from the host source")
@@ -599,7 +603,8 @@ def stage_verify_variant(args, image, variant, bzimage):
                                % (variant, sanitizer))
         return {"fixture_root": root,
                 "lane_count": int(lane_status["lane_count"]),
-                "nfs_minor": int(lane_status["nfs_minor"]),
+                "nfs_version": lane_status["nfs_version"],
+                "nfs_minor": lane_status["nfs_minor"],
                 "lane_script_sha256": guest_lane_sha,
                 "mem_sanitizer": sanitizer,
                 "target_kasan": sanitizer == "kasan",
@@ -630,7 +635,7 @@ def last_good_manifest(target):
 
 def main(argv=None):
     args = parse_args(argv)
-    manifest = {"target": str(args.target), "minor": args.minor,
+    manifest = {"target": str(args.target), "nfs_version": args.version,
                 "repo": str(BUNDLE.parent)}
     # --skip-build reuses existing pinned build outputs; it must never delete them.
     kernel_reuse = args.skip_build

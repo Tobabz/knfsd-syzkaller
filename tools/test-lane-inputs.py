@@ -55,11 +55,12 @@ with tempfile.TemporaryDirectory() as directory:
     assert output.read_bytes() == before
 
     # Parsing must find all three moved lane files without explicit overrides.
-    for minor in ("1", "2"):
+    for version in ("3", "4.0", "4.1", "4.2"):
         args = baker["parse_args"]([
             "--base-image", str(proxy), "--kernel", str(proxy), "--ssh-key", str(proxy),
             "--deps-tar", str(output), "--output", str(work / "image.qcow2"),
-            "--minor", minor])
+            "--version", version])
+        assert args.version == version
         assert args.lane_script == ROOT / "bundle/lane/lane.sh"
         assert args.boot_fixture == ROOT / "bundle/lane/boot-fixture.sh"
         assert args.service == ROOT / "bundle/lane/fixture.service"
@@ -69,7 +70,7 @@ with tempfile.TemporaryDirectory() as directory:
     manager.write_text(json.dumps({"type": "qemu", "workdir": str(work / "workdir"),
                                    "vm": {"cmdline": "nfs.localio_enabled=N"}}))
     subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
-                    str(manager), str(live), "--minor", "2", "--image", str(proxy)],
+                    str(manager), str(live), "--version", "3", "--image", str(proxy)],
                    check=True,
                    capture_output=True)
     prepared = json.loads(live.read_text())
@@ -77,7 +78,7 @@ with tempfile.TemporaryDirectory() as directory:
     lane_sha = hashlib.sha256(lane_bytes).hexdigest()
     assert (Path(prepared["workdir_template"]) / "lane.sh").read_bytes() == lane_bytes
     assert "path={{TEMPLATE}}" in prepared["vm"]["qemu_args"]
-    assert "koov.nfs_minor=2" in prepared["vm"]["cmdline"]
+    assert "koov.nfs_version=3" in prepared["vm"]["cmdline"]
     assert "koov.lane_sha256=" + lane_sha in prepared["vm"]["cmdline"]
     assert prepared["image"] == str(proxy.resolve())
 

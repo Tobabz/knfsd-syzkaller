@@ -1,122 +1,160 @@
 {
-  "schema": 1,
+  "schema": 2,
   "corpus": "nfs-normal",
-  "runtime_scope": "Parser success is syntax validation only. The current KASAN v4.1 image was verified and the knfsd and Ganesha 34-call inputs each passed one separate snapshot execution. syz-manager admitted both corpus.db records and completed corpus-triage. The current KASAN v4.2 image also passed one 11-call COPY execution. A 180-second combined-manager fuzzing smoke with only the two basic seeds and their file-operation syscalls enabled completed 7,791 executions without a recorded crash; both canonical 34-call seeds remained in the saved corpus. These runs do not establish long-run stability, paired replay, RPC-level handoff attribution, or Ganesha user-space coverage.",
-  "topology_evidence": {"path": "cache/four-mount-check-20261002/result.json", "status": "pass", "scope": "KASAN v4.1 and v4.2 snapshot guests: both default clients share the knfsd export; both explicit Ganesha clients share a separate export."},
-  "manager_corpus_triage": {"path": "cache/manager-corpus-v41-20261002/result.json", "status": "pass", "input_records": 2, "scope": "Both records admitted and triage completed with procs=4; exact seeds may be minimized during fuzzing."},
-  "manager_fuzzing_smoke": {"path": "cache/manager-unified-v41-20261002/focused-smoke.json", "corpus_inspection": "cache/manager-unified-v41-20261002/corpus-inspection.json", "status": "bounded_pass", "procs": 4, "seconds": 180, "executions": 7791, "crashes": 0, "scope": "One manager loaded both backend seeds with only their file-operation syscalls enabled. Both canonical 34-call programs remained in corpus.db. An unrestricted trial had two executor-hung reports, with non-NFS programs in the crash logs; no long-run stability claim."},
+  "runtime_scope": "Parser success is syntax validation only. The v4.1 knfsd and Ganesha 34-call seeds passed separate snapshot executions. The v4.2 COPY input passed one 11-call snapshot execution. Current v4.1 fuzzing uses separate syz-manager configs, workdirs and corpus.db files for knfsd and Ganesha, one backend at a time. The two separate corpus-triage runs completed. These bounded runs do not establish long-run stability, paired replay, RPC-level handoff attribution, or Ganesha user-space coverage.",
   "parser": {
     "path": "env/syzkaller/bin/syz-prog2c",
     "sha256": "f2e525f37b17f38512885bf0ac3fd5db4ac70138d99c453176926bfb0328b410",
     "source_checkout": "87ebfdd99487285e1a898264f008ac56c7ccb4fa",
-    "argv": ["-os", "linux", "-arch", "amd64", "-prog", "ABSOLUTE_INPUT_PATH"]
+    "argv": [
+      "-os",
+      "linux",
+      "-arch",
+      "amd64",
+      "-prog",
+      "ABSOLUTE_INPUT_PATH"
+    ]
   },
   "programs": [
     {
       "path": "basic-v41-tcp.prog",
       "sha256": "59e1d766a9a15c8e1700ce055674d9d1b06dccc9167d567e06985d8d9cf69f02",
-      "source": "copied by value from the former Wave1 worktree (tools/nfs_remote_kcov_ab_workload_markerhidden.prog); worktree removed",
-      "source_sha256": "59e1d766a9a15c8e1700ce055674d9d1b06dccc9167d567e06985d8d9cf69f02",
-      "nf_flows": ["NF-A1", "NF-A2"],
+      "nf_flows": [
+        "NF-A1",
+        "NF-A2"
+      ],
       "nfs_version": "4.1",
       "transport": "TCP",
       "fixture_path": "bundle/lane/lane.sh",
-      "fixture_command": "baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot",
       "functional_oracle": "All 34 calls finish on each execution; call 14 is the deliberate peer-lock conflict and returns errno 11, every other call returns errno 0, local KCOV is positive, and create/write/read/rename/unlink effects succeed across both mounts.",
-      "execution_status": "Historical run passed under the earlier fixture. On 2026-10-02 the restored 34-call input passed one snapshot run on the current KASAN v4.1 image: call 14 errno 11, all other calls errno 0. The raw .extra contains 77,314 records and 1,581 distinct fs/nfsd source locations; no RPC handoff trace.",
-      "runtime_evidence": {
-        "path": "/home/idealinsane/normal-flow-evidence/NF-A1-A2-basic-v41-tcp-v1",
-        "functional": "Both OFF and ON complete 34 calls with the expected call-14 errno 11 and 53 nfsd RPCs.",
-        "handoff": "NF-A1 unverified for this v4.1 input; operation success and PCs are not a transport trace.",
-        "kcov": "Local coverage present in both modes; remote ON coverage present."
-      },
-      "current_runtime_evidence": {"path": "cache/backend-current-v41-20261002/knfsd/result.json", "image_sha256": "544e986b0889c072e4482fd574ed8b6e7de808a8bd4678df898c32f73e921966", "functional": "One 34-call KASAN v4.1 syz-execprog execution; rc=0, call 14 errno 11, all other calls errno 0.", "kcov": "Local per-call coverage and a copied raw .extra: 77,314 PC records, 7,457 unique PCs, 1,581 distinct fs/nfsd source locations; no request-level attribution or RPC handoff trace."},
-      "parser_result": {"exit": 0, "c_bytes": 16077, "c_sha256": "fdb7ce127d1d5e9b7b0fd7db01e30543d68a250ed9c3a9a3c1d90041f54852f7", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
+      "execution_status": "One KASAN v4.1 snapshot completed 34 calls with the expected errno values and nonempty knfsd remote coverage. No request handoff trace was captured.",
+      "parser_result": {
+        "exit": 0
+      }
     },
     {
       "path": "basic-v41-ganesha-tcp.prog",
       "sha256": "a06c57e2216e1cb7d559ffb9514f2d1e6263f1f0ff59dd3d5e6a57bd02cbeffb",
-      "source": "derived by replacing the two client mount paths in basic-v41-tcp.prog with their Ganesha counterparts; file operations unchanged",
-      "source_sha256": "59e1d766a9a15c8e1700ce055674d9d1b06dccc9167d567e06985d8d9cf69f02",
       "nf_flows": [],
       "nfs_version": "4.1",
       "transport": "TCP",
       "fixture_path": "bundle/lane/lane.sh",
-      "fixture_command": "baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot",
       "functional_oracle": "All 34 calls finish; call 14 returns errno 11 and every other call returns errno 0. Local kernel client KCOV is present. This does not measure Ganesha user-space coverage.",
-      "execution_status": "One 2026-10-02 snapshot run on the current KASAN v4.1 image passed the 34-call errno oracle; local kernel client coverage files present, no .extra file. Ganesha internal execution and NFS RPC handoff were not separately traced.",
-      "runtime_evidence": {
-        "path": "cache/backend-single-validation-20261002/ganesha",
-        "functional": "One 34-call syz-execprog execution; rc=0, call 14 errno 11, all other calls errno 0.",
-        "handoff": "No RPC-level trace captured.",
-        "kcov": "Local per-call kernel coverage files present; no .extra file in this run. Ganesha user-space coverage was not collected."
-      },
-      "current_runtime_evidence": {"path": "cache/backend-current-v41-20261002/ganesha/result.json", "image_sha256": "544e986b0889c072e4482fd574ed8b6e7de808a8bd4678df898c32f73e921966", "functional": "One 34-call KASAN v4.1 syz-execprog execution; rc=0, call 14 errno 11, all other calls errno 0.", "kcov": "Local per-call kernel coverage files present; no .extra or Ganesha user-space coverage."},
+      "execution_status": "One KASAN v4.1 snapshot completed 34 calls with the expected errno values and client-kernel coverage. No Ganesha user-space coverage was collected.",
       "parser_result": {
-        "exit": 0,
-        "c_bytes": 16173,
-        "c_sha256": "09ff83ee30956a03ce587bf60bad6a7829e5fa3605625d24ac2fa992561a6022",
-        "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"
+        "exit": 0
       }
     },
     {
       "path": "async-copy-v42-tcp.prog",
       "sha256": "b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068",
-      "source": "copied by value from the former Wave1 worktree (bundle/corpus/attr-scenarios/B05/reach-copy-offload-x2.prog); worktree removed",
-      "source_sha256": "b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068",
-      "nf_flows": ["NF-A1", "NF-A2", "NF-C1", "NF-D1"],
+      "nf_flows": [
+        "NF-A1",
+        "NF-A2",
+        "NF-C1",
+        "NF-D1"
+      ],
       "nfs_version": "4.2",
       "transport": "TCP",
       "fixture_path": "bundle/lane/lane.sh",
-      "fixture_command": "baked image (standalone baker --minor 2): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot",
       "functional_oracle": "copy_file_range returns 33554432, async execution reaches nfsd4_do_async_copy, CB_OFFLOAD completes with status 0, and destination fsync and closes finish.",
-      "execution_status": "Historical B05 paired v4.2/TCP VM PASS for async COPY and callback; separate NF-A1 R2 ON VM confirms a socket-to-nfsd handoff. On the current KASAN v4.2 image, one 11-call snapshot execution passed with a 32 MiB copy_file_range return and nonempty .extra; callback and handoff were not retraced. Strict parser mode rejects legacy line-7 offset strings.",
-      "runtime_evidence": {
-        "paired_copy": "/home/idealinsane/attr-scenario-evidence/NORMAL-B05-CORPUS-20260928",
-        "transport_witness": "/home/idealinsane/normal-flow-evidence/NF-A1-COPY-20260928-R2",
-        "functional": "Ten 32 MiB COPY completions per mode in B05; R2 has ten 11-call errno-zero COPY executions and ten callback deliveries.",
-        "handoff": "R2 raw trace correlates socket-ready, enqueue, dequeue, and process across distinct kworker and nfsd tasks using the same transport and request; NF-A1 confirmed for v4.2/TCP only.",
-        "kcov": "B05 ON-only fs/nfsd has 1,421 unique PCs; R2 ON has 694,531 remote PC records. Callback worker is observed in the trace but absent from on-only coverage; these aggregate PCs do not attribute the NF-A1 handoff to a request ticket.",
-        "sanitizer": "KCSAN reports retained; not sanitizer-clean."
-      },
-      "current_runtime_evidence": {"path": "cache/backend-current-v42-20261002/copy/result.json", "image_sha256": "7e0e59f58e531b98b9adc58c991b2faf66de1621fe7980b4520457040e898b0a", "functional": "One 11-call KASAN v4.2 snapshot execution; rc=0, all call errno 0, copy_file_range returned 32 MiB.", "kcov": "Local per-call coverage and nonempty .extra; callback and RPC handoff not retraced."},
-      "parser_result": {"exit": 0, "c_bytes": 3149730, "c_sha256": "663fd5832b0adf789b8182bd380b8149366c20ccf03824d882de81576ed9f6db", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
+      "execution_status": "One KASAN v4.2 snapshot completed 11 calls, returned 32 MiB from copy_file_range and produced nonempty remote coverage. The current fixture did not directly retrace callback or transport handoff.",
+      "parser_result": {
+        "exit": 0
+      }
     },
     {
       "path": "delegation-recall-v41-tcp.prog",
       "sha256": "2a25b68396c7fbb147eedb68a3b8eaf9f5a65ba65d7463b0b88772b32f0e4978",
-      "source": "copied by value from the former Wave3 worktree (B06/delegation-recall.prog); Wave3 removed",
-      "source_sha256": "2a25b68396c7fbb147eedb68a3b8eaf9f5a65ba65d7463b0b88772b32f0e4978",
-      "nf_flows": ["NF-A1", "NF-A2", "NF-D3", "NF-D1", "NF-D2"],
+      "nf_flows": [
+        "NF-A1",
+        "NF-A2",
+        "NF-D3",
+        "NF-D1",
+        "NF-D2"
+      ],
       "nfs_version": "4.1",
       "transport": "TCP",
       "fixture_path": "bundle/lane/lane.sh",
-      "fixture_command": "baked image (bootstrap --minor 1): frozen-phase9-fixture.service runs lane.sh setup /tmp/frozen-phase9.manager 4 at boot",
       "functional_oracle": "First prove delegation grant; then the client1 conflict must produce ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and delegation return/close. File effects alone do not pass.",
-      "execution_status": "Fresh paired v4.1/TCP VM PASS for 15-call functional input and two observed delegation-recall/callback/backchannel-service chains per mode. Full NF-D2 xprtiod receive-to-queue transition and DELEGRETURN are not separately traced.",
-      "runtime_evidence": {
-        "path": "/home/idealinsane/normal-flow-evidence/B06-V1-delegation-recall-v41-r3",
-        "functional": "OFF and ON each complete 150 errno-zero call results; record_backchannel increases from 0 to 20 in both trials.",
-        "handoff": "Two independently reviewed complete grant, recall, callback-work, svc_process_bc, successful ACK, and server-completion chains per trial; earlier NF-D2 receive/queue segment and DELEGRETURN remain unverified.",
-        "kcov": "OFF remote KCOV disabled. ON has ten nonempty extra files and 294,223 remote PCs, but no svc_process_bc PC: this executor is trace-observed and ownerless, not unexecuted.",
-        "sanitizer": "KCSAN OFF has one report and ON has none; not a race-freedom claim."
-      },
-      "parser_result": {"exit": 0, "c_bytes": 4906, "c_sha256": "0bec812704fb1b959fef1c744f566c18908613f24d2bc919dbde0cb8a86b6077", "stderr": "failed to format source: exec: \"clang-format\": executable file not found in $PATH\n\n"}
+      "execution_status": "The input is present; its full callback and backchannel oracle has not been revalidated with the current fixture.",
+      "parser_result": {
+        "exit": 0
+      }
     }
   ],
-  "excluded": [
-    {"input": "Wave3 B07", "reason": "Byte-identical duplicate of B05; distinguishing behavior is a forced owner-window runner contract, not a normal input."},
-    {"input": "Wave3 B12", "reason": "The .prog is getpid(); NFS behavior comes entirely from a forced retry hook."}
-  ],
   "gaps": [
-    {"flows": ["NF-B1"], "reason": "No reusable .prog contract. Clean Wave1 Gate8 has a bounded historical predecode auth-unix-ip single-defer PASS through a C helper and six-case runner, but it is not a .prog or a new corpus run; B04 forced redefer is not a normal substitute."},
-    {"flows": ["NF-B2", "NF-E1", "NF-E2", "NF-E3", "NF-E3b", "NF-E4", "NF-E5"], "reason": "No source-backed syzkaller input with a concrete event-armed background-worker fixture and functional oracle."},
-    {"flows": ["NF-D2"], "reason": "B06 confirms svc_process_bc and callback ACK, but not the earlier xprtiod receive -> backchannel queue/dequeue physical transition."},
-    {"flows": ["NF-D3"], "reason": "B06 confirms delegation grant, callback work, ACK, and completion; DELEGRETURN is not separately traced."},
-    {"boundary": "NFSv2", "reason": "Disabled in the pinned build."},
-    {"boundary": "UDP", "reason": "Current fixtures are TCP-only; no UDP fixture/parser execution exists."},
-    {"boundary": "RPC-over-RDMA", "reason": "No device or provisioned fixture."},
-    {"boundary": "LOCALIO", "reason": "Compiled but disabled and no input/fixture exists."},
-    {"boundary": "NAT", "reason": "Direct-veth fixtures do not establish address-rewritten pairing."}
+    {
+      "flows": [
+        "NF-A1"
+      ],
+      "reason": "The current corpus run has no direct observation linking TCP request arrival to nfsd service-thread execution."
+    },
+    {
+      "flows": [
+        "NF-A2"
+      ],
+      "reason": "Basic file operations completed; the duplicate-reply-cache branch has not been observed separately."
+    },
+    {
+      "flows": [
+        "NF-B1",
+        "NF-B2"
+      ],
+      "reason": "No event-bound input and fixture establish cache defer/revisit or cleaner-worker execution."
+    },
+    {
+      "flows": [
+        "NF-C1"
+      ],
+      "reason": "The current COPY snapshot returned 32 MiB; the copy-thread transition was not retraced independently."
+    },
+    {
+      "flows": [
+        "NF-D1",
+        "NF-D2",
+        "NF-D3"
+      ],
+      "reason": "The current fixture has not directly observed the complete callback, backchannel and delegation-return sequence."
+    },
+    {
+      "flows": [
+        "NF-E1",
+        "NF-E2",
+        "NF-E3",
+        "NF-E3b",
+        "NF-E4",
+        "NF-E5"
+      ],
+      "reason": "No matching normal input and event-bound fixture establish worker execution."
+    },
+    {
+      "boundary": "NFSv3",
+      "reason": "The historical seed was removed; the current lane fixture passes basic NFSv3 mount and cross-client I/O, but no v3 normal-flow seed or oracle is included."
+    },
+    {
+      "boundary": "NFSv2",
+      "reason": "Disabled in the pinned build."
+    },
+    {
+      "boundary": "NFSv4.0",
+      "reason": "The current lane fixture passes basic NFSv4.0 mount and cross-client I/O, but no v4.0 normal-flow seed or oracle is included."
+    },
+    {
+      "boundary": "UDP",
+      "reason": "Current fixtures are TCP-only."
+    },
+    {
+      "boundary": "RPC-over-RDMA",
+      "reason": "No provisioned device or fixture."
+    },
+    {
+      "boundary": "LOCALIO",
+      "reason": "Compiled but disabled; no input or fixture."
+    },
+    {
+      "boundary": "NAT",
+      "reason": "Current fixture does not establish address-rewritten pairing."
+    }
   ]
 }

@@ -16,18 +16,20 @@ comes up and that the kernel carries the expected memory sanitizer.
 | Instrumentation | KCOV + KASAN/KCSAN boot kernels, built **out of tree** from one patched source tree |
 | Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path. Ownership is lane-scoped (kernel 0002): every request that reaches lane N's server counts for the program proc N is running, so attribution survives the NFS wire relay |
 | Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the boot fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count |
-| NFS version | `koov.nfs_minor=1\|2` in `vm.cmdline` selects the mount version for both backends at boot |
+| NFS version | `koov.nfs_version=3\|4.0\|4.1\|4.2` in `vm.cmdline` selects one mount version for both backends at boot |
 | Boot model | One version-neutral image serves both sanitizer kernels; the lane script is copied from a read-only host 9P share at each VM boot |
 | Seeds | `bundle/corpus/nfs-normal/` — normal-flow syzkaller programs plus a manifest; run them with a stock syz-manager (remote coverage is the `experimental.remote_cover` setting) |
 
-The image uses `bundle/lane/lane.sh` for both NFS minor versions. Its default `SERVER_IMPL=both`
+The image uses `bundle/lane/lane.sh` for all four NFS versions. Its default `SERVER_IMPL=both`
 routes both clients through the relay; `nfs-lane/client0` and `client1` select the same knfsd
 export. Explicit `client{0,1}-ganesha` paths select the separate Ganesha export.
-Both backends use the selected minor version. The lane exports a bounded ext4
+Both backends use the selected version. The lane exports a bounded ext4
 loop image through [Ganesha V15.6](https://github.com/nfs-ganesha/nfs-ganesha/releases/tag/V15.6)
 FSAL_VFS; knfsd keeps its tmpfs.
-The v4.1 and v4.2 images passed four-mount cross-client reads and writes,
-a direct Ganesha mount, and cleanup. Build and guest-check commands are in
+The reusable image passed four-mount cross-client reads, writes, backend isolation
+and cleanup with NFSv3, v4.0, v4.1 and v4.2. NFSv3 uses pinned TCP MOUNT ports
+and `nolock`; cross-client NLM locking is not part of this fixture. Build and
+guest-check commands are in
 [tools/README.md](tools/README.md).
 
 The reusable image is `env/images/bookworm-kcov-fresh.qcow2`. The earlier
@@ -93,13 +95,13 @@ python3 tools/bootstrap-kcov-env.py env \
   --base-image artifacts/bookworm-base.img \
   --ssh-key artifacts/bookworm.id_rsa \
   --deps-tar bundle/src/guest-deps-lane.tar.gz \
-  --minor 2
+  --version 4.2
 ```
 
 | Input | Description |
 |---|---|
 | `--base-image`, `--ssh-key`, `--deps-tar` (required) | Stage-1 outputs + guest dependencies |
-| `--minor 1\|2` (required) | NFS minor version |
+| `--version 3\|4.0\|4.1\|4.2` (required) | Version for verification boots; legacy `--minor 1\|2` remains an alias for v4.1/v4.2 |
 | kernel/syzkaller sources (default) | Cloned at pinned refs — kernel `v7.3-rc5` (git.kernel.org), syzkaller `801f09666` (github.com/google/syzkaller) |
 | `--kernel-repo` / `--syz-repo` (optional) | Override clone URLs |
 | `--kernel-ref TAG\|latest` (optional) | Kernel release or rc tag to build; `latest` is the newest tag, rc included. Default: the tag in `bundle/patches/BASE` |
@@ -120,7 +122,7 @@ No runner is provided: point a syz-manager config at the outputs of step 2.
 | `procs` | the fixture's lane count (4) |
 | `workdir`, `http` | distinct for knfsd and Ganesha; each workdir owns its own `corpus.db` |
 | `experimental.remote_cover` | `true` for knfsd; `false` for Ganesha, whose current feedback is local client-kernel coverage |
-| `vm.cmdline` | must include `nfs.localio_enabled=N`; the helper below adds `koov.nfs_minor` and the expected lane-script SHA-256. `sunrpc.lane_attribution=0` switches to request-level attribution for comparison runs |
+| `vm.cmdline` | must include `nfs.localio_enabled=N`; the helper below adds `koov.nfs_version` and the expected lane-script SHA-256. `sunrpc.lane_attribution=0` disables lane attribution; it does not restore request-level attribution |
 
 Create one base config per backend with distinct `workdir` and `http` values.
 Initialize each new workdir's DB from only that backend's seed: knfsd uses
@@ -133,8 +135,8 @@ to each config separately; the helper preserves its backend-specific workdir
 and coverage settings:
 
 ```sh
-python3 tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-v41.cfg --minor 1
-python3 tools/prepare-live-lane-config.py manager-ganesha-base.cfg manager-ganesha-v41.cfg --minor 1
+python3 tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-v41.cfg --version 4.1
+python3 tools/prepare-live-lane-config.py manager-ganesha-base.cfg manager-ganesha-v41.cfg --version 4.1
 ```
 
 Run one backend at a time. Start knfsd with:
@@ -154,12 +156,14 @@ use the already validated separate configs. Corpus separation prevents splicing
 between backend corpora; it does not preserve seed paths or disable minimization.
 The fixture still exposes both backends, so this is not a strict execution filter.
 
-Use `--minor 2` for a v4.2 campaign. The helper leaves the input config alone,
+Use `--version 3`, `4.0`, `4.1` or `4.2` for a campaign. The helper leaves the input config alone,
 copies `bundle/lane/lane.sh` to a hash-named `workdir_template`, and pins that
 hash in the guest boot arguments. Each VM copies the script once into `/run`;
 setup, status and cleanup use that same copy. Changing `lane.sh` requires a new
 prepared config, **not** a new image. The host share is read-only and is unmounted
 after the copy. A missing share or wrong hash fails the fixture at boot.
+The checked-in normal corpus has v4.1/v4.2 inputs; version-specific v3/v4.0
+seeds and their oracles still need to be prepared before fuzzing those versions.
 
 For version comparisons, mount only the selected version in each VM. Extra
 NFSv4 mounts establish client/server state and can issue lease-renewal traffic
@@ -179,14 +183,14 @@ python3 tools/bootstrap-kcov-env.py env ... --update
 
 `bump-kernel.py` applies the kernel series to a shallow clone of the tag. If it applies, `bundle/patches/BASE` moves to that tag and the patch files stay as they are. If it conflicts, the clone is left in the middle of `git am`: resolve it with git (edit, `git add`, `git am --continue`), then run `python3 tools/bump-kernel.py --export <clone>` to write the rebased series back and update `BASE`. Resolutions are remembered (git rerere) in `cache/rr-cache-kernel` and replayed on the next release.
 
-Re-running bootstrap with `--update` rebuilds both kernels and syzkaller into the same `env/`, so only the latest kernel images are kept. The VM image does not depend on the kernel, lane script or selected minor; it is reused when the base image, boot wrapper, service and guest dependencies are unchanged. Every variant is booted with the current host script and checked again. A failed run keeps the previous images and `manifest.json` and records the failure in `manifest.failed.json`. `manifest.json` also records the seconds each stage took (`timing_seconds`) and which axis the run moved (`changes.axis`: `kernel-release`, `scenario`, `both`, `none`, `first-run` or `unknown`); `tools/README.md` explains when syzkaller must be rebuilt.
+Re-running bootstrap with `--update` rebuilds both kernels and syzkaller into the same `env/`, so only the latest kernel images are kept. The VM image does not depend on the kernel, lane script or selected version; it is reused when the base image, baker, boot wrapper, service and guest dependencies are unchanged. Every variant is booted with the current host script and checked again. A failed run keeps the previous images and `manifest.json` and records the failure in `manifest.failed.json`. `manifest.json` also records the seconds each stage took (`timing_seconds`) and which axis the run moved (`changes.axis`: `kernel-release`, `scenario`, `both`, `none`, `first-run` or `unknown`); `tools/README.md` explains when syzkaller must be rebuilt.
 
 ## Command summary
 
 | Stage | Command | Input → Output |
 |---|---|---|
 | Base image | `sudo bash tools/make-base-image.sh --out artifacts` | sudo + debootstrap → `artifacts/bookworm-base.img` + keypair |
-| Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 2` | base · key · deps + upstream → `env/` (per-variant kernel images, binaries, shared image, manifest); `--minor` selects the verification boot only |
+| Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --version 4.2` | base · key · deps + upstream → `env/` (per-variant kernel images, binaries, shared image, manifest); `--version` selects the verification boot only |
 | New kernel | `python3 tools/bump-kernel.py latest` then bootstrap with `--update` | newest release/rc tag → `bundle/patches/BASE` + rebuilt kernel images |
 
 ## Repository layout
@@ -197,8 +201,6 @@ Re-running bootstrap with `--update` rebuilds both kernels and syzkaller into th
 | `bundle/` | Inputs — patch series · guest deps · kernel configs · lane fixture · image baker · seed corpus (`bundle/README-HANDOFF.md`) |
 | `report/` | Design notes and the normal-flow corpus audit |
 | `LICENSE` · `THIRD-PARTY-LICENSES.md` | MIT + vendor component attribution |
-
-The earlier A/B harness, NF-A1/B06 observers, attribution scenario matrix, design gate and forward-port pipeline were removed in commit `7833ed3`.
 
 ## License
 

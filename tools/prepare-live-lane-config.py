@@ -12,12 +12,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, help="existing syz-manager JSON config")
     parser.add_argument("output", type=Path, help="new config path")
-    parser.add_argument("--minor", choices=("1", "2"), required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--version", choices=("3", "4.0", "4.1", "4.2"))
+    selection.add_argument("--minor", choices=("1", "2"),
+                           help="legacy alias for --version 4.1 or 4.2")
     parser.add_argument("--image", type=Path,
                         default=REPO / "env/images/bookworm-kcov-fresh.qcow2")
     parser.add_argument("--lane-script", type=Path,
                         default=REPO / "bundle/lane/lane.sh")
     args = parser.parse_args()
+    version = args.version or "4." + args.minor
     if args.output.exists() or args.output.is_symlink():
         parser.error("output already exists")
     if not args.image.is_file():
@@ -54,8 +58,8 @@ def main():
         "-fsdev local,id=koov_lane,path={{TEMPLATE}},security_model=none,readonly=on "
         "-device virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane"
     )
-    vm["cmdline"] = (cmdline + " koov.nfs_minor=%s koov.lane_sha256=%s"
-                     % (args.minor, digest)).strip()
+    vm["cmdline"] = (cmdline + " koov.nfs_version=%s koov.lane_sha256=%s"
+                     % (version, digest)).strip()
     args.output.write_text(json.dumps(config, indent=2) + "\n")
     print("config=%s lane_sha256=%s" % (args.output, digest))
 

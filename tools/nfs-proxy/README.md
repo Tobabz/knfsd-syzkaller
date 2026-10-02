@@ -1,10 +1,13 @@
-# NFSv4 scoped wire relay
+# NFS wire relay
 
 `build.sh` runs host framing/walk/delta/relay/control tests under clang and
 GCC ASan+UBSan. `build-guest.sh --out FILE` creates a Debian bookworm ABI
 guest binary after those checks. The two backend listeners are routed solely
 by destination IP, and the source IP identifies the client. `SERVER_IMPL=both`
 provides `.1:2049 → knfsd :20490` and `.5:2049 → Ganesha :20491`.
+NFSv3 calls use the same TCP relay; their MOUNT requests go directly to the
+backends on pinned ports. Typed operation matching is defined for NFSv4
+COMPOUND requests, while v3 messages expose only the RPC header and raw body.
 
 ## Arm protocol
 

@@ -75,8 +75,8 @@ rc5 대비 44개 파일 9,890줄 → 19개 파일 약 6,200줄. syzkaller 0018�
   (README에 반영, `e2b3201`).
 - 2026-10-01 기준 저장소 `env/syzkaller/bin`의 `syz-manager`(74ad462)와 `syz-executor`(9316aaa+) 리비전이 달라
   manager가 실행을 거부했다. 같은 트리에서 manager를 다시 빌드해야 한다.
-- 기존 A/B 하네스는 제거된 debugfs 파일(`phase3_stats` 등)을 읽으므로 새 커널에서 쓸 수 없다. 대체 검증 스크립트는
-  WSL `~/prune-evidence/inputs/verify-lane.py`(저장소 밖)에 있다.
+- 당시 A/B 하네스는 제거된 debugfs 파일(`phase3_stats` 등)을 읽었다. 현재 검증 스크립트는
+  `docs/handoff/proxy-variable-length-edits/verify-lane.py`에 있다.
 - `bundle/corpus/nfs-normal/async-copy-v42-tcp.prog`는 syzkaller 엄격 해석에서 실패한다(이 작업 이전부터). `syz-execprog`는 통과.
 
 ## 남은 위험
@@ -87,4 +87,4 @@ rc5 대비 44개 파일 9,890줄 → 19개 파일 약 6,200줄. syzkaller 0018�
 | 같은 lane에 프로그램 밖 트래픽이 들어오면 실행 중 프로그램에 귀속 | 설계상 성질. lane에 다른 트래픽원이 없어야 함 |
 | 긴 비동기 작업이 배출 대기(`1000 × slowdown` ms, executor FINISH)를 넘으면 그 프로그램 generation abort | 32 MiB COPY에서는 발생 안 함. 더 큰 작업은 미검증 |
 | 레코드 수를 바꾸는 프록시 변조 | 구조상 무관하지만 미검증 |
-| 전송 단계(NF-A1)와 백그라운드 분류 | lane 단위로는 다른 클라이언트 혼입 우려가 사라졌으나 미구현. `report/nfa1-kcov-feedback-design.md`의 결론은 요청 단위 전제라 재검토 필요 |
+| 전송 단계(NF-A1)와 백그라운드 분류 | 미구현. 수신·큐잉 PC는 요청별 `.extra`에 없을 수 있으며, 전역 PC를 입력별 피드백에 합치려면 실행별 격리와 배출을 검증해야 한다. 현재 완료 기준은 `report/normal-flow-corpus.md` 참조 |
