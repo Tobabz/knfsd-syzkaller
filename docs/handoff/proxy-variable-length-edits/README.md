@@ -3,7 +3,7 @@
 > **임시 인계 문서다. 아래 "삭제 조건"을 모두 만족하면 이 디렉터리 전체를 삭제한다.**
 > 작성: 2026-10-01 · 기준: `main` (`1f3af0b` 이후), 커널 `v7.3-rc5` + 새 시리즈(0001~0003), syzkaller 0001~0018
 
-> **진행 상황 (2026-10-02): Phase 1(6절) 구현 + 게스트 검증 완료, 아직 `main`에 병합 안 함.**
+> **진행 상황 (2026-10-02): Phase 1(6절) 구현 + 단일/4-lane 게스트 검증 완료, `main` 병합·push 완료.**
 > `tools/nfs-proxy/src/edit.{c,h}`(새 모듈), `control.c`의 arm v2 디코드·적용·체이닝, 프록시 arm v2
 > 패킷(`NFSPARM2`)과 delta v2(`NFSPDLT2`), syzkaller 패치 `0019`(`syz_arm_nfs_proxy_v2`). `tools/nfs-proxy/build.sh`
 > 전체(클랑 + gcc ASan/UBSan, `test_edit` 추가)와 syzkaller `go test ./sys/linux/...` 통과.
@@ -15,12 +15,14 @@
 >   디코드·실행했음을 확인. lane 상태 `unhealthy 0`. dmesg fatal 없음.
 > - `REPLACE`(4→8바이트로 키움, xid 앵커로 레코드 하나만 특정): `edit_applied=1`(정확히 의도한 레코드 1개),
 >   오류 0.
+> - 같은 `REPLACE`를 `syz-execprog -procs=4 -repeat=30`으로 병렬 검증: lane별 `edit_applied=8/7/7/8`
+>   (합계 30), 모든 lane의 framing/relay/mutation 오류와 edit 거부 0, `.extra` 30/30 nonempty. lane 0~3 모두
+>   `valid 1 unhealthy 0`, `generation_aborted=outstanding_tokens=0`, dmesg fatal 없음.
 > - `REPLACE`(틀린 원본 바이트, 같은 앵커): `edit_applied=0`, `edit_refused_orig=1` — verify-before-patch가
 >   실제 트래픽에서도 거부함을 확인. 레코드는 변경 없이 그대로 전달됨.
 > - 세 경우 모두 dmesg에 BUG/KASAN/panic/Oops/WARNING 없음(KCSAN 제외).
-> - **하지 않은 것:** `INSERT`/`DELETE`, 여러 fragment 레코드 합치기, `syz-manager`로 긴 시간 운용, lane 4개
->   병렬 운용에서의 검증(스냅샷 모드 VM 1대, lane 1개로만 확인). 5.3절의 "응답이 길어질 때 클라이언트 처리"도
->   미확인(이번 테스트는 C2S만 사용).
+> - **하지 않은 것:** `INSERT`/`DELETE`, 여러 fragment 레코드 합치기, `syz-manager`로 긴 시간 운용,
+>   5.3절의 "응답이 길어질 때 클라이언트 처리"(이번 테스트는 C2S만 사용).
 > 증거: `tools/nfs-proxy/test/guest-syzkaller-v2-*.prog`(각 파일 머리말 주석에 결과 기록).
 
 ## 0. 이 문서의 성격과 삭제 조건
@@ -149,7 +151,7 @@ NFS wire 프록시(`tools/nfs-proxy/`)가 지금은 **같은 위치를 같은 �
 | 요청에 op를 추가하면 응답의 `resarray`가 길어지는데, 리눅스 NFS 클라이언트가 뒤에 붙은 결과를 어떻게 처리하는가 | 게스트에서 OP_APPEND를 켜고 클라이언트 동작과 `dmesg` 관찰. 응답은 보정하지 않는 것이 결정이다 | **미검증.** 이번 테스트는 C2S(요청)만 썼다. S2C append는 host 단위 테스트(`test_control.c`)로만 확인했다 |
 | 앞 op가 실패하면 뒤 op는 실행되지 않으므로, 추가한 op가 실제로 실행되는가 | 서버 쪽 `.extra`에서 추가 op의 처리 함수(예: `nfsd4_getattr`) 도달 여부 | **확인함 (2026-10-02).** `nfsd4_decode_getattr`/`nfsd4_getattr`/`nfsd4_encode_getattr`가 커버리지에 나타남. 증거: `guest-syzkaller-v2-append.prog` |
 | 여러 fragment로 온 레코드를 한 fragment로 합쳐 내보내도 서버가 문제없이 받는가 | 큰 WRITE 등으로 다중 fragment 레코드를 만들어 편집 | 미검증 |
-| 길이가 바뀐 레코드에서도 lane 귀속이 유지되는가 | 편집을 켠 상태에서 `.extra` 30/30 확인 | **부분 확인 (2026-10-02).** `repeat=10`, `procs=1`(lane 1개)에서 `.extra` 10/10 nonempty, lane 상태 `unhealthy 0`. lane 4개 병렬·30회 반복은 안 함 |
+| 길이가 바뀐 레코드에서도 lane 귀속이 유지되는가 | 편집을 켠 상태에서 `.extra` 30/30 확인 | **확인함 (2026-10-02).** 길이 변경 `REPLACE`, `repeat=30`, `procs=4`에서 `.extra` 30/30 nonempty. lane별 `edit_applied=8/7/7/8`, lane 0~3 모두 `valid 1 unhealthy 0`, 프록시 오류와 dmesg fatal 0 |
 | 서버의 최대 요청 크기와 프록시 `msg_limit`의 관계 | 상한 근처 편집으로 거부·연결 종료 동작 확인 | 미검증 |
 
 ## 6. 단계
@@ -205,7 +207,7 @@ tools/nfs-proxy/build.sh          # clang 빌드 + 단위 테스트 + gcc ASan/U
 ```sh
 tools/nfs-proxy/build-guest.sh --out ~/nfsp-build/nfs-proxy-v2
 NFSP_PROXY=~/nfsp-build/nfs-proxy-v2 python3 docs/handoff/proxy-variable-length-edits/mkinputs.py
-WORKLOAD=<v2 arm 프로그램> docs/handoff/proxy-variable-length-edits/run-verify.sh <ENV_DIR> kasan raw
+PROCS=4 WORKLOAD=<v2 arm 프로그램> docs/handoff/proxy-variable-length-edits/run-verify.sh <ENV_DIR> kasan raw
 ```
 
 **통과 기준 (프록시 경유, 편집 규칙을 켠 상태):**
@@ -225,10 +227,10 @@ WORKLOAD=<v2 arm 프로그램> docs/handoff/proxy-variable-length-edits/run-veri
 - **A/B 러너, `evidence/`, 이전 실험 하네스(`~/q1-harness`)는 없다.** 검증은 8.2의 스크립트로 한다.
 - 이 저장소의 `bundle/src/nfs-proxy-lane`은 gitignore 대상 빌드 산출물이다. 프록시를 고치면 다른 경로로 다시 빌드한다.
 - **VM 도우미는 lane 스크립트 주입(9P, `koov.lane_sha256`)을 하지 않는다.** 그래서 이미지의 부팅 fixture는 시작을
-  거부하고, `mkinputs.py`가 만든 실행별 fixture가 lane을 직접 띄운다. 이 조합으로 게스트를 돌려 본 적은 아직 없다
-  (2026-10-02, 스크립트 수정 후 미실행). 처음 실행할 때 fixture 단계 로그를 먼저 확인한다.
-- **lane 병렬 운용이 필수다.** 이 스크립트는 `--procs 1`로 lane 하나만 검증한다. 편집 규칙이 lane 여러 개에서 동시에
-  쓰일 때의 검증은 `vm.snapshot`을 끈 syz-manager로 따로 한다.
+  거부하고, `mkinputs.py`가 만든 실행별 fixture가 lane을 직접 띄운다. 이 조합은 2026-10-02에 lane 1개와 4개로
+  실제 검증했다.
+- **lane 병렬 운용이 필수다.** `run-verify.sh`는 기본 `PROCS=1`이며 `PROCS=4`로 4-lane 검증을 실행한다.
+  장시간 캠페인은 별도로 `vm.snapshot`을 끈 syz-manager를 사용한다.
 - WSL 안에서 작업한다 (`/home/idealinsane/projects/knfsd-syzkaller`). KVM(`/dev/kvm`)이 필요하다.
 
 ## 10. 완료 보고

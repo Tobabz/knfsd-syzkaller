@@ -5,6 +5,8 @@
 # (2026-10-02, kasan): edit_applied=1, 0 framing/relay/mutation errors, no
 # fatal dmesg -- a length-changing REPLACE reaches knfsd without
 # desynchronising the connection.
+# Four-lane run (-procs=4, -repeat=30): edit_applied=8/7/7/8 (30 total),
+# .extra 30/30 nonempty, lanes 0-3 healthy, 0 proxy errors or fatal dmesg.
 r2 = syz_arm_nfs_proxy_v2$scoped(&(0x7f0000001000)={0x4e46535041524d32, 0x0, 0x0, 0x0, 0xffffffff, 0x4, 0x4, 0x1, 0x1, 0x0, '\x11\x11\x11\x11', [{0x0, 0x3c, 0x4, 0x8, '\x00\x00\x00\x00', '\xaa\xaa\xaa\xaa\xbb\xbb\xbb\xbb'}]}, 0x4c)
 r0 = syz_open_nfs_lane_pair$client0_knfsd(0x0, 0x0)
 r1 = syz_socket_connect_nfs_pair$client0_knfsd(0x0, 0x0)

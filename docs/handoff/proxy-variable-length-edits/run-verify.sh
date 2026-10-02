@@ -1,7 +1,7 @@
 #!/bin/bash
 # Verify proxy changes in a guest with the bootstrap's own kernel, syzkaller and image.
 #
-#   usage: run-verify.sh ENV_DIR VARIANT ARM [ARM...]
+#   usage: [PROCS=N] run-verify.sh ENV_DIR VARIANT ARM [ARM...]
 #     ENV_DIR  bootstrap output directory (contains images/, syzkaller/)
 #     VARIANT  kasan | kcsan
 #     ARM      direct | proxy | raw | copy
@@ -15,10 +15,11 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
-env_dir=${1:?ENV_DIR}; v=${2:?VARIANT}; shift 2
+env_dir=$(cd "${1:?ENV_DIR}" && pwd); v=${2:?VARIANT}; shift 2
 inputs=$HOME/prune-evidence/inputs
 image=${IMAGE:-$HOME/prune-env-image.raw}
 out=${OUT:-$HOME/prune-evidence/proxy-$v}
+procs=${PROCS:-1}
 kdir=$HOME/kv-$v
 mkdir -p "$kdir/arch/x86/boot" "$out"
 ln -sfn "$env_dir/images/$v/bzImage" "$kdir/arch/x86/boot/bzImage"
@@ -36,6 +37,6 @@ for arm in "$@"; do
   python3 "$here/verify-lane.py" --kernel "$kdir/arch/x86/boot/bzImage" --vmlinux "$kdir/vmlinux" \
     --image "$image" --ssh-key "$repo/artifacts/bookworm.id_rsa" --deps "$deps" \
     --fixture "$fix" --workload "$w" --syz-dir "$env_dir/syzkaller" \
-    --executions "${EXECUTIONS:-30}" --procs 1 --output "$out/$arm" > "$out/$arm.log" 2>&1
+    --executions "${EXECUTIONS:-30}" --procs "$procs" --output "$out/$arm" > "$out/$arm.log" 2>&1
   echo "$v $arm rc=$?"
 done

@@ -146,7 +146,7 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 | pseudo-syscall, 기술 파일 | seed가 NFS 프로토콜을 다루게 함 | 구현됨 | syzkaller 패치 시리즈 |
 | lane, namespace | 프로세스별 격리된 NFS 환경 | 구현됨 | `bundle/lane/`, `tools/README.md` |
 | remote KCOV | 서버 경로 도달 관측 | 구현됨 (knfsd 한정) | kernel 패치 0001~0003 |
-| nfs-proxy | wire 변조 주입 | 고정 경로, 같은 폭 편집(v1)과 길이 변경 편집(v2, 호스트+단일 lane 게스트 검증) 구현 | `tools/nfs-proxy/README.md` |
+| nfs-proxy | wire 변조 주입 | 고정 경로, 같은 폭 편집(v1)과 길이 변경 편집(v2, 호스트+4-lane 게스트 검증) 구현 | `tools/nfs-proxy/README.md` |
 | Ganesha 백엔드 | 별도 서버 대상 | 서버별 corpus로 순차 퍼징 | `bundle/corpus/nfs-normal/README.md` |
 | 재현 판정 | Q1, Q2 종합 | 통합 판정 도구 **없음** | `report/normal-flow-corpus.md` |
 
@@ -254,12 +254,12 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 | lane 귀속의 경계: 프로그램 종료 뒤 늦게 발생하는 작업 | 다음 프로그램 시작 뒤 늦게 도착하는 요청의 오귀속 위험이 남는다 |
 | 프록시가 레코드 수를 바꾸는 변조 | **미검증**. lane의 서버 netns로 소유자를 정하므로 구조상 무관하지만 실험하지 않았다 |
 | KCSAN 변형의 lane 귀속 | 현재 부트스트랩은 빌드·부팅만 확인한다. 시드별 귀속은 별도 검증이 필요하다 |
-| 프록시의 길이 변경 변조 (operation 추가, 가변 길이 필드 변경) | **Phase 1 구현 + 단일 lane 게스트 검증 (2026-10-02)**. `INSERT`/`DELETE`/`REPLACE`/`OP_APPEND`/`OP_PREPEND`를 구조 보존·raw 두 모드로 지원(`tools/nfs-proxy/src/edit.c`), arm v2(`NFSPARM2`)와 delta v2, syzkaller 0019. 호스트 단위 테스트(클랑+ASan/UBSan) 전부 통과. 게스트(kasan, lane 1개)에서 OP_APPEND 적용과 서버 측 디코드·실행(`nfsd4_getattr` 등 커버리지), 길이 변경 REPLACE의 적용과 verify-before-patch 거부를 확인; `.extra` 10/10 nonempty로 lane 귀속 유지도 부분 확인. INSERT/DELETE, 여러 fragment 합치기, lane 4개 병렬 운용, S2C 응답 편집은 게스트에서 안 함. 상세는 `docs/handoff/proxy-variable-length-edits/`의 완료 보고 참조 |
+| 프록시의 길이 변경 변조 (operation 추가, 가변 길이 필드 변경) | **Phase 1 구현 + 4-lane 게스트 검증 (2026-10-02)**. `INSERT`/`DELETE`/`REPLACE`/`OP_APPEND`/`OP_PREPEND`를 구조 보존·raw 두 모드로 지원(`tools/nfs-proxy/src/edit.c`), arm v2(`NFSPARM2`)와 delta v2, syzkaller 0019. 호스트 단위 테스트(클랑+ASan/UBSan) 전부 통과. 게스트에서 OP_APPEND의 서버 측 디코드·실행(`nfsd4_getattr` 등 커버리지)과 REPLACE/verify-before-patch를 확인했다. 길이 변경 REPLACE를 kasan VM의 `syz-execprog -procs=4 -repeat=30`으로 실행해 `.extra` 30/30 nonempty, lane별 적용 8/7/7/8, lane 0~3 healthy, 프록시 오류·dmesg fatal 0을 확인했다. INSERT/DELETE, 여러 fragment 합치기, S2C 응답 편집은 게스트에서 안 함. 상세는 `docs/handoff/proxy-variable-length-edits/`의 완료 보고 참조 |
 | 기본 이미지의 직접 마운트 경로 제거 | **완료**. 단일 lane fixture의 기본값은 `both`; NFSv3 시드와 중복 fixture 제거. 직접 경로는 비교 진단 옵션으로만 남음 |
 | 프록시 변조가 서버에 도달했는지 퍼징 중에 판정하는 채널 | 프록시 진단 출력은 있으나 syz-manager의 입력별 피드백에 미연결 |
 | Ganesha 대상의 도달 관측 | 미구현. remote KCOV는 사용자 공간 서버에 귀속 대상이 없다 |
 | 서버별 실행 방식 | **결정됨 (2026-10-02)**. 서버별 34개 호출 입력을 따로 실행; KASAN v4.1 스냅샷 모드(proc 1개)에서 각 1회 errno 오라클 통과 |
-| lane 병렬 manager 운용 (`vm.snapshot` 끔, `procs=4`) | **필수 조건, 현재 토폴로지에서 미검증**. 검증된 로컬 설정은 스냅샷 모드라 lane 0만 사용했다 |
+| lane 병렬 manager 운용 (`vm.snapshot` 끔, `procs=4`) | **필수 조건.** `syz-execprog`의 4-lane 병렬 실행은 검증했지만, 현재 manager 토폴로지에서 `vm.snapshot`을 끈 장시간 운용은 미검증 |
 | lane 밖에서 생기는 요청 | knfsd lease가 10초(`nfsv4leasetime`)라 클라이언트 netns마다 수 초 간격의 lease 갱신 요청이 생기고, lane 단위 귀속에서는 그때 실행 중인 프로그램의 커버리지로 잡힌다. 프로그램과 무관한 PC가 섞이는 거짓 양성 원천이다. syzkaller의 triage 재실행이 불안정한 신호를 걸러 영향은 제한적이나 측정하지 않았다 |
 | Ganesha 캠페인의 sanitizer 보고 | Ganesha export가 ext4 루프 위에 있어, 보고에 NFS가 아닌 ext4·loop 경로가 섞일 수 있다. 보고의 호출 경로로 구분한다 |
 | 프록시의 실행 대상 선택·관리 라우팅 확장 | **후속 계획**. 기존 고정 중계와 별개이며, 자동 전환·복제는 미구현 |

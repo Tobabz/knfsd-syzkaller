@@ -94,6 +94,35 @@ def main():
         result["errno_by_call"] = sorted({(int(c), int(e)) for c, e in calls if e != "0"})
         vm.guest("drain", "sleep 10", timeout=30)
         result["stats_after"] = vm.guest("stats-after", stats).stdout
+        result["lane_states"] = {}
+        for lane in range(args.procs):
+            result["lane_states"][str(lane)] = vm.guest(
+                "lane-state-%d" % lane,
+                "ip netns exec f9l%ds nsenter -t 1 -m -- " % lane +
+                "cat /sys/kernel/debug/sunrpc_fuzz/lane_state",
+                check=False).stdout
+        result["proxy_lanes"] = {}
+        for lane in range(args.procs):
+            lane_root = "%s/lane%d" % (root, lane)
+            pid = vm.guest("proxy-pid-%d" % lane,
+                           "cat %s/server/proxy.pid" % lane_root,
+                           check=False).stdout.strip()
+            if pid:
+                vm.guest("proxy-snapshot-%d" % lane, "kill -USR1 %s" % pid,
+                         check=False)
+        vm.guest("proxy-snapshot-drain", "sleep 1", timeout=10)
+        for lane in range(args.procs):
+            lane_root = "%s/lane%d" % (root, lane)
+            proxy_log = vm.guest("proxy-log-%d" % lane,
+                                 "cat %s/server/proxy.log" % lane_root,
+                                 check=False).stdout
+            (args.output / ("proxy-lane%d.log" % lane)).write_text(proxy_log)
+            stats_lines = re.findall(r"^peak_active=.*$", proxy_log, re.MULTILINE)
+            control_lines = re.findall(r"^control .*$", proxy_log, re.MULTILINE)
+            result["proxy_lanes"][str(lane)] = {
+                "stats": stats_lines[-1] if stats_lines else "",
+                "control": control_lines[-1] if control_lines else "",
+            }
         vm.guest("tar", "tar -C /tmp/cov -czf /tmp/cov.tgz .", timeout=120)
         subprocess.run([*vm.scp, "root@127.0.0.1:/tmp/cov.tgz",
                         str(args.output / "cov.tgz")], check=True)
