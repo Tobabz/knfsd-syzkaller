@@ -13,8 +13,7 @@ PRELUDE = """action=${1:-}
 case "$action" in
     setup)
         systemctl stop frozen-phase9-fixture.service >/dev/null 2>&1 || \\
-            NFS_MINOR_VERSION=${NFS_MINOR_VERSION:-1} \\
-                /opt/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.manager >/dev/null 2>&1 || true
+            /run/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.manager >/dev/null 2>&1 || true
         ;;
 esac
 """
@@ -46,15 +45,14 @@ for c in ("client0", "client1"):
 for src, dst in (("tools/nfs-proxy/test/guest-syzkaller-four.prog", "workload-raw.prog"),
                  ("bundle/corpus/nfs-normal/async-copy-v42-tcp.prog", "workload-copy.prog")):
     (I / dst).write_bytes((R / src).read_bytes())
-(I / "lane-v42.sh").write_text(per_run(lane, "NFS_MINOR_VERSION=2; export NFS_MINOR_VERSION\n"))
+(I / "lane-v42.sh").write_text(per_run(lane, "NFS_VERSION=4.2; export NFS_VERSION\n"))
 os.chmod(I / "lane-v42.sh", 0o755)
 # NFSP_PROXY: a proxy built with build-guest.sh --out, for testing a rebuilt proxy.
-proxy = Path(os.environ.get("NFSP_PROXY", R / "bundle/src/nfs-proxy-control-guest")).read_bytes()
-with tarfile.open(R / "bundle/src/guest-deps-ganesha.tar.gz") as tin, \
-        tarfile.open(I / "deps-ganesha-proxy.tar.gz", "w:gz") as tout:
-    for m in tin:
-        tout.addfile(m, tin.extractfile(m) if m.isfile() else None)
-    ti = tarfile.TarInfo("usr/sbin/nfs-proxy")
-    ti.size, ti.mode = len(proxy), 0o755
-    tout.addfile(ti, io.BytesIO(proxy))
+# The deps are assembled the same way as the lane image (Ganesha V15.6 + relay).
+proxy = Path(os.environ.get("NFSP_PROXY", R / "bundle/src/nfs-proxy-lane"))
+deps = I / "deps-ganesha-proxy.tar.gz"
+deps.unlink(missing_ok=True)
+subprocess.run(["python3", str(R / "tools/assemble-guest-deps.py"),
+                "--ganesha-deps", str(R / "bundle/src/guest-deps-ganesha-v15.6.tar.gz"),
+                "--proxy", str(proxy), "--out", str(deps)], check=True)
 print(sorted(p.name for p in I.iterdir()))

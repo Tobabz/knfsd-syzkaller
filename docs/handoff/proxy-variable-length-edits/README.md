@@ -171,11 +171,12 @@ tools/nfs-proxy/build.sh          # clang 빌드 + 단위 테스트 + gcc ASan/U
 
 | 파일 | 용도 |
 |---|---|
-| `mkinputs.py` | 검증 입력(VM 도우미, lane fixture 두 종, 워크로드, 프록시를 넣은 deps)을 `~/prune-evidence/inputs`에 다시 만든다. VM 도우미는 `git show ab353b0:bundle/ab-runner/phases/run_frozen_phase1_vm.py`에서 복원한다 |
+| `mkinputs.py` | 검증 입력(VM 도우미, lane fixture 세 종, 워크로드, 프록시를 넣은 deps)을 `~/prune-evidence/inputs`에 다시 만든다. VM 도우미는 `git show ab353b0:bundle/ab-runner/phases/run_frozen_phase1_vm.py`에서 복원한다. deps는 `tools/assemble-guest-deps.py`로 `bundle/src/guest-deps-ganesha-v15.6.tar.gz`와 프록시(`NFSP_PROXY`, 기본 `bundle/src/nfs-proxy-lane`)를 합쳐 만든다 |
 | `verify-lane.py` | VM 한 대를 띄워 fixture, `syz-execprog`(원격 커버리지 켬), 카운터와 `.extra`, `dmesg`를 확인하고 `result.json`을 쓴다 |
 | `run-verify.sh` | 위를 부트스트랩 산출물 기준으로 감싼 실행 스크립트 (`kasan`/`kcsan` × `direct`/`proxy`/`raw`/`copy`) |
 
-필요한 것: 부트스트랩이 만든 환경(`env/images/<variant>/{bzImage,vmlinux}`, `env/syzkaller/bin`, 구운 이미지의 raw 사본),
+필요한 것: 부트스트랩이 만든 환경(`env/images/<variant>/{bzImage,vmlinux}`, `env/syzkaller/bin`,
+버전 중립 이미지 `env/images/bookworm-kcov-fresh.qcow2`의 raw 사본), Ganesha deps(`tools/build-ganesha-v15.sh`),
 프록시 게스트 빌드(Docker 필요: `tools/nfs-proxy/build-guest.sh`).
 
 `build-guest.sh`는 출력 파일이 이미 있으면 덮어쓰지 않고 실패한다(`output already exists`). 새 프록시는 다른 경로로 빌드하고
@@ -198,11 +199,16 @@ WORKLOAD=<v2 arm 프로그램> docs/handoff/proxy-variable-length-edits/run-veri
 
 - **부팅 인자 `nfs.localio_enabled=N`이 필수다.** 없으면 이미지의 lane fixture가 시작을 거부해 NFS에 닿지 않는다(`README.md`에 기재됨).
 - **저장소 `env/`가 낡았을 수 있다.** 다른 작업으로 병합 전 시리즈(커널 14개)로 빌드됐을 수 있으니, 새 시리즈로 쓰려면 부트스트랩을 다시 돌린다.
-  `~/prune-env`에 새 시리즈로 검증한 환경이 있었다(없으면 부트스트랩).
+  2026-10-02 기준 저장소 `env/`는 버전 중립 이미지(`bookworm-kcov-fresh.qcow2`)를 쓰는 구조다.
 - **`env/syzkaller/bin`의 `syz-manager`와 `syz-executor`의 리비전이 다를 수 있다.** manager 실행이 필요하면 같은 소스에서 따로 빌드한다.
   이 작업은 `syz-execprog`만 쓰므로 영향이 없다.
 - **A/B 러너, `evidence/`, 이전 실험 하네스(`~/q1-harness`)는 없다.** 검증은 8.2의 스크립트로 한다.
-- 이 저장소의 `bundle/src/nfs-proxy-control-guest`는 gitignore 대상 빌드 산출물이다. 프록시를 고치면 다시 빌드한다.
+- 이 저장소의 `bundle/src/nfs-proxy-lane`은 gitignore 대상 빌드 산출물이다. 프록시를 고치면 다른 경로로 다시 빌드한다.
+- **VM 도우미는 lane 스크립트 주입(9P, `koov.lane_sha256`)을 하지 않는다.** 그래서 이미지의 부팅 fixture는 시작을
+  거부하고, `mkinputs.py`가 만든 실행별 fixture가 lane을 직접 띄운다. 이 조합으로 게스트를 돌려 본 적은 아직 없다
+  (2026-10-02, 스크립트 수정 후 미실행). 처음 실행할 때 fixture 단계 로그를 먼저 확인한다.
+- **lane 병렬 운용이 필수다.** 이 스크립트는 `--procs 1`로 lane 하나만 검증한다. 편집 규칙이 lane 여러 개에서 동시에
+  쓰일 때의 검증은 `vm.snapshot`을 끈 syz-manager로 따로 한다.
 - WSL 안에서 작업한다 (`/home/idealinsane/projects/knfsd-syzkaller`). KVM(`/dev/kvm`)이 필요하다.
 
 ## 10. 완료 보고

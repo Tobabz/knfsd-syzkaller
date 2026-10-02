@@ -8,7 +8,7 @@
 #
 # Prerequisites (see README.md, section 8.2):
 #   python3 mkinputs.py                         # once; recreates ~/prune-evidence/inputs
-#   qemu-img convert -O raw ENV_DIR/images/bookworm-kcov-fresh-v2.qcow2 ~/prune-env-image.raw
+#   qemu-img convert -O raw ENV_DIR/images/bookworm-kcov-fresh.qcow2 ~/prune-env-image.raw
 # To test a rebuilt proxy, build it elsewhere and rebuild the deps tarball:
 #   tools/nfs-proxy/build-guest.sh --out ~/nfsp-build/nfs-proxy-v2
 #   NFSP_PROXY=~/nfsp-build/nfs-proxy-v2 python3 mkinputs.py

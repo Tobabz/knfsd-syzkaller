@@ -55,17 +55,22 @@ Stop that manager and wait for shutdown before starting Ganesha:
 env/syzkaller/bin/syz-manager -config cache/manager-separated-v41-20261002/ganesha/manager.cfg -mode fuzzing
 ```
 
-Each local config uses `procs=4`, one KASAN VM snapshot, `cover=true`,
+Each local config uses `procs=4`, one KASAN VM with `vm.snapshot: true`, `cover=true`,
 `cover_edges=true`, and `reproduce=false`. Enabled syscalls are
 `open$dir`, `openat`, `getdents64`, `close`, `write`, `fsync`,
 `statx`, `lseek`, `read`, `flock`, `renameat2`, and `unlinkat`.
 Ganesha's current coverage feedback is from the local client kernel, not
 Ganesha user-space code.
 
+Snapshot mode runs one program at a time with one proc, so these campaigns
+used lane 0 only and did not exercise parallel lanes. Lanes exist for
+parallel fuzzing, which is required: set `vm.snapshot` to `false` for regular
+campaigns. Four-lane parallel runs with this topology are not yet validated.
+
 These validated configs pin the baked-script V15.6 v4.1 image
 `env/images/bookworm-kcov-v41-ganesha-v15.6.qcow2`. For the reusable
 `bookworm-kcov-fresh.qcow2` image, prepare each backend's config separately
-with `tools/prepare-live-lane-config.py --minor 1`, as described in the
+with `tools/prepare-live-lane-config.py --version 4.1`, as described in the
 [root usage guide](../../../README.md#3-using-the-result-with-syz-manager).
 The helper preserves the workdir and coverage settings. Changing only the
 image path is insufficient for the reusable image's host-script boot model.

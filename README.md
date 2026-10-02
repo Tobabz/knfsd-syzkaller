@@ -15,7 +15,7 @@ comes up and that the kernel carries the expected memory sanitizer.
 |---|---|
 | Instrumentation | KCOV + KASAN/KCSAN boot kernels, built **out of tree** from one patched source tree |
 | Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path. Ownership is lane-scoped (kernel 0002): every request that reaches lane N's server counts for the program proc N is running, so attribution survives the NFS wire relay |
-| Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the boot fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count |
+| Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the boot fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count and `vm.snapshot` off. Lanes exist for parallel fuzzing inside one VM |
 | NFS version | `koov.nfs_version=3\|4.0\|4.1\|4.2` in `vm.cmdline` selects one mount version for both backends at boot |
 | Boot model | One version-neutral image serves both sanitizer kernels; the lane script is copied from a read-only host 9P share at each VM boot |
 | Seeds | `bundle/corpus/nfs-normal/` — normal-flow syzkaller programs plus a manifest; run them with a stock syz-manager (remote coverage is the `experimental.remote_cover` setting) |
@@ -120,6 +120,7 @@ No runner is provided: point a syz-manager config at the outputs of step 2.
 | `kernel` / `kernel_obj` | `env/images/<variant>/bzImage` / the directory holding `vmlinux` |
 | `image`, `sshkey` | `env/images/bookworm-kcov-fresh.qcow2`, `artifacts/bookworm.id_rsa` |
 | `procs` | the fixture's lane count (4) |
+| `vm.snapshot` | `false` (or absent). Snapshot mode runs one program at a time with one proc, so only lane 0 is used |
 | `workdir`, `http` | distinct for knfsd and Ganesha; each workdir owns its own `corpus.db` |
 | `experimental.remote_cover` | `true` for knfsd; `false` for Ganesha, whose current feedback is local client-kernel coverage |
 | `vm.cmdline` | must include `nfs.localio_enabled=N`; the helper below adds `koov.nfs_version` and the expected lane-script SHA-256. `sunrpc.lane_attribution=0` disables lane attribution; it does not restore request-level attribution |
@@ -152,7 +153,9 @@ env/syzkaller/bin/syz-manager -config manager-ganesha-v41.cfg -mode fuzzing
 ```
 
 The [existing local campaign commands](bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)
-use the already validated separate configs. Corpus separation prevents splicing
+use the already validated separate configs. Those configs set `vm.snapshot: true`, so they ran
+one proc (lane 0) only; turn snapshot mode off for the parallel lane operation this fixture is
+designed for. Parallel four-lane manager runs with the current topology are not yet validated. Corpus separation prevents splicing
 between backend corpora; it does not preserve seed paths or disable minimization.
 The fixture still exposes both backends, so this is not a strict execution filter.
 

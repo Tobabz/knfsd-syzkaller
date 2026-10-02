@@ -30,6 +30,9 @@ pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범�
 
 여섯 번째 요소인 NFS-Ganesha는 추가 서버 대상이다. v4.1 기본 시드는 서버별로 나누고,
 서로 다른 syz-manager 설정·workdir·`corpus.db`로 한 번에 한 서버씩 퍼징한다.
+Ganesha는 원래 knfsd와 동시에 퍼징해 처리량을 높이는 병렬 축으로 도입했으나, 한 manager에서 두 서버를
+함께 운용할 때의 상태 관리 문제 등으로 서버별 순차 캠페인으로 바꿨다(2026-10-02 결정).
+병렬성은 서버 축이 아니라 한 VM 안의 lane(proc) 축이 담당한다.
 프록시의 실행 대상 선택 확장은 후속 계획이다.
 
 ## 구조
@@ -92,7 +95,15 @@ Ganesha manager -> ganesha/workdir/corpus.db -> client0-ganesha <-> client1-gane
 ```
 
 현재 로컬 설정은 `cache/manager-separated-v41-20261002/{knfsd,ganesha}/manager.cfg`다.
-두 설정은 `procs=4`, KASAN v4.1 스냅샷 VM 하나와 파일 연산 syscall 범위를 사용한다.
+두 설정은 `procs=4`, KASAN v4.1 VM 하나, 파일 연산 syscall 범위를 쓰며 `vm.snapshot`이 켜져 있다.
+
+**lane 병렬 운용은 필수다 (2026-10-02 결정).** lane은 한 VM 안에서 proc마다 격리된 NFS 상태를 주기 위한
+설계이므로 manager는 `procs`를 lane 수(4)로 두고 **`vm.snapshot`을 끈다.** syzkaller 스냅샷 모드는 VM마다
+프로그램을 하나씩 순서대로 실행하고 proc을 하나만 쓴다(`executor/snapshot.h`, `pkg/execbackend/snapshot.go`).
+그래서 스냅샷 모드에서는 `procs=4`를 줘도 lane 0만 쓰이고 lane 1~3은 놀며, 프로그램마다 VM 상태가 되돌려져
+lane 귀속의 프로그램 경계도 시험되지 않는다.
+위 로컬 설정과 아래 분리 검증 결과는 스냅샷 모드, 즉 proc 하나로 얻은 것이다. 현재 토폴로지(서버별 캠페인,
+기본 `both`)에서 `vm.snapshot`을 끄고 lane 4개를 동시에 쓰는 manager 운용은 **미검증**이다.
 `experimental.remote_cover`는 knfsd에서 `true`, Ganesha에서 `false`다.
 Ganesha 피드백은 로컬 클라이언트 커널 KCOV이며 사용자 공간 서버 내부 커버리지가 아니다.
 실행 명령과 이미지 준비 방식은
@@ -149,7 +160,7 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 | 주장 | 상태 | 확인한 것 | 남은 검증 |
 |---|---|---|---|
 | syscall 인자 뮤테이션은 NFS operation의 wire 표현을 직접 바꾸지 못한다 | 부분 | `write$nfs` 등 표준 syscall 기술은 커널 NFS 클라이언트를 거쳐 RPC가 만들어진다(`fs_nfs_fuzz.txt`) | 특정 operation이 표준 syscall로 도달 불가함을 보이는 대조 실험 |
-| pseudo-syscall이 이 공백을 메운다 | 부분 | `syz_send_nfs_fuzz`와 `sendmsg$inet_nfs_fuzz_*`가 RPC/XDR 메시지를 직접 전송하고, `nfs4_op_arg` 등으로 NFSv4 COMPOUND의 operation을 기술한다(`socket_inet_nfs.txt`). 즉 C2S 방향의 operation 뮤테이션은 raw 전송 경로로 가능하다 | raw 경로로 만든 요청이 클라이언트 세션 상태(세션, slot, stateid)에 의존하는 operation에 유효한지 |
+| pseudo-syscall이 이 공백을 메운다 | 부분 | `syz_send_nfs_fuzz`와 `write$inet_nfs_fuzz`(syzkaller 0018, 일반 TCP)가 RPC/XDR 메시지를 직접 전송하고, `nfs4_op_arg` 등으로 NFSv4 COMPOUND의 operation을 기술한다(`socket_inet_nfs.txt`). 즉 C2S 방향의 operation 뮤테이션은 raw 전송 경로로 가능하다 | raw 경로로 만든 요청이 클라이언트 세션 상태(세션, slot, stateid)에 의존하는 operation에 유효한지 |
 | 클라이언트 취약점은 서버 응답 변조가 필요하고, 이는 프록시로만 가능하다 | 부분 | raw 경로는 C2S 전용이다. S2C 변조는 프록시의 `direction=1` arm이 유일하게 구현되어 있다. 게스트 실험에서 C2S와 S2C 양방향 변조가 적용·재생됐다 | 변조된 응답이 실제로 클라이언트 취약점을 트리거하는 사례. 현재 증거는 XID 변조의 적용까지다 |
 
 ## 설계
@@ -158,7 +169,8 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 2. **도달은 remote KCOV와 카운터로 판정한다.** 서버 스레드의 PC를 시나리오 실행에 귀속한다.
    귀속 단위는 **lane**이다. lane N의 서버가 받은 요청은 proc N이 그때 실행 중인 프로그램의 것이다(kernel 0002).
 3. **변조는 프록시 한 곳에서 한다.** 변조 규칙은 seed에 포함되어 프로그램과 함께 재현된다.
-4. **격리는 lane 단위로 한다.** 한 프로세스의 상태가 다른 프로세스의 관측에 섞이지 않게 한다.
+4. **격리는 lane 단위로 하고, lane은 병렬로 쓴다.** 한 프로세스의 상태가 다른 프로세스의 관측에 섞이지 않게 하고,
+   manager는 proc마다 lane 하나를 동시에 쓴다(`procs` = lane 수, `vm.snapshot` 끔).
 5. **sanitizer는 대상 서버가 실행되는 곳에 둔다.** knfsd는 커널 계측(KASAN/KCSAN)이다.
 6. **실패는 조용히 하지 않는다.** 정지한 lane은 fail-closed로 처리한다(syzkaller 0008, 0013).
 
@@ -186,8 +198,9 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 - **상류.** 패치 시리즈와 커널·syzkaller 핀이 바뀌면 remote KCOV 계약과 pseudo-syscall ABI가 깨질 수 있다.
   부트스트랩 manifest는 빌드·부팅을 검증하지만 시드의 도달·커버리지를 판정하지 않는다.
 - **하류.** Q1 판정이 틀리면 재현 실패와 seed 오동작이 섞인다.
-- **운영.** remote KCOV 활성 시 처리량 비용이 있다. Ganesha 병렬 운용의 처리량 이득은
-  미실증이다. 격리 fixture는 tmpfs 256 MiB 상한 등 자원 비용이 있다.
+- **운영.** remote KCOV 활성 시 처리량 비용이 있다. 병렬 처리량은 lane(proc) 수로 얻으며, 스냅샷 모드로
+  돌리면 이 이득이 사라진다. 격리 fixture는 lane마다 knfsd tmpfs 256 MiB와 Ganesha ext4 루프 이미지
+  256 MiB(`KOOV_TMPFS_SIZE`) 등의 자원 비용이 있다.
 
 ## 신뢰성 요구
 
@@ -245,9 +258,12 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 | 기본 이미지의 직접 마운트 경로 제거 | **완료**. 단일 lane fixture의 기본값은 `both`; NFSv3 시드와 중복 fixture 제거. 직접 경로는 비교 진단 옵션으로만 남음 |
 | 프록시 변조가 서버에 도달했는지 퍼징 중에 판정하는 채널 | 프록시 진단 출력은 있으나 syz-manager의 입력별 피드백에 미연결 |
 | Ganesha 대상의 도달 관측 | 미구현. remote KCOV는 사용자 공간 서버에 귀속 대상이 없다 |
-| 서버별 실행 방식 | **결정됨 (2026-10-02)**. 서버별 34개 호출 입력을 따로 실행; KASAN v4.1 스냅샷에서 각 1회 errno 오라클 통과 |
+| 서버별 실행 방식 | **결정됨 (2026-10-02)**. 서버별 34개 호출 입력을 따로 실행; KASAN v4.1 스냅샷 모드(proc 1개)에서 각 1회 errno 오라클 통과 |
+| lane 병렬 manager 운용 (`vm.snapshot` 끔, `procs=4`) | **필수 조건, 현재 토폴로지에서 미검증**. 검증된 로컬 설정은 스냅샷 모드라 lane 0만 사용했다 |
+| lane 밖에서 생기는 요청 | knfsd lease가 10초(`nfsv4leasetime`)라 클라이언트 netns마다 수 초 간격의 lease 갱신 요청이 생기고, lane 단위 귀속에서는 그때 실행 중인 프로그램의 커버리지로 잡힌다. 프로그램과 무관한 PC가 섞이는 거짓 양성 원천이다. syzkaller의 triage 재실행이 불안정한 신호를 걸러 영향은 제한적이나 측정하지 않았다 |
+| Ganesha 캠페인의 sanitizer 보고 | Ganesha export가 ext4 루프 위에 있어, 보고에 NFS가 아닌 ext4·loop 경로가 섞일 수 있다. 보고의 호출 경로로 구분한다 |
 | 프록시의 실행 대상 선택·관리 라우팅 확장 | **후속 계획**. 기존 고정 중계와 별개이며, 자동 전환·복제는 미구현 |
-| Ganesha 병렬 처리량 이득 | 현재 순차 운용하므로 미실증 |
+| Ganesha 병렬 처리량 이득 | 해당 없음. Ganesha는 병렬 축에서 빠졌다(상태 관리 문제 등, 2026-10-02) |
 | 정상 NFS 흐름 코퍼스의 지원 범위 | 부분 완료(`report/normal-flow-corpus.md`) |
 
 ## 문서 상태
