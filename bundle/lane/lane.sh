@@ -610,7 +610,7 @@ EOF
                 # host-wide pgrep result from another lane.
                 exec ganesha.nfsd -F -p "$lane_root/server/ganesha.lock" \
                     -f "$lane_root/server/ganesha.conf" \
-                    -N "${KOOV_GANESHA_DEBUG:-NIV_DEBUG}" \
+                    -N "${KOOV_GANESHA_DEBUG:-NIV_WARN}" \
                     -L "$lane_root/server/ganesha.log"
             ) &
             ganesha_pid=$!
