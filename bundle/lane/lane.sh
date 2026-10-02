@@ -17,7 +17,7 @@
 #                     skip the relay and are for diagnosis only
 #   SERVER_PORT       NFS port the clients mount (default 2049)
 #   KOOV_KNFS_PORT    knfsd listen port (default: SERVER_PORT, or 20490 in
-#                     "both", leaving 2049 for the mirror proxy)
+#                     "both", leaving 2049 for the relay)
 #   KOOV_GANESHA_PORT Ganesha listen port (default: SERVER_PORT, or 20491 in
 #                     "both")
 #   KOOV_GANESHA_ASAN_OPTIONS / KOOV_UBSAN_OPTIONS
@@ -32,10 +32,11 @@
 # The executor client0/client1 aliases both select knfsd, preserving the
 # two-client shared-filesystem contract of the normal corpus.
 #
-# Why "both" uses two tmpfs trees: knfsd and Ganesha must never co-own mutable
-# filesystem state.  Both clients see the same tree within a backend, while
-# the two backends remain independent.  The proxy selects ONE backend from
-# the destination IP and returns that backend's own NFS response.
+# Why "both" uses two storage trees (knfsd tmpfs, Ganesha ext4): knfsd and
+# Ganesha must never co-own mutable filesystem state.  Both clients see the
+# same tree within a backend, while the two backends remain independent.
+# The proxy selects ONE backend from the destination IP and returns that
+# backend's own NFS response.
 # NFS_VERSION applies to both backends. Ganesha V15.6 exports its
 # separate bounded ext4 filesystem through FSAL_VFS.
 
@@ -82,8 +83,8 @@ case "$server_impl" in
     *) echo "SERVER_IMPL must be knfsd, ganesha, or both" >&2; exit 2 ;;
 esac
 tmpfs_size=${KOOV_TMPFS_SIZE:-256m}
-# KOOV: per-backend listen ports.  In "both" mode the clients keep 2049 for
-# the future mirror proxy and each backend moves aside.
+# KOOV: per-backend listen ports.  In "both" mode the relay keeps 2049 and
+# each backend listens on its own port behind it.
 knfsd_port=${KOOV_KNFS_PORT:-}
 ganesha_port=${KOOV_GANESHA_PORT:-}
 if [ -z "$knfsd_port" ]; then
@@ -605,8 +606,8 @@ EOF
             #     [3, 4, NFS3, NFS4, V3, V4, NFSv3, NFSv4, 9P].  4.0 vs 4.1 is
             #     negotiated per session by the client.  V3 uses its real
             #     export path and a separate pinned MOUNT port.
-            #   * Pseudo MUST be "/".  With the absolute export path, the 4.3
-            #     log showed "make_pseudofs_node ... CREATE export-ganesha",
+            #   * Pseudo MUST be "/".  With an absolute export path, Ganesha
+            #     4.3 logged "make_pseudofs_node ... CREATE export-ganesha",
             #     i.e. a pseudo node named after the export: the client root
             #     then held an "export-ganesha" directory instead of the tree,
             #     and the corpus path shared/... resolved to ENOENT.  Pseudo = /
@@ -771,7 +772,7 @@ EOF
     fi
 
     # A fixed fuzzer process N enters only lane N's primary client mount
-    # namespace.  Its peer alias preserves the second Phase 1 client for
+    # namespace.  Its peer alias preserves the second client for
     # cross-client state, locking, callback, and race workloads.
     ln -s "lane$setup_lane_id/client0" "$root/proc$setup_lane_id"
     ln -s "lane$setup_lane_id/client1" "$root/proc$setup_lane_id-peer"
