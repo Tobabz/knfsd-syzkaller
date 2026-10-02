@@ -115,6 +115,21 @@ setup·status·cleanup은 모두 이 복사본을 사용합니다.
 두 서버 모두 요청한 버전을 사용합니다. v3는 별도 TCP MOUNT 포트와 `nolock`을 사용하므로
 서로 다른 클라이언트 사이의 NLM 잠금은 이 fixture에서 제공하지 않습니다.
 
+**특이사항 — NFSv3 잠금:** 현재 `nolock` 마운트의 파일 잠금은 같은 클라이언트 안에서만
+효력이 있으며, Ganesha도 `Enable_NLM = false`로 실행합니다. v3의 일반적인 읽기·쓰기
+시나리오는 이 설정을 유지할 수 있지만, 클라이언트 간 잠금이나 NLM 자체가 취약점의
+재현 조건이면 시나리오 실행 전에 잠금용 설정으로 lane을 새로 시작해야 합니다.
+이때 클라이언트의 `nolock`을 해제하고 서버 측 NLM, 필요한 NSM 상태 모니터링과
+클라이언트의 `rpc.statd`, 네트워크 네임스페이스 간 RPC/콜백 통신을 함께 준비한 뒤
+두 클라이언트의 충돌하는 잠금 요청으로 동작을 검증합니다. 커널에는
+`CONFIG_LOCKD=y`가 있지만 현재 lane의 NLM/NSM 경로는 검증되지 않았으므로
+마운트 옵션만 바꿔서 재현 가능하다고 간주하지 않습니다.
+NFSv4.0~4.2는 잠금을 NFS 프로토콜 안에서 처리하므로 NLM 설정을 바꿀 필요가 없습니다.
+잠금 설정 사용 여부도 재현 설정과 함께 기록합니다.
+참고: [Linux nfs(5)](https://man7.org/linux/man-pages/man5/nfs.5.html),
+[NFSv4 명세](https://www.rfc-editor.org/rfc/rfc7530),
+[Ganesha NLM 설정](https://github.com/nfs-ganesha/nfs-ganesha/blob/next/src/doc/man/ganesha-core-config.rst).
+
 퍼징은 서버별 syz-manager 설정·workdir·`corpus.db`를 분리하고 한 번에 하나씩 실행합니다.
 각 새 DB에는 해당 서버의 기본 시드만 넣으며 DB 병합이나 공유 corpus hub를 사용하지 않습니다.
 knfsd는 `experimental.remote_cover=true`, Ganesha는 `false`로 두고 로컬 클라이언트
