@@ -1,0 +1,258 @@
+From 01fa50721727a4cbcd2a79a2c69b4b56d472b858 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Fri, 2 Oct 2026 16:30:09 +0900
+Subject: [PATCH] sys/linux, executor: add a variable-length proxy arm packet
+
+The fixed 140-byte NFSPARM1 packet can only overwrite a field in place at
+the same width, so it cannot add an NFSv4 COMPOUND operation or resize a
+field. Add a second, self-describing packet (NFSPARM2) for that: a header
+naming how many edits follow, each edit naming its own original/replacement
+byte counts, so the only external input to decoding it is the packet's own
+length.
+
+syz_arm_nfs_proxy_v2(arm, arm_len) sends exactly arm_len bytes (not a fixed
+140) and shares its ACK/lifetime-FD contract and fd_nfs_proxy_rule resource
+with the existing syz_arm_nfs_proxy, so one close$nfs_proxy_arm releases
+either kind and both can be armed on the same proxy at once -- it dispatches
+incoming packets by magic, not by length, so an executor built against the
+old description still arms the fixed packet. mode selects whether an
+inserted operation also bumps the COMPOUND op count (struct-preserving) or
+leaves it alone (raw, for a deliberate opcount/op-array mismatch); the edit
+kinds (REPLACE/INSERT/DELETE/OP_APPEND/OP_PREPEND) mirror
+tools/nfs-proxy/src/edit.h, which decodes and applies this packet.
+
+This patch only adds the executor-side packet description and send path.
+The proxy's own decoder, edit application and tests are tools/nfs-proxy/src
+(host-built, no syzkaller dependency); see docs/design/05-wire-mutation
+and docs/handoff/proxy-variable-length-edits for the full design and the
+host/guest verification this change still needs.
+---
+ executor/common_linux.h      | 47 +++++++++++++++++++------
+ pkg/vminfo/linux_syscalls.go |  1 +
+ sys/linux/fs_nfs_fuzz.txt    | 41 ++++++++++++++++++++++
+ sys/linux/nfs_fuzz_test.go   | 68 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 146 insertions(+), 11 deletions(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index a006837c4..669ebcf98 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2826,7 +2826,7 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+ 
+ #if SYZ_EXECUTOR || __NR_syz_open_nfs_lane || __NR_syz_socket_connect_nfs || \
+     __NR_syz_open_nfs_lane_pair || __NR_syz_socket_connect_nfs_pair || \
+-    __NR_syz_arm_nfs_proxy || __NR_syz_send_nfs_fuzz
++    __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || __NR_syz_send_nfs_fuzz
+ #include <fcntl.h>
+ #include <sched.h>
+ #include <stdio.h>
+@@ -2924,16 +2924,13 @@ static long syz_socket_connect_nfs_pair(volatile long a0, volatile long a1)
+ 	return nfs_socket_connect_pair(a0, a1);
+ }
+ 
+-static long syz_arm_nfs_proxy(volatile long a0)
++// Shared by both arm wire formats: connect to the proxy's control socket,
++// send exactly `len` bytes, and wait for the one-byte ACK.  Registration is
++// an ACKed configuration call; the returned FD is a lifetime handle, not
++// proof that an RPC was subsequently mutated and delivered.  Returning it as
++// a resource keeps the rule alive until close(program).
++static long nfs_proxy_arm_send(const void* rule, size_t len)
+ {
+-	// Registration is an ACKed configuration call.  The FD is a lifetime
+-	// handle, not proof that an RPC was subsequently mutated and delivered.
+-	// Returning it as a resource keeps the rule alive until close(program).
+-	const void* rule = (const void*)a0;
+-	if (!rule) {
+-		errno = EINVAL;
+-		return -1;
+-	}
+ 	int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+ 	if (fd < 0)
+ 		return -1;
+@@ -2942,7 +2939,7 @@ static long syz_arm_nfs_proxy(volatile long a0)
+ 	strcpy(addr.sun_path, "/nfs-lane/control/arm.sock");
+ 	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) ||
+ 	    connect(fd, (struct sockaddr*)&addr, sizeof(addr)) ||
+-	    send(fd, rule, 140, MSG_NOSIGNAL) != 140) {
++	    send(fd, rule, len, MSG_NOSIGNAL) != (ssize_t)len) {
+ 		int saved_errno = errno;
+ 		close(fd);
+ 		errno = saved_errno;
+@@ -2958,6 +2955,34 @@ static long syz_arm_nfs_proxy(volatile long a0)
+ 	return fd;
+ }
+ 
++static long syz_arm_nfs_proxy(volatile long a0)
++{
++	// Fixed 140-byte packet (NFSPARM1): same-width overwrite only.
++	const void* rule = (const void*)a0;
++	if (!rule) {
++		errno = EINVAL;
++		return -1;
++	}
++	return nfs_proxy_arm_send(rule, 140);
++}
++
++static long syz_arm_nfs_proxy_v2(volatile long a0, volatile long a1)
++{
++	// Variable-length packet (NFSPARM2): operation insertion and resizing
++	// edits.  Unlike the fixed packet, the wire size is not a constant here
++	// either -- a1 is whatever syzkaller serialised for `arm`, computed from
++	// the struct's own nedits/orig_len/data_len fields, and the proxy's
++	// decoder independently re-derives and checks that same length from the
++	// packet's own header before trusting any of it.
++	const void* rule = (const void*)a0;
++	size_t len = (size_t)a1;
++	if (!rule || len < 8 || len > 0x7fffffff) {
++		errno = EINVAL;
++		return -1;
++	}
++	return nfs_proxy_arm_send(rule, len);
++}
++
+ static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
+ 			      volatile long a2, volatile long a3,
+ 			      volatile long a4)
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index 826e88e1a..b91a17610 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -114,6 +114,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_socket_connect_nfs_pair":   alwaysSupported,
+ 	"syz_open_nfs_lane_pair":        alwaysSupported,
+ 	"syz_arm_nfs_proxy":             alwaysSupported,
++	"syz_arm_nfs_proxy_v2":          alwaysSupported,
+ 	"syz_send_nfs_fuzz":             alwaysSupported,
+ 	"syz_pidfd_open":                alwaysSupported,
+ 	"syz_create_resource":           alwaysSupported,
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+index 407fcbf7b..37d3dd6be 100644
+--- a/sys/linux/fs_nfs_fuzz.txt
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -72,6 +72,47 @@ nfs_proxy_direction = 0, 1
+ nfs_proxy_backend = 0, 1
+ nfs_proxy_client = 0, 1
+ 
++# Variable-length arm: operation insertion and resizing edits (proxy "Phase
++# 1"/layer 0, no per-op schema).  A distinct magic on the same control socket
++# means an executor built against this description and one built against the
++# older fixed-width packet can arm the same proxy: it dispatches by magic, not
++# by packet length.  Unlike nfs_proxy_arm this packet is self-describing
++# rather than fixed-size: nedits and each edit's orig_len/data_len say how
++# much of the packet follows, and arm_len (the pseudo-syscall's own length
++# argument) must account for exactly that many bytes -- the proxy rejects a
++# packet whose declared sizes do not consume it exactly.  mode selects whether
++# OP_APPEND/OP_PREPEND also bump the COMPOUND op count (struct-preserving) or
++# leave it alone (raw, for a deliberate opcount/op-array mismatch).
++syz_arm_nfs_proxy_v2$scoped(arm ptr[in, nfs_proxy_edit_arm], arm_len bytesize[arm]) fd_nfs_proxy_rule
++
++nfs_proxy_edit_arm {
++    magic        const[0x4e46535041524d32, int64be]
++    direction    flags[nfs_proxy_direction, int32be]
++    backend      flags[nfs_proxy_backend, int32be]
++    client       flags[nfs_proxy_client, int32be]
++    first_opcode int32be
++    anchor_off   int32be
++    anchor_len   len[anchor, int32be]
++    mode         flags[nfs_proxy_edit_mode, int32be]
++    nedits       len[edits, int32be]
++    reserved     const[0, int32be]
++    anchor       array[int8, 0:64]
++    edits        array[nfs_proxy_edit_field, 1:8]
++} [packed]
++
++nfs_proxy_edit_field {
++    kind     flags[nfs_proxy_edit_kind, int32be]
++    offset   int32be
++    orig_len len[orig, int32be]
++    data_len len[data, int32be]
++    orig     array[int8, 0:1024]
++    data     array[int8, 0:1024]
++} [packed]
++
++nfs_proxy_edit_mode = 0, 1
++# REPLACE, INSERT, DELETE, OP_APPEND, OP_PREPEND -- see tools/nfs-proxy/src/edit.h.
++nfs_proxy_edit_kind = 0, 1, 2, 3, 4
++
+ openat$nfs_file(fd fd_nfs_dir, file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_nfs
+ openat$nfs_dir(fd fd_nfs_dir, file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd_nfs_dir
+ 
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index bf1ab5ffb..15df45efa 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -234,3 +234,71 @@ func TestNFSFourRoutesAndScopedArm(t *testing.T) {
+ 		t.Fatalf("close cannot release scoped arm FD: %s", closeCall.Name)
+ 	}
+ }
++
++// TestNFSProxyVariableLengthArm checks the v2 (NFSPARM2) wire packet: unlike
++// nfs_proxy_arm, its size is NOT fixed, so this asserts shape (fields, length
++// linkage, magic) rather than a byte count, and that it shares its lifetime FD
++// with the v1 packet so one close$nfs_proxy_arm releases either.
++func TestNFSProxyVariableLengthArm(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	arm := requireNFSFuzzCall(t, target, "syz_arm_nfs_proxy_v2$scoped")
++	if arm.CallName != "syz_arm_nfs_proxy_v2" || len(arm.Args) != 2 {
++		t.Fatalf("v2 arm dispatch or arity is wrong: %s", arm.Name)
++	}
++	ret, ok := arm.Ret.(*prog.ResourceType)
++	if !ok || ret.Desc.Name != "fd_nfs_proxy_rule" {
++		t.Fatalf("v2 arm return is %T %v, want the same lifetime FD as v1", arm.Ret, arm.Ret)
++	}
++	lenArg, ok := arm.Args[1].Type.(*prog.LenType)
++	if !ok || !pathIs(lenArg.Path, "arm") {
++		t.Fatalf("v2 arm_len is %T %v, want len[arm]", arm.Args[1].Type, arm.Args[1].Type)
++	}
++	packet := requireStruct(t, arm, "nfs_proxy_edit_arm")
++	requireConst(t, requireField(t, packet, "magic").Type,
++		0x4e46535041524d32, "v2 arm wire magic")
++	if requireField(t, packet, "magic").Type.(*prog.ConstType).Val ==
++		0x4e46535041524d31 {
++		t.Fatalf("v2 magic must differ from the v1 magic so the control socket can dispatch by it")
++	}
++	requireConst(t, requireField(t, packet, "reserved").Type, 0, "v2 reserved field")
++	anchorLen, ok := requireField(t, packet, "anchor_len").Type.(*prog.LenType)
++	if !ok || !pathIs(anchorLen.Path, "anchor") {
++		t.Fatalf("v2 anchor_len is %T %v, want len[anchor]", requireField(t, packet, "anchor_len").Type,
++			requireField(t, packet, "anchor_len").Type)
++	}
++	neditsLen, ok := requireField(t, packet, "nedits").Type.(*prog.LenType)
++	if !ok || !pathIs(neditsLen.Path, "edits") {
++		t.Fatalf("v2 nedits is %T %v, want len[edits]", requireField(t, packet, "nedits").Type,
++			requireField(t, packet, "nedits").Type)
++	}
++	edits, ok := requireField(t, packet, "edits").Type.(*prog.ArrayType)
++	if !ok {
++		t.Fatalf("v2 edits field is %T, want array", requireField(t, packet, "edits").Type)
++	}
++	field, ok := edits.Elem.(*prog.StructType)
++	if !ok || field.TemplateName() != "nfs_proxy_edit_field" {
++		t.Fatalf("v2 edits element is %T %v, want nfs_proxy_edit_field", edits.Elem, edits.Elem)
++	}
++	for _, name := range []struct{ field, buf string }{
++		{"orig_len", "orig"}, {"data_len", "data"},
++	} {
++		lt, ok := requireField(t, field, name.field).Type.(*prog.LenType)
++		if !ok || !pathIs(lt.Path, name.buf) {
++			t.Fatalf("nfs_proxy_edit_field.%s is %T %v, want len[%s]",
++				name.field, requireField(t, field, name.field).Type,
++				requireField(t, field, name.field).Type, name.buf)
++		}
++	}
++	closeCall := requireNFSFuzzCall(t, target, "close$nfs_proxy_arm")
++	closeFD, ok := closeCall.Args[0].Type.(*prog.ResourceType)
++	if closeCall.CallName != "close" || !ok || closeFD.Desc.Name != "fd_nfs_proxy_rule" {
++		t.Fatalf("close cannot release the v2 arm FD: %s", closeCall.Name)
++	}
++}
++
++func pathIs(path []string, want string) bool {
++	return len(path) == 1 && path[0] == want
++}
+-- 
+2.53.0
+

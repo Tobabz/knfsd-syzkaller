@@ -37,11 +37,21 @@ struct nfsp_proxy_cfg {
 	size_t msg_limit;  /* zero chooses NFSP_MSG_LIMIT_DEFAULT */
 	unsigned connect_timeout_ms; /* zero chooses a finite default */
 	_Atomic int *stop;
-	/* The only place a complete record can be changed.  The callback must
-	 * preserve its length.  Negative means refuse this record and close this
-	 * connection, without forwarding unverified bytes.  NULL is pure relay. */
+	/* The only place a complete record can be changed.
+	 *
+	 * On entry *out == record and *out_len == len (the relay default).  The
+	 * callback forwards record unchanged by leaving them alone, or forwards a
+	 * different, possibly longer or shorter, record by pointing *out at a
+	 * buffer it owns and setting *out_len.  That buffer must stay valid until
+	 * the next call.  `record` itself is read-only and must not be modified.
+	 *
+	 * The length may change because an edit can add an operation or resize a
+	 * field; the callback is responsible for rebuilding the record marker.
+	 * Returns 0 on success, negative to refuse this record and close this
+	 * connection without forwarding unverified bytes.  NULL is pure relay. */
 	int (*on_record)(unsigned client, unsigned backend, int dir,
-			 uint8_t *record, size_t len, void *arg);
+			 const uint8_t *record, size_t len,
+			 const uint8_t **out, size_t *out_len, void *arg);
 	void *on_record_arg;
 	/* Called by the relay event loop, never from a signal handler.  The
 	 * pointer is an in-thread snapshot; do not retain it after return. */

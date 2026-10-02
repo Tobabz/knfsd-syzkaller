@@ -181,14 +181,19 @@ static void *run_proxy(void *arg)
 }
 
 static int mutate(unsigned client, unsigned backend, int dir,
-		  uint8_t *msg, size_t len, void *arg)
+		  const uint8_t *msg, size_t len, const uint8_t **out,
+		  size_t *out_len, void *arg)
 {
 	struct fixture *f = arg;
+	static uint8_t scratch[6];	/* the record is read-only: edit a copy */
 	if (backend == 1u &&
 	    ((client == 1u && dir == NFSP_DIR_S2C) ||
 	     (client == 0u && dir == NFSP_DIR_C2S))) {
 		if (len != 6u) return -1;
-		msg[4] = dir == NFSP_DIR_S2C ? 0xee : 0x09;
+		memcpy(scratch, msg, sizeof(scratch));
+		scratch[4] = dir == NFSP_DIR_S2C ? 0xee : 0x09;
+		*out = scratch;
+		*out_len = sizeof(scratch);
 		atomic_fetch_add(&f->mutations, 1u);
 	}
 	return 0;
@@ -397,6 +402,207 @@ static void watchdog(int sig)
 	_exit(97);
 }
 
+/* ---- variable-length forwarding -----------------------------------------
+ *
+ * The callback may return a record of a different length than it was given.
+ * The risk is not the grown record itself but what follows it: if the relay
+ * advanced by the wrong length, or forwarded stale bytes, the NEXT record would
+ * arrive misframed.  So the two records are sent coalesced in one write and the
+ * backend must see the grown first record, then the second one intact. */
+
+struct raw_backend {
+	int listener;
+	uint16_t port;
+	uint8_t got[64];
+	size_t got_len;
+	pthread_t thread;
+};
+
+static void *raw_backend_main(void *arg)
+{
+	struct raw_backend *b = arg;
+	int fd = accept(b->listener, NULL, NULL);
+	if (fd < 0) return NULL;
+	timeout_socket(fd);
+	for (;;) {
+		ssize_t n = recv(fd, b->got + b->got_len, sizeof(b->got) - b->got_len, 0);
+		if (n <= 0) break;
+		b->got_len += (size_t)n;
+		if (b->got_len >= 16u) break;	/* 10 grown + 6 intact */
+	}
+	close(fd);
+	return NULL;
+}
+
+/* Grow the first C2S record from client 0 by four bytes and rebuild its marker;
+ * leave every other record alone (fwd stays the original). */
+static int grow_first(unsigned client, unsigned backend, int dir,
+		      const uint8_t *msg, size_t len, const uint8_t **out,
+		      size_t *out_len, void *arg)
+{
+	static uint8_t grown[10];
+	_Atomic unsigned *seen = arg;
+	(void)backend;
+	if (client != 0u || dir != NFSP_DIR_C2S) return 0;
+	if (atomic_fetch_add(seen, 1u) != 0u) return 0;
+	if (len != 6u) return -1;
+	memcpy(grown, msg, 6);
+	memset(grown + 6, 0xAB, 4);
+	stamp(grown, 6);		/* marker now covers the 6 body bytes */
+	*out = grown;
+	*out_len = sizeof(grown);
+	return 0;
+}
+
+static void test_resize_keeps_stream_in_sync(void)
+{
+	struct raw_backend rb = {0};
+	struct nfsp_proxy_cfg cfg = {0};
+	struct nfsp_proxy_stats stats;
+	struct fixture f;		/* only for the proxy thread plumbing */
+	struct sockaddr_in sa = {0};
+	socklen_t slen = sizeof(sa);
+	_Atomic unsigned seen = 0;
+	uint8_t two[12];
+	int fd;
+
+	printf("a grown record keeps the next coalesced record framed\n");
+	memset(&f, 0, sizeof(f));
+	pthread_mutex_init(&f.mutex, NULL);
+	pthread_cond_init(&f.cond, NULL);
+
+	rb.listener = socket(AF_INET, SOCK_STREAM, 0);
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	CHECK(rb.listener >= 0 && bind(rb.listener, (struct sockaddr *)&sa, slen) == 0 &&
+	      listen(rb.listener, 4) == 0 &&
+	      getsockname(rb.listener, (struct sockaddr *)&sa, &slen) == 0,
+	      "raw backend setup");
+	rb.port = ntohs(sa.sin_port);
+	CHECK(pthread_create(&rb.thread, NULL, raw_backend_main, &rb) == 0, "backend thread");
+
+	cfg.client_ip[0] = "127.0.0.10";
+	cfg.client_ip[1] = "127.0.0.11";
+	cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", rb.port};
+	cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", rb.port};
+	cfg.stop = &f.stop;
+	cfg.msg_limit = 64;
+	cfg.connect_timeout_ms = 500;
+	cfg.on_record = grow_first;
+	cfg.on_record_arg = &seen;
+	f.cfg = cfg;
+	CHECK(pthread_create(&f.proxy_thread, NULL, run_proxy, &f) == 0, "proxy thread");
+	pthread_mutex_lock(&f.mutex);
+	while (!f.ready && !f.done) pthread_cond_wait(&f.cond, &f.mutex);
+	if (f.ready && !f.done) { f.port[0] = f.stats.bound_port[0]; f.port[1] = f.stats.bound_port[1]; }
+	pthread_mutex_unlock(&f.mutex);
+	CHECK(f.ready && f.port[0] != 0, "proxy ready");
+
+	fd = f.port[0] ? client_socket(&f, 0, 0) : -1;
+	CHECK(fd >= 0, "client connect");
+	if (fd >= 0) {
+		/* two 6-byte records, one TCP write */
+		stamp(two, 2); two[4] = 0x11; two[5] = 0x22;
+		stamp(two + 6, 2); two[10] = 0x33; two[11] = 0x44;
+		CHECK(send(fd, two, sizeof(two), MSG_NOSIGNAL) == (ssize_t)sizeof(two), "send");
+	}
+	pthread_join(rb.thread, NULL);
+	if (fd >= 0) close(fd);
+	atomic_store(&f.stop, 1);
+	pthread_join(f.proxy_thread, NULL);
+	stats = f.stats;
+	close(rb.listener);
+	pthread_mutex_destroy(&f.mutex);
+	pthread_cond_destroy(&f.cond);
+
+	CHECK(rb.got_len == 16u, "backend received %zu bytes, want 16", rb.got_len);
+	if (rb.got_len == 16u) {
+		/* record 1: marker for 6 body bytes, original body, four 0xAB */
+		CHECK(memcmp(rb.got, "\x80\0\0\6", 4) == 0, "grown marker wrong");
+		CHECK(rb.got[4] == 0x11 && rb.got[5] == 0x22, "grown body wrong");
+		CHECK(rb.got[6] == 0xAB && rb.got[9] == 0xAB, "appended bytes wrong");
+		/* record 2 begins exactly at offset 10 and is untouched */
+		CHECK(memcmp(rb.got + 10, "\x80\0\0\2", 4) == 0, "next record misframed");
+		CHECK(rb.got[14] == 0x33 && rb.got[15] == 0x44, "next record body wrong");
+	}
+	CHECK(stats.records[0][0][0] == 2u, "records counted %u, want 2", stats.records[0][0][0]);
+	CHECK(stats.mutation_errors == 0u && stats.framing_errors == 0u && stats.relay_errors == 0u,
+	      "unexpected errors m=%u f=%u r=%u", stats.mutation_errors,
+	      stats.framing_errors, stats.relay_errors);
+}
+
+static int bad_output(unsigned client, unsigned backend, int dir,
+		      const uint8_t *msg, size_t len, const uint8_t **out,
+		      size_t *out_len, void *arg)
+{
+	(void)client; (void)backend; (void)dir; (void)msg; (void)len; (void)arg;
+	*out = msg;
+	*out_len = 2;		/* shorter than a record marker */
+	return 0;
+}
+
+/* A callback that returns something the peer could not frame must close the
+ * connection as a mutation error, never forward it. */
+static void test_unframeable_output_refused(void)
+{
+	struct raw_backend rb = {0};
+	struct fixture f;
+	struct sockaddr_in sa = {0};
+	socklen_t slen = sizeof(sa);
+	uint8_t one[6];
+	int fd;
+
+	printf("an unframeable rewritten record is refused, not forwarded\n");
+	memset(&f, 0, sizeof(f));
+	pthread_mutex_init(&f.mutex, NULL);
+	pthread_cond_init(&f.cond, NULL);
+	rb.listener = socket(AF_INET, SOCK_STREAM, 0);
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	CHECK(rb.listener >= 0 && bind(rb.listener, (struct sockaddr *)&sa, slen) == 0 &&
+	      listen(rb.listener, 4) == 0 &&
+	      getsockname(rb.listener, (struct sockaddr *)&sa, &slen) == 0,
+	      "raw backend setup");
+	rb.port = ntohs(sa.sin_port);
+	CHECK(pthread_create(&rb.thread, NULL, raw_backend_main, &rb) == 0, "backend thread");
+	f.cfg.client_ip[0] = "127.0.0.10";
+	f.cfg.client_ip[1] = "127.0.0.11";
+	f.cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", rb.port};
+	f.cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", rb.port};
+	f.cfg.stop = &f.stop;
+	f.cfg.msg_limit = 64;
+	f.cfg.connect_timeout_ms = 500;
+	f.cfg.on_record = bad_output;
+	CHECK(pthread_create(&f.proxy_thread, NULL, run_proxy, &f) == 0, "proxy thread");
+	pthread_mutex_lock(&f.mutex);
+	while (!f.ready && !f.done) pthread_cond_wait(&f.cond, &f.mutex);
+	if (f.ready && !f.done) { f.port[0] = f.stats.bound_port[0]; f.port[1] = f.stats.bound_port[1]; }
+	pthread_mutex_unlock(&f.mutex);
+	fd = f.port[0] ? client_socket(&f, 0, 0) : -1;
+	CHECK(fd >= 0, "client connect");
+	if (fd >= 0) {
+		stamp(one, 2); one[4] = 1; one[5] = 2;
+		CHECK(send(fd, one, sizeof(one), MSG_NOSIGNAL) == (ssize_t)sizeof(one), "send");
+		/* the proxy must close the connection; the backend sees nothing */
+		{
+			uint8_t sink;
+			ssize_t n = recv(fd, &sink, 1, 0);
+			CHECK(n == 0 || n < 0, "connection should be closed, recv=%zd", n);
+		}
+		close(fd);
+	}
+	atomic_store(&f.stop, 1);
+	pthread_join(f.proxy_thread, NULL);
+	shutdown(rb.listener, SHUT_RDWR);
+	close(rb.listener);
+	pthread_join(rb.thread, NULL);
+	CHECK(rb.got_len == 0u, "backend received %zu bytes of an unframeable record", rb.got_len);
+	CHECK(f.stats.mutation_errors == 1u, "mutation_errors=%u, want 1", f.stats.mutation_errors);
+	pthread_mutex_destroy(&f.mutex);
+	pthread_cond_destroy(&f.cond);
+}
+
+
 int main(void)
 {
 	signal(SIGALRM, watchdog);
@@ -404,6 +610,8 @@ int main(void)
 	test_four();
 	test_dead();
 	test_three_coalesced_and_split();
+	test_resize_keeps_stream_in_sync();
+	test_unframeable_output_refused();
 	printf("%u checks, %u failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

@@ -61,8 +61,9 @@ mkdir -p "$BUILD"
 UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_walk:$TEST/test_walk.c:$SRC/walk.c\
        test_delta:$TEST/test_delta.c:$SRC/delta.c\
+       test_edit:$TEST/test_edit.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c\
-       test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c"
+       test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
 for c in "$CC" "$SANCC"; do
@@ -152,7 +153,7 @@ if [ "$MODE" != "--test" ]; then
 	# shellcheck disable=SC2086
 	$CC $CFLAGS -I"$SRC" -o "$BUILD/nfs-proxy" \
 		"$SRC/main.c" "$SRC/proxy.c" "$SRC/framing.c" \
-		"$SRC/control.c" "$SRC/delta.c" "$SRC/walk.c"
+		"$SRC/control.c" "$SRC/delta.c" "$SRC/walk.c" "$SRC/edit.c"
 fi
 
 echo "=== host test suite: PASS ==="

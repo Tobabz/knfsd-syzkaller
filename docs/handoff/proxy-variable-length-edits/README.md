@@ -3,6 +3,14 @@
 > **임시 인계 문서다. 아래 "삭제 조건"을 모두 만족하면 이 디렉터리 전체를 삭제한다.**
 > 작성: 2026-10-01 · 기준: `main` (`1f3af0b` 이후), 커널 `v7.3-rc5` + 새 시리즈(0001~0003), syzkaller 0001~0018
 
+> **진행 상황 (2026-10-02): Phase 1(6절) 구현 완료, 호스트 검증만 통과, 아직 `main`에 병합 안 함.**
+> `tools/nfs-proxy/src/edit.{c,h}`(새 모듈), `control.c`의 arm v2 디코드·적용·체이닝, 프록시 arm v2
+> 패킷(`NFSPARM2`)과 delta v2(`NFSPDLT2`), syzkaller 패치 `0019`(`syz_arm_nfs_proxy_v2`). `tools/nfs-proxy/build.sh`
+> 전체(클랑 + gcc ASan/UBSan, `test_edit` 추가)와 syzkaller `go test ./sys/linux/...` 통과. **8절의 게스트
+> 검증은 하지 않았다** — lane 귀속이 길이 변경 편집에서 유지되는지, 실제 게스트에서 OP_APPEND/INSERT/DELETE/REPLACE가
+> 적용되는지는 미확인. 삭제 조건 1~5는 아직 하나도 충족되지 않았다(아래 조건 그대로 유효). 다음 단계와 남은 미검증
+> 항목은 세션 보고(완료 보고)를 참조.
+
 ## 0. 이 문서의 성격과 삭제 조건
 
 이 문서는 대화 컨텍스트가 길어져 새 세션에서 구현을 이어 가기 위해 만든 **작업 지시서**다. 설계의 영구 기록이 아니다.

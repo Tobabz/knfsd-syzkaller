@@ -192,13 +192,28 @@ static int feed(struct state *s, struct conn *c, int dir,
 			int rc = nfsp_framing_peek(f, &len, NULL, NULL);
 			if (rc < 0) goto bad_frame;
 			if (rc == 0) break;
+			const uint8_t *fwd = f->buf;
+			size_t fwd_len = len;
+			/* Default: forward the record exactly as received.  The callback
+			 * may redirect to a rebuilt record of a different length; framing
+			 * is consumed by the ORIGINAL length either way, since that is
+			 * what was read. */
 			if (s->cfg->on_record != NULL &&
-			    s->cfg->on_record(c->client, c->backend, dir,
-					      f->buf, len, s->cfg->on_record_arg) != 0) {
+			    s->cfg->on_record(c->client, c->backend, dir, f->buf, len,
+					      &fwd, &fwd_len, s->cfg->on_record_arg) != 0) {
 				s->stats->mutation_errors++;
 				return -1;
 			}
-			if (enqueue(q, f->buf, len, ceiling + NFSP_READ_CHUNK) != 0) {
+			/* A rebuilt record must still be a whole, in-bounds record.
+			 * Anything else would put bytes on the wire the peer cannot
+			 * frame, so it is a mutation error and closes only this
+			 * connection. */
+			if (fwd == NULL || fwd_len < NFSP_FRAG_HEADER_LEN ||
+			    fwd_len > ceiling) {
+				s->stats->mutation_errors++;
+				return -1;
+			}
+			if (enqueue(q, fwd, fwd_len, ceiling + NFSP_READ_CHUNK) != 0) {
 				s->stats->relay_errors++;
 				return -1;
 			}
