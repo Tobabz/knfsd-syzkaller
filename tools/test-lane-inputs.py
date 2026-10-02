@@ -64,6 +64,23 @@ with tempfile.TemporaryDirectory() as directory:
         assert args.boot_fixture == ROOT / "bundle/lane/boot-fixture.sh"
         assert args.service == ROOT / "bundle/lane/fixture.service"
 
+    manager = work / "manager.cfg"
+    live = work / "manager-live.cfg"
+    manager.write_text(json.dumps({"type": "qemu", "workdir": str(work / "workdir"),
+                                   "vm": {"cmdline": "nfs.localio_enabled=N"}}))
+    subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                    str(manager), str(live), "--minor", "2", "--image", str(proxy)],
+                   check=True,
+                   capture_output=True)
+    prepared = json.loads(live.read_text())
+    lane_bytes = (ROOT / "bundle/lane/lane.sh").read_bytes()
+    lane_sha = hashlib.sha256(lane_bytes).hexdigest()
+    assert (Path(prepared["workdir_template"]) / "lane.sh").read_bytes() == lane_bytes
+    assert "path={{TEMPLATE}}" in prepared["vm"]["qemu_args"]
+    assert "koov.nfs_minor=2" in prepared["vm"]["cmdline"]
+    assert "koov.lane_sha256=" + lane_sha in prepared["vm"]["cmdline"]
+    assert prepared["image"] == str(proxy.resolve())
+
 # --skip-build must fail before deleting an incomplete existing checkout.
 with tempfile.TemporaryDirectory() as directory:
     work = Path(directory)

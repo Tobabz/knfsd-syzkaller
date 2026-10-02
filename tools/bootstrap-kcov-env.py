@@ -21,7 +21,7 @@ TARGET_DIR layout:
   build/<variant>/              out-of-tree kernel build (disposable)
   images/<variant>/bzImage      run-time kernel image
   images/<variant>/vmlinux      symbol source for coverage symbolization
-  images/bookworm-kcov-fresh-vN.qcow2 (+ .json)   baked VM image, shared
+  images/bookworm-kcov-fresh.qcow2 (+ .json)   version-neutral VM image
   manifest.json
 
 Usage (all paths explicit, no host defaults besides REPO auto-detect):
@@ -412,7 +412,7 @@ def reusable_image(args, image_out):
     """The baked image's manifest when it was made from exactly today's inputs, else None.
 
     The image is booted with -kernel, so a new kernel alone never needs a re-bake;
-    only a change of the base image, lane fixture, service, deps or NFS minor does.
+    only a change of the base image, boot wrapper, service or deps does.
     """
     meta_path = image_out.with_suffix(".json")
     if not (args.update and image_out.is_file() and meta_path.is_file()):
@@ -423,8 +423,6 @@ def reusable_image(args, image_out):
         return None
     inputs = {
         "base_sha256": sha256(args.base_image),
-        "nfs_minor": args.minor,
-        "lane_script_sha256": sha256(LANE / "lane.sh"),
         "boot_fixture_sha256": sha256(LANE / "boot-fixture.sh"),
         "service_sha256": sha256(LANE / "fixture.service"),
         "deps_tar_sha256": sha256(args.deps_tar),
@@ -456,7 +454,7 @@ def stage_bake(args, bzimage, image_out):
 
 
 class VM:
-    def __init__(self, image, kernel, ssh_key, boot_timeout):
+    def __init__(self, image, kernel, ssh_key, boot_timeout, minor):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             self.ssh_port = reservation.getsockname()[1]
@@ -469,16 +467,21 @@ class VM:
         self.scp = ["scp", "-O", *common, "-P", str(self.ssh_port)]
         self.image, self.kernel = image, kernel
         self.boot_timeout = boot_timeout
+        self.minor = minor
         self.process = None
 
     def start(self):
         cmd = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
                "-m", "4096", "-smp", "4", "-display", "none",
                "-serial", "none", "-no-reboot", "-snapshot",
+               "-fsdev", "local,id=koov_lane,path=%s,security_model=none,readonly=on"
+               % LANE,
+               "-device", "virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane",
                "-drive", "file=%s,format=qcow2,if=ide" % self.image,
                "-kernel", str(self.kernel),
                "-append", "root=/dev/sda console=ttyS0 nokaslr "
-               "nfs.localio_enabled=N",
+               "nfs.localio_enabled=N koov.nfs_minor=%s koov.lane_sha256=%s"
+               % (self.minor, sha256(LANE / "lane.sh")),
                "-device", "e1000,netdev=net0",
                "-netdev", "user,id=net0,restrict=on,"
                "hostfwd=tcp:127.0.0.1:%d-:22" % self.ssh_port]
@@ -570,7 +573,7 @@ def detect_mem_sanitizer(vm, config_path):
 
 def stage_verify_variant(args, image, variant, bzimage):
     started = time.monotonic()
-    vm = VM(image, bzimage, args.ssh_key, args.boot_timeout)
+    vm = VM(image, bzimage, args.ssh_key, args.boot_timeout, args.minor)
     try:
         vm.start()
         state = vm.guest("systemctl is-active frozen-phase9-fixture.service",
@@ -580,17 +583,24 @@ def stage_verify_variant(args, image, variant, bzimage):
         root = vm.guest("ls -d /tmp/frozen-phase9.manager",
                         timeout=30).strip()
         lanes = vm.guest(
-            "NFS_MINOR_VERSION=%s /opt/frozen-phase9/lane.sh status %s"
+            "NFS_MINOR_VERSION=%s /run/frozen-phase9/lane.sh status %s"
             % (args.minor, root), timeout=90)
-        if int(json.loads(lanes).get("lane_count", 0)) < 1:
-            raise RuntimeError("no lanes reported")
+        lane_status = json.loads(lanes)
+        if int(lane_status.get("lane_count", 0)) < 1 or \
+                int(lane_status.get("nfs_minor", -1)) != int(args.minor):
+            raise RuntimeError("lane status or NFS minor does not match")
+        guest_lane_sha = vm.guest("sha256sum /run/frozen-phase9/lane.sh").split()[0]
+        if guest_lane_sha != sha256(LANE / "lane.sh"):
+            raise RuntimeError("guest lane script differs from the host source")
         sanitizer = detect_mem_sanitizer(
             vm, image_dir(args, variant) / ".config")
         if sanitizer != variant:
             raise RuntimeError("variant %s booted a %s kernel"
                                % (variant, sanitizer))
         return {"fixture_root": root,
-                "lane_count": int(json.loads(lanes)["lane_count"]),
+                "lane_count": int(lane_status["lane_count"]),
+                "nfs_minor": int(lane_status["nfs_minor"]),
+                "lane_script_sha256": guest_lane_sha,
                 "mem_sanitizer": sanitizer,
                 "target_kasan": sanitizer == "kasan",
                 "target_kcsan": sanitizer == "kcsan",
@@ -630,8 +640,7 @@ def main(argv=None):
     try:
         kernels, kernel_rebuilt = stage_kernel(args, manifest, kernel_reuse)
         syz = stage_syzkaller(args, manifest, syz_reuse)
-        image_out = args.target / "images" / ("bookworm-kcov-fresh-v%s.qcow2"
-                                              % args.minor)
+        image_out = args.target / "images" / "bookworm-kcov-fresh.qcow2"
         image_out.parent.mkdir(parents=True, exist_ok=True)
         with timed(manifest, "bake"):
             reused = reusable_image(args, image_out)

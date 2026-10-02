@@ -141,7 +141,15 @@ inputs are unchanged. To follow a new kernel release first run
 ## Fuzzing after bootstrap
 
 Point a stock syz-manager at the outputs: `kernel` = `<target>/images/<variant>/bzImage`,
-`kernel_obj` = the directory holding `vmlinux`, `image` = `<target>/images/bookworm-kcov-fresh-v2.qcow2`,
+`kernel_obj` = the directory holding `vmlinux`, `image` = `<target>/images/bookworm-kcov-fresh.qcow2`,
 `sshkey` = the generated `artifacts/bookworm.id_rsa`, `procs` = the fixture's lane count (4), and
 `experimental.remote_cover` to switch remote coverage. The earlier A/B harness was removed in
-commit `7833ed3`.
+commit `7833ed3`. Before starting the manager, run `tools/prepare-live-lane-config.py`
+on its base config to add the hash-pinned host lane script share and select minor 1 or 2.
+
+Use separate manager configs, workdirs and `corpus.db` files for knfsd and
+Ganesha, running one manager at a time. Initialize each DB from only its backend's
+seed and keep the corpora separate on resume. Set `experimental.remote_cover=true`
+for knfsd and `false` for Ganesha (local client-kernel feedback only).
+The combined DBs have been removed; current commands and validation limits are in
+the [corpus execution guide](corpus/nfs-normal/README.md#execution-scope-2026-10-02).

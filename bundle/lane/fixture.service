@@ -7,8 +7,8 @@ Before=ssh.service
 [Service]
 Type=oneshot
 ExecStart=/opt/frozen-phase9/boot-fixture.sh
-ExecStartPost=/opt/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager
-ExecStop=/opt/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.manager
+ExecStartPost=/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager
+ExecStop=/run/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.manager
 RemainAfterExit=yes
 TimeoutStartSec=180
 TimeoutStopSec=120

@@ -15,9 +15,9 @@ comes up and that the kernel carries the expected memory sanitizer.
 |---|---|
 | Instrumentation | KCOV + KASAN/KCSAN boot kernels, built **out of tree** from one patched source tree |
 | Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path. Ownership is lane-scoped (kernel 0002): every request that reaches lane N's server counts for the program proc N is running, so attribution survives the NFS wire relay |
-| Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the baked fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count |
-| NFS version | `--minor 1\|2` selects the mount version for both knfsd and Ganesha (recorded in the image manifest) |
-| Boot model | Kernel is injected **outside the image** (`-kernel`), so one baked image serves both sanitizer kernels |
+| Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the boot fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count |
+| NFS version | `koov.nfs_minor=1\|2` in `vm.cmdline` selects the mount version for both backends at boot |
+| Boot model | One version-neutral image serves both sanitizer kernels; the lane script is copied from a read-only host 9P share at each VM boot |
 | Seeds | `bundle/corpus/nfs-normal/` — normal-flow syzkaller programs plus a manifest; run them with a stock syz-manager (remote coverage is the `experimental.remote_cover` setting) |
 
 The image uses `bundle/lane/lane.sh` for both NFS minor versions. Its default `SERVER_IMPL=both`
@@ -30,18 +30,23 @@ The v4.1 and v4.2 images passed four-mount cross-client reads and writes,
 a direct Ganesha mount, and cleanup. Build and guest-check commands are in
 [tools/README.md](tools/README.md).
 
-The current `env/manifest.json` selects the V15.6 v4.2 image at
-`env/images/bookworm-kcov-fresh-v2.qcow2` and records KASAN/KCSAN boot checks.
-The V15.6 v4.1 image is `env/images/bookworm-kcov-v41-ganesha-v15.6.qcow2`.
+The reusable image is `env/images/bookworm-kcov-fresh.qcow2`. The earlier
+V15.6 v4.1/v4.2 image names in historical evidence refer to the baked-script
+configuration used for those runs.
 An earlier KASAN snapshot run of the 11-call COPY seed returned 32 MiB and collected a
 nonempty remote `.extra`; the v4.1 knfsd and Ganesha seeds each passed 34 calls
-in separate KASAN snapshots. The two basic seeds also passed syz-manager
-`corpus-triage` admission and a bounded single-manager fuzzing smoke with both
-backend paths retained in the corpus. See `bundle/corpus/nfs-normal/README.md` for limits
-and evidence paths.
-Point a new syz-manager config's `image` field at the V15.6 image for the
-selected minor version. Existing cache configs are historical and may still
-reference the older image.
+in separate KASAN snapshots. Current fuzzing uses a separate syz-manager,
+workdir and `corpus.db` for each backend, running one backend at a time. Each
+manager starts from its own basic seed; the former combined DBs have been removed.
+The separate managers completed `corpus-triage` with 100 knfsd and 109 Ganesha
+programs, with no opposite-backend path literals found in either saved corpus.
+See the [corpus execution guide](bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)
+for resume commands, evidence and limits.
+
+New configs use the reusable image. The validated separate v4.1 cache configs
+still pin `bookworm-kcov-v41-ganesha-v15.6.qcow2`, which contains its lane script.
+To use the reusable image instead, prepare each config with the helper in step 3;
+changing only the image filename does not supply the required host lane script.
 
 The corpus objective is to cover thread-execution flows reachable through normal NFS scenarios; see
 [scope and completion criteria](report/normal-flow-corpus.md).
@@ -101,8 +106,8 @@ python3 tools/bootstrap-kcov-env.py env \
 | `--variant kasan\|kcsan` (optional, repeatable) | Sanitizer kernels to build and verify; default: both |
 | `--jobs N` (optional) | Parallel build jobs |
 
-- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (3+18) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the bootable VM image once (`bookworm-kcov-fresh-v2.qcow2`, shared by all variants) → boot every variant and verify lane status
-- **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` and `.config` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh-v2.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records the kernel ref and resolved commit, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated.
+- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (3+18) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the version-neutral VM image once (`bookworm-kcov-fresh.qcow2`) → boot every variant with the host lane script and verify its hash and lane status
+- **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` and `.config` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records the kernel ref and resolved commit, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated.
 
 ### 3. Using the result with syz-manager
 
@@ -111,10 +116,59 @@ No runner is provided: point a syz-manager config at the outputs of step 2.
 | syz-manager setting | Value |
 |---|---|
 | `kernel` / `kernel_obj` | `env/images/<variant>/bzImage` / the directory holding `vmlinux` |
-| `image`, `sshkey` | `env/images/bookworm-kcov-fresh-v2.qcow2`, `artifacts/bookworm.id_rsa` |
+| `image`, `sshkey` | `env/images/bookworm-kcov-fresh.qcow2`, `artifacts/bookworm.id_rsa` |
 | `procs` | the fixture's lane count (4) |
-| `experimental.remote_cover` | on/off switch for remote coverage |
-| `vm.cmdline` | must include `nfs.localio_enabled=N` (the baked lane fixture refuses to start otherwise, so no lane exists and fuzzing never reaches NFS); bootstrap and the baker pass it the same way. `sunrpc.lane_attribution=0` switches to request-level attribution for comparison runs |
+| `workdir`, `http` | distinct for knfsd and Ganesha; each workdir owns its own `corpus.db` |
+| `experimental.remote_cover` | `true` for knfsd; `false` for Ganesha, whose current feedback is local client-kernel coverage |
+| `vm.cmdline` | must include `nfs.localio_enabled=N`; the helper below adds `koov.nfs_minor` and the expected lane-script SHA-256. `sunrpc.lane_attribution=0` switches to request-level attribution for comparison runs |
+
+Create one base config per backend with distinct `workdir` and `http` values.
+Initialize each new workdir's DB from only that backend's seed: knfsd uses
+`basic-v41-tcp.prog`, Ganesha uses `basic-v41-ganesha-tcp.prog`.
+Do not pack the whole seed directory into both DBs, merge the DBs, or share a
+corpus hub between these campaigns. Keep existing DBs when resuming.
+
+For the reusable image, freeze the host script and add the read-only 9P device
+to each config separately; the helper preserves its backend-specific workdir
+and coverage settings:
+
+```sh
+python3 tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-v41.cfg --minor 1
+python3 tools/prepare-live-lane-config.py manager-ganesha-base.cfg manager-ganesha-v41.cfg --minor 1
+```
+
+Run one backend at a time. Start knfsd with:
+
+```sh
+env/syzkaller/bin/syz-manager -config manager-knfsd-v41.cfg -mode fuzzing
+```
+
+After stopping it and waiting for shutdown, run Ganesha:
+
+```sh
+env/syzkaller/bin/syz-manager -config manager-ganesha-v41.cfg -mode fuzzing
+```
+
+The [existing local campaign commands](bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)
+use the already validated separate configs. Corpus separation prevents splicing
+between backend corpora; it does not preserve seed paths or disable minimization.
+The fixture still exposes both backends, so this is not a strict execution filter.
+
+Use `--minor 2` for a v4.2 campaign. The helper leaves the input config alone,
+copies `bundle/lane/lane.sh` to a hash-named `workdir_template`, and pins that
+hash in the guest boot arguments. Each VM copies the script once into `/run`;
+setup, status and cleanup use that same copy. Changing `lane.sh` requires a new
+prepared config, **not** a new image. The host share is read-only and is unmounted
+after the copy. A missing share or wrong hash fails the fixture at boot.
+
+For version comparisons, mount only the selected version in each VM. Extra
+NFSv4 mounts establish client/server state and can issue lease-renewal traffic
+even when no seed opens their paths; concurrent mounts can also change cache
+behavior. A run with all versions mounted is a valid, separate topology if it
+is held constant across repeats, but it is not equivalent to a single-version
+run. This matters especially here because remote coverage is lane-scoped.
+See [NFSv4.1 lease renewal](https://www.rfc-editor.org/rfc/rfc8881.html#section-8.3)
+and [Linux NFS mount caching](https://man7.org/linux/man-pages/man5/nfs.5.html).
 
 ### 4. Moving to a newer kernel
 
@@ -125,14 +179,14 @@ python3 tools/bootstrap-kcov-env.py env ... --update
 
 `bump-kernel.py` applies the kernel series to a shallow clone of the tag. If it applies, `bundle/patches/BASE` moves to that tag and the patch files stay as they are. If it conflicts, the clone is left in the middle of `git am`: resolve it with git (edit, `git add`, `git am --continue`), then run `python3 tools/bump-kernel.py --export <clone>` to write the rebased series back and update `BASE`. Resolutions are remembered (git rerere) in `cache/rr-cache-kernel` and replayed on the next release.
 
-Re-running bootstrap with `--update` rebuilds both kernels and syzkaller into the same `env/`, so only the latest kernel images are kept. The baked VM image does not depend on the kernel (it is booted with `-kernel`); it is reused when the base image, lane fixture, service, deps and NFS minor are unchanged, and re-baked otherwise. Every variant is booted and verified again against the new kernel. A failed run keeps the previous images and `manifest.json` and records the failure in `manifest.failed.json`. `manifest.json` also records the seconds each stage took (`timing_seconds`) and which axis the run moved (`changes.axis`: `kernel-release`, `scenario`, `both`, `none`, `first-run` or `unknown`); `tools/README.md` explains when syzkaller must be rebuilt.
+Re-running bootstrap with `--update` rebuilds both kernels and syzkaller into the same `env/`, so only the latest kernel images are kept. The VM image does not depend on the kernel, lane script or selected minor; it is reused when the base image, boot wrapper, service and guest dependencies are unchanged. Every variant is booted with the current host script and checked again. A failed run keeps the previous images and `manifest.json` and records the failure in `manifest.failed.json`. `manifest.json` also records the seconds each stage took (`timing_seconds`) and which axis the run moved (`changes.axis`: `kernel-release`, `scenario`, `both`, `none`, `first-run` or `unknown`); `tools/README.md` explains when syzkaller must be rebuilt.
 
 ## Command summary
 
 | Stage | Command | Input → Output |
 |---|---|---|
 | Base image | `sudo bash tools/make-base-image.sh --out artifacts` | sudo + debootstrap → `artifacts/bookworm-base.img` + keypair |
-| Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 2` | base · key · deps + upstream → `env/` (per-variant kernel images, binaries, image, manifest) |
+| Bootstrap | `python3 tools/bootstrap-kcov-env.py env --base-image ... --ssh-key ... --deps-tar ... --minor 2` | base · key · deps + upstream → `env/` (per-variant kernel images, binaries, shared image, manifest); `--minor` selects the verification boot only |
 | New kernel | `python3 tools/bump-kernel.py latest` then bootstrap with `--update` | newest release/rc tag → `bundle/patches/BASE` + rebuilt kernel images |
 
 ## Repository layout

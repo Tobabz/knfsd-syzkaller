@@ -1,12 +1,12 @@
 #!/bin/sh
-# The NFS lane fixture: the single lane script baked into the image.
+# The NFS lane fixture: copied from the host into /run at guest boot.
+# The boot wrapper checks the copy against the run's expected SHA-256.
 #
 # Every lane has one knfsd and one NFS-Ganesha behind a wire relay (nfs-proxy),
 # and two client namespaces that mount both.  Variants are selected by
-# environment variables, never by a copy of this file.  The image baker sets
-# NFS_MINOR_VERSION in the fixture service's drop-in; everything else keeps the
-# default.  This file runs as the boot fixture's lane.sh and must not stop that
-# service itself.
+# environment variables, never by a copy of this file.  boot-fixture.sh reads
+# the minor version from the VM kernel command line.  This file runs from its
+# per-VM copy and must not stop the fixture service itself.
 #
 #   KOOV_TMPFS_SIZE   bound the per-lane tmpfs (default 256m).  The original
 #                     mounts it with no size=, so a runaway corpus program

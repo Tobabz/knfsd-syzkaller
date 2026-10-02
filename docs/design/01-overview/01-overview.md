@@ -79,29 +79,46 @@ Ganesha는 `client0-ganesha`·`client1-ganesha` 경로로 선택한다. 두 서�
 
 ### 서버별 실행 결정 (2026-10-02)
 
-**결정됨.** knfsd와 Ganesha는 서로 다른 34호출 시드를 하나의 syz-manager corpus에
-넣어 퍼징한다. 각 시드의 두 클라이언트는 같은 서버의 export를 사용한다.
-`basic-v41-tcp.prog`는 기본 knfsd 경로를, `basic-v41-ganesha-tcp.prog`는 명시적
-Ganesha 경로를 쓴다. 기능 오라클 확인은 서버별 스냅샷에서 따로 수행했다.
+**결정됨.** knfsd와 Ganesha는 syz-manager 설정, workdir, `corpus.db`를 각각
+분리하고 한 번에 한 서버씩 퍼징한다. knfsd DB는 `basic-v41-tcp.prog`,
+Ganesha DB는 `basic-v41-ganesha-tcp.prog` 하나로 초기화했다. 각 시드의 두
+클라이언트는 같은 서버의 export를 사용한다. DB를 병합하거나 두 캠페인에
+공유 corpus hub를 연결하지 않는다.
 
-34개 호출을 두 번 붙인 통합안은 채택하지 않는다. 고정된 syzkaller의 `prog.MaxCalls`는 40이며
-`pkg/manager/seeds.go`의 `parseProg`가 초과 입력을 거부한다. 일반 변이와 최소화도 두 서버
-구간의 동일성이나 보존을 보장하지 않는다. 자동으로 양쪽에 같은 입력을 재실행하는 기능은 없다.
+```text
+knfsd manager   -> knfsd/workdir/corpus.db   -> client0         <-> client1
+Ganesha manager -> ganesha/workdir/corpus.db -> client0-ganesha <-> client1-ganesha
+                  (한 번에 한 manager 실행)
+```
 
-**후속 계획.** 동일 시나리오의 실행 대상을 프록시에서 선택·관리하는 라우팅 확장은 추후 설계와
-구현으로 남긴다. 기존의 고정 중계 경로와 구분하며, 실행 중인 NFS 세션을 다른 서버로 바꾸거나
-요청을 양쪽에 복제하는 기능을 지원한다고 간주하지 않는다. 서버별 상태 격리와 결과 구분은
-후속 설계에서 검토한다. 처리량 이득은 미검증이다. 2026-10-02 현재 KASAN v4.1
-이미지에서 knfsd와 Ganesha가 각각 34개 호출의 errno 오라클을 단회 통과했다.
-knfsd의 raw `.extra`에는 77,314개 PC 레코드와 1,581개의 서로 다른 `fs/nfsd`
-소스 위치가 있고, Ganesha에는 로컬 클라이언트 커널 커버리지 파일만 있다.
-두 시드는 syz-manager의 `corpus.db`에 수용되어 `corpus-triage`가 종료 코드 0으로
-끝났다. 3분 제한 단일 매니저 퍼징은 파일 연산 syscall만 활성화한 설정에서 크래시
-없이 7,791회를 실행했고, 두 시드의 정규화된 34호출 프로그램을 corpus에 유지했다.
-근거는 `cache/backend-current-v41-20261002/{knfsd,ganesha}/result.json`,
-`cache/manager-corpus-v41-20261002/result.json`,
-`cache/manager-unified-v41-20261002/{focused-smoke,corpus-inspection}.json`이다. Ganesha 사용자 공간 커버리지와
-요청별 RPC handoff는 이 실행에서 확인하지 않았다.
+현재 로컬 설정은 `cache/manager-separated-v41-20261002/{knfsd,ganesha}/manager.cfg`다.
+두 설정은 `procs=4`, KASAN v4.1 스냅샷 VM 하나와 파일 연산 syscall 범위를 사용한다.
+`experimental.remote_cover`는 knfsd에서 `true`, Ganesha에서 `false`다.
+Ganesha 피드백은 로컬 클라이언트 커널 KCOV이며 사용자 공간 서버 내부 커버리지가 아니다.
+실행 명령과 이미지 준비 방식은
+[코퍼스 운영 문서](../../../bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)를 따른다.
+
+분리 검증의 `corpus-triage`는 양쪽 모두 종료 코드 0으로 끝났다. 저장된 knfsd
+프로그램 100개와 Ganesha 프로그램 109개에서 상대 서버 경로 문자열은 발견되지 않았다.
+기대 경로 문자열이 없는 프로그램은 각각 78개와 89개다. 근거는 분리 캠페인 디렉터리의
+각 `triage.log`, `triage-unpacked/`, 루트의 `maintenance.json`이다.
+
+이 분리는 서로 다른 서버의 코퍼스에서 프로그램을 가져와 splice하는 문제를 막는다.
+일반 생성·경로 변이·최소화는 계속 적용되며, 게스트에는 두 서버의 마운트가 모두 있으므로
+다른 서버 경로의 생성이나 실행까지 강제 차단하지는 않는다. 경로 문자열이 없다는
+사실만으로 NFS 미실행을 단정할 수도 없다. 서버 간 동일 변이와 자동 재실행은 보장하지 않는다.
+
+기존 단일 매니저 통합 운영은 폐기했다.
+`cache/manager-unified-v41-20261002/{workdir,workdir-focused}/corpus.db`와
+`cache/manager-corpus-v41-20261002/{workdir,workdir-four}/corpus.db`는 삭제했다.
+기존 설정과 로그는 과거 실험 기록이며 현재 실행에 사용하지 않는다.
+34호출을 두 번 붙이는 통합안도 채택하지 않는다. 고정된 syzkaller의
+`prog.MaxCalls`는 40이며 초과 입력은 매니저가 거부한다.
+
+**후속 계획.** 동일 시나리오의 실행 대상을 프록시에서 선택·관리하는 라우팅 확장은
+추후 설계와 구현으로 남긴다. 현재 프록시는 고정 중계 경로를 유지한다.
+실행 중인 NFS 세션의 서버 전환이나 양쪽 요청 복제 기능은 구현되어 있지 않다.
+서버별 상태 격리, 결과 구분과 처리량 이득은 후속 검토 대상이다.
 
 ### 판정 논리
 

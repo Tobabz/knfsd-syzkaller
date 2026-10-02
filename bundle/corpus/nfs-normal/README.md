@@ -13,11 +13,14 @@ transport, guest setup, functional oracle, current execution status, exclusions,
 
 Paths to files inside this repository, here and in `manifest.json`, are relative to the
 repository root. The kernel/image environment is `env/` (`env/images/<variant>/{bzImage,vmlinux}`,
-`env/images/bookworm-kcov-fresh-v2.qcow2`, `env/syzkaller`).
+`env/images/bookworm-kcov-fresh.qcow2`, `env/syzkaller`).
 
-Guest setup comes from the baked image: `frozen-phase9-fixture.service` runs
-`lane.sh setup /tmp/frozen-phase9.manager 4` at boot, with the NFS minor version chosen by
-`bootstrap --minor N`. Run syz-manager with `procs` equal to that lane count (4).
+Guest setup uses the baked boot service and a host lane script copied through a
+read-only 9P share: `frozen-phase9-fixture.service` runs
+`lane.sh setup /tmp/frozen-phase9.manager 4` at boot. The manager config pins
+the script hash and selects the NFS minor in `vm.cmdline`; prepare it with
+`tools/prepare-live-lane-config.py`. Run syz-manager with `procs` equal to the
+lane count (4).
 The default fixture routes every mount through the relay. `nfs-lane/client0` and
 `nfs-lane/client1` remain two clients of the same knfsd export; Ganesha uses the
 explicit `client0-ganesha` and `client1-ganesha` paths. The corpus contains four
@@ -37,43 +40,95 @@ establish repeatability or a server-side RPC handoff trace.
 
 ## Execution scope (2026-10-02)
 
-Use one syz-manager corpus with two separate 34-call inputs for v4.1 fuzzing.
-The knfsd input uses the default client pair; `basic-v41-ganesha-tcp.prog`
-uses the explicit Ganesha client pair. Each input keeps both clients on one
-backend. The original functional checks ran the two inputs sequentially in
-separate KASAN v4.1 VM snapshots. A shared manager does not provide paired
-replay or identical mutations across backends. The four-mount guest check
-passed on both current v4.1 and v4.2 images, including the default aliases
-and backend isolation (`cache/four-mount-check-20261002/result.json`).
+Run knfsd and Ganesha as separate campaigns, one backend at a time. Each has
+its own syz-manager config, workdir and `corpus.db`. Initialize a new DB from
+only its backend's canonical 34-call seed; resume an existing DB without
+repacking it. Do not merge these DBs, import the former combined corpus, or
+connect the campaigns to a shared corpus hub.
 
-The combined 34+34-call draft was withdrawn: the pinned manager rejects programs
-with more than 40 calls. Both separate 34-call inputs were packed into an isolated
-`corpus.db`; syz-manager admitted both records and completed `corpus-triage`
-with `procs=4` (exit 0). The manager may minimize inputs during fuzzing, so this admission
-does not guarantee that an unmodified 34-call oracle remains in the output corpus.
-Evidence: `cache/manager-corpus-v41-20261002/result.json` and `manager.log`.
-For the first bounded fuzzing run, pack only these two basic inputs into one
-`corpus.db` and use one manager with `procs=4`, the KASAN v4.1 image,
-`experimental.remote_cover=true`, and `enable_syscalls` limited to
-`open$dir`, `openat`, `getdents64`, `close`, `write`, `fsync`, `statx`,
-`lseek`, `read`, `flock`, `renameat2`, and `unlinkat`. The local configuration
-is `cache/manager-unified-v41-20261002/manager-focused.cfg`. Resume its
-corpus with:
+| Backend | Initial seed | Client paths under `nfs-lane/` | `experimental.remote_cover` | Local HTTP endpoint |
+| --- | --- | --- | --- | --- |
+| knfsd | `basic-v41-tcp.prog` | `client0`, `client1` | `true` | `127.0.0.1:56753` |
+| Ganesha | `basic-v41-ganesha-tcp.prog` | `client0-ganesha`, `client1-ganesha` | `false` | `127.0.0.1:56754` |
 
-```sh
-env/syzkaller/bin/syz-manager -config cache/manager-unified-v41-20261002/manager-focused.cfg -mode fuzzing
+The current local campaigns are stored as:
+
+```text
+cache/manager-separated-v41-20261002/
++-- knfsd/
+|   +-- manager.cfg
+|   +-- inputs/basic-v41-tcp.prog
+|   +-- workdir/corpus.db
+|   +-- triage.log
++-- ganesha/
+    +-- manager.cfg
+    +-- inputs/basic-v41-ganesha-tcp.prog
+    +-- workdir/corpus.db
+    +-- triage.log
 ```
 
-A 180-second smoke completed 7,791 executions without a recorded crash or fatal error.
-The saved corpus retained both canonical 34-call seeds and additional programs
-using each backend path (`focused-smoke.json`, `corpus-inspection.json`).
-This is a bounded check, not evidence of long-run stability or equivalent
-server-side coverage. An earlier unrestricted manager run reported two fixed
-lane executor hangs; its crash logs show non-NFS programs near the failures.
-Evidence is in `fuzz-smoke.log` and the matching `workdir/crashes/` directory.
+From the repository root, resume knfsd with:
 
-Proxy-managed backend selection is deferred; the existing fixed relay paths
-remain in place. See the [design decision](../../../docs/design/01-overview/01-overview.md#backend-execution-decision).
+```sh
+env/syzkaller/bin/syz-manager -config cache/manager-separated-v41-20261002/knfsd/manager.cfg -mode fuzzing
+```
+
+Stop that manager and wait for shutdown before starting Ganesha:
+
+```sh
+env/syzkaller/bin/syz-manager -config cache/manager-separated-v41-20261002/ganesha/manager.cfg -mode fuzzing
+```
+
+Each local config uses `procs=4`, one KASAN VM snapshot, `cover=true`,
+`cover_edges=true`, and `reproduce=false`. Enabled syscalls are
+`open$dir`, `openat`, `getdents64`, `close`, `write`, `fsync`,
+`statx`, `lseek`, `read`, `flock`, `renameat2`, and `unlinkat`.
+Ganesha's current coverage feedback is from the local client kernel, not
+Ganesha user-space code.
+
+These validated configs pin the baked-script V15.6 v4.1 image
+`env/images/bookworm-kcov-v41-ganesha-v15.6.qcow2`. For the reusable
+`bookworm-kcov-fresh.qcow2` image, prepare each backend's config separately
+with `tools/prepare-live-lane-config.py --minor 1`, as described in the
+[root usage guide](../../../README.md#3-using-the-result-with-syz-manager).
+The helper preserves the workdir and coverage settings. Changing only the
+image path is insufficient for the reusable image's host-script boot model.
+The cache configs and DBs are local artifacts, not committed repository assets.
+
+Both separate managers completed `corpus-triage` with exit 0 and are stopped
+after validation. The saved DBs were unpacked and checked for backend path
+literals:
+
+| Saved corpus | Programs | Own backend path | Opposite backend path | Both backend paths | Neither expected path |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| knfsd | 100 | 22 | 0 | 0 | 78 |
+| Ganesha | 109 | 20 | 0 | 0 | 89 |
+
+Evidence: `cache/manager-separated-v41-20261002/{knfsd,ganesha}/triage.log`,
+the corresponding `triage-unpacked/` directories, and `maintenance.json`
+in the campaign root. These are bounded corpus checks, not proof that every
+program reaches NFS or that long runs retain this distribution.
+
+Separate managers do not splice programs from each other's corpus. Ordinary
+generation, path mutation and minimization remain enabled: calls or paths may
+disappear, and another path can still be generated. The fixture still exposes
+both backend mount pairs, so separation does not enforce backend-only execution.
+An absent path literal alone does not prove that a program cannot reach NFS.
+The two campaigns also do not produce identical mutations or paired replay.
+
+The earlier shared-manager experiment is retired. Its two runtime DBs under
+`cache/manager-unified-v41-20261002/{workdir,workdir-focused}/corpus.db` and
+two admission-test DBs under
+`cache/manager-corpus-v41-20261002/{workdir,workdir-four}/corpus.db`
+were deleted on 2026-10-02. Their configs and logs remain historical evidence;
+do not resume those configs or repack their combined inputs. The initial
+180-second shared-manager smoke recorded 7,791 executions, but subsequent
+inspection found mixed-backend programs; it is not the current operating model.
+
+The combined 34+34-call draft remains withdrawn because the pinned manager
+rejects programs over 40 calls. Proxy-managed backend selection is deferred;
+the existing fixed relay paths remain in place. See the
+[design decision](../../../docs/design/01-overview/01-overview.md#backend-execution-decision).
 
 ## Intended scenarios -> corpus contract
 
@@ -148,12 +203,12 @@ are stored in `manifest.json`. The 2026-10-02 run evidence is under
 `cache/backend-current-v41-20261002/{knfsd,ganesha}` and
 `cache/backend-current-v42-20261002/copy`. Those runs used earlier images that have since been removed. Each used a
 QEMU snapshot with one syz-execprog execution and `-threaded=false`.
-The current V15.6 v4.2 image is `env/images/bookworm-kcov-fresh-v2.qcow2`. B05 remains byte-identical to its historical
+The current reusable V15.6 image is `env/images/bookworm-kcov-fresh.qcow2`. B05 remains byte-identical to its historical
 input. Its default-mode acceptance is the compatibility contract; strict mode
 rejects the legacy offset strings and is intentionally not made green by an
 untested behavioral rewrite.
 
-Ganesha V15.6 검증에서는 `basic-v41-ganesha-tcp.prog`를 현재 v4.2 이미지
+Ganesha V15.6의 이전 검증에서는 `basic-v41-ganesha-tcp.prog`를 당시 v4.2 이미지
 `env/images/bookworm-kcov-fresh-v2.qcow2`에서 다시 실행했다.
 파일명은 기존 v4.1 시드의 이름을 유지하지만, 이번 실행의 두 Ganesha 마운트는
 v4.2이다. 34개 호출이 모두 완료됐고 14번 호출의 기대 errno 11을 제외한

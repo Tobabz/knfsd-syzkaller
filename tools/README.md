@@ -65,8 +65,9 @@ bootstrap은 지금 매번 syzkaller를 처음부터 빌드합니다(재사용 �
 | **시나리오 개발** | syzlang(`sys/linux/*.txt`, `.const`), executor 의사 시스템 콜, `pkg/vminfo`, execprog 변경, 또는 syzkaller 커밋 변경 | **필수** |
 
 그 밖의 경우: 시드(`.prog`)나 syz-manager cfg만 바뀌면 불필요합니다. 커널 시리즈가 UAPI(KCOV ioctl 등)를 바꾸면
-executor가 `executor_linux.h`에 따로 둔 정의와 맞춰야 하므로 필요합니다. 이미지 재생성과는 별개이며, 새 의사 시스템
-콜이 새 게스트 구조(마운트, 소켓)를 요구할 때만 lane 스크립트와 이미지가 바뀝니다.
+executor가 `executor_linux.h`에 따로 둔 정의와 맞춰야 하므로 필요합니다. 이미지 재생성과는 별개입니다.
+`lane.sh` 변경은 호스트 스크립트 스냅샷을 다시 준비하면 적용됩니다. 부팅 래퍼·서비스·게스트 의존성이 바뀔 때만
+이미지를 다시 만듭니다.
 
 `manifest.json`은 이 구분을 기록합니다.
 
@@ -101,17 +102,27 @@ lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 
 
 | 변수 | 기본값 | 누가 정하는가 |
 |---|---|---|
-| `NFS_MINOR_VERSION` | `1` | bake가 서비스 drop-in에 씁니다 (`--minor 1\|2`). knfsd와 Ganesha 마운트에 모두 적용됩니다 |
+| `NFS_MINOR_VERSION` | `1` | 부팅 래퍼가 `vm.cmdline`의 `koov.nfs_minor=1\|2`를 읽어 전달합니다. 두 백엔드의 마운트에 적용됩니다 |
 | `SERVER_IMPL` | `both` | `both`는 lane마다 knfsd와 Ganesha를 프록시 뒤에 둡니다. `knfsd`·`ganesha`는 프록시를 거치지 않는 진단용입니다 |
 | `KOOV_TMPFS_SIZE` | `256m` | lane마다 tmpfs 상한 |
 
 `both`가 기본이라 이미지의 deps에 `ganesha.nfsd`와 `nfs-proxy`가 없으면 bootstrap이 시작 전에 거부합니다.
-부팅 래퍼(`boot-fixture.sh`)와 서비스(`fixture.service`)도 같은 디렉터리에 있습니다. 이미지 안의 경로
-(`/opt/frozen-phase9/lane.sh`)는 그대로입니다.
+부팅 래퍼(`boot-fixture.sh`)와 서비스(`fixture.service`)도 같은 디렉터리에 있습니다. 래퍼는 읽기 전용 9P
+공유의 `lane.sh`를 `/run/frozen-phase9/lane.sh`로 복사하고 지정된 SHA-256과 비교합니다. 서비스의
+setup·status·cleanup은 모두 이 복사본을 사용합니다.
 
 기존 시드의 `nfs-lane/client0`·`client1`은 같은 knfsd export를 보는 두 클라이언트입니다.
 `both`에서도 이 의미를 유지하며, Ganesha는 `client0-ganesha`·`client1-ganesha`로 선택합니다.
 두 서버 모두 요청한 minor 버전을 사용합니다.
+
+퍼징은 서버별 syz-manager 설정·workdir·`corpus.db`를 분리하고 한 번에 하나씩 실행합니다.
+각 새 DB에는 해당 서버의 기본 시드만 넣으며 DB 병합이나 공유 corpus hub를 사용하지 않습니다.
+knfsd는 `experimental.remote_cover=true`, Ganesha는 `false`로 두고 로컬 클라이언트
+커널 커버리지를 사용합니다. 기존 통합 DB는 삭제했습니다.
+[코퍼스 운영 문서](../bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)에
+현재 설정 경로, 재개 명령, 검증 결과와 변이·최소화의 한계를 정리했습니다.
+재사용 이미지의 host lane 설정도 서버별로 각각 준비해야 합니다.
+
 호스트 입력 검사는 `python3 tools/test-lane-inputs.py`, 셸 검사는 `sh tools/lane-quote-lint.sh`로 실행합니다.
 게스트의 두 백엔드와 기본 별칭은 `tools/nfs-proxy/test/guest-four-mounts.sh`로 확인합니다.
 
@@ -133,24 +144,27 @@ python3 tools/bootstrap-kcov-env.py env \
     --ssh-key artifacts/bookworm.id_rsa \
     --deps-tar bundle/src/guest-deps-lane.tar.gz --minor 2
 python3 tools/check-ganesha-v15-guest.py \
-    --image env/images/bookworm-kcov-fresh-v2.qcow2 \
+    --image env/images/bookworm-kcov-fresh.qcow2 \
     --seed bundle/corpus/nfs-normal/basic-v41-ganesha-tcp.prog
 ```
 
-v4.1 이미지는 bootstrap의 `--minor 1`로 생성합니다. 기존 `env/`를
-갱신하면서 컴파일 결과를 재사용할 때는 `--update --skip-build`를 지정합니다.
+`--minor 1`과 `--minor 2`는 같은 이미지를 각 버전으로 부팅해 검증합니다.
+기존 `env/`를 갱신하면서 컴파일 결과를 재사용할 때는 `--update --skip-build`를 지정합니다.
 빌더와 deps 조립기는 기존 출력 덮어쓰기를 거부하므로 이미 만든 자산을
 재사용하거나 새 출력 경로를 지정합니다.
 
 `build-ganesha-v15.sh`는 Ganesha 커밋 `98eb4beb642674d4188361008495bb6d585d393d`와
 libntirpc 커밋 `848ab93b63174338ad72875bddd5680113f64b39`를 확인합니다.
 빌드 중 필요한 Bookworm 의존성 기반은 임시 생성 후 제거합니다.
-이미지 입력 해시는 인접한 `.json`과 `env/manifest.json`에 기록됩니다.
+이미지 입력 해시는 인접한 `.json`에, 실행 시 주입한 lane 스크립트 해시는
+`env/manifest.json`의 variant별 검증 결과에 기록됩니다. syz-manager에서는
+`tools/prepare-live-lane-config.py`로 해시가 고정된 호스트 스크립트 스냅샷과
+`workdir_template`·`vm.qemu_args`·`vm.cmdline`을 가진 새 설정을 준비합니다.
 
 ## 경계
 
 - **번들 독립 구조** (2026-09-25): `bundle/` = `src/`(원천) · `patches/`(독립 시리즈) ·
-  `lane/`(bake 입력: lane 스크립트 하나·부팅 래퍼·서비스) · `baker/`(프로비저닝) · `corpus/`(시드 코퍼스).
+  `lane/`(호스트 주입 스크립트·bake되는 부팅 래퍼와 서비스) · `baker/`(프로비저닝) · `corpus/`(시드 코퍼스).
 - **파이프라인 스코프**: `fport-apply.sh`의 `--kind`는 `kernel|syzkaller`만.
 
 ## 문서 맵
