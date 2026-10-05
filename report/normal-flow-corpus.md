@@ -62,7 +62,7 @@ Ganesha 사용자 공간 서버 내부 커버리지는 수집하지 않는다.
 | NF-F5 NFSv4.0 callback 서버 | 서버가 client의 callback 리스너에 별도 TCP 연결을 연다 | S2-05–06, S2-13 | `LINKED`와 `ORDERED`: v4.0에서만 관측했다. v4.1에서는 `UNPAIRED`와 `MISSING`을 확인했다 |
 | NF-F6 delegation 반환 | state manager가 DELEGRETURN을 rpciod에 제출한다. nfsd 스레드가 실행한다 | S2-08–09, S3b-08–09 | `LINKED` |
 | NF-G1 NFSv3 서버 기동 | 제어 태스크가 nfsd 스레드와 lockd를 시작한다. lockd grace 타이머가 `grace_ender`를 제출한다 | S1-09–11 | `ORDERED`와 `LINKED` |
-| NF-G2 NLM 잠금 대기와 GRANTED | lockd가 GRANTED_MSG를 rpciod에 제출한다 | 없음 | 미도달: lane 마운트가 `nolock`이고 `rpc.statd`가 없다 |
+| NF-G2 NLM 잠금 대기, GRANTED, NSM, reclaim | 서버 로컬 잠금의 해제가 `lm_notify`를 실행한다. lockd가 `GRANTED_MSG`를 rpciod에 제출한다. `SM_NOTIFY`가 reclaimer kthread를 만든다 | S5-01–07, S5b-01–03 | `LINKED`와 `ORDERED`: loopback 잠금 마운트에서 관측했다(셸 스크립트, 시드 아님). lane 마운트는 `nolock`이고 lane에 `rpc.statd`가 없어서 lane 구성에서는 도달하지 못한다. 호스트 간 NLM은 관측하지 못했다 |
 | NF-G3 mount와 umount | `mount.nfs`, `umount` 태스크가 동기 RPC를 보낸다. umount 뒤 해제 work가 실행된다 | 없음 | 부분 측정: client 쪽 RPC와 해제 work만 관측했다. MOUNT 프로토콜 서버는 사용자 공간 `rpc.mountd`이므로 서버 쪽 전환은 추적 대상이 아니다 |
 
 ## 프로토콜과 계측 경계
@@ -72,6 +72,7 @@ NFSv3 입력은 `basic-v3-tcp.prog`이고 NFSv4.0 입력은 `deleg-recall-v40-tc
 두 입력은 2026-10-05에 추가했다. 두 입력의 모든 호출이 errno 0으로 끝났다.
 NFSv3 입력은 `flock`을 쓰지 않는다. `nolock` 마운트에서 `flock`은 client 로컬 잠금이다(코드상).
 NFSv2, UDP, RPC-over-RDMA, LOCALIO, NAT에 대한 실행 완료나 스레드 전환은 주장하지 않는다.
+NLM 잠금은 시드로 만들 수 없다. lane 마운트가 `nolock`이기 때문이다. NLM은 셸 스크립트 S5, S5b가 별도 구성으로 다룬다.
 LOCALIO의 probe work는 `nfs.localio_enabled=N`에서도 실행한다(측정됨). LOCALIO의 I/O 경로는 실행하지 않는다.
 
 knfsd의 요청별 원격 KCOV는 `svc_process` 부근에서 시작한다.

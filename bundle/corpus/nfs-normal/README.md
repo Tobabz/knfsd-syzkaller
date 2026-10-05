@@ -138,5 +138,5 @@ The [flow scope](../../../report/normal-flow-corpus.md) lists the state of each
 flow. The periodic and state-lifetime work (NF-B2, NF-E1–E4) is judged with the
 shell script `tools/flow-trace/stimulus/s4-state-lifetime.sh`, not with a seed:
 the enabled syscalls have no `nanosleep`, and the client renews its lease
-automatically. NF-E5 and NF-G2 are not reached. NFSv2, UDP, RPC-over-RDMA,
+automatically. NLM locking (NF-G2) is judged with the shell scripts S5 and S5b: the lane mounts use nolock, so a seed cannot reach it. NF-E5 is not reached. NFSv2, UDP, RPC-over-RDMA,
 LOCALIO and NAT remain outside the verified execution scope.

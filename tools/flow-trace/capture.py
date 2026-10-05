@@ -137,9 +137,11 @@ def main():
             (args.out / "stimulus.log").write_text(output)
         else:
             vm.put(args.shell.resolve(), "/tmp/stimulus.sh")
-            output = vm.guest("ROOT=%s NFS_VERSION=%s sh /tmp/stimulus.sh 2>&1" % (ROOT, args.version),
-                              timeout=900)
+            # Keep the output and the exit code even when the script fails.
+            output = vm.guest("ROOT=%s NFS_VERSION=%s sh -x /tmp/stimulus.sh 2>&1; "
+                              "echo STIMULUS_RC=$?" % (ROOT, args.version), timeout=900)
             (args.out / "stimulus.log").write_text(output)
+            meta["stimulus_rc"] = int(output.rsplit("STIMULUS_RC=", 1)[1].split()[0])
         if args.settle:
             time.sleep(args.settle)
         if args.stop_fixture:

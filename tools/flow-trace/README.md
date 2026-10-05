@@ -45,6 +45,7 @@ tools/flow-trace/summarize.sh ~/flow-trace-evidence/run3
 | `scenarios/*.json` | Transition rules for S1, S2, S3, S3b and S4 |
 | `subjects.json`, `subjects.py` | One marker event per execution subject; counts per trace |
 | `stimulus/s4-state-lifetime.sh` | Shell stimulus for state-lifetime work |
+| `stimulus/s5-nlm-lock.sh`, `stimulus/s5b-nlm-reboot.sh` | NFSv3 NLM lock conflict and SM_NOTIFY reclaim. They start `rpc.statd` and mount over loopback with locks inside the lane 0 server namespaces, and they compile a small lock helper with the guest `gcc` |
 | `run-all.sh`, `summarize.sh` | Record every run; judge every run |
 
 ## Notes

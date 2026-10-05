@@ -7,7 +7,7 @@
 ## 요약
 
 이 문서는 커널 NFS client, knfsd, lockd, 보조 데몬에서 요청·응답·callback을 실행하는 실행 주체를 모두 식별한다.
-이 문서는 NFS 버전별 시나리오 S1–S4에서 실행 주체 사이의 전환을 추적하고, 전환마다 확정 수준(`측정됨`, `코드상`, `미검증`)을 기록한다.
+이 문서는 NFS 버전별 시나리오 S1–S5에서 실행 주체 사이의 전환을 추적하고, 전환마다 확정 수준(`측정됨`, `코드상`, `미검증`)을 기록한다.
 이 문서가 틀리면 PC가 있다는 사실을 스레드 전환의 증거로 읽거나, PC가 없다는 사실을 미실행으로 읽는다.
 
 ## 용어
@@ -23,7 +23,7 @@
 | 전환 | 제출 하나와 그에 대응하는 실행 하나의 쌍 | 핸드오프 |
 | 연결 키 | 제출 이벤트와 실행 이벤트에 같은 값으로 나타나서 둘을 같은 일로 묶는 값. 예: work 포인터, xid, 소켓 주소 쌍 | 상관 ID |
 | 흐름 | `normal-flow-corpus.md`의 NF 식별자 하나가 가리키는 전환의 묶음 | 경로, 플로우 |
-| 시나리오 | 여러 흐름을 정해진 순서로 일으키는 입력과 조건의 묶음. S1–S4 | 케이스 |
+| 시나리오 | 여러 흐름을 정해진 순서로 일으키는 입력과 조건의 묶음. S1–S5 | 케이스 |
 | 귀속 | remote KCOV가 수집한 PC를 특정 프로그램의 generation에 기록하는 일 | 할당, 매핑 |
 | LINKED | 제출 이벤트와 실행 이벤트가 같은 연결 키를 가진다 | |
 | ORDERED | 연결 키가 없다. 다른 태스크의 실행 이벤트가 제출 이벤트 뒤에 시간 창 안에서 나타난다 | |
@@ -161,24 +161,26 @@ workqueue 이름은 트레이스가 표시하는 이름을 쓴다. `system_percp
 | C12 | idmapper | 요청 태스크가 `request_key`를 호출한다. 사용자 공간 `nfsidmap`이나 rpc_pipefs 경로를 쓴다 | uid/gid 이름 변환 | 미도달: `sec=sys`, 숫자 id | 코드상 |
 | C13 | 마운트 만료와 `nfslocaliod` | `nfs_expire_automounts`(`events`). `nfslocaliod`는 LOCALIO I/O 전용 | | 미도달 | 코드상 |
 | C14 | pNFS layout 반환과 block layout 정리 | C6의 layoutrecall, `events` | | 미도달 | 코드상 |
-| C15 | NLM client, reclaimer, NSM | `nlmclnt_proc`, `<host>-reclaim` 스레드, `nsm_monitor` → `rpc.statd` | fcntl/flock | 미도달: 마운트 옵션 `nolock`, `rpc.statd` 없음 | 코드상 |
+| C15 | NLM client 호출 | 잠금을 요청한 태스크가 `nlmclnt_proc`에서 `nsm_monitor`(SM_MON, 동기 RPC)와 `LOCK` 동기 RPC를 보낸다. 해제는 `UNLOCK` 비동기 RPC이다 | fcntl/flock → 서버의 `LCK_GRANTED` 또는 `NLM_BLOCKED` | 미도달: lane 마운트가 `nolock`이다. S5는 서버 네임스페이스의 loopback 마운트로 도달시킨다 | 측정됨(S5) |
+| C15a | 스레드 `<host>-reclaim` (NLM reclaimer) | `nlmclnt_recovery`가 `kthread_run`으로 만든다. 실행 함수는 `reclaimer` | lockd가 `SM_NOTIFY`를 받아 `nlm_host_rebooted`를 실행한다 → 재획득 `LOCK` RPC | S5b로 도달 | 측정됨(S5b) |
 
 **L. lockd와 보조 서비스**
 
 | ID | 실행 주체 | 제출 지점 → 실행 함수 | 깨우는 원인 → 다음 제출 | lane | 확정 |
 |---|---|---|---|---|---|
-| L1 | 스레드 `lockd` (전역 1개) | `lockd_up`이 `svc_create` + `svc_set_num_threads`로 만든다. NFSv2·v3가 켜져 있으면 `nfsd_startup_net`이 호출한다 | NLM RPC, `nlmsvc_retry` 타이머 → `nlmsvc_retry_blocked` → `nlm_async_call` | v3에서 도달 | 측정됨(`s1-v3-basic`: 스레드 시작 1회, `nlmsvc_retry_blocked` 25회) |
+| L1 | 스레드 `lockd` (전역 1개) | `lockd_up`이 `svc_create` + `svc_set_num_threads`로 만든다. NFSv2·v3가 켜져 있으면 `nfsd_startup_net`이 호출한다 | NLM RPC, `nlmsvc_retry` 타이머 → `nlmsvc_retry_blocked` → `nlm_async_call` | v3에서 도달 | 측정됨(`s1-v3-basic`: 스레드 시작 1회, `nlmsvc_retry_blocked` 25회). 같은 스레드가 NLM의 서버 쪽 요청과 client 쪽 콜백(`GRANTED_MSG`, `SM_NOTIFY`)을 모두 실행한다(측정됨, S5, S5b) |
 | L2 | rpcbind 등록 | 서버를 시작한 제어 태스크가 `svc_register` → `rpcb_register` → `rpc_call_sync`로 호출한다 | 서비스 시작 | 도달 | 측정됨(`rpcb_register`). 데몬 쪽은 트레이스 대상이 아니다 |
 | L3 | lockd grace 종료 `grace_ender`. `schedule_delayed_work`이므로 `events`(`system_percpu_wq`) | `set_grace_period` | 타이머 | v3에서 도달 | 측정됨(`s1-v3-basic` 4회) |
-| L4 | NLM GRANTED 콜백 `nlmsvc_grant_callback` | `nlmsvc_grant_blocked`가 `nlm_async_call`로 R1에 제출한다. 콜백은 R1에서 실행된다 | 잠금 해제 → lockd를 깨운다 | 미도달: 두 client가 `nolock`이라 NLM 충돌이 없다 | 코드상 |
-| L5 | NSM → `rpc.statd` | `nsm_mon_unmon` → `rpc_call_sync` | 잠금 | 미도달: `rpc.statd` 없음 | 코드상 |
+| L4 | NLM GRANTED 콜백 `nlmsvc_grant_callback` | `nlmsvc_grant_blocked`(인라인, kprobe 불가)가 `nlm_async_call`로 R1에 제출한다. 콜백은 R1에서 실행된다 | `GRANTED_MSG`의 RPC 완료 → client 쪽 lockd가 `nlmclnt_grant`를 실행한다 | lane은 미도달(`nolock`). S5로 도달 | 측정됨(S5) |
+| L4a | lm_notify 콜백 `nlmsvc_notify_blocked` | 잠금을 해제한 태스크의 문맥에서 VFS가 호출한다 | 충돌하던 잠금의 해제 → lockd를 깨운다(`svc_wake_up`) | lane은 미도달. S5로 도달 | 측정됨(S5: `plock` 태스크 문맥) |
+| L5 | NSM: `nsm_monitor`가 `rpc.statd`에 SM_MON을 보낸다 | 잠금을 요청한 태스크(client 쪽)와 lockd 스레드(서버 쪽)가 `rpc_call_sync`로 호출한다. `rpc.statd`는 사용자 프로세스이다 | 잠금 → statd 응답이 softirq로 xprtiod 수신 worker를 제출한다. 재시작한 statd와 `sm-notify`는 `SM_NOTIFY`를 lockd에 보낸다 | 미도달: lane에 `rpc.statd`가 없다. S5는 서버 키퍼 네임스페이스에서 statd를 시작한다 | 측정됨(S5, S5b) |
 | L6 | auth_gss: gssd/gssproxy | `gss_refresh_upcall`, `gssp_accept_sec_context_upcall` | RPCSEC_GSS | 미도달: `sec=sys` | 코드상 |
 | L7 | `rpc.mountd` | 사용자 프로세스. K11의 downcall과 MOUNT RPC 응답을 실행한다 | 캐시 upcall, v3 마운트 | 도달 | 측정됨(`cache_revisit_request`가 `rpc.mountd` 문맥에서 실행되었다) |
 | L8 | `nfsdcld` | 사용자 프로세스. K13의 downcall을 실행한다 | cld upcall | 도달(v4) | 측정됨 |
 
 ### 시나리오
 
-네 시나리오는 모두 lane 0에서 `syz-execprog`(proc 0) 또는 셸 스크립트를 실행한다. 서버 시작을 추적하는 시나리오는 추적을 켠 뒤에 fixture 서비스를 재시작한다. 재시작은 4개 lane 전체를 다시 만든다. 그러므로 트레이스에는 lane 1–3의 서버 시작 이벤트도 있다.
+S1–S4는 lane 0에서 `syz-execprog`(proc 0) 또는 셸 스크립트를 실행한다. S5, S5b는 lane 0 서버 키퍼 네임스페이스 안의 loopback 마운트에서 셸 스크립트를 실행한다. 서버 시작을 추적하는 시나리오는 추적을 켠 뒤에 fixture 서비스를 재시작한다. 재시작은 4개 lane 전체를 다시 만든다. 그러므로 트레이스에는 lane 1–3의 서버 시작 이벤트도 있다.
 
 `판정` 열의 값은 증거 실행 `~/flow-trace-evidence/run2/judgement/summary.txt`의 결과이다. `키` 열은 연결 키 종류이다.
 
@@ -232,7 +234,7 @@ workqueue 이름은 트레이스가 표시하는 이름을 쓴다. `system_percp
 | S1-10 | NF-G1 | `sh` → L1 | 없음 | ORDERED | 조건: NFSv3. 같은 규칙을 v4.1 서버 시작에 적용하면 `UNPAIRED`이다(측정됨: lockd가 없다) |
 | S1-11 | NF-G1 | 타이머(softirq) → kworker | work 포인터 | LINKED | `grace_ender`가 `events`에서 4회 실행한다. 코드상 `grace_period_end`는 netns마다 하나이다. 4회가 lane 4개와 대응하는지는 미검증이다 |
 
-관측하지 못한 것: NLM 잠금 대기, GRANTED 콜백(L4), NSM(L5). 이유는 lane의 마운트가 `nolock`이고 `rpc.statd`가 없기 때문이다. `NF-G2`는 미도달이다.
+관측하지 못한 것: NLM 잠금 대기, GRANTED 콜백(L4), NSM(L5). 이유는 lane의 마운트가 `nolock`이고 `rpc.statd`가 없기 때문이다. 이 흐름(`NF-G2`)은 S5와 S5b가 별도 구성으로 다룬다.
 
 #### S2. NFSv4.0: 위임 부여, 별도 callback 연결, recall, 반환
 
@@ -388,6 +390,101 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
 - client1 링크를 25초 끊어도 `nfsd_mark_client_expired`, `nfsd_cb_lost` 이벤트가 0건이다(측정됨). 이 시간 동안 laundromat과 `cl_renewd`는 계속 실행했고, client state manager가 `CHECK_LEASE`를 실행했다. client 만료와 cld 제거 흐름은 관측하지 못했다. 이유는 미검증이다.
 - `nfsd_file_gc_worker`는 v4.x 실행에서 관측하지 못했다. 이유는 미검증이다.
 
+#### S5. NFSv3: NLM 잠금 충돌과 GRANTED 콜백
+
+lane의 두 client 마운트는 `nolock`이고 lane에 `rpc.statd`가 없다. 그래서 S5는 lane의 마운트를 쓰지 않는다. S5는 lane 0 서버 키퍼 네임스페이스(사설 `/run`과 `/var/lib/nfs`, lane 0 네트워크 네임스페이스) 안에서 다음 순서로 구성한다.
+
+1. `rpc.statd`를 시작한다. 실행 파일은 이미지의 `/opt/kcov-nfs/deps/sbin/rpc.statd`이다. 이미지를 다시 만들지 않는다.
+2. lane 0 export를 `127.0.0.1`에 연다.
+3. 같은 네임스페이스에서 `nolock` 없이 loopback으로 마운트한다.
+4. 서버 로컬 태스크 `plock`이 export 파일에 POSIX 잠금을 건다. 이 헬퍼는 스크립트가 게스트에서 컴파일한다.
+5. NFS 마운트의 `flock`이 같은 파일을 잠근다. 이 호출은 NLM `LOCK` 요청이 되므로, 서버는 `NLM_BLOCKED`로 답한다.
+6. `plock`이 끝나서 잠금이 풀리면 서버가 GRANTED 콜백을 보낸다.
+
+전제 조건:
+
+- 부팅 인자는 `koov.nfs_version=3`이다.
+- lockd grace가 끝나기 전에는 새 NLM 잠금이 승인되지 않는다. 스크립트는 `grace_end` 이벤트 4개를 기다린 뒤 잠근다. 기다린 시간은 41–44초이다(측정됨). grace 중의 `LOCK` RPC는 약 5초 간격으로 반복되었다(예비 실행 `~/flow-trace-evidence/nlm/try3`, 측정됨). 거부 상태 코드는 트레이스에 없어서 미검증이다.
+- 보유자를 서버 로컬 태스크로 둔 이유는 근거 절에 있다.
+
+```text
++- lane 0 server keeper namespaces (private /run and /var/lib/nfs) ------------+
+| plock (local task)          flock task (NFS client, nlmclnt_proc)            |
+|   | holds POSIX lock          | SM_MON ----------------> L5 rpc.statd (user) |
+|   |                           | LOCK (xid) over loopback                     |
+|   |                           v                                              |
+|   |                         L1 lockd thread: nlmsvc_lock -> NLM_BLOCKED      |
+|   | exits: lock released      (flock task sleeps in nlmclnt_lock)            |
+|   v                                                                          |
+| L4a nlmsvc_notify_blocked (runs in the plock task)                           |
+|   | wakes                                                                    |
+|   v                                                                          |
+| L1 lockd thread: nlmsvc_retry_blocked                                        |
+|   | queue_work rpc_async_schedule                                            |
+|   v                                                                          |
+| R1 rpciod: GRANTED_MSG (xid) ------> L1 lockd thread (NLM client side)       |
+|                                        | nlmclnt_grant                       |
+|                                        v wakes                               |
+|                                      flock task leaves nlmclnt_lock          |
++------------------------------------------------------------------------------+
+```
+
+범례: `-->`=제출, `(user)`=사용자 공간 프로세스.
+읽는 순서: 위에서 아래로. 왼쪽 줄은 보유자, 오른쪽 줄은 대기자이다. 같은 `lockd` 스레드가 서버 쪽 요청과 client 쪽 콜백을 모두 실행한다.
+
+| ID | 흐름 | 제출 주체 → 실행 주체 | 키 | 판정 | 조건·예외·근거 |
+|---|---|---|---|---|---|
+| S5-01 | NF-G2 | L5(`rpc.statd`)의 응답 → R2 | work 포인터 | LINKED | SM_MON은 대기자 태스크가 보내는 동기 RPC이다. `rpc.statd`는 사용자 프로세스라서 커널 이벤트는 응답이 일으킨 softirq(태스크 이름 `rpc.statd`)에서만 보인다 |
+| S5-02 | NF-G2 | `flock` 태스크 → L1 | xid | LINKED | `LOCK` RPC가 lockd 스레드에서 `svc_process`로 실행된다. 이 이후 `nlmsvc_lock`이 실행된다(kprobe) |
+| S5-03 | NF-G2 | `plock` 태스크(L4a) → L1 | 없음 | ORDERED | lm_notify는 잠금을 푼 태스크의 문맥에서 실행되고 `svc_wake_up`으로 lockd를 깨운다. 깨움에는 tracepoint가 없다 |
+| S5-04 | NF-G2 | L1 → R1 | work 포인터 | LINKED | lockd가 `GRANTED_MSG` `rpc_task`를 rpciod에 제출한다 |
+| S5-05 | NF-G2 | R1 → L1(client 쪽) | xid | LINKED | rpciod가 보낸 `GRANTED_MSG`를 lockd가 `svc_process`로 실행한다(proc=GRANTED_MSG) |
+| S5-06 | NF-G2 | L1 → `flock` 태스크 | 없음 | ORDERED | lockd의 `nlmclnt_grant`가 대기자를 깨운다. 대기자의 `nlmclnt_lock`이 `LCK_GRANTED`로 끝난다 |
+| S5-07 | NF-G2 | R1 → L1 | xid | LINKED | client가 보낸 `GRANTED_RES`를 lockd가 `svc_process`로 실행한다 |
+
+예외: 같은 마운트의 두 NFS 태스크로 충돌을 만들면 순서가 뒤집힌다. 첫 시도(예비 실행 `~/flow-trace-evidence/nlm/try4`)에서 보유자의 비동기 `UNLOCK`(rpciod)보다 대기자의 동기 `LOCK`이 서버에 먼저 도착했다. 이 순서에서는 서버가 `NLM_BLOCKED`로 답하고 `UNLOCK` 뒤에 GRANTED 콜백이 일어난다. 반대 순서에서는 서버가 바로 승인한다(코드상). 그래서 S5는 보유자를 서버 로컬로 둔다.
+
+관측하지 못한 것:
+
+- 서로 다른 두 호스트 사이의 NLM. 이 구성은 client와 server가 같은 호스트, 같은 네임스페이스, 같은 lockd 스레드이다.
+- 대기자가 GRANTED 없이 타임아웃으로 깨어나는 경로.
+- `nlmsvc_grant_blocked`는 인라인되어 kprobe가 불가능하다. 제출은 `rpc_async_schedule`의 `queue_work`로 관측했다.
+
+#### S5b. NFSv3: SM_NOTIFY와 NLM reclaimer
+
+S5와 같은 구성에서, 한 client 태스크가 잠금을 쥔 채로 둔다. 그 사이에 `rpc.statd`를 `--no-notify`로 다시 시작하고, `sm-notify`를 직접 실행한다. `sm-notify`는 `sm.bak`에 있는 호스트에 `SM_NOTIFY`를 보낸다. 이 시험은 상대 호스트의 재부팅을 흉내 낸다.
+
+전제 조건:
+
+- `sm-notify`는 statd 등록이 끝난 뒤에 실행해야 한다. 새로 시작한 statd가 자기 안에서 `sm-notify`를 띄우면 등록 전에 포트를 조회해서 "No statd on host"로 실패하고 120초를 기다린다(측정됨, `~/flow-trace-evidence/nlm/reboot2`).
+- statd는 `sm-notify`를 절대 경로 `/sbin/sm-notify`로 찾는다. 이 이미지는 `/opt/kcov-nfs/deps/sbin/`에 둔다. 스크립트가 임시 심볼릭 링크를 만든다. 게스트는 스냅샷 모드라서 링크는 실행 뒤에 사라진다.
+
+```text
++- lane 0 server keeper namespaces --------------------------------------------+
+| sm-notify (user) --SM_NOTIFY--> L5 rpc.statd (user)                          |
+|                                   | NLM downcall (callback RPC)              |
+|                                   v                                          |
+| L1 lockd thread: svc_process SM_NOTIFY -> nlm_host_rebooted                  |
+|   | nlmclnt_recovery: kthread_run                                            |
+|   v                                                                          |
+| C15a <host>-reclaim kthread: reclaimer                                       |
+|   | LOCK (reclaim) over loopback                                             |
+|   v                                                                          |
+| L1 lockd thread: svc_process LOCK -> nlmsvc_lock                             |
++------------------------------------------------------------------------------+
+```
+
+범례: `(user)`=사용자 공간 프로세스.
+읽는 순서: 위에서 아래로.
+
+| ID | 흐름 | 제출 주체 → 실행 주체 | 키 | 판정 | 조건·예외·근거 |
+|---|---|---|---|---|---|
+| S5b-01 | NF-G2 | L5(`rpc.statd`)의 softirq → L1 | 소켓 주소 | LINKED | statd가 `SM_NOTIFY` 콜백을 lockd의 전송 소켓으로 보낸다. 제출 이벤트의 태스크 이름은 `rpc.statd`이다 |
+| S5b-02 | NF-G2 | L1 → C15a | 없음 | ORDERED | `nlmclnt_recovery`가 `kthread_run`으로 reclaimer를 만든다. 스레드 이름은 `<host>-reclaim`(15자로 잘려 `127.0.0.1-recla`)이다 |
+| S5b-03 | NF-G2 | C15a → L1 | xid | LINKED | reclaimer가 재획득 `LOCK`을 동기 RPC로 보낸다. lockd가 `svc_process`로 실행한다 |
+
+관측하지 못한 것: reclaimer가 여러 잠금을 재획득하는 경우, 서버가 grace 중에 재획득을 받아들이는 상태 코드.
+
 ### 판정 규칙
 
 - 규칙은 `tools/flow-trace/scenarios/*.json`에 전환마다 하나씩 있다.
@@ -407,8 +504,9 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
 | `tools/flow-trace/events.txt` | 기록할 tracepoint와 kprobe 목록 |
 | `tools/flow-trace/handoffs.py` | 트레이스와 시나리오 규칙을 읽어 전환마다 판정한다 |
 | `tools/flow-trace/subjects.json`, `subjects.py` | 실행 주체마다 표지 이벤트를 정의하고 트레이스별 관측 횟수를 센다 |
-| `tools/flow-trace/scenarios/*.json` | 시나리오 S1, S2, S3, S3b, S4의 전환 규칙 |
+| `tools/flow-trace/scenarios/*.json` | 시나리오 S1, S2, S3, S3b, S4, S5, S5b의 전환 규칙 |
 | `tools/flow-trace/stimulus/s4-state-lifetime.sh` | S4의 자극 |
+| `tools/flow-trace/stimulus/s5-nlm-lock.sh`, `s5b-nlm-reboot.sh` | S5, S5b의 자극. `rpc.statd` 시작, loopback 잠금 마운트, 잠금 충돌과 `SM_NOTIFY`를 일으킨다 |
 | `tools/flow-trace/run-all.sh`, `summarize.sh` | 모든 실행을 순서대로 수집하고, 모든 판정을 저장한다 |
 
 증거 실행 `run2`는 `run-all.sh`가 만든 7개 실행이다. 증거는 저장소 밖 `~/flow-trace-evidence/run2/`에 있다.
@@ -422,6 +520,13 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
 | `s3b-v41-deleg` | 4.1 | `delegation-recall-v41-tcp.prog`, 서버 재시작 | S3b |
 | `s4-v41-state` | 4.1 | `s4-state-lifetime.sh` | S4 |
 | `s4b-v41-grace` | 4.1 | 서버 재시작, 14초 대기 | S4-05 |
+
+NLM 시나리오는 `run2`와 다른 실행 묶음 `run3`(`~/flow-trace-evidence/run3/`)에 있다. `run3`의 이벤트 목록은 NLM 서버·client 진입점 kprobe 9개가 더 있다(`meta.json`이 기록한다).
+
+| 실행 | 부팅 버전 | 자극 | 용도 |
+|---|---|---|---|
+| `s5-v3-nlm-lock` | 3 | `s5-nlm-lock.sh` | S5 |
+| `s5b-v3-nlm-reclaim` | 3 | `s5b-nlm-reboot.sh` | S5b |
 
 ## 설계 근거
 
@@ -443,6 +548,10 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
    근거: `nolock` 마운트에서 잠금은 client 로컬이다(코드상). `basic-v41-tcp.prog`의 피어 잠금 충돌(errno 11)이 v3에서는 일어나지 않는다.
 8. **lease 만료는 시드가 아니라 셸 스크립트로 일으킨다.**
    근거: manager의 허용 syscall에 `nanosleep`이 없다. client가 lease를 자동으로 갱신한다(측정됨).
+9. **NLM 시나리오는 서버 키퍼 네임스페이스의 loopback 마운트로 구성한다.**
+   근거: lane의 client 네임스페이스 두 개에는 rpcbind와 `rpc.statd`가 없다. 그 안에서 NLM을 켜려면 네임스페이스마다 rpcbind, statd, 사설 `/run`, `/var/lib/nfs`가 필요하다. 서버 키퍼 네임스페이스는 rpcbind와 사설 디렉터리를 이미 가진다. 거기에 statd 하나만 더 시작하면 된다. 단점은 client와 server가 같은 호스트라서 호스트 간 NLM을 관측하지 못하는 것이다.
+10. **잠금 충돌의 보유자를 서버 로컬 POSIX 잠금으로 둔다.**
+    근거: 같은 마운트의 두 NFS 태스크로 충돌을 만들면 서버에 도착하는 `LOCK`과 `UNLOCK`의 순서가 실행마다 달라질 수 있다. 예비 실행 `try4`에서 `LOCK`이 먼저 도착했다(측정됨). 로컬 보유자는 서버에서 항상 `NLM_BLOCKED`를 만든다. 이 구성은 `lm_notify` 경로(L4a)도 실행한다.
 
 ## 검토한 대안
 
@@ -453,6 +562,8 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
 | function tracer | 호출 사슬 전체를 얻는다 | 오버헤드가 크다. 이번에는 시도하지 않았다 | 미채택 |
 | remote KCOV 핸들로 전환을 증명 | 기존 계측을 쓴다 | 기준 커널은 `svc_process`, async COPY, softirq 관측 구간만 귀속한다. callback, rpciod, laundromat은 무소유자이다(코드상) | 대체 불가. 보완 관계이다. callback 귀속은 `report/xprtsock-remote-kcov-plan.md`(draft)가 다룬다 |
 | 시나리오 하나로 통합 | 실행이 한 번이다 | v4.0의 별도 연결과 v4.1의 backchannel은 한 부팅에서 공존할 수 없다. 버전이 부팅 인자로 정해진다 | 기각 |
+| 각 client 네임스페이스에 rpcbind와 `rpc.statd`를 시작 | lane의 실제 topology(veth)에서 NLM을 관측한다 | 네임스페이스마다 사설 `/run`, `/var/lib/nfs`, 데몬 둘이 필요하다. 시도하지 않았다 | 미채택. 재검토 조건: 호스트 간 NLM 전환을 관측해야 할 때 |
+| 같은 마운트의 NFS 태스크 둘로 잠금 충돌 | 헬퍼 프로그램이 필요 없다 | 서버에 도착하는 순서가 달라질 수 있어 blocked 경로를 보장하지 못한다(측정됨, `try4`) | 기각 |
 | 커널에 전용 tracepoint 추가 | `ORDERED` 전환이 `LINKED`가 된다 | 패치 시리즈가 늘고 포워드포트 비용이 든다 | 보류. 재검토 조건: `ORDERED` 전환이 판정의 병목이 될 때 |
 
 ## 영향
@@ -482,15 +593,15 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
 | 오류 방향 | 거짓 양성(무관한 이벤트를 짝지어 전환을 주장함)이 더 위험하다. 잘못된 전환 주장은 corpus 완료로 이어진다. 거짓 음성은 시드를 더 만들게 할 뿐이다 |
 | 실패 방식 | fail-closed이다. `MISSING`과 `UNPAIRED`는 통과하지 않는다. 버퍼 손실이 있으면 경고한다 |
 | 관측 가능성 | 판정기가 전환마다 `submits`와 `pairs`를 출력한다. `meta.json`이 부착에 실패한 이벤트를 기록한다 |
-| 재현성 | 독립된 부팅 두 번(`run1`, `run2`)에서 S2, S3, S3b, S4의 41개 전환의 판정이 모두 같다. 연결 키 값(포인터, xid, pid)은 매번 다르다 |
+| 재현성 | 독립된 부팅 두 번(`run1`, `run2`)에서 S2, S3, S3b, S4의 41개 전환의 판정이 모두 같다. S5의 7개와 S5b의 3개도 독립된 부팅 두 번(`nlm/try5`와 `run3`, `nlm/reboot3`와 `run3`)에서 판정이 같다. 연결 키 값(포인터, xid, pid)은 매번 다르다 |
 
 ## 검증 오라클
 
 통과 조건:
 
-- 시나리오 S1, S2, S3, S3b의 모든 전환이 `LINKED` 또는 `ORDERED`이다. 증거 실행의 결과는 S1 11/11, S2 13/13, S3 10/10, S3b 11/11이다.
+- 시나리오 S1, S2, S3, S3b, S5, S5b의 모든 전환이 `LINKED` 또는 `ORDERED`이다. 증거 실행의 결과는 S1 11/11, S2 13/13, S3 10/10, S3b 11/11, S5 7/7, S5b 3/3이다.
 - S4는 전환 7개 중 6개가 S4 자극 실행(`s4-v41-state`, `s4b-v41-grace`)에서 관측된다. S4-04는 `s1-v3-basic`에서만 관측된다.
-- 음성 대조: `specific` 전환이 대조 실행에서 0개이다. 대조 실행은 S1용 `ctl-v41-basic`, S2·S3b용 `s1-v3-basic`, S3용 `s1-v3-basic`과 `ctl-v41-basic`, S4용 `ctl-v41-basic`이다. 모두 0개이다.
+- 음성 대조: `specific` 전환이 대조 실행에서 0개이다. 대조 실행은 S1용 `ctl-v41-basic`, S2·S3b용 `s1-v3-basic`, S3용 `s1-v3-basic`과 `ctl-v41-basic`, S4용 `ctl-v41-basic`, S5·S5b용 `run2`의 `s1-v3-basic`, `s3-v42-copy`, `ctl-v41-basic`(`run3/judgement/controls-vs-run2.txt`)이다. S5b는 S5 실행(재회수 없음)에서도 0개이다. 모두 0개이다.
 - 버전 차이:
   - `S1-10`(lockd)은 v4.1 서버 시작에서 `UNPAIRED`이다.
   - `S2-06`(별도 callback 연결의 softirq)은 v4.1에서 `MISSING`이다.
@@ -521,13 +632,15 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
 | 항목 | 상태 | 내용 |
 |---|---|---|
 | 목록 기준, 확정 수준 세 단계 | 결정됨 | 위 설계 절 |
-| NLM 잠금 대기, GRANTED, NSM 실측 | 포기 | lane이 `nolock`이고 `rpc.statd`가 없다. 재검토 조건: 이미지에 `rpc.statd`를 넣고 잠금 마운트 옵션을 선택 가능하게 할 때 |
+| NLM 잠금 대기, GRANTED, NSM, reclaimer | 결정됨(부분) | S5, S5b가 loopback 구성에서 측정했다. lane의 veth topology에서는 측정하지 않았다. lane 마운트는 `nolock`이고 lane에 `rpc.statd`가 없다 |
+| 호스트 간 NLM | 미결 | client와 server가 같은 호스트, 같은 lockd 스레드인 구성만 측정했다. 재검토 조건: client 네임스페이스에 rpcbind와 `rpc.statd`를 시작할 때 |
+| lockd grace 중 `LOCK` 거부 상태 코드 | 미검증 | `LOCK` RPC가 약 5초 간격으로 반복되는 것만 관측했다 |
 | GSS, TLS, pNFS, RDMA, UDP | 포기 | 환경에 없다 |
 | LOCALIO 읽기·쓰기 경로 | 포기 | `nfs.localio_enabled=N`이 필수이다. probe work(C2b)만 측정됨 |
 | lease 만료 → client 만료 → cld 제거 | 미결 | 25초 링크 단절에서 만료 이벤트가 0건이다. 이유 미검증 |
 | v4.x에서 filecache GC(K8) | 미결 | v3 실행에서만 관측했다. 이유 미검증 |
 | `receive_cb_reply`, `__cld_pipe_upcall` | 미결 | 인라인되어 kprobe가 불가능하다. 다른 이벤트(K1b, `cld_down`)로 대신 관측했다 |
-| `ORDERED` 전환 | 미결 | S1-08–10, S2-02, S2-07, S2-12, S2-13, S3-08, S3-09, S3b-01, S3b-06, S3b-07, S3b-10, S4-01, S4-04, S4-05는 연결 키가 없다. 같은 일이라는 증명이 없다 |
+| `ORDERED` 전환 | 미결 | S1-08–10, S2-02, S2-07, S2-12, S2-13, S3-08, S3-09, S3b-01, S3b-06, S3b-07, S3b-10, S4-01, S4-04, S4-05, S5-03, S5-06, S5b-02는 연결 키가 없다. 같은 일이라는 증명이 없다 |
 | 트레이싱이 타이밍에 주는 영향 | 미검증 | lease와 grace에 영향을 줄 수 있다 |
 | 병렬 lane | 미검증 | 자극은 lane 0만 실행한다. 4개 lane을 동시에 실행했을 때 혼입은 확인하지 않았다 |
 | KCOV 귀속 열 | 미검증 | 코드를 읽은 결과이다. 실측하지 않았다 |
@@ -539,13 +652,15 @@ S2와 같은 사슬이 backchannel 위에서 일어난다. 아래 표는 S2와 �
 
 - 시드: 경로는 `nfs-lane/client0`, `nfs-lane/client1`(knfsd)을 쓴다. 허용 syscall은 `open$dir`, `openat`, `getdents64`, `close`, `write`, `fsync`, `statx`, `lseek`, `read`, `flock`, `renameat2`, `unlinkat`이다(`bundle/corpus/nfs-normal/README.md`). 기존 COPY 시드는 목록 밖 호출 3개(`pwrite64`, `ftruncate`, `copy_file_range`)를 쓴다. manager 설정과의 관계는 미검증이다.
 - NFS 버전은 시드가 정하지 않는다. 부팅 인자 `koov.nfs_version`이 정한다(`3`, `4.0`, `4.1`, `4.2`).
-- 시나리오: S1, S2, S3, S3b, S4. 전환 규칙은 `tools/flow-trace/scenarios/`에 있다.
+- 시나리오: S1, S2, S3, S3b, S4, S5, S5b. 전환 규칙은 `tools/flow-trace/scenarios/`에 있다.
+- NLM 잠금은 시드로 만들 수 없다. 이유는 lane 마운트가 `nolock`이기 때문이다. S5, S5b의 셸 스크립트를 쓴다.
 
 **비지원 범위**
 
 - v3 시드에서 `flock`을 쓰면 안 된다. client 로컬 잠금이 되어 충돌이 일어나지 않는다(코드상).
 - lease 만료를 시드로 일으킬 수 없다. `nanosleep`이 허용 목록에 없다.
-- NLM, GSS, TLS, pNFS, UDP, RDMA 흐름은 환경이 지원하지 않는다.
+- lane의 veth topology에서 NLM은 지원하지 않는다. 호스트 간 NLM은 관측하지 못했다.
+- GSS, TLS, pNFS, UDP, RDMA 흐름은 환경이 지원하지 않는다.
 
 **확장 절차**
 

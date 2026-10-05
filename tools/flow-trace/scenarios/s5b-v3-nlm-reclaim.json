@@ -1,0 +1,26 @@
+{
+  "scenario": "S5b v3 NLM reclaim after SM_NOTIFY: statd callback, lockd, reclaimer kthread",
+  "nfs_version": "3",
+  "stimulus": "tools/flow-trace/stimulus/s5b-nlm-reboot.sh",
+  "transitions": [
+    {"id": "S5b-01", "flow": "NF-G2", "specific": true,
+     "text": "rpc.statd (user process) sends the SM_NOTIFY callback; its socket softirq enqueues the lockd transport; the lockd thread dequeues it",
+     "submit": {"event": "svc_xprt_enqueue", "ctx": "softirq", "comm": "^rpc.statd$",
+                "detail": "server=(?P<k>\\S+) client=\\(einval\\)"},
+     "execute": {"event": "svc_xprt_dequeue", "comm": "^lockd$",
+                 "detail": "server=(?P<k>\\S+) client=\\(einval\\)"},
+     "link": "key"},
+    {"id": "S5b-02", "flow": "NF-G2", "specific": true,
+     "text": "the lockd thread runs nlm_host_rebooted and nlmclnt_recovery; the <host>-reclaim kthread starts",
+     "submit": {"event": "nlm_recovery", "comm": "^lockd$"},
+     "execute": {"event": "nlm_reclaimer", "comm": "-recla"},
+     "link": "order", "within_us": 5000},
+    {"id": "S5b-03", "flow": "NF-G2", "specific": true,
+     "text": "the reclaimer sends a reclaim LOCK; the lockd thread runs svc_process with the same xid",
+     "submit": {"event": "xprt_transmit", "comm": "-recla", "detail": "xid=(?P<k>0x[0-9a-f]+)",
+                "after": {"rule": "S5b-02", "side": "execute", "window_us": 5000, "same_task": true}},
+     "execute": {"event": "svc_process", "comm": "^lockd$",
+                 "detail": "xid=(?P<k>0x[0-9a-f]+) service=lockd vers=4 proc=LOCK"},
+     "link": "key"}
+  ]
+}

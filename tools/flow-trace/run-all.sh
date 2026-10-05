@@ -38,3 +38,7 @@ run s3b-v41-deleg  --version 4.1 --restart-fixture --stop-fixture --seed "$corpu
 run s4-v41-state   --version 4.1 --shell "$here/stimulus/s4-state-lifetime.sh"
 # S4b: NFSv4.1 server start and grace end (grace is 10 s; wait past it)
 run s4b-v41-grace  --version 4.1 --restart-fixture --stop-fixture --settle 14
+# S5: NFSv3 NLM lock conflict (loopback lock mount in the lane 0 server namespace)
+run s5-v3-nlm-lock      --version 3 --shell "$here/stimulus/s5-nlm-lock.sh" --settle 2
+# S5b: NFSv3 NLM reclaim after SM_NOTIFY
+run s5b-v3-nlm-reclaim  --version 3 --shell "$here/stimulus/s5b-nlm-reboot.sh" --settle 3

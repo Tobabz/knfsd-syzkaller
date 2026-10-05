@@ -81,3 +81,14 @@ kprobe bc_process svc_process_bc
 kprobe cb_recall_client nfs4_callback_recall
 kprobe rpc_release_async rpc_async_release
 kprobe nfsd_main nfsd
+
+# NLM server and client entry points
+kprobe nlm_srv_lock nlmsvc_lock
+kprobe nlm_srv_unlock nlmsvc_unlock
+kprobe nlm_srv_grant_blocked nlmsvc_grant_blocked
+kprobe nlm_srv_notify nlmsvc_notify_blocked
+kprobe nlm_client_proc nlmclnt_proc
+kprobe nsm_monitor_fn nsm_monitor
+kprobe nlm_reclaimer reclaimer
+kprobe nlm_recovery nlmclnt_recovery
+kprobe nlm_host_rebooted_fn nlm_host_rebooted

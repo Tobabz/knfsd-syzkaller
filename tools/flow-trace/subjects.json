@@ -270,13 +270,6 @@
       }
     },
     {
-      "id": "L5",
-      "name": "lockd retry of blocked locks",
-      "marker": {
-        "event": "lockd_retry"
-      }
-    },
-    {
       "id": "K14",
       "name": "grace period end (nfsd_grace_complete in the control task)",
       "marker": {
@@ -353,6 +346,45 @@
       "marker": {
         "event": "workqueue_execute_start",
         "detail": "function rpc_free_client_work"
+      }
+    },
+    {
+      "id": "L5",
+      "name": "NSM: SM_MON RPC to rpc.statd",
+      "marker": {
+        "event": "rpc_request",
+        "detail": "statdv1 MONITOR"
+      }
+    },
+    {
+      "id": "L5a",
+      "name": "rpc.statd user process (softirq reply)",
+      "marker": {
+        "event": "workqueue_queue_work",
+        "ctx": "softirq",
+        "comm": "^rpc.statd$"
+      }
+    },
+    {
+      "id": "C15",
+      "name": "NLM client call (nlmclnt_proc)",
+      "marker": {
+        "event": "nlm_client_proc"
+      }
+    },
+    {
+      "id": "C15a",
+      "name": "NLM reclaimer kthread",
+      "marker": {
+        "event": "nlm_reclaimer",
+        "comm": "-recla"
+      }
+    },
+    {
+      "id": "K17",
+      "name": "lm_notify: nlmsvc_notify_blocked in the releasing task",
+      "marker": {
+        "event": "nlm_srv_notify"
       }
     }
   ]

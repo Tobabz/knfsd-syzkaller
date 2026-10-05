@@ -1,8 +1,9 @@
 #!/bin/sh
 # Judge every scenario against its trace and save the results next to the traces.
 # Usage: summarize.sh RUN_DIR
-# Each line below pairs a scenario file with the run that records its stimulus,
-# plus the negative control run for that scenario.
+# Each judge line pairs a scenario file with the run that records its stimulus, or
+# with a control run in which the scenario's "specific" transitions must be absent.
+# A judge line is skipped when its trace is not in RUN_DIR.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 run=${1:?usage: summarize.sh RUN_DIR}
@@ -14,6 +15,7 @@ judge() { # scenario-file trace-name label [extra args]
     trace=$2
     label=$3
     shift 3
+    [ -f "$run/$trace/trace.txt.gz" ] || return 0
     echo "### $label: $(basename "$scen") on $trace" >>"$out/summary.txt"
     python3 "$here/handoffs.py" "$run/$trace/trace.txt.gz" "$here/scenarios/$scen" \
         --json "$out/$label.json" "$@" >>"$out/summary.txt" 2>&1
@@ -38,14 +40,16 @@ judge s4-v41-state-lifetime.json     s4-v41-state      s4
 judge s4-v41-state-lifetime.json     s4b-v41-grace     s4b
 judge s4-v41-state-lifetime.json     ctl-v41-basic     s4-control --control
 judge s4-v41-state-lifetime.json     s1-v3-basic       s4-on-v3
+judge s5-v3-nlm-lock.json            s5-v3-nlm-lock    s5
+judge s5-v3-nlm-lock.json            s1-v3-basic       s5-control-v3-no-nlm --control
+judge s5-v3-nlm-lock.json            s3-v42-copy       s5-control-v42 --control
+judge s5b-v3-nlm-reclaim.json        s5b-v3-nlm-reclaim s5b
+judge s5b-v3-nlm-reclaim.json        s5-v3-nlm-lock    s5b-control-no-reboot --control
 
-python3 "$here/subjects.py" \
-    ctl-v41-basic="$run/ctl-v41-basic/trace.txt.gz" \
-    s1-v3="$run/s1-v3-basic/trace.txt.gz" \
-    s2-v40="$run/s2-v40-deleg/trace.txt.gz" \
-    s3-v42="$run/s3-v42-copy/trace.txt.gz" \
-    s3b-v41="$run/s3b-v41-deleg/trace.txt.gz" \
-    s4-v41="$run/s4-v41-state/trace.txt.gz" \
-    s4b-v41="$run/s4b-v41-grace/trace.txt.gz" \
-    --json "$out/subjects.json" >"$out/subjects.txt" 2>&1
+set --
+for t in ctl-v41-basic s1-v3-basic s2-v40-deleg s3-v42-copy s3b-v41-deleg s4-v41-state \
+         s4b-v41-grace s5-v3-nlm-lock s5b-v3-nlm-reclaim; do
+    [ -f "$run/$t/trace.txt.gz" ] && set -- "$@" "$t=$run/$t/trace.txt.gz"
+done
+python3 "$here/subjects.py" "$@" --json "$out/subjects.json" >"$out/subjects.txt" 2>&1
 echo "saved: $out/summary.txt $out/subjects.txt"

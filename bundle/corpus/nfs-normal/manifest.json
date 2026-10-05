@@ -178,11 +178,11 @@
       "flows": [
         "NF-G2"
       ],
-      "reason": "NLM lock wait and GRANTED are unreached: the lane mounts use nolock and rpc.statd is absent."
+      "reason": "Observed with shell scripts S5 and S5b (loopback lock mount in the lane 0 server namespace), not with a seed: the lane mounts use nolock. Cross-host NLM is not observed."
     },
     {
       "boundary": "NFSv3",
-      "reason": "basic-v3-tcp.prog was added on 2026-10-05. NLM locking is not reached."
+      "reason": "basic-v3-tcp.prog was added on 2026-10-05. NLM locking is observed only by tools/flow-trace S5 and S5b, not by a seed."
     },
     {
       "boundary": "NFSv4.0",
