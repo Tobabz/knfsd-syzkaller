@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "corpus": "nfs-normal",
-  "runtime_scope": "Parser success is syntax validation only. The v4.1 knfsd and Ganesha 34-call seeds passed separate snapshot executions. The v4.2 COPY input passed one 11-call snapshot execution. Current v4.1 fuzzing uses separate syz-manager configs, workdirs and corpus.db files for knfsd and Ganesha, one backend at a time. The two separate corpus-triage runs completed. These bounded runs do not establish long-run stability, paired replay, RPC-level handoff attribution, or Ganesha user-space coverage.",
+  "runtime_scope": "Parser success is syntax validation only. The v4.1 knfsd and Ganesha 34-call seeds passed separate snapshot executions. The v4.2 COPY input passed one 11-call snapshot execution. Current v4.1 fuzzing uses separate syz-manager configs, workdirs and corpus.db files for knfsd and Ganesha, one backend at a time. The two separate corpus-triage runs completed. These bounded runs do not establish long-run stability, paired replay, RPC-level handoff attribution, or Ganesha user-space coverage. 2026-10-05: the NFSv3 and NFSv4.0 inputs each completed one KASAN execution. Thread transitions for all six inputs and the periodic work were judged from kernel trace events; see report/normal-flow-threads.md. These judgements do not establish KCOV attribution, long-run stability or NLM locking.",
   "parser": {
     "path": "env/syzkaller/bin/syz-prog2c",
     "sha256": "f2e525f37b17f38512885bf0ac3fd5db4ac70138d99c453176926bfb0328b410",
@@ -81,15 +81,48 @@
       "parser_result": {
         "exit": 0
       }
+    },
+    {
+      "path": "basic-v3-tcp.prog",
+      "sha256": "ca26478b06be4091acf7a7c1ffd3cae75628cb155a16d215640f302f1bd1a560",
+      "nf_flows": [
+        "NF-A1",
+        "NF-B1",
+        "NF-F1",
+        "NF-F2",
+        "NF-G1"
+      ],
+      "nfs_version": "3",
+      "transport": "TCP",
+      "fixture_path": "bundle/lane/lane.sh",
+      "functional_oracle": "All 25 calls finish with errno 0. The program has no flock because the NFSv3 mounts use nolock, which makes flock a client-local lock. Create, write, read, rename and unlink succeed across both mounts.",
+      "execution_status": "2026-10-05: one KASAN NFSv3 execution (syz-execprog, lane 0) completed 25 of 25 calls with errno 0 and positive coverage. Thread transitions S1-01 to S1-11 were observed (report/normal-flow-threads.md). NLM lock paths were not reached.",
+      "parser_result": {
+        "exit": 0
+      }
+    },
+    {
+      "path": "deleg-recall-v40-tcp.prog",
+      "sha256": "aa529aef74be0a26e5a1a539e71790accccaa23de2db9794c45c4a35c6a268be",
+      "nf_flows": [
+        "NF-A1",
+        "NF-D1",
+        "NF-D3",
+        "NF-F3",
+        "NF-F5",
+        "NF-F6"
+      ],
+      "nfs_version": "4.0",
+      "transport": "TCP",
+      "fixture_path": "bundle/lane/lane.sh",
+      "functional_oracle": "All 16 calls finish with errno 0. Client0 opens read-only and receives a read delegation. Client1 opens for write; the server delays that OPEN with NFS4ERR_DELAY and the client retries it after the recall.",
+      "execution_status": "2026-10-05: one KASAN NFSv4.0 execution (syz-execprog, lane 0) completed 16 of 16 calls with errno 0. Thread transitions S2-01 to S2-13 were observed (report/normal-flow-threads.md), including the separate callback connection.",
+      "parser_result": {
+        "exit": 0
+      }
     }
   ],
   "gaps": [
-    {
-      "flows": [
-        "NF-A1"
-      ],
-      "reason": "The current corpus run has no direct observation linking TCP request arrival to nfsd service-thread execution."
-    },
     {
       "flows": [
         "NF-A2"
@@ -97,48 +130,8 @@
       "reason": "Basic file operations completed; the duplicate-reply-cache branch has not been observed separately."
     },
     {
-      "flows": [
-        "NF-B1",
-        "NF-B2"
-      ],
-      "reason": "No event-bound input and fixture establish cache defer/revisit or cleaner-worker execution."
-    },
-    {
-      "flows": [
-        "NF-C1"
-      ],
-      "reason": "The current COPY snapshot returned 32 MiB; the copy-thread transition was not retraced independently."
-    },
-    {
-      "flows": [
-        "NF-D1",
-        "NF-D2",
-        "NF-D3"
-      ],
-      "reason": "The current fixture has not directly observed the complete callback, backchannel and delegation-return sequence."
-    },
-    {
-      "flows": [
-        "NF-E1",
-        "NF-E2",
-        "NF-E3",
-        "NF-E3b",
-        "NF-E4",
-        "NF-E5"
-      ],
-      "reason": "No matching normal input and event-bound fixture establish worker execution."
-    },
-    {
-      "boundary": "NFSv3",
-      "reason": "The historical seed was removed; the current lane fixture passes basic NFSv3 mount and cross-client I/O, but no v3 normal-flow seed or oracle is included."
-    },
-    {
       "boundary": "NFSv2",
       "reason": "Disabled in the pinned build."
-    },
-    {
-      "boundary": "NFSv4.0",
-      "reason": "The current lane fixture passes basic NFSv4.0 mount and cross-client I/O, but no v4.0 normal-flow seed or oracle is included."
     },
     {
       "boundary": "UDP",
@@ -155,6 +148,45 @@
     {
       "boundary": "NAT",
       "reason": "Current fixture does not establish address-rewritten pairing."
+    },
+    {
+      "flows": [
+        "NF-A1",
+        "NF-C1",
+        "NF-D1",
+        "NF-D2",
+        "NF-D3"
+      ],
+      "reason": "Thread transitions were observed with kernel trace events (report/normal-flow-threads.md). This does not show that remote KCOV attributes the callback, rpciod or copy-thread work to the program."
+    },
+    {
+      "flows": [
+        "NF-B1",
+        "NF-E3",
+        "NF-E4"
+      ],
+      "reason": "Only ORDERED observations exist (no connection key). NF-E3 was observed only in the NFSv3 run."
+    },
+    {
+      "flows": [
+        "NF-E1",
+        "NF-E2"
+      ],
+      "reason": "Laundromat and shrinker work were observed. A 25 s link cut produced no client-expiry event; the cause is unverified."
+    },
+    {
+      "flows": [
+        "NF-G2"
+      ],
+      "reason": "NLM lock wait and GRANTED are unreached: the lane mounts use nolock and rpc.statd is absent."
+    },
+    {
+      "boundary": "NFSv3",
+      "reason": "basic-v3-tcp.prog was added on 2026-10-05. NLM locking is not reached."
+    },
+    {
+      "boundary": "NFSv4.0",
+      "reason": "deleg-recall-v40-tcp.prog was added on 2026-10-05. Only delegation recall is covered; there is no v4.0 basic file-operation seed."
     }
   ]
 }

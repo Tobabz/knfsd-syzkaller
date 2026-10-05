@@ -1,0 +1,117 @@
+{
+  "scenario": "S4 state lifetime and cleanup work: cache upcall, shrinker, laundromat, filecache GC, cache_cleaner, lease renewal, grace end",
+  "nfs_version": "4.1",
+  "stimulus": "tools/flow-trace/stimulus/s4-state-lifetime.sh (S4-01..S4-04, S4-06, S4-07); server start with --restart-fixture (S4-05)",
+  "transitions": [
+    {
+      "id": "S4-01",
+      "flow": "NF-B1",
+      "specific": true,
+      "text": "nfsd thread misses an export cache entry and calls the upcall; rpc.mountd answers and runs cache_revisit_request",
+      "submit": {
+        "event": "cache_entry_upcall",
+        "comm": "^nfsd$"
+      },
+      "execute": {
+        "event": "cache_revisit",
+        "comm": "mountd"
+      },
+      "link": "order",
+      "within_us": 100000
+    },
+    {
+      "id": "S4-02",
+      "flow": "NF-E1",
+      "specific": true,
+      "text": "memory reclaim in a task queues nfsd4_state_shrinker_worker on the nfsd4 workqueue; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "detail": "work struct=(?P<k>\\w+) function=nfsd4_state_shrinker_worker workqueue=nfsd4"
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function nfsd4_state_shrinker_worker"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S4-03",
+      "flow": "NF-E1",
+      "text": "laundromat delayed-work timer (softirq) queues laundromat_main on the nfsd4 workqueue; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "ctx": "softirq",
+        "detail": "work struct=(?P<k>\\w+) function=laundromat_main workqueue=nfsd4"
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function laundromat_main"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S4-04",
+      "flow": "NF-E3",
+      "specific": true,
+      "text": "filecache laundrette work (system_dfl_wq) runs; an nfsd thread then disposes the queued nfsd_file entries",
+      "submit": {
+        "event": "filecache_gc",
+        "comm": "^kworker/"
+      },
+      "execute": {
+        "event": "file_dispose",
+        "comm": "^nfsd$"
+      },
+      "link": "order",
+      "within_us": 100000
+    },
+    {
+      "id": "S4-05",
+      "flow": "NF-E4",
+      "specific": true,
+      "text": "nfsdcld writes the downcall; the control task that started nfsd completes the grace period",
+      "submit": {
+        "event": "cld_down",
+        "comm": "^nfsdcld$"
+      },
+      "execute": {
+        "event": "nfsd_grace_complete",
+        "comm": "^(sh|sleep)$"
+      },
+      "link": "order",
+      "within_us": 5000
+    },
+    {
+      "id": "S4-06",
+      "flow": "NF-B2",
+      "text": "cache_cleaner delayed-work timer queues do_cache_clean; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "detail": "work struct=(?P<k>\\w+) function=do_cache_clean "
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function do_cache_clean"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S4-07",
+      "flow": "NF-F4",
+      "text": "client lease renewal timer queues nfs4_renew_state; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "detail": "work struct=(?P<k>\\w+) function=nfs4_renew_state "
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function nfs4_renew_state"
+      },
+      "link": "key"
+    }
+  ]
+}

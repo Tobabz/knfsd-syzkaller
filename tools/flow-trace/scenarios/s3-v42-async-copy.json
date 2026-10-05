@@ -1,0 +1,210 @@
+{
+  "scenario": "S3 v4.2 async COPY and CB_OFFLOAD over the session backchannel",
+  "nfs_version": "4.2",
+  "stimulus": "bundle/corpus/nfs-normal/async-copy-v42-tcp.prog",
+  "transitions": [
+    {
+      "id": "S3-01",
+      "flow": "NF-A1",
+      "text": "client syscall task sends a request; nfsd thread starts svc_process with the same xid",
+      "submit": {
+        "event": "xprt_transmit",
+        "comm": "^syz",
+        "detail": "xid=(?P<k>0x[0-9a-f]+)"
+      },
+      "execute": {
+        "event": "svc_process",
+        "comm": "^nfsd$",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) service=nfsd "
+      },
+      "link": "key"
+    },
+    {
+      "id": "S3-02",
+      "flow": "NF-A1",
+      "text": "server socket data_ready (softirq) enqueues the transport; nfsd thread dequeues it",
+      "submit": {
+        "event": "svc_xprt_enqueue",
+        "ctx": "softirq",
+        "detail": "server=(?P<s>\\S+) client=(?P<k>\\S+)"
+      },
+      "execute": {
+        "event": "svc_xprt_dequeue",
+        "comm": "^nfsd$",
+        "detail": "server=(?P<s>\\S+) client=(?P<k>\\S+)"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S3-03",
+      "flow": "NF-C1",
+      "text": "nfsd thread decides async COPY; the copy thread kthread runs it",
+      "submit": {
+        "event": "nfsd_copy_intra",
+        "comm": "^nfsd$",
+        "detail": "client=(?P<k>\\S+) intra=1 async=1"
+      },
+      "execute": {
+        "event": "nfsd_copy_async",
+        "comm": "^copy thread$",
+        "detail": "client=(?P<k>\\S+) intra=1 async=1"
+      },
+      "link": "key",
+      "specific": true
+    },
+    {
+      "id": "S3-04",
+      "flow": "NF-D1",
+      "text": "copy thread submits the CB_OFFLOAD work; a kworker runs nfsd4_run_cb_work",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^copy thread$",
+        "detail": "work struct=(?P<k>\\w+) function=nfsd4_run_cb_work workqueue=nfsd4_callbacks"
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function nfsd4_run_cb_work"
+      },
+      "link": "key",
+      "specific": true
+    },
+    {
+      "id": "S3-05",
+      "flow": "NF-D1",
+      "text": "callback kworker queues the RPC task on rpciod; rpciod runs rpc_async_schedule",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^kworker/",
+        "detail": "work struct=(?P<k>\\w+) function=rpc_async_schedule workqueue=rpciod",
+        "after": {
+          "rule": "S3-04",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function rpc_async_schedule"
+      },
+      "link": "key",
+      "same_task_ok": true,
+      "specific": true
+    },
+    {
+      "id": "S3-06",
+      "flow": "NF-D2",
+      "text": "server CB request (xid) reaches the client callback svc thread with the same xid",
+      "submit": {
+        "event": "xprt_transmit",
+        "comm": "^kworker/",
+        "detail": "xid=(?P<k>0x[0-9a-f]+)",
+        "after": {
+          "rule": "S3-05",
+          "side": "execute",
+          "window_us": 2000
+        }
+      },
+      "execute": {
+        "event": "svc_process",
+        "comm": "^NFSv4 callback$",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) service=NFSv4 callback"
+      },
+      "link": "key",
+      "specific": true
+    },
+    {
+      "id": "S3-07",
+      "flow": "NF-D2",
+      "text": "client socket data_ready (softirq) queues xs_stream_data_receive_workfn on xprtiod; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "ctx": "softirq",
+        "detail": "work struct=(?P<k>\\w+) function=xs_stream_data_receive_workfn workqueue=xprtiod",
+        "after": {
+          "rule": "S3-06",
+          "side": "submit",
+          "window_us": 2000
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function xs_stream_data_receive_workfn"
+      },
+      "link": "key",
+      "specific": true
+    },
+    {
+      "id": "S3-08",
+      "flow": "NF-D2",
+      "text": "xprtiod receive worker enqueues the backchannel request; the callback svc thread runs svc_process_bc",
+      "submit": {
+        "event": "bc_enqueue",
+        "comm": "^kworker/",
+        "detail": "",
+        "after": {
+          "rule": "S3-07",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "bc_process",
+        "comm": "^NFSv4 callback$",
+        "detail": ""
+      },
+      "link": "order",
+      "specific": true
+    },
+    {
+      "id": "S3-09",
+      "flow": "NF-D1",
+      "text": "callback svc thread sends the CB reply; an nfsd thread wakes the waiting CB rpc_task",
+      "submit": {
+        "event": "xprt_transmit",
+        "comm": "^NFSv4 callback$",
+        "detail": "",
+        "after": {
+          "rule": "S3-06",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "rpc_task_wakeup",
+        "comm": "^nfsd$",
+        "detail": "queue=xprt_pending"
+      },
+      "link": "order",
+      "specific": true
+    },
+    {
+      "id": "S3-10",
+      "flow": "NF-D1",
+      "text": "nfsd thread queues rpc_async_schedule; rpciod finishes the CB rpc_task (nfsd4_cb_done)",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^nfsd$",
+        "detail": "work struct=(?P<k>\\w+) function=rpc_async_schedule workqueue=rpciod",
+        "after": {
+          "rule": "S3-09",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function rpc_async_schedule"
+      },
+      "link": "key",
+      "specific": true
+    }
+  ]
+}

@@ -1,0 +1,184 @@
+{
+  "scenario": "S1 v3 server start, request/reply with synchronous and asynchronous RPC, cache upcall to rpc.mountd",
+  "nfs_version": "3",
+  "stimulus": "bundle/corpus/nfs-normal/basic-v3-tcp.prog (with --restart-fixture)",
+  "transitions": [
+    {
+      "id": "S1-01",
+      "flow": "NF-A1",
+      "text": "client syscall task sends an NFSv3 request; nfsd thread starts svc_process with the same xid",
+      "submit": {
+        "event": "xprt_transmit",
+        "comm": "^syz",
+        "detail": "xid=(?P<k>0x[0-9a-f]+)"
+      },
+      "execute": {
+        "event": "svc_process",
+        "comm": "^nfsd$",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) service=nfsd "
+      },
+      "link": "key"
+    },
+    {
+      "id": "S1-02",
+      "flow": "NF-A1",
+      "text": "server socket data_ready (softirq) enqueues the transport; nfsd thread dequeues it",
+      "submit": {
+        "event": "svc_xprt_enqueue",
+        "ctx": "softirq",
+        "detail": "server=(?P<s>\\S+) client=(?P<k>\\S+)"
+      },
+      "execute": {
+        "event": "svc_xprt_dequeue",
+        "comm": "^nfsd$",
+        "detail": "server=(?P<s>\\S+) client=(?P<k>\\S+)"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S1-03",
+      "flow": "NF-A1",
+      "text": "nfsd thread sends the reply; the client xprtiod receive worker reads a reply with the same xid",
+      "submit": {
+        "event": "svc_send",
+        "comm": "^nfsd$",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) "
+      },
+      "execute": {
+        "event": "xs_stream_read_request",
+        "comm": "^kworker/",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) "
+      },
+      "link": "key"
+    },
+    {
+      "id": "S1-04",
+      "flow": "NF-F1",
+      "text": "client socket data_ready (softirq) queues xs_stream_data_receive_workfn on xprtiod; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "ctx": "softirq",
+        "detail": "work struct=(?P<k>\\w+) function=xs_stream_data_receive_workfn workqueue=xprtiod"
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function xs_stream_data_receive_workfn"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S1-05",
+      "flow": "NF-F1",
+      "text": "xprtiod worker wakes the sleeping synchronous RPC; the syscall task leaves rpc_task_sync_sleep",
+      "submit": {
+        "event": "rpc_task_wakeup",
+        "comm": "^kworker/",
+        "detail": "task:(?P<k>\\S+) .*queue=xprt_pending"
+      },
+      "execute": {
+        "event": "rpc_task_sync_wake",
+        "comm": "^syz",
+        "detail": "task:(?P<k>\\S+) "
+      },
+      "link": "key"
+    },
+    {
+      "id": "S1-06",
+      "flow": "NF-F2",
+      "text": "syscall task starts an asynchronous RPC (WRITE, RENAME, REMOVE, READ); rpciod runs rpc_async_schedule",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^syz",
+        "detail": "work struct=(?P<k>\\w+) function=rpc_async_schedule workqueue=rpciod"
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function rpc_async_schedule"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S1-07",
+      "flow": "NF-F2",
+      "text": "rpciod finishes an asynchronous RPC and queues rpc_async_release on nfsiod; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^kworker/",
+        "detail": "work struct=(?P<k>\\w+) function=rpc_async_release workqueue=nfsiod"
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function rpc_async_release"
+      },
+      "link": "key",
+      "same_task_ok": true
+    },
+    {
+      "id": "S1-08",
+      "flow": "NF-B1",
+      "text": "nfsd thread misses the export cache and calls the upcall; rpc.mountd runs cache_revisit_request in its own process",
+      "submit": {
+        "event": "cache_entry_upcall",
+        "comm": "^nfsd$"
+      },
+      "execute": {
+        "event": "cache_revisit",
+        "comm": "mountd"
+      },
+      "link": "order",
+      "within_us": 100000
+    },
+    {
+      "id": "S1-09",
+      "flow": "NF-G1",
+      "text": "control task writes the nfsd thread count; the nfsd service threads start",
+      "submit": {
+        "event": "nfsd_ctl_threads",
+        "comm": "^(sh|sleep)$"
+      },
+      "execute": {
+        "event": "nfsd_main",
+        "comm": "^nfsd$"
+      },
+      "link": "order",
+      "within_us": 2000000,
+      "specific": true
+    },
+    {
+      "id": "S1-10",
+      "flow": "NF-G1",
+      "text": "control task starts NFSv3 service; the lockd kthread starts (nfsd_needs_lockd)",
+      "submit": {
+        "event": "nfsd_ctl_threads",
+        "comm": "^(sh|sleep)$"
+      },
+      "execute": {
+        "event": "lockd_main",
+        "comm": "^lockd$"
+      },
+      "link": "order",
+      "within_us": 3000000,
+      "specific": true
+    },
+    {
+      "id": "S1-11",
+      "flow": "NF-G1",
+      "specific": true,
+      "text": "lockd grace delayed-work timer (softirq) queues grace_ender on the events workqueue; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "ctx": "softirq",
+        "detail": "work struct=(?P<k>\\w+) function=grace_ender workqueue=events"
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function grace_ender"
+      },
+      "link": "key"
+    }
+  ]
+}

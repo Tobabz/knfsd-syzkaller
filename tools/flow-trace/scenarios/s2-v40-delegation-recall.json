@@ -1,0 +1,275 @@
+{
+  "scenario": "S2 v4.0 read delegation grant and recall over a separate callback connection",
+  "nfs_version": "4.0",
+  "stimulus": "bundle/corpus/nfs-normal/deleg-recall-v40-tcp.prog",
+  "transitions": [
+    {
+      "id": "S2-01",
+      "flow": "NF-A1",
+      "text": "client syscall task sends a request; nfsd thread starts svc_process with the same xid",
+      "submit": {
+        "event": "xprt_transmit",
+        "comm": "^syz",
+        "detail": "xid=(?P<k>0x[0-9a-f]+)"
+      },
+      "execute": {
+        "event": "svc_process",
+        "comm": "^nfsd$",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) service=nfsd "
+      },
+      "link": "key"
+    },
+    {
+      "id": "S2-02",
+      "flow": "NF-D3",
+      "specific": true,
+      "text": "nfsd thread handling the conflicting OPEN calls nfsd_break_deleg_cb in the same task",
+      "submit": {
+        "event": "svc_process",
+        "comm": "^nfsd$",
+        "detail": "service=nfsd "
+      },
+      "execute": {
+        "event": "break_deleg",
+        "comm": "^nfsd$"
+      },
+      "link": "order",
+      "same_task_ok": true,
+      "within_us": 5000
+    },
+    {
+      "id": "S2-03",
+      "flow": "NF-D3",
+      "specific": true,
+      "text": "nfsd thread queues nfsd4_run_cb_work (CB_RECALL); a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^nfsd$",
+        "detail": "work struct=(?P<k>\\w+) function=nfsd4_run_cb_work workqueue=nfsd4_callbacks",
+        "after": {
+          "rule": "S2-02",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function nfsd4_run_cb_work"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S2-04",
+      "flow": "NF-D1",
+      "specific": true,
+      "text": "callback kworker queues the CB rpc_task on rpciod; rpciod runs rpc_async_schedule",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^kworker/",
+        "detail": "work struct=(?P<k>\\w+) function=rpc_async_schedule workqueue=rpciod",
+        "after": {
+          "rule": "S2-03",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function rpc_async_schedule"
+      },
+      "link": "key",
+      "same_task_ok": true
+    },
+    {
+      "id": "S2-05",
+      "flow": "NF-F5",
+      "specific": true,
+      "text": "server sends CB_RECALL; the client callback svc thread runs svc_process with the same xid (v4.0: own TCP connection; v4.1: session backchannel)",
+      "submit": {
+        "event": "xprt_transmit",
+        "comm": "^kworker/",
+        "detail": "xid=(?P<k>0x[0-9a-f]+)",
+        "after": {
+          "rule": "S2-04",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "svc_process",
+        "comm": "^NFSv4 callback$",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) service=NFSv4 callback"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S2-06",
+      "flow": "NF-F5",
+      "specific": true,
+      "text": "callback socket data_ready (softirq, inside the sender) enqueues the transport; the client callback svc thread dequeues it (separate callback connection: v4.0 only)",
+      "submit": {
+        "event": "svc_xprt_enqueue",
+        "ctx": "softirq",
+        "detail": "server=(?P<s>\\S+) client=(?P<k>\\S+)",
+        "after": {
+          "rule": "S2-04",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "svc_xprt_dequeue",
+        "comm": "^NFSv4 callback$",
+        "detail": "server=(?P<s>\\S+) client=(?P<k>\\S+)"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S2-07",
+      "flow": "NF-F3",
+      "specific": true,
+      "text": "client callback svc thread handles CB_RECALL; the state manager kthread starts",
+      "submit": {
+        "event": "cb_recall_client",
+        "comm": "^NFSv4 callback$"
+      },
+      "execute": {
+        "event": "state_manager",
+        "comm": "-manag"
+      },
+      "link": "order"
+    },
+    {
+      "id": "S2-08",
+      "flow": "NF-F6",
+      "specific": true,
+      "text": "state manager queues the DELEGRETURN rpc_task on rpciod; rpciod runs rpc_async_schedule",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "-manag",
+        "detail": "work struct=(?P<k>\\w+) function=rpc_async_schedule workqueue=rpciod",
+        "after": {
+          "rule": "S2-07",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function rpc_async_schedule"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S2-09",
+      "flow": "NF-F6",
+      "specific": true,
+      "text": "rpciod sends DELEGRETURN; an nfsd thread runs svc_process with the same xid",
+      "submit": {
+        "event": "xprt_transmit",
+        "comm": "^kworker/",
+        "detail": "xid=(?P<k>0x[0-9a-f]+)",
+        "after": {
+          "rule": "S2-08",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "svc_process",
+        "comm": "^nfsd$",
+        "detail": "xid=(?P<k>0x[0-9a-f]+) service=nfsd "
+      },
+      "link": "key"
+    },
+    {
+      "id": "S2-10",
+      "flow": "NF-D1",
+      "specific": true,
+      "text": "CB reply: callback socket (softirq) queues xs_stream_data_receive_workfn on xprtiod; a kworker runs it",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "ctx": "softirq",
+        "detail": "work struct=(?P<k>\\w+) function=xs_stream_data_receive_workfn workqueue=xprtiod",
+        "after": {
+          "rule": "S2-05",
+          "side": "execute",
+          "window_us": 2000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function xs_stream_data_receive_workfn"
+      },
+      "link": "key"
+    },
+    {
+      "id": "S2-11",
+      "flow": "NF-D1",
+      "specific": true,
+      "text": "xprtiod worker wakes the CB rpc_task; rpciod runs nfsd4_cb_done",
+      "submit": {
+        "event": "workqueue_queue_work",
+        "comm": "^kworker/",
+        "detail": "work struct=(?P<k>\\w+) function=rpc_async_schedule workqueue=rpciod",
+        "after": {
+          "rule": "S2-10",
+          "side": "execute",
+          "window_us": 1000,
+          "same_task": true
+        }
+      },
+      "execute": {
+        "event": "workqueue_execute_start",
+        "comm": "^kworker/",
+        "detail": "work struct (?P<k>\\w+): function rpc_async_schedule"
+      },
+      "link": "key",
+      "same_task_ok": true
+    },
+    {
+      "id": "S2-12",
+      "flow": "NF-D1",
+      "text": "CB_NULL probe: nfsd thread submits the probe; the callback kworker runs nfsd4_run_cb_work",
+      "submit": {
+        "event": "nfsd_cb_probe",
+        "comm": "^nfsd$"
+      },
+      "execute": {
+        "event": "cb_run",
+        "comm": "^kworker/"
+      },
+      "link": "order",
+      "within_us": 2000
+    },
+    {
+      "id": "S2-13",
+      "flow": "NF-F5",
+      "specific": true,
+      "text": "callback kworker sets up the callback client (proto=tcp); the client NFSv4 callback thread accepts the new connection",
+      "submit": {
+        "event": "nfsd_cb_setup",
+        "comm": "^kworker/",
+        "detail": "proto=tcp"
+      },
+      "execute": {
+        "event": "svc_xprt_accept",
+        "comm": "^NFSv4 callback$",
+        "detail": "service=NFSv4 callback"
+      },
+      "link": "order",
+      "within_us": 5000
+    }
+  ]
+}

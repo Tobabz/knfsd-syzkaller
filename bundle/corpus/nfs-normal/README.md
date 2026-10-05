@@ -1,6 +1,7 @@
 # Normal NFS syzkaller corpus
 
-This directory contains four parser-checked NFSv4/TCP inputs. The current
+This directory contains six parser-checked TCP inputs: one NFSv3, one NFSv4.0
+and four NFSv4.1/4.2. The current
 [flow scope and completion criteria](../../../report/normal-flow-corpus.md)
 describe their targets and gaps. `manifest.json` records each seed's hash,
 version, fixture, functional oracle and execution status.
@@ -111,7 +112,14 @@ seed shown above.
 | `basic-v41-tcp.prog` | knfsd v4.1/TCP, two clients | 34 calls; peer lock conflict at call 14 returns errno 11, other calls return 0; create/read/write/rename/unlink work across both mounts | One KASAN snapshot passed; knfsd remote `.extra` was nonempty. No request handoff trace. |
 | `basic-v41-ganesha-tcp.prog` | Ganesha v4.1/TCP, two clients | Same 34-call errno and file-operation oracle | One KASAN snapshot passed; client-kernel KCOV was present. Ganesha user-space coverage was not collected. |
 | `async-copy-v42-tcp.prog` | knfsd v4.2/TCP COPY | 11 calls, 32 MiB `copy_file_range` return and successful close/fsync | One KASAN snapshot passed with nonempty `.extra`. The current fixture has no direct callback or handoff trace for this run. |
-| `delegation-recall-v41-tcp.prog` | knfsd v4.1/TCP delegation conflict | Delegation grant, ordered recall, client ACK and return | Input is present; the full callback/backchannel chain has not been revalidated with the current fixture. |
+| `delegation-recall-v41-tcp.prog` | knfsd v4.1/TCP delegation conflict | Delegation grant, ordered recall, client ACK and return | One KASAN execution on 2026-10-05; the recall and return chain over the session backchannel was observed in trace events (S3b in the thread report). |
+| `basic-v3-tcp.prog` | knfsd v3/TCP, two clients | 25 calls, all errno 0. No `flock`: the v3 mounts use `nolock`, so `flock` is client-local and no peer conflict occurs. | One KASAN execution on 2026-10-05 completed 25 calls. Thread transitions S1-01 to S1-11 were observed. NLM locking is not reached (`nolock`, no `rpc.statd`). |
+| `deleg-recall-v40-tcp.prog` | knfsd v4.0/TCP delegation conflict | 16 calls, all errno 0. Client0 opens read-only; client1 opens for write and its first OPEN is delayed (`NFS4ERR_DELAY`) until the recall completes. | One KASAN execution on 2026-10-05 completed 16 calls. Thread transitions S2-01 to S2-13 were observed, including the separate callback connection. |
+
+Thread transitions are judged from kernel trace events, not from PCs. The rules, the
+judge and the recorded evidence are described in the
+[thread-transition report](../../../report/normal-flow-threads.md); the tools are in
+`tools/flow-trace/`.
 
 ## Parser and measurement limits
 
@@ -126,8 +134,9 @@ pass does not prove a VM execution. A nonempty `.extra` demonstrates collected
 kernel coverage; it does not identify every RPC or prove a cross-thread
 handoff. Ganesha user-space coverage requires a different feedback channel.
 
-The [flow scope](../../../report/normal-flow-corpus.md) lists NF-B1/B2 and
-NF-E1–E5 as missing an input or event-bound fixture. The current lane fixture
-passed basic mounts and cross-client reads/writes for NFSv3 and NFSv4.0, but
-their normal-flow seeds and oracles are not included in this corpus. NFSv2,
-UDP, RPC-over-RDMA, LOCALIO and NAT remain outside the verified execution scope.
+The [flow scope](../../../report/normal-flow-corpus.md) lists the state of each
+flow. The periodic and state-lifetime work (NF-B2, NF-E1–E4) is judged with the
+shell script `tools/flow-trace/stimulus/s4-state-lifetime.sh`, not with a seed:
+the enabled syscalls have no `nanosleep`, and the client renews its lease
+automatically. NF-E5 and NF-G2 are not reached. NFSv2, UDP, RPC-over-RDMA,
+LOCALIO and NAT remain outside the verified execution scope.

@@ -1,0 +1,359 @@
+{
+  "_comment": "Marker for each execution subject. A subject counts as observed in a trace when an event with this name, comm and detail exists. 'ctx' is task or softirq.",
+  "subjects": [
+    {
+      "id": "R1",
+      "name": "rpciod workqueue",
+      "marker": {
+        "event": "workqueue_queue_work",
+        "detail": "workqueue=rpciod"
+      }
+    },
+    {
+      "id": "R2",
+      "name": "xprtiod workqueue",
+      "marker": {
+        "event": "workqueue_queue_work",
+        "detail": "workqueue=xprtiod"
+      }
+    },
+    {
+      "id": "R3",
+      "name": "synchronous RPC caller task",
+      "marker": {
+        "event": "rpc_task_sync_sleep"
+      }
+    },
+    {
+      "id": "R4",
+      "name": "rpc_wait_queue timeout work",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function __rpc_queue_timer_fn"
+      }
+    },
+    {
+      "id": "R5",
+      "name": "xprt autoclose work",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function xprt_autoclose"
+      }
+    },
+    {
+      "id": "K1",
+      "name": "nfsd service thread",
+      "marker": {
+        "event": "svc_process",
+        "comm": "^nfsd$",
+        "detail": "service=nfsd"
+      }
+    },
+    {
+      "id": "K1a",
+      "name": "nfsd service thread start",
+      "marker": {
+        "event": "nfsd_main",
+        "comm": "^nfsd$"
+      }
+    },
+    {
+      "id": "K2",
+      "name": "server socket data_ready (softirq)",
+      "marker": {
+        "event": "svc_xprt_enqueue",
+        "ctx": "softirq"
+      }
+    },
+    {
+      "id": "K3",
+      "name": "server accept",
+      "marker": {
+        "event": "svc_xprt_accept"
+      }
+    },
+    {
+      "id": "K4",
+      "name": "nfsd4_callbacks workqueue",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function nfsd4_run_cb_work"
+      }
+    },
+    {
+      "id": "K5",
+      "name": "callback rpc_task (server as RPC client)",
+      "marker": {
+        "event": "rpc_request",
+        "detail": "nfs4_cbv1"
+      }
+    },
+    {
+      "id": "K6",
+      "name": "laundromat",
+      "marker": {
+        "event": "laundromat"
+      }
+    },
+    {
+      "id": "K7",
+      "name": "client state shrinker worker",
+      "marker": {
+        "event": "state_shrinker"
+      }
+    },
+    {
+      "id": "K8",
+      "name": "filecache laundrette",
+      "marker": {
+        "event": "filecache_gc"
+      }
+    },
+    {
+      "id": "K8a",
+      "name": "filecache dispose by nfsd thread",
+      "marker": {
+        "event": "file_dispose",
+        "comm": "^nfsd$"
+      }
+    },
+    {
+      "id": "K9",
+      "name": "delegation break (lease manager)",
+      "marker": {
+        "event": "break_deleg"
+      }
+    },
+    {
+      "id": "K10",
+      "name": "copy thread kthread",
+      "marker": {
+        "event": "async_copy_thread",
+        "comm": "^copy thread$"
+      }
+    },
+    {
+      "id": "K11",
+      "name": "cache upcall to rpc.mountd",
+      "marker": {
+        "event": "cache_entry_upcall"
+      }
+    },
+    {
+      "id": "K11a",
+      "name": "cache revisit in the downcall process",
+      "marker": {
+        "event": "cache_revisit",
+        "comm": "mountd"
+      }
+    },
+    {
+      "id": "K12",
+      "name": "cache_cleaner work",
+      "marker": {
+        "event": "cache_clean"
+      }
+    },
+    {
+      "id": "K13",
+      "name": "nfsdcld downcall",
+      "marker": {
+        "event": "cld_down",
+        "comm": "nfsdcld"
+      }
+    },
+    {
+      "id": "K1b",
+      "name": "nfsd thread wakes the waiting CB rpc_task (CB reply, v4.1+)",
+      "marker": {
+        "event": "rpc_task_wakeup",
+        "comm": "^nfsd$",
+        "detail": "queue=xprt_pending"
+      }
+    },
+    {
+      "id": "C1",
+      "name": "syscall task issuing RPC",
+      "marker": {
+        "event": "xprt_transmit",
+        "comm": "^(?!kworker|nfsd|NFSv4|copy thread|nfs-proxy|.*-manag)"
+      }
+    },
+    {
+      "id": "C2",
+      "name": "nfsiod workqueue (rpc release)",
+      "marker": {
+        "event": "workqueue_queue_work",
+        "detail": "workqueue=nfsiod"
+      }
+    },
+    {
+      "id": "C3",
+      "name": "xprtiod receive worker",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function xs_stream_data_receive_workfn"
+      }
+    },
+    {
+      "id": "C3a",
+      "name": "client socket data_ready (softirq)",
+      "marker": {
+        "event": "xs_data_ready",
+        "ctx": "softirq"
+      }
+    },
+    {
+      "id": "C4",
+      "name": "NFSv4 state manager kthread",
+      "marker": {
+        "event": "state_manager"
+      }
+    },
+    {
+      "id": "C5",
+      "name": "lease renewal work (cl_renewd)",
+      "marker": {
+        "event": "renewd"
+      }
+    },
+    {
+      "id": "C6",
+      "name": "NFSv4 callback svc thread",
+      "marker": {
+        "event": "svc_process",
+        "comm": "^NFSv4 callback$"
+      }
+    },
+    {
+      "id": "C7",
+      "name": "backchannel request enqueue",
+      "marker": {
+        "event": "bc_enqueue"
+      }
+    },
+    {
+      "id": "C8",
+      "name": "writeback flusher",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function wb_workfn"
+      }
+    },
+    {
+      "id": "L1",
+      "name": "lockd kthread",
+      "marker": {
+        "event": "lockd_main",
+        "comm": "^lockd$"
+      }
+    },
+    {
+      "id": "L2",
+      "name": "rpcbind registration",
+      "marker": {
+        "event": "rpcb_register"
+      }
+    },
+    {
+      "id": "L3",
+      "name": "lockd grace_ender work",
+      "marker": {
+        "event": "grace_end"
+      }
+    },
+    {
+      "id": "L4",
+      "name": "NLM grant callback",
+      "marker": {
+        "event": "grant_cb"
+      }
+    },
+    {
+      "id": "L5",
+      "name": "lockd retry of blocked locks",
+      "marker": {
+        "event": "lockd_retry"
+      }
+    },
+    {
+      "id": "K14",
+      "name": "grace period end (nfsd_grace_complete in the control task)",
+      "marker": {
+        "event": "nfsd_grace_complete"
+      }
+    },
+    {
+      "id": "K15",
+      "name": "procfs control write (threads, ports)",
+      "marker": {
+        "event": "nfsd_ctl_threads"
+      }
+    },
+    {
+      "id": "R2a",
+      "name": "xprtiod connect worker",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function xs_tcp_setup_socket"
+      }
+    },
+    {
+      "id": "R2b",
+      "name": "xprtiod error worker",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function xs_error_handle"
+      }
+    },
+    {
+      "id": "R2c",
+      "name": "rpc_async_schedule run on xprtiod (write-lock handover)",
+      "marker": {
+        "event": "workqueue_queue_work",
+        "detail": "function=rpc_async_schedule workqueue=xprtiod"
+      }
+    },
+    {
+      "id": "C2a",
+      "name": "nfsiod rpc_async_release",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function rpc_async_release"
+      }
+    },
+    {
+      "id": "C2b",
+      "name": "LOCALIO probe work on nfsiod",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function nfs_local_probe_async_work"
+      }
+    },
+    {
+      "id": "C10",
+      "name": "mount task issuing MOUNT RPC",
+      "marker": {
+        "event": "rpc_request",
+        "comm": "^mount",
+        "detail": "mountv3 MOUNT"
+      }
+    },
+    {
+      "id": "C10a",
+      "name": "umount task issuing RPC",
+      "marker": {
+        "event": "rpc_request",
+        "comm": "^umount"
+      }
+    },
+    {
+      "id": "C10b",
+      "name": "client teardown work (rpc_free_client_work)",
+      "marker": {
+        "event": "workqueue_execute_start",
+        "detail": "function rpc_free_client_work"
+      }
+    }
+  ]
+}

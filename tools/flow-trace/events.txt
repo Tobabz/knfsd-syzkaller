@@ -1,0 +1,83 @@
+# Trace events and kprobes recorded by capture.py.
+# 'event group:name' enables one tracepoint ('group:*' enables the group).
+# 'kprobe label symbol' attaches an entry kprobe where no tracepoint exists.
+# Each name was checked against the headers of kernel 25456a766.
+
+# Submit and execute of every workqueue item
+event workqueue:workqueue_queue_work
+event workqueue:workqueue_execute_start
+
+# SUNRPC server: socket to nfsd thread
+event sunrpc:svc_xprt_enqueue
+event sunrpc:svc_xprt_dequeue
+event sunrpc:svc_process
+event sunrpc:svc_send
+event sunrpc:svc_defer
+event sunrpc:svc_drop
+event sunrpc:svc_revisit_deferred
+event sunrpc:cache_entry_*
+event sunrpc:svcsock_marker
+event sunrpc:svc_xprt_accept
+event sunrpc:svc_xprt_create_err
+event sunrpc:rpcb_register
+
+# SUNRPC client: task state machine and transport
+event sunrpc:rpc_request
+event sunrpc:rpc_task_*
+event sunrpc:xprt_transmit
+event sunrpc:xs_data_ready
+event sunrpc:xs_stream_read_request
+event sunrpc:rpc_socket_nospace
+
+# nfsd: compound, callback, copy, grace, filecache (globs: names come from macros)
+event nfsd:nfsd_compound
+event nfsd:nfsd_cb_*
+event nfsd:nfsd_copy_*
+event nfsd:nfsd_end_grace
+event nfsd:nfsd_grace_*
+event nfsd:nfsd_ctl_*
+event lockd:*
+event nfsd:nfsd_file_gc_*
+event nfsd:nfsd_file_close
+event nfsd:nfsd_mark_client_expired
+event nfsd:nfsd_delegret_wakeup
+event nfsd:nfsd_drc_found
+
+# NFS client: state manager, callbacks, delegation, copy
+event nfs4:nfs4_state_mgr
+event nfs4:nfs4_cb_*
+event nfs4:nfs4_delegreturn_exit
+event nfs4:nfs4_*delegation*
+event nfs4:nfs4_copy
+event nfs4:nfs4_sequence_done
+event nfs4:nfs4_xdr_bad_operation
+
+# Functions without a tracepoint
+kprobe laundromat laundromat_main
+kprobe state_shrinker nfsd4_state_shrinker_worker
+kprobe async_copy_thread nfsd4_do_async_copy
+kprobe copy_submit nfsd4_copy
+kprobe cb_run nfsd4_run_cb_work
+kprobe break_deleg nfsd_break_deleg_cb
+kprobe cb_reply receive_cb_reply
+kprobe file_dispose nfsd_file_net_dispose
+kprobe filecache_gc nfsd_file_gc_worker
+kprobe cache_revisit cache_revisit_request
+kprobe cache_clean do_cache_clean
+kprobe svc_revisit_fn svc_revisit
+kprobe lockd_main lockd
+kprobe lockd_retry nlmsvc_retry_blocked
+kprobe grant_cb nlmsvc_grant_callback
+kprobe grace_end grace_ender
+kprobe cld_down cld_pipe_downcall
+kprobe cld_up __cld_pipe_upcall
+kprobe state_manager nfs4_run_state_manager
+kprobe renewd nfs4_renew_state
+kprobe cb_svc_thread nfs4_callback_svc
+kprobe cb_compound nfs4_callback_compound
+kprobe bc_complete xprt_complete_bc_request
+kprobe bc_enqueue xprt_enqueue_bc_request
+kprobe bc_process svc_process_bc
+kprobe cb_recall_client nfs4_callback_recall
+kprobe rpc_release_async rpc_async_release
+kprobe nfsd_main nfsd
