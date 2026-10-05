@@ -1,0 +1,1257 @@
+From 2f0acf4dc463c972b38a82c362d4a187276c3013 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Mon, 5 Oct 2026 20:59:51 +0900
+Subject: [PATCH 4/4] sunrpc: attribute NFSv4.1 server callbacks to the program
+ that caused them
+
+A callback runs long after the request that caused it has replied, in a
+workqueue worker and in rpciod, so none of it was covered by the request's
+remote section.  A missing PC could not be read as "not executed".
+
+Record the program behind a callback when it is queued, from the section the
+caller is running, and open a short remote section for each step of it.
+
+The record holds a generation reference and no outstanding Token.  A pending
+callback therefore never delays FINISH.  Each section mints its own Token and
+Ticket from that reference and is refused once the generation is closing,
+committed or aborted; the late work is counted, not attributed to whichever
+generation is open at that moment.  The first owner of a callback wins when
+events merge into one.
+
+kcov: kcov_request_token_generation_get() and
+kcov_request_try_get_section_token() create the reference and the Token; the
+section helpers look at the section the current task runs, so a nested call
+for the same owner joins it instead of starting a second Ticket.
+
+sunrpc: the owner is carried on the rpc_task.  __rpc_execute() opens a section
+around each FSM step, and the resource release and the calldata release open
+one too.  receive_cb_reply() collects the reply for the owner of the matching
+request; it leaves queue_lock with the request pinned to start the section and
+checks the request again afterwards.  rpc_free_task() reads the owner before
+the release op because the task can be embedded in its calldata.
+
+nfsd: nfsd4_run_cb() stores the owner, nfsd4_run_cb_work() runs inside a
+section, and nfsd41_destroy_cb() detaches the owner before RUNNING is cleared.
+
+Also add kcov_request_handle_id() so lane_owner_work() builds without
+CONFIG_KCOV.  Selftests cover the Token and Ticket life cycle.
+---
+ fs/nfsd/nfs4callback.c       |  60 +++++++++-
+ fs/nfsd/state.h              |   4 +
+ include/linux/kcov.h         |  42 +++++++
+ include/linux/sunrpc/clnt.h  |   5 +
+ include/linux/sunrpc/fuzz.h  |  26 +++++
+ include/linux/sunrpc/sched.h |   4 +
+ kernel/kcov.c                | 150 ++++++++++++++++++++++++-
+ kernel/kcov_request.c        | 187 ++++++++++++++++++++++++++++++-
+ net/sunrpc/clnt.c            |  17 ++-
+ net/sunrpc/fuzz.c            | 207 ++++++++++++++++++++++++++++++++++-
+ net/sunrpc/sched.c           |  24 ++++
+ net/sunrpc/svcsock.c         |  24 ++++
+ 12 files changed, 734 insertions(+), 16 deletions(-)
+ mode change 100755 => 100644 net/sunrpc/fuzz.c
+
+diff --git a/fs/nfsd/nfs4callback.c b/fs/nfsd/nfs4callback.c
+index 19dc33750..8e3df1e48 100644
+--- a/fs/nfsd/nfs4callback.c
++++ b/fs/nfsd/nfs4callback.c
+@@ -35,6 +35,7 @@
+ #include <linux/sunrpc/clnt.h>
+ #include <linux/sunrpc/xprt.h>
+ #include <linux/sunrpc/svc_xprt.h>
++#include <linux/sunrpc/fuzz.h>
+ #include <linux/slab.h>
+ #include "nfsd.h"
+ #include "state.h"
+@@ -1438,7 +1439,15 @@ static void nfsd41_cb_release_slot(struct nfsd4_callback *cb)
+ static void nfsd41_destroy_cb(struct nfsd4_callback *cb)
+ {
+ 	struct nfs4_client *clp = cb->cb_clp;
++	struct sunrpc_fuzz_cb_section fuzz_section;
++	struct sunrpc_fuzz_cb_owner *fuzz_owner;
+ 
++	/*
++	 * Detach the owner before RUNNING is cleared: from then on a new
++	 * submission may attach its own.  A retry does not come through here,
++	 * so it keeps the owner.
++	 */
++	fuzz_owner = xchg(&cb->cb_fuzz_owner, NULL);
+ 	trace_nfsd_cb_destroy(clp, cb);
+ 	nfsd41_cb_release_slot(cb);
+ 	if (test_bit(NFSD4_CALLBACK_WAKE, &cb->cb_flags))
+@@ -1456,9 +1465,13 @@ static void nfsd41_destroy_cb(struct nfsd4_callback *cb)
+ 	 */
+ 	smp_mb__after_atomic();
+ 
++	/* ->release() may free @cb; the section and owner do not depend on it. */
++	sunrpc_fuzz_cb_section_start(fuzz_owner, &fuzz_section);
+ 	if (cb->cb_ops && cb->cb_ops->release)
+ 		cb->cb_ops->release(cb);
++	sunrpc_fuzz_cb_section_stop(&fuzz_section);
+ 	nfsd41_cb_inflight_end(clp);
++	sunrpc_fuzz_cb_owner_put(fuzz_owner);
+ }
+ 
+ /**
+@@ -1846,10 +1859,9 @@ static void nfsd4_process_cb_update(struct nfsd4_callback *cb)
+ }
+ 
+ static void
+-nfsd4_run_cb_work(struct work_struct *work)
++__nfsd4_run_cb_work(struct nfsd4_callback *cb,
++		    struct sunrpc_fuzz_cb_owner *fuzz_owner)
+ {
+-	struct nfsd4_callback *cb =
+-		container_of(work, struct nfsd4_callback, cb_work);
+ 	struct nfs4_client *clp = cb->cb_clp;
+ 	struct rpc_clnt *clnt;
+ 	int flags, ret;
+@@ -1888,14 +1900,35 @@ nfsd4_run_cb_work(struct work_struct *work)
+ 
+ 	cb->cb_msg.rpc_cred = clp->cl_cb_cred;
+ 	flags = clp->cl_minorversion ? RPC_TASK_NOCONNECT : RPC_TASK_SOFTCONN;
+-	ret = rpc_call_async(clnt, &cb->cb_msg, RPC_TASK_SOFT | flags,
+-			     cb->cb_ops ? &nfsd4_cb_ops : &nfsd4_cb_probe_ops, cb);
++	ret = rpc_call_async_owner(clnt, &cb->cb_msg, RPC_TASK_SOFT | flags,
++				   cb->cb_ops ? &nfsd4_cb_ops :
++						&nfsd4_cb_probe_ops,
++				   cb, fuzz_owner);
+ 	if (ret != 0) {
+ 		set_bit(NFSD4_CALLBACK_REQUEUE, &cb->cb_flags);
+ 		nfsd4_queue_cb(cb);
+ 	}
+ }
+ 
++static void
++nfsd4_run_cb_work(struct work_struct *work)
++{
++	struct nfsd4_callback *cb =
++		container_of(work, struct nfsd4_callback, cb_work);
++	struct sunrpc_fuzz_cb_section fuzz_section;
++	struct sunrpc_fuzz_cb_owner *fuzz_owner;
++
++	/*
++	 * The body may hand @cb to the RPC task, whose release can free it, so
++	 * hold the owner here and do not touch @cb after the call.
++	 */
++	fuzz_owner = sunrpc_fuzz_cb_owner_get(READ_ONCE(cb->cb_fuzz_owner));
++	sunrpc_fuzz_cb_section_start(fuzz_owner, &fuzz_section);
++	__nfsd4_run_cb_work(cb, fuzz_owner);
++	sunrpc_fuzz_cb_section_stop(&fuzz_section);
++	sunrpc_fuzz_cb_owner_put(fuzz_owner);
++}
++
+ void nfsd4_init_cb(struct nfsd4_callback *cb, struct nfs4_client *clp,
+ 		const struct nfsd4_callback_ops *ops, enum nfsd4_cb_op op)
+ {
+@@ -1908,6 +1941,7 @@ void nfsd4_init_cb(struct nfsd4_callback *cb, struct nfs4_client *clp,
+ 	INIT_WORK(&cb->cb_work, nfsd4_run_cb_work);
+ 	cb->cb_status = 0;
+ 	cb->cb_held_slot = -1;
++	cb->cb_fuzz_owner = NULL;
+ 	cb->cb_nr_referring_call_list = 0;
+ 	INIT_LIST_HEAD(&cb->cb_referring_call_list);
+ }
+@@ -1925,10 +1959,26 @@ bool nfsd4_run_cb(struct nfsd4_callback *cb)
+ 	struct nfsd_net *nn = net_generic(clp->net, nfsd_net_id);
+ 	const struct nfsd4_callback_ops *ops = cb->cb_ops;
+ 	u32 minorversion = clp->cl_minorversion;
++	struct sunrpc_fuzz_cb_owner *fuzz_owner;
+ 	bool queued;
+ 
++	/*
++	 * Record the program behind this callback if the caller runs a
++	 * section.  The first owner wins: a callback that already carries one
++	 * keeps it, and events merged into it are not attributed separately.
++	 * GFP_ATOMIC because callers may hold spinlocks.
++	 */
++	fuzz_owner = sunrpc_fuzz_cb_owner_save_current(clp->net, GFP_ATOMIC);
++	if (fuzz_owner &&
++	    cmpxchg(&cb->cb_fuzz_owner, NULL, fuzz_owner)) {
++		sunrpc_fuzz_cb_owner_put(fuzz_owner);
++		fuzz_owner = NULL;
++	}
+ 	nfsd41_cb_inflight_begin(clp);
+ 	queued = nfsd4_queue_cb(cb);
++	if (!queued && fuzz_owner &&
++	    cmpxchg(&cb->cb_fuzz_owner, fuzz_owner, NULL) == fuzz_owner)
++		sunrpc_fuzz_cb_owner_put(fuzz_owner);
+ 	if (queued) {
+ 		if (ops) {
+ 			nfsd_stats_cb_op_inc(nn, ops->opcode);
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index 2d00a411c..489a84759 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -82,6 +82,8 @@ struct nfsd4_referring_call_list {
+ 	struct list_head	rcl_referring_calls;
+ };
+ 
++struct sunrpc_fuzz_cb_owner;
++
+ struct nfsd4_callback {
+ 	struct nfs4_client *cb_clp;
+ 	struct rpc_message cb_msg;
+@@ -94,6 +96,8 @@ struct nfsd4_callback {
+ 	int cb_seq_status;
+ 	int cb_status;
+ 	int cb_held_slot;
++	/* Program that caused this callback; kept until the final release. */
++	struct sunrpc_fuzz_cb_owner *cb_fuzz_owner;
+ 
+ 	int cb_nr_referring_call_list;
+ 	struct list_head cb_referring_call_list;
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+index 1a28501f0..b8c5c3782 100644
+--- a/include/linux/kcov.h
++++ b/include/linux/kcov.h
+@@ -282,6 +282,17 @@ bool kcov_remote_start_nfsd_observe(void);
+ void kcov_remote_stop(void);
+ struct kcov_common_handle_id kcov_common_handle(void);
+ u64 kcov_request_current_generation(u64 handle);
++struct kcov_request_generation *kcov_request_current_section_ref(
++		struct kcov_common_handle_id *owner, u64 *cookie);
++bool kcov_request_current_section_match(struct kcov_common_handle_id owner,
++		u64 cookie);
++/* Build a handle id; without KCOV the id has no members, so callers use this. */
++static inline struct kcov_common_handle_id
++kcov_request_handle_id(u64 handle, u64 generation)
++{
++	return (struct kcov_common_handle_id){
++		.val = handle, .generation = generation };
++}
+ 
+ struct kcov_request_generation *
+ kcov_request_generation_begin(u64 owner, u64 *generation);
+@@ -343,6 +354,12 @@ bool kcov_request_try_get_continuation_token(
+ 		struct kcov_request_token *parent,
+ 		enum kcov_request_token_type type,
+ 		struct kcov_request_token *token);
++struct kcov_request_generation *kcov_request_token_generation_get(
++		struct kcov_request_token *parent);
++bool kcov_request_try_get_section_token(
++		struct kcov_request_generation *generation,
++		struct kcov_common_handle_id owner, u64 request_cookie,
++		struct kcov_request_token *token);
+ bool kcov_request_token_complete_once(struct kcov_request_token *token);
+ bool kcov_request_wire_token_set_identity(struct kcov_request_token *token,
+ 		struct kcov_common_handle_id owner, u64 request_cookie);
+@@ -541,6 +558,22 @@ static inline u64 kcov_request_current_generation(u64 handle)
+ {
+ 	return 0;
+ }
++static inline struct kcov_common_handle_id
++kcov_request_handle_id(u64 handle, u64 generation)
++{
++	return (struct kcov_common_handle_id){};
++}
++static inline struct kcov_request_generation *
++kcov_request_current_section_ref(struct kcov_common_handle_id *owner,
++		u64 *cookie)
++{
++	return NULL;
++}
++static inline bool kcov_request_current_section_match(
++		struct kcov_common_handle_id owner, u64 cookie)
++{
++	return false;
++}
+ 
+ static inline bool kcov_request_root_init(struct kcov_request_root *root,
+ 		struct kcov_common_handle_id owner, u64 request_cookie)
+@@ -563,6 +596,15 @@ static inline bool kcov_request_try_get_continuation_token(
+ 		struct kcov_request_token *parent,
+ 		enum kcov_request_token_type type,
+ 		struct kcov_request_token *token) { return false; }
++static inline struct kcov_request_generation *
++kcov_request_token_generation_get(struct kcov_request_token *parent)
++{
++	return NULL;
++}
++static inline bool kcov_request_try_get_section_token(
++		struct kcov_request_generation *generation,
++		struct kcov_common_handle_id owner, u64 request_cookie,
++		struct kcov_request_token *token) { return false; }
+ static inline bool kcov_request_token_complete_once(
+ 		struct kcov_request_token *token) { return false; }
+ static inline bool kcov_request_wire_token_set_identity(
+diff --git a/include/linux/sunrpc/clnt.h b/include/linux/sunrpc/clnt.h
+index 3c2b8c355..36f9a9965 100644
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@ -214,6 +214,11 @@ int		rpc_call_async(struct rpc_clnt *clnt,
+ 			       const struct rpc_message *msg, int flags,
+ 			       const struct rpc_call_ops *tk_ops,
+ 			       void *calldata);
++int		rpc_call_async_owner(struct rpc_clnt *clnt,
++			       const struct rpc_message *msg, int flags,
++			       const struct rpc_call_ops *tk_ops,
++			       void *calldata,
++			       struct sunrpc_fuzz_cb_owner *owner);
+ int		rpc_call_sync(struct rpc_clnt *clnt,
+ 			      const struct rpc_message *msg, int flags);
+ struct rpc_task *rpc_call_null(struct rpc_clnt *clnt, struct rpc_cred *cred,
+diff --git a/include/linux/sunrpc/fuzz.h b/include/linux/sunrpc/fuzz.h
+index cd822029c..4469556e1 100755
+--- a/include/linux/sunrpc/fuzz.h
++++ b/include/linux/sunrpc/fuzz.h
+@@ -8,6 +8,7 @@
+ struct net;
+ struct kcov_request_remote_ticket;
+ struct sunrpc_fuzz_saved_work;
++struct sunrpc_fuzz_cb_owner;
+ struct svc_rqst;
+ struct svc_xprt;
+ 
+@@ -17,6 +18,16 @@ enum sunrpc_fuzz_saved_start_result {
+ 	SUNRPC_FUZZ_SAVED_NESTED,
+ };
+ 
++/*
++ * One execution section of a callback (a task step, a reply, a release).
++ * It lives on the caller's stack and must be stopped in the same context.
++ */
++struct sunrpc_fuzz_cb_section {
++	struct kcov_request_token token;
++	struct kcov_request_remote_ticket *ticket;
++	bool shared;	/* the current task already runs this owner's section */
++};
++
+ void sunrpc_fuzz_init(void);
+ void sunrpc_fuzz_exit(void);
+ 
+@@ -47,4 +58,19 @@ enum sunrpc_fuzz_saved_start_result sunrpc_fuzz_saved_work_start(
+ void sunrpc_fuzz_saved_work_stop(struct sunrpc_fuzz_saved_work **savedp,
+ 		struct kcov_request_remote_ticket **ticketp);
+ 
++/*
++ * Callbacks: the owner records which program caused a callback.  It holds a
++ * generation reference but no outstanding Token, so a pending callback never
++ * delays FINISH.  Each execution section mints its own Token and Ticket.
++ */
++struct sunrpc_fuzz_cb_owner *sunrpc_fuzz_cb_owner_save_current(
++		struct net *net, gfp_t gfp);
++struct sunrpc_fuzz_cb_owner *sunrpc_fuzz_cb_owner_get(
++		struct sunrpc_fuzz_cb_owner *owner);
++void sunrpc_fuzz_cb_owner_put(struct sunrpc_fuzz_cb_owner *owner);
++enum sunrpc_fuzz_saved_start_result sunrpc_fuzz_cb_section_start(
++		struct sunrpc_fuzz_cb_owner *owner,
++		struct sunrpc_fuzz_cb_section *section);
++void sunrpc_fuzz_cb_section_stop(struct sunrpc_fuzz_cb_section *section);
++
+ #endif /* _LINUX_SUNRPC_FUZZ_H */
+diff --git a/include/linux/sunrpc/sched.h b/include/linux/sunrpc/sched.h
+index 0dbdf3722..ab93491d2 100644
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@ -51,6 +51,8 @@ struct rpc_timeout {
+ /*
+  * This is the RPC task struct
+  */
++struct sunrpc_fuzz_cb_owner;
++
+ struct rpc_task {
+ 	atomic_t		tk_count;	/* Reference count */
+ 	int			tk_status;	/* result of last operation */
+@@ -91,6 +93,7 @@ struct rpc_task {
+ 	ktime_t			tk_start;	/* RPC task init timestamp */
+ 
+ 	pid_t			tk_owner;	/* Process id for batching tasks */
++	struct sunrpc_fuzz_cb_owner *tk_fuzz_owner; /* program behind this call */
+ 
+ 	int			tk_rpc_status;	/* Result of last RPC operation */
+ 	unsigned short		tk_flags;	/* misc flags */
+@@ -118,6 +121,7 @@ struct rpc_task_setup {
+ 	const struct rpc_message *rpc_message;
+ 	const struct rpc_call_ops *callback_ops;
+ 	void *callback_data;
++	struct sunrpc_fuzz_cb_owner *fuzz_owner;
+ 	struct workqueue_struct *workqueue;
+ 	unsigned short flags;
+ 	signed char priority;
+diff --git a/kernel/kcov.c b/kernel/kcov.c
+index 000d88b01..9aad23001 100644
+--- a/kernel/kcov.c
++++ b/kernel/kcov.c
+@@ -2124,6 +2124,69 @@ void kcov_request_remote_ticket_put(
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_remote_ticket_put);
+ 
++/* Pin the section the current task is running, if any. */
++static struct kcov_request_remote_ticket *kcov_request_current_ticket_get(void)
++{
++	struct kcov_request_remote_ticket *ticket;
++	unsigned long flags;
++
++	if (!in_task())
++		return NULL;
++	local_lock_irqsave(&kcov_percpu_data.lock, flags);
++	ticket = current->kcov_request_remote_ticket;
++	if (ticket && !refcount_inc_not_zero(&ticket->refs))
++		ticket = NULL;
++	local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++	if (ticket && (atomic_read(&ticket->state) !=
++			KCOV_REQUEST_TICKET_REMOTE_ACTIVE || !ticket->token)) {
++		kcov_request_remote_ticket_put(ticket);
++		ticket = NULL;
++	}
++	return ticket;
++}
++
++/*
++ * Take a generation reference from the section the current task is running
++ * and report its owner and cookie.  The token outlives the section, which the
++ * caller is inside of, so reading it here is safe.
++ */
++struct kcov_request_generation *kcov_request_current_section_ref(
++		struct kcov_common_handle_id *owner, u64 *cookie)
++{
++	struct kcov_request_remote_ticket *ticket;
++	struct kcov_request_generation *gen;
++
++	ticket = kcov_request_current_ticket_get();
++	if (!ticket)
++		return NULL;
++	gen = kcov_request_token_generation_get(ticket->token);
++	if (gen) {
++		*owner = ticket->token->owner;
++		*cookie = ticket->token->request_cookie;
++	}
++	kcov_request_remote_ticket_put(ticket);
++	return gen;
++}
++EXPORT_SYMBOL_GPL(kcov_request_current_section_ref);
++
++/* Is the current task already running a section for exactly this owner? */
++bool kcov_request_current_section_match(struct kcov_common_handle_id owner,
++		u64 cookie)
++{
++	struct kcov_request_remote_ticket *ticket;
++	bool match;
++
++	ticket = kcov_request_current_ticket_get();
++	if (!ticket)
++		return false;
++	match = ticket->token->owner.val == owner.val &&
++		ticket->token->owner.generation == owner.generation &&
++		ticket->token->request_cookie == cookie;
++	kcov_request_remote_ticket_put(ticket);
++	return match;
++}
++EXPORT_SYMBOL_GPL(kcov_request_current_section_match);
++
+ struct kcov_request_phase5_test_ctx {
+ 	struct kcov_request_generation *generation;
+ 	struct kcov_request_root root;
+@@ -2168,8 +2231,13 @@ static bool kcov_request_phase5_test_init(
+ 	return true;
+ }
+ 
+-static bool kcov_request_phase5_test_grant(
+-		struct kcov_request_phase5_test_ctx *ctx, unsigned int index)
++/*
++ * @section selects how the Token is made: a wire child of the root, or a
++ * section Token minted from the generation reference alone.
++ */
++static bool __kcov_request_phase5_test_grant(
++		struct kcov_request_phase5_test_ctx *ctx, unsigned int index,
++		bool section)
+ {
+ 	struct kcov_request_remote_ticket *ticket;
+ 	struct kcov_request_generation *generation;
+@@ -2178,11 +2246,17 @@ static bool kcov_request_phase5_test_grant(
+ 
+ 	if (index >= ARRAY_SIZE(ctx->ticket) || !ctx->kcov)
+ 		return false;
+-	if (!kcov_request_try_get_child_token(&ctx->root,
++	if (section) {
++		if (!kcov_request_try_get_section_token(ctx->generation,
++				ctx->owner, ctx->cookie[index],
++				&ctx->token[index]))
++			return false;
++	} else if (!kcov_request_try_get_child_token(&ctx->root,
+ 			KCOV_REQUEST_TOKEN_WIRE, &ctx->token[index]) ||
+-	    !kcov_request_wire_token_set_identity(&ctx->token[index],
+-			ctx->owner, ctx->cookie[index]))
++		   !kcov_request_wire_token_set_identity(&ctx->token[index],
++			ctx->owner, ctx->cookie[index])) {
+ 		return false;
++	}
+ 	ticket = kzalloc(sizeof(*ticket), GFP_KERNEL);
+ 	if (!ticket)
+ 		return false;
+@@ -2228,6 +2302,12 @@ static bool kcov_request_phase5_test_grant(
+ 	return false;
+ }
+ 
++static bool kcov_request_phase5_test_grant(
++		struct kcov_request_phase5_test_ctx *ctx, unsigned int index)
++{
++	return __kcov_request_phase5_test_grant(ctx, index, false);
++}
++
+ static void kcov_request_phase5_test_cleanup(
+ 		struct kcov_request_phase5_test_ctx *ctx)
+ {
+@@ -2254,6 +2334,64 @@ static void kcov_request_phase5_test_cleanup(
+ 	kfree(ctx->kcov);
+ }
+ 
++/*
++ * A work item that holds only a generation reference runs several sections.
++ * Each gets its own Token and Ticket, a finished Ticket cannot be restarted,
++ * and a generation that was aborted refuses further sections.
++ */
++static noinline_for_stack bool kcov_request_phase5_test_section(void)
++{
++	struct kcov_request_phase5_test_ctx ctx = {};
++	struct kcov_request_generation *ref = NULL;
++	unsigned int i;
++	bool pass = false;
++
++	if (!kcov_request_phase5_test_init(&ctx, 0xf5000018) ||
++	    !kcov_request_phase5_test_grant(&ctx, 0))
++		goto out;
++	/* A granted and claimed parent yields a generation reference. */
++	ref = kcov_request_token_generation_get(&ctx.token[0]);
++	if (ref != ctx.generation)
++		goto out;
++	if (kcov_request_remote_start_checked(ctx.ticket[0]) !=
++			KCOV_REQUEST_REMOTE_START_SUCCESS)
++		goto out;
++	kcov_request_remote_stop_checked(ctx.ticket[0]);
++
++	for (i = 0; i < 2; i++) {
++		if (ctx.ticket[1]) {
++			kcov_request_remote_ticket_put(ctx.ticket[1]);
++			ctx.ticket[1] = NULL;
++		}
++		if (!__kcov_request_phase5_test_grant(&ctx, 1, true) ||
++		    kcov_request_remote_start_checked(ctx.ticket[1]) !=
++				KCOV_REQUEST_REMOTE_START_SUCCESS)
++			goto out;
++		kcov_request_remote_stop_checked(ctx.ticket[1]);
++		if (atomic_read(&ctx.ticket[1]->state) !=
++				KCOV_REQUEST_TICKET_DONE ||
++		    ctx.ticket[1]->scratch || ctx.token[1].generation)
++			goto out;
++		/* A finished Ticket is not reusable. */
++		if (kcov_request_remote_start_checked(ctx.ticket[1]) ==
++				KCOV_REQUEST_REMOTE_START_SUCCESS)
++			goto out;
++	}
++	if (kcov_request_generation_abort(ctx.generation) ||
++	    ctx.token[1].generation)
++		goto out;
++	kcov_request_remote_ticket_put(ctx.ticket[1]);
++	ctx.ticket[1] = NULL;
++	if (__kcov_request_phase5_test_grant(&ctx, 1, true))
++		goto out;
++	pass = true;
++out:
++	if (ref)
++		kcov_request_generation_put(ref);
++	kcov_request_phase5_test_cleanup(&ctx);
++	return pass;
++}
++
+ static noinline_for_stack bool
+ kcov_request_phase5_test_mapping_classification(void)
+ {
+@@ -2387,6 +2525,8 @@ bool kcov_request_phase5_selftest(void)
+ 	kcov_request_remote_start_failed(attempted.ticket[0], true);
+ 	kcov_request_remote_stop_checked(incumbent.ticket[0]);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_SELFTEST_NESTED_CROSS);
++	if (!kcov_request_phase5_test_section())
++		goto out_cross;
+ 	pass = true;
+ out_cross:
+ 	kcov_request_phase5_test_cleanup(&attempted);
+diff --git a/kernel/kcov_request.c b/kernel/kcov_request.c
+index 3383aaec7..a37872547 100644
+--- a/kernel/kcov_request.c
++++ b/kernel/kcov_request.c
+@@ -37,6 +37,13 @@ enum request_stat {
+ 	REQUEST_ROOT_TOKEN_CANCELED,
+ 	REQUEST_CHILD_TOKEN_GRANTED,
+ 	REQUEST_CHILD_TOKEN_REJECTED,
++	REQUEST_SECTION_GEN_REF_GRANTED,
++	REQUEST_SECTION_GEN_REF_REJECTED,
++	REQUEST_SECTION_TOKEN_GRANTED,
++	REQUEST_SECTION_TOKEN_REJECTED_IDENTITY,
++	REQUEST_SECTION_TOKEN_REJECTED_CLOSING,
++	REQUEST_SECTION_TOKEN_REJECTED_ABORTED,
++	REQUEST_SECTION_TOKEN_REJECTED_FINISHED,
+ 	REQUEST_TOKEN_CREATED,
+ 	REQUEST_TOKEN_COMPLETED,
+ 	REQUEST_TOKEN_DOUBLE_COMPLETE,
+@@ -70,6 +77,7 @@ enum request_stat {
+ 	REQUEST_SELFTEST_WIRE_TOKEN_TERMINAL,
+ 	REQUEST_SELFTEST_ROOT_RELEASE_TASK,
+ 	REQUEST_SELFTEST_BEGIN_ORPHAN_ABORT,
++	REQUEST_SELFTEST_SECTION_TOKEN,
+ 	REQUEST_STAT_COUNT,
+ };
+ 
+@@ -95,6 +103,17 @@ static const char *const request_stat_names[REQUEST_STAT_COUNT] = {
+ 	[REQUEST_ROOT_TOKEN_CANCELED] = "root_token_canceled",
+ 	[REQUEST_CHILD_TOKEN_GRANTED] = "child_token_granted",
+ 	[REQUEST_CHILD_TOKEN_REJECTED] = "child_token_rejected",
++	[REQUEST_SECTION_GEN_REF_GRANTED] = "section_gen_ref_granted",
++	[REQUEST_SECTION_GEN_REF_REJECTED] = "section_gen_ref_rejected",
++	[REQUEST_SECTION_TOKEN_GRANTED] = "section_token_granted",
++	[REQUEST_SECTION_TOKEN_REJECTED_IDENTITY] =
++		"section_token_rejected_identity",
++	[REQUEST_SECTION_TOKEN_REJECTED_CLOSING] =
++		"section_token_rejected_closing",
++	[REQUEST_SECTION_TOKEN_REJECTED_ABORTED] =
++		"section_token_rejected_aborted",
++	[REQUEST_SECTION_TOKEN_REJECTED_FINISHED] =
++		"section_token_rejected_finished",
+ 	[REQUEST_TOKEN_CREATED] = "token_created",
+ 	[REQUEST_TOKEN_COMPLETED] = "token_completed",
+ 	[REQUEST_TOKEN_DOUBLE_COMPLETE] = "token_double_complete",
+@@ -135,6 +154,7 @@ static const char *const request_stat_names[REQUEST_STAT_COUNT] = {
+ 	[REQUEST_SELFTEST_ROOT_RELEASE_TASK] = "selftest_root_release_task",
+ 	[REQUEST_SELFTEST_BEGIN_ORPHAN_ABORT] =
+ 		"selftest_begin_orphan_abort",
++	[REQUEST_SELFTEST_SECTION_TOKEN] = "selftest_section_token",
+ };
+ 
+ enum request_token_completion {
+@@ -1878,6 +1898,73 @@ bool kcov_request_try_get_continuation_token(
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_try_get_continuation_token);
+ 
++/*
++ * Take a generation reference from a parent token that is currently running
++ * a granted remote section.  The reference lets a long-lived work item mint
++ * short-lived section tokens later without keeping the generation open: the
++ * work item itself owns no outstanding Token.
++ */
++struct kcov_request_generation *kcov_request_token_generation_get(
++		struct kcov_request_token *parent)
++{
++	struct kcov_request_generation *gen;
++	bool ok = false;
++
++	if (!parent || !(gen = parent->generation))
++		return NULL;
++	spin_lock(&gen->lock);
++	if (atomic_read(&parent->completed) == REQUEST_TOKEN_START_GRANTED &&
++	    parent->remote_claimed && parent->request_cookie &&
++	    gen->owner == parent->owner.val &&
++	    gen->id == parent->owner.generation &&
++	    gen->state == KCOV_REQUEST_GEN_OPEN)
++		ok = refcount_inc_not_zero(&gen->object_refs);
++	spin_unlock(&gen->lock);
++	request_stat_inc(ok ? REQUEST_SECTION_GEN_REF_GRANTED :
++			      REQUEST_SECTION_GEN_REF_REJECTED);
++	return ok ? gen : NULL;
++}
++EXPORT_SYMBOL_GPL(kcov_request_token_generation_get);
++
++/*
++ * Mint a Token for one execution section of a work item that holds only a
++ * generation reference.  The Token counts as outstanding while the section
++ * runs, so FINISH drains it, but it is refused once FINISH has started
++ * (CLOSING) so a retrying work item cannot keep the drain open.  A new Token
++ * is born ACTIVE and unclaimed, which is what kcov_request_remote_try_grant()
++ * expects.  The caller must hold a reference on @gen.
++ */
++bool kcov_request_try_get_section_token(struct kcov_request_generation *gen,
++		struct kcov_common_handle_id owner, u64 request_cookie,
++		struct kcov_request_token *token)
++{
++	bool ok = false;
++
++	if (!gen || !token || !owner.val || !owner.generation ||
++	    !request_cookie)
++		return false;
++	spin_lock(&gen->lock);
++	if (gen->owner != owner.val || gen->id != owner.generation) {
++		request_stat_inc(REQUEST_SECTION_TOKEN_REJECTED_IDENTITY);
++	} else if (gen->state == KCOV_REQUEST_GEN_OPEN) {
++		request_token_init_locked(gen, token, KCOV_REQUEST_TOKEN_ASYNC);
++		token->owner = owner;
++		token->request_cookie = request_cookie;
++		request_stat_inc(REQUEST_SECTION_TOKEN_GRANTED);
++		ok = true;
++	} else if (gen->state == KCOV_REQUEST_GEN_CLOSING) {
++		request_stat_inc(REQUEST_SECTION_TOKEN_REJECTED_CLOSING);
++	} else if (gen->state == KCOV_REQUEST_GEN_ABORTED) {
++		request_stat_inc(REQUEST_SECTION_TOKEN_REJECTED_ABORTED);
++	} else {
++		/* COMMITTED or DEAD: the program finished, the work is late. */
++		request_stat_inc(REQUEST_SECTION_TOKEN_REJECTED_FINISHED);
++	}
++	spin_unlock(&gen->lock);
++	return ok;
++}
++EXPORT_SYMBOL_GPL(kcov_request_try_get_section_token);
++
+ static bool request_token_complete(struct kcov_request_token *token,
+ 		bool count_duplicate)
+ {
+@@ -2257,6 +2344,103 @@ static void request_late_workfn(struct work_struct *work)
+ 	complete(&late->done);
+ }
+ 
++/*
++ * Section tokens: independent per-section Tokens from one generation
++ * reference, refused on identity mismatch, CLOSING and after abort, and a late
++ * completion after abort is safe.
++ */
++static bool request_selftest_section_token(u64 owner_val)
++{
++	struct kcov_request_generation *gen, *aborted;
++	struct kcov_request_root root = {};
++	struct kcov_request_token first = {}, second = {}, canceled = {};
++	struct kcov_common_handle_id owner, wrong;
++	struct kcov_request_generation *ref;
++	unsigned int outstanding;
++	bool refs_ok;
++	bool pass = false;
++	u64 id;
++
++	gen = kcov_request_generation_begin(owner_val, &id);
++	if (IS_ERR(gen))
++		return false;
++	owner = (struct kcov_common_handle_id){ .val = owner_val,
++		.generation = id };
++	wrong = owner;
++	wrong.generation++;
++	if (!kcov_request_root_init(&root, owner, 0x7001))
++		goto out;
++	/* An unclaimed root Token is not a running section: no reference. */
++	ref = kcov_request_token_generation_get(&root.root_token);
++	if (ref) {
++		kcov_request_generation_put(ref);
++		goto out;
++	}
++	if (kcov_request_try_get_section_token(gen, wrong, 0x7001, &first) ||
++	    kcov_request_try_get_section_token(gen, owner, 0, &first))
++		goto out;
++	if (!kcov_request_try_get_section_token(gen, owner, 0x7001, &first) ||
++	    !kcov_request_try_get_section_token(gen, owner, 0x7001, &second))
++		goto out;
++	spin_lock(&gen->lock);
++	outstanding = gen->outstanding_tokens;
++	spin_unlock(&gen->lock);
++	if (outstanding != 3)
++		goto out;
++	if (!request_token_complete(&first, false) ||
++	    request_token_complete(&first, false) ||
++	    !request_token_complete(&second, false))
++		goto out;
++	spin_lock(&gen->lock);
++	outstanding = gen->outstanding_tokens;
++	gen->state = KCOV_REQUEST_GEN_CLOSING;
++	request_stat_inc(REQUEST_GENERATION_CLOSING);
++	spin_unlock(&gen->lock);
++	if (outstanding != 1 ||
++	    kcov_request_try_get_section_token(gen, owner, 0x7001, &first))
++		goto out;
++	kcov_request_root_finish(&root);
++	if (kcov_request_generation_finish(gen, 1000))
++		goto out;
++	if (kcov_request_try_get_section_token(gen, owner, 0x7001, &first))
++		goto out;
++
++	aborted = kcov_request_generation_begin(owner_val + 1, &id);
++	if (IS_ERR(aborted))
++		goto out;
++	owner = (struct kcov_common_handle_id){ .val = owner_val + 1,
++		.generation = id };
++	if (!kcov_request_try_get_section_token(aborted, owner, 0x7002,
++			&canceled) ||
++	    kcov_request_generation_abort(aborted) ||
++	    kcov_request_try_get_section_token(aborted, owner, 0x7002, &first))
++		goto out_aborted;
++	/* The abort canceled the unclaimed Token; completing it is late. */
++	if (request_token_complete(&canceled, false) || canceled.generation)
++		goto out_aborted;
++	spin_lock(&aborted->lock);
++	refs_ok = !aborted->outstanding_tokens &&
++		refcount_read(&aborted->object_refs) == 1;
++	spin_unlock(&aborted->lock);
++	if (!refs_ok)
++		goto out_aborted;
++	request_stat_inc(REQUEST_SELFTEST_SECTION_TOKEN);
++	pass = true;
++out_aborted:
++	if (canceled.generation)
++		request_token_complete(&canceled, false);
++	kcov_request_generation_put(aborted);
++out:
++	if (first.generation)
++		request_token_complete(&first, false);
++	if (second.generation)
++		request_token_complete(&second, false);
++	if (root.generation)
++		kcov_request_root_finish(&root);
++	kcov_request_generation_put(gen);
++	return pass;
++}
++
+ static bool request_selftest(void)
+ {
+ 	struct kcov_request_generation *closing, *aborted;
+@@ -2350,7 +2534,8 @@ static bool request_selftest(void)
+ 			REQUEST_SELFTEST_CONN_CLOSE_VS_ABORT) ||
+ 	    !request_selftest_abort_root_race(0xf4000005) ||
+ 	    !request_selftest_double_root_finish(0xf4000006) ||
+-	    !request_selftest_orphan_abort(0xf4000007))
++	    !request_selftest_orphan_abort(0xf4000007) ||
++	    !request_selftest_section_token(0xf4000008))
+ 		goto out_aborted;
+ 	pass = true;
+ out_aborted:
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index 6cedc824c..85fa61d5e 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -1315,6 +1315,20 @@ EXPORT_SYMBOL_GPL(rpc_call_sync);
+ int
+ rpc_call_async(struct rpc_clnt *clnt, const struct rpc_message *msg, int flags,
+ 	       const struct rpc_call_ops *tk_ops, void *data)
++{
++	return rpc_call_async_owner(clnt, msg, flags, tk_ops, data, NULL);
++}
++EXPORT_SYMBOL_GPL(rpc_call_async);
++
++/**
++ * rpc_call_async_owner - rpc_call_async() for a call caused by a fuzz program
++ * @owner: the program behind the call, or NULL; the task takes its own
++ *	reference
++ */
++int
++rpc_call_async_owner(struct rpc_clnt *clnt, const struct rpc_message *msg,
++		     int flags, const struct rpc_call_ops *tk_ops, void *data,
++		     struct sunrpc_fuzz_cb_owner *owner)
+ {
+ 	struct rpc_task	*task;
+ 	struct rpc_task_setup task_setup_data = {
+@@ -1322,6 +1336,7 @@ rpc_call_async(struct rpc_clnt *clnt, const struct rpc_message *msg, int flags,
+ 		.rpc_message = msg,
+ 		.callback_ops = tk_ops,
+ 		.callback_data = data,
++		.fuzz_owner = owner,
+ 		.flags = flags|RPC_TASK_ASYNC,
+ 	};
+ 
+@@ -1331,7 +1346,7 @@ rpc_call_async(struct rpc_clnt *clnt, const struct rpc_message *msg, int flags,
+ 	rpc_put_task(task);
+ 	return 0;
+ }
+-EXPORT_SYMBOL_GPL(rpc_call_async);
++EXPORT_SYMBOL_GPL(rpc_call_async_owner);
+ 
+ #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+ static void call_bc_encode(struct rpc_task *task);
+diff --git a/net/sunrpc/fuzz.c b/net/sunrpc/fuzz.c
+old mode 100755
+new mode 100644
+index 104b25c5c..208999149
+--- a/net/sunrpc/fuzz.c
++++ b/net/sunrpc/fuzz.c
+@@ -83,6 +83,17 @@ enum sunrpc_fuzz_saved_stat {
+ 	SAVED_ASYNC_COMPLETED,
+ 	SAVED_ASYNC_DROPPED,
+ 	SAVED_DOUBLE_ATTACH,
++	SAVED_CB_OWNER_SAVED,
++	SAVED_CB_OWNER_NO_PARENT,
++	SAVED_CB_OWNER_ALLOC_FAILED,
++	SAVED_CB_SECTION_SHARED,
++	SAVED_CB_SECTION_START_OK,
++	SAVED_CB_SECTION_OWNER_NONE,
++	SAVED_CB_SECTION_LANE_UNHEALTHY,
++	SAVED_CB_SECTION_EPOCH_MISMATCH,
++	SAVED_CB_SECTION_START_INCOMPLETE,
++	SAVED_CB_SECTION_START_NESTED,
++	SAVED_CB_SECTION_COMPLETED,
+ 	SAVED_STAT_COUNT,
+ };
+ 
+@@ -108,6 +119,17 @@ static const char *const saved_stat_names[SAVED_STAT_COUNT] = {
+ 	[SAVED_ASYNC_COMPLETED] = "async_completed",
+ 	[SAVED_ASYNC_DROPPED] = "async_dropped",
+ 	[SAVED_DOUBLE_ATTACH] = "saved_work_double_attach",
++	[SAVED_CB_OWNER_SAVED] = "cb_owner_saved",
++	[SAVED_CB_OWNER_NO_PARENT] = "cb_owner_no_parent",
++	[SAVED_CB_OWNER_ALLOC_FAILED] = "cb_owner_alloc_failed",
++	[SAVED_CB_SECTION_SHARED] = "cb_section_shared",
++	[SAVED_CB_SECTION_START_OK] = "cb_section_start_ok",
++	[SAVED_CB_SECTION_OWNER_NONE] = "cb_section_owner_none",
++	[SAVED_CB_SECTION_LANE_UNHEALTHY] = "cb_section_lane_unhealthy",
++	[SAVED_CB_SECTION_EPOCH_MISMATCH] = "cb_section_epoch_mismatch",
++	[SAVED_CB_SECTION_START_INCOMPLETE] = "cb_section_start_incomplete",
++	[SAVED_CB_SECTION_START_NESTED] = "cb_section_start_nested",
++	[SAVED_CB_SECTION_COMPLETED] = "cb_section_completed",
+ };
+ 
+ struct sunrpc_fuzz_net {
+@@ -139,6 +161,16 @@ struct sunrpc_fuzz_saved_work {
+ 	u8 type;
+ };
+ 
++/* Who caused a callback: a generation reference, no outstanding Token. */
++struct sunrpc_fuzz_cb_owner {
++	refcount_t refs;
++	struct kcov_request_generation *generation;
++	struct kcov_common_handle_id owner;
++	struct net *net;
++	u64 request_cookie;
++	u64 lane_epoch;
++};
++
+ static bool lane_attribution_enabled = true;
+ module_param_named(lane_attribution, lane_attribution_enabled, bool, 0644);
+ MODULE_PARM_DESC(lane_attribution,
+@@ -150,6 +182,7 @@ static atomic64_t lane_owner_cookie_seq = ATOMIC64_INIT(0);
+ static atomic64_t lane_stats[LANE_STAT_COUNT];
+ static atomic64_t saved_stats[SAVED_STAT_COUNT];
+ static atomic_t live_saved = ATOMIC_INIT(0);
++static atomic_t live_cb_owner = ATOMIC_INIT(0);
+ static LIST_HEAD(domain_list);
+ static DEFINE_MUTEX(domain_lock);
+ static struct dentry *sunrpc_fuzz_debugfs_dir;
+@@ -235,17 +268,18 @@ static void request_work_finish(struct sunrpc_fuzz_request_work *work,
+ /* Build a request owned by the generation currently open for @handle. */
+ static struct sunrpc_fuzz_request_work *lane_owner_work(u64 handle)
+ {
+-	struct kcov_common_handle_id owner = { .val = handle };
++	struct kcov_common_handle_id owner;
+ 	struct sunrpc_fuzz_request_work *work;
+ 	struct kcov_request_root root;
+-	u64 cookie;
++	u64 generation, cookie;
+ 
+-	owner.generation = kcov_request_current_generation(handle);
+-	if (!owner.generation) {
++	generation = kcov_request_current_generation(handle);
++	if (!generation) {
+ 		/* Between programs, or no executor: the record stays ownerless. */
+ 		lane_stat_inc(LANE_OWNER_NO_GENERATION);
+ 		return NULL;
+ 	}
++	owner = kcov_request_handle_id(handle, generation);
+ 	work = kzalloc_obj(*work);
+ 	if (!work)
+ 		goto fail;
+@@ -501,6 +535,170 @@ void sunrpc_fuzz_saved_work_stop(struct sunrpc_fuzz_saved_work **savedp,
+ }
+ EXPORT_SYMBOL_GPL(sunrpc_fuzz_saved_work_stop);
+ 
++static void cb_owner_fill(struct sunrpc_fuzz_cb_owner *owner,
++		struct kcov_common_handle_id id, u64 cookie, struct net *net)
++{
++	owner->owner = id;
++	owner->request_cookie = cookie;
++	if (net) {
++		owner->net = get_net(net);
++		if (sunrpc_fuzz_registered)
++			owner->lane_epoch =
++				READ_ONCE(fuzz_pernet(owner->net)->lane_epoch);
++	}
++	refcount_set(&owner->refs, 1);
++	atomic_inc(&live_cb_owner);
++	saved_stat_inc(SAVED_CB_OWNER_SAVED);
++}
++
++/*
++ * Record the program behind a callback from the section the current task is
++ * running, for example the asynchronous COPY thread or an nfsd thread inside
++ * its request.  Returns NULL, and counts the reason, when the task runs no
++ * section: a callback without a parent is background work, not a failure.  A
++ * running section whose owner cannot be stored degrades the generation,
++ * because coverage that should have been collected is missing.  Callable from
++ * atomic context with GFP_ATOMIC.
++ */
++struct sunrpc_fuzz_cb_owner *sunrpc_fuzz_cb_owner_save_current(
++		struct net *net, gfp_t gfp)
++{
++	struct sunrpc_fuzz_cb_owner *owner;
++	struct kcov_common_handle_id id = {};
++	u64 cookie = 0;
++	struct kcov_request_generation *gen;
++
++	gen = kcov_request_current_section_ref(&id, &cookie);
++	if (!gen) {
++		saved_stat_inc(SAVED_CB_OWNER_NO_PARENT);
++		return NULL;
++	}
++	owner = kzalloc_obj(*owner, gfp);
++	if (!owner) {
++		saved_stat_inc(SAVED_CB_OWNER_ALLOC_FAILED);
++		if (!kcov_request_remote_was_aborted(gen))
++			kcov_request_remote_degrade(gen,
++				KCOV_REQUEST_REMOTE_INCOMPLETE,
++				KCOV_REQUEST_REMOTE_ISSUE_START_FAILED);
++		kcov_request_generation_put(gen);
++		return NULL;
++	}
++	owner->generation = gen;
++	cb_owner_fill(owner, id, cookie, net);
++	return owner;
++}
++EXPORT_SYMBOL_GPL(sunrpc_fuzz_cb_owner_save_current);
++
++struct sunrpc_fuzz_cb_owner *sunrpc_fuzz_cb_owner_get(
++		struct sunrpc_fuzz_cb_owner *owner)
++{
++	if (owner)
++		refcount_inc(&owner->refs);
++	return owner;
++}
++EXPORT_SYMBOL_GPL(sunrpc_fuzz_cb_owner_get);
++
++void sunrpc_fuzz_cb_owner_put(struct sunrpc_fuzz_cb_owner *owner)
++{
++	if (!owner || !refcount_dec_and_test(&owner->refs))
++		return;
++	kcov_request_generation_put(owner->generation);
++	if (owner->net)
++		put_net(owner->net);
++	atomic_dec(&live_cb_owner);
++	kfree(owner);
++}
++EXPORT_SYMBOL_GPL(sunrpc_fuzz_cb_owner_put);
++
++/*
++ * Start one execution section for @owner.  Nothing here may sleep on the
++ * callback's behalf beyond what the Ticket grant already does, and a failure
++ * never changes the callback's own result: the section simply has no owner.
++ */
++enum sunrpc_fuzz_saved_start_result sunrpc_fuzz_cb_section_start(
++		struct sunrpc_fuzz_cb_owner *owner,
++		struct sunrpc_fuzz_cb_section *section)
++{
++	enum kcov_request_remote_start_result result;
++
++	if (!section)
++		return SUNRPC_FUZZ_SAVED_OWNER_NONE;
++	section->ticket = NULL;
++	section->shared = false;
++	if (!owner)
++		return SUNRPC_FUZZ_SAVED_OWNER_NONE;
++	/*
++	 * An inner call, for example a release run from the callback worker,
++	 * joins the section its caller already runs for the same program.  It
++	 * never starts a second Ticket and never ends the outer one.
++	 */
++	if (kcov_request_current_section_match(owner->owner,
++			owner->request_cookie)) {
++		section->shared = true;
++		saved_stat_inc(SAVED_CB_SECTION_SHARED);
++		return SUNRPC_FUZZ_SAVED_ACTIVE;
++	}
++	if (owner->net && sunrpc_fuzz_lane_is_unhealthy(owner->net)) {
++		saved_stat_inc(SAVED_CB_SECTION_LANE_UNHEALTHY);
++		return SUNRPC_FUZZ_SAVED_OWNER_NONE;
++	}
++	if (owner->net && sunrpc_fuzz_registered &&
++	    READ_ONCE(fuzz_pernet(owner->net)->lane_epoch) !=
++			owner->lane_epoch) {
++		saved_stat_inc(SAVED_CB_SECTION_EPOCH_MISMATCH);
++		return SUNRPC_FUZZ_SAVED_OWNER_NONE;
++	}
++	if (!kcov_request_try_get_section_token(owner->generation,
++			owner->owner, owner->request_cookie,
++			&section->token)) {
++		saved_stat_inc(SAVED_CB_SECTION_OWNER_NONE);
++		return SUNRPC_FUZZ_SAVED_OWNER_NONE;
++	}
++	if (kcov_request_remote_try_grant(owner->request_cookie, owner->owner,
++			&section->token, &section->ticket)) {
++		kcov_request_token_complete_once(&section->token);
++		saved_stat_inc(SAVED_CB_SECTION_OWNER_NONE);
++		return SUNRPC_FUZZ_SAVED_OWNER_NONE;
++	}
++	result = kcov_request_remote_start_checked(section->ticket);
++	if (result == KCOV_REQUEST_REMOTE_START_SUCCESS) {
++		saved_stat_inc(SAVED_CB_SECTION_START_OK);
++		return SUNRPC_FUZZ_SAVED_ACTIVE;
++	}
++	if (result == KCOV_REQUEST_REMOTE_START_NESTED) {
++		saved_stat_inc(SAVED_CB_SECTION_START_NESTED);
++		if (owner->net)
++			sunrpc_fuzz_lane_mark_unhealthy(owner->net);
++		kcov_request_remote_start_failed(section->ticket, true);
++		kcov_request_remote_ticket_put(section->ticket);
++		section->ticket = NULL;
++		return SUNRPC_FUZZ_SAVED_NESTED;
++	}
++	saved_stat_inc(SAVED_CB_SECTION_START_INCOMPLETE);
++	kcov_request_remote_start_failed(section->ticket, false);
++	kcov_request_remote_ticket_put(section->ticket);
++	section->ticket = NULL;
++	return SUNRPC_FUZZ_SAVED_OWNER_NONE;
++}
++EXPORT_SYMBOL_GPL(sunrpc_fuzz_cb_section_start);
++
++void sunrpc_fuzz_cb_section_stop(struct sunrpc_fuzz_cb_section *section)
++{
++	if (!section)
++		return;
++	if (section->shared) {
++		section->shared = false;
++		return;
++	}
++	if (!section->ticket)
++		return;
++	kcov_request_remote_stop_checked(section->ticket);
++	kcov_request_remote_ticket_put(section->ticket);
++	section->ticket = NULL;
++	saved_stat_inc(SAVED_CB_SECTION_COMPLETED);
++}
++EXPORT_SYMBOL_GPL(sunrpc_fuzz_cb_section_stop);
++
+ bool sunrpc_fuzz_svc_has_remote_work(const struct svc_rqst *rqstp)
+ {
+ 	return rqstp && (rqstp->rq_fuzz_request_work ||
+@@ -646,6 +844,7 @@ static int saved_work_stats_show(struct seq_file *m, void *v)
+ 		seq_printf(m, "%s %lld\n", saved_stat_names[i],
+ 			   atomic64_read(&saved_stats[i]));
+ 	seq_printf(m, "live_saved_work %d\n", atomic_read(&live_saved));
++	seq_printf(m, "live_cb_owner %d\n", atomic_read(&live_cb_owner));
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(saved_work_stats);
+diff --git a/net/sunrpc/sched.c b/net/sunrpc/sched.c
+index 016f16ca5..89649edfa 100644
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@ -23,6 +23,7 @@
+ #include <linux/sched/mm.h>
+ 
+ #include <linux/sunrpc/clnt.h>
++#include <linux/sunrpc/fuzz.h>
+ #include <linux/sunrpc/metrics.h>
+ 
+ #include "sunrpc.h"
+@@ -908,6 +909,8 @@ static bool xprt_needs_memalloc(struct rpc_xprt *xprt, struct rpc_task *tk)
+  */
+ static void __rpc_execute(struct rpc_task *task)
+ {
++	struct sunrpc_fuzz_cb_section fuzz_section;
++	struct sunrpc_fuzz_cb_owner *fuzz_owner;
+ 	struct rpc_wait_queue *queue;
+ 	int task_is_async = RPC_IS_ASYNC(task);
+ 	int status = 0;
+@@ -944,7 +947,17 @@ static void __rpc_execute(struct rpc_task *task)
+ 			current->flags |= PF_MEMALLOC;
+ 
+ 		trace_rpc_task_run_action(task, do_action);
++		/*
++		 * One section per FSM step for a call a fuzz program caused.
++		 * It ends before the lockless QUEUED check below, after which
++		 * another worker may take the task.
++		 */
++		fuzz_owner = task->tk_fuzz_owner;
++		if (fuzz_owner)
++			sunrpc_fuzz_cb_section_start(fuzz_owner, &fuzz_section);
+ 		do_action(task);
++		if (fuzz_owner)
++			sunrpc_fuzz_cb_section_stop(&fuzz_section);
+ 
+ 		/*
+ 		 * Lockless check for whether task is sleeping or not.
+@@ -1109,6 +1122,7 @@ static void rpc_init_task(struct rpc_task *task, const struct rpc_task_setup *ta
+ 
+ 	task->tk_priority = task_setup_data->priority - RPC_PRIORITY_LOW;
+ 	task->tk_owner = current->tgid;
++	task->tk_fuzz_owner = sunrpc_fuzz_cb_owner_get(task_setup_data->fuzz_owner);
+ 
+ 	/* Initialize workqueue for async tasks */
+ 	task->tk_workqueue = task_setup_data->workqueue;
+@@ -1178,10 +1192,16 @@ struct rpc_task *rpc_new_task(const struct rpc_task_setup *setup_data)
+  */
+ static void rpc_free_task(struct rpc_task *task)
+ {
++	struct sunrpc_fuzz_cb_section fuzz_section;
++	/* The task may be embedded in its calldata: read what we need first. */
++	struct sunrpc_fuzz_cb_owner *fuzz_owner = task->tk_fuzz_owner;
+ 	unsigned short tk_flags = task->tk_flags;
+ 
++	sunrpc_fuzz_cb_section_start(fuzz_owner, &fuzz_section);
+ 	put_rpccred(task->tk_op_cred);
+ 	rpc_release_calldata(task->tk_ops, task->tk_calldata);
++	sunrpc_fuzz_cb_section_stop(&fuzz_section);
++	sunrpc_fuzz_cb_owner_put(fuzz_owner);
+ 
+ 	if (tk_flags & RPC_TASK_DYNAMIC)
+ 		mempool_free(task, rpc_task_mempool);
+@@ -1197,6 +1217,9 @@ static void rpc_async_release(struct work_struct *work)
+ 
+ static void rpc_release_resources_task(struct rpc_task *task)
+ {
++	struct sunrpc_fuzz_cb_section fuzz_section;
++
++	sunrpc_fuzz_cb_section_start(task->tk_fuzz_owner, &fuzz_section);
+ 	xprt_release(task);
+ 	if (task->tk_msg.rpc_cred) {
+ 		if (!(task->tk_flags & RPC_TASK_CRED_NOREF))
+@@ -1204,6 +1227,7 @@ static void rpc_release_resources_task(struct rpc_task *task)
+ 		task->tk_msg.rpc_cred = NULL;
+ 	}
+ 	rpc_task_release_client(task);
++	sunrpc_fuzz_cb_section_stop(&fuzz_section);
+ }
+ 
+ static void rpc_final_put_task(struct rpc_task *task,
+diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
+index 0722eb67e..4b26d8038 100644
+--- a/net/sunrpc/svcsock.c
++++ b/net/sunrpc/svcsock.c
+@@ -1108,6 +1108,8 @@ static ssize_t svc_tcp_read_marker(struct svc_sock *svsk,
+ static int receive_cb_reply(struct svc_sock *svsk, struct svc_rqst *rqstp)
+ {
+ 	struct rpc_xprt *bc_xprt = svsk->sk_xprt.xpt_bc_xprt;
++	struct sunrpc_fuzz_cb_section fuzz_section = {};
++	struct sunrpc_fuzz_cb_owner *fuzz_owner = NULL;
+ 	struct rpc_rqst *req = NULL;
+ 	struct kvec *src, *dst;
+ 	__be32 *p = (__be32 *)rqstp->rq_arg.head[0].iov_base;
+@@ -1120,6 +1122,23 @@ static int receive_cb_reply(struct svc_sock *svsk, struct svc_rqst *rqstp)
+ 	if (!req)
+ 		goto unlock_eagain;
+ 
++	/*
++	 * A reply to a callback that a fuzz program caused is collected for
++	 * that program, not for whichever generation is open now.  Starting a
++	 * section may sleep, so leave the lock with the request pinned and
++	 * check that it is still the one waiting for this XID.
++	 */
++	fuzz_owner = sunrpc_fuzz_cb_owner_get(req->rq_task->tk_fuzz_owner);
++	if (fuzz_owner) {
++		xprt_pin_rqst(req);
++		spin_unlock(&bc_xprt->queue_lock);
++		sunrpc_fuzz_cb_section_start(fuzz_owner, &fuzz_section);
++		spin_lock(&bc_xprt->queue_lock);
++		xprt_unpin_rqst(req);
++		if (xprt_lookup_rqst(bc_xprt, xid) != req)
++			goto unlock_eagain;
++	}
++
+ 	memcpy(&req->rq_private_buf, &req->rq_rcv_buf, sizeof(struct xdr_buf));
+ 	/*
+ 	 * XXX!: cheating for now!  Only copying HEAD.
+@@ -1134,9 +1153,14 @@ static int receive_cb_reply(struct svc_sock *svsk, struct svc_rqst *rqstp)
+ 	xprt_complete_rqst(req->rq_task, rqstp->rq_arg.len);
+ 	rqstp->rq_arg.len = 0;
+ 	spin_unlock(&bc_xprt->queue_lock);
++	/* Stopping merges the section's coverage, so it happens unlocked. */
++	sunrpc_fuzz_cb_section_stop(&fuzz_section);
++	sunrpc_fuzz_cb_owner_put(fuzz_owner);
+ 	return 0;
+ unlock_eagain:
+ 	spin_unlock(&bc_xprt->queue_lock);
++	sunrpc_fuzz_cb_section_stop(&fuzz_section);
++	sunrpc_fuzz_cb_owner_put(fuzz_owner);
+ 	return -EAGAIN;
+ }
+ 
+-- 
+2.53.0
+

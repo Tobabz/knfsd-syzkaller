@@ -19,7 +19,7 @@ longer mirrors the handoff repo's internal layout (`repo/` tree removed
 | base image (site-generated) | `tools/make-base-image.sh` → `artifacts/bookworm-base.img` (2 GiB raw, `create-image.sh -d bookworm`) | 2 GiB |
 | `src/guest-deps.tar.gz` | Debian nfs-utils extraction for guests (committed) | ~6 MB |
 | guest keypair (site-generated) | same run: `artifacts/bookworm.id_rsa[.pub]` (pairs with your base) | — |
-| `patches/kernel/` | kernel series: 3 patches + `series` | — |
+| `patches/kernel/` | kernel series: 4 patches + `series` | — |
 | `patches/syzkaller/` | syzkaller series: 18 patches + `series` | — |
 | `patches/BASE` | last base the series applies to (kernel tag + commit, syzkaller commit); updated by `tools/bump-kernel.py` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
