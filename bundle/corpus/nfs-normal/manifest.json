@@ -4,6 +4,7 @@
   "purpose": "mutation_seed",
   "database_policy": "corpus.db is generated per profile and is not a committed artifact",
   "required_syzkaller_patch": "bundle/patches/syzkaller/0020-sys-linux-select-versioned-NFS-lane-profiles.patch",
+  "required_syzkaller_validator_patch": "bundle/patches/syzkaller/0021-tools-syz-nfs-corpus-recognize-profile-and-typed-NFS.patch",
   "profiles": {
     "knfsd-v3": {
       "backend": "knfsd",
@@ -63,6 +64,12 @@
       ],
       "screening_duration_minutes": 30,
       "automatic_promotion": false,
+      "mixed_profile_runtime": "allowed",
+      "promotion_policy": {
+        "nfs_root_required": true,
+        "single_profile_required": true,
+        "matching_single_fixture_replay_required": true
+      },
       "excludes": [
         "ganesha-v41"
       ]

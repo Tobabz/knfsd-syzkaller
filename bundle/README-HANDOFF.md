@@ -145,8 +145,10 @@ Point a stock syz-manager at the outputs: `kernel` = `<target>/images/<variant>/
 `sshkey` = the generated `artifacts/bookworm.id_rsa`, `procs` = the fixture's lane count (4), and
 `experimental.remote_cover` to switch remote coverage. Before starting the manager, run `tools/prepare-live-lane-config.py`
 on its base config to add the hash-pinned host lane script share and select
-`--version 3|4.0|4.1|4.2`. `--broad-knfsd` is an experimental four-version
-knfsd fixture and is not a stable default.
+`--profile PROFILE`. The old `--version 3|4.0|4.1|4.2` form is a knfsd-only
+alias. The helper emits only the exact two profile variants; `--broad-knfsd`
+emits the eight knfsd variants and excludes Ganesha. Broad is an experimental
+four-version fixture and is not a stable default.
 
 Use separate manager configs, workdirs and `corpus.db` files for each native
 profile, running one manager at a time. Build each DB with
@@ -155,3 +157,9 @@ on resume. Set `experimental.remote_cover=true`
 for knfsd and `false` for Ganesha (local client-kernel feedback only).
 The combined DBs have been removed; current commands and validation limits are in
 the [corpus execution guide](corpus/nfs-normal/README.md).
+Audit broad outputs with `tools/audit-normal-corpus.py`. Stable promotion
+requires one NFS profile root and successful replay in the matching single
+fixture; mixed-profile and no-root programs are never promoted.
+The first equal-budget comparison found higher broad server-PC coverage but
+lower execution throughput, so broad remains an experimental adjunct rather
+than a stable-profile replacement.

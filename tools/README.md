@@ -29,6 +29,9 @@ python3 tools/bootstrap-kcov-env.py env ... --update       # 새 커널로 다�
 | `release-assembly.sh` | (선택) 번들 스냅샷 tar 조립 |
 | `tool-requirements.txt` | 호스트 의존성 목록 |
 | `lane-quote-lint.sh` | `bundle/lane/lane.sh`의 `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
+| `build-normal-corpus.py` | manifest에서 stable profile 또는 broad fixture의 정상 시나리오 mutation seed DB를 결정적으로 생성 |
+| `prepare-live-lane-config.py` | lane script를 hash-pinned 9P snapshot으로 고정하고 선택 profile의 정확한 syscall variant만 활성화 |
+| `audit-normal-corpus.py` | corpus의 NFS root/profile 구성을 보고하고 single-fixture replay 증거가 있는 승격 후보만 허용 |
 | `assemble-guest-deps.py` | Ganesha deps에 프록시 바이너리를 넣어 lane deps tar 생성 — bootstrap의 `--deps-tar` |
 | `build-ganesha-deps.sh` | V15.6 빌드 중 Bookworm 의존성 기반을 임시 생성 |
 | `build-ganesha-v15.sh`·`ganesha-v15-container.sh`·`package-ganesha-v15.sh` | 공식 V15.6 커밋에서 Bookworm 호환 실행 파일·VFS·libntirpc을 빌드해 별도 deps tar 생성 (Docker 사용) |
@@ -143,7 +146,12 @@ knfsd는 `experimental.remote_cover=true`, Ganesha는 `false`로 두고 로컬 �
 
 실험용 broad DB는 `--fixture broad-knfsd`, VM 설정은
 `tools/prepare-live-lane-config.py ... --broad-knfsd`로 만듭니다. Ganesha는
-이 DB에 포함하지 않으며 최초 screening은 30분입니다. lease 만료와 서버
+이 DB와 활성 syscall variant에서 제외합니다. 안정 fixture는
+`--profile knfsd-v3|knfsd-v40|knfsd-v41|knfsd-v42|ganesha-v41`로 선택하며
+선택한 두 client variant만 활성화됩니다. broad runtime의 mixed-profile은
+실험 대상으로 허용하지만 안정 corpus 승격은 금지합니다.
+`tools/audit-normal-corpus.py`가 NFS root, 단일 profile, 동일 single fixture
+replay 증거를 검사합니다. 최초 screening은 30분입니다. lease 만료와 서버
 재시작은 corpus가 아니라 `tools/nfs-lifecycle/run.py`의 버전별 scenario로 실행합니다.
 
 호스트 입력 검사는 `python3 tools/test-lane-inputs.py`, 셸 검사는 `sh tools/lane-quote-lint.sh`로 실행합니다.

@@ -53,3 +53,43 @@ is viable for further comparison. It remains experimental: this run did not
 compare execution rate, signal growth, timeout rate, or profile balance against
 four equally budgeted stable-profile campaigns. There is no automatic
 promotion, and stable runs must continue to use a profile-specific corpus.
+
+## Follow-up validity audit and corrective controls
+
+A later four-VM run showed that the original base config's generic
+`syz_open_nfs_lane_profile` entry expanded to every variant, including the two
+Ganesha variants that the broad fixture did not expose. Its 1,174-program DB
+contained 921 profile-only programs, 74 raw-only programs, 32 profile/raw
+hybrids, 147 programs with neither root, 163 mixed-profile programs, and 6
+programs containing an unavailable Ganesha profile. This run is therefore
+useful for aggregate reachability and crash screening, but not for promotion or
+per-profile attribution.
+
+A controlled 90-second no-NFS workload measured fixture traffic itself. One
+v4.1 mount produced two background `SEQUENCE` requests and 199 `fs/nfsd` PCs;
+the broad fixture produced six background requests (two v4.0 `RENEW`, two v4.1
+`SEQUENCE`, and two v4.2 `SEQUENCE`) and 235 PCs. The extra 36 PCs included the
+v4.0 renewal path, confirming that simultaneous mounts add measurable remote
+coverage noise even when the test program does not issue NFS operations.
+
+The config generator now replaces the generic pseudo-call with exactly two
+variants for a stable profile or eight knfsd variants for broad. Broad and
+`knfsd-v3` retain the unversioned raw NFS socket calls; v4-only and Ganesha
+stable profiles remove them so raw NFSv3-shaped generation cannot cross the
+profile boundary. The broad runtime continues to allow mixed-profile programs
+as an explicit experiment. Promotion
+is separately gated by `tools/audit-normal-corpus.py`: no-root, mixed-profile,
+profile/raw hybrid, unavailable-profile, and missing matching single-fixture
+replay candidates are rejected.
+
+The legacy generic-variant WebUI run later recorded three reports under one
+title, `SYZFAIL: NFS fuzz lane executor hung`, after roughly two hours. The
+reports carried executor errors `EAGAIN` (two) and `EBADF` (one), not KASAN,
+oops, or panic reports. Their logs also contained repeated lost-lock messages
+and `nfs4_schedule_state_manager: kthread_run` failures. These are operational
+fixture failures rather than kernel-crash findings, but they rule out treating
+the legacy broad run as a healthy long-duration baseline.
+
+The corrected equal-budget comparison and the decision to retain broad only as
+an experimental adjunct are in
+[`2026-10-07-broad-vs-stable-equal-budget.md`](2026-10-07-broad-vs-stable-equal-budget.md).

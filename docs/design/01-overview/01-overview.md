@@ -123,9 +123,16 @@ splice하는 문제를 막는다.
 사실만으로 NFS 미실행을 단정할 수도 없다. 서버 간 동일 변이와 자동 재실행은 보장하지 않는다.
 
 `broad-knfsd`는 v3/v4.0/v4.1/v4.2를 동시에 mount하는 별도 실험 fixture다.
-Ganesha corpus와 profile mount는 제외하며 자동 승격하지 않는다. 2026-10-07의
-30분 1차 screening에서는 네 profile 모두 mutation 뒤 최종 DB에 남았다. 안정
-profile 캠페인과 같은 시간 예산으로 효율을 비교하기 전에는 기본값으로 쓰지 않는다.
+Ganesha corpus와 활성 profile syscall variant는 제외하며 자동 승격하지 않는다.
+stable 설정은 선택한 profile의 client0/client1 variant 두 개만 활성화하고 broad는
+knfsd variant 여덟 개만 활성화한다. 버전 표기가 없는 raw NFS socket 호출은
+NFSv3 raw seed가 있는 `knfsd-v3`와 broad에서만 활성화한다. broad runtime에서 여러 profile root가 섞이는
+것은 실험적으로 허용하지만, NFS root가 없거나 profile이 섞인 프로그램은 stable
+corpus로 승격하지 않는다. 승격 후보는 동일 profile의 single fixture에서 다시
+실행해 성공해야 한다. 2026-10-07의
+30분 동일 예산 비교에서는 stable 네 캠페인의 합보다 실행 수는 14.25% 적었지만
+`fs/nfsd`와 `net/sunrpc` PC 합집합은 6.39% 많았다. 따라서 broad는 coverage 발견용
+보조 실험으로 유지하고, profile별 stable 캠페인을 기본값과 승격 검증 경로로 둔다.
 lease 만료와 서버 restart처럼 대기가 필요한 경계는 corpus가 아니라 버전별
 lifecycle scenario로 실행한다.
 

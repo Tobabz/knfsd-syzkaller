@@ -108,7 +108,7 @@ python3 tools/bootstrap-kcov-env.py env \
 | `--variant kasan\|kcsan` (optional, repeatable) | Sanitizer kernels to build and verify; default: both |
 | `--jobs N` (optional) | Parallel build jobs |
 
-- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (4+20) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the version-neutral VM image once (`bookworm-kcov-fresh.qcow2`) → boot every variant with the host lane script and verify its hash and lane status
+- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (4+21) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the version-neutral VM image once (`bookworm-kcov-fresh.qcow2`) → boot every variant with the host lane script and verify its hash and lane status
 - **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` and `.config` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records the kernel ref and resolved commit, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated.
 
 ### 3. Using the result with syz-manager
@@ -141,8 +141,8 @@ to each config separately; the helper preserves its profile-specific workdir
 and coverage settings:
 
 ```sh
-python3 tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-v41.cfg --version 4.1
-python3 tools/prepare-live-lane-config.py manager-ganesha-base.cfg manager-ganesha-v41.cfg --version 4.1
+python3 tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-v41.cfg --profile knfsd-v41
+python3 tools/prepare-live-lane-config.py manager-ganesha-base.cfg manager-ganesha-v41.cfg --profile ganesha-v41
 ```
 
 Run one profile at a time. Start knfsd v4.1 with:
@@ -160,7 +160,12 @@ env/syzkaller/bin/syz-manager -config manager-ganesha-v41.cfg -mode fuzzing
 Profile separation prevents cross-version seed splicing at initialization; it
 does not disable ordinary mutation or minimization.
 
-Use `--version 3`, `4.0`, `4.1` or `4.2` for a campaign. The helper leaves the input config alone,
+Use `--profile` for a stable campaign. The legacy `--version 3`, `4.0`, `4.1`
+and `4.2` forms select the corresponding knfsd profile. The helper replaces the
+generic profile pseudo-call in `enable_syscalls` with only the two exact client
+variants for that profile. Raw NFS socket calls are retained only for
+`knfsd-v3` (whose DRC seed sends NFSv3 RPC records) and `broad-knfsd`; they are
+removed from v4 and Ganesha stable configs. The helper leaves the input config alone,
 copies `bundle/lane/lane.sh` to a hash-named `workdir_template`, and pins that
 hash in the guest boot arguments. Each VM copies the script once into `/run`;
 setup, status and cleanup use that same copy. Changing `lane.sh` requires a new
@@ -169,7 +174,9 @@ after the copy. A missing share or wrong hash fails the fixture at boot.
 The checked-in corpus includes native v3, v4.0, v4.1, v4.2, and Ganesha-v4.1
 inputs. `--broad-knfsd` selects the experimental four-version fixture; build
 its 11-seed DB with `--fixture broad-knfsd` and screen it separately for 30
-minutes. It never replaces stable profiles automatically.
+minutes. Its generated config enables exactly eight knfsd profile variants and
+does not enable the two Ganesha variants. It never replaces stable profiles
+automatically.
 
 For version comparisons, mount only the selected version in each VM. Extra
 NFSv4 mounts establish client/server state and can issue lease-renewal traffic

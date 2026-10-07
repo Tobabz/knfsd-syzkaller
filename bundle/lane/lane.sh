@@ -1418,7 +1418,17 @@ status_fixture()
             pid_in_named_netns "$status_relay_pid" "$status_server_ns"
         fi
         if [ "$server_impl" = both ] && [ "$status_mode" = single ]; then
-            test "$status_connections" -ge 4
+            # NFSv3 has no session and Ganesha may close an idle transport
+            # while keeping the mount valid.  The two actively fuzzed knfsd
+            # mounts must remain connected; the mount/source checks below
+            # validate both idle Ganesha mounts without treating transport
+            # reclamation as fixture failure.  NFSv4 retains all four
+            # session-bearing transports.
+            status_min_connections=4
+            if [ "$status_version" = 3 ]; then
+                status_min_connections=2
+            fi
+            test "$status_connections" -ge "$status_min_connections"
             nsenter -t "$status_client0_pid" -m -n -- grep -Eq \
                 " $status_lane_root/client0/ganesha $status_mount_type .*vers=$status_mount_version.*proto=tcp" \
                 /proc/mounts
