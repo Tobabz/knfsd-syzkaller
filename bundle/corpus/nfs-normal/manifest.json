@@ -1,192 +1,225 @@
 {
-  "schema": 2,
+  "schema": 3,
   "corpus": "nfs-normal",
-  "runtime_scope": "Parser success is syntax validation only. The v4.1 knfsd and Ganesha 34-call seeds passed separate snapshot executions. The v4.2 COPY input passed one 11-call snapshot execution. Current v4.1 fuzzing uses separate syz-manager configs, workdirs and corpus.db files for knfsd and Ganesha, one backend at a time. The two separate corpus-triage runs completed. These bounded runs do not establish long-run stability, paired replay, RPC-level handoff attribution, or Ganesha user-space coverage. 2026-10-05: the NFSv3 and NFSv4.0 inputs each completed one KASAN execution. Thread transitions for all six inputs and the periodic work were judged from kernel trace events; see report/normal-flow-threads.md. These judgements do not establish KCOV attribution, long-run stability or NLM locking.",
-  "parser": {
-    "path": "env/syzkaller/bin/syz-prog2c",
-    "sha256": "f2e525f37b17f38512885bf0ac3fd5db4ac70138d99c453176926bfb0328b410",
-    "source_checkout": "87ebfdd99487285e1a898264f008ac56c7ccb4fa",
-    "argv": [
-      "-os",
-      "linux",
-      "-arch",
-      "amd64",
-      "-prog",
-      "ABSOLUTE_INPUT_PATH"
-    ]
+  "purpose": "mutation_seed",
+  "database_policy": "corpus.db is generated per profile and is not a committed artifact",
+  "required_syzkaller_patch": "bundle/patches/syzkaller/0020-sys-linux-select-versioned-NFS-lane-profiles.patch",
+  "profiles": {
+    "knfsd-v3": {
+      "backend": "knfsd",
+      "native_version": "3",
+      "fixture": "single",
+      "programs": [
+        "basic-v3-tcp.prog",
+        "nfs3-procedures-tcp.prog",
+        "nfs3-create-retry-tcp.prog"
+      ]
+    },
+    "knfsd-v40": {
+      "backend": "knfsd",
+      "native_version": "4.0",
+      "fixture": "single",
+      "programs": [
+        "deleg-recall-v40-tcp.prog",
+        "nfs40-state-namespace-tcp.prog"
+      ]
+    },
+    "knfsd-v41": {
+      "backend": "knfsd",
+      "native_version": "4.1",
+      "fixture": "single",
+      "programs": [
+        "basic-v41-tcp.prog",
+        "delegation-recall-v41-tcp.prog",
+        "nfs41-session-state-tcp.prog"
+      ]
+    },
+    "knfsd-v42": {
+      "backend": "knfsd",
+      "native_version": "4.2",
+      "fixture": "single",
+      "programs": [
+        "async-copy-v42-tcp.prog",
+        "remote-kcov-max-v42.prog",
+        "remote-kcov-gaps-v42.prog"
+      ]
+    },
+    "ganesha-v41": {
+      "backend": "ganesha",
+      "native_version": "4.1",
+      "fixture": "single",
+      "programs": [
+        "basic-v41-ganesha-tcp.prog"
+      ]
+    }
+  },
+  "experimental_fixtures": {
+    "broad-knfsd": {
+      "profiles": [
+        "knfsd-v3",
+        "knfsd-v40",
+        "knfsd-v41",
+        "knfsd-v42"
+      ],
+      "screening_duration_minutes": 30,
+      "automatic_promotion": false,
+      "excludes": [
+        "ganesha-v41"
+      ]
+    }
   },
   "programs": [
     {
-      "path": "basic-v41-tcp.prog",
-      "sha256": "59e1d766a9a15c8e1700ce055674d9d1b06dccc9167d567e06985d8d9cf69f02",
-      "nf_flows": [
-        "NF-A1",
-        "NF-A2"
-      ],
-      "nfs_version": "4.1",
-      "transport": "TCP",
-      "fixture_path": "bundle/lane/lane.sh",
-      "functional_oracle": "All 34 calls finish on each execution; call 14 is the deliberate peer-lock conflict and returns errno 11, every other call returns errno 0, local KCOV is positive, and create/write/read/rename/unlink effects succeed across both mounts.",
-      "execution_status": "One KASAN v4.1 snapshot completed 34 calls with the expected errno values and nonempty knfsd remote coverage. No request handoff trace was captured.",
-      "parser_result": {
-        "exit": 0
-      }
-    },
-    {
-      "path": "basic-v41-ganesha-tcp.prog",
-      "sha256": "a06c57e2216e1cb7d559ffb9514f2d1e6263f1f0ff59dd3d5e6a57bd02cbeffb",
-      "nf_flows": [],
-      "nfs_version": "4.1",
-      "transport": "TCP",
-      "fixture_path": "bundle/lane/lane.sh",
-      "functional_oracle": "All 34 calls finish; call 14 returns errno 11 and every other call returns errno 0. Local kernel client KCOV is present. This does not measure Ganesha user-space coverage.",
-      "execution_status": "One KASAN v4.1 snapshot completed 34 calls with the expected errno values and client-kernel coverage. No Ganesha user-space coverage was collected.",
-      "parser_result": {
-        "exit": 0
-      }
-    },
-    {
-      "path": "async-copy-v42-tcp.prog",
-      "sha256": "b7b2ed5bba3004c354f61a5f8b648bca25e54d4189c866229d26c4590ea18068",
-      "nf_flows": [
-        "NF-A1",
-        "NF-A2",
-        "NF-C1",
-        "NF-D1"
-      ],
-      "nfs_version": "4.2",
-      "transport": "TCP",
-      "fixture_path": "bundle/lane/lane.sh",
-      "functional_oracle": "copy_file_range returns 33554432, async execution reaches nfsd4_do_async_copy, CB_OFFLOAD completes with status 0, and destination fsync and closes finish.",
-      "execution_status": "One KASAN v4.2 snapshot completed 11 calls, returned 32 MiB from copy_file_range and produced nonempty remote coverage. The current fixture did not directly retrace callback or transport handoff.",
-      "parser_result": {
-        "exit": 0
-      }
-    },
-    {
-      "path": "delegation-recall-v41-tcp.prog",
-      "sha256": "2a25b68396c7fbb147eedb68a3b8eaf9f5a65ba65d7463b0b88772b32f0e4978",
-      "nf_flows": [
-        "NF-A1",
-        "NF-A2",
-        "NF-D3",
-        "NF-D1",
-        "NF-D2"
-      ],
-      "nfs_version": "4.1",
-      "transport": "TCP",
-      "fixture_path": "bundle/lane/lane.sh",
-      "functional_oracle": "First prove delegation grant; then the client1 conflict must produce ordered CB_RECALL queue/start, backchannel service, callback ACK/status 0, and delegation return/close. File effects alone do not pass.",
-      "execution_status": "The input is present; its full callback and backchannel oracle has not been revalidated with the current fixture.",
-      "parser_result": {
-        "exit": 0
-      }
-    },
-    {
       "path": "basic-v3-tcp.prog",
-      "sha256": "ca26478b06be4091acf7a7c1ffd3cae75628cb155a16d215640f302f1bd1a560",
-      "nf_flows": [
-        "NF-A1",
-        "NF-B1",
-        "NF-F1",
-        "NF-F2",
-        "NF-G1"
-      ],
-      "nfs_version": "3",
+      "sha256": "536b89fc0ec49a44c705d31e3af92a84fd95c979dff6949067d583b16189ba2c",
+      "calls": 25,
+      "backend": "knfsd",
+      "native_version": "3",
+      "native_profile": "knfsd-v3",
       "transport": "TCP",
-      "fixture_path": "bundle/lane/lane.sh",
-      "functional_oracle": "All 25 calls finish with errno 0. The program has no flock because the NFSv3 mounts use nolock, which makes flock a client-local lock. Create, write, read, rename and unlink succeed across both mounts.",
-      "execution_status": "2026-10-05: one KASAN NFSv3 execution (syz-execprog, lane 0) completed 25 of 25 calls with errno 0 and positive coverage. Thread transitions S1-01 to S1-11 were observed (report/normal-flow-threads.md). NLM lock paths were not reached.",
-      "parser_result": {
-        "exit": 0
-      }
+      "capabilities": ["namespace", "read-write", "rename", "two-client"],
+      "oracle": "25 calls complete; create, write, read, rename, and unlink effects are visible through both clients.",
+      "evidence": "One KASAN execution and the recorded NFSv3 thread-transition trace completed on 2026-10-05; NLM is not exercised because the fixture mounts with nolock."
+    },
+    {
+      "path": "nfs3-procedures-tcp.prog",
+      "sha256": "1c16bcc05980c062a5cc0a8d2007b0ff50e251b034f12e9bd309e50ec11ccad6",
+      "calls": 40,
+      "backend": "knfsd",
+      "native_version": "3",
+      "native_profile": "knfsd-v3",
+      "transport": "TCP",
+      "capabilities": ["access", "attributes", "hardlink", "namespace", "read-write", "symlink"],
+      "oracle": "The procedure-oriented file, directory, link, attribute, and I/O sequence completes and removes its objects.",
+      "evidence": "Promoted from the 2026-10-05 protocol coverage campaign after native NFSv3 execution."
+    },
+    {
+      "path": "nfs3-create-retry-tcp.prog",
+      "sha256": "d0af57a6413c8ad1aa8484c417d7afa0d8bb326ea5a70acfb8c135e35360dcb7",
+      "calls": 6,
+      "backend": "knfsd",
+      "native_version": "3",
+      "native_profile": "knfsd-v3",
+      "transport": "TCP",
+      "capabilities": ["duplicate-request-cache", "raw-rpc", "retransmit"],
+      "oracle": "Two byte-identical NFSv3 CREATE RPC records are sent on one TCP connection and both replies are received.",
+      "evidence": "Promoted from the 2026-10-05 duplicate-request-cache campaign; this is a mutation seed, not proof of a particular cache branch on every execution."
     },
     {
       "path": "deleg-recall-v40-tcp.prog",
-      "sha256": "aa529aef74be0a26e5a1a539e71790accccaa23de2db9794c45c4a35c6a268be",
-      "nf_flows": [
-        "NF-A1",
-        "NF-D1",
-        "NF-D3",
-        "NF-F3",
-        "NF-F5",
-        "NF-F6"
-      ],
-      "nfs_version": "4.0",
+      "sha256": "647244d91cec2d83f35e8170af6652bf146f5410fbc1059681497315e9ad5413",
+      "calls": 16,
+      "backend": "knfsd",
+      "native_version": "4.0",
+      "native_profile": "knfsd-v40",
       "transport": "TCP",
-      "fixture_path": "bundle/lane/lane.sh",
-      "functional_oracle": "All 16 calls finish with errno 0. Client0 opens read-only and receives a read delegation. Client1 opens for write; the server delays that OPEN with NFS4ERR_DELAY and the client retries it after the recall.",
-      "execution_status": "2026-10-05: one KASAN NFSv4.0 execution (syz-execprog, lane 0) completed 16 of 16 calls with errno 0. Thread transitions S2-01 to S2-13 were observed (report/normal-flow-threads.md), including the separate callback connection.",
-      "parser_result": {
-        "exit": 0
-      }
+      "capabilities": ["callback", "delegation", "two-client"],
+      "oracle": "A read delegation is followed by a conflicting write OPEN and recall before cleanup.",
+      "evidence": "One KASAN execution and the separate NFSv4.0 callback-connection trace completed on 2026-10-05."
+    },
+    {
+      "path": "nfs40-state-namespace-tcp.prog",
+      "sha256": "d8e5c4c543f2de3ab2ba1a65d18b9654c8daab3dc7ffc05c35871f92b72acd1a",
+      "calls": 40,
+      "backend": "knfsd",
+      "native_version": "4.0",
+      "native_profile": "knfsd-v40",
+      "transport": "TCP",
+      "capabilities": ["locking", "namespace", "stateid", "two-client"],
+      "oracle": "The two-client state, byte-range locking, namespace, link, and I/O sequence completes.",
+      "evidence": "Promoted from the 2026-10-05 native NFSv4.0 protocol coverage campaign."
+    },
+    {
+      "path": "basic-v41-tcp.prog",
+      "sha256": "b9f1db1f9666ed85ab7b24738a296ead5eaafe8e18289c9cea142838dd2854ed",
+      "calls": 34,
+      "backend": "knfsd",
+      "native_version": "4.1",
+      "native_profile": "knfsd-v41",
+      "transport": "TCP",
+      "capabilities": ["locking", "namespace", "read-write", "session", "two-client"],
+      "oracle": "The peer lock conflict returns EAGAIN and the remaining file and namespace operations complete.",
+      "evidence": "A KASAN snapshot execution completed all calls with nonempty knfsd remote coverage."
+    },
+    {
+      "path": "delegation-recall-v41-tcp.prog",
+      "sha256": "1cbf4029a9dc8201665e4f26878b57e744888fa58c4607aa01d8553fd7a6dd88",
+      "calls": 15,
+      "backend": "knfsd",
+      "native_version": "4.1",
+      "native_profile": "knfsd-v41",
+      "transport": "TCP",
+      "capabilities": ["backchannel", "callback", "delegation", "session", "two-client"],
+      "oracle": "Delegation grant, conflicting OPEN, CB_RECALL, callback acknowledgement, and delegation return occur in order.",
+      "evidence": "The complete callback chain was recorded for 30 repeated executions. Repetition reduced asynchronous variance; it does not turn this mutation seed into a validation-only input."
+    },
+    {
+      "path": "nfs41-session-state-tcp.prog",
+      "sha256": "68c23e7bb2e23ba74f15fb7fdf73fc3cdec90e594453791ad2751e69104232db",
+      "calls": 40,
+      "backend": "knfsd",
+      "native_version": "4.1",
+      "native_profile": "knfsd-v41",
+      "transport": "TCP",
+      "capabilities": ["locking", "namespace", "session", "stateid", "vectored-io"],
+      "oracle": "The session-backed I/O, byte-range lock, state, and namespace sequence completes across two clients.",
+      "evidence": "Promoted from the 2026-10-05 native NFSv4.1 protocol coverage campaign."
+    },
+    {
+      "path": "async-copy-v42-tcp.prog",
+      "sha256": "69aa93194346379112e5e3d763c51959cc2f5f94f843c4fd2fcc754b6c1d894d",
+      "calls": 11,
+      "backend": "knfsd",
+      "native_version": "4.2",
+      "native_profile": "knfsd-v42",
+      "transport": "TCP",
+      "capabilities": ["async-copy", "callback", "offload"],
+      "oracle": "A 32 MiB copy_file_range completes, followed by destination fsync and close.",
+      "evidence": "One KASAN snapshot execution returned 32 MiB and produced nonempty remote coverage; callback attribution was not independently measured in that run."
+    },
+    {
+      "path": "remote-kcov-max-v42.prog",
+      "sha256": "35026868ded301fd2db7aa602ca9a3c539256ad9874f165df68f0081630f65c4",
+      "calls": 40,
+      "backend": "knfsd",
+      "native_version": "4.2",
+      "native_profile": "knfsd-v42",
+      "transport": "TCP",
+      "capabilities": ["allocate", "copy", "locking", "namespace", "seek", "xattr"],
+      "oracle": "The wide NFSv4.2 file, xattr, allocation, locking, namespace, and COPY sequence completes.",
+      "evidence": "The evidence campaign recorded 100 OFF/ON executions to compare remote-KCOV behavior and reduce run-to-run variance; the program is retained as a normal mutation seed."
+    },
+    {
+      "path": "remote-kcov-gaps-v42.prog",
+      "sha256": "96f8a01773e9df50d3adc884a0c0a4a3ade00848c42ca3a61236de347f51f533",
+      "calls": 28,
+      "backend": "knfsd",
+      "native_version": "4.2",
+      "native_profile": "knfsd-v42",
+      "transport": "TCP",
+      "capabilities": ["copy", "locking", "rename-open-file", "stateid", "two-client"],
+      "oracle": "Targeted COPY, overlapping locks, rename of an open file, and post-rename reads complete.",
+      "evidence": "The evidence campaign recorded 30 repeated native NFSv4.2 executions to screen asynchronous and coverage variance; the program is retained as a normal mutation seed."
+    },
+    {
+      "path": "basic-v41-ganesha-tcp.prog",
+      "sha256": "a75db047c4f4e1925ecf8f0e57ea73a3b720339ac776efbc0cb3266e1a669865",
+      "calls": 34,
+      "backend": "ganesha",
+      "native_version": "4.1",
+      "native_profile": "ganesha-v41",
+      "transport": "TCP",
+      "capabilities": ["locking", "namespace", "read-write", "session", "two-client"],
+      "oracle": "The peer lock conflict returns EAGAIN and the remaining file and namespace operations complete against Ganesha.",
+      "evidence": "A KASAN snapshot execution completed all calls with local client-kernel coverage; Ganesha user-space coverage was not collected."
     }
   ],
-  "gaps": [
-    {
-      "flows": [
-        "NF-A2"
-      ],
-      "reason": "Basic file operations completed; the duplicate-reply-cache branch has not been observed separately."
-    },
-    {
-      "boundary": "NFSv2",
-      "reason": "Disabled in the pinned build."
-    },
-    {
-      "boundary": "UDP",
-      "reason": "Current fixtures are TCP-only."
-    },
-    {
-      "boundary": "RPC-over-RDMA",
-      "reason": "No provisioned device or fixture."
-    },
-    {
-      "boundary": "LOCALIO",
-      "reason": "Compiled but disabled; no input or fixture."
-    },
-    {
-      "boundary": "NAT",
-      "reason": "Current fixture does not establish address-rewritten pairing."
-    },
-    {
-      "flows": [
-        "NF-A1",
-        "NF-C1",
-        "NF-D1",
-        "NF-D2",
-        "NF-D3"
-      ],
-      "reason": "Thread transitions were observed with kernel trace events (report/normal-flow-threads.md). This does not show that remote KCOV attributes the callback, rpciod or copy-thread work to the program."
-    },
-    {
-      "flows": [
-        "NF-B1",
-        "NF-E3",
-        "NF-E4"
-      ],
-      "reason": "Only ORDERED observations exist (no connection key). NF-E3 was observed only in the NFSv3 run."
-    },
-    {
-      "flows": [
-        "NF-E1",
-        "NF-E2"
-      ],
-      "reason": "Laundromat and shrinker work were observed. A 25 s link cut produced no client-expiry event; the cause is unverified."
-    },
-    {
-      "flows": [
-        "NF-G2"
-      ],
-      "reason": "Observed with shell scripts S5 and S5b (loopback lock mount in the lane 0 server namespace), not with a seed: the lane mounts use nolock. Cross-host NLM is not observed."
-    },
-    {
-      "boundary": "NFSv3",
-      "reason": "basic-v3-tcp.prog was added on 2026-10-05. NLM locking is observed only by tools/flow-trace S5 and S5b, not by a seed."
-    },
-    {
-      "boundary": "NFSv4.0",
-      "reason": "deleg-recall-v40-tcp.prog was added on 2026-10-05. Only delegation recall is covered; there is no v4.0 basic file-operation seed."
-    }
+  "out_of_scope": [
+    "NFSv2",
+    "NFS over UDP",
+    "RPC over RDMA",
+    "pNFS",
+    "LOCALIO",
+    "NFSv3 NLM"
   ]
 }

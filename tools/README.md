@@ -102,8 +102,10 @@ lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 
 | 변수 | 기본값 | 누가 정하는가 |
 |---|---|---|
 | `NFS_VERSION` | `4.1` | 부팅 래퍼가 `vm.cmdline`의 `koov.nfs_version=3\|4.0\|4.1\|4.2`를 읽어 전달합니다. 두 백엔드의 마운트에 적용됩니다 |
+| `NFS_FIXTURE` | `single` | `broad-knfsd`는 실험용으로 knfsd v3/v4.0/v4.1/v4.2 mount를 동시에 만듭니다 |
 | `SERVER_IMPL` | `both` | `both`는 lane마다 knfsd와 Ganesha를 프록시 뒤에 둡니다. `knfsd`·`ganesha`는 프록시를 거치지 않는 진단용입니다 |
 | `KOOV_TMPFS_SIZE` | `256m` | lane마다 tmpfs 상한 |
+| `KOOV_NFSV4_LEASE_TIME` | single `10`, broad `90` | knfsd lease 시간 |
 
 `both`가 기본이라 이미지의 deps에 `ganesha.nfsd`와 `nfs-proxy`가 없으면 bootstrap이 시작 전에 거부합니다.
 부팅 래퍼(`boot-fixture.sh`)와 서비스(`fixture.service`)도 같은 디렉터리에 있습니다. 래퍼는 읽기 전용 9P
@@ -130,13 +132,19 @@ NFSv4.0~4.2는 잠금을 NFS 프로토콜 안에서 처리하므로 NLM 설정�
 [NFSv4 명세](https://www.rfc-editor.org/rfc/rfc7530),
 [Ganesha NLM 설정](https://github.com/nfs-ganesha/nfs-ganesha/blob/next/src/doc/man/ganesha-core-config.rst).
 
-퍼징은 서버별 syz-manager 설정·workdir·`corpus.db`를 분리하고 한 번에 하나씩 실행합니다.
-각 새 DB에는 해당 서버의 기본 시드만 넣으며 DB 병합이나 공유 corpus hub를 사용하지 않습니다.
+퍼징은 native profile별 syz-manager 설정·workdir·`corpus.db`를 분리하고 한 번에 하나씩 실행합니다.
+`tools/build-normal-corpus.py --profile PROFILE`로 manifest에 지정된 정상 시나리오 mutation seed만 넣으며
+DB 병합이나 공유 corpus hub를 사용하지 않습니다.
 knfsd는 `experimental.remote_cover=true`, Ganesha는 `false`로 두고 로컬 클라이언트
 커널 커버리지를 사용합니다. 기존 통합 DB는 삭제했습니다.
-[코퍼스 운영 문서](../bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)에
+[코퍼스 운영 문서](../bundle/corpus/nfs-normal/README.md)에
 현재 설정 경로, 재개 명령, 검증 결과와 변이·최소화의 한계를 정리했습니다.
-재사용 이미지의 host lane 설정도 서버별로 각각 준비해야 합니다.
+재사용 이미지의 host lane 설정도 profile별로 각각 준비해야 합니다.
+
+실험용 broad DB는 `--fixture broad-knfsd`, VM 설정은
+`tools/prepare-live-lane-config.py ... --broad-knfsd`로 만듭니다. Ganesha는
+이 DB에 포함하지 않으며 최초 screening은 30분입니다. lease 만료와 서버
+재시작은 corpus가 아니라 `tools/nfs-lifecycle/run.py`의 버전별 scenario로 실행합니다.
 
 호스트 입력 검사는 `python3 tools/test-lane-inputs.py`, 셸 검사는 `sh tools/lane-quote-lint.sh`로 실행합니다.
 게스트의 두 백엔드와 기본 별칭은 `tools/nfs-proxy/test/guest-four-mounts.sh`로 확인합니다.

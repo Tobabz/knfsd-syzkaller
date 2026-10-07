@@ -78,9 +78,20 @@ with tempfile.TemporaryDirectory() as directory:
     lane_sha = hashlib.sha256(lane_bytes).hexdigest()
     assert (Path(prepared["workdir_template"]) / "lane.sh").read_bytes() == lane_bytes
     assert "path={{TEMPLATE}}" in prepared["vm"]["qemu_args"]
+    assert "-snapshot" in prepared["vm"]["qemu_args"].split()
     assert "koov.nfs_version=3" in prepared["vm"]["cmdline"]
     assert "koov.lane_sha256=" + lane_sha in prepared["vm"]["cmdline"]
     assert prepared["image"] == str(proxy.resolve())
+
+    broad = work / "manager-broad.cfg"
+    subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                    str(manager), str(broad), "--broad-knfsd", "--image", str(proxy)],
+                   check=True, capture_output=True)
+    broad_prepared = json.loads(broad.read_text())
+    assert "koov.nfs_fixture=broad-knfsd" in broad_prepared["vm"]["cmdline"]
+    assert "koov.nfs_version=" not in broad_prepared["vm"]["cmdline"]
+    assert "koov.lane_sha256=" + lane_sha in broad_prepared["vm"]["cmdline"]
+    assert "-snapshot" in broad_prepared["vm"]["qemu_args"].split()
 
 # --skip-build must fail before deleting an incomplete existing checkout.
 with tempfile.TemporaryDirectory() as directory:
@@ -102,9 +113,37 @@ with tempfile.TemporaryDirectory() as directory:
         assert marker.read_text() == "existing data"
 
 manifest = json.loads((ROOT / "bundle/corpus/nfs-normal/manifest.json").read_text())
+assert manifest["schema"] == 3
+assert manifest["purpose"] == "mutation_seed"
+programs = {entry["path"]: entry for entry in manifest["programs"]}
+assert len(programs) == len(manifest["programs"]) == 12
 for entry in manifest["programs"]:
     source = ROOT / "bundle/corpus/nfs-normal" / entry["path"]
     assert hashlib.sha256(source.read_bytes()).hexdigest() == entry["sha256"]
-    assert (ROOT / entry["fixture_path"]).is_file()
+    assert sum(bool(line.strip()) for line in source.read_text().splitlines()) == entry["calls"]
+    assert entry["native_profile"] in manifest["profiles"]
+    assert entry["backend"] == manifest["profiles"][entry["native_profile"]]["backend"]
+    assert entry["native_version"] == manifest["profiles"][entry["native_profile"]]["native_version"]
+    if entry["path"] != "nfs3-create-retry-tcp.prog":
+        assert "syz_open_nfs_lane_profile$" in source.read_text()
 
-print("PASS: lane deps assembly, preflight, and corpus paths/hashes")
+listed = []
+for name, profile in manifest["profiles"].items():
+    for path in profile["programs"]:
+        assert path in programs
+        assert programs[path]["native_profile"] == name
+        listed.append(path)
+assert sorted(listed) == sorted(programs)
+broad_profiles = manifest["experimental_fixtures"]["broad-knfsd"]["profiles"]
+assert broad_profiles == ["knfsd-v3", "knfsd-v40", "knfsd-v41", "knfsd-v42"]
+assert manifest["experimental_fixtures"]["broad-knfsd"]["automatic_promotion"] is False
+assert "ganesha-v41" not in broad_profiles
+
+builder = runpy.run_path(str(ROOT / "tools/build-normal-corpus.py"))
+selected, description = builder["select_programs"](
+    argparse.ArgumentParser(), manifest, programs, None, "broad-knfsd")
+assert len(selected) == 11
+assert description["profiles"] == broad_profiles
+assert "basic-v41-ganesha-tcp.prog" not in selected
+
+print("PASS: lane deps, fixture modes, and profile-aware mutation corpus")

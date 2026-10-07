@@ -80,52 +80,54 @@ Ganesha는 `client0-ganesha`·`client1-ganesha` 경로로 선택한다. 두 서�
 
 <a id="backend-execution-decision"></a>
 
-### 서버별 실행 결정 (2026-10-02)
+### native profile별 실행 결정 (2026-10-07 갱신)
 
-**결정됨.** knfsd와 Ganesha는 syz-manager 설정, workdir, `corpus.db`를 각각
-분리하고 한 번에 한 서버씩 퍼징한다. knfsd DB는 `basic-v41-tcp.prog`,
-Ganesha DB는 `basic-v41-ganesha-tcp.prog` 하나로 초기화했다. 각 시드의 두
-클라이언트는 같은 서버의 export를 사용한다. DB를 병합하거나 두 캠페인에
+**결정됨.** 안정 퍼징은 서버뿐 아니라 native NFS 버전까지 포함한 profile별로
+syz-manager 설정, workdir, `corpus.db`를 분리한다. 현재 profile은
+`knfsd-v3`, `knfsd-v40`, `knfsd-v41`, `knfsd-v42`, `ganesha-v41`이다.
+`tools/build-normal-corpus.py --profile PROFILE`이 manifest에 지정된 정상
+시나리오 mutation seed만 새 DB에 넣는다. DB를 병합하거나 profile 사이에
 공유 corpus hub를 연결하지 않는다.
 
 ```text
-knfsd manager   -> knfsd/workdir/corpus.db   -> client0         <-> client1
-Ganesha manager -> ganesha/workdir/corpus.db -> client0-ganesha <-> client1-ganesha
-                  (한 번에 한 manager 실행)
+profile manager -> profile/workdir/corpus.db -> client0-PROFILE <-> client1-PROFILE
+                 (안정 캠페인은 한 번에 한 profile 실행)
 ```
 
-현재 로컬 설정은 `cache/manager-separated-v41-20261002/{knfsd,ganesha}/manager.cfg`다.
-두 설정은 `procs=4`, KASAN v4.1 VM 하나, 파일 연산 syscall 범위를 쓰며 `vm.snapshot`이 켜져 있다.
+상위 NFS 버전이 하위 버전의 시드를 자동 상속하지는 않는다. 사용자 관점의
+파일 연산이 호환되더라도 wire state machine, 세션, callback, stateid와 지원
+opcode가 다르기 때문이다. profile pseudo-syscall은 backend/version 선택을
+변이 가능한 경로 문자열이 아니라 상수 인자로 고정한다.
 
 **lane 병렬 운용은 필수다 (2026-10-02 결정).** lane은 한 VM 안에서 proc마다 격리된 NFS 상태를 주기 위한
 설계이므로 manager는 `procs`를 lane 수(4)로 두고 **`vm.snapshot`을 끈다.** syzkaller 스냅샷 모드는 VM마다
 프로그램을 하나씩 순서대로 실행하고 proc을 하나만 쓴다(`executor/snapshot.h`, `pkg/execbackend/snapshot.go`).
 그래서 스냅샷 모드에서는 `procs=4`를 줘도 lane 0만 쓰이고 lane 1~3은 놀며, 프로그램마다 VM 상태가 되돌려져
 lane 귀속의 프로그램 경계도 시험되지 않는다.
-위 로컬 설정과 아래 분리 검증 결과는 스냅샷 모드, 즉 proc 하나로 얻은 것이다. 현재 토폴로지(서버별 캠페인,
-기본 `both`)에서 `vm.snapshot`을 끄고 lane 4개를 동시에 쓰는 manager 운용은 **미검증**이다.
+2026-10-02의 기존 분리 검증 결과는 스냅샷 모드, 즉 proc 하나로 얻은 것이다.
+현재 fixture의 단일 버전 4-lane 마운트·격리 검사는 v3, v4.0, v4.1, v4.2에서 통과했다.
 `experimental.remote_cover`는 knfsd에서 `true`, Ganesha에서 `false`다.
 Ganesha 피드백은 로컬 클라이언트 커널 KCOV이며 사용자 공간 서버 내부 커버리지가 아니다.
 실행 명령과 이미지 준비 방식은
-[코퍼스 운영 문서](../../../bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)를 따른다.
+[코퍼스 운영 문서](../../../bundle/corpus/nfs-normal/README.md#stable-profiles)를 따른다.
 
 분리 검증의 `corpus-triage`는 양쪽 모두 종료 코드 0으로 끝났다. 저장된 knfsd
 프로그램 100개와 Ganesha 프로그램 109개에서 상대 서버 경로 문자열은 발견되지 않았다.
 기대 경로 문자열이 없는 프로그램은 각각 78개와 89개다. 근거는 분리 캠페인 디렉터리의
 각 `triage.log`, `triage-unpacked/`, 루트의 `maintenance.json`이다.
 
-이 분리는 서로 다른 서버의 코퍼스에서 프로그램을 가져와 splice하는 문제를 막는다.
+profile 분리는 서로 다른 서버·버전의 초기 코퍼스에서 프로그램을 가져와
+splice하는 문제를 막는다.
 일반 생성·경로 변이·최소화는 계속 적용되며, 게스트에는 두 서버의 마운트가 모두 있으므로
 다른 서버 경로의 생성이나 실행까지 강제 차단하지는 않는다. 경로 문자열이 없다는
 사실만으로 NFS 미실행을 단정할 수도 없다. 서버 간 동일 변이와 자동 재실행은 보장하지 않는다.
 
-단일 매니저 통합 운영은 폐기했다. 34호출을 두 번 붙이는 통합안도 채택하지 않는다. 고정된 syzkaller의
-`prog.MaxCalls`는 40이며 초과 입력은 매니저가 거부한다.
-
-**후속 계획.** 동일 시나리오의 실행 대상을 프록시에서 선택·관리하는 라우팅 확장은
-추후 설계와 구현으로 남긴다. 현재 프록시는 고정 중계 경로를 유지한다.
-실행 중인 NFS 세션의 서버 전환이나 양쪽 요청 복제 기능은 구현되어 있지 않다.
-서버별 상태 격리, 결과 구분과 처리량 이득은 후속 검토 대상이다.
+`broad-knfsd`는 v3/v4.0/v4.1/v4.2를 동시에 mount하는 별도 실험 fixture다.
+Ganesha corpus와 profile mount는 제외하며 자동 승격하지 않는다. 2026-10-07의
+30분 1차 screening에서는 네 profile 모두 mutation 뒤 최종 DB에 남았다. 안정
+profile 캠페인과 같은 시간 예산으로 효율을 비교하기 전에는 기본값으로 쓰지 않는다.
+lease 만료와 서버 restart처럼 대기가 필요한 경계는 corpus가 아니라 버전별
+lifecycle scenario로 실행한다.
 
 ### 판정 논리
 
@@ -247,9 +249,9 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 
 | 항목 | 상태 |
 |---|---|
-| Agent가 넘기는 seed의 정확한 계약과 확장 절차 | 미결. 요소별 설계 문서 미작성 |
+| 정상 시나리오 mutation seed의 계약과 확장 절차 | **구현됨.** schema 3 manifest가 native profile, hash, 호출 수, capability, oracle, evidence를 기록하고 profile DB builder가 이를 검증한다 |
 | 재현 판정의 통합 절차 (Q1 + Q2) | 미결. 통합 판정 도구·문서 없음 |
-| `syz-manager` 기반 운용 | 서버별 설정·DB·재개 명령은 `bundle/corpus/nfs-normal/README.md` 참조. 부팅 인자 `nfs.localio_enabled=N`이 필수다 |
+| `syz-manager` 기반 운용 | profile별 설정·DB와 broad 실험 절차는 `bundle/corpus/nfs-normal/README.md` 참조. 부팅 인자 `nfs.localio_enabled=N`이 필수다 |
 | 프록시 경유 시 knfsd remote KCOV 귀속 | lane 단위 귀속 구현. lane은 proc 하나가 단독 점유해야 한다 |
 | lane 귀속의 경계: 프로그램 종료 뒤 늦게 발생하는 작업 | 다음 프로그램 시작 뒤 늦게 도착하는 요청의 오귀속 위험이 남는다 |
 | 프록시가 레코드 수를 바꾸는 변조 | **미검증**. lane의 서버 netns로 소유자를 정하므로 구조상 무관하지만 실험하지 않았다 |
@@ -258,8 +260,8 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 | 기본 이미지의 직접 마운트 경로 제거 | **완료**. 단일 lane fixture의 기본값은 `both`; NFSv3 시드와 중복 fixture 제거. 직접 경로는 비교 진단 옵션으로만 남음 |
 | 프록시 변조가 서버에 도달했는지 퍼징 중에 판정하는 채널 | 프록시 진단 출력은 있으나 syz-manager의 입력별 피드백에 미연결 |
 | Ganesha 대상의 도달 관측 | 미구현. remote KCOV는 사용자 공간 서버에 귀속 대상이 없다 |
-| 서버별 실행 방식 | **결정됨 (2026-10-02)**. 서버별 34개 호출 입력을 따로 실행; KASAN v4.1 스냅샷 모드(proc 1개)에서 각 1회 errno 오라클 통과 |
-| lane 병렬 manager 운용 (`vm.snapshot` 끔, `procs=4`) | **필수 조건.** `syz-execprog`의 4-lane 병렬 실행은 검증했지만, 현재 manager 토폴로지에서 `vm.snapshot`을 끈 장시간 운용은 미검증 |
+| profile별 실행 방식 | **결정됨 (2026-10-07)**. knfsd v3/v4.0/v4.1/v4.2와 Ganesha v4.1을 별도 DB·workdir로 실행한다 |
+| lane 병렬 manager 운용 (`vm.snapshot` 끔, `procs=4`) | **부분 검증.** 단일 버전 guest의 4-lane 격리와 broad-knfsd manager 30분 운용은 통과했다. 동일 시간의 안정 profile별 효율 비교와 장시간 운용은 미검증 |
 | lane 밖에서 생기는 요청 | knfsd lease가 10초(`nfsv4leasetime`)라 클라이언트 netns마다 수 초 간격의 lease 갱신 요청이 생기고, lane 단위 귀속에서는 그때 실행 중인 프로그램의 커버리지로 잡힌다. 프로그램과 무관한 PC가 섞이는 거짓 양성 원천이다. syzkaller의 triage 재실행이 불안정한 신호를 걸러 영향은 제한적이나 측정하지 않았다 |
 | Ganesha 캠페인의 sanitizer 보고 | Ganesha export가 ext4 루프 위에 있어, 보고에 NFS가 아닌 ext4·loop 경로가 섞일 수 있다. 보고의 호출 경로로 구분한다 |
 | 프록시의 실행 대상 선택·관리 라우팅 확장 | **후속 계획**. 기존 고정 중계와 별개이며, 자동 전환·복제는 미구현 |

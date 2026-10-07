@@ -1,0 +1,172 @@
+From 58823f2ac295d241c47241327aa952a3ad0b7be3 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Wed, 7 Oct 2026 12:03:56 +0900
+Subject: [PATCH] sys/linux: select versioned NFS lane profiles
+
+---
+ executor/common_linux.h      | 47 +++++++++++++++++++++++++++++++++++-
+ pkg/vminfo/linux_syscalls.go |  1 +
+ sys/linux/fs_nfs_fuzz.txt    | 10 ++++++++
+ sys/linux/nfs_fuzz_test.go   | 30 +++++++++++++++++++++++
+ 4 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 669ebcf98..ae5bd713c 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2825,7 +2825,8 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+ #endif
+ 
+ #if SYZ_EXECUTOR || __NR_syz_open_nfs_lane || __NR_syz_socket_connect_nfs || \
+-    __NR_syz_open_nfs_lane_pair || __NR_syz_socket_connect_nfs_pair || \
++    __NR_syz_open_nfs_lane_pair || __NR_syz_open_nfs_lane_profile || \
++    __NR_syz_socket_connect_nfs_pair || \
+     __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || __NR_syz_send_nfs_fuzz
+ #include <fcntl.h>
+ #include <sched.h>
+@@ -2873,6 +2874,30 @@ static long syz_open_nfs_lane_pair(volatile long a0, volatile long a1)
+ 	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+ }
+ 
++static long syz_open_nfs_lane_profile(volatile long a0, volatile long a1)
++{
++	// The profile selects one native protocol/backend mount.  Keeping the
++	// client as a separate constant lets syzkaller splice cross-client state
++	// scenarios without turning the profile into a mutable path string.
++	unsigned long profile = a0, client = a1;
++	static const char* const names[] = {
++		"knfsd-v3", "knfsd-v40", "knfsd-v41", "knfsd-v42",
++		"ganesha-v41",
++	};
++	if (profile >= sizeof(names) / sizeof(names[0]) || client > 1) {
++		errno = EINVAL;
++		return -1;
++	}
++	char path[64];
++	int len = snprintf(path, sizeof(path), "/nfs-lane/client%lu-%s", client,
++			   names[profile]);
++	if (len <= 0 || len >= (int)sizeof(path)) {
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++}
++
+ static long nfs_socket_connect_pair(unsigned long client, unsigned long backend)
+ {
+ 	if (client > 1 || backend > 1 || nfs_fuzz_netns_fds[client] < 0 ||
+@@ -4642,10 +4667,30 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+ 				    snprintf(dst, sizeof(dst), "%s/client%u-%s", target, client, name) >=
+ 				    (int)sizeof(dst))
+ 					fail("NFS pair mount path is too long");
++				if (access(src, F_OK) && errno == ENOENT)
++					continue;
+ 				if (mkdir(dst, 0700) || mount(src, dst, NULL, MS_BIND | MS_REC, NULL))
+ 					fail("mount NFS client/backend pair failed");
+ 			}
+ 		}
++		static const char* const profiles[] = {
++			"knfsd-v3", "knfsd-v40", "knfsd-v41", "knfsd-v42",
++			"ganesha-v41",
++		};
++		for (unsigned client = 0; client < 2; client++) {
++			for (unsigned profile = 0; profile < sizeof(profiles) / sizeof(profiles[0]); profile++) {
++				char src[160], dst[160];
++				if (snprintf(src, sizeof(src), "%s/client%u-%s", source, client,
++					     profiles[profile]) >= (int)sizeof(src) ||
++				    snprintf(dst, sizeof(dst), "%s/client%u-%s", target, client,
++					     profiles[profile]) >= (int)sizeof(dst))
++					fail("NFS profile mount path is too long");
++				if (access(src, F_OK) && errno == ENOENT)
++					continue;
++				if (mkdir(dst, 0700) || mount(src, dst, NULL, MS_BIND | MS_REC, NULL))
++					fail("mount NFS client/profile failed");
++			}
++		}
+ 	}
+ 	debug("NFS fuzz lane bound: proc=%llu clients-only source=%s target=/nfs-lane\n",
+ 	      procid, source);
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index b91a17610..c7564b6c6 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -113,6 +113,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_socket_connect_nfs":        alwaysSupported,
+ 	"syz_socket_connect_nfs_pair":   alwaysSupported,
+ 	"syz_open_nfs_lane_pair":        alwaysSupported,
++	"syz_open_nfs_lane_profile":     alwaysSupported,
+ 	"syz_arm_nfs_proxy":             alwaysSupported,
+ 	"syz_arm_nfs_proxy_v2":          alwaysSupported,
+ 	"syz_send_nfs_fuzz":             alwaysSupported,
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+index 37d3dd6be..7fe57c878 100644
+--- a/sys/linux/fs_nfs_fuzz.txt
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -42,6 +42,16 @@ syz_open_nfs_lane_pair$client0_knfsd(client const[0], backend const[0]) fd_nfs_d
+ syz_open_nfs_lane_pair$client0_ganesha(client const[0], backend const[1]) fd_nfs_dir
+ syz_open_nfs_lane_pair$client1_knfsd(client const[1], backend const[0]) fd_nfs_dir
+ syz_open_nfs_lane_pair$client1_ganesha(client const[1], backend const[1]) fd_nfs_dir
++syz_open_nfs_lane_profile$client0_knfsd_v3(profile const[0], client const[0]) fd_nfs_dir
++syz_open_nfs_lane_profile$client1_knfsd_v3(profile const[0], client const[1]) fd_nfs_dir
++syz_open_nfs_lane_profile$client0_knfsd_v40(profile const[1], client const[0]) fd_nfs_dir
++syz_open_nfs_lane_profile$client1_knfsd_v40(profile const[1], client const[1]) fd_nfs_dir
++syz_open_nfs_lane_profile$client0_knfsd_v41(profile const[2], client const[0]) fd_nfs_dir
++syz_open_nfs_lane_profile$client1_knfsd_v41(profile const[2], client const[1]) fd_nfs_dir
++syz_open_nfs_lane_profile$client0_knfsd_v42(profile const[3], client const[0]) fd_nfs_dir
++syz_open_nfs_lane_profile$client1_knfsd_v42(profile const[3], client const[1]) fd_nfs_dir
++syz_open_nfs_lane_profile$client0_ganesha_v41(profile const[4], client const[0]) fd_nfs_dir
++syz_open_nfs_lane_profile$client1_ganesha_v41(profile const[4], client const[1]) fd_nfs_dir
+ 
+ # One registration per FD.  Bytes are an explicit versioned wire packet:
+ # magic; dir, backend, client, first_opcode, anchor_off, anchor_len,
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 15df45efa..f58187e6c 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -4,6 +4,7 @@
+ package linux_test
+ 
+ import (
++	"fmt"
+ 	"testing"
+ 
+ 	"github.com/google/syzkaller/prog"
+@@ -235,6 +236,35 @@ func TestNFSFourRoutesAndScopedArm(t *testing.T) {
+ 	}
+ }
+ 
++func TestNFSNativeProfiles(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	profiles := []struct {
++		name    string
++		profile uint64
++	}{
++		{"knfsd_v3", 0}, {"knfsd_v40", 1}, {"knfsd_v41", 2},
++		{"knfsd_v42", 3}, {"ganesha_v41", 4},
++	}
++	for _, profile := range profiles {
++		for client := uint64(0); client < 2; client++ {
++			name := fmt.Sprintf("syz_open_nfs_lane_profile$client%d_%s", client, profile.name)
++			call := requireNFSFuzzCall(t, target, name)
++			if call.CallName != "syz_open_nfs_lane_profile" || len(call.Args) != 2 {
++				t.Fatalf("%s has wrong dispatch or arity", call.Name)
++			}
++			requireConst(t, call.Args[0].Type, profile.profile, call.Name+" profile")
++			requireConst(t, call.Args[1].Type, client, call.Name+" client")
++			ret, ok := call.Ret.(*prog.ResourceType)
++			if !ok || ret.Desc.Name != "fd_nfs_dir" {
++				t.Fatalf("%s return is %T %v, want fd_nfs_dir", call.Name, call.Ret, call.Ret)
++			}
++		}
++	}
++}
++
+ // TestNFSProxyVariableLengthArm checks the v2 (NFSPARM2) wire packet: unlike
+ // nfs_proxy_arm, its size is NOT fixed, so this asserts shape (fields, length
+ // linkage, magic) rather than a byte count, and that it shares its lifetime FD
+-- 
+2.34.1
+

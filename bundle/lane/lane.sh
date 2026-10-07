@@ -24,7 +24,12 @@
 #                     passed to the Ganesha process; with ASan requested,
 #                     keep the daemon in the foreground so its ASan reports
 #                     reach the per-lane server.log rather than /dev/null.
-#   NFS_VERSION       3 | 4.0 | 4.1 (default) | 4.2
+#   NFS_FIXTURE       single (default) | broad-knfsd.  broad-knfsd is an
+#                     experimental fixture that mounts knfsd through NFSv3,
+#                     v4.0, v4.1, and v4.2 at the same time.
+#   NFS_VERSION       3 | 4.0 | 4.1 (default) | 4.2; single fixture only
+#   KOOV_NFSV4_LEASE_TIME
+#                     knfsd lease time (default 10 for single, 90 for broad)
 #
 # In both mode, a listener on .1:2049 and .5:2049 sends records to knfsd
 # :20490 and Ganesha :20491 respectively.  Each of the two client namespaces
@@ -64,7 +69,12 @@ domain_directory=/sys/kernel/debug/sunrpc_fuzz
 domain_control=$domain_directory/domain_control
 domain_state=$domain_directory/domain
 executor_root=/syz-nfs-lanes
-nfs_version=${NFS_VERSION:-4.${NFS_MINOR_VERSION:-1}}
+fixture_mode=${NFS_FIXTURE:-single}
+case "$fixture_mode" in
+    single) nfs_version=${NFS_VERSION:-4.${NFS_MINOR_VERSION:-1}} ;;
+    broad-knfsd) nfs_version=4.1 ;;
+    *) echo "NFS_FIXTURE must be single or broad-knfsd" >&2; exit 2 ;;
+esac
 case "$nfs_version" in
     3) nfs_minor_version=; nfs_mount_type=nfs ;;
     4.0|4.1|4.2) nfs_minor_version=${nfs_version#4.}; nfs_mount_type=nfs4 ;;
@@ -82,7 +92,23 @@ case "$server_impl" in
     knfsd|ganesha|both) ;;
     *) echo "SERVER_IMPL must be knfsd, ganesha, or both" >&2; exit 2 ;;
 esac
+if [ "$fixture_mode" = broad-knfsd ] && [ "$server_impl" != both ]; then
+    echo "broad-knfsd requires SERVER_IMPL=both for proxy-backed mounts" >&2
+    exit 2
+fi
 tmpfs_size=${KOOV_TMPFS_SIZE:-256m}
+nfs4_lease_time=${KOOV_NFSV4_LEASE_TIME:-}
+if [ -z "$nfs4_lease_time" ]; then
+    case "$fixture_mode" in
+        broad-knfsd) nfs4_lease_time=90 ;;
+        *) nfs4_lease_time=10 ;;
+    esac
+fi
+case "$nfs4_lease_time" in
+    ''|*[!0-9]*) echo "KOOV_NFSV4_LEASE_TIME must be a number" >&2; exit 2 ;;
+esac
+test "$nfs4_lease_time" -ge 1 || {
+    echo "KOOV_NFSV4_LEASE_TIME must be positive" >&2; exit 2; }
 # KOOV: per-backend listen ports.  In "both" mode the relay keeps 2049 and
 # each backend listens on its own port behind it.
 knfsd_port=${KOOV_KNFS_PORT:-}
@@ -101,6 +127,7 @@ if [ -z "$ganesha_port" ]; then
     esac
 fi
 export server_port server_impl tmpfs_size knfsd_port ganesha_port nfs_version
+export fixture_mode nfs4_lease_time
 # deps is needed inside the sh -c block: the Ganesha FSAL bind-mounts source
 # from the injected tree, and that path must not be hardcoded twice.
 export deps
@@ -158,7 +185,13 @@ mount_lane_export()
     mount_backend=$4
     mount_lane=$5
     mount_target=$6
-    if [ "$nfs_version" = 3 ]; then
+    mount_version=${7:-$nfs_version}
+    case "$mount_version" in
+        3) mount_type=nfs; mount_minor= ;;
+        4.0|4.1|4.2) mount_type=nfs4; mount_minor=${mount_version#4.} ;;
+        *) echo "unsupported mount version: $mount_version" >&2; return 2 ;;
+    esac
+    if [ "$mount_version" = 3 ]; then
         mount_export=$root/lane$mount_lane/server/export
         mount_mountport=20048
         if [ "$mount_backend" = ganesha ]; then
@@ -170,9 +203,90 @@ mount_lane_export()
             "$mount_ip:$mount_export" "$mount_target"
     else
         nsenter --net="/run/netns/$mount_ns" -- \
-            mount.nfs4 -o "vers=$nfs_version,minorversion=$nfs_minor_version,proto=tcp,port=$mount_port,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
+            mount.nfs4 -o "vers=$mount_version,minorversion=$mount_minor,proto=tcp,port=$mount_port,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
             "$mount_ip:/" "$mount_target"
     fi
+}
+
+version_suffix()
+{
+    case "$1" in
+        3) printf 'v3\n' ;;
+        4.0) printf 'v40\n' ;;
+        4.1) printf 'v41\n' ;;
+        4.2) printf 'v42\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+profile_alias_names()
+{
+    if [ "$fixture_mode" = broad-knfsd ]; then
+        for profile_client in 0 1; do
+            for profile_suffix in v3 v40 v41 v42; do
+                printf 'client%s-knfsd-%s\n' \
+                    "$profile_client" "$profile_suffix"
+            done
+        done
+        return
+    fi
+
+    profile_suffix=$(version_suffix "$nfs_version")
+    if [ "$server_impl" != ganesha ]; then
+        printf 'client0-knfsd-%s\nclient1-knfsd-%s\n' \
+            "$profile_suffix" "$profile_suffix"
+    fi
+    if [ "$nfs_version" = 4.1 ] && [ "$server_impl" != knfsd ]; then
+        printf 'client0-ganesha-v41\nclient1-ganesha-v41\n'
+    fi
+}
+
+fixture_source_entries()
+{
+    printf '%s\n' .client0_netns .client0_pid .client1_netns .client1_pid \
+        .lane_id .server0_ipv4 .server1_ipv4 client0 client1
+    if [ "$server_impl" = both ]; then
+        printf '%s\n' control
+        if [ "$fixture_mode" = broad-knfsd ]; then
+            printf '%s\n' client0-knfsd client1-knfsd
+        else
+            printf '%s\n' client0-knfsd client0-ganesha \
+                client1-knfsd client1-ganesha
+        fi
+    fi
+    profile_alias_names
+}
+
+profile_mount_path()
+{
+    profile_lane=$1
+    profile_client=$2
+    profile_name=$3
+    profile_lane_root=$root/lane$profile_lane
+    profile_backend=${profile_name%%-*}
+    profile_suffix=${profile_name##*-}
+
+    if [ "$fixture_mode" = broad-knfsd ]; then
+        case "$profile_suffix" in
+            v41) printf '%s/client%s/mnt\n' \
+                "$profile_lane_root" "$profile_client" ;;
+            *) printf '%s/client%s/knfsd-%s\n' \
+                "$profile_lane_root" "$profile_client" "$profile_suffix" ;;
+        esac
+        return
+    fi
+
+    if [ "$server_impl" != both ]; then
+        printf '%s/client%s/mnt\n' "$profile_lane_root" "$profile_client"
+        return
+    fi
+    case "$profile_client:$profile_backend" in
+        0:knfsd|1:ganesha)
+            printf '%s/client%s/mnt\n' "$profile_lane_root" "$profile_client" ;;
+        *)
+            printf '%s/client%s/%s\n' \
+                "$profile_lane_root" "$profile_client" "$profile_backend" ;;
+    esac
 }
 
 namespace_pids()
@@ -353,6 +467,26 @@ setup_cross_mount()
         "$root/lane$cross_lane/client$cross_client.$cross_backend.mount"
 }
 
+setup_broad_profile_mount()
+{
+    broad_lane=$1
+    broad_client=$2
+    broad_ns=$3
+    broad_ip=$4
+    broad_version=$5
+    broad_suffix=$(version_suffix "$broad_version")
+    broad_mount=$root/lane$broad_lane/client$broad_client/knfsd-$broad_suffix
+    broad_type=nfs4
+    if [ "$broad_version" = 3 ]; then
+        broad_type=nfs
+    fi
+    mkdir -p "$broad_mount"
+    mount_lane_export "$broad_ns" "$broad_ip" "$server_port" \
+        knfsd "$broad_lane" "$broad_mount" "$broad_version"
+    grep -F " $broad_mount $broad_type " /proc/mounts > \
+        "$root/lane$broad_lane/client$broad_client.knfsd-$broad_suffix.mount"
+}
+
 setup_lane()
 {
     setup_lane_id=$1
@@ -447,7 +581,7 @@ setup_lane()
         mountpoint -q /var/lib/nfs/rpc_pipefs || \
             mount -t rpc_pipefs sunrpc /var/lib/nfs/rpc_pipefs
         rpcbind -w
-        if [ "$nfs_version" = 3 ]; then
+        if [ "$nfs_version" = 3 ] || [ "$fixture_mode" = broad-knfsd ]; then
             rpcbind_wait=0
             until rpcinfo -p 127.0.0.1 >/dev/null 2>&1; do
                 rpcbind_wait=$((rpcbind_wait + 1))
@@ -458,16 +592,18 @@ setup_lane()
                 sleep 0.1
             done
         fi
-        if [ "$nfs_version" = 3 ]; then
+        if [ "$fixture_mode" = broad-knfsd ]; then
+            printf "%s\n" "-2 +3 +4 +4.0 +4.1 +4.2" > /proc/fs/nfsd/versions
+        elif [ "$nfs_version" = 3 ]; then
             printf "%s\n" "-2 +3 -4" > /proc/fs/nfsd/versions
         else
             printf "%s\n" "-2 -3 +4" > /proc/fs/nfsd/versions
         fi
-        printf "10\n" > /proc/fs/nfsd/nfsv4leasetime
+        printf "%s\n" "$nfs4_lease_time" > /proc/fs/nfsd/nfsv4leasetime
         printf "10\n" > /proc/fs/nfsd/nfsv4gracetime
         exportfs -i -o rw,sync,insecure,no_subtree_check,no_root_squash,fsid=0 \
             "$export_network:$lane_root/server/export"
-        if [ "$nfs_version" = 3 ]; then
+        if [ "$nfs_version" = 3 ] || [ "$fixture_mode" = broad-knfsd ]; then
             rpc.mountd --no-nfs-version 2 --no-udp --port 20048
         else
             rpc.mountd --no-nfs-version 3 --no-udp --port 20048
@@ -756,19 +892,36 @@ EOF
         ip netns exec "$setup_client1_ns" ping -c 1 -W 2 \
             "$setup_server0_ip" >/dev/null
     fi
-    setup_client0_backend=$server_impl
-    setup_client1_backend=$server_impl
-    if [ "$server_impl" = both ]; then
-        setup_client0_backend=knfsd
-        setup_client1_backend=ganesha
-    fi
-    setup_client "$setup_lane_id" 0 "$setup_client0_ns" "$setup_server0_ip" "$server_port" "$setup_client0_backend"
-    setup_client "$setup_lane_id" 1 "$setup_client1_ns" "$setup_server1_ip" "$server_port" "$setup_client1_backend"
-    if [ "$server_impl" = both ]; then
-        setup_cross_mount "$setup_lane_id" 0 "$setup_client0_ns" \
-            ganesha "$setup_server1_ip"
-        setup_cross_mount "$setup_lane_id" 1 "$setup_client1_ns" \
-            knfsd "$setup_server0_ip"
+    if [ "$fixture_mode" = broad-knfsd ]; then
+        setup_client "$setup_lane_id" 0 "$setup_client0_ns" \
+            "$setup_server0_ip" "$server_port" knfsd
+        setup_client "$setup_lane_id" 1 "$setup_client1_ns" \
+            "$setup_server0_ip" "$server_port" knfsd
+        for setup_profile_version in 3 4.0 4.2; do
+            setup_broad_profile_mount "$setup_lane_id" 0 \
+                "$setup_client0_ns" "$setup_server0_ip" \
+                "$setup_profile_version"
+            setup_broad_profile_mount "$setup_lane_id" 1 \
+                "$setup_client1_ns" "$setup_server0_ip" \
+                "$setup_profile_version"
+        done
+    else
+        setup_client0_backend=$server_impl
+        setup_client1_backend=$server_impl
+        if [ "$server_impl" = both ]; then
+            setup_client0_backend=knfsd
+            setup_client1_backend=ganesha
+        fi
+        setup_client "$setup_lane_id" 0 "$setup_client0_ns" \
+            "$setup_server0_ip" "$server_port" "$setup_client0_backend"
+        setup_client "$setup_lane_id" 1 "$setup_client1_ns" \
+            "$setup_server1_ip" "$server_port" "$setup_client1_backend"
+        if [ "$server_impl" = both ]; then
+            setup_cross_mount "$setup_lane_id" 0 "$setup_client0_ns" \
+                ganesha "$setup_server1_ip"
+            setup_cross_mount "$setup_lane_id" 1 "$setup_client1_ns" \
+                knfsd "$setup_server0_ip"
+        fi
     fi
 
     # A fixed fuzzer process N enters only lane N's primary client mount
@@ -794,11 +947,11 @@ expose_lane_to_executor()
     # The executor bind-mounts only this selected subtree into its sandbox.
     mount --bind "$expose_lane_root/client0/mnt" "$expose_source/client0"
     expose_peer_mount=$expose_lane_root/client1/mnt
-    if [ "$server_impl" = both ]; then
+    if [ "$server_impl" = both ] && [ "$fixture_mode" = single ]; then
         expose_peer_mount=$expose_lane_root/client1/knfsd
     fi
     mount --bind "$expose_peer_mount" "$expose_source/client1"
-    if [ "$server_impl" = both ]; then
+    if [ "$server_impl" = both ] && [ "$fixture_mode" = single ]; then
         for expose_client in 0 1; do
             for expose_backend in knfsd ganesha; do
                 mkdir "$expose_source/client$expose_client-$expose_backend"
@@ -812,6 +965,23 @@ expose_lane_to_executor()
                     "$expose_source/client$expose_client-$expose_backend"
             done
         done
+    elif [ "$fixture_mode" = broad-knfsd ]; then
+        for expose_client in 0 1; do
+            mkdir "$expose_source/client$expose_client-knfsd"
+            mount --bind "$expose_lane_root/client$expose_client/mnt" \
+                "$expose_source/client$expose_client-knfsd"
+        done
+    fi
+    for expose_alias in $(profile_alias_names); do
+        expose_client=${expose_alias#client}
+        expose_client=${expose_client%%-*}
+        expose_profile=${expose_alias#client$expose_client-}
+        expose_mount=$(profile_mount_path "$expose_lane" \
+            "$expose_client" "$expose_profile")
+        mkdir "$expose_source/$expose_alias"
+        mount --bind "$expose_mount" "$expose_source/$expose_alias"
+    done
+    if [ "$server_impl" = both ]; then
         test -S "$expose_source/control/arm.sock"
     fi
     touch "$expose_source/.client0_netns" "$expose_source/.client1_netns"
@@ -888,6 +1058,7 @@ cleanup_fixture()
                 fi
             done
             for cleanup_client_mount in \
+                "$cleanup_source"/client?-*-v* \
                 "$cleanup_source/client0-knfsd" \
                 "$cleanup_source/client0-ganesha" \
                 "$cleanup_source/client1-knfsd" \
@@ -910,6 +1081,18 @@ cleanup_fixture()
         if test -e "$root/relay.cleanup.trace"; then
             echo "KOOV cleanup trace: cross mounts lane=$cleanup_lane" >&2
         fi
+        for cleanup_profile_mount in \
+            "$cleanup_lane_root"/client?/knfsd-v*; do
+            if nfs_mount_exists "$cleanup_profile_mount"; then
+                if test -e "$root/relay.cleanup.trace"; then
+                    echo "KOOV cleanup trace: umount $cleanup_profile_mount" >&2
+                fi
+                timeout 30s umount "$cleanup_profile_mount" 2>/dev/null || true
+                if nfs_mount_exists "$cleanup_profile_mount"; then
+                    cleanup_mount_leaks=$((cleanup_mount_leaks + 1))
+                fi
+            fi
+        done
         for cleanup_cross_mount in \
             "$cleanup_lane_root/client0/ganesha" \
             "$cleanup_lane_root/client1/knfsd"; do
@@ -1043,6 +1226,10 @@ cleanup_fixture()
                 "$cleanup_source/.server0_ipv4" "$cleanup_source/.server1_ipv4"
             rm -f "$cleanup_source/control/arm.sock"
             rmdir "$cleanup_source/control" 2>/dev/null || true
+            for cleanup_profile_dir in \
+                "$cleanup_source"/client?-*-v*; do
+                rmdir "$cleanup_profile_dir" 2>/dev/null || true
+            done
             rmdir "$cleanup_source/client0-knfsd" \
                 "$cleanup_source/client0-ganesha" \
                 "$cleanup_source/client1-knfsd" \
@@ -1081,8 +1268,15 @@ status_fixture()
     test -s "$root/fixture.count"
     status_count=$(cat "$root/fixture.count")
     valid_count "$status_count"
+    status_mode=$(cat "$root/fixture.mode")
+    case "$status_mode" in single|broad-knfsd) ;; *) return 1 ;; esac
     status_version=$(cat "$root/fixture.version")
     case "$status_version" in 3|4.0|4.1|4.2) ;; *) return 1 ;; esac
+    # ExecStartPost and ExecStop are separate systemd processes and do not
+    # inherit variables exported by boot-fixture.sh.  Persisted setup state is
+    # therefore authoritative for status helpers and profile alias selection.
+    fixture_mode=$status_mode
+    nfs_version=$status_version
     status_mount_type=nfs4
     status_mount_version=$status_version
     status_minor_json=${status_version#4.}
@@ -1094,8 +1288,22 @@ status_fixture()
     test "$(cat "$executor_root/enabled")" -eq 1
     test "$(cat "$executor_root/.lane_count")" -eq "$status_count"
     test "$(cat "$executor_root/.frozen_phase9_fixture")" = "$root"
-    printf '{"lane_count":%s,"nfs_version":"%s","nfs_minor":%s,"localio":"N","lanes":[' \
-        "$status_count" "$status_version" "$status_minor_json"
+    status_profiles='["knfsd-v3","knfsd-v40","knfsd-v41","knfsd-v42"]'
+    if [ "$status_mode" = single ]; then
+        status_suffix=$(version_suffix "$status_version")
+        status_profiles='[]'
+        if [ "$server_impl" != ganesha ]; then
+            status_profiles="[\"knfsd-$status_suffix\"]"
+        fi
+        if [ "$status_version" = 4.1 ] && [ "$server_impl" = ganesha ]; then
+            status_profiles='["ganesha-v41"]'
+        elif [ "$status_version" = 4.1 ] && [ "$server_impl" = both ]; then
+            status_profiles='["knfsd-v41","ganesha-v41"]'
+        fi
+    fi
+    printf '{"lane_count":%s,"fixture_mode":"%s","profiles":%s,"nfs_version":"%s","nfs_minor":%s,"localio":"N","lanes":[' \
+        "$status_count" "$status_mode" "$status_profiles" \
+        "$status_version" "$status_minor_json"
     status_lane=0
     status_previous_epoch=0
     while test "$status_lane" -lt "$status_count"; do
@@ -1199,9 +1407,17 @@ status_fixture()
                 -m -n -- findmnt -n -o OPTIONS \
                 -- "$status_lane_root/server/export-ganesha")
         fi
+        status_knfsd_source=10.89.$status_lane.1:/
+        status_ganesha_source=10.89.$status_lane.5:/
+        if [ "$status_version" = 3 ]; then
+            status_knfsd_source=10.89.$status_lane.1:$status_lane_root/server/export
+            status_ganesha_source=10.89.$status_lane.5:$status_lane_root/server/export-ganesha
+        fi
         if [ "$server_impl" = both ]; then
             status_relay_pid=$(cat "$status_lane_root/server/proxy.pid")
             pid_in_named_netns "$status_relay_pid" "$status_server_ns"
+        fi
+        if [ "$server_impl" = both ] && [ "$status_mode" = single ]; then
             test "$status_connections" -ge 4
             nsenter -t "$status_client0_pid" -m -n -- grep -Eq \
                 " $status_lane_root/client0/ganesha $status_mount_type .*vers=$status_mount_version.*proto=tcp" \
@@ -1209,12 +1425,6 @@ status_fixture()
             nsenter -t "$status_client1_pid" -m -n -- grep -Eq \
                 " $status_lane_root/client1/knfsd $status_mount_type .*vers=$status_mount_version.*proto=tcp" \
                 /proc/mounts
-            status_knfsd_source=10.89.$status_lane.1:/
-            status_ganesha_source=10.89.$status_lane.5:/
-            if [ "$status_version" = 3 ]; then
-                status_knfsd_source=10.89.$status_lane.1:$status_lane_root/server/export
-                status_ganesha_source=10.89.$status_lane.5:$status_lane_root/server/export-ganesha
-            fi
             test "$(findmnt -n -o SOURCE -- "$status_lane_root/client0/ganesha")" = \
                 "$status_ganesha_source"
             test "$(findmnt -n -o SOURCE -- "$status_lane_root/client1/knfsd")" = \
@@ -1248,20 +1458,51 @@ status_fixture()
         test "$(cat "$status_source/.lane_id")" -eq "$status_lane"
         status_source_entries=$(find "$status_source" -mindepth 1 \
             -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+        status_expected_entries=$(fixture_source_entries | LC_ALL=C sort)
+        test "$status_source_entries" = "$status_expected_entries"
         if [ "$server_impl" = both ]; then
-            test "$status_source_entries" = "$(printf '.client0_netns\n.client0_pid\n.client1_netns\n.client1_pid\n.lane_id\n.server0_ipv4\n.server1_ipv4\nclient0\nclient0-ganesha\nclient0-knfsd\nclient1\nclient1-ganesha\nclient1-knfsd\ncontrol\n')"
             test -S "$status_source/control/arm.sock"
-            for status_bind in client0-knfsd client0-ganesha \
-                client1-knfsd client1-ganesha; do
-                nfs_mount_exists "$status_source/$status_bind"
-            done
-            test "$(findmnt -n -o SOURCE -- "$status_source/client0-knfsd")" = "$status_knfsd_source"
-            test "$(findmnt -n -o SOURCE -- "$status_source/client1-knfsd")" = "$status_knfsd_source"
-            test "$(findmnt -n -o SOURCE -- "$status_source/client0-ganesha")" = "$status_ganesha_source"
-            test "$(findmnt -n -o SOURCE -- "$status_source/client1-ganesha")" = "$status_ganesha_source"
-        else
-            test "$status_source_entries" = "$(printf '.client0_netns\n.client0_pid\n.client1_netns\n.client1_pid\n.lane_id\n.server0_ipv4\n.server1_ipv4\nclient0\nclient1\n')"
+            if [ "$status_mode" = broad-knfsd ]; then
+                for status_bind in client0-knfsd client1-knfsd; do
+                    nfs_mount_exists "$status_source/$status_bind"
+                    test "$(findmnt -n -o SOURCE -- \
+                        "$status_source/$status_bind")" = \
+                        "10.89.$status_lane.1:/"
+                done
+            else
+                for status_bind in client0-knfsd client0-ganesha \
+                    client1-knfsd client1-ganesha; do
+                    nfs_mount_exists "$status_source/$status_bind"
+                done
+                test "$(findmnt -n -o SOURCE -- "$status_source/client0-knfsd")" = "$status_knfsd_source"
+                test "$(findmnt -n -o SOURCE -- "$status_source/client1-knfsd")" = "$status_knfsd_source"
+                test "$(findmnt -n -o SOURCE -- "$status_source/client0-ganesha")" = "$status_ganesha_source"
+                test "$(findmnt -n -o SOURCE -- "$status_source/client1-ganesha")" = "$status_ganesha_source"
+            fi
         fi
+        for status_alias in $(profile_alias_names); do
+            nfs_mount_exists "$status_source/$status_alias"
+            status_alias_client=${status_alias#client}
+            status_alias_client=${status_alias_client%%-*}
+            status_alias_profile=${status_alias#client$status_alias_client-}
+            status_alias_mount=$(profile_mount_path "$status_lane" \
+                "$status_alias_client" "$status_alias_profile")
+            test "$(findmnt -n -o SOURCE -- "$status_source/$status_alias")" = \
+                "$(findmnt -n -o SOURCE -- "$status_alias_mount")"
+            if [ "$status_mode" = broad-knfsd ]; then
+                status_alias_suffix=${status_alias_profile##*-}
+                case "$status_alias_suffix" in
+                    v3) status_alias_type=nfs; status_alias_version=3 ;;
+                    v40) status_alias_type=nfs4; status_alias_version=4.0 ;;
+                    v41) status_alias_type=nfs4; status_alias_version=4.1 ;;
+                    v42) status_alias_type=nfs4; status_alias_version=4.2 ;;
+                    *) return 1 ;;
+                esac
+                grep -Eq \
+                    " $status_source/$status_alias $status_alias_type .*vers=$status_alias_version.*proto=tcp" \
+                    /proc/mounts
+            fi
+        done
         mountpoint -q "$status_source/.client0_netns"
         mountpoint -q "$status_source/.client1_netns"
         test "$(cat "$status_source/.client0_pid")" -eq "$status_client0_pid"
@@ -1337,6 +1578,7 @@ setup)
     fi; exit "$rc"' EXIT
     mkdir -p "$root"
     printf '%s\n' "$requested_count" > "$root/fixture.count"
+    printf '%s\n' "$fixture_mode" > "$root/fixture.mode"
     printf '%s\n' "$nfs_version" > "$root/fixture.version"
     if test -e "$executor_root" || test -L "$executor_root"; then
         echo "$executor_root is already owned by another fixture" >&2

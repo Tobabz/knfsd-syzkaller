@@ -5,7 +5,7 @@ It reflects a **remote KCOV coverage model** — collecting NFS server-side cove
 kernel, and automates the whole pipeline from base image to a bootable fuzz VM (instrumented kernels + syzkaller binaries +
 one baked protocol image).
 
-The checked-in customization series — **4 kernel patches + 19 syzkaller patches** (`bundle/patches/`) — is applied by
+The checked-in customization series — **4 kernel patches + 20 syzkaller patches** (`bundle/patches/`) — is applied by
 `tools/fport-apply.sh` during bootstrap. Every bootstrap run boots each kernel variant with the baked image and checks that the NFS lane fixture
 comes up and that the kernel carries the expected memory sanitizer.
 
@@ -16,9 +16,9 @@ comes up and that the kernel carries the expected memory sanitizer.
 | Instrumentation | KCOV + KASAN/KCSAN boot kernels, built **out of tree** from one patched source tree |
 | Coverage model | **Remote KCOV** — knfsd server-side coverage collected remotely (`remote_cover`, `cover_edges`); fs/nfsd and net/sunrpc PCs are attributed through this path. Ownership is lane-scoped (kernel 0002): every request that reaches lane N's server counts for the program proc N is running, so attribution survives the NFS wire relay |
 | Fuzz lanes | One NFS lane per executor proc (a server plus two client mount namespaces, `/nfs-lane`); the boot fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count and `vm.snapshot` off. Lanes exist for parallel fuzzing inside one VM |
-| NFS version | `koov.nfs_version=3\|4.0\|4.1\|4.2` in `vm.cmdline` selects one mount version for both backends at boot |
+| NFS fixture | Stable runs use `koov.nfs_version=3\|4.0\|4.1\|4.2`. The opt-in `koov.nfs_fixture=broad-knfsd` experiment mounts all four versions against knfsd |
 | Boot model | One version-neutral image serves both sanitizer kernels; the lane script is copied from a read-only host 9P share at each VM boot |
-| Seeds | `bundle/corpus/nfs-normal/` — normal-flow syzkaller programs plus a manifest; run them with a stock syz-manager (remote coverage is the `experimental.remote_cover` setting) |
+| Seeds | `bundle/corpus/nfs-normal/` — 12 normal-scenario mutation seeds selected into generated `corpus.db` files by native backend/version profile |
 
 The image uses `bundle/lane/lane.sh` for all four NFS versions. Its default `SERVER_IMPL=both`
 routes both clients through the relay; `nfs-lane/client0` and `client1` select the same knfsd
@@ -37,13 +37,13 @@ V15.6 v4.1/v4.2 image names in historical evidence refer to the baked-script
 configuration used for those runs.
 An earlier KASAN snapshot run of the 11-call COPY seed returned 32 MiB and collected a
 nonempty remote `.extra`; the v4.1 knfsd and Ganesha seeds each passed 34 calls
-in separate KASAN snapshots. Current fuzzing uses a separate syz-manager,
-workdir and `corpus.db` for each backend, running one backend at a time. Each
-manager starts from its own basic seed; the former combined DBs have been removed.
+in separate KASAN snapshots. Stable fuzzing uses a separate syz-manager,
+workdir and generated `corpus.db` for each native profile, running one profile
+at a time. The former combined DBs have been removed.
 The separate managers completed `corpus-triage` with 100 knfsd and 109 Ganesha
 programs, with no opposite-backend path literals found in either saved corpus.
-See the [corpus execution guide](bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)
-for resume commands, evidence and limits.
+See the [corpus execution guide](bundle/corpus/nfs-normal/README.md)
+for DB construction, broad-fixture screening, evidence and limits.
 
 New configs use the reusable image. The validated separate v4.1 cache configs
 still pin `bookworm-kcov-v41-ganesha-v15.6.qcow2`, which contains its lane script.
@@ -108,7 +108,7 @@ python3 tools/bootstrap-kcov-env.py env \
 | `--variant kasan\|kcsan` (optional, repeatable) | Sanitizer kernels to build and verify; default: both |
 | `--jobs N` (optional) | Parallel build jobs |
 
-- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (4+19) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the version-neutral VM image once (`bookworm-kcov-fresh.qcow2`) → boot every variant with the host lane script and verify its hash and lane status
+- **Behavior**: clone upstream (kernel at `--kernel-ref`, syzkaller at the commit in `bundle/patches/BASE`) → apply the series (4+20) → build one `bzImage`/`vmlinux` per variant out of tree (`make O=`) plus the syzkaller binaries → bake the version-neutral VM image once (`bookworm-kcov-fresh.qcow2`) → boot every variant with the host lane script and verify its hash and lane status
 - **Output**: `env/` — `env/images/<variant>/bzImage` and `env/images/<variant>/vmlinux` and `.config` (`<variant>` = `kasan` or `kcsan`), `env/images/bookworm-kcov-fresh.qcow2`, `env/syzkaller/bin/...`, and **`env/manifest.json`** (records the kernel ref and resolved commit, pins, per-variant kernel hashes and verification). `env/linux/` is the clean patched source tree and `env/build/<variant>/` the disposable build tree; delete `env/build/` once `env/images/` is populated.
 
 ### 3. Using the result with syz-manager
@@ -121,18 +121,23 @@ No runner is provided: point a syz-manager config at the outputs of step 2.
 | `image`, `sshkey` | `env/images/bookworm-kcov-fresh.qcow2`, `artifacts/bookworm.id_rsa` |
 | `procs` | the fixture's lane count (4) |
 | `vm.snapshot` | `false` (or absent). Snapshot mode runs one program at a time with one proc, so only lane 0 is used |
-| `workdir`, `http` | distinct for knfsd and Ganesha; each workdir owns its own `corpus.db` |
+| `workdir`, `http` | distinct for every native profile; each workdir owns its own `corpus.db` |
 | `experimental.remote_cover` | `true` for knfsd; `false` for Ganesha, whose current feedback is local client-kernel coverage |
 | `vm.cmdline` | must include `nfs.localio_enabled=N`; the helper below adds `koov.nfs_version` and the expected lane-script SHA-256. `sunrpc.lane_attribution=0` disables lane attribution; it does not restore request-level attribution |
 
-Create one base config per backend with distinct `workdir` and `http` values.
-Initialize each new workdir's DB from only that backend's seed: knfsd uses
-`basic-v41-tcp.prog`, Ganesha uses `basic-v41-ganesha-tcp.prog`.
-Do not pack the whole seed directory into both DBs, merge the DBs, or share a
-corpus hub between these campaigns. Keep existing DBs when resuming.
+Create one base config per profile with distinct `workdir` and `http` values.
+Initialize a new workdir from the manifest-selected native seeds, and keep its
+DB when resuming:
+
+```sh
+tools/build-normal-corpus.py /tmp/knfsd-v41/corpus.db --profile knfsd-v41
+tools/build-normal-corpus.py /tmp/ganesha-v41/corpus.db --profile ganesha-v41
+```
+
+Do not merge DBs or share a corpus hub between stable profiles.
 
 For the reusable image, freeze the host script and add the read-only 9P device
-to each config separately; the helper preserves its backend-specific workdir
+to each config separately; the helper preserves its profile-specific workdir
 and coverage settings:
 
 ```sh
@@ -140,7 +145,7 @@ python3 tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-v
 python3 tools/prepare-live-lane-config.py manager-ganesha-base.cfg manager-ganesha-v41.cfg --version 4.1
 ```
 
-Run one backend at a time. Start knfsd with:
+Run one profile at a time. Start knfsd v4.1 with:
 
 ```sh
 env/syzkaller/bin/syz-manager -config manager-knfsd-v41.cfg -mode fuzzing
@@ -152,12 +157,8 @@ After stopping it and waiting for shutdown, run Ganesha:
 env/syzkaller/bin/syz-manager -config manager-ganesha-v41.cfg -mode fuzzing
 ```
 
-The [existing local campaign commands](bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)
-use the already validated separate configs. Those configs set `vm.snapshot: true`, so they ran
-one proc (lane 0) only; turn snapshot mode off for the parallel lane operation this fixture is
-designed for. Parallel four-lane manager runs with the current topology are not yet validated. Corpus separation prevents splicing
-between backend corpora; it does not preserve seed paths or disable minimization.
-The fixture still exposes both backends, so this is not a strict execution filter.
+Profile separation prevents cross-version seed splicing at initialization; it
+does not disable ordinary mutation or minimization.
 
 Use `--version 3`, `4.0`, `4.1` or `4.2` for a campaign. The helper leaves the input config alone,
 copies `bundle/lane/lane.sh` to a hash-named `workdir_template`, and pins that
@@ -165,8 +166,10 @@ hash in the guest boot arguments. Each VM copies the script once into `/run`;
 setup, status and cleanup use that same copy. Changing `lane.sh` requires a new
 prepared config, **not** a new image. The host share is read-only and is unmounted
 after the copy. A missing share or wrong hash fails the fixture at boot.
-The checked-in normal corpus has v4.1/v4.2 inputs; version-specific v3/v4.0
-seeds and their oracles still need to be prepared before fuzzing those versions.
+The checked-in corpus includes native v3, v4.0, v4.1, v4.2, and Ganesha-v4.1
+inputs. `--broad-knfsd` selects the experimental four-version fixture; build
+its 11-seed DB with `--fixture broad-knfsd` and screen it separately for 30
+minutes. It never replaces stable profiles automatically.
 
 For version comparisons, mount only the selected version in each VM. Extra
 NFSv4 mounts establish client/server state and can issue lease-renewal traffic

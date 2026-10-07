@@ -459,7 +459,8 @@ def stage_bake(args, bzimage, image_out):
 
 
 class VM:
-    def __init__(self, image, kernel, ssh_key, boot_timeout, version):
+    def __init__(self, image, kernel, ssh_key, boot_timeout, version,
+                 fixture=None):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             self.ssh_port = reservation.getsockname()[1]
@@ -473,9 +474,14 @@ class VM:
         self.image, self.kernel = image, kernel
         self.boot_timeout = boot_timeout
         self.version = version
+        self.fixture = fixture
         self.process = None
 
     def start(self):
+        if self.fixture:
+            fixture_arg = "koov.nfs_fixture=%s" % self.fixture
+        else:
+            fixture_arg = "koov.nfs_version=%s" % self.version
         cmd = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
                "-m", "4096", "-smp", "4", "-display", "none",
                "-serial", "none", "-no-reboot", "-snapshot",
@@ -485,8 +491,8 @@ class VM:
                "-drive", "file=%s,format=qcow2,if=ide" % self.image,
                "-kernel", str(self.kernel),
                "-append", "root=/dev/sda console=ttyS0 nokaslr "
-               "nfs.localio_enabled=N koov.nfs_version=%s koov.lane_sha256=%s"
-               % (self.version, sha256(LANE / "lane.sh")),
+               "nfs.localio_enabled=N %s koov.lane_sha256=%s"
+               % (fixture_arg, sha256(LANE / "lane.sh")),
                "-device", "e1000,netdev=net0",
                "-netdev", "user,id=net0,restrict=on,"
                "hostfwd=tcp:127.0.0.1:%d-:22" % self.ssh_port]

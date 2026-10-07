@@ -16,12 +16,14 @@ def main():
     selection.add_argument("--version", choices=("3", "4.0", "4.1", "4.2"))
     selection.add_argument("--minor", choices=("1", "2"),
                            help="legacy alias for --version 4.1 or 4.2")
+    selection.add_argument("--broad-knfsd", action="store_true",
+                           help="experimental knfsd v3/v4.0/v4.1/v4.2 fixture")
     parser.add_argument("--image", type=Path,
                         default=REPO / "env/images/bookworm-kcov-fresh.qcow2")
     parser.add_argument("--lane-script", type=Path,
                         default=REPO / "bundle/lane/lane.sh")
     args = parser.parse_args()
-    version = args.version or "4." + args.minor
+    version = None if args.broad_knfsd else args.version or "4." + args.minor
     if args.output.exists() or args.output.is_symlink():
         parser.error("output already exists")
     if not args.image.is_file():
@@ -53,13 +55,19 @@ def main():
         lane_copy.chmod(0o444)
     config["workdir_template"] = str(snapshot)
     config["image"] = str(args.image.resolve())
+    # vm.snapshot controls syzkaller's executor snapshot mode.  Parallel lane
+    # campaigns keep that false, but QEMU must still protect the shared base
+    # image from guest writes (and syz-manager's image-integrity guard).
+    disk_snapshot = "" if vm.get("snapshot") else " -snapshot"
     vm["qemu_args"] = (
-        "-enable-kvm -cpu host,migratable=off "
+        "-enable-kvm -cpu host,migratable=off" + disk_snapshot + " "
         "-fsdev local,id=koov_lane,path={{TEMPLATE}},security_model=none,readonly=on "
         "-device virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane"
     )
-    vm["cmdline"] = (cmdline + " koov.nfs_version=%s koov.lane_sha256=%s"
-                     % (version, digest)).strip()
+    fixture_arg = ("koov.nfs_fixture=broad-knfsd" if args.broad_knfsd else
+                   "koov.nfs_version=%s" % version)
+    vm["cmdline"] = (cmdline + " %s koov.lane_sha256=%s"
+                     % (fixture_arg, digest)).strip()
     args.output.write_text(json.dumps(config, indent=2) + "\n")
     print("config=%s lane_sha256=%s" % (args.output, digest))
 
