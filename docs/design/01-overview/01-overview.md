@@ -1,7 +1,7 @@
 # 재현 파이프라인 개요
 
 > 상태: draft   ·   최종 확인: 2026-10-02   ·   기준: kernel `v7.3-rc5` / syzkaller `801f09666`
-> 관련 패치: kernel 0001~0003, syzkaller 0001~0019   ·   부트스트랩 검사: manifest의 빌드·부팅 결과
+> 관련 패치: kernel 0001~0004, syzkaller 0001~0019   ·   부트스트랩 검사: manifest의 빌드·부팅 결과
 
 ## 요약
 
@@ -22,7 +22,7 @@ pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범�
 
 | # | 문제 | 해결 요소 | 근거 |
 |---|---|---|---|
-| 1 | 서버 쪽 처리는 nfsd 커널 스레드에서 일어나 executor 스레드의 KCOV로는 보이지 않는다 | remote KCOV (kernel 0001~0003) | `README.md`의 Coverage model |
+| 1 | 서버 쪽 처리는 nfsd 커널 스레드에서 일어나 executor 스레드의 KCOV로는 보이지 않는다 | remote KCOV (kernel 0001~0004) | `README.md`의 Coverage model |
 | 2 | 도달 여부를 알 수 없으면 PC가 없는 이유를 "미실행"으로 오독한다 | 소유권 규칙과 관측 진단 카운터 | `report/normal-flow-corpus.md`의 완료 기준 |
 | 3 | syzkaller는 syscall을 변조하는데, syscall 인자로는 NFS operation 단위의 뮤테이션이 되지 않는 경우가 있다 | pseudo-syscall과 프로토콜 형태 연산 (syzkaller 0006, 0015) | 설계 의도(사용자 확인). 코드 대조는 아래 "주장 검증" 참조 |
 | 4 | NFS 클라이언트를 대상으로 하는 취약점을 트리거하려면 서버의 응답을 변조해야 한다 | wire 프록시와 arm 규칙 (syzkaller 0017) | 설계 의도(사용자 확인). 프록시에 S2C 방향 변조가 구현되어 있음 (`tools/nfs-proxy/README.md`) |
@@ -145,7 +145,7 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 | LLM Agent 연동 | 설계 문서로 syzlang, pseudo-syscall, arm 규칙을 생성 | 저장소에 생성기 **없음** | 요소별 설계 문서 미작성 |
 | pseudo-syscall, 기술 파일 | seed가 NFS 프로토콜을 다루게 함 | 구현됨 | syzkaller 패치 시리즈 |
 | lane, namespace | 프로세스별 격리된 NFS 환경 | 구현됨 | `bundle/lane/`, `tools/README.md` |
-| remote KCOV | 서버 경로 도달 관측 | 구현됨 (knfsd 한정) | kernel 패치 0001~0003 |
+| remote KCOV | 서버 경로 도달 관측 | 구현됨 (knfsd 한정) | kernel 패치 0001~0004 |
 | nfs-proxy | wire 변조 주입 | 고정 경로, 같은 폭 편집(v1)과 길이 변경 편집(v2, 호스트+4-lane 게스트 검증) 구현 | `tools/nfs-proxy/README.md` |
 | Ganesha 백엔드 | 별도 서버 대상 | 서버별 corpus로 순차 퍼징 | `bundle/corpus/nfs-normal/README.md` |
 | 재현 판정 | Q1, Q2 종합 | 통합 판정 도구 **없음** | `report/normal-flow-corpus.md` |
