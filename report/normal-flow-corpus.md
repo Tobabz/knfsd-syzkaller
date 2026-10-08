@@ -1,6 +1,6 @@
 # 정상 NFS 실행 흐름: 지원 범위와 완료 기준
 
-현재 코퍼스는 TCP 입력 여섯 개를 포함한다. NFSv3 입력 하나, NFSv4.0 입력 하나, NFSv4.1·v4.2 입력 네 개이다.
+현재 코퍼스는 NFSv3·v4.0·v4.1·v4.2의 정상 흐름을 위한 TCP 입력을 포함한다.
 v4.1 기본 파일 연산 퍼징은 knfsd와 Ganesha가 각각 별도 syz-manager와 `corpus.db`를 사용한다.
 두 서버는 한 번에 한 서버씩 실행한다.
 입력·마운트·실행 명령의 기준은
@@ -80,5 +80,5 @@ knfsd의 요청별 원격 KCOV는 `svc_process` 부근에서 시작한다.
 전역으로 관측한 전송 단계 PC는 특정 프로그램의 피드백으로 바로 합칠 수 없다.
 corpus 선택 신호로 쓰기 전에 세 가지를 확인한다: 실행별 격리, 남은 작업의 배출, 외부 트래픽 배제.
 callback과 주기적 작업은 별도 관측 없이 요청에 귀속하지 않는다.
-현재 검증 결과의 범위와 실행 방법은
-[코퍼스 운영 문서](../bundle/corpus/nfs-normal/README.md)를 따른다.
+실행 결과의 범위는 [검증 기록](validation-history.md)에,
+사용 방법은 [코퍼스 운영 문서](../bundle/corpus/nfs-normal/README.md)에 정리되어 있다.

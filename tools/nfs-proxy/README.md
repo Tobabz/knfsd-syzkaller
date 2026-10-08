@@ -1,11 +1,15 @@
-# NFS wire relay
+# NFS-specific Mutation Engine
+
+`nfs-proxy` is a **Mutation Engine specialized for NFS, implemented as a proxy** between
+NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
+RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
 `build.sh` runs host framing/walk/delta/relay/control tests under clang and
 GCC ASan+UBSan. `build-guest.sh --out FILE` creates a Debian bookworm ABI
 guest binary after those checks. The two backend listeners are routed solely
 by destination IP, and the source IP identifies the client. `SERVER_IMPL=both`
 provides `.1:2049 → knfsd :20490` and `.5:2049 → Ganesha :20491`.
-NFSv3 calls use the same TCP relay; their MOUNT requests go directly to the
+NFSv3 calls pass through the engine's TCP proxy; their MOUNT requests go directly to the
 backends on pinned ports. Typed operation matching is defined for NFSv4
 COMPOUND requests, while v3 messages expose only the RPC header and raw body.
 
@@ -23,11 +27,11 @@ COMPOUND requests, while v3 messages expose only the RPC header and raw body.
 | 108–123 | recorded original bytes (first `patch_w` used, max 16) |
 | 124–139 | replacement bytes (first `patch_w` used) |
 
-The proxy ACKs with one zero byte **after registering** the rule. The
+The engine ACKs with one zero byte **after registering** the rule. The
 returned FD owns it: closing the FD or ending the executor program expires
 the rule. The ACK says neither that a matching RPC arrived nor that changed
 bytes reached the backend. The rule always includes both client and backend;
-there is no proxy-side random choice. Only structurally certain typed 32-bit
+the engine makes no random choice. Only structurally certain typed 32-bit
 slots and known raw regions may be patched. A mismatch against recorded
 original bytes refuses the mutation and increments the mismatch counter.
 
@@ -44,7 +48,7 @@ relay and control statistics; SIGTERM prints the final replay comparison.
 `syz_arm_nfs_proxy_v2(arm, arm_len)` sends a second, self-describing packet on
 the same control socket for edits the fixed 140-byte packet cannot express:
 inserting an operation into a COMPOUND, or growing/shrinking a field. The
-proxy dispatches by magic, so v1 and v2 arms can be registered and applied
+engine dispatches by magic, so v1 and v2 arms can be registered and applied
 together on the same connection.
 
 | Bytes | Meaning |
@@ -56,7 +60,7 @@ together on the same connection.
 
 The packet is self-describing (no fixed length): the header's `nedits` and
 each edit's own `orig_len`/`data_len` say how many bytes follow, and the
-proxy's decoder (`tools/nfs-proxy/src/edit.c`, `control.c`'s `decode_v2`)
+engine's decoder (`tools/nfs-proxy/src/edit.c`, `control.c`'s `decode_v2`)
 requires the declared sizes to consume the packet exactly, with nothing
 trailing. All of REPLACE/INSERT/DELETE/OP_APPEND/OP_PREPEND verify any bytes
 they claim to overwrite or remove before patching (same verify-before-patch
@@ -89,10 +93,8 @@ tools/nfs-proxy/build-syzkaller.sh      # applies 0017 to an already patched syz
 tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-control-guest
 ```
 
-The guest relay gates and the arm OFF/ON repeated-run runners that used these builds
-(`ganesha-asan-relay-run.sh`, `ganesha-asan-relay-ab-run.sh`, `run-ganesha-asan-relay-*.py`) were removed in
-commit `7833ed3`, together with their evidence. The static `test/guest-delta-replay.c` probe and the unit
-tests under `test/` remain.
+Host tests are under `test/`; `build.sh` builds and runs them.
+`test/guest-delta-replay.c` provides a guest replay probe.
 
 `bundle/patches/syzkaller/0017-*` is a `git am` patch after 0016, included in the series. The `tools/` build
 wrapper can apply just 0017 to an already patched source tree (`KOOV_SYZ_TARGET`); guest paths can be
@@ -100,8 +102,8 @@ selected with `KOOV_*` overrides. Binaries are local, gitignored artifacts.
 
 `bundle/patches/syzkaller/0019-*` adds `syz_arm_nfs_proxy_v2` (the arm v2 packet above) on top of 0017/0018;
 applying the series and running `make descriptions` (`tools/bootstrap-kcov-env.py` does this) regenerates
-`sys/gen/*.gob.flate` so the new pseudo-syscall is visible to `prog.GetTarget`. As of 2026-10-02 this patch
-and the proxy's v2 code are host-verified only (`build.sh`, `test_edit.c`, `test_control.c`); no guest boot
-has exercised `syz_arm_nfs_proxy_v2` yet. See `docs/handoff/proxy-variable-length-edits/` for the completion
-report and what guest verification (lane attribution under a length-changing edit, `syz-manager` corpus
-impact) is still open.
+`sys/gen/*.gob.flate` so the new pseudo-syscall is visible to `prog.GetTarget`.
+
+Implementation background and execution results are maintained in the
+[handoff document](../../docs/handoff/proxy-variable-length-edits/handoff.md)
+and [validation history](../../report/validation-history.md).

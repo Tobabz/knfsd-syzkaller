@@ -9,7 +9,8 @@
 보고하는 이상으로 재현을 판정한다. Agent는 이 설계 문서를 읽고 시나리오에 필요한 syzlang과
 pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범위 안에서 그것을 만드는 것이다.
 시나리오가 의도한 서버 경로까지 도달했는지는 remote KCOV로 확인하고, 시나리오가 요구하는 변조는
-프록시가 주입한다. 도달 여부를 잘못 읽으면 "재현 실패"와 "seed 오동작"을 구분할 수 없다.
+프록시 기반의 NFS 특화 Mutation Engine (`nfs-proxy`)이 주입한다.
+도달 여부를 잘못 읽으면 "재현 실패"와 "seed 오동작"을 구분할 수 없다.
 
 > 이 문서 시리즈의 독자는 사람과 LLM Agent다. 그래서 각 문서는 "무엇이 지원되고, 무엇이 지원되지
 > 않으며, 확장하려면 어디를 고쳐야 하는가"를 명시한다(`00-writing-guidelines.md` 8절).
@@ -25,7 +26,7 @@ pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범�
 | 1 | 서버 쪽 처리는 nfsd 커널 스레드에서 일어나 executor 스레드의 KCOV로는 보이지 않는다 | remote KCOV (kernel 0001~0004) | `README.md`의 Coverage model |
 | 2 | 도달 여부를 알 수 없으면 PC가 없는 이유를 "미실행"으로 오독한다 | 소유권 규칙과 관측 진단 카운터 | `report/normal-flow-corpus.md`의 완료 기준 |
 | 3 | syzkaller는 syscall을 변조하는데, syscall 인자로는 NFS operation 단위의 뮤테이션이 되지 않는 경우가 있다 | pseudo-syscall과 프로토콜 형태 연산 (syzkaller 0006, 0015) | 설계 의도(사용자 확인). 코드 대조는 아래 "주장 검증" 참조 |
-| 4 | NFS 클라이언트를 대상으로 하는 취약점을 트리거하려면 서버의 응답을 변조해야 한다 | wire 프록시와 arm 규칙 (syzkaller 0017) | 설계 의도(사용자 확인). 프록시에 S2C 방향 변조가 구현되어 있음 (`tools/nfs-proxy/README.md`) |
+| 4 | NFS 클라이언트를 대상으로 하는 취약점을 트리거하려면 서버의 응답을 변조해야 한다 | NFS 특화 Mutation Engine과 arm 규칙 (syzkaller 0017) | 설계 의도(사용자 확인). Mutation Engine에 S2C 방향 변조가 구현되어 있음 (`tools/nfs-proxy/README.md`) |
 | 5 | 동시 퍼징 시 프로세스 간 상태가 섞이면 결과를 해석할 수 없다 | lane과 namespace 격리 (syzkaller 0007~0014) | `bundle/lane/`의 fixture와 syzkaller 패치 |
 
 여섯 번째 요소인 NFS-Ganesha는 추가 서버 대상이다. v4.1 기본 시드는 서버별로 나누고,
@@ -33,7 +34,7 @@ pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범�
 Ganesha는 원래 knfsd와 동시에 퍼징해 처리량을 높이는 병렬 축으로 도입했으나, 한 manager에서 두 서버를
 함께 운용할 때의 상태 관리 문제 등으로 서버별 순차 캠페인으로 바꿨다(2026-10-02 결정).
 병렬성은 서버 축이 아니라 한 VM 안의 lane(proc) 축이 담당한다.
-프록시의 실행 대상 선택 확장은 후속 계획이다.
+Mutation Engine의 실행 대상 선택 확장은 후속 계획이다.
 
 ## 구조
 
@@ -63,12 +64,14 @@ Ganesha는 원래 knfsd와 동시에 퍼징해 처리량을 높이는 병렬 축
    [ 판정 ]   Q1: seed가 의도한 경로에 도달했는가   <- R, 카운터
               Q2: sanitizer가 이상을 보고했는가     <- S
 
- (K)=서버 처리 지점  (R)=remote KCOV 계측  (W)=변조 지점  (S)=sanitizer 보고
- 읽는 순서: Agent에서 시작해 위에서 아래로. 기본 이미지의 NFS 마운트는 프록시를 거친다.
+ (K)=서버 처리 지점  (R)=remote KCOV 계측  (S)=sanitizer 보고
+ (W)=프록시 기반의 NFS 특화 Mutation Engine (`nfs-proxy`)
+ 읽는 순서: Agent에서 시작해 위에서 아래로. 기본 이미지의 NFS 마운트는 Mutation Engine을 거친다.
 ```
 
-기본 이미지는 `bundle/lane/lane.sh` 하나를 사용하며 `SERVER_IMPL=both`로 두 서버를 프록시 뒤에 둔다.
-기존 NFSv3 시드와 별도 fixture는 제거했다. 현재 공통 lane은 부팅 시
+기본 이미지는 `bundle/lane/lane.sh` 하나를 사용하며 `SERVER_IMPL=both`로 두 서버를 Mutation Engine 뒤에 둔다.
+예전 NFSv3 시드와 별도 fixture는 제거했고, 2026-10-05에 공통 lane용
+`basic-v3-tcp.prog`와 `deleg-recall-v40-tcp.prog`를 추가했다. 현재 공통 lane은 부팅 시
 `--version 3|4.0|4.1|4.2`로 두 서버의 마운트 버전을 선택한다.
 현재 lane은 Ganesha V15.6을 사용한다. V15.6의 FSAL_VFS는 `tmpfs` export를
 제외하므로 Ganesha는 크기가 제한된 ext4 루프 저장소를 사용하고, knfsd는 기존
@@ -94,20 +97,24 @@ Ganesha manager -> ganesha/workdir/corpus.db -> client0-ganesha <-> client1-gane
                   (한 번에 한 manager 실행)
 ```
 
-현재 로컬 설정은 `cache/manager-separated-v41-20261002/{knfsd,ganesha}/manager.cfg`다.
-두 설정은 `procs=4`, KASAN v4.1 VM 하나, 파일 연산 syscall 범위를 쓰며 `vm.snapshot`이 켜져 있다.
+2026-10-02 기록의 로컬 설정 경로는 `cache/manager-separated-v41-20261002/{knfsd,ganesha}/manager.cfg`다.
+당시 기록은 `procs=4`, KASAN v4.1 VM 하나, 파일 연산 syscall 범위와 프로그램 스냅샷 모드 사용을 기술한다.
+이 cache 설정·DB는 미커밋 자산이며 2026-10-08 문서 검토 시 현재 체크아웃에 없어 실제 설정을 다시 확인하지 못했다.
 
 **lane 병렬 운용은 필수다 (2026-10-02 결정).** lane은 한 VM 안에서 proc마다 격리된 NFS 상태를 주기 위한
-설계이므로 manager는 `procs`를 lane 수(4)로 두고 **`vm.snapshot`을 끈다.** syzkaller 스냅샷 모드는 VM마다
+설계이므로 manager는 `procs`를 lane 수(4)로 두고 **최상위 `snapshot`을 끈다.** syzkaller 프로그램 스냅샷 모드는 VM마다
 프로그램을 하나씩 순서대로 실행하고 proc을 하나만 쓴다(`executor/snapshot.h`, `pkg/execbackend/snapshot.go`).
 그래서 스냅샷 모드에서는 `procs=4`를 줘도 lane 0만 쓰이고 lane 1~3은 놀며, 프로그램마다 VM 상태가 되돌려져
 lane 귀속의 프로그램 경계도 시험되지 않는다.
-위 로컬 설정과 아래 분리 검증 결과는 스냅샷 모드, 즉 proc 하나로 얻은 것이다. 현재 토폴로지(서버별 캠페인,
-기본 `both`)에서 `vm.snapshot`을 끄고 lane 4개를 동시에 쓰는 manager 운용은 **미검증**이다.
+위 과거 기록은 proc 하나의 스냅샷 실행으로 기술되어 있어 lane 병렬 검증의 근거로 쓰지 않는다. 현재 토폴로지(서버별 캠페인,
+기본 `both`)에서 최상위 `snapshot`을 끄고 lane 4개를 동시에 쓰는 manager 운용은 **미검증**이다.
+`vm.snapshot`은 QEMU의 임시 디스크 쓰기 옵션이다. 기본값 `true`로 이미지를 보존하며 프로그램 스냅샷과 독립적이다.
 `experimental.remote_cover`는 knfsd에서 `true`, Ganesha에서 `false`다.
 Ganesha 피드백은 로컬 클라이언트 커널 KCOV이며 사용자 공간 서버 내부 커버리지가 아니다.
 실행 명령과 이미지 준비 방식은
-[코퍼스 운영 문서](../../../bundle/corpus/nfs-normal/README.md#execution-scope-2026-10-02)를 따른다.
+[코퍼스 운영 문서](../../../bundle/corpus/nfs-normal/README.md#campaign-setup)를 따른다.
+완료된 4-lane 실행기 검증과 manager 검증의 차이, 보존된 원본 결과는
+[병렬 lane 검증 기록](../../../report/validation-history.md#parallel-lane-verification)에 정리되어 있다.
 
 분리 검증의 `corpus-triage`는 양쪽 모두 종료 코드 0으로 끝났다. 저장된 knfsd
 프로그램 100개와 Ganesha 프로그램 109개에서 상대 서버 경로 문자열은 발견되지 않았다.
@@ -122,8 +129,8 @@ Ganesha 피드백은 로컬 클라이언트 커널 KCOV이며 사용자 공간 �
 단일 매니저 통합 운영은 폐기했다. 34호출을 두 번 붙이는 통합안도 채택하지 않는다. 고정된 syzkaller의
 `prog.MaxCalls`는 40이며 초과 입력은 매니저가 거부한다.
 
-**후속 계획.** 동일 시나리오의 실행 대상을 프록시에서 선택·관리하는 라우팅 확장은
-추후 설계와 구현으로 남긴다. 현재 프록시는 고정 중계 경로를 유지한다.
+**후속 계획.** 동일 시나리오의 실행 대상을 Mutation Engine에서 선택·관리하는 라우팅 확장은
+추후 설계와 구현으로 남긴다. 현재 Mutation Engine은 고정 중계 경로를 유지한다.
 실행 중인 NFS 세션의 서버 전환이나 양쪽 요청 복제 기능은 구현되어 있지 않다.
 서버별 상태 격리, 결과 구분과 처리량 이득은 후속 검토 대상이다.
 
@@ -131,7 +138,7 @@ Ganesha 피드백은 로컬 클라이언트 커널 KCOV이며 사용자 공간 �
 
 | Q1 도달 | Q2 sanitizer 보고 | 해석 | 다음 행동 |
 |---|---|---|---|
-| 아니오 | (무관) | seed 오동작 또는 환경 문제. 재현 실패가 아니다 | lane 상태·NFS 응답·프록시 통계를 확인 |
+| 아니오 | (무관) | seed 오동작 또는 환경 문제. 재현 실패가 아니다 | lane 상태·NFS 응답·Mutation Engine 통계를 확인 |
 | 예 | 아니오 | 시나리오는 실행됐으나 이상이 관측되지 않음 | 조건(타이밍, 변조 위치)을 재검토 |
 | 예 | 예 | 재현 후보 | 보고 내용과 시나리오의 대응을 확인 |
 
@@ -146,14 +153,14 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 | pseudo-syscall, 기술 파일 | seed가 NFS 프로토콜을 다루게 함 | 구현됨 | syzkaller 패치 시리즈 |
 | lane, namespace | 프로세스별 격리된 NFS 환경 | 구현됨 | `bundle/lane/`, `tools/README.md` |
 | remote KCOV | 서버 경로 도달 관측 | 구현됨 (knfsd 한정) | kernel 패치 0001~0004 |
-| nfs-proxy | wire 변조 주입 | 고정 경로, 같은 폭 편집(v1)과 길이 변경 편집(v2, 호스트+4-lane 게스트 검증) 구현 | `tools/nfs-proxy/README.md` |
+| NFS 특화 Mutation Engine (`nfs-proxy`) | 프록시 기반 RPC/XDR 변조 | 고정 경로, 같은 폭 편집(v1)과 길이 변경 편집(v2, 호스트+4-lane 게스트 검증) 구현 | `tools/nfs-proxy/README.md` |
 | Ganesha 백엔드 | 별도 서버 대상 | 서버별 corpus로 순차 퍼징 | `bundle/corpus/nfs-normal/README.md` |
 | 재현 판정 | Q1, Q2 종합 | 통합 판정 도구 **없음** | `report/normal-flow-corpus.md` |
 
-기본 운용 방식은 서버별 `syz-manager` 퍼징이다. 현재 실행 명령과 검증 범위는
-`bundle/corpus/nfs-normal/README.md`가 소유한다.
+기본 운용 방식은 서버별 `syz-manager` 퍼징이다. 현재 실행 방법은
+`bundle/corpus/nfs-normal/README.md`에, 검증 기록은 `report/validation-history.md`에 정리되어 있다.
 
-### 주장 검증: 왜 프록시와 pseudo-syscall인가
+### 주장 검증: 왜 Mutation Engine과 pseudo-syscall인가
 
 설계 의도(문제 3, 4)를 코드와 대조한 결과다. 상태는 `확인` / `부분` / `미검증`으로 구분한다.
 
@@ -161,16 +168,16 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 |---|---|---|---|
 | syscall 인자 뮤테이션은 NFS operation의 wire 표현을 직접 바꾸지 못한다 | 부분 | `write$nfs` 등 표준 syscall 기술은 커널 NFS 클라이언트를 거쳐 RPC가 만들어진다(`fs_nfs_fuzz.txt`) | 특정 operation이 표준 syscall로 도달 불가함을 보이는 대조 실험 |
 | pseudo-syscall이 이 공백을 메운다 | 부분 | `syz_send_nfs_fuzz`와 `write$inet_nfs_fuzz`(syzkaller 0018, 일반 TCP)가 RPC/XDR 메시지를 직접 전송하고, `nfs4_op_arg` 등으로 NFSv4 COMPOUND의 operation을 기술한다(`socket_inet_nfs.txt`). 즉 C2S 방향의 operation 뮤테이션은 raw 전송 경로로 가능하다 | raw 경로로 만든 요청이 클라이언트 세션 상태(세션, slot, stateid)에 의존하는 operation에 유효한지 |
-| 클라이언트 취약점은 서버 응답 변조가 필요하고, 이는 프록시로만 가능하다 | 부분 | raw 경로는 C2S 전용이다. S2C 변조는 프록시의 `direction=1` arm이 유일하게 구현되어 있다. 게스트 실험에서 C2S와 S2C 양방향 변조가 적용·재생됐다 | 변조된 응답이 실제로 클라이언트 취약점을 트리거하는 사례. 현재 증거는 XID 변조의 적용까지다 |
+| 클라이언트 취약점은 서버 응답 변조가 필요하고, 이는 Mutation Engine으로만 가능하다 | 부분 | raw 경로는 C2S 전용이다. S2C 변조는 Mutation Engine의 `direction=1` arm이 유일하게 구현되어 있다. 게스트 실험에서 C2S와 S2C 양방향 변조가 적용·재생됐다 | 변조된 응답이 실제로 클라이언트 취약점을 트리거하는 사례. 현재 증거는 XID 변조의 적용까지다 |
 
 ## 설계
 
 1. **판정을 둘로 나눈다.** 도달(Q1)과 이상 보고(Q2)를 별개의 관측으로 유지한다.
 2. **도달은 remote KCOV와 카운터로 판정한다.** 서버 스레드의 PC를 시나리오 실행에 귀속한다.
    귀속 단위는 **lane**이다. lane N의 서버가 받은 요청은 proc N이 그때 실행 중인 프로그램의 것이다(kernel 0002).
-3. **변조는 프록시 한 곳에서 한다.** 변조 규칙은 seed에 포함되어 프로그램과 함께 재현된다.
+3. **변조는 Mutation Engine 한 곳에서 한다.** 변조 규칙은 seed에 포함되어 프로그램과 함께 재현된다.
 4. **격리는 lane 단위로 하고, lane은 병렬로 쓴다.** 한 프로세스의 상태가 다른 프로세스의 관측에 섞이지 않게 하고,
-   manager는 proc마다 lane 하나를 동시에 쓴다(`procs` = lane 수, `vm.snapshot` 끔).
+   manager는 proc마다 lane 하나를 동시에 쓴다(`procs` = lane 수, 최상위 `snapshot` 끔).
 5. **sanitizer는 대상 서버가 실행되는 곳에 둔다.** knfsd는 커널 계측(KASAN/KCSAN)이다.
 6. **실패는 조용히 하지 않는다.** 정지한 lane은 fail-closed로 처리한다(syzkaller 0008, 0013).
 
@@ -180,9 +187,9 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 |---|---|
 | 판정 분리 | 보고가 없을 때 원인이 취약점 부재인지 seed 오동작인지 가르려면 서로 다른 관측이 필요하다 |
 | remote KCOV | knfsd는 커널 스레드가 요청을 처리해서 호출자 KCOV로는 보이지 않는다 |
-| 변조 지점 단일화 | 변조가 seed 바이트에 들어 있어야 같은 입력이 같은 변조를 재현한다. 프록시에는 PRNG가 없다 |
+| 변조 지점 단일화 | 변조가 seed 바이트에 들어 있어야 같은 입력이 같은 변조를 재현한다. Mutation Engine에는 PRNG가 없다 |
 | lane 격리 | 동시 실행 프로그램의 요청이 서로의 커버리지에 귀속되면 도달 판정이 오염된다 |
-| lane 단위 귀속 | lane은 proc 하나가 단독 점유한다. 그래서 서버 netns만 보고 소유자를 정할 수 있고, TCP를 끊는 프록시나 레코드를 바꾸는 변조에도 귀속이 유지된다 |
+| lane 단위 귀속 | lane은 proc 하나가 단독 점유한다. 그래서 서버 netns만 보고 소유자를 정할 수 있고, TCP 연결을 분리하는 Mutation Engine이나 레코드를 바꾸는 변조에도 귀속이 유지된다 |
 | KCSAN 비치명 | KCSAN 보고 뒤에도 커널이 살아 있어, 치명 보고와 같이 처리하면 유효한 실행을 버린다 |
 
 ## 검토한 대안
@@ -191,7 +198,7 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 |---|---|---|---|
 | 도달 관측 없이 sanitizer 보고만 판정 | 구현이 단순함 | 미보고의 원인을 가릴 수 없음 | 기각 |
 | 전역 KCOV 핸들 하나로 서버 스레드 수집 | 귀속 규칙이 필요 없음 | 동시 클라이언트의 PC가 섞임 | 기각. 전역 핸들을 입력별 피드백으로 사용하지 않음 |
-| 클라이언트 커널에 변조 기능 추가 | 프록시가 필요 없음 | 서버 응답 변조는 클라이언트 쪽에서 만들 수 없음 | 기각 (S2C 변조 불가) |
+| 클라이언트 커널에 변조 기능 추가 | Mutation Engine이 필요 없음 | 서버 응답 변조는 클라이언트 쪽에서 만들 수 없음 | 기각 (S2C 변조 불가) |
 
 ## 영향
 
@@ -240,7 +247,7 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 |---|---|---|---|
 | sentinel PC 없음 | 미실행, 귀속 실패, 버퍼 포화, 진행 중 section 폐기 | `scratch_overflow`, `generation_aborted`, 카운터 배출 | 요청·커버리지 진단 |
 | seed 실행이 시작되지 않음 | lane 정지, 마운트 실패 | lane 상태 필드, fail-closed 종료 코드 | `bundle/lane/` 확인 |
-| 변조가 서버에 닿았는지 불명 | arm ACK는 적용 성공이 아니다 | 프록시 적용 횟수와 통계 | 프록시 로그 확인 |
+| 변조가 서버에 닿았는지 불명 | arm ACK는 적용 성공이 아니다 | Mutation Engine 적용 횟수와 통계 | Mutation Engine 로그 확인 |
 | sanitizer 보고가 남지 않음 | 조건 불충족 또는 Q1 실패 | Q1 결과 확인 후 판정 | 실행 결과 확인 |
 
 ## 한계와 미결 사항
@@ -250,19 +257,19 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 | Agent가 넘기는 seed의 정확한 계약과 확장 절차 | 미결. 요소별 설계 문서 미작성 |
 | 재현 판정의 통합 절차 (Q1 + Q2) | 미결. 통합 판정 도구·문서 없음 |
 | `syz-manager` 기반 운용 | 서버별 설정·DB·재개 명령은 `bundle/corpus/nfs-normal/README.md` 참조. 부팅 인자 `nfs.localio_enabled=N`이 필수다 |
-| 프록시 경유 시 knfsd remote KCOV 귀속 | lane 단위 귀속 구현. lane은 proc 하나가 단독 점유해야 한다 |
+| Mutation Engine 경유 시 knfsd remote KCOV 귀속 | lane 단위 귀속 구현. lane은 proc 하나가 단독 점유해야 한다 |
 | lane 귀속의 경계: 프로그램 종료 뒤 늦게 발생하는 작업 | 다음 프로그램 시작 뒤 늦게 도착하는 요청의 오귀속 위험이 남는다 |
-| 프록시가 레코드 수를 바꾸는 변조 | **미검증**. lane의 서버 netns로 소유자를 정하므로 구조상 무관하지만 실험하지 않았다 |
+| Mutation Engine이 레코드 수를 바꾸는 변조 | **미검증**. lane의 서버 netns로 소유자를 정하므로 구조상 무관하지만 실험하지 않았다 |
 | KCSAN 변형의 lane 귀속 | 현재 부트스트랩은 빌드·부팅만 확인한다. 시드별 귀속은 별도 검증이 필요하다 |
-| 프록시의 길이 변경 변조 (operation 추가, 가변 길이 필드 변경) | **Phase 1 구현 + 4-lane 게스트 검증 (2026-10-02)**. `INSERT`/`DELETE`/`REPLACE`/`OP_APPEND`/`OP_PREPEND`를 구조 보존·raw 두 모드로 지원(`tools/nfs-proxy/src/edit.c`), arm v2(`NFSPARM2`)와 delta v2, syzkaller 0019. 호스트 단위 테스트(클랑+ASan/UBSan) 전부 통과. 게스트에서 OP_APPEND의 서버 측 디코드·실행(`nfsd4_getattr` 등 커버리지)과 REPLACE/verify-before-patch를 확인했다. 길이 변경 REPLACE를 kasan VM의 `syz-execprog -procs=4 -repeat=30`으로 실행해 `.extra` 30/30 nonempty, lane별 적용 8/7/7/8, lane 0~3 healthy, 프록시 오류·dmesg fatal 0을 확인했다. INSERT/DELETE, 여러 fragment 합치기, S2C 응답 편집은 게스트에서 안 함. 상세는 `docs/handoff/proxy-variable-length-edits/`의 완료 보고 참조 |
+| Mutation Engine의 길이 변경 변조 (operation 추가, 가변 길이 필드 변경) | **Phase 1 구현 + 4-lane 게스트 검증 (2026-10-02)**. `INSERT`/`DELETE`/`REPLACE`/`OP_APPEND`/`OP_PREPEND`를 구조 보존·raw 두 모드로 지원(`tools/nfs-proxy/src/edit.c`), arm v2(`NFSPARM2`)와 delta v2, syzkaller 0019. 호스트 단위 테스트(클랑+ASan/UBSan) 전부 통과. 게스트에서 OP_APPEND의 서버 측 디코드·실행(`nfsd4_getattr` 등 커버리지)과 REPLACE/verify-before-patch를 확인했다. 길이 변경 REPLACE를 kasan VM의 `syz-execprog -procs=4 -repeat=30`으로 실행해 `.extra` 30/30 nonempty, lane별 적용 8/7/7/8, lane 0~3 healthy, Mutation Engine 오류·dmesg fatal 0을 확인했다. INSERT/DELETE, 여러 fragment 합치기, S2C 응답 편집은 게스트에서 안 함. 상세는 `docs/handoff/proxy-variable-length-edits/`의 완료 보고 참조 |
 | 기본 이미지의 직접 마운트 경로 제거 | **완료**. 단일 lane fixture의 기본값은 `both`; NFSv3 시드와 중복 fixture 제거. 직접 경로는 비교 진단 옵션으로만 남음 |
-| 프록시 변조가 서버에 도달했는지 퍼징 중에 판정하는 채널 | 프록시 진단 출력은 있으나 syz-manager의 입력별 피드백에 미연결 |
+| Mutation Engine 변조가 서버에 도달했는지 퍼징 중에 판정하는 채널 | Mutation Engine 진단 출력은 있으나 syz-manager의 입력별 피드백에 미연결 |
 | Ganesha 대상의 도달 관측 | 미구현. remote KCOV는 사용자 공간 서버에 귀속 대상이 없다 |
 | 서버별 실행 방식 | **결정됨 (2026-10-02)**. 서버별 34개 호출 입력을 따로 실행; KASAN v4.1 스냅샷 모드(proc 1개)에서 각 1회 errno 오라클 통과 |
-| lane 병렬 manager 운용 (`vm.snapshot` 끔, `procs=4`) | **필수 조건.** `syz-execprog`의 4-lane 병렬 실행은 검증했지만, 현재 manager 토폴로지에서 `vm.snapshot`을 끈 장시간 운용은 미검증 |
+| lane 병렬 manager 운용 (최상위 `snapshot` 끔, `procs=4`) | **필수 조건.** `syz-execprog`의 4-lane 병렬 실행은 검증했지만, 현재 manager 토폴로지에서 최상위 `snapshot`을 끈 장시간 운용은 미검증 |
 | lane 밖에서 생기는 요청 | knfsd lease가 10초(`nfsv4leasetime`)라 클라이언트 netns마다 수 초 간격의 lease 갱신 요청이 생기고, lane 단위 귀속에서는 그때 실행 중인 프로그램의 커버리지로 잡힌다. 프로그램과 무관한 PC가 섞이는 거짓 양성 원천이다. syzkaller의 triage 재실행이 불안정한 신호를 걸러 영향은 제한적이나 측정하지 않았다 |
 | Ganesha 캠페인의 sanitizer 보고 | Ganesha export가 ext4 루프 위에 있어, 보고에 NFS가 아닌 ext4·loop 경로가 섞일 수 있다. 보고의 호출 경로로 구분한다 |
-| 프록시의 실행 대상 선택·관리 라우팅 확장 | **후속 계획**. 기존 고정 중계와 별개이며, 자동 전환·복제는 미구현 |
+| Mutation Engine의 실행 대상 선택·관리 라우팅 확장 | **후속 계획**. 기존 고정 중계와 별개이며, 자동 전환·복제는 미구현 |
 | Ganesha 병렬 처리량 이득 | 해당 없음. Ganesha는 병렬 축에서 빠졌다(상태 관리 문제 등, 2026-10-02) |
 | 정상 NFS 흐름 코퍼스의 지원 범위 | 부분 완료(`report/normal-flow-corpus.md`) |
 
@@ -275,5 +282,5 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 
 - `README.md`: 환경 구축 및 서버별 퍼징 절차
 - `report/normal-flow-corpus.md`: 정상 흐름의 지원 범위·완료 기준·미검증 항목; `bundle/corpus/`: 시드와 실행 계약
-- `tools/nfs-proxy/README.md`: 프록시 arm 프로토콜
+- `tools/nfs-proxy/README.md`: Mutation Engine arm 프로토콜
 - `tools/README.md`: 빌드·부트스트랩 도구와 무결성 판정

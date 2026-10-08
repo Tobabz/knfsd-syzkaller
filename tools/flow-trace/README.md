@@ -9,20 +9,20 @@ The design, the rules and the recorded results are in
 Record all runs (about 20 minutes; each run boots a fresh guest):
 
 ```sh
-tools/flow-trace/run-all.sh ~/flow-trace-evidence/run3
+uv run tools/flow-trace/run-all.sh ~/flow-trace-evidence/run3
 ```
 
 Record one run, for example the NFSv4.2 COPY seed:
 
 ```sh
-python3 tools/flow-trace/capture.py --version 4.2 --restart-fixture --stop-fixture \
+uv run python tools/flow-trace/capture.py --version 4.2 --restart-fixture --stop-fixture \
     --seed bundle/corpus/nfs-normal/async-copy-v42-tcp.prog --settle 3 --out /tmp/s3
 ```
 
 Judge one trace against one scenario:
 
 ```sh
-python3 tools/flow-trace/handoffs.py /tmp/s3/trace.txt.gz \
+uv run python tools/flow-trace/handoffs.py /tmp/s3/trace.txt.gz \
     tools/flow-trace/scenarios/s3-v42-async-copy.json
 ```
 
@@ -32,7 +32,7 @@ Add `--only S3-03,S3-04` to judge selected transitions.
 Judge all runs and count the execution subjects:
 
 ```sh
-tools/flow-trace/summarize.sh ~/flow-trace-evidence/run3
+uv run tools/flow-trace/summarize.sh ~/flow-trace-evidence/run3
 ```
 
 ## Files
@@ -42,7 +42,7 @@ tools/flow-trace/summarize.sh ~/flow-trace-evidence/run3
 | `capture.py` | Boots a guest, enables the events, runs a seed or a shell script, saves the trace |
 | `events.txt` | Tracepoints (`event group:pattern`) and kprobes (`kprobe label symbol`) |
 | `handoffs.py` | Pairs submit and execute events and prints one verdict per transition |
-| `scenarios/*.json` | Transition rules for S1, S2, S3, S3b and S4 |
+| `scenarios/*.json` | Transition rules for S1, S2, S3, S3b, S4, S5 and S5b |
 | `subjects.json`, `subjects.py` | One marker event per execution subject; counts per trace |
 | `stimulus/s4-state-lifetime.sh` | Shell stimulus for state-lifetime work |
 | `stimulus/s5-nlm-lock.sh`, `stimulus/s5b-nlm-reboot.sh` | NFSv3 NLM lock conflict and SM_NOTIFY reclaim. They start `rpc.statd` and mount over loopback with locks inside the lane 0 server namespaces, and they compile a small lock helper with the guest `gcc` |
@@ -53,5 +53,4 @@ tools/flow-trace/summarize.sh ~/flow-trace-evidence/run3
 - The evidence stays outside the repository. Cite its directory and the commit of these tools.
 - `--restart-fixture` rebuilds all four lanes inside the traced window.
 - A probe that fails to attach is listed in `meta.json` as `kprobe_failed`.
-  `receive_cb_reply`, `__cld_pipe_upcall` and `svc_revisit_deferred` fail on kernel `25456a766`.
 - Check the judge output line `[no loss]`. If it says `LOSS`, a `MISSING` verdict is not trustworthy.

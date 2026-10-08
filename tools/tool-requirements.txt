@@ -1,9 +1,10 @@
 # tool-requirements.txt — teammate-host prerequisites
 
-`bundle/README-HANDOFF.md` "Reproduce"의 전제 조건을 정형화한 목록.
+이 문서는 호스트 준비 안내의 기준이며 pip/uv에 입력하는 requirements 파일이 아니다.
 신규 호스트에서 `tools/bootstrap-kcov-env.py` 부트스트랩으로 syz-manager용 환경
-(커널 이미지·VM 이미지)을 만들기 위한 호스트 의존성. 루트 권한은
-필요하지 않다(모든 단계가 작업 루트 내부에서 실행됨).
+(커널 이미지·VM 이미지)을 만들기 위한 Linux x86-64 호스트 의존성.
+베이스 이미지 생성에는 sudo가 필요하고, bootstrap 자체는 일반 사용자로 실행한다.
+Ganesha·프록시 기반의 NFS 특화 Mutation Engine 게스트 빌드에는 Docker daemon 접근 권한이 필요하다.
 
 검증 예시는 Debian/Ubuntu 기준이며, 배포판별 패키지명은 해당 저장소에서
 확인할 것.
@@ -12,16 +13,26 @@
 
 | 의존성 | 최소 버전 | 용도 | 검증 |
 |---|---|---|---|
-| Python 3 | ≥ 3.10 | bootstrap/런너/분석 (전부 표준 라이브러리만 사용) | `python3 -V` |
-| Go | ≥ 1.23 | syzkaller `make` 빌드 (env/ 부트스트랩) | `go version` |
+| uv | — | [pyproject.toml](../pyproject.toml)의 Python 환경 준비·실행 | `uv --version` |
+| Python | [pyproject.toml](../pyproject.toml)의 `requires-python` | 기본 인터프리터는 [.python-version](../.python-version), 의존성은 [uv.lock](../uv.lock) 참조 | `uv run python --version` |
+| Go | 고정 syzkaller 소스의 `go.mod` 참조 | [BASE](../bundle/patches/BASE)가 선택한 소스의 요구사항을 따름 | `go version` |
+| git | — | 고정 상류 소스 클론·패치 적용 | `git --version` |
 | gcc | (배포판 기본) | 커널 bzImage·syzkaller executor cgo 빌드 | `gcc --version` |
+| clang + GCC ASan/UBSan 런타임 | — | `nfs-proxy/build-guest.sh`가 먼저 실행하는 호스트 빌드·검사 | `clang --version` |
 | make | — | 커널·syzkaller 빌드 | `make --version` |
 | flex / bison | — | 커널 파서 생성 | `flex --version; bison --version` |
 | bc | — | 커널 빌드 툴 | `bc --version` |
 | libssl-dev | — | 커널 빌드 헤더 | `dpkg -s libssl-dev` |
 | libelf-dev | — | 커널 vmlinux ELF 참조 | `dpkg -s libelf-dev` |
 
-배포 예: `sudo apt install python3 golang-go gcc make flex bison bc libssl-dev libelf-dev`
+Go는 배포판 패키지 이름만으로 버전을 보장할 수 없다. 선택한 도구체인이
+고정 커밋의 `go.mod` 요구 버전을 만족하는지 확인한다.
+커널 도구체인 요구사항은 선택한 커널 소스의 `Documentation/process/changes.rst`를 따른다.
+
+저장소 루트에서 `uv sync --locked`로 Python 환경을 준비한다. Python 도구의 외부 패키지
+요구사항은 `pyproject.toml`에서 관리한다. Ganesha 컨테이너 내부의 라이브러리는
+[ganesha-v15-container.sh](ganesha-v15-container.sh), Mutation Engine 컨테이너는
+[nfs-proxy/guest-build.sh](nfs-proxy/guest-build.sh)가 설치한다. 위 호스트 도구와 설치 대상이 다르다.
 
 ## 2. 가상화 (필수 — 이미지 bake와 variant 검증이 KVM 게스트에서 실행됨)
 
@@ -29,7 +40,7 @@
 |---|---|---|
 | KVM 커널 디바이스 `/dev/kvm` | qemu-system-x86_64 `-enable-kvm -cpu host` | `[ -e /dev/kvm ] && echo ok` / `ls -l /dev/kvm` |
 | qemu-system-x86 (qemu-kvm) | 이미지 베이크·variant 검증 VM 실행 | `qemu-system-x86_64 --version` |
-| cpu 마이그레이션 가능 VM 호스트 | `-cpu host` KVM 실행 | `kvm-ok` (cpu-checker) |
+| qemu-utils | raw/qcow2 이미지 변환·정보 조회 | `qemu-img --version` |
 
 하이퍼바이저 환경(예: nested VM, 클라우드)에서 `/dev/kvm`이 없다면
 부트스트랩은 실패한다 — 물리 호스트 또는 KVM 노출 인스턴스 필요.
@@ -38,24 +49,31 @@
 
 | 의존성 | 용도 | 검증 |
 |---|---|---|
-| openssh-client | 게스트 ssh/scp (`-O` 옵션 사용, OpenSSH ≥ 9.0) | `ssh -V` |
+| openssh-client | 게스트 ssh/scp (`scp -O` 지원 필요) | `ssh -V` |
 | tar (xz·gzip) | 아카이브 추출·배포 조립 | `tar --version` |
 | coreutils | `sha256sum` (증거 해시·배포 검증) | `sha256sum --version` |
 
-## 4. 선택/권장
+## 4. 베이스 이미지와 게스트 의존성 빌드
+
+| 의존성 | 용도 |
+|---|---|
+| sudo, debootstrap, e2fsprogs, util-linux | `make-base-image.sh`의 chroot·ext4 베이스 이미지 생성 |
+| Docker CLI·daemon | Bookworm 환경에서 Ganesha와 Mutation Engine 빌드 |
+| 네트워크 | git.kernel.org·GitHub 소스, Debian 패키지, Go 모듈과 컨테이너 이미지 다운로드 |
+
+## 5. 선택/자원 계획
 
 | 의존성 | 용도 |
 |---|---|
 | pahole (dwarves) | 커널 BTF 생성(커널 설정에 의존) |
 | libncurses-dev | `make menuconfig` 수작업 시 |
-| git | 소스 출력이 tar가 아닌 클론인 경우에만 |
-| ~30 GB 여유 디스크 | 원천 소스(184M)+raw 이미지(2 GB)+빌드 산출물 |
-| RAM ≥ 8 GB | 1 VM당 4 GB(기본), trials 병렬 시 증량 |
+| 여유 디스크 | 커널·syzkaller 클론, 두 variant 빌드·vmlinux 복사본, 이미지, Docker 캐시를 포함해 산정. 전체 파이프라인의 최소 여유 공간은 미측정 |
+| RAM | bootstrap VM은 4 GiB·4 vCPU를 사용. 커널 병렬 빌드의 호스트 메모리도 별도로 확보 |
 
-## 5. 작업 트리 구조 (전제)
+## 6. 작업 트리 구조 (전제)
 
-- `tools/`·`bundle/`·`env/`·`report/`가 있는 작업 루트.
-- 번들 배포본(`dist/knfsd-fuzz-forward-port-<날짜>.tar.gz`, `tools/release-assembly.sh` 산출)으로
-  `bundle/`을 확보하고, `tools/bootstrap-kcov-env.py`로 `env/`를 생성한다.
-- 하드코딩 경로는 없음 — 모든 도구가 자기 위치에서 작업 루트를 유도하며
-  `KOOV_WORK_ROOT`로 오버라이드 가능(`tools/README.md` "환경 변수" 표).
+- 저장소 체크아웃의 `tools/`·`bundle/`을 사용한다. bootstrap이 `env/`를 생성하므로
+  새 환경에 `env/`가 미리 있을 필요는 없다. 배포용 릴리스 자산은 제공하지 않는다.
+- 경로는 각 도구의 위치에서 유도한다. `KOOV_WORK_ROOT`는 일부 셸 도구만 읽는다.
+  bootstrap 입력은 `KOOV_BUNDLE`·`KOOV_LANE`·`KOOV_BAKER`와 CLI 인자로 지정한다
+  (`tools/README.md` "환경 변수" 표).

@@ -12,6 +12,7 @@ bundle/src/*
 !bundle/src/guest-deps.tar.gz
 artifacts/
 # --- Python caches ---
+.venv/
 __pycache__/
 *.pyc
 # --- OS / editor noise ---
