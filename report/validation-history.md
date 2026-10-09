@@ -90,7 +90,7 @@ this review did not start a new VM or fuzzing campaign.
 | --- | --- |
 | KASAN proxy check, 2026-10-02 (`de348e5`) | `syz-execprog` with four procs completed 30 executions with exit 0. Saved `.extra` files are nonempty in 30/30 cases; lane 0–3 are healthy; per-lane edit counts are 8/7/7/8. Recorded proxy errors, fatal dmesg entries, `generation_aborted` and `outstanding_tokens` are all zero. |
 | Callback attribution, 2026-10-05 | The [decision record](../docs/design/decisions/2026-10-05-callback-attribution.md#검증) reports four-lane mixed-program checks on KASAN and KCSAN. It states that raw evidence was not retained, so these results could not be independently rechecked here. |
-| Parallel `syz-manager` campaigns | No completion evidence was found in the repository history or the inspected local evidence. The bounded executor checks do not establish manager corpus behavior or long-run stability. |
+| Parallel `syz-manager` campaigns | The [earlier lane-attribution record](../docs/design/decisions/2026-10-01-lane-attribution.md#실험-kasan-syz-execprog-프로그램-30회) reports a ten-minute, four-lane manager run. That record states its raw evidence was not retained; the effective snapshot settings and later campaign topology could not be rechecked. It does not establish long-run stability of the later configuration. |
 
 The retained proxy evidence is local to the original host:
 `~/prune-evidence/proxy-kasan-4lane-final/raw/`. It contains `result.json`,
@@ -134,6 +134,74 @@ The earlier flow-trace README records attachment failures for `receive_cb_reply`
 
 The site-generated base image and keypair model was adopted on 2026-09-26.
 Commit `7833ed3` removed the custom guest relay and A/B runners with their evidence.
+
+## NFSD trace.c KCOV activation (2026-10-10)
+
+The existing KASAN guest was tested at 00:00–00:01 KST on 2026-10-10
+(2026-10-09 15:00–15:01 UTC). No kernel patch or `capture.py` change was made.
+The guest ran `basic-v41-tcp.prog` with one executor proc, one execution per condition,
+`threaded=false`, and existing remote coverage enabled.
+
+In the same VM, `/sys/kernel/tracing/events/nfsd/enable` was set to `0`, then `1`,
+then `0`. The trace buffer was cleared between conditions and `tracing_on` was enabled
+during each execution. Raw per-program `.extra` coverage and trace output were retained.
+
+| Condition | NFSD trace records | Unique remote PCs in generated NFSD trace functions | Generated functions reached |
+| --- | ---: | ---: | ---: |
+| OFF before | 0 | 0 | 0 |
+| ON | 768 | 136 | 22 |
+| OFF after | 0 | 0 | 0 |
+
+The ON coverage includes `trace_event_raw_event_nfsd_compound`,
+`trace_event_raw_event_nfsd_compound_status`, `trace_event_raw_event_nfsd_io_class`
+and generated file-operation callbacks. PC membership was determined from the matching
+`vmlinux` symbol address ranges; inline-aware symbolization resolves sample PCs through
+`fs/nfsd/trace.h`. The counts refer to generated functions and PC locations, not unique
+event names or RPCs. Trace records can include background activity.
+
+All three executions completed with exit 0 and the seed's expected errno results
+(34 calls, call 14 returning errno 11, all others returning 0). The ON trace reports
+768 entries in the buffer and 768 written. Recorded generation aborts, scratch overflow,
+aggregate truncation and outstanding tokens were zero. No fatal dmesg signatures were found.
+The guest was stopped, and the backing image's SHA-256 was unchanged.
+
+The running guest and `vmlinux` had the same GNU Build ID:
+`5704eca19cd5d05a9c0b820691fe199fb53f6128`. Evidence is stored locally under
+`evidence/nfsd-tracec-kcov-20261009T150019Z/`:
+
+- `metadata.json`: actual input hashes, guest Build ID, commands and exit status.
+- `coverage-comparison.json`: counts and per-function PC matches.
+- `nfsd-trace-symbols.json`, `sample-pc-locations.txt`: symbol ranges and sample source mappings.
+- `{off-before,on,off-after}/coverage/`: original coverage files.
+- `*-executor.stdout`, `*-trace.stdout`, `*-stats.stdout`, `dmesg-after.stdout`: execution and diagnostic logs.
+
+This confirms that enabling NFSD events is sufficient to collect the exercised generated
+trace code through the existing KCOV path in this configuration. It does not establish
+coverage of every generated function, every background context, KCSAN, or parallel manager execution.
+
+## NFSD trace.c automatic activation (2026-10-10)
+
+Fresh KASAN and KCSAN guests were booted with the updated host-injected `lane.sh`.
+The test issued no manual event-enable or `tracing_on` writes. Immediately after boot,
+both guests had tracefs mounted and reported `1` for `events/nfsd/enable` and `tracing_on`.
+The guest lane script hash matched the host input, and each running kernel's GNU Build ID
+matched the `vmlinux` used to classify the coverage PCs.
+
+Each guest ran the unchanged `basic-v41-tcp.prog` once with one executor proc,
+`threaded=false` and remote coverage enabled. Both executions matched the functional oracle.
+
+| Kernel | Automatic tracing | Unique remote PCs in generated NFSD trace functions | Generated functions reached | Sanitizer diagnostics |
+| --- | --- | ---: | ---: | --- |
+| KASAN | Enabled at boot and after execution | 141 | 23 | No fatal signatures |
+| KCSAN | Enabled at boot and after execution | 141 | 23 | One data-race report in `kthread_is_per_cpu`, with scheduler frames; origin reported as unknown |
+
+The KCSAN report is preserved in `kcsan/dmesg.stdout`; its cause was not investigated in
+this activation change. A successful coverage check does not mean that this run was free
+of sanitizer reports. Both guests were stopped and the reusable image hash was unchanged.
+
+Evidence: `evidence/nfsd-tracec-autostart-20261009T152248Z/`. `result.json` contains the
+lane and kernel hashes, Build IDs, checks and per-function PC counts. Each variant directory
+contains the raw coverage, trace, guest command outputs and dmesg.
 
 ## Related records
 

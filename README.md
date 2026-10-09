@@ -39,6 +39,9 @@ at a time. Seed selection is described in the [corpus guide](bundle/corpus/nfs-n
 
 The corpus covers normal NFS scenarios. [tools/flow-trace/](tools/flow-trace/README.md)
 provides kernel event collection and thread-transition analysis.
+Lane setup enables NFSD trace events in the guest so their generated callbacks can
+contribute to existing remote KCOV sections. Keep `experimental.remote_cover=true`
+for knfsd campaigns.
 
 ## Host requirements
 

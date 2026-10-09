@@ -115,6 +115,8 @@ lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 
 부팅 래퍼(`boot-fixture.sh`)와 서비스(`fixture.service`)도 같은 디렉터리에 있습니다. 래퍼는 읽기 전용 9P
 공유의 `lane.sh`를 `/run/frozen-phase9/lane.sh`로 복사하고 지정된 SHA-256과 비교합니다. 서비스의
 setup·status·cleanup은 모두 이 복사본을 사용합니다.
+lane setup은 tracefs를 준비하고 NFSD 이벤트와 `tracing_on`을 활성화합니다.
+bootstrap의 부팅 검사도 이 상태를 확인하며 `verify.variants.<variant>.nfsd_trace_enabled`에 기록합니다.
 
 기존 시드의 `nfs-lane/client0`·`client1`은 같은 knfsd export를 보는 두 클라이언트입니다.
 `both`에서도 이 의미를 유지하며, Ganesha는 `client0-ganesha`·`client1-ganesha`로 선택합니다.

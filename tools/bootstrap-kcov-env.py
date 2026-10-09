@@ -596,6 +596,8 @@ def stage_verify_variant(args, image, variant, bzimage):
         guest_lane_sha = vm.guest("sha256sum /run/frozen-phase9/lane.sh").split()[0]
         if guest_lane_sha != sha256(LANE / "lane.sh"):
             raise RuntimeError("guest lane script differs from the host source")
+        vm.guest('test "$(cat /sys/kernel/tracing/events/nfsd/enable)" = 1 && '
+                 'test "$(cat /sys/kernel/tracing/tracing_on)" = 1')
         sanitizer = detect_mem_sanitizer(
             vm, image_dir(args, variant) / ".config")
         if sanitizer != variant:
@@ -606,6 +608,7 @@ def stage_verify_variant(args, image, variant, bzimage):
                 "nfs_version": lane_status["nfs_version"],
                 "nfs_minor": lane_status["nfs_minor"],
                 "lane_script_sha256": guest_lane_sha,
+                "nfsd_trace_enabled": True,
                 "mem_sanitizer": sanitizer,
                 "target_kasan": sanitizer == "kasan",
                 "target_kcsan": sanitizer == "kcsan",

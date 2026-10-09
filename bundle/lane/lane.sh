@@ -1355,6 +1355,14 @@ setup)
         expose_lane_to_executor "$setup_index"
         setup_index=$((setup_index + 1))
     done
+    # Enable NFSD event callbacks so existing KCOV sections can collect them.
+    tracefs=/sys/kernel/tracing
+    mkdir -p "$tracefs"
+    if ! mountpoint -q "$tracefs"; then
+        mount -t tracefs nodev "$tracefs"
+    fi
+    printf '1\n' > "$tracefs/events/nfsd/enable"
+    printf '1\n' > "$tracefs/tracing_on"
     printf '1\n' > "$executor_root/enabled"
     status_fixture
     trap - EXIT
