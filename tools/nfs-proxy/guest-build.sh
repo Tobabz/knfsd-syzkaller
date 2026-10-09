@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Called in debian:bookworm by build-guest.sh.  No guest instrumentation here:
-# the separately built Ganesha daemon is the ASan target.
+# Called in debian:bookworm by build-guest.sh to build the guest ABI binary.
+# Sanitizer checks run in the host build before this script.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq

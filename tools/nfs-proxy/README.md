@@ -89,16 +89,15 @@ original does not match what was recorded.
 ## Building
 
 ```sh
-tools/nfs-proxy/build-syzkaller.sh      # applies 0017 to an already patched syzkaller tree (KOOV_SYZ_TARGET)
 tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-control-guest
 ```
 
 Host tests are under `test/`; `build.sh` builds and runs them.
 `test/guest-delta-replay.c` provides a guest replay probe.
 
-`bundle/patches/syzkaller/0017-*` is a `git am` patch after 0016, included in the series. The `tools/` build
-wrapper can apply just 0017 to an already patched source tree (`KOOV_SYZ_TARGET`); guest paths can be
-selected with `KOOV_*` overrides. Binaries are local, gitignored artifacts.
+Build the syzkaller integration with [bootstrap](../../README.md#2-provision-the-fuzzing-environment-build--bake),
+which applies the complete checked-in patch series and builds the binaries.
+Binaries are local, gitignored artifacts.
 
 `bundle/patches/syzkaller/0019-*` adds `syz_arm_nfs_proxy_v2` (the arm v2 packet above) on top of 0017/0018;
 applying the series and running `make descriptions` (`tools/bootstrap-kcov-env.py` does this) regenerates

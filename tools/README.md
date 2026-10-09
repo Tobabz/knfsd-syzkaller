@@ -30,7 +30,7 @@ uv run python tools/bootstrap-kcov-env.py env ... --update       # 새 커널로
 | `fport-apply.sh` | 시리즈 적용 — `fport-apply.sh [--dry-run] <kind> <target>` (bootstrap이 호출; BASE와 다른 베이스도 `git am -3`으로 시도) |
 | `bump-kernel.py` | 새 커널 태그로 이월 — `bump-kernel.py <태그\|latest>`; 충돌 시 손으로 해결 후 `--export <클론>` (해결 기록은 `cache/rr-cache-kernel`) |
 | `kernel_base.py` | `bundle/patches/BASE` 읽기·쓰기와 커널 태그 정렬·`latest` 조회 (bootstrap·bump가 공용) |
-| `release-assembly.sh` | (선택) 번들 스냅샷 tar 조립 |
+| `release-assembly.sh` | (선택) 보관·전달용 `bundle/` tar.gz 생성 |
 | `tool-requirements.txt` | 호스트 의존성 목록 |
 | `lane-quote-lint.sh` | `bundle/lane/lane.sh`의 `sh -c '...'` 영역 게이트 — 아포스트로피 0개 + 영역 자체가 셸로 파싱됨 |
 | `assemble-guest-deps.py` | Ganesha deps에 Mutation Engine 바이너리(`nfs-proxy`)를 넣어 lane deps tar 생성 — bootstrap의 `--deps-tar` |
@@ -41,8 +41,7 @@ uv run python tools/bootstrap-kcov-env.py env ... --update       # 새 커널로
 | `prepare-live-lane-config.py` | 기존 manager 설정에서 lane 스크립트 스냅샷·읽기 전용 9P 공유·버전·해시를 고정한 새 설정 생성 |
 | `test-lane-inputs.py` | VM 부팅 없이 deps 조립·입력 검사·lane 설정 helper·시드 해시 검증 |
 | `flow-trace/` | 정상 NFS 실행의 이벤트 수집과 스레드 전환 판정 (`flow-trace/README.md`) |
-| `build-ganesha-asan.sh`·`ganesha-asan-container.sh` | bookworm 4.3-2 소스·패치로 Ganesha 실행 파일/코어/VFS를 GCC ASan으로 빌드하고 별도 deps tar 생성 (Docker 사용) |
-| `nfs-proxy/` | 프록시 기반의 NFS 특화 Mutation Engine 소스·테스트와 빌드 스크립트 (`build.sh`, `build-guest.sh`, `build-syzkaller.sh`, `guest-build.sh`) |
+| `nfs-proxy/` | 프록시 기반의 NFS 특화 Mutation Engine 소스·테스트와 빌드 스크립트 (`build.sh`, `build-guest.sh`, `guest-build.sh`) |
 
 ## 환경 변수 (`KOOV_*`)
 
@@ -50,13 +49,11 @@ uv run python tools/bootstrap-kcov-env.py env ... --update       # 새 커널로
 
 | 변수 | 기본값 | 용도 |
 |---|---|---|
-| `KOOV_WORK_ROOT` | 저장소 루트 | `make-base-image.sh`, `release-assembly.sh`, `nfs-proxy/build-syzkaller.sh`의 작업 루트. bootstrap에는 적용되지 않음 |
+| `KOOV_WORK_ROOT` | 저장소 루트 | `make-base-image.sh`, `release-assembly.sh`의 작업 루트. bootstrap에는 적용되지 않음 |
 | `KOOV_BUNDLE` | `<root>/bundle/patches` | 패치 시리즈 위치 |
 | `KOOV_LANE` | `<root>/bundle/lane` | bootstrap의 호스트 주입 lane 스크립트와 bake되는 부팅 래퍼·서비스 위치 |
 | `KOOV_BAKER` | `<root>/bundle/baker` | 이미지 baker 위치 |
 | `KOOV_ARTIFACTS_DIR` | `<root>/artifacts` | `make-base-image.sh` 출력 위치 |
-| `KOOV_SYZ_TARGET` | `<root>/env/syzkaller` | `nfs-proxy/build-syzkaller.sh`의 대상 트리 |
-| `KOOV_BUNDLE_DIR` | `<root>/bundle` | `nfs-proxy/build-syzkaller.sh` 전용 번들 루트(`patches/syzkaller`를 덧붙임) |
 
 Ganesha·Mutation Engine 스크립트가 읽는 `KOOV_GANESHA_*`, `KOOV_NFS_PROXY_*`, `KOOV_TMPFS_SIZE`, `KOOV_KNFS_PORT`,
 `KOOV_UBSAN_OPTIONS`는 각 스크립트 머리 주석을 참조합니다.
@@ -102,7 +99,7 @@ executor가 `executor_linux.h`에 따로 둔 정의와 맞춰야 하므로 필�
   `kernel.variants.<variant>.config_sha256`가 기록합니다.
 - `bundle/patches/BASE`: 시리즈가 적용되는 것으로 확인된 마지막 베이스(커널 태그·커밋, syzkaller 커밋).
   bootstrap과 `fport-apply.sh`가 읽고 `bump-kernel.py`가 갱신합니다. syzkaller는 고정합니다.
-- (선택) `bash tools/release-assembly.sh` → 유지보수용 번들 스냅샷 (배포 아님).
+- (선택) `bash tools/release-assembly.sh` → 보관·전달용 번들 tar.gz. 패치·fixture·게스트 의존성을 묶으며 VM 디스크 스냅샷은 포함하지 않습니다.
 
 ## lane 스크립트 하나
 
