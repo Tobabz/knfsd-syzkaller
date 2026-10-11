@@ -80,6 +80,10 @@ def main():
                         default=REPO / "env/images/bookworm-kcov-fresh.qcow2")
     parser.add_argument("--lane-script", type=Path,
                         default=REPO / "bundle/lane/lane.sh")
+    parser.add_argument(
+        "--state-dir", type=Path,
+        help=("persistent campaign state directory; sets config.workdir to "
+              "<state-dir>/workdir and stores the frozen lane template there"))
     args = parser.parse_args()
     profile = args.profile
     if args.version or args.minor:
@@ -95,7 +99,9 @@ def main():
         parser.error("missing reusable image: %s" % args.image)
     source = args.lane_script.read_bytes()
     digest = hashlib.sha256(source).hexdigest()
-    snapshot = args.output.resolve().parent / ("lane-template-" + digest[:16])
+    state_dir = args.state_dir.resolve() if args.state_dir else None
+    snapshot_parent = state_dir or args.output.resolve().parent
+    snapshot = snapshot_parent / ("lane-template-" + digest[:16])
     if any(char.isspace() for char in str(snapshot)) or "," in str(snapshot):
         parser.error("snapshot path cannot contain whitespace or commas")
     config = json.loads(args.config.read_text())
@@ -114,6 +120,13 @@ def main():
     allow_raw = args.broad_knfsd or profile == "knfsd-v3"
     select_profile_calls(parser, config, profiles, allow_raw)
 
+    if state_dir:
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            parser.error("cannot create state directory %s: %s" %
+                         (state_dir, error))
+        config["workdir"] = str(state_dir / "workdir")
     snapshot.mkdir(parents=True, exist_ok=True)
     lane_copy = snapshot / "lane.sh"
     if lane_copy.exists():
@@ -138,7 +151,8 @@ def main():
     vm["cmdline"] = (cmdline + " %s koov.lane_sha256=%s"
                      % (fixture_arg, digest)).strip()
     args.output.write_text(json.dumps(config, indent=2) + "\n")
-    print("config=%s lane_sha256=%s" % (args.output, digest))
+    print("config=%s workdir=%s lane_sha256=%s" %
+          (args.output, config["workdir"], digest))
 
 
 if __name__ == "__main__":

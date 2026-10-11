@@ -133,6 +133,11 @@ bootstrap은 모든 개별 event 상태를 검사하고 `trace_groups_enabled`,
 메인 KNFSD 퍼징은 `--broad-knfsd`로 네 버전을 함께 노출하고 정확한 8개
 profile producer를 사용합니다. Ganesha는 별도 manager·workdir·`corpus.db`로
 분리하며 DB 병합이나 공유 corpus hub를 사용하지 않습니다.
+`prepare-live-lane-config.py --state-dir /persistent/path/to/campaign`을 지정하면
+생성 설정의 `workdir`는 `<state-dir>/workdir`로 고정되고 lane 스냅샷도 같은
+영구 상태 디렉터리에 놓입니다. 같은 캠페인을 재시작할 때 같은 state directory를
+재사용해야 `corpus.db`와 `crashes/`가 누적됩니다. 하나의 workdir를 둘 이상의
+manager가 동시에 사용해서는 안 되며 `/tmp`나 Git checkout 안에 두지 않습니다.
 knfsd는 `experimental.remote_cover=true`, Ganesha는 `false`로 두고 로컬 클라이언트
 커널 커버리지를 사용합니다. 시드 선택과 DB 운영 방법은
 [코퍼스 사용 안내](../bundle/corpus/nfs-normal/README.md#campaign-setup)를 따릅니다.

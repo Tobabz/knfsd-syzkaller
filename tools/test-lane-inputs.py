@@ -90,6 +90,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert "koov.nfs_version=3" in prepared["vm"]["cmdline"]
     assert "koov.lane_sha256=" + lane_sha in prepared["vm"]["cmdline"]
     assert prepared["image"] == str(proxy.resolve())
+    assert prepared["workdir"] == str(work / "workdir")
     assert prepared["enable_syscalls"] == [
         "openat$nfs",
         "syz_open_nfs_lane_profile$client0_knfsd_v3",
@@ -120,10 +121,14 @@ with tempfile.TemporaryDirectory() as directory:
                for call in ganesha_prepared["enable_syscalls"])
 
     broad = work / "manager-broad.cfg"
+    broad_state = work / "persistent-broad-state"
     subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
-                    str(manager), str(broad), "--broad-knfsd", "--image", str(proxy)],
+                    str(manager), str(broad), "--broad-knfsd", "--image", str(proxy),
+                    "--state-dir", str(broad_state)],
                    check=True, capture_output=True)
     broad_prepared = json.loads(broad.read_text())
+    assert broad_prepared["workdir"] == str(broad_state.resolve() / "workdir")
+    assert Path(broad_prepared["workdir_template"]).parent == broad_state.resolve()
     assert "koov.nfs_fixture=broad-knfsd" in broad_prepared["vm"]["cmdline"]
     assert "koov.nfs_version=" not in broad_prepared["vm"]["cmdline"]
     assert "koov.lane_sha256=" + lane_sha in broad_prepared["vm"]["cmdline"]

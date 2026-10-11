@@ -135,7 +135,11 @@ Use the syz-manager built by bootstrap: `vm.kernel` = `<target>/images/<variant>
 `experimental.remote_cover` to switch remote coverage. Use top-level `snapshot=false` for parallel
 program execution; keep `vm.snapshot=true` (the default) for temporary disk writes.
 Before starting the manager, run `tools/prepare-live-lane-config.py`
-on its base config to add the hash-pinned host lane script share. Use
+on its base config to add the hash-pinned host lane script share. Pass
+`--state-dir /persistent/path/to/campaign` so the generated config uses
+`<state-dir>/workdir` for `corpus.db` and `crashes/`, and keeps the frozen lane
+template outside temporary storage. Reuse the same state directory when restarting
+the same campaign; do not run two managers against one workdir. Use
 `--broad-knfsd` for the KNFSD v3/v4.0/v4.1/v4.2 campaign, or
 `--version 3|4.0|4.1|4.2` for focused replay.
 
