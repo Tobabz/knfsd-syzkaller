@@ -38,7 +38,7 @@ uv run python tools/bootstrap-kcov-env.py env ... --update       # 새 커널로
 | `build-ganesha-v15.sh`·`ganesha-v15-container.sh`·`package-ganesha-v15.sh` | 공식 V15.6 커밋에서 Bookworm 호환 실행 파일·VFS·libntirpc을 빌드해 별도 deps tar 생성 (Docker 사용) |
 | `check-ganesha-v15-guest.py` | v4.1/v4.2 네 마운트, 읽기·쓰기, 직접 경로, 선택적 시드, 정리 검증 |
 | `check-nfs-versions-guest.py` | 공통 이미지의 v3/v4.0/v4.1/v4.2 마운트·교차 읽기/쓰기·백엔드 격리·정리 검증 |
-| `prepare-live-lane-config.py` | 기존 manager 설정에서 lane 스크립트 스냅샷·읽기 전용 9P 공유·버전·해시를 고정한 새 설정 생성 |
+| `prepare-live-lane-config.py` | lane 스크립트 스냅샷·읽기 전용 9P 공유·fixture·해시를 고정하고 broad에서는 KNFSD 8개 exact profile producer만 선택한 새 설정 생성 |
 | `test-lane-inputs.py` | VM 부팅 없이 deps 조립·입력 검사·lane 설정 helper·시드 해시 검증 |
 | `flow-trace/` | 정상 NFS 실행의 이벤트 수집과 스레드 전환 판정 (`flow-trace/README.md`) |
 | `nfs-proxy/` | 프록시 기반의 NFS 특화 Mutation Engine 소스·테스트와 빌드 스크립트 (`build.sh`, `build-guest.sh`, `guest-build.sh`) |
@@ -107,6 +107,7 @@ lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 
 
 | 변수 | 기본값 | 누가 정하는가 |
 |---|---|---|
+| `NFS_FIXTURE` | `single` | `broad-knfsd`는 KNFSD v3/v4.0/v4.1/v4.2를 동시에 mount합니다 |
 | `NFS_VERSION` | `4.1` | 부팅 래퍼가 `vm.cmdline`의 `koov.nfs_version=3\|4.0\|4.1\|4.2`를 읽어 전달합니다. 두 백엔드의 마운트에 적용됩니다 |
 | `SERVER_IMPL` | `both` | `both`는 lane마다 Mutation Engine을 통해 knfsd와 Ganesha에 연결합니다. `knfsd`·`ganesha`는 서버에 직접 연결하는 진단용입니다 |
 | `KOOV_TMPFS_SIZE` | `256m` | lane마다 tmpfs 상한 |
@@ -115,8 +116,10 @@ lane 스크립트는 `bundle/lane/lane.sh` 하나입니다. 변형은 파일을 
 부팅 래퍼(`boot-fixture.sh`)와 서비스(`fixture.service`)도 같은 디렉터리에 있습니다. 래퍼는 읽기 전용 9P
 공유의 `lane.sh`를 `/run/frozen-phase9/lane.sh`로 복사하고 지정된 SHA-256과 비교합니다. 서비스의
 setup·status·cleanup은 모두 이 복사본을 사용합니다.
-lane setup은 tracefs를 준비하고 NFSD 이벤트와 `tracing_on`을 활성화합니다.
-bootstrap의 부팅 검사도 이 상태를 확인하며 `verify.variants.<variant>.nfsd_trace_enabled`에 기록합니다.
+lane setup은 tracefs를 준비해 1 MiB buffer와 `nfsd`, `lockd`, `sunrpc`,
+`rpcgss`를 활성화합니다. rc6 UAF가 있는 `sunrpc:svc_xprt_accept`만 끕니다.
+bootstrap은 모든 개별 event 상태를 검사하고 `trace_groups_enabled`,
+`trace_buffer_size_kb`, `sunrpc_svc_xprt_accept_enabled`를 기록합니다.
 
 기존 시드의 `nfs-lane/client0`·`client1`은 같은 knfsd export를 보는 두 클라이언트입니다.
 `both`에서도 이 의미를 유지하며, Ganesha는 `client0-ganesha`·`client1-ganesha`로 선택합니다.
@@ -127,8 +130,9 @@ bootstrap의 부팅 검사도 이 상태를 확인하며 `verify.variants.<varia
 효력이 있으며, Ganesha도 `Enable_NLM = false`로 실행합니다. NLM/NSM용
 `flow-trace/`의 S5·S5b는 별도 loopback 구성을 사용합니다.
 
-퍼징은 서버별 syz-manager 설정·workdir·`corpus.db`를 분리하고 한 번에 하나씩 실행합니다.
-각 새 DB에는 해당 서버의 기본 시드만 넣으며 DB 병합이나 공유 corpus hub를 사용하지 않습니다.
+메인 KNFSD 퍼징은 `--broad-knfsd`로 네 버전을 함께 노출하고 정확한 8개
+profile producer를 사용합니다. Ganesha는 별도 manager·workdir·`corpus.db`로
+분리하며 DB 병합이나 공유 corpus hub를 사용하지 않습니다.
 knfsd는 `experimental.remote_cover=true`, Ganesha는 `false`로 두고 로컬 클라이언트
 커널 커버리지를 사용합니다. 시드 선택과 DB 운영 방법은
 [코퍼스 사용 안내](../bundle/corpus/nfs-normal/README.md#campaign-setup)를 따릅니다.

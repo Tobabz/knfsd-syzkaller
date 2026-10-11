@@ -8,29 +8,43 @@ root=/tmp/frozen-phase9.manager
 lanes=4
 minor=1
 version=
+fixture_mode=single
 expected_sha=
 
 for arg in $(cat /proc/cmdline); do
 	case "$arg" in
 		koov.nfs_minor=*) minor=${arg#koov.nfs_minor=} ;;
 		koov.nfs_version=*) version=${arg#koov.nfs_version=} ;;
+		koov.nfs_fixture=*) fixture_mode=${arg#koov.nfs_fixture=} ;;
 		koov.lane_sha256=*) expected_sha=${arg#koov.lane_sha256=} ;;
 	esac
 done
-if [ -z "$version" ]; then
-	version=4.$minor
-fi
-case "$version" in
-	3|4.0|4.1|4.2) ;;
-	*) echo "unsupported NFS version: $version" >&2; exit 2 ;;
+case "$fixture_mode" in
+	single)
+		if [ -z "$version" ]; then
+			version=4.$minor
+		fi
+		case "$version" in
+			3|4.0|4.1|4.2) ;;
+			*) echo "unsupported NFS version: $version" >&2; exit 2 ;;
+		esac
+		NFS_VERSION=$version
+		export NFS_VERSION
+		;;
+	broad-knfsd)
+		test -z "$version" || {
+			echo "koov.nfs_version cannot be combined with broad-knfsd" >&2
+			exit 2
+		}
+		NFS_FIXTURE=broad-knfsd
+		export NFS_FIXTURE
+		;;
+	*) echo "unsupported NFS fixture: $fixture_mode" >&2; exit 2 ;;
 esac
 case "$expected_sha" in
 	????????????????????????????????????????????????????????????????) ;;
 	*) echo "missing or invalid koov.lane_sha256" >&2; exit 2 ;;
 esac
-NFS_VERSION=$version
-export NFS_VERSION
-
 mkdir -p /run/frozen-phase9 "$source_dir"
 mount -t 9p -o trans=virtio,version=9p2000.L,ro koov-lane "$source_dir"
 install -m 0755 "$source_dir/lane.sh" "$fixture"

@@ -135,12 +135,14 @@ Use the syz-manager built by bootstrap: `vm.kernel` = `<target>/images/<variant>
 `experimental.remote_cover` to switch remote coverage. Use top-level `snapshot=false` for parallel
 program execution; keep `vm.snapshot=true` (the default) for temporary disk writes.
 Before starting the manager, run `tools/prepare-live-lane-config.py`
-on its base config to add the hash-pinned host lane script share and select
-`--version 3|4.0|4.1|4.2`.
+on its base config to add the hash-pinned host lane script share. Use
+`--broad-knfsd` for the KNFSD v3/v4.0/v4.1/v4.2 campaign, or
+`--version 3|4.0|4.1|4.2` for focused replay.
 
-Use separate manager configs, workdirs and `corpus.db` files for knfsd and
-Ganesha, running one manager at a time. Initialize each DB from only its backend's
-seed and keep the corpora separate on resume. Set `experimental.remote_cover=true`
+Use separate manager configs, workdirs and `corpus.db` files for broad KNFSD
+and Ganesha, running one manager at a time. Build the broad DB with
+`tools/build-normal-corpus.py --fixture broad-knfsd` and keep Ganesha separate.
+Set `experimental.remote_cover=true`
 for knfsd and `false` for Ganesha (local client-kernel feedback only).
 Seed selection and DB operation are described in the
 [corpus guide](corpus/nfs-normal/README.md#campaign-setup).

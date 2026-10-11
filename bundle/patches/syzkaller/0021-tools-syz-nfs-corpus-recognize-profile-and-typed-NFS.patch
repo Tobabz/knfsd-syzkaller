@@ -1,0 +1,86 @@
+From 2c77bd94e713c7ddb66402e6a2d34c742fdd1689 Mon Sep 17 00:00:00 2001
+From: idealinsane <gsnake7@naver.com>
+Date: Wed, 7 Oct 2026 16:21:28 +0900
+Subject: [PATCH] tools/syz-nfs-corpus: recognize profile and typed NFS roots
+
+---
+ tools/syz-nfs-corpus/syz-nfs-corpus.go | 41 ++++++++++++++++++++++++--
+ 1 file changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/tools/syz-nfs-corpus/syz-nfs-corpus.go b/tools/syz-nfs-corpus/syz-nfs-corpus.go
+index a2a667b30..906b8a59b 100644
+--- a/tools/syz-nfs-corpus/syz-nfs-corpus.go
++++ b/tools/syz-nfs-corpus/syz-nfs-corpus.go
+@@ -143,17 +143,25 @@ func inspect(target *prog.Target, file, campaign string) programResult {
+ 	for _, call := range p.Calls {
+ 		res.Calls++
+ 		name := call.Meta.Name
++		usesNFSResource := callUsesResource(call, func(resource string) bool {
++			return strings.HasPrefix(resource, "fd_nfs_")
++		})
++		usesRawSocket := callUsesResource(call, func(resource string) bool {
++			return resource == "sock_nfs_fuzz_tcp"
++		})
+ 		switch {
+-		case strings.HasPrefix(name, "syz_open_nfs_lane$"):
++		case strings.HasPrefix(name, "syz_open_nfs_lane$") ||
++			strings.HasPrefix(name, "syz_open_nfs_lane_profile$"):
+ 			res.LaneRoots++
+ 		case strings.HasPrefix(name, "syz_socket_connect_nfs$"):
+ 			res.RawSockets++
+ 		case strings.HasPrefix(name, "sendmsg$inet_nfs_fuzz_") ||
+-			strings.HasPrefix(name, "syz_send_nfs_fuzz$"):
++			strings.HasPrefix(name, "syz_send_nfs_fuzz$") ||
++			(strings.HasPrefix(name, "write") && usesRawSocket):
+ 			res.RawRecords++
+ 		case strings.HasSuffix(name, "$nfs") || strings.HasSuffix(name, "$nfs_file") ||
+ 			strings.HasSuffix(name, "$nfs_dir") || strings.HasSuffix(name, "$nfs_lock") ||
+-			strings.HasSuffix(name, "$nfs_user"):
++			strings.HasSuffix(name, "$nfs_user") || usesNFSResource:
+ 			res.NFSOps++
+ 		}
+ 		if strings.HasPrefix(name, "fallocate$nfs") {
+@@ -207,6 +215,12 @@ func inspect(target *prog.Target, file, campaign string) programResult {
+ 			features["raw_reply"] = true
+ 		}
+ 	}
++	if res.RawRecords > 0 {
++		features["raw_call"] = true
++	}
++	if res.RawRecords > 1 {
++		features["raw_retry"] = true
++	}
+ 	for feature := range features {
+ 		res.Features = append(res.Features, feature)
+ 	}
+@@ -225,6 +239,27 @@ func inspect(target *prog.Target, file, campaign string) programResult {
+ 	return res
+ }
+ 
++func callUsesResource(call *prog.Call, matches func(string) bool) bool {
++	found := false
++	for _, argument := range call.Args {
++		prog.ForeachSubArg(argument, func(arg prog.Arg, _ *prog.ArgCtx) {
++			result, ok := arg.(*prog.ResultArg)
++			if !ok {
++				return
++			}
++			for result != nil {
++				if resource, ok := result.Type().(*prog.ResourceType); ok &&
++					matches(resource.Desc.Name) {
++					found = true
++					return
++				}
++				result = result.Res
++			}
++		})
++	}
++	return found
++}
++
+ func fail(err error) {
+ 	fmt.Fprintln(os.Stderr, err)
+ 	os.Exit(1)
+-- 
+2.34.1
+

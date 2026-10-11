@@ -17,11 +17,13 @@ comes up and that the kernel carries the expected sanitizer. `--skip-verify` omi
 | Mutation Engine | A [Mutation Engine specialized for NFS](tools/nfs-proxy/README.md), implemented as a proxy between clients and servers. It applies mutation rules supplied by syzkaller programs to NFS RPC/XDR traffic |
 | Coverage model | **Remote KCOV** — instrumented knfsd and SUNRPC paths feed `experimental.remote_cover`. Request ownership is lane-scoped (kernel 0002); asynchronous COPY carries that ownership (0003), and server callbacks retain the originating program's ownership (0004). See the [callback attribution contract and limits](docs/design/decisions/2026-10-05-callback-attribution.md) |
 | Fuzz lanes | One NFS lane per executor proc (knfsd and Ganesha backends plus two client mount namespaces, `/nfs-lane`); the boot fixture provides 4 lanes, so run syz-manager with `procs` equal to the lane count and top-level `snapshot` off. Lanes exist for parallel fuzzing inside one VM |
-| NFS version | `koov.nfs_version=3\|4.0\|4.1\|4.2` in `vm.cmdline` selects one mount version for both backends at boot |
+| NFS fixture | `koov.nfs_fixture=broad-knfsd` exposes KNFSD v3/v4.0/v4.1/v4.2 together. `koov.nfs_version=...` remains available for focused replay |
 | Boot model | One version-neutral image serves both sanitizer kernels; the lane script is copied from a read-only host 9P share at each VM boot |
 | Seeds | [Normal-flow corpus](bundle/corpus/nfs-normal/README.md) — TCP programs and a manifest recording their versions, backends and execution status; use the patched syzkaller binaries built by bootstrap |
 
-The image uses `bundle/lane/lane.sh` for all four NFS versions. Its default `SERVER_IMPL=both`
+The image uses `bundle/lane/lane.sh` for all four NFS versions. The broad KNFSD
+fixture exposes two client mounts for each version through exact profile aliases.
+Its default `SERVER_IMPL=both`
 routes both clients through the Mutation Engine; `nfs-lane/client0` and `client1` select the same knfsd
 export. Explicit `client{0,1}-ganesha` paths select the separate Ganesha export.
 Both backends use the selected version. The lane exports a bounded ext4
@@ -34,14 +36,16 @@ guest-check commands are in
 
 The reusable image is `env/images/bookworm-kcov-fresh.qcow2`. Prepare each manager config
 with the helper in step 3 to supply the required host lane script.
-Use separate manager configs, workdirs and corpora for each backend, running one backend
-at a time. Seed selection is described in the [corpus guide](bundle/corpus/nfs-normal/README.md).
+Use a dedicated manager config, workdir and corpus for the broad KNFSD campaign.
+Ganesha remains a separate campaign. Seed selection is described in the
+[corpus guide](bundle/corpus/nfs-normal/README.md).
 
 The corpus covers normal NFS scenarios. [tools/flow-trace/](tools/flow-trace/README.md)
 provides kernel event collection and thread-transition analysis.
-Lane setup enables NFSD trace events in the guest so their generated callbacks can
-contribute to existing remote KCOV sections. Keep `experimental.remote_cover=true`
-for knfsd campaigns.
+Lane setup enables the `nfsd`, `lockd`, `sunrpc`, and `rpcgss` trace groups with
+a 1 MiB per-CPU buffer so their generated callbacks can contribute to existing
+remote KCOV sections. `sunrpc:svc_xprt_accept` stays disabled because it exposes
+a reproducible v7.3-rc6 UAF. Keep `experimental.remote_cover=true` for knfsd.
 
 ## Host requirements
 
@@ -117,29 +121,33 @@ Start campaigns directly with the syz-manager built in step 2 and a config point
 | `procs` | the fixture's lane count (4) |
 | `snapshot` (top level) | `false` (or absent). Program snapshot mode runs one program at a time with one proc, so only lane 0 is used |
 | `vm.snapshot` | `true` (default). QEMU's temporary disk writes preserve the baked image; this setting does not select program snapshot mode |
-| `workdir`, `http` | distinct for knfsd and Ganesha; each workdir owns its own `corpus.db` |
+| `workdir`, `http` | distinct for the broad KNFSD and Ganesha campaigns; each workdir owns its own `corpus.db` |
 | `experimental.remote_cover` | `true` for knfsd; `false` for Ganesha, whose current feedback is local client-kernel coverage |
-| `vm.cmdline` | must include `nfs.localio_enabled=N`; the helper below adds `koov.nfs_version` and the expected lane-script SHA-256. `sunrpc.lane_attribution=0` disables lane attribution; it does not restore request-level attribution |
+| `vm.cmdline` | must include `nfs.localio_enabled=N`; the helper adds the selected fixture and expected lane-script SHA-256. `sunrpc.lane_attribution=0` disables lane attribution; it does not restore request-level attribution |
 
-Create one base config per backend with distinct `workdir` and `http` values.
-Initialize each new workdir's DB from only that backend's seed: knfsd uses
-`basic-v41-tcp.prog`, Ganesha uses `basic-v41-ganesha-tcp.prog`.
-Do not pack the whole seed directory into both DBs, merge the DBs, or share a
-corpus hub between these campaigns. Keep existing DBs when resuming.
+Create one base config per campaign with distinct `workdir` and `http` values.
+Build the broad KNFSD DB from the manifest-selected v3/v4.0/v4.1/v4.2 seeds:
+
+```sh
+uv run python tools/build-normal-corpus.py /tmp/knfsd-broad/corpus.db \
+  --fixture broad-knfsd
+```
+
+Do not merge Ganesha inputs into this DB or share a corpus hub with Ganesha.
 
 For the reusable image, freeze the host script and add the read-only 9P device
 to each config separately; the helper preserves its backend-specific workdir
 and coverage settings:
 
 ```sh
-uv run python tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-v41.cfg --version 4.1
+uv run python tools/prepare-live-lane-config.py manager-knfsd-base.cfg manager-knfsd-broad.cfg --broad-knfsd
 uv run python tools/prepare-live-lane-config.py manager-ganesha-base.cfg manager-ganesha-v41.cfg --version 4.1
 ```
 
 Run one backend at a time. Start knfsd with:
 
 ```sh
-env/syzkaller/bin/syz-manager -config manager-knfsd-v41.cfg -mode fuzzing
+env/syzkaller/bin/syz-manager -config manager-knfsd-broad.cfg -mode fuzzing
 ```
 
 After stopping it and waiting for shutdown, run Ganesha:
@@ -152,7 +160,8 @@ Corpus separation prevents splicing
 between backend corpora; it does not preserve seed paths or disable minimization.
 The fixture still exposes both backends, so this is not a strict execution filter.
 
-Use `--version 3`, `4.0`, `4.1` or `4.2` for a campaign. The helper leaves the input config alone,
+Use `--broad-knfsd` for the multi-version KNFSD campaign. `--version 3`, `4.0`,
+`4.1`, or `4.2` remains available for focused replay. The helper leaves the input config alone,
 copies `bundle/lane/lane.sh` to a hash-named `workdir_template`, and pins that
 hash in the guest boot arguments. Each VM copies the script once into `/run`;
 setup, status and cleanup use that same copy. Changing `lane.sh` requires a new
@@ -161,12 +170,10 @@ after the copy. A missing share or wrong hash fails the fixture at boot.
 The checked-in corpus includes inputs for NFSv3, v4.0, v4.1 and v4.2. Their targets and
 functional contracts are listed in the [corpus guide](bundle/corpus/nfs-normal/README.md).
 
-For version comparisons, mount only the selected version in each VM. Extra
-NFSv4 mounts establish client/server state and can issue lease-renewal traffic
-even when no seed opens their paths; concurrent mounts can also change cache
-behavior. A run with all versions mounted is a valid, separate topology if it
-is held constant across repeats, but it is not equivalent to a single-version
-run. This matters especially here because remote coverage is lane-scoped.
+The broad fixture deliberately keeps all versions mounted. NFSv4 mounts can
+issue lease-renewal traffic even when a program does not open their paths, so
+coverage reports must retain a measured idle-fixture baseline. Focused replay
+uses one selected version when per-version causality is required.
 See [NFSv4.1 lease renewal](https://www.rfc-editor.org/rfc/rfc8881.html#section-8.3)
 and [Linux NFS mount caching](https://man7.org/linux/man-pages/man5/nfs.5.html).
 

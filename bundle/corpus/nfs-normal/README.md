@@ -1,7 +1,7 @@
 # Normal NFS syzkaller corpus
 
-This directory contains normal-flow TCP inputs for NFSv3, v4.0, v4.1 and v4.2.
-[manifest.json](manifest.json) identifies each seed's version, backend, fixture,
+This directory contains canonical mutation seeds for NFSv3, v4.0, v4.1 and
+v4.2. [manifest.json](manifest.json) identifies every seed's native profile,
 functional oracle and content hash.
 
 The lane fixture provides four client mounts: `nfs-lane/client0` and `client1`
@@ -11,15 +11,24 @@ separate Ganesha export. Prepare the image and host lane script using the
 
 ## Campaign setup
 
-Run knfsd and Ganesha as separate campaigns, one backend at a time. Each has
-its own manager config, HTTP endpoint, workdir and `corpus.db`. Initialize a
-new DB with its backend's basic seed and preserve the DB when resuming.
-Keep the DBs separate and do not connect the campaigns to a shared corpus hub.
+The broad KNFSD campaign exposes v3, v4.0, v4.1 and v4.2 together. Its eight
+exact profile producers map two clients to four immutable version aliases.
+Ganesha remains a separate campaign and is not admitted into the broad DB.
 
-| Backend | Initial seed | Client paths under `nfs-lane/` | `experimental.remote_cover` |
-| --- | --- | --- | --- |
-| knfsd | `basic-v41-tcp.prog` | `client0`, `client1` | `true` |
-| Ganesha | `basic-v41-ganesha-tcp.prog` | `client0-ganesha`, `client1-ganesha` | `false` |
+Build a fresh broad database with:
+
+```sh
+tools/build-normal-corpus.py /tmp/knfsd-broad/corpus.db \
+  --fixture broad-knfsd
+```
+
+Audit an evolved DB with `tools/audit-normal-corpus.py --fixture broad-knfsd`.
+The auditor recognizes both `.db` paths and renamed preservation copies by the
+syzkaller database header. It unpacks a temporary writable copy so the source
+database is never compacted or changed during inspection.
+Mixed-profile programs are executable in this topology but remain explicitly
+classified; unavailable Ganesha roots and inputs with no NFS root are not
+admitted for corpus promotion.
 
 Set `procs` to the fixture's lane count and top-level `snapshot` to `false`
 (or omit it) for parallel execution. `vm.snapshot` controls temporary disk
