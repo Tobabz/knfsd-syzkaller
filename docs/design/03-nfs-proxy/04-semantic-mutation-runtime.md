@@ -347,6 +347,9 @@ ValueRef
 - matching TransactionEntry에 보존된 request-side semantic value.
 - response target에서 request-side selector/transform에 사용한다.
 
+초기 runtime의 source는 이 셋뿐이다. 이전 transaction의 값은 어떤 source로도 읽지 않는다
+(cross-transaction state lineage, §12, issue #6). request-side view의 세부는 issue #7에서 정한다.
+
 ### 9. predicate type rules
 
 Compiler는 predicate를 runtime 전에 type-check한다.
@@ -430,7 +433,9 @@ Transform은 deterministic하고 side-effect free여야 한다.
 Runtime transform이 wall clock, random generator, global mutable identifier pool,
 another rule's mutated output, future record를 읽는 것은 금지한다.
 
-동적 값은 live current record와 matching TransactionEntry에서만 명시적으로 가져온다.
+동적 값은 live current record와 matching TransactionEntry에서만 명시적으로 가져온다. 이전 transaction에서
+capture한 값을 읽는 source는 없으며, 이런 intent는 Compiler가 `requires_state_lineage`로 거부한다
+(§19, issue #6).
 
 ### 13. literal transform
 
@@ -467,6 +472,9 @@ truncate_value 같은 category가 가능하지만 이 예시가 current support�
 deterministic meaning을 가져야 한다.
 
 Arbitrary script, shell, Python expression 같은 executable transform은 허용하지 않는다.
+
+현재 field에 대한 builtin(예: `stateid.other`에 integer_xor)은 위조·변형 값을 만든다. 이전 transaction의
+값을 재사용하는 stale 값과는 다르며, 그런 의미로 기술하지 않는다(issue #6).
 
 ### 16. operation value
 
@@ -525,6 +533,7 @@ predicate types compatible
 transform types compatible
 structure_policy valid for mutation kind
 context dependencies derivable
+no cross-transaction value reference (else requires_state_lineage)
 application mode == all_matches
 runtime capability advertised
 ```
@@ -989,6 +998,9 @@ Expected:
 - **결정됨:** 모든 rule은 같은 pre-mutation record snapshot에서 resolve한다.
 - **결정됨:** cross-rule conflict를 registration order로 해결하지 않는다.
 - **결정됨:** Resolver success는 M1이 아니다.
+- **결정됨:** cross-transaction state lineage는 초기 target runtime(M0–M7) 범위 밖이다. 해당 intent는
+  `requires_state_lineage`로 거부하고 `mutation_engine` gap(missing capability `state_lineage`)으로
+  보낸다(issue #6).
 - **미결:** CompiledMutationRule serialization/control ABI.
 - **미결:** initial supported builtin transform registry.
 - **미결:** insert/delete가 지원할 schema container subset.
@@ -996,6 +1008,11 @@ Expected:
 - **미결:** runtime numeric safety limits.
 - **미결:** same-container independent edit conflict granularity.
 - **미결:** existing NFSPARM engine 재사용 범위.
+- **미결:** state lineage 확장. 이미 정한 불변식은 새 versioned ValueRef source와 semantic runtime
+  version, bounded·명시적 scope, capture/reference의 semantic identity(literal 값을 replay identity로 쓰지
+  않음), 선언된 capture/match semantics(last observed 값이나 Nth temporal identity 금지), 같은 reference를
+  재구성할 capture evidence 기록이다. scope(한 `ProgramGenerationExecution` 또는 `CrashContextWindow`의
+  bounded ordered 구간)는 component를 설계할 때 정한다(issue #6).
 - **미검증:** order-independent semantics의 real workload performance cost.
 
 ## 참조

@@ -502,6 +502,8 @@ transaction-derived transform
     current transaction context -> derived value
 ```
 
+다른 transaction에서 얻은 값(state lineage)은 초기 target runtime 범위 밖이다(`04` §12, issue #6).
+
 `value_or_transform`의 concrete DSL/ABI는 별도 runtime-rule 설계에서 고정한다.
 
 ### 12. `[COMPONENT] Delta Recorder`

@@ -173,11 +173,12 @@ record_match
 operation: NFS4_OP_OPEN
 
 conditions:
-    stateid belongs to the selected open state
+    request의 open path가 scenario 파일과 같음     # request_context
     response status is NFS4_OK
 ```
 
-`conditions`는 Agent가 의도하는 의미를 표현한다.
+`conditions`는 Agent가 의도하는 의미를 표현한다. 같은 RPC transaction 밖의 값을 기억해야 하는 조건
+(예: "file X를 연 OPEN의 stateid를 쓰는 WRITE")은 초기 runtime에서 표현할 수 없다(§15, issue #6).
 Compiler는 target Proxy schema가 이 selector를 표현할 수 있는지 검증하고 정규화한다.
 실제 live record matching과 field resolution은 Proxy Semantic Rule Resolver가 수행한다.
 
@@ -237,9 +238,12 @@ Agent가 original-message byte offset을 직접 지정하지 않는다.
 ```text
 status = NFS4ERR_*
 length = <semantic value>
-stateid = <chosen malformed/stale semantic value>
+stateid = <현재 field에서 만든 위조 값, 예: stateid.other에 integer_xor>
 append operation = GETATTR(...)
 ```
+
+현재 field에 대한 transform은 위조·변형 값을 만든다. 이전 transaction에서 받은 값을 다시 쓰는 stale
+값(예: CLOSE 전에 받은 stateid)은 state lineage가 필요하며 초기 runtime 범위 밖이다(§15, issue #6).
 
 Compiler는 semantic value/transform을 검증·정규화한다.
 Live target field의 concrete XDR bytes와 current value는 Proxy가 runtime에 resolve한다.
@@ -270,7 +274,7 @@ expected_effect
 
 ```text
 target_state:
-    stale stateid reaches candidate validation path
+    forged stateid reaches candidate validation path
 
 rationale:
     candidate dereferences state derived from the reply before ...
@@ -378,6 +382,7 @@ semantic selector를 stable하게 표현할 수 없음
 required live-value transform을 Proxy가 지원하지 않음
 resolved concrete edit를 Edit Applier가 표현할 수 없음
 reproduction delta를 요구된 의미로 기록할 수 없음
+이전 transaction의 값이나 identity가 필요함 (state lineage)
 ```
 
 결과:
@@ -389,6 +394,17 @@ unsupported_by_current_harness
 HarnessGapIssue
     stage: stage2_mutation
     gap_class: mutation_engine
+```
+
+state lineage가 필요한 intent는 Compiler가 `requires_state_lineage`로 거부하고, Controller가
+`HarnessGapIssue(gap_class=mutation_engine)`에 missing capability `state_lineage`로 연결한다(issue #6).
+초기 runtime(M0–M7)은 다음을 표현하지 않는다.
+
+```text
+file X를 연 OPEN의 stateid를 쓰는 WRITE의 stateid 변조
+CLOSE 뒤에 그 stateid 재사용
+client0의 stateid를 client1 요청에 사용
+이전 transaction에서 받은 sessionid / clientid 참조
 ```
 
 Harness Extension Work가 해결된 뒤 Stage 2를 다시 실행한다.

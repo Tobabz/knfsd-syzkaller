@@ -670,7 +670,8 @@ Outstanding RPC 수에 비례한 bounded runtime memory가 필요하다.
 Timeout, duplicate detection, completed retention은 CPU/memory overhead를 추가하지만
 wire packet capture 전체를 보존하는 것보다 작게 유지해야 한다.
 
-Context table은 Proxy process/job 밖으로 persistence하지 않는다.
+Context table은 Proxy process/job 밖으로 persistence하지 않는다. transaction 사이의 state lineage도
+보존하지 않는다(초기 runtime 범위 밖, `04` §12, issue #6).
 
 ## 신뢰성 요구
 
