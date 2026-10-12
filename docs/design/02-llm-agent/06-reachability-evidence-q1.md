@@ -10,18 +10,19 @@
 ~~~text
 ReachabilityEvidence
     Type:        DATA
-    Produced by: isolated Runner
+    Produced by: isolated Runner (EvidenceManifest로 봉인)
 
 Q1 Judge
     Type:        COMPONENT
-    Executed by: Application / validation layer
+    Executed by: Application / validation layer (Controller 측)
 
 Q1Result
     Type:        DATA
     Produced by: Q1 Judge
 ~~~
 
-Q1 Judge는 Agent Task가 아니다.
+Q1 Judge는 Agent Task가 아니다. Judge 실행 위치와 evidence 신뢰 경계는
+`01-two-stage-agent-architecture.md` §11.1이 소유한다(issue #11).
 
 ## 2. Stage 1의 마지막 구간
 
@@ -138,7 +139,8 @@ Q1 Judge
     inputs:
         VulnerabilityCandidate
         ReachabilityPlan.q1_observation
-        ReachabilityEvidence
+        ReachabilityEvidence           # 봉인된 bundle. manifest hash 대조 후 사용
+        JudgeProfile (Q1)
 ~~~
 
 Judge는 Agent의 자유 텍스트가 아니라 plan의 구조화된 observation requirement를 사용한다.
@@ -167,6 +169,8 @@ remote KCOV 실행이 판정 가능한 상태였는지를 확인하는 health/ad
 ~~~text
 Q1Result
     candidate_id
+    judge_profile_id
+    evidence_manifest_sha256
     status
         reached
         not_reached
@@ -197,7 +201,8 @@ remote_refs drained
 target code location observed
 ~~~
 
-정확한 counter 기대값은 runner/profile이 소유하며 Agent가 임의로 완화하지 않는다.
+정확한 counter 기대값은 Q1 `JudgeProfile`이 소유하며(01 §11.1, 구체 내용은 issue #9) Agent가 임의로
+완화하지 않는다.
 
 ## 9. NOT_REACHED 조건
 
@@ -223,6 +228,8 @@ fixture/lane failure
 remote KCOV collection failure
 coverage truncation/loss
 counter inconsistency
+evidence integrity failure (manifest hash mismatch)
+host-stamped / guest correlation mismatch
 coverage is not generation-attributed
 target source -> PC mapping unavailable
 target later turns out to be outside the current remote-KCOV propagation boundary

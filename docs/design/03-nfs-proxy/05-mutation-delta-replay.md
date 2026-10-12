@@ -1051,7 +1051,8 @@ Target은 이를 record-level semantic batch signature multiset + delivery state
 MutationDelta는 M1 Judge가 사용할 semantic rule snapshot, concrete production mutation,
 EXPOSURE_INTENT durability, FORWARD_COMPLETE/FAILED/unknown evidence를 제공한다.
 
-하지만 Delta Recorder가 M1 verdict를 직접 결정하지 않는다.
+하지만 Delta Recorder가 M1 verdict를 직접 결정하지 않는다. M1 Judge는 Controller 측에서 Runner가 봉인한
+host journal을 읽는다(`../02-llm-agent/01-two-stage-agent-architecture.md` §11.1).
 
 ```text
 REPLAY_EQUIVALENT

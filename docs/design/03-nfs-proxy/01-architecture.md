@@ -723,7 +723,9 @@ Proxy는 Q1 Judge가 아니다.
 Q1 = generation-attributed remote KCOV
 ```
 
-Proxy는 M1 evidence의 주요 producer다.
+Proxy는 M1 evidence의 주요 producer다. Proxy와 Runner(host sink 포함)는 evidence를 만들고 봉인할 뿐
+verdict를 내리지 않는다. M1 Judge는 Controller 측 validation layer에서 봉인된 evidence로 판정한다
+(`../02-llm-agent/01-two-stage-agent-architecture.md` §11.1, issue #11).
 
 M1이 검토할 최소 runtime 사실:
 

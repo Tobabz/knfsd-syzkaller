@@ -40,12 +40,12 @@ Stage 2는 Stage 1의 Q1이 증명되기 전에는 시작하지 않는다.
 
 ### 2.1 요소의 종류
 
-이 문서에서 이름은 네 종류로 구분한다.
+이 문서에서 이름은 다섯 종류로 구분한다.
 
 | 종류 | 의미 | 예 |
 |---|---|---|
 | **Data** | 저장·전달되는 구조화 데이터 | `VulnerabilityCandidate`, `CandidateAnalysis`, `ReachabilityPlan` |
-| **Repository Design Data** | 저장소 capability를 정리한 정적 명세 | `Harness Capability Specification` |
+| **Repository Design Data** | 저장소에 버전과 함께 두는 정적 명세 | `Harness Capability Specification`, `JudgeProfile` |
 | **Component** | application code | Controller, Rule Compiler, Judges |
 | **Agent Task** | Agent SDK가 reasoning을 수행하는 작업 | Candidate Analysis, Reachability Planning, Mutation Strategy |
 | **Runner Task** | 격리된 실행 환경에서 실제 코드를 실행하는 작업 | build, VM, KCOV, fuzz |
@@ -550,7 +550,7 @@ GENERATION_COMPLETE
 ### 7.4 MutationEvidence
 
 ```text
-MutationEvidence
+MutationEvidence                 # Runner가 수집하고 봉인한다 (§11.1)
     program_generation_correlation
         vm_instance_id           # host-stamped
         lane_id / proc_id
@@ -569,13 +569,17 @@ MutationEvidence
         exposure_intent_ref
         delivery_state
         forward_event_ref?
+
+M1Result                         # M1 Judge 출력 (§11.1)
+    evidence_manifest_sha256
+    judge_profile_id
     m1[]
         rule_id
         status
         reason?
 ```
 
-concrete byte snapshot은 `03-nfs-proxy/05`의 batch journal evidence에 두고 이 객체에 복제하지 않는다.
+concrete byte snapshot은 `03-nfs-proxy/05`의 batch journal evidence에 두고 MutationEvidence에 복제하지 않는다.
 
 Q2 판정은 M1과 독립적으로 기록한다. 다만 `M1≠APPLIED`일 때 `Q2=NOT_OBSERVED`를
 "mutation이 trigger하지 못했다"는 결론이나 취약점이 없다는 음성 증거로 해석하지 않는다.
@@ -678,6 +682,7 @@ Agent SDK does NOT own
     KCOV Q1 verdict
     mutation M1 verdict
     sanitizer/crash Q2 verdict
+    judge profile / job policy
     approval state
     publish credentials
 ```
@@ -711,6 +716,8 @@ artifact hashes
 failure routing
 repair budgets
 evidence lineage
+evidence manifest 검증
+Q1/M1/Q2 deterministic judge (§11.1)
 ```
 
 isolated Linux/KVM runner는 다음을 소유한다.
@@ -719,18 +726,76 @@ isolated Linux/KVM runner는 다음을 소유한다.
 prepared syzkaller/kernel environment use
 VM/fixture
 remote KCOV collection
-Q1 deterministic judge
 proxy rule-set installation (proxy session마다)
 proxy mutation execution/replay
 host-side mutation journal sink (durable ACK, issue #3)
 CrashContextWindow execution history (issue #2)
-M1 deterministic judge
 bounded syz-manager fuzz
 sanitizer/crash collection
-Q2 deterministic judge
+evidence 수집과 봉인 (EvidenceManifest, §11.1)
+operational health check (verdict 아님)
 ```
 
-Judge의 실행 위치(Runner 또는 application layer)는 issue #11에서 정한다.
+### 11.1 Judge 위치와 evidence 신뢰 경계
+
+이 절은 issue #11에서 합의했다.
+
+Runner는 evidence를 수집하고 봉인하지만 Q1/M1/Q2 verdict를 내리지 않는다. Runner의 health check와
+protocol 동작(generation ABORT, lane quarantine 등)은 실행을 멈추거나 격리하는 운영 판단이며, 그 결과는
+evidence에 사실로 기록한다.
+
+```text
+EvidenceManifest                 # Runner가 수집 시점에 작성하고 전송 전에 봉인한다
+    artifacts[]
+        identity
+        sha256
+        size / type
+    host-stamped execution correlation
+    collection / sealing metadata
+```
+
+Q1/M1/Q2 Judge는 Controller 측 validation layer에서 실행하는 결정적 함수다.
+
+```text
+verdict = Judge(봉인된 evidence bundle, JudgeProfile, plan / rule set)
+```
+
+- Controller는 받은 artifact의 SHA-256을 manifest와 대조한 뒤 Judge에 넘긴다.
+- Judge는 판정 중 guest에 추가 사실을 묻지 않고 봉인된 bundle만 읽는다.
+- verdict record는 `judge_profile_id`, `evidence_manifest_sha256`, 판정에 쓴 plan / rule set identity를
+  기록한다. plan과 execution identity 체계는 issue #13에서 정한다.
+- verdict record는 불변이다. 새 JudgeProfile로 다시 판정하면 같은 봉인 bundle에 대해 새 verdict를
+  만든다. bundle에 필요한 evidence가 모두 있으면 VM을 다시 실행하지 않는다(무효화 규칙은 issue #13).
+
+판정 의미와 실행 정책은 분리한다.
+
+```text
+JudgeProfile                     # 버전이 있는 Repository Design Data
+    Q1    remote-KCOV support boundary / admissibility (issue #9), evidence 유효성 규칙
+    M1    §7 판정 의미, journal / evidence 유효성 규칙
+    Q2    sanitizer / crash report 분류 규칙
+
+JobPolicy                        # trusted control-plane policy (§4.1)
+    baseline 반복 횟수
+    fuzz / execution budget
+    campaign repair 임계값
+    retry / repair budget
+```
+
+JobPolicy는 실행 횟수와 경로 전환을 정할 뿐 개별 verdict의 의미를 바꾸지 않는다. JobPolicy identity는
+`judge_profile_id`에 넣지 않고 execution/job record에 기록한다. 여러 verdict를 모아 경로를 정하는 결정
+(§3 gate, §12 campaign repair)은 사용한 JobPolicy identity와 소비한 verdict를 함께 기록한다. delivery
+state(§7.2)는 M1과 분리된 evidence이며 어떤 policy도 M1 판정을 바꾸지 않는다.
+
+**신뢰 규칙.** guest에서 온 evidence는 untrusted data다.
+
+- identity의 기준은 host-stamped 값이다. guest가 보낸 correlation이 host-stamped 값과 다르면 host 값으로
+  바꿔 판정을 계속하지 않고 evidence 불일치로 처리한다.
+- manifest hash가 맞지 않는 bundle은 invalid evidence다.
+- invalid evidence, 내부 불일치(서로 모순인 counter, sequence가 끊긴 journal), correlation 불일치로는 확정
+  verdict(REACHED / NOT_REACHED, APPLIED / NOT_APPLIED)를 내리지 않는다. 그 Judge는 `INCONCLUSIVE`와
+  reason을 기록한다. Q2 상태 집합은 Q2 judge 세부에서 정하되 같은 규칙을 따른다.
+- evidence가 repair 입력으로 Agent에 전달될 때도 data로만 다루며 지시로 해석하지 않는다.
 
 ## 12. Repair boundaries
 
@@ -822,7 +887,9 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
 7. [`MutationRuleSet`](08-mutation-rule-set.md) — detailed contract fixed
 8. [`NFS Proxy target architecture`](../03-nfs-proxy/01-architecture.md) — draft
 9. Mutation Rule Compiler
-10. `MutationEvidence` / M1 judge — 판정 계약은 §7에 고정(issue #4), judge 실행 위치는 issue #11
-11. `CrashEvidence` / Q2 judge — Q2 경계와 `CrashContextWindow`는 §8에 고정(issue #2, #4), judge 세부는 미정
+10. `MutationEvidence` / M1 judge — 판정 계약은 §7(issue #4), judge 실행 위치와 evidence 신뢰 경계는
+    §11.1(issue #11)에 고정
+11. `CrashEvidence` / Q2 judge — Q2 경계와 `CrashContextWindow`는 §8(issue #2, #4), judge 실행 위치는
+    §11.1(issue #11)에 고정. Q2 분류 규칙(`JudgeProfile` Q2)은 미정
 12. repair/state graph
 13. Agent SDK concrete selection and agent/tool definitions
