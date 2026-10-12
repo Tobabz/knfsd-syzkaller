@@ -200,6 +200,15 @@ lane_source = (ROOT / "bundle/lane/lane.sh").read_text()
 assert "for trace_group in nfsd lockd sunrpc rpcgss" in lane_source
 assert "events/sunrpc/svc_xprt_accept/enable" in lane_source
 assert "buffer_size_kb" in lane_source
+# NFS tracing is opt-in: off unless boot-fixture maps koov.nfs_trace=1.
+assert "nfs_trace=${NFS_TRACE:-0}" in lane_source
+assert 'if [ "$nfs_trace" = 1 ]; then' in lane_source
+assert lane_source.index('if [ "$nfs_trace" = 1 ]; then') < lane_source.index(
+    "for trace_group in nfsd lockd sunrpc rpcgss")
+assert '"nfs_trace":%s' in lane_source
+boot_source = (ROOT / "bundle/lane/boot-fixture.sh").read_text()
+assert "koov.nfs_trace=*) trace=${arg#koov.nfs_trace=} ;;" in boot_source
+assert "trace=0\n" in boot_source
 assert manifest["fixtures"]["broad-knfsd"]["mixed_profile_runtime"] == "allowed"
 assert manifest["fixtures"]["broad-knfsd"]["promotion_policy"] == {
     "nfs_root_required": True,

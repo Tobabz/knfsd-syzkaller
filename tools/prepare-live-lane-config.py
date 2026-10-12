@@ -137,9 +137,11 @@ def main():
         lane_copy.chmod(0o444)
     config["workdir_template"] = str(snapshot)
     config["image"] = str(args.image.resolve())
-    # vm.snapshot controls syzkaller's executor snapshot mode.  Parallel lane
-    # campaigns keep that false, but QEMU must still protect the shared base
-    # image from guest writes (and syz-manager's image-integrity guard).
+    # vm.snapshot is QEMU's -snapshot disk overlay (default true); program
+    # snapshot mode is the top-level "snapshot" setting.  The qemu backend adds
+    # -snapshot itself when vm.snapshot is true; add it here otherwise so the
+    # shared base image never takes guest writes (and syz-manager's
+    # image-integrity guard holds).
     disk_snapshot = "" if vm.get("snapshot") else " -snapshot"
     vm["qemu_args"] = (
         "-enable-kvm -cpu host,migratable=off" + disk_snapshot + " "

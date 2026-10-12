@@ -602,19 +602,15 @@ def stage_verify_variant(args, image, variant, bzimage):
         guest_lane_sha = vm.guest("sha256sum /run/frozen-phase9/lane.sh").split()[0]
         if guest_lane_sha != sha256(LANE / "lane.sh"):
             raise RuntimeError("guest lane script differs from the host source")
-        trace_buffer_kb = int(vm.guest(
+        # Lane tracing is opt-in (koov.nfs_trace=1).  Bootstrap boots the
+        # default, so no NFS trace group may be enabled.
+        if lane_status.get("nfs_trace") != 0:
+            raise RuntimeError("lane NFS tracing is not off by default")
+        vm.guest(
             'set -eu; tracefs=/sys/kernel/tracing; '
-            'test "$(cat $tracefs/tracing_on)" = 1; '
-            'test "$(cat $tracefs/events/sunrpc/svc_xprt_accept/enable)" = 0; '
-            'buffer_kb=$(cat $tracefs/buffer_size_kb); test "$buffer_kb" -ge 1024; '
-            'for group in nfsd lockd rpcgss; do '
-            'for event_enable in $tracefs/events/$group/*/enable; do '
-            'test "$(cat $event_enable)" = 1; done; done; '
-            'for event_enable in $tracefs/events/sunrpc/*/enable; do '
-            'case "$event_enable" in */svc_xprt_accept/enable) '
-            'test "$(cat $event_enable)" = 0 ;; *) '
-            'test "$(cat $event_enable)" = 1 ;; esac; done; '
-            'printf "%s\\n" "$buffer_kb"').strip())
+            'if mountpoint -q $tracefs; then '
+            'for group in nfsd lockd sunrpc rpcgss; do '
+            'test "$(cat $tracefs/events/$group/enable)" = 0; done; fi')
         sanitizer = detect_mem_sanitizer(
             vm, image_dir(args, variant) / ".config")
         if sanitizer != variant:
@@ -625,9 +621,7 @@ def stage_verify_variant(args, image, variant, bzimage):
                 "nfs_version": lane_status["nfs_version"],
                 "nfs_minor": lane_status["nfs_minor"],
                 "lane_script_sha256": guest_lane_sha,
-                "trace_groups_enabled": ["nfsd", "lockd", "sunrpc", "rpcgss"],
-                "trace_buffer_size_kb": trace_buffer_kb,
-                "sunrpc_svc_xprt_accept_enabled": False,
+                "nfs_trace": False,
                 "mem_sanitizer": sanitizer,
                 "target_kasan": sanitizer == "kasan",
                 "target_kcsan": sanitizer == "kcsan",

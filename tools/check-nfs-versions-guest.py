@@ -41,27 +41,20 @@ def main():
         expected_mode = "broad-knfsd" if args.broad_knfsd else "single"
         if (fixture["nfs_version"] != expected_version or
                 fixture["fixture_mode"] != expected_mode or
+                fixture["nfs_trace"] != 0 or
                 fixture["lane_count"] != 4):
             raise RuntimeError("wrong lane status: " + status)
+        # Lane tracing is opt-in (koov.nfs_trace=1) and this check boots the
+        # default, so no NFS trace group may be enabled.
         trace_status = vm.guest(r'''
 set -eu
 tracefs=/sys/kernel/tracing
-test "$(cat "$tracefs/tracing_on")" = 1
-test "$(cat "$tracefs/events/sunrpc/svc_xprt_accept/enable")" = 0
-buffer_kb=$(cat "$tracefs/buffer_size_kb")
-test "$buffer_kb" -ge 1024
-for group in nfsd lockd rpcgss; do
-    for event_enable in "$tracefs/events/$group"/*/enable; do
-        test "$(cat "$event_enable")" = 1
+if mountpoint -q "$tracefs"; then
+    for group in nfsd lockd sunrpc rpcgss; do
+        test "$(cat "$tracefs/events/$group/enable")" = 0
     done
-done
-for event_enable in "$tracefs/events/sunrpc"/*/enable; do
-    case "$event_enable" in
-        */svc_xprt_accept/enable) test "$(cat "$event_enable")" = 0 ;;
-        *) test "$(cat "$event_enable")" = 1 ;;
-    esac
-done
-printf 'trace_groups=pass buffer_kb=%s svc_xprt_accept=off\n' "$buffer_kb"
+fi
+printf 'nfs_trace=off\n'
 ''')
         print(trace_status.strip(), flush=True)
         if args.broad_knfsd:

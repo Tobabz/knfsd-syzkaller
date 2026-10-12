@@ -18,3 +18,4 @@
 0018-sys-linux-executor-send-raw-NFS-RPCs-over-plain-TCP.patch
 0019-sys-linux-executor-add-variable-length-proxy-arm.patch
 0020-sys-linux-select-versioned-NFS-lane-profiles.patch
+0021-tools-syz-nfs-corpus-recognize-profile-and-typed-NFS.patch

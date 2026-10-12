@@ -42,10 +42,15 @@ Ganesha remains a separate campaign. Seed selection is described in the
 
 The corpus covers normal NFS scenarios. [tools/flow-trace/](tools/flow-trace/README.md)
 provides kernel event collection and thread-transition analysis.
-Lane setup enables the `nfsd`, `lockd`, `sunrpc`, and `rpcgss` trace groups with
-a 1 MiB per-CPU buffer so their generated callbacks can contribute to existing
-remote KCOV sections. `sunrpc:svc_xprt_accept` stays disabled because it exposes
-a reproducible v7.3-rc6 UAF. Keep `experimental.remote_cover=true` for knfsd.
+NFS tracing is off by default. With `koov.nfs_trace=1` on the VM command line
+(add it to the generated config's `vm.cmdline`), lane setup enables the `nfsd`,
+`lockd`, `sunrpc`, and `rpcgss` trace groups with a 1 MiB per-CPU buffer so their
+generated callbacks contribute to existing remote KCOV sections;
+`sunrpc:svc_xprt_accept` stays disabled because it exposes a reproducible
+v7.3-rc6 UAF. It stays off by default because it adds tracepoint PCs to the
+coverage signal and runs tracepoint code unrelated to the fuzzed code. The opt-in
+needs an image baked with the current `boot-fixture.sh`.
+Keep `experimental.remote_cover=true` for knfsd.
 
 ## Host requirements
 

@@ -9,6 +9,7 @@ lanes=4
 minor=1
 version=
 fixture_mode=single
+trace=0
 expected_sha=
 
 for arg in $(cat /proc/cmdline); do
@@ -16,9 +17,14 @@ for arg in $(cat /proc/cmdline); do
 		koov.nfs_minor=*) minor=${arg#koov.nfs_minor=} ;;
 		koov.nfs_version=*) version=${arg#koov.nfs_version=} ;;
 		koov.nfs_fixture=*) fixture_mode=${arg#koov.nfs_fixture=} ;;
+		koov.nfs_trace=*) trace=${arg#koov.nfs_trace=} ;;
 		koov.lane_sha256=*) expected_sha=${arg#koov.lane_sha256=} ;;
 	esac
 done
+case "$trace" in
+	0|1) NFS_TRACE=$trace; export NFS_TRACE ;;
+	*) echo "koov.nfs_trace must be 0 or 1" >&2; exit 2 ;;
+esac
 case "$fixture_mode" in
 	single)
 		if [ -z "$version" ]; then

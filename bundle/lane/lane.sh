@@ -30,6 +30,12 @@
 #   NFS_VERSION       3 | 4.0 | 4.1 (default) | 4.2; single fixture only
 #   KOOV_NFSV4_LEASE_TIME
 #                     knfsd lease time (default 10 for single, 90 for broad)
+#   NFS_TRACE         0 (default) | 1.  1 enables the nfsd, lockd, sunrpc and
+#                     rpcgss trace groups so tracepoint code runs inside the
+#                     existing remote KCOV sections.  Off by default: it adds
+#                     tracepoint PCs to the coverage signal and runs tracepoint
+#                     code paths unrelated to the fuzzed code.  boot-fixture.sh
+#                     maps koov.nfs_trace=1 to this variable.
 #
 # In both mode, a listener on .1:2049 and .5:2049 sends records to knfsd
 # :20490 and Ganesha :20491 respectively.  Each of the two client namespaces
@@ -109,6 +115,11 @@ case "$nfs4_lease_time" in
 esac
 test "$nfs4_lease_time" -ge 1 || {
     echo "KOOV_NFSV4_LEASE_TIME must be positive" >&2; exit 2; }
+nfs_trace=${NFS_TRACE:-0}
+case "$nfs_trace" in
+    0|1) ;;
+    *) echo "NFS_TRACE must be 0 or 1" >&2; exit 2 ;;
+esac
 # KOOV: per-backend listen ports.  In "both" mode the relay keeps 2049 and
 # each backend listens on its own port behind it.
 knfsd_port=${KOOV_KNFS_PORT:-}
@@ -1272,6 +1283,8 @@ status_fixture()
     case "$status_mode" in single|broad-knfsd) ;; *) return 1 ;; esac
     status_version=$(cat "$root/fixture.version")
     case "$status_version" in 3|4.0|4.1|4.2) ;; *) return 1 ;; esac
+    status_trace=$(cat "$root/fixture.trace")
+    case "$status_trace" in 0|1) ;; *) return 1 ;; esac
     # ExecStartPost and ExecStop are separate systemd processes and do not
     # inherit variables exported by boot-fixture.sh.  Persisted setup state is
     # therefore authoritative for status helpers and profile alias selection.
@@ -1301,9 +1314,9 @@ status_fixture()
             status_profiles='["knfsd-v41","ganesha-v41"]'
         fi
     fi
-    printf '{"lane_count":%s,"fixture_mode":"%s","profiles":%s,"nfs_version":"%s","nfs_minor":%s,"localio":"N","lanes":[' \
+    printf '{"lane_count":%s,"fixture_mode":"%s","profiles":%s,"nfs_version":"%s","nfs_minor":%s,"nfs_trace":%s,"localio":"N","lanes":[' \
         "$status_count" "$status_mode" "$status_profiles" \
-        "$status_version" "$status_minor_json"
+        "$status_version" "$status_minor_json" "$status_trace"
     status_lane=0
     status_previous_epoch=0
     while test "$status_lane" -lt "$status_count"; do
@@ -1590,6 +1603,7 @@ setup)
     printf '%s\n' "$requested_count" > "$root/fixture.count"
     printf '%s\n' "$fixture_mode" > "$root/fixture.mode"
     printf '%s\n' "$nfs_version" > "$root/fixture.version"
+    printf '%s\n' "$nfs_trace" > "$root/fixture.trace"
     if test -e "$executor_root" || test -L "$executor_root"; then
         echo "$executor_root is already owned by another fixture" >&2
         exit 1
@@ -1607,24 +1621,27 @@ setup)
         expose_lane_to_executor "$setup_index"
         setup_index=$((setup_index + 1))
     done
-    # Enable NFS server event callbacks so existing KCOV sections can collect
-    # coverage from NFSD, NLM, SUNRPC, and RPCSEC_GSS tracepoint call sites.
-    tracefs=/sys/kernel/tracing
-    mkdir -p "$tracefs"
-    if ! mountpoint -q "$tracefs"; then
-        mount -t tracefs nodev "$tracefs"
+    # Opt-in (NFS_TRACE=1): enable NFS server event callbacks so existing KCOV
+    # sections can collect coverage from NFSD, NLM, SUNRPC, and RPCSEC_GSS
+    # tracepoint call sites.  Off by default; see NFS_TRACE in the header.
+    if [ "$nfs_trace" = 1 ]; then
+        tracefs=/sys/kernel/tracing
+        mkdir -p "$tracefs"
+        if ! mountpoint -q "$tracefs"; then
+            mount -t tracefs nodev "$tracefs"
+        fi
+        printf '0\n' > "$tracefs/tracing_on"
+        printf '1024\n' > "$tracefs/buffer_size_kb"
+        for trace_group in nfsd lockd sunrpc rpcgss; do
+            printf '1\n' > "$tracefs/events/$trace_group/enable"
+        done
+        # v7.3-rc6 can drop the accepted transport's last reference in
+        # svc_add_new_temp_xprt() before trace_svc_xprt_accept() dereferences
+        # it.  Keep the rest of sunrpc enabled without turning every TCP accept
+        # into a reproducible KASAN use-after-free.
+        printf '0\n' > "$tracefs/events/sunrpc/svc_xprt_accept/enable"
+        printf '1\n' > "$tracefs/tracing_on"
     fi
-    printf '0\n' > "$tracefs/tracing_on"
-    printf '1024\n' > "$tracefs/buffer_size_kb"
-    for trace_group in nfsd lockd sunrpc rpcgss; do
-        printf '1\n' > "$tracefs/events/$trace_group/enable"
-    done
-    # v7.3-rc6 can drop the accepted transport's last reference in
-    # svc_add_new_temp_xprt() before trace_svc_xprt_accept() dereferences it.
-    # Keep the rest of sunrpc enabled without turning every TCP accept into a
-    # reproducible KASAN use-after-free.
-    printf '0\n' > "$tracefs/events/sunrpc/svc_xprt_accept/enable"
-    printf '1\n' > "$tracefs/tracing_on"
     printf '1\n' > "$executor_root/enabled"
     status_fixture
     trap - EXIT

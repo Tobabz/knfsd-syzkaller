@@ -9,7 +9,7 @@
 
 목표는 `fs/nfsd/trace.c`에서 생성되는 tracepoint 코드의 실제 PC를 KCOV로 수집하는 것이다.
 기존 KASAN 게스트의 정상 NFS 입력에서 이벤트 활성화만으로 대상 PC가 수집됨을 확인했다.
-`bundle/lane/lane.sh`의 setup이 tracefs를 준비하고 NFSD 이벤트와 `tracing_on`을 활성화하며, bootstrap이 부팅 상태를 확인한다.
+`bundle/lane/lane.sh`의 setup은 `NFS_TRACE=1`(VM 커널 인자 `koov.nfs_trace=1`)일 때만 tracefs를 준비하고 이벤트를 활성화한다. 기본값은 꺼짐이며 bootstrap은 기본값에서 이벤트가 꺼져 있음을 확인한다(2026-10-12 변경, VM 검증 대기).
 
 실측 조건과 원시 증거는 [수동 활성화 비교](../../../report/validation-history.md#nfsd-tracec-kcov-activation-2026-10-10)와
 [자동 활성화 결과](../../../report/validation-history.md#nfsd-tracec-automatic-activation-2026-10-10)에 기록한다.
@@ -126,8 +126,8 @@ tracepoint 활성화에 따른 처리량·버퍼 사용량과 커버리지의 �
 
 ### 변경 범위
 
-- 적용: `bundle/lane/lane.sh`의 setup에서 NFSD 이벤트를 활성화한다. tracefs 준비나 활성화에 실패하면 setup이 실패한다.
-- 부팅 검사: `tools/bootstrap-kcov-env.py`의 `stage_verify_variant`가 NFSD 이벤트와 `tracing_on`의 활성 상태를 확인한다.
+- 적용: `NFS_TRACE=1`일 때 `bundle/lane/lane.sh`의 setup에서 NFSD 이벤트를 활성화한다. tracefs 준비나 활성화에 실패하면 setup이 실패한다. 기본값은 꺼짐이다.
+- 부팅 검사: `tools/bootstrap-kcov-env.py`의 `stage_verify_variant`는 기본값(꺼짐)에서 trace group이 모두 꺼져 있음을 확인한다.
 - 배포: 호스트 주입 lane 스크립트를 사용하므로 이미지 재생성은 필요 없다. 기존 manager 설정은 `prepare-live-lane-config.py`로 새 스크립트를 고정해야 한다.
 - 조사·측정: 필요한 경우 기존 정상 입력과 `syz-execprog`의 원시 PC 출력을 사용한다.
 - 빌드 설정: `fs/nfsd/Makefile`과 KCOV 설정은 누락 원인이 확인된 경우에만 변경한다.
@@ -203,7 +203,7 @@ PC 수집 성공은 `trace.c`에서 생성된 해당 코드의 실행 근거이�
 
 ## Agent 사용 지침
 
-기본 활성화는 lane setup에서 제공한다. 추가 범위를 다룰 때 `trace.c`의 생성 코드와 수집 문맥을 조사하며, 확인된 누락 없이 계측 패치를 추가하지 않는다.
+활성화는 lane setup의 opt-in(`koov.nfs_trace=1`)으로 제공하며 기본값은 꺼짐이다. 켜면 tracepoint PC가 coverage 신호에 섞이고 후보와 무관한 tracepoint 결함(예: `svc_xprt_accept` UAF)이 Q2 신호에 섞일 수 있기 때문이다. 추가 범위를 다룰 때 `trace.c`의 생성 코드와 수집 문맥을 조사하며, 확인된 누락 없이 계측 패치를 추가하지 않는다.
 seed·Mutation Engine의 동작 변경과 새로운 취약점 시나리오 작성은 이 계획에 포함하지 않는다.
 
 ## 참조
