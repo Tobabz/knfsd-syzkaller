@@ -71,6 +71,7 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_walk:$TEST/test_walk.c:$SRC/walk.c\
        test_delta:$TEST/test_delta.c:$SRC/delta.c\
        test_edit:$TEST/test_edit.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
+       test_golden:$TEST/test_golden.c:$SRC/delta.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
 
