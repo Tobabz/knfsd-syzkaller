@@ -245,6 +245,7 @@ fatal sanitizer report로 VM이 죽은 generation은 FINISH 전에 끝나 remote
 해석은 다음 세 표를 따른다(issue #4).
 
 **baseline-with-rules gate.** fuzz campaign 전에 Stage 1 시나리오를 rule set을 설치한 상태로 실행한다.
+같은 조건의 neutral program도 실행한다(아래 ambient control).
 반복 횟수는 job policy가 정한다.
 
 | Q1 (target mode/rules) | rule별 M1 | 경로 |
@@ -256,6 +257,22 @@ fatal sanitizer report로 VM이 죽은 generation은 FINISH 전에 끝나 remote
 | REACHED | 그 밖 | fuzz campaign 시작 |
 
 표는 위에서부터 처음 맞는 행을 적용한다.
+
+**ambient control (issue #10).** Stage 1과 gate는 같은 harness identity, fixture mode, NFS version,
+route/topology, lease 설정, trace mode에서 scenario NFS operation이 없는 neutral program도 실행한다(`06` §11).
+gate의 neutral run에도 rule set을 설치한다. 결과는 oracle이 아니며 위 표의 경로와 Q1/M1/Q2 판정을
+바꾸지 않는다.
+
+- neutral run에서 target이 관측되면 `q1_preservation_unverifiable`을 기록한다. Q1만으로는 scenario
+  퇴행과 ambient hit를 구분할 수 없으므로 scenario 도달성이 유지됐다고 주장하지 않는다. 이것만으로 Q1을
+  `INCONCLUSIVE`로 바꾸거나 campaign을 막지 않는다.
+- gate의 neutral run에서 `APPLIED`인 rule은 `ambient_applied`로 기록한다. M1 판정은 바뀌지 않는다.
+- 관측되지 않음은 그 control window에서 보지 못했다는 뜻일 뿐이다. scenario가 Q1이나 M1을 일으켰다는
+  증명이 아니다.
+- 두 flag는 인과 해석만 한정한다. scenario traffic을 주장하는 hypothesis에는 그 traffic을 구분하는 typed
+  selector/predicate나 matched-control evidence가 필요하다. background traffic을 의도한 strategy에서는
+  `ambient_applied` rule도 hypothesis에 남을 수 있다. campaign 경로는 issue #5의 typed hypothesis
+  semantics가 정한다.
 
 **FINISH를 마친 fuzz generation** (rule별)
 
@@ -413,7 +430,8 @@ Stage2Input
 ```
 
 따라서 Stage 2 repair가 Stage 1의 도달성을 우연히 깨뜨리는 것을 검출할 수 있어야 한다.
-이 검출은 fuzz campaign 전에 실행하는 baseline-with-rules gate(§3)가 맡는다.
+이 검출은 fuzz campaign 전에 실행하는 baseline-with-rules gate(§3)가 맡는다. target이 ambient
+control에서도 관측되면 이 검출은 불가능하며 gate는 `q1_preservation_unverifiable`을 기록한다.
 
 ### 5.2 Agent SDK 책임
 
@@ -517,7 +535,8 @@ crash 뒤 `EXPOSURE_INTENT`가 없다는 사실만으로 `NOT_APPLIED`를 추론
 여러 rule을 묶는 group 판정은 issue #5의 typed vocabulary가 정해진 뒤 추가한다.
 
 `APPLIED`는 그 generation에서 matching record가 변조됐다는 뜻이다. 그 record가 시나리오가 만든
-traffic인지 ambient traffic인지는 구분하지 않는다(issue #10).
+traffic인지 ambient traffic인지는 구분하지 않는다(issue #10). neutral run에서도 적용되는지는 gate가
+`ambient_applied`로 따로 기록한다(§3).
 
 ### 7.2 delivery는 별도 차원이다
 
@@ -640,6 +659,8 @@ CrashEvidence
     dmesg / stack trace
     crash signature
     candidate association triage metadata?   # oracle 아님
+    ambient control flags                    # target_ambient_observed, ambient_applied[],
+                                             # q1_preservation_unverifiable (§3)
     replay result
 ```
 

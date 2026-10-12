@@ -109,6 +109,11 @@ ReachabilityEvidence
         observed
         observed_locations[]
 
+    ambient_control                # non-oracle evidence (§11, issue #10)
+        control_evidence_ref       # neutral run의 봉인 evidence
+        control_window
+        target_ambient_observed    # true | false
+
     runtime_errors[]
 ~~~
 
@@ -368,6 +373,33 @@ Q1은 특정 syscall/RPC가 target의 직접 원인이었다는 causal claim을 
 원인 구분이 후속 분석에 필요하면 matched control이나 추가 diagnostic을 사용할 수 있지만,
 그 결과를 Q1 reached/not_reached 조건으로 사용하지 않는다.
 
+### ambient control
+
+Q1 정의는 그대로 두고, Stage 2로 넘길 harness는 matched neutral control을 함께 실행한다(issue #10).
+
+~~~text
+neutral program
+    lane만 열고 scenario NFS operation은 실행하지 않는다
+
+같게 맞추는 조건
+    execution / harness identity, fixture mode, NFS version, route / topology,
+    lease 설정, trace mode, 비교 가능한 관측 window
+~~~
+
+결과는 비대칭으로 해석한다.
+
+~~~text
+target_ambient_observed = true
+    scenario 없이도 target이 실행될 수 있다.
+    Q1 REACHED를 scenario 경로가 유지됐다는 근거로 쓰지 않는다.
+
+target_ambient_observed = false
+    이 control window에서 관측되지 않았다는 뜻일 뿐이다.
+    ambient 실행이 불가능하다거나 scenario가 Q1을 일으켰다는 증명이 아니다.
+~~~
+
+ambient control은 oracle이 아니며 Q1, M1, Q2를 바꾸지 않는다. Stage 2에서의 해석은 01 §3이 정한다.
+
 ## 12. Stage 2 handoff
 
 Stage 2로 넘길 수 있는 것은 `Q1Result.status == reached`인 경우뿐이다.
@@ -383,7 +415,8 @@ Q1Result(REACHED)
 Stage 2 Mutation Strategy
 ~~~
 
-Stage 2는 이 reachability baseline을 유지해야 한다.
+Stage 2는 이 reachability baseline을 유지해야 한다. `target_ambient_observed`이면 baseline 유지 여부를
+Q1만으로 확인할 수 없다(01 §3).
 
 ## 13. repair routing
 

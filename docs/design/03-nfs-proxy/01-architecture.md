@@ -713,7 +713,8 @@ legacy NFSPARM arm과 target mode는 한 lane에서 동시에 활성화되지 �
 동안 Proxy가 legacy arm 등록을 거부하는 것이 최종 경계이고, manager의 call filtering은 추가 방어선이다.
 
 Proxy가 backend/client를 임의 선택하지 않는다.
-Traffic scope는 Stage 1에서 선택한 route에 맞춰 Controller/Runner가 bind한다.
+Traffic scope는 Stage 1에서 선택한 route에 맞춰 Controller/Runner가 bind한다. Stage 1 harness도 같은
+proxied route/topology에서 실행한다(`../02-llm-agent/05-reachability-plan.md` §12, issue #10).
 
 ### 17. Q1 / M1 / Q2 경계
 

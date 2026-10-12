@@ -266,7 +266,10 @@ Capability Specification을 갱신하고 이 candidate를 재시도한다.
 ReachabilityHarness
     candidate_id
     nfs_version
+    fixture mode                    # single | broad-knfsd
+    route / topology identity       # Stage 2가 변조할 proxied route
     syz_program / selected seed
+    neutral control program         # ambient control (06 §11)
     fixture actions
     manager/runtime configuration
     required capability IDs
@@ -274,6 +277,10 @@ ReachabilityHarness
 ```
 
 이는 repository patch가 아니라 job-local runtime input이다.
+
+Stage 2로 넘길 harness는 Stage 2가 변조할 proxied route/topology에서 실행한다(issue #10). 현재 구체
+값은 `SERVER_IMPL=both`이지만 계약은 기록된 route/topology identity다. identity 체계는 issue #13에서
+정한다.
 
 ## 13. 실패 분류
 

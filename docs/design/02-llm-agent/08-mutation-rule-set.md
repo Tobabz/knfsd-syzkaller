@@ -51,7 +51,8 @@ STAGE 2 — MUTATION / CRASH TRIGGER
 MutationEvidence / CrashEvidence
 ```
 
-Stage 2는 Q1이 증명된 Stage 1 scenario를 baseline으로 사용한다.
+Stage 2는 Q1이 증명된 Stage 1 scenario를 baseline으로 사용한다. target이 ambient control에서도
+관측되면 이 baseline은 scenario 경로의 보존을 증명하지 못한다(`01` §3, issue #10).
 
 ## 3. Mutation Strategy가 읽는 것
 
@@ -408,7 +409,16 @@ baseline-with-rules gate
     |
     +-- Q1이 여전히 REACHED인가?     (gate pass/fail)
     +-- rule별 M1은 무엇인가?         (routing 입력)
+
+neutral program (같은 harness identity, scenario NFS operation 없음)
+        + 설치된 rule set
+        + target mode activation
+    |
+    +-- target이 관측되는가?          (q1_preservation_unverifiable)
+    +-- rule별로 APPLIED인가?         (ambient_applied)
 ```
+
+neutral run 결과는 gate 경로를 바꾸지 않고 인과 해석만 한정한다(`01` §3, issue #10).
 
 반복 횟수는 job policy가 정한다. gate의 Q1이 `NOT_REACHED`이면 gate 실패로 기록하고 target mode,
 rule, runtime 중 어디서 도달성이 퇴행했는지 진단한다. rule이 도달성을 깨뜨렸다고 바로 단정하지
