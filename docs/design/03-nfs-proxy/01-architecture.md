@@ -903,7 +903,7 @@ applied mutation
     -> durable MutationDelta
 
 replay
-    -> same semantic resolver + mutation engine path
+    -> same semantic resolver + Edit Applier path
 ```
 
 Negative oracle도 필요하다.
@@ -1005,7 +1005,7 @@ semantic decoder/schema
 Transaction Context
 semantic rule ABI
 resolver
-concrete mutation engine mapping
+concrete Edit Applier mapping
 MutationDelta / replay
 Harness Capability Specification
 tests / guest validation
