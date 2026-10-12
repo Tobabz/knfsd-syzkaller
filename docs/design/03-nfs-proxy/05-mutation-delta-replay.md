@@ -1,0 +1,1298 @@
+# NFS Proxy MutationDelta / Replay Contract
+
+> 상태: draft · 최종 확인: 2026-10-12
+> 기준: kernel v7.3-rc5 / syzkaller 801f0966669a37e048adabf9e5f38ce52825ea82
+> 상위 설계: `01-architecture.md`
+> 선행 계약: `02-semantic-decoder.md`, `03-transaction-context.md`,
+> `04-semantic-mutation-runtime.md`
+> 관련 구현: `tools/nfs-proxy/src/delta.c`, `delta.h`, `edit.c`,
+> `control.c`
+> 관련 게이트: Stage 2 M1 evidence / crash reproduction
+
+## 요약
+
+MutationDelta는 Stage 2에서 실제 사용한 `CompiledMutationRule` set과 생산 실행의
+concrete mutation evidence를 durable하게 함께 보존하는 semantic replay artifact다.
+Replay는 생산 당시 byte offset/original bytes를 그대로 다시 패치하지 않고,
+recorded semantic rule을 동일 Decoder/Transaction Context/Resolver/Mutation Engine
+경로에서 live traffic에 다시 resolve한다. 생산 당시 concrete bytes는 증거로 남지만
+dynamic field의 replay identity가 아니다.
+
+## 해결하려는 문제
+
+Current `NFSPDLT1/2`는 concrete byte rule을 reproduction unit으로 사용한다.
+
+```text
+recorded rule
+    direction / route / first opcode / anchor
+    byte offset
+    exact original bytes
+    exact replacement bytes
+    applied_count
+```
+
+Replay는 production original bytes와 현재 bytes가 다르면 hard failure다.
+이 invariant는 fixed/static field replay에는 강하지만 target semantic runtime의
+dynamic state에는 그대로 적용할 수 없다.
+
+```text
+production:
+    OPEN result stateid = A
+    transform = zero_value
+
+replay:
+    OPEN result stateid = B
+```
+
+`A != B`여도 같은 semantic OPEN result이고 같은 rule/predicate가 성립하면
+`B -> zero_value`가 target semantic replay다.
+
+반대로 replay가 다른 field나 다른 request context를 mutation하면 안 된다.
+
+따라서 target artifact는 다음 둘을 분리한다.
+
+```text
+semantic replay contract
+    exact CompiledMutationRule snapshot
+    schema/runtime semantics
+
+production evidence
+    actual target/value/bytes/edit/output observed
+```
+
+Replay-time original bytes는 live record에서 다시 resolve하고 apply 직전에 다시
+verify한다. Production original bytes는 evidence이지 default replay selector가 아니다.
+
+## 구조
+
+```text
+  +---------------- production execution ----------------+
+  |  CompiledMutationRule[]                              |
+  |        | durable rule-set snapshot                   |
+  |        v                                             |
+  |  [Delta Recorder]                                    |
+  |        |                                             |
+  |  live record -> Resolver -> Mutation Engine          |
+  |                         | built mutated batch         |
+  |                         v                            |
+  |                  EXPOSURE_INTENT (D)                 |
+  |                         | durable before exposure    |
+  |                         v                            |
+  |                      relay                           |
+  |                         | full write?                |
+  |                         v                            |
+  |                  FORWARD_COMPLETE                    |
+  +-------------------------|-----------------------------+
+                            |
+                            v
+                     MutationDelta
+                            |
+                            v
+  +------------------- replay execution -----------------+
+  |  same CompiledMutationRule[]                         |
+  |        |                                             |
+  |  Decoder -> Transaction Context -> Resolver          |
+  |        -> Mutation Engine -> replay batch log        |
+  |                                      |               |
+  |                                      v               |
+  |                                ReplayResult          |
+  +------------------------------------------------------+
+```
+
+`(D)`=crash-survival durability point.
+원본 MutationDelta는 replay 중 수정하지 않는다.
+
+## 설계
+
+### 1. 요소 분류와 소유권
+
+```text
+[DATA] MutationDelta
+    Produced by:   Delta Recorder
+    Consumed by:   Replay / Crash Report / M1 evidence
+    Scope:         one Stage 2 semantic rule-set execution
+
+[COMPONENT] Delta Recorder
+    Runs at:       Proxy runtime
+    Input:         CompiledMutationRule[] + applied mutation batches
+    Output:        append-only durable MutationDelta
+
+[COMPONENT] Replay
+    Runs at:       Runner + Proxy runtime
+    Input:         MutationDelta + matching ProtocolSchema + scenario
+    Output:        ReplayResult
+
+[DATA] ReplayResult
+    Produced by:   Replay
+    Meaning:       replay-time semantic application/delivery comparison
+```
+
+Delta Recorder는 crash/sanitizer verdict를 만들지 않는다.
+ReplayResult도 Q2 crash reproduction verdict 자체가 아니다.
+
+### 2. Delta scope
+
+MutationDelta의 logical scope는 **한 semantic rule set의 한 Stage 2 execution**이다.
+
+Current `arm-N.delta`처럼 rule 하나당 독립 reproduction file을 target 기본 단위로
+사용하지 않는다.
+
+이유:
+
+```text
+same record
+    -> rule A
+    -> rule B
+    -> shared conflict/structure preflight
+    -> one final rebuild
+```
+
+Rule별 artifact로 분리하면 production에서 같은 pre-mutation snapshot에 함께
+resolve된 batch 관계를 잃는다.
+
+물리적으로 journal을 여러 file/segment로 나눌지는 implementation detail이다.
+Logical artifact는 하나의 rule set과 application journal이다.
+
+### 3. MutationDelta
+
+```text
+MutationDelta
+    format_version
+    semantic_runtime_version
+    candidate_id
+    schema_id
+
+    rule_set[]
+        CompiledMutationRule
+
+    journal[]
+        JournalEvent
+```
+
+`format_version`은 file/serialization contract를 식별한다.
+
+`semantic_runtime_version`은 selector/predicate/transform evaluation semantics를
+식별한다. Builtin transform의 versioned `transform_id`도 rule snapshot에 포함된다.
+
+`schema_id`는 production Decoder/Compiler가 사용한 exact ProtocolSchema contract다.
+
+### 4. replay source는 CompiledMutationRule snapshot
+
+Replay는 MutationRuleSet을 다시 Agent에게 보내거나 Compiler를 다시 실행하지 않는다.
+
+```text
+production CompiledMutationRule[]
+        |
+        v
+durable exact normalized snapshot
+        |
+        v
+Replay
+```
+
+이유:
+- Agent reasoning은 replay dependency가 아니다.
+- Compiler가 이후 변경돼도 recorded rule semantics가 바뀌면 안 된다.
+- replay가 current Compiler normalization 차이에 영향받으면 안 된다.
+
+Runtime이 recorded semantic runtime version/transform ID를 지원하지 못하면
+silent migration 대신 explicit incompatibility로 실패한다.
+
+### 5. ProtocolSchema dependency
+
+MutationDelta가 entire ProtocolSchema bytes를 반드시 inline해야 하는 것은 아니다.
+
+대신:
+
+```text
+MutationDelta.schema_id
+    ->
+exact matching ProtocolSchema artifact
+```
+
+가 replay input으로 존재해야 한다.
+
+Matching schema artifact를 확보할 수 없으면 replay는 `schema_unavailable`이다.
+다른 schema로 best-effort remap하지 않는다.
+
+Crash Report/reproduction package가 필요하면 schema artifact를 함께 bundle할 수 있다.
+그 packaging contract는 이 문서의 scope가 아니다.
+
+### 6. JournalEvent
+
+Target journal은 append-only event stream이다.
+
+```text
+JournalEvent
+    event_seq
+    event_type
+    payload
+```
+
+Core event:
+
+```text
+RULESET
+EXPOSURE_INTENT
+FORWARD_COMPLETE
+FORWARD_FAILED
+RUN_COMPLETE
+```
+
+`event_seq`는 journal integrity/order용 local sequence다.
+Semantic replay selector나 mutation identity가 아니다.
+
+### 7. RULESET event
+
+`RULESET`은 traffic mutation이 시작되기 전에 durable해야 한다.
+
+```text
+RULESET
+    semantic_runtime_version
+    schema_id
+    candidate_id
+    CompiledMutationRule[]
+```
+
+Runner/Proxy는 RULESET durability가 확인되기 전에 Stage 2 traffic mutation을 시작하지
+않는다.
+
+Rule registration ACK가 존재한다면 target architecture에서는 최소한 해당 semantic
+rule set이 memory에 유효하게 등록되고 RULESET이 durable하다는 의미까지만 가진다.
+ACK 자체는 M1이 아니다.
+
+### 8. mutation durability unit은 batch
+
+한 complete RPC record에 여러 semantic rule/occurrence가 함께 적용될 수 있다.
+
+따라서 durability unit도 record-level mutation batch다.
+
+```text
+MutationBatch
+    batch_id
+    semantic_signature
+    record_context
+    applications[]
+    concrete_output
+```
+
+`batch_id`는 journal event correlation용 local identifier다.
+Replay selector가 아니며 다음 run에서 동일할 필요가 없다.
+
+### 9. batch semantic signature
+
+Replay equivalence를 stream ordinal 없이 비교하기 위해 각 successful mutation batch에
+semantic signature를 만든다.
+
+```text
+semantic_signature
+    canonical multiset of:
+        rule_id
+        target.semantic_path
+        target.part
+        mutation.kind
+```
+
+같은 rule/path가 한 record에서 여러 번 적용되면 multiplicity를 보존한다.
+
+예:
+
+```text
+record A:
+    rule-open-stateid x 2
+    rule-status       x 1
+```
+
+Signature는 record를 찾는 selector가 아니다.
+Production과 replay가 같은 semantic batch composition을 만들었는지 사후 비교하는
+witness다.
+
+### 10. EXPOSURE_INTENT
+
+Mutation Engine이 original precondition을 검증하고 final mutated record를 성공적으로
+구성한 뒤, 그 bytes를 relay에 노출하기 **전에** 다음 event를 durable하게 기록한다.
+
+```text
+EXPOSURE_INTENT
+    batch_id
+    semantic_signature
+
+    record_context
+        direction
+        backend
+        client
+        rpc message type/program/version/procedure?
+        nfs version/minor?
+
+    applications[]
+        rule_id
+        semantic_target
+        predicate_values[]
+        transform_source_values[]
+        original_value_snapshot
+        mutated_value_snapshot
+        concrete_edits[]
+
+    output
+        final_record_length
+        concrete_output_snapshot?
+```
+
+Concrete output snapshot 전체를 inline할지 concrete edits + final length로 충분한지는
+serialization 설계에서 결정한다.
+
+하지만 최소한 production에서 실제로 어떤 semantic value와 bytes가 바뀌었는지
+사후 검증할 수 있어야 한다.
+
+### 11. 왜 exposure 전에 durable하게 쓰는가
+
+Crash를 만든 마지막 mutation은 crash 직후 user-space가 더 이상 journal을 갱신할
+기회를 얻지 못할 수 있다.
+
+따라서 invariant는:
+
+```text
+unrecorded mutated output
+    must never be exposed to peer
+```
+
+이다.
+
+Delta durability가 실패하면 mutated output을 relay에 넘기지 않는다.
+
+### 12. production concrete snapshot의 의미
+
+EXPOSURE_INTENT에 저장한 다음 값은 production evidence다.
+
+```text
+original_value_snapshot
+mutated_value_snapshot
+concrete original bytes
+concrete replacement/insert bytes
+live WireRef-derived coordinates
+```
+
+이 값은 다음 질문에 답한다.
+
+> production에서 실제 무엇을 바꿨는가?
+
+하지만 default replay selector가 아니다.
+
+### 13. semantic replay precondition
+
+Replay precondition은 production concrete original equality가 아니라 recorded
+`CompiledMutationRule`의 semantic contract다.
+
+```text
+same schema_id
+same semantic selector
+same typed predicates
+same context dependencies
+same transform semantics
+same structure policy
+```
+
+Replay-time Resolver는 현재 live value/bytes를 새로 snapshot한다.
+
+```text
+production original = A
+replay original     = B
+
+if same semantic rule matches:
+    resolve B
+    transform B
+    verify B before apply
+```
+
+### 14. exact original equality가 필요한 경우
+
+Replay가 특정 semantic original value를 반드시 요구한다면 그 요구는 production
+snapshot 암묵 비교가 아니라 rule predicate로 표현한다.
+
+예:
+
+```text
+predicate:
+    target == NFS4_OK
+```
+
+또는:
+
+```text
+predicate:
+    current_message.some_field == literal
+```
+
+이렇게 하면 production/replay 모두 같은 typed condition을 검증한다.
+
+Production concrete byte snapshot 자체를 replay predicate로 승격하지 않는다.
+
+### 15. replay-time verify-before-apply
+
+Production original bytes를 요구하지 않는다는 것이 verify-before-apply를 없애는 것은
+아니다.
+
+Replay-time flow:
+
+```text
+live replay record
+    |
+    v
+Semantic Resolver
+    |
+    +--> replay current value
+    +--> replay current original bytes
+    |
+    v
+ResolvedMutation
+    |
+    v
+Mutation Engine
+    |
+    +--> verify replay-current original bytes
+    +--> apply
+```
+
+즉 TOCTOU/wrong-buffer 방지를 위한 concrete verification은 **매 실행마다 새로 resolve한
+bytes**를 기준으로 유지한다.
+
+### 16. forward lifecycle
+
+EXPOSURE_INTENT가 durable해진 뒤에만 mutated record를 relay에 넘긴다.
+
+Relay는 batch와 연결된 local token을 받아 full record write 결과를 Delta Recorder에
+돌려줄 수 있어야 한다.
+
+```text
+EXPOSURE_INTENT durable
+        |
+        v
+relay accepts mutated record
+        |
+        +--> full record written
+        |        |
+        |        v
+        |   FORWARD_COMPLETE
+        |
+        +--> known failure
+                 |
+                 v
+            FORWARD_FAILED
+```
+
+Current `on_record` callback은 output buffer만 반환하고 downstream full-write completion을
+Delta Recorder에 통지하지 않는다. Target contract를 구현하려면 relay completion hook이
+필요하다.
+
+### 17. FORWARD_COMPLETE
+
+```text
+FORWARD_COMPLETE
+    batch_id
+    forwarded_length
+```
+
+Destination socket에 complete RPC record가 local relay 관점에서 전부 write된 뒤에만
+append한다.
+
+`FORWARD_COMPLETE`는 remote kernel이 그 record를 처리했다는 증거는 아니다.
+그것은 local Proxy가 complete bytes를 peer socket으로 넘겼다는 evidence다.
+
+### 18. FORWARD_FAILED
+
+Known local failure는 다음처럼 기록할 수 있다.
+
+```text
+FORWARD_FAILED
+    batch_id
+    reason
+    bytes_written?
+```
+
+Partial socket write 뒤 fatal error가 난 경우도 success로 올리지 않는다.
+
+### 19. socket delivery와 disk commit의 atomicity 한계
+
+File append와 socket write를 하나의 atomic transaction으로 묶을 수 없다.
+
+따라서 다음 crash window는 제거할 수 없고 **명시적으로 표현해야 한다**.
+
+```text
+EXPOSURE_INTENT durable
+        |
+        v
+socket write may start / may complete
+        |
+       CRASH
+        |
+        v
+no FORWARD_COMPLETE event
+```
+
+이 상태의 delivery verdict:
+
+```text
+delivery_unknown
+```
+
+이다.
+
+다음을 주장하지 않는다.
+
+```text
+no FORWARD_COMPLETE
+    == definitely not delivered
+```
+
+또한 write completion 후 FORWARD_COMPLETE event가 durable해지기 직전에 crash할 수 있다.
+이 경우 peer가 bytes를 받았어도 local journal에서는 delivery_unknown으로 남는다.
+
+### 20. crash-cut state
+
+Journal에서 batch state를 다음처럼 재구성한다.
+
+```text
+no EXPOSURE_INTENT
+    -> no recorded mutation exposure
+
+EXPOSURE_INTENT only
+    -> mutation built and durable
+    -> peer delivery unknown
+
+EXPOSURE_INTENT + FORWARD_COMPLETE
+    -> local full-write confirmed
+
+EXPOSURE_INTENT + FORWARD_FAILED
+    -> local forwarding failure known
+```
+
+이 distinction을 in-place counter 하나로 압축하지 않는다.
+
+### 21. RUN_COMPLETE
+
+Clean execution end에서는 optional `RUN_COMPLETE` event를 append할 수 있다.
+
+```text
+RUN_COMPLETE
+    rule summaries[]
+    batch count
+    forward complete count
+    forward failed count
+```
+
+Crash reproduction correctness가 RUN_COMPLETE 존재에 의존하면 안 된다.
+Crash가 목적일 수 있으므로 journal prefix만으로 의미를 복구할 수 있어야 한다.
+
+### 22. append-only durability contract
+
+Target MutationDelta는 production application state를 in-place update하지 않는다.
+
+```text
+append RULESET
+append EXPOSURE_INTENT
+append FORWARD_COMPLETE
+...
+```
+
+각 event는 다음 조건을 가져야 한다.
+
+```text
+framed length
+event type/version
+monotonic event_seq
+bounded payload
+integrity check
+synchronous durability before success return
+```
+
+Exact binary framing/checksum algorithm은 implementation design에서 정한다.
+
+### 23. file creation durability
+
+Mutation traffic를 시작하기 전에:
+
+- delta header/rule-set file content가 durable해야 한다.
+- 새 file path가 crash 후 사라지지 않도록 필요한 filesystem metadata durability도
+  확보해야 한다.
+
+구체적으로 `O_SYNC`, `fdatasync/fsync`, parent-directory fsync 중 어떤 조합을
+사용할지는 platform implementation에서 정한다.
+
+Contract는:
+
+```text
+RULESET acknowledged durable
+    before
+first mutation exposure
+```
+
+를 요구한다.
+
+### 24. torn tail
+
+Crash 중 마지막 append가 완성되지 않을 수 있다.
+
+Reader는 event framing/integrity를 사용해:
+
+```text
+complete valid prefix
+    + incomplete final tail
+```
+
+을 구분해야 한다.
+
+Incomplete final event는 committed event로 취급하지 않는다.
+
+반면 middle-of-journal corruption이나 sequence/integrity violation은 artifact
+corruption이다.
+
+Silent skipping 후 replay를 계속하지 않는다.
+
+### 25. Replay 입력
+
+Replay에 필요한 logical input:
+
+```text
+MutationDelta
+matching ProtocolSchema(schema_id)
+compatible semantic runtime
+same Stage 2 scenario/harness inputs
+```
+
+MutationDelta 자체가 network scenario 전체를 포함한다고 가정하지 않는다.
+
+Scenario/harness reproduction package는 Controller/Runner/Crash Report lineage가
+제공한다.
+
+### 26. Replay는 Agent/Compiler를 다시 호출하지 않는다
+
+```text
+MutationDelta.rule_set[]
+        |
+        v
+validate semantic runtime version
+validate schema_id
+        |
+        v
+register recorded CompiledMutationRule[]
+```
+
+Agent가 새로운 reasoning을 하거나 current Compiler가 rule을 재-normalize하면
+replay 의미가 drift할 수 있으므로 금지한다.
+
+### 27. Replay pipeline
+
+Replay도 production과 동일 semantic execution path를 사용한다.
+
+```text
+live replay traffic
+        |
+        v
+Record Framer
+        |
+        v
+RPC Decoder
+        |
+        v
+Transaction Context
+        |
+        v
+NFS Semantic Decoder
+        |
+        v
+Semantic Rule Resolver
+        |
+        v
+Conflict / Structure Preflight
+        |
+        v
+Mutation Engine
+```
+
+별도 ad-hoc replay byte patcher를 만들지 않는다.
+
+### 28. ReplayResult
+
+```text
+ReplayResult
+    semantic_verdict
+    delivery_evidence
+
+    production
+        batch_signature_multiset
+        forward_complete_multiset
+
+    replay
+        batch_signature_multiset
+        forward_complete_multiset
+
+    differences[]
+    runtime_errors[]
+```
+
+ReplayResult는 production MutationDelta를 수정하지 않는 별도 execution result다.
+
+### 29. semantic replay verdict
+
+Semantic replay는 successful exposure-intent batch semantics를 stream position 없이 비교한다.
+
+```text
+REPLAY_EQUIVALENT
+REPLAY_DIVERGED
+REPLAY_INVALID
+```
+
+`REPLAY_EQUIVALENT`는 delta/runtime/schema가 compatible하고 production/replay의
+`EXPOSURE_INTENT` semantic batch signature multiset이 동일하며 hard semantic/apply
+refusal이 없음을 뜻한다.
+
+`REPLAY_DIVERGED`는 실행은 valid하지만 missing/extra batch, batch composition 또는
+cardinality가 production과 다름을 뜻한다.
+
+`REPLAY_INVALID`는 delta corruption, schema/runtime incompatibility, unsupported
+transform, invalid fixture/resource failure 등으로 의미 있는 비교 자체가 불가능한 경우다.
+
+이 verdict는 Q2 crash reproduced/not reproduced와 별개다.
+
+### 30. cardinality contract
+
+Target rule mode가 `all_matches`이므로 replay에서 extra/missing successful mutation은
+scenario drift다.
+
+Rule별 count만 비교하지 않고 record-level semantic batch signature의 multiset을 비교한다.
+
+```text
+production:
+    batch [A, B]
+    batch [A]
+
+replay:
+    batch [A]
+    batch [A, B]
+
+    -> equivalent
+```
+
+반면:
+
+```text
+production:
+    batch [A, B]
+
+replay:
+    batch [A]
+    batch [B]
+
+    -> diverged
+```
+
+Rule counts가 같아도 같은 RPC record에서 함께 적용됐는지가 다르기 때문이다.
+
+### 31. production ordering은 replay identity가 아님
+
+Journal event order는 crash evidence chronology에는 필요하지만 replay target selector는
+아니다. Production first/second mutated record를 replay의 first/second record로 찾지 않는다.
+
+Batch signature multiset은 사후 equivalence 비교에만 사용한다.
+
+### 32. dynamic semantic values
+
+다음 값은 run 사이에 달라질 수 있다.
+
+```text
+XID
+clientid
+sessionid
+stateid
+slot sequence
+filehandle
+verifier
+```
+
+Production/replay snapshot bytes가 달라도 same recorded rule, schema, target path,
+predicate, request context, deterministic transform semantics가 성립하면 semantic replay가
+가능하다.
+
+### 33. concrete byte comparison
+
+ReplayResult는 diagnostic으로 production/replay concrete value/bytes 비교를 남길 수 있다.
+
+```text
+byte_comparison
+    identical
+    differs
+    not_comparable
+```
+
+`differs`가 곧 semantic replay failure는 아니다.
+
+```text
+production stateid A -> zero
+replay stateid B     -> zero
+```
+
+는 production original bytes가 다르지만 동일 semantic transform이 재적용된 경우다.
+
+### 34. stable literal condition
+
+특정 original value equality가 replay correctness에 필수라면 그 조건은
+`CompiledMutationRule.predicates[]`에 이미 존재해야 한다.
+
+Replay layer가 production concrete snapshot을 보고 새로운 implicit equality predicate를
+만들지 않는다.
+
+### 35. transform source comparison
+
+`copy` 또는 context-derived builtin은 production과 replay source value가 달라질 수 있다.
+Replay는 same ValueRef source semantics와 same typed transform을 요구한다.
+Production source value snapshot은 evidence다.
+
+### 36. replay batch logging
+
+Replay 자체도 target kernel crash를 일으킬 수 있다.
+
+따라서 Replay 실행도 production과 같은 exposure-before-forward durability discipline을
+사용해 별도의 replay execution log를 남겨야 한다.
+
+```text
+production MutationDelta
+    read-only
+
+replay execution
+    -> replay application journal
+    -> ReplayResult
+```
+
+Crash가 replay 중 발생해도 마지막 replay mutation candidate가 durable해야 한다.
+
+### 37. delivery evidence
+
+Semantic replay verdict와 local delivery evidence를 분리한다.
+
+```text
+delivery_evidence
+    complete
+    unknown
+    failed
+```
+
+Production/replay 각각 batch별 delivery state를 가진다.
+
+Production batch가 `EXPOSURE_INTENT`만 남기고 crash했다면 semantic replay input으로는
+사용 가능하지만 production delivery는 unknown이다.
+
+### 38. FORWARD_COMPLETE cardinality
+
+Production에 FORWARD_COMPLETE가 존재하는 batch subset은 replay delivery 결과와 별도로
+비교할 수 있다.
+
+하지만 crash-triggering 마지막 batch가 production에서 delivery_unknown일 수 있으므로
+semantic replay equivalence를 FORWARD_COMPLETE equality 하나에만 묶지 않는다.
+
+M1 Judge가 어떤 delivery state를 성공으로 인정하는지는 후속 Agent contract가 소유한다.
+
+### 39. schema/runtime incompatibility
+
+다음은 implicit migration하지 않는다.
+
+```text
+format_version unsupported
+semantic_runtime_version unsupported
+schema_id unavailable/mismatch
+versioned transform_id unsupported
+```
+
+결과는 `REPLAY_INVALID`이다.
+
+Old artifact migration이 필요하면 explicit offline migration/compatibility path를 별도로
+만든다.
+
+### 40. multiple-rule replay
+
+Replay는 MutationDelta의 entire recorded rule set을 한 unit으로 설치한다.
+
+```text
+rule A
+rule B
+rule C
+    -> same pre-mutation snapshot
+    -> same conflict preflight
+```
+
+Rule별 file을 순차 replay해 production batch semantics를 재구성하지 않는다.
+
+### 41. replay 중 rule mutation 금지
+
+Replay 실행 중 Agent 재계획, Compiler 재작성, rule 추가/삭제, predicate 완화,
+transform substitution, schema remapping을 하지 않는다.
+
+Recorded rule set을 current traffic에 그대로 semantic resolve한다.
+
+### 42. current NFSPDLT1/2와의 관계
+
+Current `NFSPDLT1` / `NFSPDLT2`는 concrete Layer 0 replay artifact다.
+
+유지할 가치가 있는 invariant:
+
+```text
+no ordinal matching
+verify-before-patch
+explicit orig mismatch
+durable mutation record
+produce/replay share apply implementation
+application cardinality checked
+```
+
+하지만 literal anchor, precomputed byte offset, production exact original bytes,
+one-arm-per-file, in-place applied_count update는 target semantic replay identity가 아니다.
+
+Implementation migration에서 NFSPDLT1/2는 legacy compatibility input, concrete
+application evidence subrecord, Layer 0 regression fixture로 남을 수 있다.
+
+Dynamic semantic campaign의 top-level artifact는 이 contract의 semantic MutationDelta다.
+새 format magic/version은 implementation gap analysis에서 정한다.
+
+### 43. current applied_count와 target cardinality
+
+Current delta는 rule별 `applied_count`를 in-place 갱신하고 replay 종료 시 exact count를
+비교한다.
+
+Target은 이를 record-level semantic batch signature multiset + delivery state로
+일반화한다. Rule summary count는 진단에는 쓸 수 있지만 primary equivalence gate가 아니다.
+
+### 44. M1 / Q2 경계
+
+MutationDelta는 M1 Judge가 사용할 semantic rule snapshot, concrete production mutation,
+EXPOSURE_INTENT durability, FORWARD_COMPLETE/FAILED/unknown evidence를 제공한다.
+
+하지만 Delta Recorder가 M1 verdict를 직접 결정하지 않는다.
+
+```text
+REPLAY_EQUIVALENT
+    !=
+Q2 crash reproduced
+```
+
+Q2는 crash/sanitizer evidence가 별도로 판단한다.
+
+## 설계 근거
+
+| 결정 | 근거 |
+|---|---|
+| CompiledMutationRule snapshot을 replay source로 저장 | Agent/Compiler evolution이 replay meaning을 바꾸지 않게 함 |
+| production concrete bytes를 evidence로 분리 | dynamic state 값이 replay에서 달라질 수 있음 |
+| replay current bytes를 다시 resolve/verify | wrong-buffer patch를 막으면서 dynamic replay 허용 |
+| rule-set execution을 하나의 delta scope로 사용 | same-snapshot multi-rule batch/conflict semantics 보존 |
+| semantic batch signature multiset 비교 | stream ordinal 없이 batch composition/cardinality 비교 |
+| EXPOSURE_INTENT를 forwarding 전에 durable | crash 직전 mutation candidate가 사라지지 않게 함 |
+| append-only events 사용 | crash-cut 상태를 in-place counter 하나로 덮어쓰지 않음 |
+| forward completion을 별도 event로 기록 | local mutation build와 peer socket write를 분리 |
+| delivery_unknown을 명시 | socket write와 disk commit은 atomic transaction이 아님 |
+| replay도 같은 semantic runtime path 사용 | produce/replay semantic drift 방지 |
+| production delta를 replay 중 immutable하게 유지 | reproduction evidence 오염 방지 |
+| exact original condition은 rule predicate로 표현 | concrete snapshot을 implicit replay identity로 만들지 않음 |
+
+## 검토한 대안
+
+| 선택지 | 얻는 것 | 비용·한계 | 채택 여부와 이유 |
+|---|---|---|---|
+| production concrete edits를 그대로 replay | current engine 재사용 쉬움 | dynamic state에서 stale original/offset | 비채택 |
+| production original bytes 항상 exact-match | wrong target 방지 강함 | semantically same dynamic record도 거부 | 비채택 |
+| original verification 완전 제거 | dynamic replay 쉬움 | TOCTOU/wrong-buffer 위험 | 비채택 |
+| replay-time current original 새로 verify | dynamic semantics + apply safety | semantic resolver 필요 | 채택 |
+| rule applied_count만 비교 | 구현 단순 | same count/different batch composition 놓침 | 비채택 |
+| semantic batch signature multiset | order-independent batch equivalence | signature normalization 필요 | 채택 |
+| forward 성공만 기록 | delivery certainty 높음 | crash 직전 mutation record 소실 가능 | 비채택 |
+| forwarding 전 write-ahead intent | crash survival | delivery 별도 tracking 필요 | 채택 |
+| in-place lifecycle update | compact | crash-cut 의미/torn update 복잡 | 비채택 |
+| append-only lifecycle events | complete prefix 해석 가능 | artifact가 더 커짐 | 채택 |
+
+## 영향
+
+### 상류
+
+Semantic runtime은 stable `CompiledMutationRule` serialization을 제공해야 한다.
+Mutation Engine은 final batch output과 per-application concrete evidence를 Delta Recorder에
+제공해야 한다. Relay는 full-write completion을 batch token과 연결해 notify해야 한다.
+
+### 하류
+
+M1 Judge는 delivery state와 semantic application evidence를 읽을 수 있다.
+Replay Runner는 matching ProtocolSchema와 scenario/harness input을 준비해야 한다.
+Crash Report는 production Delta와 ReplayResult/Q2 evidence를 함께 묶을 수 있다.
+
+### 운영
+
+Per-mutation synchronous durability write가 필요하다. Semantic all-matches campaign의
+actual write volume은 real workload로 재검증한다.
+
+Journal snapshot은 hostile/malformed traffic에서 나온 data를 포함할 수 있으므로
+모든 serialized length/count는 bounded여야 한다.
+
+## 신뢰성 요구
+
+가장 위험한 오류는 두 종류다.
+
+```text
+1. production mutation이 있었는데 durable evidence가 없음
+2. replay가 다른 semantic target을 바꿨는데 equivalent라고 판정
+```
+
+| 항목 | 요구 |
+|---|---|
+| crash survival | mutated output exposure 전에 EXPOSURE_INTENT durable |
+| replay safety | schema/rule/context/target을 live semantic path에서 재검증 |
+| apply safety | replay-current original bytes verify-before-apply |
+| ambiguity | delivery/corruption/schema drift를 explicit state로 남김 |
+| ordering | replay selector가 event/stream ordinal을 사용하지 않음 |
+| immutability | production MutationDelta는 replay 중 수정하지 않음 |
+
+Artifact reader는 corrupt data를 permissive하게 해석해서 replay하지 않는다.
+
+## 검증 오라클
+
+### 1. dynamic original replay
+
+Production/replay에서 같은 semantic target의 stateid bytes를 다르게 만든다.
+
+Expected:
+- production original mismatch만으로 replay를 거부하지 않음;
+- replay semantic predicate/target이 맞으면 replay-current bytes에서 transform;
+- replay-current original을 apply 직전에 verify.
+
+### 2. explicit stable predicate
+
+Rule에 `target == literal` predicate를 넣고 replay value를 다르게 만든다.
+
+Expected:
+- predicate false;
+- mutation 없음;
+- production concrete snapshot을 implicit predicate로 사용하지 않음.
+
+### 3. same batch multiset, different arrival order
+
+Production/replay RPC arrival order를 바꾸되 semantic mutation batch set은 같게 만든다.
+
+Expected: `REPLAY_EQUIVALENT`.
+
+### 4. same rule counts, different batch grouping
+
+Production에서는 [A,B]가 한 record에 적용되고 replay에서는 [A], [B]로 나뉘게 만든다.
+
+Expected: `REPLAY_DIVERGED`.
+
+### 5. extra / missing semantic match
+
+Replay에서 production에 없던 match를 추가하거나 production batch 하나를 없앤다.
+
+Expected:
+- batch signature/cardinality mismatch;
+- REPLAY_DIVERGED.
+
+### 6. schema / transform incompatibility
+
+Recorded schema_id 또는 versioned transform semantics를 runtime에서 지원하지 않게 한다.
+
+Expected:
+- no substitution/remap;
+- REPLAY_INVALID.
+
+### 7. durability before exposure
+
+Delta append를 강제로 실패시킨다.
+
+Expected:
+- mutated record가 relay에 노출되지 않음;
+- unrecorded mutation 없음.
+
+### 8. crash after EXPOSURE_INTENT
+
+Intent durability 직후 process를 종료한다.
+
+Expected:
+- batch concrete evidence survives;
+- no FORWARD_COMPLETE;
+- delivery_unknown.
+
+### 9. crash after socket write, before FORWARD_COMPLETE
+
+Full local write 직후 completion event 전에 종료한다.
+
+Expected:
+- artifact does not claim definite complete delivery;
+- delivery_unknown.
+
+### 10. known forward failure
+
+Relay full-write를 실패시키고 failure callback을 만든다.
+
+Expected:
+- FORWARD_FAILED;
+- confirmed delivery로 세지 않음.
+
+### 11. torn final journal event
+
+마지막 event를 중간에서 truncate한다.
+
+Expected:
+- complete prefix recovered;
+- torn tail not committed;
+- earlier events preserved.
+
+### 12. middle journal corruption
+
+중간 event integrity를 깨뜨린다.
+
+Expected:
+- artifact corrupt;
+- silent skip/replay 금지.
+
+### 13. production delta immutability
+
+Replay 전/후 production MutationDelta bytes를 비교한다.
+
+Expected: unchanged.
+
+### 14. replay crash durability
+
+Replay 중 target crash를 일으킨다.
+
+Expected:
+- separate replay log에 last EXPOSURE_INTENT surviving;
+- production delta unchanged.
+
+## 실패 양상과 진단
+
+| 증상 | 가능한 원인 | 구분하는 관측 | 조치 |
+|---|---|---|---|
+| delta open 실패 | missing/corrupt artifact | header/read status | replay invalid |
+| schema_unavailable | matching ProtocolSchema 없음 | schema_id lookup | package 보완 |
+| runtime incompatible | semantic runtime/transform version 불일치 | version check | compatible runtime 사용 |
+| replay batch missing | scenario/context drift | batch signature diff | replay diverged |
+| replay extra batch | new all-match traffic | batch signature diff | replay diverged |
+| same count, grouping 다름 | rules가 다른 records에 적용됨 | batch multiset | replay diverged |
+| production/replay bytes 다름 | dynamic semantic value | typed snapshots + rule | 별도 진단 |
+| EXPOSURE_INTENT만 존재 | crash window | no terminal event | delivery_unknown |
+| FORWARD_FAILED | relay/socket failure | batch terminal event | M1/Q2와 분리 |
+| torn final event | crash during append | valid prefix + incomplete tail | tail 무시 |
+| middle corruption | storage corruption/bug | integrity/sequence failure | artifact invalid |
+| replay orig verify 실패 | replay-time TOCTOU/wrong buffer | current precondition bytes | apply refusal |
+
+## 한계와 미결 사항
+
+- **결정됨:** MutationDelta replay source는 recorded `CompiledMutationRule[]`이다.
+- **결정됨:** Replay는 Agent와 Compiler를 다시 호출하지 않는다.
+- **결정됨:** production concrete original/mutated bytes는 evidence이며 default replay identity가 아니다.
+- **결정됨:** replay-time current bytes를 새로 resolve하고 verify-before-apply한다.
+- **결정됨:** exact stable original 요구는 semantic predicate로 표현한다.
+- **결정됨:** Delta logical scope는 one semantic rule-set execution이다.
+- **결정됨:** application durability unit은 one mutated RPC record batch다.
+- **결정됨:** semantic batch signature multiset으로 replay cardinality/composition을 비교한다.
+- **결정됨:** EXPOSURE_INTENT는 mutated output을 relay에 노출하기 전에 durable해야 한다.
+- **결정됨:** production journal은 append-only lifecycle events를 사용한다.
+- **결정됨:** socket delivery와 disk commit의 atomicity gap은 `delivery_unknown`으로 표현한다.
+- **결정됨:** production MutationDelta는 replay 중 immutable이다.
+- **결정됨:** replay도 same Decoder/Context/Resolver/Mutation Engine path를 사용한다.
+- **결정됨:** NFSPDLT1/2 literal-original semantics는 target dynamic replay identity가 아니다.
+- **미결:** semantic MutationDelta exact serialization.
+- **미결:** event framing/integrity algorithm.
+- **미결:** semantic_runtime_version versioning scheme.
+- **미결:** concrete output snapshot 전체를 inline할지 여부.
+- **미결:** ReplayResult on-disk representation.
+- **미결:** filesystem metadata durability implementation details.
+- **미결:** relay full-write completion callback/token API.
+- **미결:** journal size/snapshot value numeric caps.
+- **미결:** legacy NFSPDLT1/2 compatibility reader 유지 여부.
+- **미검증:** synchronous journal writes의 syz-manager throughput 영향.
+
+## 참조
+
+- `docs/design/03-nfs-proxy/01-architecture.md`
+- `docs/design/03-nfs-proxy/02-semantic-decoder.md`
+- `docs/design/03-nfs-proxy/03-transaction-context.md`
+- `docs/design/03-nfs-proxy/04-semantic-mutation-runtime.md`
+- `docs/design/02-llm-agent/08-mutation-rule-set.md`
+- `docs/design/02-llm-agent/04-harness-capability-spec.md`
+- `tools/nfs-proxy/src/delta.h`
+- `tools/nfs-proxy/src/delta.c`
+- `tools/nfs-proxy/src/edit.h`
+- `tools/nfs-proxy/src/edit.c`
+- `tools/nfs-proxy/src/control.c`
+- `tools/nfs-proxy/test/test_delta.c`
+- `tools/nfs-proxy/test/test_edit.c`
+- `tools/nfs-proxy/test/test_control.c`
+- `tools/nfs-proxy/test/guest-delta-replay.c`
+
+## Agent 사용 지침
+
+### 지원 범위
+
+Agent가 replay 가능한 semantic mutation이라고 가정하려면 current implementation에서
+최소 다음이 검증되어야 한다.
+
+```text
+CompiledMutationRule durable serialization
+matching ProtocolSchema retention
+same semantic Resolver/Mutation Engine replay path
+production EXPOSURE_INTENT durability
+dynamic replay-current resolution
+batch signature/cardinality comparison
+replay execution logging
+```
+
+Target design 문서가 존재한다는 사실만으로 HCAP-09가 semantic replay를 지원한다고
+가정하지 않는다. HCAP-09는 현재 NFSPDLT1/2 concrete replay capability다.
+
+### 비지원 범위
+
+다음 경우 semantic replay 성공을 주장하지 않는다.
+
+```text
+schema/runtime version unavailable
+recorded rule set을 exact semantic form으로 load할 수 없음
+dynamic replay를 production literal original로 강제해야만 하는 current backend
+batch signature/cardinality comparison 없음
+delivery state를 알 수 없는데 complete라고 가정
+legacy concrete delta를 semantic delta라고 취급
+```
+
+필요한 campaign이 target semantic replay를 요구하지만 implementation이 없으면
+`HarnessGapIssue(gap_class=mutation_engine)`로 block한다.
+
+### 확장 절차
+
+Semantic Delta/Replay 구현 시 semantic delta serialization, Delta Recorder, relay
+completion callback, Replay loader/runtime, ReplayResult comparison, legacy compatibility,
+host/guest tests와 Harness Capability Specification을 함께 갱신한다.
+
+### 제약
+
+```text
+recorded CompiledMutationRule is replay source
+no Agent/Compiler rerun
+no runtime XID/connection/ordinal replay identity
+production concrete bytes are evidence
+replay-current verify-before-apply
+all rule set replayed together
+production delta immutable
+write-ahead exposure intent
+delivery_unknown kept explicit
+Q1/M1/Q2 evidence separated
+```
+
+### 검증 방법
+
+Semantic replay capability를 validated로 올리려면 dynamic-original replay,
+stable-predicate negative test, batch multiset comparison, extra/missing divergence,
+schema/transform incompatibility, durability/crash-cut tests, torn-tail/corruption tests,
+production-delta immutability와 guest/runtime replay를 통과해야 한다.
+
+Current NFSPDLT1/2 replay success만으로 target semantic replay capability를 validated로
+올리지 않는다.
+
+## 다음 상세 설계
+
+```text
+1. [`Implementation gap analysis`](06-implementation-gap-analysis.md) — current-vs-target mapping fixed
+2. Proxy implementation
+```
