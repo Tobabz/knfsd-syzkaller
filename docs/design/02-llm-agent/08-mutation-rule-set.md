@@ -375,7 +375,7 @@ HCAP-08은 partially validated 상태이므로 미검증 조합은 그대로 미
 semantic target schema/decoder가 없음
 semantic selector를 stable하게 표현할 수 없음
 required live-value transform을 Proxy가 지원하지 않음
-resolved concrete edit를 Mutation Engine이 표현할 수 없음
+resolved concrete edit를 Edit Applier가 표현할 수 없음
 reproduction delta를 요구된 의미로 기록할 수 없음
 ```
 

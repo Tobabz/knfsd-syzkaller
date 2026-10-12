@@ -52,6 +52,9 @@ Stage 2는 Stage 1의 Q1이 증명되기 전에는 시작하지 않는다.
 
 즉 Candidate는 실행 주체가 아니라 **데이터 객체**다.
 
+용어: NFS Proxy(`tools/nfs-proxy`)는 운영 문서의 NFS 특화 Mutation Engine과 같은 컴포넌트이고,
+**Edit Applier**는 그 내부에서 resolve된 concrete edit를 검증하고 적용하는 단계다(`03-nfs-proxy/01` §10).
+
 ### 2.2 Stage 1 전 준비 구간
 
 Stage 1 전에는 Controller의 intake/validation만 있다.

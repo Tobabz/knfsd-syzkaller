@@ -14,7 +14,7 @@
 MutationDelta는 Stage 2에서 실제 사용한 `CompiledMutationRule` set과 생산 실행의
 concrete mutation evidence를 durable하게 함께 보존하는 semantic replay artifact다.
 Replay는 생산 당시 byte offset/original bytes를 그대로 다시 패치하지 않고,
-recorded semantic rule을 동일 Decoder/Transaction Context/Resolver/Mutation Engine
+recorded semantic rule을 동일 Decoder/Transaction Context/Resolver/Edit Applier
 경로에서 live traffic에 다시 resolve한다. 생산 당시 concrete bytes는 증거로 남지만
 dynamic field의 replay identity가 아니다. 논리 단위는 program generation 하나
 (`ProgramGenerationExecution`)이고, journal은 crash가 일어나는 guest가 아니라 Runner가 소유한
@@ -74,7 +74,7 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
   |        v                                             |
   |  [Delta Recorder]                                    |
   |        |                                             |
-  |  live record -> Resolver -> Mutation Engine          |
+  |  live record -> Resolver -> Edit Applier             |
   |                         | built mutated batch         |
   |                         v                            |
   |                  EXPOSURE_INTENT (D)                 |
@@ -94,7 +94,7 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
   |  same CompiledMutationRule[]                         |
   |        |                                             |
   |  Decoder -> Transaction Context -> Resolver          |
-  |        -> Mutation Engine -> replay batch log        |
+  |        -> Edit Applier -> replay batch log           |
   |                                      |               |
   |                                      v               |
   |                                ReplayResult          |
@@ -340,7 +340,7 @@ witness다.
 
 ### 10. EXPOSURE_INTENT
 
-Mutation Engine이 original precondition을 검증하고 final mutated record를 성공적으로
+Edit Applier가 original precondition을 검증하고 final mutated record를 성공적으로
 구성한 뒤, 그 bytes를 relay에 노출하기 **전에** 다음 event를 durable하게 기록한다.
 
 ```text
@@ -494,7 +494,7 @@ Semantic Resolver
 ResolvedMutation
     |
     v
-Mutation Engine
+Edit Applier
     |
     +--> verify replay-current original bytes
     +--> apply
@@ -783,7 +783,7 @@ Semantic Rule Resolver
 Conflict / Structure Preflight
         |
         v
-Mutation Engine
+Edit Applier
 ```
 
 별도 ad-hoc replay byte patcher를 만들지 않는다.
@@ -1098,7 +1098,7 @@ Q2는 crash/sanitizer evidence가 별도로 판단한다.
 ### 상류
 
 Semantic runtime은 stable `CompiledMutationRule` serialization을 제공해야 한다.
-Mutation Engine은 final batch output과 per-application concrete evidence를 Delta Recorder에
+Edit Applier는 final batch output과 per-application concrete evidence를 Delta Recorder에
 제공해야 한다. Relay는 full-write completion을 batch token과 연결해 notify해야 한다.
 
 ### 하류
@@ -1320,7 +1320,7 @@ Expected:
 - **결정됨:** production journal은 append-only lifecycle events를 사용한다.
 - **결정됨:** socket delivery와 disk commit의 atomicity gap은 `delivery_unknown`으로 표현한다.
 - **결정됨:** production MutationDelta는 replay 중 immutable이다.
-- **결정됨:** replay도 same Decoder/Context/Resolver/Mutation Engine path를 사용한다.
+- **결정됨:** replay도 same Decoder/Context/Resolver/Edit Applier path를 사용한다.
 - **결정됨:** NFSPDLT1/2 literal-original semantics는 target dynamic replay identity가 아니다.
 - **미결:** semantic MutationDelta exact serialization.
 - **미결:** event framing/integrity algorithm.
@@ -1364,7 +1364,7 @@ Agent가 replay 가능한 semantic mutation이라고 가정하려면 current imp
 ```text
 CompiledMutationRule durable serialization
 matching ProtocolSchema retention
-same semantic Resolver/Mutation Engine replay path
+same semantic Resolver/Edit Applier replay path
 production EXPOSURE_INTENT durability (Runner host sink `(D)`)
 dynamic replay-current resolution
 batch signature/cardinality comparison

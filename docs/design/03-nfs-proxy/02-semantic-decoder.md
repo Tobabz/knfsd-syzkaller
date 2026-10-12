@@ -670,7 +670,7 @@ semantic target resolved
 ResolvedMutation
         |
         v
-Mutation Engine
+Edit Applier
         |
         +--> intentionally malformed output
 ```

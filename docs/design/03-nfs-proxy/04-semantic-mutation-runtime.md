@@ -73,7 +73,7 @@ ResolvedMutation[]
 conflict / structure preflight
         |
         v
-[Mutation Engine]
+[Edit Applier]
 ```
 
 모든 selector, predicate, transform input은 같은 pre-mutation snapshot을 본다.
@@ -99,7 +99,7 @@ conflict / structure preflight
   |  [Conflict / Structure Preflight]                    |
   |        | conflict-free concrete edits                |
   |        v                                             |
-  |  [Mutation Engine]                                   |
+  |  [Edit Applier]                                      |
   +--------|---------------------------------------------+
            | mutated record
            v
@@ -133,7 +133,7 @@ conflict / structure preflight
 
 [DATA] ResolvedMutation
     Produced by:   Semantic Rule Resolver
-    Consumed by:   Mutation Engine / evidence
+    Consumed by:   Edit Applier / evidence
 
 [COMPONENT] Semantic Rule Resolver
     Runs at:       Proxy runtime
@@ -142,7 +142,7 @@ conflict / structure preflight
     Mutates wire:  NO
 ```
 
-Mutation Engine만 실제 bytes를 바꾼다.
+Edit Applier만 실제 bytes를 바꾼다.
 
 ### 2. CompiledMutationRule
 
@@ -697,11 +697,11 @@ Count/length를 rule별 literal patch로 순차 적용하지 않고 final struct
 
 같은 insertion boundary의 ordering은 registration order로 정하지 않는다.
 
-### 30. Mutation Engine boundary
+### 30. Edit Applier boundary
 
 Semantic Rule Resolver는 bytes를 쓰지 않는다.
-Mutation Engine은 original RpcRecord와 conflict-free ResolvedMutation[]을 받아
-verify/apply/rebuild를 수행한다. Mutation Engine은 selector를 다시 해석하지 않는다.
+Edit Applier는 original RpcRecord와 conflict-free ResolvedMutation[]을 받아
+verify/apply/rebuild를 수행한다. Edit Applier는 selector를 다시 해석하지 않는다.
 
 ### 31. resolver result taxonomy
 
@@ -755,7 +755,7 @@ refusal, one final rebuild를 요구한다.
 selector matched + target resolved + transform evaluated
     -> resolution success only
 
-Mutation Engine applied + durable evidence + forwarding result
+Edit Applier applied + durable evidence + forwarding result
     -> M1 Judge input
 ```
 
@@ -806,7 +806,7 @@ MutationRuleSet은 semantic intent만 제공하고 concrete offset/original을 �
 
 ### 하류
 
-Resolver가 wrong target/transform을 만들면 Mutation Engine과 MutationDelta가 그 잘못된
+Resolver가 wrong target/transform을 만들면 Edit Applier와 MutationDelta가 그 잘못된
 의미를 정상 application으로 기록할 수 있다.
 
 따라서 M1 신뢰성은 Decoder뿐 아니라 Resolver의 typed target/predicate binding에 직접
@@ -1025,7 +1025,7 @@ predicate operator/types
 mutation kind
 transform_id/value form
 structure policy
-concrete Mutation Engine mapping
+concrete Edit Applier mapping
 ```
 
 Target design에 syntax가 존재한다는 이유만으로 current support라고 가정하지 않는다.
@@ -1056,7 +1056,7 @@ unsupported_by_current_harness
 ### 확장 절차
 
 새 selector/predicate/transform을 추가할 때 최소 Compiler validation/type rules, Proxy Resolver implementation,
-Transaction Context dependency, Mutation Engine mapping, host unit tests, guest/runtime validation,
+Transaction Context dependency, Edit Applier mapping, host unit tests, guest/runtime validation,
 Harness Capability Specification을 함께 갱신한다.
 
 ### 제약

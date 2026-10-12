@@ -12,6 +12,9 @@ Stage 2 실행 컴포넌트다. Proxy가 live record를 decode해서 target fiel
 runtime에 resolve하고, 실제 적용 결과를 durable delta로 남긴다. 이 계층이 잘못되면
 M1이 잘못 판정되고 crash 재현이 다른 record를 변조할 수 있다.
 
+용어: NFS Proxy(`tools/nfs-proxy`)는 운영 문서의 NFS 특화 Mutation Engine과 같은 컴포넌트이고,
+**Edit Applier**는 그 내부에서 resolve된 concrete edit를 검증하고 적용하는 단계다(§10).
+
 ## 해결하려는 문제
 
 현재 `tools/nfs-proxy`의 NFSPARM1/2는 코드상 concrete byte mutation을 받는다.
@@ -87,7 +90,7 @@ mutation + durable delta
   |  [Semantic Rule Resolver]                              |
   |        | ResolvedMutation                              |
   |        v                                               |
-  |  [Mutation Engine] ----(M)---> [Delta Recorder]        |
+  |  [Edit Applier] -----(M)-----> [Delta Recorder]        |
   |        | mutated RPC                 | MutationDelta    |
   +--------|-----------------------------|------------------+
            v                             v
@@ -455,9 +458,9 @@ status = NFS4_OK
 COMPOUND 내부 구조를 특정해야 하면 decoded message의 stable semantic path를
 사용한다. Stream 전체의 temporal ordinal을 사용하지 않는다.
 
-### 10. `[COMPONENT] Mutation Engine`
+### 10. `[COMPONENT] Edit Applier`
 
-Mutation Engine은 `ResolvedMutation`을 받아 실제 payload를 변경한다.
+Edit Applier는 `ResolvedMutation`을 받아 실제 payload를 변경한다.
 
 기본 mutation family:
 
@@ -517,7 +520,7 @@ CompiledMutationRule[]
 ResolvedMutation[]
         |
         v
-Mutation Engine
+Edit Applier
         |
         +--> final mutated batch
                 |
@@ -568,7 +571,7 @@ RPC/NFS Decoder + Transaction Context
 Semantic Rule Resolver
       |
       v
-Mutation Engine
+Edit Applier
 ```
 
 Production original/mutated bytes는 evidence로 보존한다.
@@ -578,7 +581,7 @@ Replay-time current value/bytes는 live semantic record에서 다시 resolve한�
 predicate로 표현한다. Production concrete original bytes를 implicit replay identity로
 사용하지 않는다.
 
-Replay-time Mutation Engine은 새로 resolve한 current original bytes를 apply 직전에
+Replay-time Edit Applier는 새로 resolve한 current original bytes를 apply 직전에
 verify한다.
 
 Replay가 target semantic context를 찾지 못하거나 precondition을 만족하지 못하면

@@ -76,7 +76,7 @@ Target design이 구현보다 앞서 있으므로 다음 질문에 답해야 한
   Transaction Context -------------------- missing
   CompiledMutationRule ABI --------------- NFSPARM1/2 (different)
   Semantic Rule Resolver ----------------- missing
-  Mutation Engine ------------------------ delta.c/edit.c substrate
+  Edit Applier --------------------------- delta.c/edit.c substrate
   Semantic Delta Recorder ---------------- NFSPDLT1/2 (different)
   Replay --------------------------------- concrete replay only
   Forward completion evidence ------------ aggregate queue stats only
@@ -120,7 +120,7 @@ Target Agent-facing path와 current compatibility path는 병존할 수 있다.
 | Transaction Context | none | missing | same-thread event loop ordering | connection_id + call_direction + XID table, lifecycle, bounded retention | 03 contract oracle |
 | Semantic control ABI | NFSPARM1/NFSPARM2 (program-armed, FD lifetime) | missing | Unix SOCK_SEQPACKET control transport, ACK model | Runner-installed immutable rule set per proxy session (`rule_set_id`); executor-only activation/deactivation barrier per generation; versioned rule-set serialization, schema/runtime IDs, typed rules; legacy arm refusal while target is installed | decode/validation, barrier ACK-loss/orphan, endpoint isolation tests |
 | Semantic Rule Resolver | none | missing | current route scoping concepts | selector/predicate/transform/context dependency runtime | 04 contract oracle |
-| Concrete Mutation Engine | `delta.c`, `edit.c` | reuse_with_adapter | verify-before-patch, original-coordinate rebuild, overlap refusal, one-pass output rebuild | consume conflict-free concrete edit batches instead of matching raw rules; remove semantic dependence on rule order | current tests + batch adapter tests |
+| Edit Applier | `delta.c`, `edit.c` | reuse_with_adapter | verify-before-patch, original-coordinate rebuild, overlap refusal, one-pass output rebuild | consume conflict-free concrete edit batches instead of matching raw rules; remove semantic dependence on rule order | current tests + batch adapter tests |
 | Structure derivation | `edit.c` op-count + record-marker rebuild | extend | COMPOUND op-count bump, final marker rebuild | schema-derived length/count/padding/discriminant fixups from final structure | preserve/raw semantic tests |
 | Rule-set same-snapshot preflight | v1 then v2 sequential in `control.c` | replace | v2 multi-rule batch aggregation idea | all semantic rules resolve on original record; global conflict preflight; one final apply | registration-order permutation tests |
 | Delta Recorder | NFSPDLT1/2 writer (guest `O_SYNC` file) | replace | bounded binary IO, corruption refusal; guest `O_SYNC` stays legacy only | per-generation semantic journal events (RULESET/EXPOSURE_INTENT/FORWARD_*/GENERATION_COMPLETE) with generation correlation, sent to the host sink | 05 crash-cut oracle incl. guest crash after host ACK |
@@ -186,7 +186,7 @@ adapter가 필요하다.
 
 - fragment bodies를 contiguous `rpc_payload`로 materialize하거나 zero-copy view로 제공.
 - semantic offset coordinate를 marker-free payload 기준으로 통일.
-- Mutation Engine output을 RFC 5531 record로 다시 frame.
+- Edit Applier output을 RFC 5531 record로 다시 frame.
 - legacy NFSPARM1/2 path는 기존 marker-inclusive coordinates를 계속 사용할 수 있음.
 
 Target semantic API와 legacy concrete API의 coordinate system을 섞지 않는다.
@@ -457,7 +457,7 @@ semantic scope/selector, typed predicate, typed transform, live WireRef를 resol
 Current route match code는 helper concept로 재사용할 수 있지만 semantic matching을
 `delta.c/edit.c`에 계속 남겨두면 target 책임 분리가 깨진다.
 
-### 11. Concrete Mutation Engine
+### 11. Edit Applier
 
 #### Current reusable substrate
 
@@ -474,7 +474,7 @@ Current edit API는 semantic resolution과 concrete apply가 섞여 있다.
 op-array boundary를 `nfsp_walk`에서 다시 resolve하며, equal-offset insert ordering에
 rule/edit traversal order를 사용한다.
 
-Target Mutation Engine은 이미 conflict-free하게 resolve된 concrete batch만 받아야 한다.
+Target Edit Applier는 이미 conflict-free하게 resolve된 concrete batch만 받아야 한다.
 
 #### Required refactor
 
@@ -518,7 +518,7 @@ COMPOUND op count를 ProtocolSchema/final semantic structure 기준으로 derive
 #### Required change
 
 Semantic Resolver/schema encoder가 final desired structure와 derived concrete edits를
-계산하고 Mutation Engine은 이를 한 batch로 적용한다. Current op-count/marker logic은
+계산하고 Edit Applier는 이를 한 batch로 적용한다. Current op-count/marker logic은
 regression reference/substrate로 유지한다.
 
 ### 14. Delta Recorder
@@ -604,7 +604,7 @@ refused_orig_diff == 0
 #### Gap
 
 Target replay는 recorded semantic `CompiledMutationRule[]`을 로드하고 Decoder ->
-Transaction Context -> Resolver -> Mutation Engine의 same path를 사용해야 한다.
+Transaction Context -> Resolver -> Edit Applier의 same path를 사용해야 한다.
 
 또한 production Delta는 immutable이고 replay execution journal / ReplayResult는 별도다.
 crash replay는 crashing program 하나가 아니라 `CrashContextWindow`의 순서 있는 generation 목록을
@@ -1103,7 +1103,7 @@ Gap closure가 target invariant를 약화시키면 구현 완료로 인정하지
 | ConnectionRef | reconnect/fd-slot reuse가 old transaction namespace를 재사용하지 않음 |
 | Transaction Context | same conn opposite CALL direction XID collision 분리 |
 | Resolver | all rules same pre-mutation snapshot |
-| Mutation Engine | replay-current original verify-before-apply |
+| Edit Applier | replay-current original verify-before-apply |
 | conflict handling | registration order로 silent winner 선택 금지 |
 | Delta | unrecorded mutated output exposure 금지 |
 | relay completion | missing completion을 definite success로 해석 금지 |
