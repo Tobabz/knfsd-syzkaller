@@ -145,7 +145,9 @@ capability id의 machine-readable 표현은 HCAP data가 소유한다(04 §1.1).
 
 candidate를 실행할 수는 있지만 현재 program generation에 귀속되는 remote KCOV로
 target PC를 관측할 수 없는 경우. candidate의 kernel revision용으로 계측을 옮기고 검증한 harness build가
-없는 경우도 이 class다(01 §11.2).
+없는 경우도 이 class다(01 §11.2). 이때 id `remote_kcov.kernel_revision.<commit>`은 그 revision용으로 검증된,
+attribution이 가능한 kernel harness가 없다는 것만 뜻한다. binding이 성공한 뒤 발견되는 syzlang, fixture,
+mutation capability 부족은 각자의 gap class로 간다(issue #13).
 
 예:
 
