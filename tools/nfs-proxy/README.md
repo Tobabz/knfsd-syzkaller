@@ -17,10 +17,12 @@ transport, and `test_proxy` needs its loopback topology (listeners on
 without lo0 aliases, the second. Where either is missing, `build.sh` still
 compiles both and then runs the whole suite in `debian:bookworm` through
 Docker, rather than substitute a stream socket or another topology, or skip the
-test. `build-guest.sh --out FILE` creates a Debian bookworm ABI guest binary
-after those checks. The two backend listeners are routed solely by destination
-IP, and the source IP identifies the client. `SERVER_IMPL=both` provides
-`.1:2049 → knfsd :20490` and `.5:2049 → Ganesha :20491`.
+test. `build-guest.sh --out FILE` then creates a Debian bookworm ABI binary for
+the x86_64 guest: it builds for `linux/amd64` on any host, checks the ELF
+machine, and records provenance next to the binary. The two backend listeners
+are routed solely by destination IP, and the source IP identifies the client.
+`SERVER_IMPL=both` provides `.1:2049 → knfsd :20490` and
+`.5:2049 → Ganesha :20491`.
 NFSv3 calls pass through the engine's TCP proxy; their MOUNT requests go directly to the
 backends on pinned ports. Typed operation matching is defined for NFSv4
 COMPOUND requests, while v3 messages expose only the RPC header and raw body.
