@@ -126,7 +126,7 @@ Target Agent-facing path와 current compatibility path는 병존할 수 있다.
 | Delta Recorder | NFSPDLT1/2 writer (guest `O_SYNC` file) | replace | bounded binary IO, corruption refusal; guest `O_SYNC` stays legacy only | per-generation semantic journal events (RULESET/EXPOSURE_INTENT/FORWARD_*/GENERATION_COMPLETE) with generation correlation, sent to the host sink | 05 crash-cut oracle incl. guest crash after host ACK |
 | Forward completion lifecycle | `queue.pending_records`, aggregate delivered stats | missing | nonblocking queue/flush loop | per-record/batch token boundaries and full-write completion/failure callback | partial-write/full-write tests |
 | Semantic Replay loader/runtime | concrete NFSPDLT1/2 loader in `control.c` | replace | CLI replay mode, shared process path, legacy replay tests | load recorded CompiledMutationRule set, run the ordered `CrashContextWindow` programs, same semantic runtime path, separate replay log on the host sink | dynamic replay + multi-generation + compatibility tests |
-| ReplayResult comparator | none | missing | current applied-count diagnostics | per-position batch-signature multiset + delivery comparison and verdict | equivalent/diverged/invalid tests |
+| ReplayResult comparator | none | missing | current applied-count diagnostics | per-position batch-signature multiset + delivery comparison and verdict, in the Controller-side validation layer over sealed production/replay evidence (issue #11) | equivalent/diverged/invalid tests |
 | Legacy compatibility | NFSPARM1/2 + NFSPDLT1/2 | reuse_as_is | validated current campaigns/tests | keep isolated from target semantic ABI; do not expose as semantic capability; never active on a lane together with a target rule set | full existing regression suite |
 | Runner/main integration | `main.c` control or replay mode | extend | process lifecycle, route CLI, stats | schema/runtime inputs, semantic ruleset/replay artifact, replay log output | startup/mode integration tests |
 | HCAP registration | HCAP-07/08/09 describe current concrete layer | extend | stable current capability IDs/evidence | add/update semantic capability only after guest/runtime validation | HCAP source_refs + guest evidence |
@@ -637,7 +637,9 @@ REPLAY_INVALID
 
 를 생성해야 한다.
 
-Comparator는 crash/sanitizer Q2를 판단하지 않는다.
+Comparator는 crash/sanitizer Q2를 판단하지 않는다. Comparator는 Proxy가 아니라 Controller 측
+validation layer에서 봉인된 production/replay evidence를 비교한다(`../02-llm-agent/01` §11.1,
+issue #11).
 
 ### 18. Runner / main integration
 
@@ -1078,8 +1080,8 @@ Target path가 검증되기 전에 current ABI를 제거하거나 의미를 바�
 
 ### Runner / harness
 
-Runner는 추가로 ProtocolSchema artifact, semantic ruleset, semantic Delta/ReplayResult를
-job artifact lineage에 포함해야 한다. 또한 Proxy session마다 rule set을 설치하고, host journal
+Runner는 추가로 ProtocolSchema artifact, semantic ruleset, semantic Delta와 replay journal을 봉인해
+job artifact lineage에 포함해야 한다. ReplayResult는 validation layer가 만든다. 또한 Proxy session마다 rule set을 설치하고, host journal
 sink와 `CrashContextWindow` execution history를 소유한다(§34, issue #2/#3).
 
 HCAP는 implementation gap이 닫히고 guest/runtime evidence가 생긴 뒤 갱신한다.

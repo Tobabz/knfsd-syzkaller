@@ -742,7 +742,7 @@ failure routing
 repair budgets
 evidence lineage
 evidence manifest 검증
-Q1/M1/Q2 deterministic judge (§11.1)
+Q1/M1/Q2 deterministic judge, replay 비교 (§11.1)
 ```
 
 isolated Linux/KVM runner는 다음을 소유한다.
@@ -765,9 +765,10 @@ operational health check (verdict 아님)
 
 이 절은 issue #11에서 합의했다.
 
-Runner는 evidence를 수집하고 봉인하지만 Q1/M1/Q2 verdict를 내리지 않는다. Runner의 health check와
-protocol 동작(generation ABORT, lane quarantine 등)은 실행을 멈추거나 격리하는 운영 판단이며, 그 결과는
-evidence에 사실로 기록한다.
+Runner는 evidence를 수집하고 봉인하지만 Q1/M1/Q2 verdict와 replay 비교 verdict(`REPLAY_*`)를 내리지 않는다.
+Runner의 health check와 protocol 동작(generation ABORT, lane quarantine 등)은 실행을 멈추거나 격리하는
+운영 판단이며, 그 결과는 evidence에 사실로 기록한다. Runner와 Proxy runtime은 `CrashContextWindow`
+replay를 실행하고 replay journal을 봉인할 뿐이다(`03-nfs-proxy/05` §27–§29).
 
 ```text
 EvidenceManifest                 # Runner가 수집 시점에 작성하고 전송 전에 봉인한다
@@ -779,7 +780,7 @@ EvidenceManifest                 # Runner가 수집 시점에 작성하고 전�
     collection / sealing metadata
 ```
 
-Q1/M1/Q2 Judge는 Controller 측 validation layer에서 실행하는 결정적 함수다.
+Q1/M1/Q2 Judge와 replay comparator는 Controller 측 validation layer에서 실행하는 결정적 함수다.
 
 ```text
 verdict = Judge(봉인된 evidence bundle, JudgeProfile, plan / rule set)
@@ -800,6 +801,7 @@ JudgeProfile                     # 버전이 있는 Repository Design Data
     Q1    Q1AdmissibilityProfile: generation integrity, context별 loss 규칙 (`06` §6.1)
     M1    §7 판정 의미, journal / evidence 유효성 규칙
     Q2    sanitizer / crash report 분류 규칙
+    Replay  batch-signature / delivery 비교 의미, schema·runtime 호환 확인, evidence 유효성 규칙
 
 JobPolicy                        # trusted control-plane policy (§4.1)
     baseline 반복 횟수
@@ -821,6 +823,8 @@ state(§7.2)는 M1과 분리된 evidence이며 어떤 policy도 M1 판정을 바
 - invalid evidence, 내부 불일치(서로 모순인 counter, sequence가 끊긴 journal), correlation 불일치로는 확정
   verdict(REACHED / NOT_REACHED, APPLIED / NOT_APPLIED)를 내리지 않는다. 그 Judge는 `INCONCLUSIVE`와
   reason을 기록한다. Q2 상태 집합은 Q2 judge 세부에서 정하되 같은 규칙을 따른다.
+- replay 비교도 같다. 검증에 실패한 bundle로는 비교 verdict를 내지 않는다. `REPLAY_INVALID`는 유효하게
+  봉인된 replay에서 비교 전제가 성립하지 않을 때만 쓴다(`03-nfs-proxy/05` §29).
 - evidence가 repair 입력으로 Agent에 전달될 때도 data로만 다루며 지시로 해석하지 않는다.
 
 ## 12. Repair boundaries

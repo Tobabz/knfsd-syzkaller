@@ -95,10 +95,13 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
   |        |                                             |
   |  Decoder -> Transaction Context -> Resolver          |
   |        -> Edit Applier -> replay batch log           |
-  |                                      |               |
-  |                                      v               |
-  |                                ReplayResult          |
-  +------------------------------------------------------+
+  +--------------------------------------|---------------+
+                                         v
+                                 replay comparator
+                           (validation layer, 01 §11.1)
+                                         |
+                                         v
+                                   ReplayResult
 ```
 
 `(D)`=crash-survival durability point. Runner host journal sink가 framed event append 전체를
@@ -128,10 +131,15 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
 [COMPONENT] Replay
     Runs at:       Runner + Proxy runtime
     Input:         MutationDelta + matching ProtocolSchema + scenario
+    Output:        replay journal (host sink, 봉인)
+
+[COMPONENT] Replay comparator
+    Runs at:       Controller 측 validation layer (`../02-llm-agent/01` §11.1)
+    Input:         봉인된 production / replay evidence + JudgeProfile(Replay)
     Output:        ReplayResult
 
 [DATA] ReplayResult
-    Produced by:   Replay
+    Produced by:   Replay comparator
     Meaning:       replay-time semantic application/delivery comparison
 ```
 
@@ -792,6 +800,10 @@ Edit Applier
 
 ```text
 ReplayResult
+    production_evidence_manifest_sha256
+    replay_evidence_manifest_sha256
+    judge_profile_id
+    schema_id / semantic_runtime_version
     semantic_verdict
     delivery_evidence
 
@@ -809,8 +821,9 @@ ReplayResult
     runtime_errors[]
 ```
 
-Replay는 recorded rule set을 설치하고 window의 program을 순서대로 실행한다. 각 위치에서 production
-generation과 replay generation의 batch를 비교한다. 두 generation의 numeric id는 같을 필요가 없다.
+Replay는 recorded rule set을 설치하고 window의 program을 순서대로 실행해 replay journal을 남긴다.
+comparator가 봉인된 두 evidence에서 각 위치의 production generation과 replay generation batch를
+비교한다(issue #11). 두 generation의 numeric id는 같을 필요가 없다.
 
 ReplayResult는 production MutationDelta를 수정하지 않는 별도 execution result다.
 
@@ -833,6 +846,10 @@ cardinality가 production과 다름을 뜻한다.
 
 `REPLAY_INVALID`는 delta corruption, schema/runtime incompatibility, unsupported
 transform, invalid fixture/resource failure 등으로 의미 있는 비교 자체가 불가능한 경우다.
+
+`REPLAY_INVALID`는 manifest와 correlation 검증을 통과한 봉인 evidence에서만 나온다. 검증에 실패한
+bundle로는 비교 verdict를 내지 않는다. comparator는 그 replay 시도를 invalid evidence로 기록하며,
+evidence를 고친 뒤 replay를 다시 실행한다(`../02-llm-agent/01` §11.1, issue #11).
 
 이 verdict는 Q2 crash reproduced/not reproduced와 별개다.
 
