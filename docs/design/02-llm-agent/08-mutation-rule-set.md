@@ -173,7 +173,7 @@ record_match
 operation: NFS4_OP_OPEN
 
 conditions:
-    request의 open path가 scenario 파일과 같음     # request_context
+    request의 open path가 scenario 파일과 같음     # request_forwarded
     response status is NFS4_OK
 ```
 
@@ -291,12 +291,12 @@ mutation이 의미를 유지하기 위해 반드시 지켜야 하는 조건만 �
 
 ```text
 keep RPC record framing valid
-preserve XID
 do not change operation ordering before OPEN
 mutation must apply to S2C only
 ```
 
-CPU/RAM/time/retry budget은 여기에 넣지 않는다.
+CPU/RAM/time/retry budget은 여기에 넣지 않는다. RPC envelope(xid, cred/verf, prog/vers/proc)는 target
+runtime의 mutation 대상이 아니므로 그 보존을 constraint로 적지 않는다(issue #7).
 
 ## 12. Mutation Rule Compiler / Proxy 경계
 

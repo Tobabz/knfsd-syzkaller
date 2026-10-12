@@ -225,9 +225,12 @@ TransactionEntry
         minor_version?
 
     request
-        semantic_decode_status?
-        operation_sequence[]
-        semantic_context[]
+        original                       # client가 보낸 CALL
+            semantic_decode_status?
+            operation_sequence[]
+            semantic_context[]
+        forwarded                      # peer 노출로 선택한 CALL (§6)
+            original과 같음 | decoded view | undecodable
 
     activation_generation?
 
@@ -288,6 +291,39 @@ NFSv3 response schema 선택에 필요한 `procedure`는 NFS request body semant
 
 반대로 request semantic predicate가 필요한 response mutation은 request decode가
 성공해 해당 metadata가 entry에 attach된 경우에만 사용할 수 있다.
+
+CALL에 semantic mutation이 적용될 수 있으면 entry는 두 request view를 가진다(issue #7).
+`request.forwarded`는 peer에 실제로 노출하도록 선택한 CALL이다.
+
+```text
+receive CALL
+    -> request.original decode / 저장
+    -> 바뀌지 않은 RPC key로 TransactionEntry insert
+    -> Resolver / Edit Applier가 mutated record 후보를 만든다
+
+mutation 없음
+    request.forwarded = request.original
+    original relay
+
+mutation 있음
+    mutated record build / verify
+    -> EXPOSURE_INTENT를 host sink에 append하고 ACK (D)를 기다린다
+
+    ACK 성공
+        mutated record를 노출할 record로 선택
+        final mutated payload를 한 번 decode
+            성공 -> request.forwarded = decoded final request
+            허용된 raw mutation으로 decode 실패 -> request.forwarded = undecodable
+        선택한 mutated bytes relay
+
+    ACK 없음 / event 거부 / durability 실패
+        mutated output을 노출하지 않는다 (`05` §11, issue #3)
+        original을 변조 없이 relay
+        request.forwarded = request.original
+```
+
+이후 socket 실패는 선택된 view를 바꾸지 않고 delivery evidence에만 영향을 준다. RPC envelope는
+변조하지 않으므로(`02` §9) transaction key와 NFSv3 reply schema 선택은 두 view에서 같다.
 
 ### 7. REPLY lookup
 
@@ -358,8 +394,9 @@ minor_version
 operation_sequence[]
 ```
 
-Response decode에서는 wire result discriminant를 우선 해석하고 request summary를
-consistency context로 사용한다.
+Response decode에서는 wire result discriminant를 우선 해석하고 server가 실제로 받은
+`request.forwarded` summary를 consistency context로 사용한다. `forwarded`가 undecodable이면
+request-dependent 검증과 predicate를 쓰지 않는다(§6).
 
 검증할 수 있는 항목:
 
@@ -426,7 +463,7 @@ same key + materially different CALL
 ```
 
 "equivalent" 판정은 downstream response semantics에 영향을 줄 수 있는 request
-metadata가 동일함을 요구한다.
+metadata가 동일함을 요구한다. client가 보낸 `request.original`끼리 비교한다.
 
 Implementation은 필요하면 complete request fingerprint를 사용할 수 있다.
 그 fingerprint는 duplicate detection용 runtime data이며 replay identity가 아니다.
@@ -575,6 +612,9 @@ runtime correlation key
     !=
 replay identity
 ```
+
+replay도 같은 view 규칙을 따른다. production과 replay의 response rule은 같은 이름의 view
+(`request_forwarded` / `request_original`)를 평가한다(issue #7).
 
 ### 20. event-loop ordering
 
@@ -798,6 +838,16 @@ S2C CALL / C2S REPLY
 
 를 동시에 실행해 independent context를 유지해야 한다.
 
+### 14. C2S operation-array mutation 뒤 request view
+
+C2S rule이 COMPOUND에 operation을 추가하고, S2C rule이 request predicate를 쓴다.
+
+Expected:
+- `request_forwarded`를 쓰는 S2C rule은 추가된 operation을 포함한 최종 sequence에 bind한다;
+- 같은 rule이 `request_original`을 쓰면 변조 전 sequence를 본다;
+- 의도적 raw mutation으로 forwarded request가 undecodable이면 request-dependent S2C rule은 거부한다;
+- exposure ACK가 없으면 `forwarded`는 `original`과 같다.
+
 이 검증은 Q1이나 Q2를 증명하지 않는다.
 Transaction Context가 correct request/reply semantic context를 공급함만 증명한다.
 
@@ -823,6 +873,8 @@ Transaction Context가 correct request/reply semantic context를 공급함만 �
 - **결정됨:** NFSv3 response schema dispatch는 live request context를 요구한다.
 - **결정됨:** same connection의 opposite CALL directions는 독립 XID namespace다.
 - **결정됨:** ambiguous duplicate/reuse는 semantic mutation에 fail closed 한다.
+- **결정됨:** entry는 `request.original`과 peer 노출로 선택한 `request.forwarded`를 함께 가진다.
+  response decode와 consistency 검증은 `forwarded`를 쓴다(issue #7).
 - **결정됨:** context memory/lifetime은 bounded여야 한다.
 - **결정됨:** full raw request 장기 보존은 기본 계약이 아니다.
 - **미결:** concrete `connection_id` 생성 방식.

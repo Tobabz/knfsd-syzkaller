@@ -431,6 +431,12 @@ Agent selector의 기본 identity로 사용하지 않는다.
 
 Schema annotation이 제공하지 않는 arbitrary alias를 Agent가 생성할 수 없다.
 
+RPC envelope(`xid`, `cred`/`verf`, `prog`/`vers`/`proc`)는 semantic path가 아니며 초기 target runtime의
+mutation 대상이 아니다. `rpc.call.*` / `rpc.reply.*` namespace는 예약한다. 나중에 envelope mutation을
+넣으면 forwarded XID 기준 re-keying과 original/forwarded envelope identity의 evidence 기록을 함께
+정해야 한다. selector는 `SemanticSelector`의 typed RPC metadata를 계속 쓸 수 있다(issue #7). 현재
+XID mutation은 legacy 경로의 capability로 남는다.
+
 ### 10. WireRef
 
 WireRef는 semantic field가 live rpc_payload 안에서 차지하는 encoding을 명시한다.
@@ -600,7 +606,9 @@ decode_status = transaction_context_missing
 NFSv4 COMPOUND result에는 operation result discriminant가 있으므로 wire schema로
 operation을 식별할 수 있다.
 
-TransactionEntry가 있으면 다음 consistency를 검증하는 데 사용한다.
+TransactionEntry가 있으면 server가 실제로 받은 `request.forwarded`로 다음 consistency를 검증한다
+(`03-transaction-context.md` §6, issue #7). `forwarded`가 undecodable이면 이 검증과 request-dependent
+predicate를 쓰지 않는다.
 
 ```text
 request operation sequence

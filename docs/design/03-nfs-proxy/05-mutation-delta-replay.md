@@ -909,8 +909,8 @@ verifier
 ```
 
 Production/replay snapshot bytes가 달라도 same recorded rule, schema, target path,
-predicate, request context, deterministic transform semantics가 성립하면 semantic replay가
-가능하다.
+predicate, request view(`03-transaction-context.md` §19), deterministic transform semantics가 성립하면
+semantic replay가 가능하다.
 
 ### 33. concrete byte comparison
 

@@ -295,7 +295,7 @@ operation sequence_index == 2
 Nth stateid in the program
 ```
 
-특정 occurrence가 필요하면 같은 operation의 sibling field나 request context를
+특정 occurrence가 필요하면 같은 operation의 sibling field나 request view를
 semantic predicate로 사용한다.
 
 ### 7. SemanticPredicate
@@ -330,7 +330,8 @@ ValueRef
     source
         target
         current_message
-        request_context
+        request_forwarded
+        request_original
     path?
 ```
 
@@ -343,12 +344,20 @@ ValueRef
   상대적으로 resolve하는 것이 기본이다.
 - message-wide reference가 유일하지 않으면 ambiguous다.
 
-`request_context`:
-- matching TransactionEntry에 보존된 request-side semantic value.
-- response target에서 request-side selector/transform에 사용한다.
+`request_forwarded`:
+- matching TransactionEntry의 `request.forwarded`, 즉 server가 실제로 받은 CALL의
+  semantic value.
+- response target에서 request-side selector/transform에 쓴다.
 
-초기 runtime의 source는 이 셋뿐이다. 이전 transaction의 값은 어떤 source로도 읽지 않는다
-(cross-transaction state lineage, §12, issue #6). request-side view의 세부는 issue #7에서 정한다.
+`request_original`:
+- matching TransactionEntry의 `request.original`, 즉 client가 보낸 CALL의 semantic value.
+- 변조 전 request와 비교하려는 rule만 쓴다.
+
+두 request source에는 기본값이 없으며 rule이 view를 이름으로 고른다. 필요한 view가 undecodable이면
+`transaction_context_unusable`로 거부하고 다른 view로 대신하지 않는다(issue #7).
+
+초기 runtime의 source는 이 넷뿐이다. 이전 transaction의 값은 어떤 source로도 읽지 않는다
+(cross-transaction state lineage, §12, issue #6).
 
 ### 9. predicate type rules
 
@@ -382,8 +391,8 @@ Bitmask, set membership 같은 추가 operator는 별도 typed operator로 확�
 
 ### 10. context_dependencies
 
-Compiler는 selector/predicate/transform이 request context에서 읽어야 하는 값을
-명시적으로 dependency set으로 만든다.
+Compiler는 selector/predicate/transform이 request view에서 읽어야 하는 값을
+view별(`forwarded` / `original`) dependency set으로 만든다.
 
 ```text
 context_dependencies[]
@@ -533,6 +542,7 @@ predicate types compatible
 transform types compatible
 structure_policy valid for mutation kind
 context dependencies derivable
+request view named explicitly (request_forwarded / request_original)
 no cross-transaction value reference (else requires_state_lineage)
 application mode == all_matches
 runtime capability advertised
@@ -590,6 +600,9 @@ Message-wide ValueRef가 여러 값으로 resolve되어 의미를 결정할 수 
 `predicate_reference_ambiguous`로 거부한다.
 
 Transaction request field도 request/result correspondence가 증명된 occurrence에만 bind한다.
+correspondence는 server가 받은 `request.forwarded` sequence로 증명한다. `request_original` field를
+response occurrence에 bind하려면 original과 forwarded operation의 대응도 증명돼야 하며, 증명할 수
+없으면 `predicate_reference_ambiguous`다(issue #7).
 
 ### 24. application = all_matches
 
@@ -614,7 +627,9 @@ after_N_messages
 
 ### 25. pre-mutation snapshot invariant
 
-한 record의 모든 semantic rule은 동일한 original live snapshot에서 resolve한다.
+한 record의 모든 semantic rule은 동일한 original live snapshot에서 resolve한다. 이 invariant는 한
+record 안의 규칙이다. response rule이 읽는 request view는 CALL record에서 노출로 선택된 결과다
+(`03-transaction-context.md` §6, issue #7).
 
 ```text
 record R0
@@ -720,6 +735,7 @@ rpc_selector_miss
 schema_mismatch
 decode_unavailable
 transaction_context_missing
+transaction_context_unusable
 target_not_found
 target_ambiguous
 predicate_false
@@ -876,7 +892,8 @@ no sibling field changed
 
 ### 2. request-context predicate
 
-두 response가 같은 operation/status를 가지되 matching request context만 다르게 만든다.
+두 response가 같은 operation/status를 가지되 matching request의 forwarded view만 다르게 만든다.
+C2S operation-array mutation과 결합한 경우는 `03-transaction-context.md` 검증 오라클 14가 다룬다.
 
 Expected:
 - predicate가 true인 transaction만 resolve;
