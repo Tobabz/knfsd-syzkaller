@@ -725,6 +725,11 @@ structure_constraint_failed
 `predicate_false`와 `target_not_found`는 정상 non-match일 수 있다.
 semantic refusal은 mutation이 실행되지 않은 이유로 별도 evidence에 남긴다.
 
+이 결과는 record마다 journal event로 쓰지 않는다. rule별로 집계해 program generation마다
+`GENERATION_COMPLETE` summary에 남긴다(`05-mutation-delta-replay.md` §21, issue #4).
+activation 창 밖의 record는 Resolver에 들어가지 않으며 `outside_activation_window`로 센다
+(`01-architecture.md` §16).
+
 ### 32. current NFSPARM1/2와의 관계
 
 Current NFSPARM1/2는 concrete Layer 0 ABI다.
@@ -754,7 +759,8 @@ Mutation Engine applied + durable evidence + forwarding result
     -> M1 Judge input
 ```
 
-M1의 exact verdict contract는 Agent 설계 후속 문서가 소유한다.
+M1의 verdict 계약은 `../02-llm-agent/01-two-stage-agent-architecture.md` §7이 소유한다
+(issue #4).
 
 ## 설계 근거
 

@@ -16,7 +16,9 @@ concrete mutation evidence를 durable하게 함께 보존하는 semantic replay 
 Replay는 생산 당시 byte offset/original bytes를 그대로 다시 패치하지 않고,
 recorded semantic rule을 동일 Decoder/Transaction Context/Resolver/Mutation Engine
 경로에서 live traffic에 다시 resolve한다. 생산 당시 concrete bytes는 증거로 남지만
-dynamic field의 replay identity가 아니다.
+dynamic field의 replay identity가 아니다. 논리 단위는 program generation 하나
+(`ProgramGenerationExecution`)이고, journal은 crash가 일어나는 guest가 아니라 Runner가 소유한
+host journal sink에 durable하게 기록한다.
 
 ## 해결하려는 문제
 
@@ -76,7 +78,7 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
   |                         | built mutated batch         |
   |                         v                            |
   |                  EXPOSURE_INTENT (D)                 |
-  |                         | durable before exposure    |
+  |                         | host ACK before exposure   |
   |                         v                            |
   |                      relay                           |
   |                         | full write?                |
@@ -85,7 +87,7 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
   +-------------------------|-----------------------------+
                             |
                             v
-                     MutationDelta
+              MutationDelta (Runner host sink)
                             |
                             v
   +------------------- replay execution -----------------+
@@ -99,8 +101,8 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
   +------------------------------------------------------+
 ```
 
-`(D)`=crash-survival durability point.
-원본 MutationDelta는 replay 중 수정하지 않는다.
+`(D)`=crash-survival durability point. Runner host journal sink가 framed event append 전체를
+마친 뒤 보내는 ACK다(§11, issue #3). 원본 MutationDelta는 replay 중 수정하지 않는다.
 
 ## 설계
 
@@ -110,12 +112,18 @@ verify한다. Production original bytes는 evidence이지 default replay selecto
 [DATA] MutationDelta
     Produced by:   Delta Recorder
     Consumed by:   Replay / Crash Report / M1 evidence
-    Scope:         one Stage 2 semantic rule-set execution
+    Scope:         one ProgramGenerationExecution (logical)
 
 [COMPONENT] Delta Recorder
-    Runs at:       Proxy runtime
+    Runs at:       Proxy runtime (guest)
     Input:         CompiledMutationRule[] + applied mutation batches
-    Output:        append-only durable MutationDelta
+    Output:        append-only journal events -> Host Journal Sink
+
+[COMPONENT] Host Journal Sink
+    Runs at:       Runner host (guest 밖)
+    Owned by:      Runner
+    Input:         guest Delta Recorder가 보낸 journal events (untrusted)
+    Output:        durable host journal + 동기 ACK (D)
 
 [COMPONENT] Replay
     Runs at:       Runner + Proxy runtime
@@ -132,7 +140,10 @@ ReplayResult도 Q2 crash reproduction verdict 자체가 아니다.
 
 ### 2. Delta scope
 
-MutationDelta의 logical scope는 **한 semantic rule set의 한 Stage 2 execution**이다.
+MutationDelta의 logical scope는 **한 `ProgramGenerationExecution`**, 즉 한 lane에서
+remote-KCOV generation 하나로 실행한 syz program 하나다(issue #2). 같은 rule set으로 여러
+generation, lane, VM instance를 실행하는 campaign 전체는 `Stage2Campaign`이며 replay 비교 단위가
+아니다. campaign 전체를 한 단위로 묶으면 crash한 program과 그 동안 적용된 batch를 연결할 수 없다.
 
 Current `arm-N.delta`처럼 rule 하나당 독립 reproduction file을 target 기본 단위로
 사용하지 않는다.
@@ -150,8 +161,23 @@ same record
 Rule별 artifact로 분리하면 production에서 같은 pre-mutation snapshot에 함께
 resolve된 batch 관계를 잃는다.
 
-물리적으로 journal을 여러 file/segment로 나눌지는 implementation detail이다.
-Logical artifact는 하나의 rule set과 application journal이다.
+물리적으로 host journal이 여러 generation을 한 file/segment에 multiplex해도 된다. 그것은
+implementation detail이며 replay identity가 아니다. Logical artifact는 한 generation의 rule set과
+application journal이다.
+
+각 event는 다음 correlation을 가진다.
+
+```text
+program_generation_correlation
+    vm_instance_id      # host sink가 channel에서 기록
+    lane_id / proc_id
+    kcov_generation     # correlation 값, replay identity 아님
+    rule_set_id
+    program_digest      # cross-check
+```
+
+host sink는 guest가 보낸 값을 Runner가 설치한 rule set과 현재 activation 상태에 대조한다
+(`01-architecture.md` §16).
 
 ### 3. MutationDelta
 
@@ -161,6 +187,8 @@ MutationDelta
     semantic_runtime_version
     candidate_id
     schema_id
+    rule_set_id
+    program_generation_correlation
 
     rule_set[]
         CompiledMutationRule
@@ -236,6 +264,7 @@ RULESET
 EXPOSURE_INTENT
 FORWARD_COMPLETE
 FORWARD_FAILED
+GENERATION_COMPLETE
 RUN_COMPLETE
 ```
 
@@ -244,13 +273,15 @@ Semantic replay selector나 mutation identity가 아니다.
 
 ### 7. RULESET event
 
-`RULESET`은 traffic mutation이 시작되기 전에 durable해야 한다.
+`RULESET`은 Proxy session에서 traffic mutation이 시작되기 전에 host sink에서 `(D)`에 도달해야
+한다. rule set은 Runner가 Proxy session마다 설치하는 불변 집합이다(`01-architecture.md` §16).
 
 ```text
 RULESET
     semantic_runtime_version
     schema_id
     candidate_id
+    rule_set_id
     CompiledMutationRule[]
 ```
 
@@ -318,6 +349,7 @@ EXPOSURE_INTENT
     semantic_signature
 
     record_context
+        program_generation_correlation   # §2
         direction
         backend
         client
@@ -347,7 +379,10 @@ serialization 설계에서 결정한다.
 ### 11. 왜 exposure 전에 durable하게 쓰는가
 
 Crash를 만든 마지막 mutation은 crash 직후 user-space가 더 이상 journal을 갱신할
-기회를 얻지 못할 수 있다.
+기회를 얻지 못할 수 있다. 더 근본적으로 Proxy는 crash가 일어나는 guest 안에서 실행되고, guest의
+파일은 guest kernel crash나 VM 종료와 함께 사라질 수 있다. syz-manager의 qemu backend는 기본으로
+`-snapshot`을 써서 VM 종료 시 디스크 변경을 버린다. 그래서 guest 안의 `O_SYNC`/`fsync`는 이 계약의
+durability가 아니다(issue #3).
 
 따라서 invariant는:
 
@@ -358,7 +393,19 @@ unrecorded mutated output
 
 이다.
 
-Delta durability가 실패하면 mutated output을 relay에 넘기지 않는다.
+failure domain과 commit point:
+
+| 항목 | 계약 |
+|---|---|
+| 견뎌야 하는 장애 | Proxy process crash, guest kernel crash, VM teardown/교체, Runner process restart |
+| 범위 밖 | Runner host OS/storage 손실. 나중에 범위에 넣으면 `fsync`/`fdatasync`와 directory metadata durability가 `(D)`에 포함된다 |
+| `(D)` | Runner host journal sink가 framed event append 전체를 마친 뒤 보내는 host-generated ACK. userspace buffer 진입이나 부분 `write()`는 해당하지 않는다. ACK되지 않은 부분 append는 torn-tail 규칙(§24)이 처리한다 |
+| transport | 구현 선택이며 request/ACK journal service를 선호한다. guest write-back cache로는 ACK를 만족할 수 없다 |
+| trust | sink는 event를 framing·bound·검증하고, host가 아는 channel identity를 기록하며, guest가 보낸 correlation을 activation 상태와 대조한다 |
+
+Delta durability가 실패하거나 sink가 event를 거부하면 mutated output을 relay에 넘기지 않는다.
+record는 변조 없이 relay하고 그 generation의 evidence는 불완전으로 남긴다. positive evidence가
+없으면 M1은 `INCONCLUSIVE`다(`../02-llm-agent/01-two-stage-agent-architecture.md` §7).
 
 ### 12. production concrete snapshot의 의미
 
@@ -547,6 +594,10 @@ no FORWARD_COMPLETE
 또한 write completion 후 FORWARD_COMPLETE event가 durable해지기 직전에 crash할 수 있다.
 이 경우 peer가 bytes를 받았어도 local journal에서는 delivery_unknown으로 남는다.
 
+host append는 끝났지만 `EXPOSURE_INTENT`의 ACK가 유실될 수도 있다. 이때 Proxy는 mutated output을
+노출하지 않는다. journal에 남은 `EXPOSURE_INTENT`는 적용 evidence로 유지하되, forward event 없이
+delivery로 승격하지 않는다(issue #3).
+
 ### 20. crash-cut state
 
 Journal에서 batch state를 다음처럼 재구성한다.
@@ -568,9 +619,28 @@ EXPOSURE_INTENT + FORWARD_FAILED
 
 이 distinction을 in-place counter 하나로 압축하지 않는다.
 
-### 21. RUN_COMPLETE
+### 21. GENERATION_COMPLETE / RUN_COMPLETE
 
-Clean execution end에서는 optional `RUN_COMPLETE` event를 append할 수 있다.
+program generation이 clean하게 끝나면 그 generation의 deactivation 처리에서 mandatory
+`GENERATION_COMPLETE`를 append한다(issue #4). normal non-match는 record마다 기록하지 않고 여기에
+rule별로 집계한다.
+
+```text
+GENERATION_COMPLETE
+    program_generation_correlation
+    rule_set_id
+    records_seen
+    exposure_batch_count
+    outside_activation_window
+    evidence_path_failures
+    resolver_summary[]        # rule_id별 04 §31 taxonomy count
+```
+
+M1 `NOT_APPLIED`는 activation/deactivation barrier가 모두 ACK되고, clean durable
+`GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없을 때만 성립한다. crash로 summary가
+없으면 그 generation의 M1은 `INCONCLUSIVE`다(`../02-llm-agent/01-two-stage-agent-architecture.md` §7).
+
+Proxy session이 clean하게 끝나면 optional `RUN_COMPLETE` event를 append할 수 있다.
 
 ```text
 RUN_COMPLETE
@@ -580,8 +650,8 @@ RUN_COMPLETE
     forward failed count
 ```
 
-Crash reproduction correctness가 RUN_COMPLETE 존재에 의존하면 안 된다.
-Crash가 목적일 수 있으므로 journal prefix만으로 의미를 복구할 수 있어야 한다.
+Crash reproduction correctness는 RUN_COMPLETE에도, crash한 generation의 GENERATION_COMPLETE에도
+의존하면 안 된다. Crash가 목적일 수 있으므로 journal prefix만으로 의미를 복구할 수 있어야 한다.
 
 ### 22. append-only durability contract
 
@@ -602,26 +672,24 @@ event type/version
 monotonic event_seq
 bounded payload
 integrity check
-synchronous durability before success return
+host sink (D) before success return (§11)
 ```
 
 Exact binary framing/checksum algorithm은 implementation design에서 정한다.
 
-### 23. file creation durability
+### 23. journal 생성과 RULESET durability
 
-Mutation traffic를 시작하기 전에:
+journal file은 Runner host journal sink가 만든다. guest 안의 file 생성과 `O_SYNC`는 이 계약의
+durability가 아니다.
 
-- delta header/rule-set file content가 durable해야 한다.
-- 새 file path가 crash 후 사라지지 않도록 필요한 filesystem metadata durability도
-  확보해야 한다.
-
-구체적으로 `O_SYNC`, `fdatasync/fsync`, parent-directory fsync 중 어떤 조합을
-사용할지는 platform implementation에서 정한다.
+Mutation traffic를 시작하기 전에 RULESET이 host sink에서 `(D)`에 도달해야 한다. 선언한 failure
+domain(§11)에서는 완료된 host append로 충분하다. host OS crash를 범위에 넣으면 그때
+`fsync`/`fdatasync`와 parent-directory metadata durability가 `(D)`에 포함된다.
 
 Contract는:
 
 ```text
-RULESET acknowledged durable
+RULESET acknowledged durable (host sink)
     before
 first mutation exposure
 ```
@@ -653,11 +721,20 @@ Silent skipping 후 replay를 계속하지 않는다.
 Replay에 필요한 logical input:
 
 ```text
-MutationDelta
+recorded rule set (rule_set_id, CompiledMutationRule[])
+CrashContextWindow의 순서 있는 ProgramGenerationExecution 목록
+    각 entry의 syz program
+    각 entry의 MutationDelta
 matching ProtocolSchema(schema_id)
 compatible semantic runtime
-same Stage 2 scenario/harness inputs
+same ReachabilityHarness / fixture / image identity
 ```
+
+crash evidence는 crashing generation 하나가 아니라 `CrashContextWindow`
+(`../02-llm-agent/01-two-stage-agent-architecture.md` §8)에 보존된 선행 generation을 함께 쓴다.
+lane state가 program 사이에 유지되기 때문이다. 필요한 선행 program이나 MutationDelta가 없으면
+multi-generation attribution은 `INCONCLUSIVE`이며 crashing program만 replay하는 것으로 대신하지
+않는다(issue #2).
 
 MutationDelta 자체가 network scenario 전체를 포함한다고 가정하지 않는다.
 
@@ -718,17 +795,22 @@ ReplayResult
     semantic_verdict
     delivery_evidence
 
-    production
-        batch_signature_multiset
-        forward_complete_multiset
+    positions[]                      # CrashContextWindow 순서
+        production_generation        # correlation 값
+        replay_generation            # correlation 값
+        production
+            batch_signature_multiset
+            forward_complete_multiset
+        replay
+            batch_signature_multiset
+            forward_complete_multiset
+        differences[]
 
-    replay
-        batch_signature_multiset
-        forward_complete_multiset
-
-    differences[]
     runtime_errors[]
 ```
+
+Replay는 recorded rule set을 설치하고 window의 program을 순서대로 실행한다. 각 위치에서 production
+generation과 replay generation의 batch를 비교한다. 두 generation의 numeric id는 같을 필요가 없다.
 
 ReplayResult는 production MutationDelta를 수정하지 않는 별도 execution result다.
 
@@ -742,9 +824,9 @@ REPLAY_DIVERGED
 REPLAY_INVALID
 ```
 
-`REPLAY_EQUIVALENT`는 delta/runtime/schema가 compatible하고 production/replay의
-`EXPOSURE_INTENT` semantic batch signature multiset이 동일하며 hard semantic/apply
-refusal이 없음을 뜻한다.
+`REPLAY_EQUIVALENT`는 delta/runtime/schema가 compatible하고, window의 모든 위치에서
+production/replay의 `EXPOSURE_INTENT` semantic batch signature multiset이 동일하며, hard
+semantic/apply refusal이 없음을 뜻한다.
 
 `REPLAY_DIVERGED`는 실행은 valid하지만 missing/extra batch, batch composition 또는
 cardinality가 production과 다름을 뜻한다.
@@ -852,7 +934,7 @@ Production source value snapshot은 evidence다.
 Replay 자체도 target kernel crash를 일으킬 수 있다.
 
 따라서 Replay 실행도 production과 같은 exposure-before-forward durability discipline을
-사용해 별도의 replay execution log를 남겨야 한다.
+사용해 별도의 replay execution log를 남겨야 한다. replay journal도 Runner host sink에 기록한다(§11).
 
 ```text
 production MutationDelta
@@ -889,7 +971,9 @@ Production에 FORWARD_COMPLETE가 존재하는 batch subset은 replay delivery �
 하지만 crash-triggering 마지막 batch가 production에서 delivery_unknown일 수 있으므로
 semantic replay equivalence를 FORWARD_COMPLETE equality 하나에만 묶지 않는다.
 
-M1 Judge가 어떤 delivery state를 성공으로 인정하는지는 후속 Agent contract가 소유한다.
+delivery state와 M1의 관계는 `../02-llm-agent/01-two-stage-agent-architecture.md` §7이 정한다
+(issue #4). `unknown`은 M1 `APPLIED`로 세지만 확인된 delivery가 아니고, `failed`는 그 batch의
+완전한 forward가 성립하지 않았다는 뜻이다.
 
 ### 39. schema/runtime incompatibility
 
@@ -947,7 +1031,9 @@ application cardinality checked
 one-arm-per-file, in-place applied_count update는 target semantic replay identity가 아니다.
 
 Implementation migration에서 NFSPDLT1/2는 legacy compatibility input, concrete
-application evidence subrecord, Layer 0 regression fixture로 남을 수 있다.
+application evidence subrecord, Layer 0 regression fixture로 남을 수 있다. guest 안에 `O_SYNC`로
+쓰는 NFSPDLT file은 legacy 구현과 host unit test 기반일 뿐, target semantic crash evidence의
+durability 기반이 아니다(§11, issue #3).
 
 Dynamic semantic campaign의 top-level artifact는 이 contract의 semantic MutationDelta다.
 새 format magic/version은 implementation gap analysis에서 정한다.
@@ -1040,7 +1126,7 @@ Journal snapshot은 hostile/malformed traffic에서 나온 data를 포함할 수
 
 | 항목 | 요구 |
 |---|---|
-| crash survival | mutated output exposure 전에 EXPOSURE_INTENT durable |
+| crash survival | mutated output exposure 전에 EXPOSURE_INTENT가 host sink `(D)`에 도달 |
 | replay safety | schema/rule/context/target을 live semantic path에서 재검증 |
 | apply safety | replay-current original bytes verify-before-apply |
 | ambiguity | delivery/corruption/schema drift를 explicit state로 남김 |
@@ -1161,6 +1247,41 @@ Expected:
 - separate replay log에 last EXPOSURE_INTENT surviving;
 - production delta unchanged.
 
+### 15. guest crash after host ACK
+
+host sink가 `EXPOSURE_INTENT`를 ACK한 직후 guest kernel crash 또는 VM teardown을 일으킨다.
+
+Expected:
+- host journal에 EXPOSURE_INTENT가 남는다;
+- forward event가 없으므로 delivery_unknown이다;
+- guest 안의 파일에 의존하지 않는다.
+
+### 16. host ACK 유실
+
+host append는 끝나고 ACK만 유실되게 만든다.
+
+Expected:
+- Proxy는 mutated output을 노출하지 않는다;
+- journal의 EXPOSURE_INTENT는 적용 evidence로 남고 delivery로 승격되지 않는다.
+
+### 17. sink 불가 / event 거부
+
+sink를 끊거나 inconsistent correlation event를 보낸다.
+
+Expected:
+- mutated output이 노출되지 않는다;
+- record는 변조 없이 relay된다;
+- 그 generation의 evidence는 불완전이며 M1은 positive evidence가 없으면 `INCONCLUSIVE`다.
+
+### 18. 다음 generation의 crash
+
+generation G에서 rule을 적용하고 G+1에서 crash를 일으킨다.
+
+Expected:
+- `CrashContextWindow`가 G와 G+1을 순서대로 고른다;
+- replay가 위치별로 비교한다;
+- G의 evidence가 없으면 multi-generation attribution은 `INCONCLUSIVE`다.
+
 ## 실패 양상과 진단
 
 | 증상 | 가능한 원인 | 구분하는 관측 | 조치 |
@@ -1177,6 +1298,8 @@ Expected:
 | torn final event | crash during append | valid prefix + incomplete tail | tail 무시 |
 | middle corruption | storage corruption/bug | integrity/sequence failure | artifact invalid |
 | replay orig verify 실패 | replay-time TOCTOU/wrong buffer | current precondition bytes | apply refusal |
+| host ACK 없음 | sink 장애, channel 단절, ACK 유실 | sink/transport 상태, host journal의 intent 존재 여부 | mutated output 노출 안 함, generation evidence 불완전 |
+| crash window 선행 entry 없음 | window bound 초과, program/delta artifact 유실 | `CrashContextWindow` 보존 기록 | multi-generation attribution `INCONCLUSIVE` |
 
 ## 한계와 미결 사항
 
@@ -1185,10 +1308,15 @@ Expected:
 - **결정됨:** production concrete original/mutated bytes는 evidence이며 default replay identity가 아니다.
 - **결정됨:** replay-time current bytes를 새로 resolve하고 verify-before-apply한다.
 - **결정됨:** exact stable original 요구는 semantic predicate로 표현한다.
-- **결정됨:** Delta logical scope는 one semantic rule-set execution이다.
+- **결정됨:** Delta logical scope는 one `ProgramGenerationExecution`이다. physical host journal은
+  여러 generation을 multiplex할 수 있다(issue #2).
+- **결정됨:** crash replay는 `CrashContextWindow`의 순서 있는 generation 목록을 위치별로 비교한다(issue #2).
 - **결정됨:** application durability unit은 one mutated RPC record batch다.
 - **결정됨:** semantic batch signature multiset으로 replay cardinality/composition을 비교한다.
-- **결정됨:** EXPOSURE_INTENT는 mutated output을 relay에 노출하기 전에 durable해야 한다.
+- **결정됨:** EXPOSURE_INTENT는 mutated output을 relay에 노출하기 전에 host sink `(D)`에 도달해야 한다.
+- **결정됨:** failure domain은 Proxy process, guest kernel, VM teardown, Runner process 장애다. host
+  OS/storage 손실은 범위 밖이며 per-event `fsync`는 요구하지 않는다(issue #3).
+- **결정됨:** clean generation마다 `GENERATION_COMPLETE`를 남긴다(issue #4).
 - **결정됨:** production journal은 append-only lifecycle events를 사용한다.
 - **결정됨:** socket delivery와 disk commit의 atomicity gap은 `delivery_unknown`으로 표현한다.
 - **결정됨:** production MutationDelta는 replay 중 immutable이다.
@@ -1199,11 +1327,14 @@ Expected:
 - **미결:** semantic_runtime_version versioning scheme.
 - **미결:** concrete output snapshot 전체를 inline할지 여부.
 - **미결:** ReplayResult on-disk representation.
-- **미결:** filesystem metadata durability implementation details.
+- **미결:** guest-to-host journal transport와 host sink framing 세부.
+- **미결:** ACK timeout으로 노출을 포기한 batch에 sink 복구 뒤
+  `FORWARD_FAILED(reason=not_exposed_after_ack_timeout)`를 남길지. issue #3에 비차단 제안으로 올렸고
+  아직 합의되지 않았다. 남기지 않아도 그 batch는 `delivery_unknown`으로 안전하게 남는다.
 - **미결:** relay full-write completion callback/token API.
 - **미결:** journal size/snapshot value numeric caps.
 - **미결:** legacy NFSPDLT1/2 compatibility reader 유지 여부.
-- **미검증:** synchronous journal writes의 syz-manager throughput 영향.
+- **미검증:** host 동기 ACK와 generation barrier 왕복의 syz-manager throughput 영향.
 
 ## 참조
 
@@ -1234,7 +1365,7 @@ Agent가 replay 가능한 semantic mutation이라고 가정하려면 current imp
 CompiledMutationRule durable serialization
 matching ProtocolSchema retention
 same semantic Resolver/Mutation Engine replay path
-production EXPOSURE_INTENT durability
+production EXPOSURE_INTENT durability (Runner host sink `(D)`)
 dynamic replay-current resolution
 batch signature/cardinality comparison
 replay execution logging

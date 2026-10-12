@@ -220,7 +220,9 @@ knfsd remote coverage enabled
 nfs.localio_enabled=N
 selected NFS version fixed for the run
 lane attribution enabled
-snapshot disabled when four-lane execution is required
+manager snapshot mode (top-level snapshot) disabled
+    when four-lane execution is required
+    (qemu vm.snapshot is a disk-overlay setting and stays at its default)
 ```
 
 CPU/RAM quota, retry 횟수, timeout 같은 운영 policy는 ReachabilityPlan에 넣지 않는다.

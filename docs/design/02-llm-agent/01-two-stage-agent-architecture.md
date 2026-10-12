@@ -176,6 +176,7 @@ APPLICATION CONTROLLER
 
 +-----------------------------+
 | [RUNNER TASK]               |
+| baseline-with-rules gate    |
 | Proxy + syz-manager fuzz    |
 +-------------+---------------+
               |
@@ -210,25 +211,71 @@ APPLICATION CONTROLLER
 
 ```text
 Q1 — Reachability
-    Stage 1 harness가 candidate 함수/코드 지점에 도달했는가?
+    harness 실행이 candidate 함수/코드 지점에 도달했는가?
 
 M1 — Mutation Application
-    의도한 Mutation Engine rule이 의도한 RPC/NFS record에 실제 적용됐는가?
+    rule별로, 의도한 semantic mutation이 실제 record에 적용됐는가?
 
 Q2 — Vulnerability Signal
-    mutation이 적용된 fuzz execution에서 sanitizer/crash signal이 관측됐는가?
+    Stage 2 execution에서 sanitizer/crash signal이 관측됐는가?
 ```
 
-의미는 다음과 같다.
+세 관측은 서로를 대신하지 않는다. Q2는 sanitizer/crash 신호만 판정하는 oracle이며 crash와 candidate의
+연관은 판정하지 않는다(§8). M1 판정 계약은 §7이 소유한다.
 
-| Q1 | M1 | Q2 | 해석 |
-|---|---|---|---|
-| no | n/a | n/a | harness/시나리오가 candidate에 도달하지 못함 |
-| yes | no | no | mutation rule 또는 matching/stream 문제 |
-| yes | yes | no | mutation은 적용됐으나 현재 조건에서는 crash 없음 |
-| yes | yes | yes | vulnerability signal; evidence freeze + replay + human review |
+Stage 2의 실행 단위는 둘로 나눈다(issue #2).
 
-`Q2=no`는 `M1=no`와 절대 같은 결과로 취급하지 않는다.
+```text
+Stage2Campaign
+    한 candidate / harness / rule set의 fuzz campaign.
+    여러 program execution, lane, VM instance에 걸친다.
+
+ProgramGenerationExecution
+    한 lane에서 remote-KCOV generation 하나로 실행한 syz program 하나.
+    M1 evidence와 ReplayResult 비교의 단위다.
+```
+
+fatal sanitizer report로 VM이 죽은 generation은 FINISH 전에 끝나 remote coverage를 publish하지 못한다
+(syzkaller 0001은 generation coverage를 FINISH 성공 전까지 격리한다). 그 generation의 Stage 2 Q1은
+`unavailable`로 기록하며 crash 해석의 조건으로 요구하지 않는다.
+
+해석은 다음 세 표를 따른다(issue #4).
+
+**baseline-with-rules gate.** fuzz campaign 전에 Stage 1 시나리오를 rule set을 설치한 상태로 실행한다.
+반복 횟수는 job policy가 정한다.
+
+| Q1 (target mode/rules) | rule별 M1 | 경로 |
+|---|---|---|
+| NOT_REACHED | any | gate 실패. target mode, rule, runtime 중 어디서 도달성이 퇴행했는지 진단한다. NOT_REACHED가 건전한 음성이 되는 조건은 issue #9에서 정한다 |
+| INCONCLUSIVE | any | runtime/evidence repair 후 gate 재실행 |
+| REACHED | gate가 평가한 rule 중 하나라도 INCONCLUSIVE | runtime/evidence repair 후 gate 재실행. mutation evidence 경로가 확정되기 전에는 fuzz campaign을 시작하지 않는다 |
+| REACHED | baseline traffic 대상으로 표시한 intent의 rule이 NOT_APPLIED (표시는 issue #5) | fuzzing 전에 rule/strategy repair |
+| REACHED | 그 밖 | fuzz campaign 시작 |
+
+표는 위에서부터 처음 맞는 행을 적용한다.
+
+**FINISH를 마친 fuzz generation** (rule별)
+
+| Stage 2 Q1 | M1 | 의미 |
+|---|---|---|
+| REACHED | APPLIED | 도달한 generation에서 mutation이 실행됐다. 취약점이 없다는 결론은 내리지 않는다 |
+| REACHED | NOT_APPLIED | 도달한 generation에서 rule이 match되지 않았다. campaign 단위 진단에 쓴다 |
+| REACHED | INCONCLUSIVE | evidence 공백. 반복되면 infrastructure repair |
+| NOT_REACHED / INCONCLUSIVE | any | 정상 fuzzing data. 개별 generation을 harness 실패로 보내지 않는다 |
+
+**crash (Q2 관측).** rule별로 §8의 `CrashContextWindow` 전체에 대해 평가한다.
+
+| `M1(rule_id, CrashContextWindow)` | 그 rule에 대한 의미 |
+|---|---|
+| window의 한 generation 이상에서 APPLIED | crash 전 또는 crash 중에 그 rule의 mutation이 적용됐다. evidence를 freeze하고 window를 순서대로 replay한 뒤 human review로 보낸다. delivery state가 연관의 강도를 한정한다 |
+| window의 모든 generation에서 NOT_APPLIED | 그 rule은 window 안에서 적용되지 않았다 |
+| APPLIED가 없고 INCONCLUSIVE가 하나 이상 | 그 rule에 대해 미해결. evidence/replay를 조사한다 |
+
+CrashEvidence는 rule별 vector 전체를 보존한다. rule set 전체에 대한 "target mutation 없는 crash" 결론은
+issue #5의 typed hypothesis/group semantics가 정해지거나 rule별 검토를 거친 뒤에만 내린다.
+
+`Q2=no`는 `M1=NOT_APPLIED`와 절대 같은 결과로 취급하지 않는다. `M1=APPLIED`이고 `Q2=no`여도
+"유효한 non-trigger"라는 결론은 내리지 않는다.
 
 ## 4. Stage 1 — Reachability Harness
 
@@ -359,6 +406,7 @@ Stage2Input
 ```
 
 따라서 Stage 2 repair가 Stage 1의 도달성을 우연히 깨뜨리는 것을 검출할 수 있어야 한다.
+이 검출은 fuzz campaign 전에 실행하는 baseline-with-rules gate(§3)가 맡는다.
 
 ### 5.2 Agent SDK 책임
 
@@ -438,40 +486,149 @@ durable arm-N.delta
 
 Proxy ACK는 rule registration만 증명하고 실제 적용을 증명하지 않는다.
 
-따라서 M1은 별도 evidence로 판정한다.
+따라서 M1은 별도 evidence로 판정한다. 이 절의 계약은 issue #4에서 합의했으며 Proxy 구현 M4/M5의
+선행 조건이다.
+
+### 7.1 M1 판정
+
+M1은 `ProgramGenerationExecution`(§3)마다 `rule_id`별로 판정한다.
+
+```text
+M1Status
+    APPLIED
+    NOT_APPLIED
+    INCONCLUSIVE
+```
+
+| 판정 | 조건 |
+|---|---|
+| `APPLIED` | 그 generation에 그 rule의 유효한 host-durable `EXPOSURE_INTENT`가 있다 |
+| `NOT_APPLIED` | activation과 deactivation barrier가 모두 ACK됐고, clean durable `GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없다 |
+| `INCONCLUSIVE` | 그 밖의 모든 경우. crash 뒤 summary가 없는 경우와 barrier 실패를 포함한다 |
+
+crash 뒤 `EXPOSURE_INTENT`가 없다는 사실만으로 `NOT_APPLIED`를 추론하지 않는다.
+여러 rule을 묶는 group 판정은 issue #5의 typed vocabulary가 정해진 뒤 추가한다.
+
+`APPLIED`는 그 generation에서 matching record가 변조됐다는 뜻이다. 그 record가 시나리오가 만든
+traffic인지 ambient traffic인지는 구분하지 않는다(issue #10).
+
+### 7.2 delivery는 별도 차원이다
+
+M1은 적용(application)을 판정하고 전달(delivery)은 판정하지 않는다. 적용된 batch마다 delivery state를
+필수 evidence로 남긴다.
+
+```text
+delivery_state
+    complete   # EXPOSURE_INTENT + FORWARD_COMPLETE
+    failed     # EXPOSURE_INTENT + FORWARD_FAILED
+    unknown    # EXPOSURE_INTENT만 있고 forward 종료 event가 없음
+```
+
+`unknown`은 `APPLIED`로 세지만 확인된 delivery로 세지 않는다. `failed`는 그 batch의 완전한 forward가
+성립하지 않았다는 뜻이다. host append가 끝났지만 ACK가 유실된 `EXPOSURE_INTENT`도 적용 evidence로
+남으며, forward event 없이 delivery로 승격하지 않는다.
+
+### 7.3 non-application evidence
+
+normal non-match를 하나씩 durable하게 기록하지 않는다. generation마다 terminal summary를 남긴다
+(`03-nfs-proxy/05` §21).
+
+```text
+GENERATION_COMPLETE
+    program_generation_correlation   # §7.4, issue #2
+    rule_set_id
+    records_seen
+    exposure_batch_count
+    outside_activation_window
+    evidence_path_failures
+    resolver_summary[]           # rule_id별 03-nfs-proxy/04 §31 taxonomy count
+```
+
+### 7.4 MutationEvidence
 
 ```text
 MutationEvidence
-    mutation_rule_id
-    compiled arm artifact identity
-    delta artifact identity
-    predicate_hits
-    applied
-    refused_orig_diff
-    refused_out_of_range
-    replay application result
-    lane/backend/client identity
+    program_generation_correlation
+        vm_instance_id           # host-stamped
+        lane_id / proc_id
+        kcov_generation
+        rule_set_id
+        program_digest           # cross-check
+    candidate_id
+    barrier_results              # activation / deactivation ACK 여부
+    journal_identity
+    journal_integrity
+    terminal_summary_present
+    resolver_summary[]
+    applied_batches[]
+        batch_id
+        semantic_signature
+        exposure_intent_ref
+        delivery_state
+        forward_event_ref?
+    m1[]
+        rule_id
+        status
+        reason?
 ```
 
-`M1=applied`가 아니면 `Q2=not_observed`라는 결론을 내리지 않는다.
+concrete byte snapshot은 `03-nfs-proxy/05`의 batch journal evidence에 두고 이 객체에 복제하지 않는다.
+
+Q2 판정은 M1과 독립적으로 기록한다. 다만 `M1≠APPLIED`일 때 `Q2=NOT_OBSERVED`를
+"mutation이 trigger하지 못했다"는 결론이나 취약점이 없다는 음성 증거로 해석하지 않는다.
 
 ## 8. Q2 — Crash / Sanitizer Evidence
 
 Stage 2 fuzzing은 `syz-manager`의 ordinary program mutation과 candidate-specific mutation rule을 함께
-사용할 수 있다. 최종 Q2는 단순 "crash file exists"가 아니라 reviewed sanitizer/crash oracle로 판정한다.
+사용한다. rule set은 Runner가 설치하고 executor가 program generation마다 활성화하므로
+(`03-nfs-proxy/01` §16), syzkaller는 program을 변이시키지만 rule 내용은 변이시키지 않는다.
+
+Q2는 sanitizer/crash 신호만 판정하는 oracle이다. 단순 "crash file exists"가 아니라 reviewed
+sanitizer/crash oracle로 판정하되, crash site나 stack이 candidate 경로 안에 있는지를 Q2의 조건으로
+삼지 않는다. candidate와의 연관은 Stage 1 Q1, rule별 M1과 delivery state, crash report, replay,
+human/root-cause review를 묶어 나중에 평가한다. "stack에 candidate symbol이 있음" 같은 deterministic
+heuristic은 triage metadata로만 기록하며 oracle verdict가 아니다.
+
+### 8.1 CrashContextWindow
+
+lane의 knfsd state(client, session, open/lock state)는 program 사이에 유지된다. generation G의
+mutation이 G+1에서 crash를 일으킬 수 있으므로 crash evidence를 crashing generation 하나로 한정하지
+않는다(issue #2).
+
+```text
+CrashContextWindow
+    Runner가 host 측에 보관하는 lane별 순서 있는 execution history
+    entry
+        ProgramGenerationExecution identity (host-stamped)
+        original lane_id / proc_id
+        exact program artifact / digest
+        generation의 MutationDelta 참조
+        activation / deactivation barrier 결과
+    bound
+        job policy에 명시하고 evidence에 기록한다
+```
+
+- crash evidence는 이 history에 실제로 보존된 entry만 고른다.
+- 필요한 선행 program이나 evidence artifact가 없으면 multi-generation mutation attribution은
+  `INCONCLUSIVE`다. crashing program만 replay하는 것으로 대신하지 않는다.
+- window는 VM instance 경계를 넘지 않는다. VM이 재시작되면 lane state도 새로 만들어진다.
+- 구현은 syz-manager `pkg/rpcserver`의 `LastExecuting`(pinned commit 기준 proc별 6개)을 확장한다.
+  `Hanged()`가 `ExecRecord.Proc`를 synthetic 값으로 바꾸므로 lane은 별도 host-known 필드로 보존한다.
+  ring 크기는 구현 세부이며 계약상 bound는 job policy가 정한다.
 
 ```text
 CrashEvidence
     candidate identity
-    Q1 evidence id
-    M1 mutation evidence id
-    syz program / seed artifact identity
-    mutation delta artifact identity
+    Stage 1 Q1 evidence id
+    crashing generation Stage 2 Q1        # fatal report면 unavailable
+    CrashContextWindow
+    M1(rule_id, CrashContextWindow) vector + delivery state
+    rule_set_id
     kernel/syzkaller/image identities
     sanitizer report
     dmesg / stack trace
-    coverage evidence
     crash signature
+    candidate association triage metadata?   # oracle 아님
     replay result
 ```
 
@@ -481,15 +638,20 @@ Mutation-driven crash의 재현 단위는 syz program 하나가 아니다.
 
 ```text
 CrashReproducer
-    = syz program
-    + mutation delta
+    = CrashContextWindow의 순서 있는 ProgramGenerationExecution 목록
+        각 entry의 syz program
+        각 entry의 MutationDelta (generation 단위 semantic batch evidence)
+    + recorded rule set (rule_set_id, CompiledMutationRule[])
     + ReachabilityHarness identity
     + kernel/syzkaller source pins
     + fixture/image identity
 ```
 
-현재 proxy의 durable delta는 mutation이 실제 어떤 bytes에 적용됐는지를 self-contained하게 남기는
-reproduction contract로 사용한다.
+target semantic 경로의 replay는 recorded rule set을 다시 설치하고 program을 순서대로 실행한 뒤
+위치별로 semantic batch를 비교한다(`03-nfs-proxy/05`). numeric generation id는 correlation 값이며
+replay identity가 아니다. production concrete bytes는 evidence로 보존한다.
+
+legacy NFSPARM/NFSPDLT 경로의 재현 단위와 migration 중 사용 여부는 issue #8에서 정한다.
 
 ## 10. Agent SDK와 deterministic boundary
 
@@ -555,12 +717,17 @@ prepared syzkaller/kernel environment use
 VM/fixture
 remote KCOV collection
 Q1 deterministic judge
+proxy rule-set installation (proxy session마다)
 proxy mutation execution/replay
+host-side mutation journal sink (durable ACK, issue #3)
+CrashContextWindow execution history (issue #2)
 M1 deterministic judge
 bounded syz-manager fuzz
 sanitizer/crash collection
 Q2 deterministic judge
 ```
+
+Judge의 실행 위치(Runner 또는 application layer)는 issue #11에서 정한다.
 
 ## 12. Repair boundaries
 
@@ -577,18 +744,32 @@ Reachability Planning unsupported
     -> capability spec update
     -> Stage 1 retry
 
-Q1 reached, M1 not applied
-    -> MutationRuleSet / rule compiler repair
+Stage 2 baseline-with-rules gate (§3)
+    Q1 NOT_REACHED
+        -> target mode / rule / runtime 도달성 퇴행 진단
+    Q1 INCONCLUSIVE, 또는 Q1 REACHED이고 평가한 rule 중 M1 INCONCLUSIVE가 있음
+        -> runtime / evidence path repair
+        -> gate 재실행 (그 전에는 fuzz campaign을 시작하지 않는다)
+    baseline traffic 대상 rule이 NOT_APPLIED
+        -> MutationRuleSet / rule compiler repair
 
-Q1 reached, M1 applied, Q2 not observed
-    -> mutation strategy/search-space refinement
-       또는 valid non-trigger result
+Stage 2 fuzz campaign (campaign 단위 evidence, 임계값은 policy)
+    도달한 generation에서 hypothesis rule이 계속 NOT_APPLIED
+        -> MutationRuleSet / rule compiler repair
+    도달한 generation에서 APPLIED, Q2 미관측
+        -> mutation strategy/search-space refinement
+           취약점이 없다는 결론은 내리지 않는다
 
-Q1 reached, M1 applied, Q2 observed
-    -> stop autonomous mutation repair
-       freeze evidence
-       replay
-       final human review
+Q2 observed
+    CrashContextWindow에서 APPLIED인 rule이 있음
+        -> stop autonomous mutation repair
+           freeze evidence
+               (CrashContextWindow, rule별 M1 vector, delivery state)
+           replay
+           final human review
+    APPLIED인 rule이 없음
+        -> crash evidence 보존, 별도 triage
+           rule set 전체 결론은 issue #5 또는 rule별 검토 뒤에만 내린다
 ```
 
 build dependency, broken fixture, image/config mismatch는 LLM source repair로 보내지 않는다.
@@ -638,7 +819,7 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
 7. [`MutationRuleSet`](08-mutation-rule-set.md) — detailed contract fixed
 8. [`NFS Proxy target architecture`](../03-nfs-proxy/01-architecture.md) — draft
 9. Mutation Rule Compiler
-10. `MutationEvidence` / M1 judge
-11. `CrashEvidence` / Q2 judge
+10. `MutationEvidence` / M1 judge — 판정 계약은 §7에 고정(issue #4), judge 실행 위치는 issue #11
+11. `CrashEvidence` / Q2 judge — Q2 경계와 `CrashContextWindow`는 §8에 고정(issue #2, #4), judge 세부는 미정
 12. repair/state graph
 13. Agent SDK concrete selection and agent/tool definitions

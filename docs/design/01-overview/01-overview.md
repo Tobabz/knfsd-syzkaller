@@ -175,7 +175,9 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 1. **판정을 둘로 나눈다.** 도달(Q1)과 이상 보고(Q2)를 별개의 관측으로 유지한다.
 2. **도달은 remote KCOV와 카운터로 판정한다.** 서버 스레드의 PC를 시나리오 실행에 귀속한다.
    귀속 단위는 **lane**이다. lane N의 서버가 받은 요청은 proc N이 그때 실행 중인 프로그램의 것이다(kernel 0002).
-3. **변조는 Mutation Engine 한 곳에서 한다.** 변조 규칙은 seed에 포함되어 프로그램과 함께 재현된다.
+3. **변조는 Mutation Engine 한 곳에서 한다.** legacy NFSPARM 경로에서는 변조 규칙이 seed에 포함되어 프로그램과
+   함께 재현된다. target semantic 경로에서는 Runner가 설치한 불변 rule set을 executor가 프로그램 generation마다
+   활성화하고, 재현 단위는 순서 있는 generation 목록이다(`docs/design/03-nfs-proxy/01-architecture.md` §16, issue #2).
 4. **격리는 lane 단위로 하고, lane은 병렬로 쓴다.** 한 프로세스의 상태가 다른 프로세스의 관측에 섞이지 않게 하고,
    manager는 proc마다 lane 하나를 동시에 쓴다(`procs` = lane 수, 최상위 `snapshot` 끔).
 5. **sanitizer는 대상 서버가 실행되는 곳에 둔다.** knfsd는 커널 계측(KASAN/KCSAN)이다.
@@ -187,7 +189,7 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 |---|---|
 | 판정 분리 | 보고가 없을 때 원인이 취약점 부재인지 seed 오동작인지 가르려면 서로 다른 관측이 필요하다 |
 | remote KCOV | knfsd는 커널 스레드가 요청을 처리해서 호출자 KCOV로는 보이지 않는다 |
-| 변조 지점 단일화 | 변조가 seed 바이트에 들어 있어야 같은 입력이 같은 변조를 재현한다. Mutation Engine에는 PRNG가 없다 |
+| 변조 지점 단일화 | 변조가 seed 바이트에 들어 있어야 같은 입력이 같은 변조를 재현한다(legacy 경로). target semantic 경로는 seed 대신 `rule_set_id`와 generation 상관 정보를 evidence에 기록해 같은 재현성을 얻는다(issue #2). Mutation Engine에는 PRNG가 없다 |
 | lane 격리 | 동시 실행 프로그램의 요청이 서로의 커버리지에 귀속되면 도달 판정이 오염된다 |
 | lane 단위 귀속 | lane은 proc 하나가 단독 점유한다. 그래서 서버 netns만 보고 소유자를 정할 수 있고, TCP 연결을 분리하는 Mutation Engine이나 레코드를 바꾸는 변조에도 귀속이 유지된다 |
 | KCSAN 비치명 | KCSAN 보고 뒤에도 커널이 살아 있어, 치명 보고와 같이 처리하면 유효한 실행을 버린다 |

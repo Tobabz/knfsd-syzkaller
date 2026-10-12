@@ -45,7 +45,7 @@ STAGE 2 — MUTATION / CRASH TRIGGER
 [DATA] CompiledMutationRule
         |
         v
-[RUNNER TASK] proxy + syz-manager
+[RUNNER TASK] baseline-with-rules gate (§16), then proxy + syz-manager fuzz
         |
         v
 MutationEvidence / CrashEvidence
@@ -397,16 +397,33 @@ Harness Extension Work가 해결된 뒤 Stage 2를 다시 실행한다.
 MutationRuleSet에 `preserve_q1=true` 같은 필드는 넣지 않는다.
 이는 데이터 선택사항이 아니라 Stage 2 전체 invariant다.
 
+Q1 보존을 fuzz program마다 확인하지 않는다. fuzz program 대부분이 candidate에 도달하지 않는 것은
+정상이다. 대신 fuzz campaign 전에 baseline-with-rules gate를 실행한다(`01` §3, issue #4).
+
 ```text
-every Stage 2 execution
+baseline-with-rules gate
+    Stage 1 ReachabilityHarness program
+        + 설치된 rule set
+        + target mode activation
     |
-    +-- Q1 remote KCOV still observed?
-    +-- M1 mutation actually applied?
-    +-- Q2 crash/sanitizer observed?
+    +-- Q1이 여전히 REACHED인가?     (gate pass/fail)
+    +-- rule별 M1은 무엇인가?         (routing 입력)
 ```
 
-mutation 때문에 candidate가 더 이상 remote KCOV에 나타나지 않는다면
-`Q2=no`만으로 non-trigger라고 해석할 수 없다.
+반복 횟수는 job policy가 정한다. gate의 Q1이 `NOT_REACHED`이면 gate 실패로 기록하고 target mode,
+rule, runtime 중 어디서 도달성이 퇴행했는지 진단한다. rule이 도달성을 깨뜨렸다고 바로 단정하지
+않는다. `NOT_REACHED`가 건전한 음성이 되는 조건은 issue #9에서 정한다.
+
+gate의 Q1이 `REACHED`여도 gate가 평가한 rule 중 하나라도 M1이 `INCONCLUSIVE`이면 runtime/evidence
+path를 고친 뒤 gate를 다시 실행한다. mutation evidence 경로가 확정되기 전에는 fuzz campaign을 시작하지
+않는다.
+
+baseline traffic을 대상으로 한다고 표시한 intent의 rule이 gate에서 `NOT_APPLIED`이면 fuzz budget을
+쓰기 전에 rule/strategy repair로 보낸다. 이 표시는 issue #5의 typed vocabulary에서 정한다.
+
+fuzz campaign 동안 개별 generation의 Q1 miss는 정상 data다. repair/search routing은 campaign 단위
+evidence로 판단하며 임계값은 policy가 소유한다. fatal crash generation은 remote coverage를 publish하지
+못하므로 그 Stage 2 Q1은 `unavailable`로 기록한다.
 
 Stage 2 runtime evidence는 Q1, M1, Q2를 계속 분리해서 보존한다.
 

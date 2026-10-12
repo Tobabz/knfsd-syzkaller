@@ -36,7 +36,8 @@ add
     semantic MutationDelta / Replay
 ```
 
-이다.
+이다. 그리고 `tools/nfs-proxy` 밖의 syzkaller/Runner 통합(S1: executor activation
+barrier, Runner host journal sink, `CrashContextWindow`)이 함께 필요하다(§34).
 
 가장 큰 architectural incompatibility는 current `control.c`의 v1 -> v2 sequential
 mutation과 `edit.c`의 equal-offset rule-order tie-break다. Target runtime은 모든
@@ -79,6 +80,9 @@ Target design이 구현보다 앞서 있으므로 다음 질문에 답해야 한
   Semantic Delta Recorder ---------------- NFSPDLT1/2 (different)
   Replay --------------------------------- concrete replay only
   Forward completion evidence ------------ aggregate queue stats only
+  Host journal sink (Runner) ------------- missing (deltas in guest)
+  Generation activation (executor) ------- program-scoped legacy arm
+  CrashContextWindow (syz-manager) ------- LastExecuting (partial)
         |
         v
   Gap Matrix
@@ -114,18 +118,21 @@ Target Agent-facing path와 current compatibility path는 병존할 수 있다.
 | NFS Semantic Decoder | `walk.c` only COMPOUND header/first opcode/raw body | missing | cursor/XDR helpers, current header tests | full NFSv3 + v4.0/v4.1/v4.2 schema walk, SemanticField/WireRef | 02 contract oracle |
 | ConnectionRef | `struct conn` pairs client/backend sockets | extend | connection lifecycle, route, half-close handling | stable `connection_id`; pass lifecycle/ID to semantic callbacks | reconnect/fd-slot reuse test |
 | Transaction Context | none | missing | same-thread event loop ordering | connection_id + call_direction + XID table, lifecycle, bounded retention | 03 contract oracle |
-| Semantic control ABI | NFSPARM1/NFSPARM2 | missing | Unix SOCK_SEQPACKET control transport, ACK/lifetime model | versioned semantic rule-set serialization, schema/runtime IDs, typed rules | decode/validation/FD lifetime tests |
+| Semantic control ABI | NFSPARM1/NFSPARM2 (program-armed, FD lifetime) | missing | Unix SOCK_SEQPACKET control transport, ACK model | Runner-installed immutable rule set per proxy session (`rule_set_id`); executor-only activation/deactivation barrier per generation; versioned rule-set serialization, schema/runtime IDs, typed rules; legacy arm refusal while target is installed | decode/validation, barrier ACK-loss/orphan, endpoint isolation tests |
 | Semantic Rule Resolver | none | missing | current route scoping concepts | selector/predicate/transform/context dependency runtime | 04 contract oracle |
 | Concrete Mutation Engine | `delta.c`, `edit.c` | reuse_with_adapter | verify-before-patch, original-coordinate rebuild, overlap refusal, one-pass output rebuild | consume conflict-free concrete edit batches instead of matching raw rules; remove semantic dependence on rule order | current tests + batch adapter tests |
 | Structure derivation | `edit.c` op-count + record-marker rebuild | extend | COMPOUND op-count bump, final marker rebuild | schema-derived length/count/padding/discriminant fixups from final structure | preserve/raw semantic tests |
 | Rule-set same-snapshot preflight | v1 then v2 sequential in `control.c` | replace | v2 multi-rule batch aggregation idea | all semantic rules resolve on original record; global conflict preflight; one final apply | registration-order permutation tests |
-| Delta Recorder | NFSPDLT1/2 writer | replace | O_SYNC durability foundation, bounded binary IO, corruption refusal | rule-set semantic journal, append-only RULESET/EXPOSURE_INTENT/FORWARD_* events | 05 crash-cut oracle |
+| Delta Recorder | NFSPDLT1/2 writer (guest `O_SYNC` file) | replace | bounded binary IO, corruption refusal; guest `O_SYNC` stays legacy only | per-generation semantic journal events (RULESET/EXPOSURE_INTENT/FORWARD_*/GENERATION_COMPLETE) with generation correlation, sent to the host sink | 05 crash-cut oracle incl. guest crash after host ACK |
 | Forward completion lifecycle | `queue.pending_records`, aggregate delivered stats | missing | nonblocking queue/flush loop | per-record/batch token boundaries and full-write completion/failure callback | partial-write/full-write tests |
-| Semantic Replay loader/runtime | concrete NFSPDLT1/2 loader in `control.c` | replace | CLI replay mode, shared process path, legacy replay tests | load recorded CompiledMutationRule set, same semantic runtime path, separate replay log | dynamic replay + compatibility tests |
-| ReplayResult comparator | none | missing | current applied-count diagnostics | batch-signature multiset + delivery comparison and verdict | equivalent/diverged/invalid tests |
-| Legacy compatibility | NFSPARM1/2 + NFSPDLT1/2 | reuse_as_is | validated current campaigns/tests | keep isolated from target semantic ABI; do not expose as semantic capability | full existing regression suite |
+| Semantic Replay loader/runtime | concrete NFSPDLT1/2 loader in `control.c` | replace | CLI replay mode, shared process path, legacy replay tests | load recorded CompiledMutationRule set, run the ordered `CrashContextWindow` programs, same semantic runtime path, separate replay log on the host sink | dynamic replay + multi-generation + compatibility tests |
+| ReplayResult comparator | none | missing | current applied-count diagnostics | per-position batch-signature multiset + delivery comparison and verdict | equivalent/diverged/invalid tests |
+| Legacy compatibility | NFSPARM1/2 + NFSPDLT1/2 | reuse_as_is | validated current campaigns/tests | keep isolated from target semantic ABI; do not expose as semantic capability; never active on a lane together with a target rule set | full existing regression suite |
 | Runner/main integration | `main.c` control or replay mode | extend | process lifecycle, route CLI, stats | schema/runtime inputs, semantic ruleset/replay artifact, replay log output | startup/mode integration tests |
 | HCAP registration | HCAP-07/08/09 describe current concrete layer | extend | stable current capability IDs/evidence | add/update semantic capability only after guest/runtime validation | HCAP source_refs + guest evidence |
+| Host journal sink (Runner) | none; deltas live in the guest | missing | read-only 9P host share exists for fixture input only | Runner-owned sink, guest-to-host channel, host ACK after full framed append, channel identity stamping, untrusted-event validation | 05 oracles 15-17 |
+| Executor generation activation (syzkaller) | `syz_arm_nfs_proxy*` program-scoped arm (0017/0019); KCOV generation BEGIN/FINISH (0001/0002) | missing | generation boundary, orphan cleanup, 0008 fail-closed lane path | activation/deactivation barrier around program syscalls, orphan-path deactivation before ABORT, generation id and barrier result in exec results, no semantic rule struct in syzlang | barrier, ACK-loss, orphan tests |
+| CrashContextWindow (syz-manager) | `pkg/rpcserver` `LastExecuting` (6 programs per proc; `Hanged()` rewrites `Proc`) | extend | per-proc ring of recent programs, crash-time `Collect()` | executor-reported generation id, host-known original lane/proc, MutationDelta references, bound as explicit job policy | crash join with a predecessor generation |
 
 ### 3. Record Framer / RpcRecord
 
@@ -414,12 +421,24 @@ New semantic registration must carry format/runtime version, schema_id, rule ide
 traffic scope, RPC/NFS selector, semantic target, typed predicates/transform,
 structure policy, context dependencies, and `all_matches` application semantics.
 
+The ownership model also changes (issue #2). The current arm is registered by the syz program
+through `syz_arm_nfs_proxy*` and lives as long as that program's FD. In the target, the Runner
+installs one immutable `CompiledMutationRule[]` per proxy session (`rule_set_id`), and the
+executor activates it per remote-KCOV program generation with ACK barriers
+(`01-architecture.md` §16). The current control socket is reachable only from the executor
+sandbox, so Runner installation needs its own path.
+
 #### Required change
 
-Keep the control transport and lifetime concept, but add a new versioned semantic rule-set
-serialization/registration path. NFSPARM1/2 remain legacy compatibility messages.
+Keep the control transport, but add:
 
-Do not overload NFSPARM2 fields to smuggle semantic paths or dynamic transforms.
+- a versioned semantic rule-set serialization and a Runner-only installation path per proxy session;
+- executor-only activation(G)/deactivation(G) messages with ACK, unreachable from fuzz program code;
+- barrier-failure handling: activation ACK missing → program not executed, generation ABORT; deactivation ACK missing or unconfirmed inactive state → no lane reuse until cleared, otherwise quarantine/restart;
+- refusal of legacy arm registration while a target rule set is installed (legacy and target are mutually exclusive per lane).
+
+NFSPARM1/2 remain legacy compatibility messages. Do not overload NFSPARM2 fields to smuggle
+semantic paths or dynamic transforms.
 
 ### 10. Semantic Rule Resolver
 
@@ -512,17 +531,23 @@ write가 성공해야 mutated output을 relay에 반환한다.
 
 #### Gap
 
-Target MutationDelta는 one semantic rule-set execution, recorded CompiledMutationRule[],
-append-only RULESET/EXPOSURE_INTENT/FORWARD_* journal, batch signatures와 concrete evidence를
-요구한다.
+Target MutationDelta는 one `ProgramGenerationExecution`, recorded CompiledMutationRule[],
+append-only RULESET/EXPOSURE_INTENT/FORWARD_*/GENERATION_COMPLETE journal, generation
+correlation, batch signatures와 concrete evidence를 요구한다.
 
 Current one-arm file + in-place count model은 이 lifecycle을 표현하지 못한다.
 
+durability 위치도 맞지 않는다. Current delta file은 guest 안에 있다(`bundle/lane/lane.sh`의
+`--delta-dir "$lane_root/server/deltas"`, root는 `/tmp/frozen-phase9.manager`). guest kernel crash나
+VM 종료(qemu `-snapshot` 기본값)가 일어나면 그 file이 사라질 수 있으므로 guest `O_SYNC`는 target
+durability 기반이 아니다(issue #3).
+
 #### Required change
 
-새 semantic journal writer/reader를 구현한다. Endian helpers, bounded validation,
-synchronous durability discipline, corruption refusal patterns는 재사용할 수 있다.
-NFSPDLT1/2 format은 legacy compatibility로 유지한다.
+새 semantic journal writer/reader를 구현하고, event를 Runner host journal sink로 보낸다. `(D)`는
+host sink가 framed event append 전체를 마친 뒤 보내는 ACK다. Endian helpers, bounded validation,
+corruption refusal patterns는 재사용할 수 있다. NFSPDLT1/2 format과 guest `O_SYNC` writer는
+legacy compatibility와 host unit test 기반으로 유지한다.
 
 ### 15. Forward completion lifecycle
 
@@ -582,10 +607,13 @@ Target replay는 recorded semantic `CompiledMutationRule[]`을 로드하고 Deco
 Transaction Context -> Resolver -> Mutation Engine의 same path를 사용해야 한다.
 
 또한 production Delta는 immutable이고 replay execution journal / ReplayResult는 별도다.
+crash replay는 crashing program 하나가 아니라 `CrashContextWindow`의 순서 있는 generation 목록을
+실행하고 위치별로 비교한다(issue #2).
 
 #### Required change
 
-새 semantic replay loader/runtime를 추가한다.
+새 semantic replay loader/runtime를 추가한다. recorded rule set을 설치하고 window의 program을 순서대로
+실행하며, replay journal도 host sink에 기록한다.
 
 Legacy `--replay NFSPDLT1/2` path는 compatibility mode로 유지 가능하다.
 CLI/file magic dispatch가 semantic delta를 별도 target path로 선택하게 해야 한다.
@@ -598,8 +626,8 @@ CLI/file magic dispatch가 semantic delta를 별도 target path로 선택하게 
 
 #### Required change
 
-새 comparator가 production/replay의 record-level semantic batch signature multiset과
-delivery evidence를 비교해:
+새 comparator가 window 위치별로 production/replay의 record-level semantic batch signature
+multiset과 delivery evidence를 비교해:
 
 ```text
 REPLAY_EQUIVALENT
@@ -757,22 +785,29 @@ M1  Canonical RpcRecord + RPC Decoder + ConnectionRef
 M2  ProtocolSchema + NFS Semantic Decoder
         |
         v
-M3  Transaction Context
+M3  Transaction Context (+ activation_generation)
         |
         v
-M4  Semantic rule ABI + Resolver + concrete edit adapter
+M4  Semantic rule ABI + Resolver + concrete edit adapter   <-- S1a
         |
         v
-M5  Semantic Delta journal + relay completion lifecycle
+M5  Semantic Delta journal (host sink) + relay completion  <-- S1b
         |
         v
-M6  Semantic Replay + ReplayResult
+M6  Semantic Replay + ReplayResult                         <-- S1c
         |
         v
 M7  Guest/runtime validation + HCAP update
+
+S1  syzkaller / Runner integration (병행 track, §34)
+    S1a rule set 설치 경로, executor activation/deactivation barrier
+    S1b Runner host journal sink + guest-to-host channel
+    S1c CrashContextWindow + replay sequence 실행
 ```
 
-각 milestone은 다음 단계의 input contract를 실제 코드/테스트로 제공한다.
+각 milestone은 다음 단계의 input contract를 실제 코드/테스트로 제공한다. 화살표의 S1 항목은 해당
+milestone을 완료하기 전에 있어야 한다. M4/M5 전에 M1 판정 계약
+(`../02-llm-agent/01-two-stage-agent-architecture.md` §7)이 고정되어 있어야 하며, issue #4에서 고정됐다.
 
 ### 23. M0 — Legacy baseline lock
 
@@ -852,15 +887,22 @@ semantic rule registration order permutation
 
 Legacy v1->v2 chain behavior는 compatibility path에만 남긴다.
 
+M4는 activation 창 eligibility도 구현한다. 새 CALL은 activation ACK와 deactivation ACK 사이에서만,
+REPLY는 CALL의 `activation_generation`으로 판단하며, 창 밖 record는 `outside_activation_window`로
+센다(`01-architecture.md` §16). resolver 결과는 rule별로 집계해 M5의 `GENERATION_COMPLETE`에 넘긴다.
+
 ### 28. M5 — Semantic Delta journal / relay completion
 
 Required:
-- semantic RULESET durable registration.
-- EXPOSURE_INTENT before enqueue/exposure.
+- semantic RULESET durable registration (host sink `(D)`).
+- EXPOSURE_INTENT host ACK before enqueue/exposure.
+- every event carries `program_generation_correlation`.
+- GENERATION_COMPLETE with per-rule resolver summary, `outside_activation_window`, evidence-path failure counters.
 - queue record/token metadata.
 - full-write complete/failure callback.
 - FORWARD_COMPLETE/FORWARD_FAILED append.
 - torn-tail/corruption handling.
+- S1b host journal sink and guest-to-host channel.
 
 이 단계 전에는 target M1 delivery evidence contract가 구현됐다고 볼 수 없다.
 
@@ -873,8 +915,9 @@ Required:
 - semantic Delta reader.
 - recorded CompiledMutationRule[] registration.
 - matching schema/runtime compatibility gate.
-- separate replay execution journal.
-- batch-signature multiset comparator.
+- separate replay execution journal (host sink).
+- ordered `CrashContextWindow` program sequence execution (S1c).
+- per-position batch-signature multiset comparator.
 - REPLAY_EQUIVALENT / DIVERGED / INVALID result.
 
 Legacy NFSPDLT1/2 replay는 compatibility path로 계속 regression test한다.
@@ -937,8 +980,48 @@ semantic_replay.*    replay comparison/orchestration
 6. durable EXPOSURE_INTENT 없이 mutated bytes를 enqueue하는 문제.
 7. missing completion을 definite delivery로 overclaim하는 문제.
 8. semantic refactor가 existing NFSPARM1/2 regression을 깨뜨리는 문제.
+9. activation ACK 유실을 비활성으로 오인해 target mode program을 실행하는 문제.
+10. host ACK 없이 guest 파일 기록만으로 durability를 주장하는 문제.
 
 이 seams는 implementation review/test plan의 우선 관측점이다.
+
+### 34. syzkaller / Runner integration (S1)
+
+target semantic 경로는 `tools/nfs-proxy`만으로 완성되지 않는다. issue #2와 #3에서 합의한 다음 작업은
+syzkaller patch series와 Runner에 속한다.
+
+#### S1a — rule set 설치와 executor activation
+
+- Runner가 Proxy session마다 불변 `CompiledMutationRule[]`을 설치하는 경로. 현재 control socket은
+  executor sandbox에만 bind되므로 별도 경로가 필요하다.
+- executor가 remote-KCOV BEGIN 뒤 activation(G)를 보내고 ACK를 받은 다음 program syscall을 실행하며,
+  FINISH/ABORT 전에 deactivation(G)를 보내고 ACK를 받는다(syzkaller 0001/0002의 generation 경계 위).
+- activation ACK가 없으면 program을 실행하지 않고 generation을 ABORT한다. deactivation ACK가 없거나 비활성
+  상태를 확인할 수 없으면 lane을 재사용하지 않고 격리/재시작한다. 기존 0008 fail-closed runner 경로를
+  쓸 수 있다.
+- fork-server parent의 orphan cleanup도 ABORT 전에 deactivation을 시도한다.
+- activation endpoint는 executor 전용이며 fuzz program syscall로 도달할 수 없다.
+- exec result에 generation id와 barrier 결과를 보고한다.
+- target semantic rule struct를 syzlang에 추가하지 않는다. legacy `syz_arm_nfs_proxy*`는 legacy campaign용으로
+  그대로 두고, target campaign에서는 manager call filtering으로도 막는다.
+
+#### S1b — Runner host journal sink
+
+- guest Proxy의 journal event를 받는 Runner 소유 sink와 guest-to-host channel.
+- framed event append 전체를 마친 뒤 host-generated ACK를 보낸다. guest write-back cache로는 ACK를 만족할
+  수 없다.
+- channel identity(`vm_instance_id` 등)를 host가 기록하고, guest event는 untrusted data로 검증한다.
+
+#### S1c — CrashContextWindow와 replay sequence
+
+- syz-manager `pkg/rpcserver`의 `LastExecuting` ring(pinned commit 기준 proc별 6개)을 확장해
+  executor가 보고한 generation id, host-known original lane/proc, MutationDelta 참조를 함께 보존한다.
+  `Hanged()`가 `ExecRecord.Proc`를 synthetic 값으로 바꾸므로 lane을 그 필드에서 유도하지 않는다.
+- window bound는 job policy로 명시하고 evidence에 기록한다. window는 VM instance를 넘지 않는다.
+- replay는 window의 program을 순서대로 실행한다.
+
+S1 변경은 syzkaller patch family로 들어가며 AGENTS.md의 pseudo-syscall/executor 규칙(executor,
+`pkg/vminfo`, syzlang, test를 한 patch family로 조정하고 `series`를 갱신)을 따른다.
 
 ## 설계 근거
 
@@ -996,7 +1079,8 @@ Target path가 검증되기 전에 current ABI를 제거하거나 의미를 바�
 ### Runner / harness
 
 Runner는 추가로 ProtocolSchema artifact, semantic ruleset, semantic Delta/ReplayResult를
-job artifact lineage에 포함해야 한다.
+job artifact lineage에 포함해야 한다. 또한 Proxy session마다 rule set을 설치하고, host journal
+sink와 `CrashContextWindow` execution history를 소유한다(§34, issue #2/#3).
 
 HCAP는 implementation gap이 닫히고 guest/runtime evidence가 생긴 뒤 갱신한다.
 
@@ -1132,7 +1216,13 @@ Host tests 뒤 실제 lane/guest에서 semantic request/response mutation과 rep
 - **결정됨:** semantic Delta/Replay는 current NFSPDLT1/2 top-level format을 그대로 확장하지 않는다.
 - **결정됨:** relay full-write completion tracking은 새 기능이 필요하다.
 - **결정됨:** legacy NFSPARM/NFSPDLT path는 migration 중 유지한다.
-- **결정됨:** implementation order는 M0-M7 dependency sequence를 따른다.
+- **결정됨:** implementation order는 M0-M7 dependency sequence를 따르고, S1 track이 M4/M5/M6 완료의
+  선행 조건이다(§22, §34).
+- **결정됨:** rule 내용은 Runner가 Proxy session마다 설치하고 활성 구간은 executor가 generation마다
+  barrier로 정한다(issue #2).
+- **결정됨:** target durability는 Runner host journal sink의 ACK다. guest `O_SYNC` writer는 legacy다(issue #3).
+- **결정됨:** M1 판정 계약은 M4/M5의 선행 조건이며 `../02-llm-agent/01-two-stage-agent-architecture.md`
+  §7에 고정됐다(issue #4).
 - **미결:** exact ProtocolSchema source/artifact paths.
 - **미결:** concrete new source filenames/API naming.
 - **미결:** semantic rule serialization binary/text format.
@@ -1141,6 +1231,7 @@ Host tests 뒤 실제 lane/guest에서 semantic request/response mutation과 rep
 - **미결:** initial protocol operation coverage subset.
 - **미결:** numeric limits for context/rules/resolved edits/journal snapshots.
 - **미결:** v4.0 separate callback routing을 initial implementation에 포함할지 별도 milestone로 둘지.
+- **미결:** guest-to-host journal transport, rule set 설치 경로, activation 메시지 형식.
 - **미검증:** current source refactor 후 syz-manager workload performance.
 
 ## 참조

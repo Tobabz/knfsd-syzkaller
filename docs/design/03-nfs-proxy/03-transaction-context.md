@@ -229,6 +229,8 @@ TransactionEntry
         operation_sequence[]
         semantic_context[]
 
+    activation_generation?
+
     lifecycle
         state
             awaiting_reply
@@ -249,6 +251,11 @@ TransactionEntry
 `semantic_context[]`는 response decode나 active semantic rule이 실제로 필요로 하는
 typed request metadata를 뜻한다. 모든 request packet을 무조건 장기간 보존하는
 계약은 아니다.
+
+entry는 `activation_generation`도 가진다. CALL을 관측한 시점에 그 lane에서 활성화된 program
+generation이며, activation 창 밖에서 관측한 CALL은 값이 없다. REPLY의 mutation eligibility는 이
+값으로 판단한다. 그래서 G 안에서 시작한 CALL의 REPLY는 deactivation 뒤 drain 중에 도착해도 G의
+rule set으로 처리하고, 창 밖 CALL의 REPLY는 변조하지 않는다(`01-architecture.md` §16, issue #2).
 
 ### 6. CALL 관측 순서
 
@@ -555,6 +562,7 @@ active CompiledMutationRule의 response predicate에 필요한 request values
 connection_id
 call_direction
 xid
+activation_generation
 created_at
 table slot
 duplicate count

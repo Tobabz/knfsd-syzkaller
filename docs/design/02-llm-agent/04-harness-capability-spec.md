@@ -196,7 +196,9 @@ purpose:
 
 constraints:
     manager procs=4
-    vm.snapshot=false for normal parallel operation
+    manager snapshot=false for normal parallel operation
+        (top-level snapshot fuzzing mode; issue #3)
+    vm.snapshot (qemu -snapshot disk overlay) keeps its default
     nfs.localio_enabled=N
     koov.nfs_version=3|4.0|4.1|4.2
 

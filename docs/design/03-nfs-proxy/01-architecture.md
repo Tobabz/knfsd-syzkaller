@@ -91,10 +91,11 @@ mutation + durable delta
   |        | mutated RPC                 | MutationDelta    |
   +--------|-----------------------------|------------------+
            v                             v
-       peer/server                     Runner
+       peer/server               Runner host sink
 ```
 
-`(M)`은 M1 evidence가 생성되는 관측 지점이다.
+`(M)`은 M1 evidence가 생성되는 관측 지점이다. MutationDelta는 guest 밖의 Runner host sink에
+durable하게 기록된다(§12).
 읽는 순서는 위에서 아래이며, RPC는 Proxy 안에서 semantic record로 해석된다.
 
 ## 설계
@@ -506,12 +507,12 @@ transaction-derived transform
 [`05-mutation-delta-replay.md`](05-mutation-delta-replay.md)에 정의한다.
 
 MutationDelta는 recorded `CompiledMutationRule[]`과 production concrete application
-evidence를 함께 보존한다.
+evidence를 함께 보존한다. 논리 단위는 `ProgramGenerationExecution` 하나다(issue #2).
 
 ```text
 CompiledMutationRule[]
         |
-        +--> RULESET durable
+        +--> RULESET durable (host sink)
         |
 ResolvedMutation[]
         |
@@ -521,7 +522,7 @@ Mutation Engine
         +--> final mutated batch
                 |
                 v
-          EXPOSURE_INTENT durable
+          EXPOSURE_INTENT durable (host ACK)
                 |
                 v
               relay
@@ -533,13 +534,16 @@ Mutation Engine
 MutationDelta
     schema/runtime identity
     rule_set[]
+    program_generation_correlation
     append-only journal[]
         EXPOSURE_INTENT
         FORWARD_COMPLETE / FORWARD_FAILED
+        GENERATION_COMPLETE
 ```
 
-Crash 직전 mutation의 reproduction record가 유실되어서는 안 된다.
-따라서 EXPOSURE_INTENT가 durable하기 전에 mutated output을 peer에 노출하지 않는다.
+Crash 직전 mutation의 reproduction record가 유실되어서는 안 된다. Proxy는 crash가 일어나는
+guest 안에서 실행되므로 durable 기록은 guest 밖, Runner가 소유한 host journal sink에 둔다(issue #3).
+EXPOSURE_INTENT에 대한 host ACK를 받기 전에는 mutated output을 peer에 노출하지 않는다.
 
 ### 13. `[COMPONENT] Replay`
 
@@ -547,7 +551,8 @@ Crash 직전 mutation의 reproduction record가 유실되어서는 안 된다.
 [`05-mutation-delta-replay.md`](05-mutation-delta-replay.md)에 정의한다.
 
 Replay도 별도 ad-hoc byte patcher가 아니라 같은 semantic resolution/application
-경로를 사용한다.
+경로를 사용한다. recorded rule set을 다시 설치하고 `CrashContextWindow`의 program을 순서대로
+실행하며, generation 위치별로 semantic batch를 비교한다(issue #2).
 
 ```text
 MutationDelta
@@ -647,21 +652,62 @@ ResolvedMutation
 
 ### 16. `[RUNNER TASK]` Proxy lifecycle
 
-Runner가 Proxy process와 rule lifetime을 관리한다.
+rule의 **내용**은 Runner가 소유하고, rule의 **활성 구간**은 executor가 소유한다(issue #2).
 
 ```text
-Stage 2 execution
+Stage2Campaign
     |
     +-- lane/route 준비
-    +-- Proxy 시작
-    +-- CompiledMutationRule 등록
-    +-- scenario / syz-manager 실행
-    +-- mutation evidence 수집
-    +-- MutationDelta 수집
-    +-- Proxy 종료
+    +-- Proxy session 시작
+    |     Runner가 Compiler가 검증한 불변 CompiledMutationRule[] 하나를 설치
+    |     rule_set_id(digest)로 식별, RULESET을 host sink에 durable 기록
+    |
+    +-- syz-manager / scenario 실행
+    |     program generation마다 (executor)
+    |       BEGIN -> generation G
+    |       activation(G) 요청, Proxy ACK 대기
+    |       program syscall 실행
+    |       deactivation(G) 요청, Proxy ACK 대기
+    |       FINISH / ABORT
+    |
+    +-- mutation evidence / MutationDelta는 host sink에 누적
+    +-- Proxy session 종료
 ```
 
-Rule은 job/lane execution lifetime 밖으로 누출되지 않는다.
+rule set은 Proxy session 동안 바뀌지 않는다. rule set을 바꾸면 새 session/campaign이다.
+target semantic rule은 syzlang 인자가 아니며 syzkaller가 변이시키지 않는다. Rule은 job/lane
+execution lifetime 밖으로 누출되지 않는다.
+
+eligibility:
+
+- 새 CALL record는 activation ACK와 deactivation ACK 사이에서만 eligible하다.
+- REPLY는 자기 CALL의 TransactionEntry에 기록된 generation으로 판단한다. G 안에서 시작한 CALL의
+  REPLY는 drain 중에 도착해도 eligible하다([`03-transaction-context.md`](03-transaction-context.md) §5).
+- managed generation이 없는 실행(comparison/hint 실행, bind 실패, remote cover 비활성)은 변조하지 않는다.
+- eligible하지 않은 record는 변조 없이 relay하고 `outside_activation_window`로 센다.
+- deactivation 직전에 변조된 record가 CLOSING 이후 knfsd에 도착하면 coverage 귀속을 잃는다.
+  journal은 그 record를 G에 남긴다. 이 잔여 위험은 문서화된 한계다.
+
+barrier 실패:
+
+| 상황 | 동작 |
+|---|---|
+| activation ACK 없음 | program을 실행하지 않는다. activation lease를 해제하고 generation을 ABORT하며, 실행과 evidence를 `INCONCLUSIVE`로 표시한다 |
+| deactivation ACK 없음 | kernel generation이 멈추지 않게 FINISH/ABORT는 진행한다. 남은 activation이 해제됐음을 확인할 때까지 그 lane에서 target mode generation을 더 실행하지 않는다 |
+| orphan (BEGIN과 FINISH 사이에 program process 종료) | ABORT 전에 deactivation과 lease 해제를 시도한다 |
+| 위 경우에 비활성 상태를 확인할 수 없음 | 재사용 전에 Proxy/lane을 격리하거나 재시작한다. 예: syzkaller 0008의 fail-closed runner 경로(VM/lane 재생성) |
+
+ACK 유실은 요청 유실을 뜻하지 않는다. 그래서 activation ACK가 없을 때 rule set이 비활성이라고
+가정하고 program을 실행하지 않는다.
+
+activation endpoint는 executor 전용이다. executor가 상속한 private fd나 fuzz namespace 밖의 endpoint를
+쓰며, fuzz program의 unix socket syscall로는 도달할 수 없다.
+
+`vm_instance_id`와 channel/lane identity는 host가 기록한다. guest가 보낸 generation과 `rule_set_id`는
+설치된 rule set과 현재 activation에 대조할 뿐 그대로 신뢰하지 않는다.
+
+legacy NFSPARM arm과 target mode는 한 lane에서 동시에 활성화되지 않는다. target rule set이 설치된
+동안 Proxy가 legacy arm 등록을 거부하는 것이 최종 경계이고, manager의 call filtering은 추가 방어선이다.
 
 Proxy가 backend/client를 임의 선택하지 않는다.
 Traffic scope는 Stage 1에서 선택한 route에 맞춰 Controller/Runner가 bind한다.
@@ -686,8 +732,9 @@ mutated record forwarding result
 durable delta result
 ```
 
-`MutationEvidence / M1 Judge`의 정확한 verdict 계약은 Agent 설계에서 별도로
-정의한다.
+M1 verdict 계약은 `../02-llm-agent/01-two-stage-agent-architecture.md` §7이 소유한다
+(issue #4). M1은 rule별 `APPLIED` / `NOT_APPLIED` / `INCONCLUSIVE`이고, delivery state
+(`complete` / `failed` / `unknown`)는 M1과 분리된 필수 evidence다.
 
 Q2는 crash/sanitizer Judge가 별도로 판정한다.
 
@@ -799,6 +846,10 @@ Semantic decode와 transaction state는 현재 byte-only mutation보다 CPU/memo
 Decoder가 지원하지 않는 protocol은 byte guess로 fallback하지 않고 명시적으로
 unsupported를 보고하므로 일부 campaign은 harness extension으로 block될 수 있다.
 
+mutated record마다 `EXPOSURE_INTENT`의 host ACK를 기다리므로 guest-to-host 동기 왕복이 생긴다.
+program generation마다 activation/deactivation barrier 왕복도 두 번 생긴다. 처리량 영향은 실제
+manager workload에서 측정한다.
+
 ## 신뢰성 요구
 
 가장 위험한 오류는 **거짓 양성 M1**이다.
@@ -880,9 +931,13 @@ failed precondition
 
 - **미결:** NFS semantic schema를 generated codec으로 만들지 hand-written codec으로
   만들지 결정하지 않았다.
-- **미결:** Agent/Runner가 Proxy에 전달하는 semantic control ABI와 versioning.
+- **결정됨:** rule 내용은 Runner가 Proxy session마다 불변 rule set으로 설치하고, 활성 구간은
+  executor가 program generation마다 ACK barrier로 정한다(§16, issue #2).
+- **미결:** rule set 설치 경로와 activation/deactivation 메시지의 serialization/versioning.
 - **미결:** runtime-derived `value_or_transform`의 DSL/typed representation.
-- **미결:** Delta write-ahead와 peer forwarding 사이의 exact commit protocol.
+- **결정됨:** write-ahead commit point `(D)`는 Runner host journal sink가 framed event append 전체를
+  마친 뒤 보내는 ACK다(§12, `05-mutation-delta-replay.md`, issue #3).
+- **미결:** guest-to-host journal transport 방식. 단, guest write-back cache로는 ACK를 만족할 수 없다.
 - **미결:** runtime-dynamic field replay에서 exact original bytes와 semantic
   precondition의 관계.
 - **미결:** transaction timeout/eviction policy와 bounded memory limits.
