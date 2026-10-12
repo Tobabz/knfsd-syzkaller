@@ -253,7 +253,7 @@ fatal sanitizer report로 VM이 죽은 generation은 FINISH 전에 끝나 remote
 | NOT_REACHED | any | gate 실패. target mode, rule, runtime 중 어디서 도달성이 퇴행했는지 진단한다. NOT_REACHED는 `06` §9의 조건을 만족할 때만 나온다(issue #9) |
 | INCONCLUSIVE | any | runtime/evidence repair 후 gate 재실행. reason이 `unsupported_attribution`이면 `06` §13의 gap 경로 |
 | REACHED | gate가 평가한 rule 중 하나라도 INCONCLUSIVE | runtime/evidence repair 후 gate 재실행. mutation evidence 경로가 확정되기 전에는 fuzz campaign을 시작하지 않는다 |
-| REACHED | baseline traffic 대상으로 표시한 intent의 rule이 NOT_APPLIED (표시는 issue #5) | fuzzing 전에 rule/strategy repair |
+| REACHED | `targets_baseline_traffic=true`인 intent의 M1(§7.1)이 NOT_APPLIED | fuzzing 전에 rule/strategy repair |
 | REACHED | 그 밖 | fuzz campaign 시작 |
 
 표는 위에서부터 처음 맞는 행을 적용한다.
@@ -271,8 +271,8 @@ gate의 neutral run에도 rule set을 설치한다. 결과는 oracle이 아니�
   증명이 아니다.
 - 두 flag는 인과 해석만 한정한다. scenario traffic을 주장하는 hypothesis에는 그 traffic을 구분하는 typed
   selector/predicate나 matched-control evidence가 필요하다. background traffic을 의도한 strategy에서는
-  `ambient_applied` rule도 hypothesis에 남을 수 있다. campaign 경로는 issue #5의 typed hypothesis
-  semantics가 정한다.
+  `ambient_applied` rule도 hypothesis에 남을 수 있다. campaign 경로는 §7.1의 hypothesis 집계를
+  따른다(issue #5).
 
 **FINISH를 마친 fuzz generation** (rule별)
 
@@ -291,8 +291,8 @@ gate의 neutral run에도 rule set을 설치한다. 결과는 oracle이 아니�
 | window의 모든 generation에서 NOT_APPLIED | 그 rule은 window 안에서 적용되지 않았다 |
 | APPLIED가 없고 INCONCLUSIVE가 하나 이상 | 그 rule에 대해 미해결. evidence/replay를 조사한다 |
 
-CrashEvidence는 rule별 vector 전체를 보존한다. rule set 전체에 대한 "target mutation 없는 crash" 결론은
-issue #5의 typed hypothesis/group semantics가 정해지거나 rule별 검토를 거친 뒤에만 내린다.
+CrashEvidence는 rule별·intent별·generation별 vector 전체를 보존한다. hypothesis 단위 결론은 §7.1의
+`HypothesisM1(CrashContextWindow)`로 내린다(issue #5).
 
 `Q2=no`는 `M1=NOT_APPLIED`와 절대 같은 결과로 취급하지 않는다. `M1=APPLIED`이고 `Q2=no`여도
 "유효한 non-trigger"라는 결론은 내리지 않는다.
@@ -457,18 +457,19 @@ Agent 출력은 raw host command가 아니라 `MutationRuleSet`이다.
 ```text
 MutationRuleSet
     candidate_id
-    intents[]
-        direction
+    intents[]                  # typed MutationIntent (08 §5)
+        intent_id
         traffic_scope
-        record_match
-        edit
-        expected_effect
-        constraints[]
+        selector
+        mutation
+        targets_baseline_traffic
+        expected_effect          # 실행하지 않는 설명
+    hypotheses[]
     uncertainties[]
 ```
 
-Agent는 semantic field/operation을 선택한다.
-Mutation Rule Compiler는 이 intent를 검증·정규화해 `CompiledMutationRule`로 낮추고,
+Agent는 runtime의 typed vocabulary로 intent를 쓴다. prose는 실행하지 않는다(issue #5).
+Mutation Rule Compiler는 이 intent를 결정적으로 검증·bind해 `CompiledMutationRule`로 낮추고,
 live offset/current value/original bytes는 Proxy가 실제 RPC record를 decode한 뒤 runtime에 resolve한다.
 
 목표 Proxy architecture는
@@ -532,7 +533,30 @@ M1Status
 | `INCONCLUSIVE` | 그 밖의 모든 경우. crash 뒤 summary가 없는 경우와 barrier 실패를 포함한다 |
 
 crash 뒤 `EXPOSURE_INTENT`가 없다는 사실만으로 `NOT_APPLIED`를 추론하지 않는다.
-여러 rule을 묶는 group 판정은 issue #5의 typed vocabulary가 정해진 뒤 추가한다.
+
+rule M1은 intent와 hypothesis로 집계한다(issue #5). intent 하나는 Compiler가 만든 rule 하나 이상을 가진다
+(`08` §12).
+
+```text
+IntentM1(generation)
+    APPLIED        child rule 중 하나라도 APPLIED
+    NOT_APPLIED    모든 child rule이 NOT_APPLIED
+    INCONCLUSIVE   그 밖
+
+HypothesisM1(generation)                 # requirement: all
+    APPLIED        모든 member intent가 이 generation에서 APPLIED
+    NOT_APPLIED    member intent 중 하나라도 NOT_APPLIED
+    INCONCLUSIVE   그 밖
+
+HypothesisM1(CrashContextWindow)
+    APPLIED        HypothesisM1(generation)이 APPLIED인 generation이 하나 이상
+    NOT_APPLIED    모든 generation에서 NOT_APPLIED
+    INCONCLUSIVE   그 밖
+```
+
+member intent가 서로 다른 generation에서 적용된 것은 joint 적용으로 보지 않는다. generation을 넘는 joint
+trigger는 replay와 review로 다루며, 결정적으로 주장하려면 이후의 typed ordering/state 계약이 필요하다
+(issue #6). intent별·generation별 vector는 항상 보존한다.
 
 `APPLIED`는 그 generation에서 matching record가 변조됐다는 뜻이다. 그 record가 시나리오가 만든
 traffic인지 ambient traffic인지는 구분하지 않는다(issue #10). neutral run에서도 적용되는지는 gate가
@@ -596,10 +620,13 @@ MutationEvidence                 # Runner가 수집하고 봉인한다 (§11.1)
 M1Result                         # M1 Judge 출력 (§11.1)
     evidence_manifest_sha256
     judge_profile_id
-    m1[]
+    m1[]                         # rule별
         rule_id
+        intent_id
         status
         reason?
+    intent_m1[]                  # §7.1 집계
+    hypothesis_m1[]
 ```
 
 concrete byte snapshot은 `03-nfs-proxy/05`의 batch journal evidence에 두고 MutationEvidence에 복제하지 않는다.
@@ -653,6 +680,7 @@ CrashEvidence
     crashing generation Stage 2 Q1        # fatal report면 unavailable
     CrashContextWindow
     M1(rule_id, CrashContextWindow) vector + delivery state
+    intent / hypothesis M1 집계            # §7.1
     rule_set_id
     kernel/syzkaller/image identities
     sanitizer report
@@ -852,11 +880,11 @@ Stage 2 baseline-with-rules gate (§3)
     Q1 INCONCLUSIVE, 또는 Q1 REACHED이고 평가한 rule 중 M1 INCONCLUSIVE가 있음
         -> runtime / evidence path repair
         -> gate 재실행 (그 전에는 fuzz campaign을 시작하지 않는다)
-    baseline traffic 대상 rule이 NOT_APPLIED
+    targets_baseline_traffic=true인 intent가 NOT_APPLIED
         -> MutationRuleSet / rule compiler repair
 
 Stage 2 fuzz campaign (campaign 단위 evidence, 임계값은 policy)
-    도달한 generation에서 hypothesis rule이 계속 NOT_APPLIED
+    도달한 generation에서 hypothesis가 계속 NOT_APPLIED (§7.1)
         -> MutationRuleSet / rule compiler repair
     도달한 generation에서 APPLIED, Q2 미관측
         -> mutation strategy/search-space refinement
@@ -871,7 +899,7 @@ Q2 observed
            final human review
     APPLIED인 rule이 없음
         -> crash evidence 보존, 별도 triage
-           rule set 전체 결론은 issue #5 또는 rule별 검토 뒤에만 내린다
+           hypothesis 단위 결론은 §7.1의 window 집계로 내린다
 ```
 
 build dependency, broken fixture, image/config mismatch는 LLM source repair로 보내지 않는다.

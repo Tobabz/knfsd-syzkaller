@@ -150,6 +150,7 @@ Edit Applier만 실제 bytes를 바꾼다.
 CompiledMutationRule
     identity
         rule_id
+        intent_id
         candidate_id
         schema_id
 
@@ -178,6 +179,8 @@ CompiledMutationRule
 
 `rule_id`는 job/evidence lineage용 logical ID다.
 content hash이거나 replay selector일 필요는 없다.
+Compiler가 결정적으로 만들며 rule set artifact 안에서 유일하다. `intent_id`는 부모 Agent intent다.
+intent 하나는 rule 하나 이상으로 낮아진다(`../02-llm-agent/08-mutation-rule-set.md` §12, issue #5).
 
 `schema_id`는 Compiler가 검증한 ProtocolSchema와 runtime Decoder가 사용한 schema가
 같은 contract인지 확인하는 데 사용한다.
@@ -253,7 +256,7 @@ Structural target:
 ```text
 target
     kind: operation_array
-    path: nfs4.request.COMPOUND.operations
+    path: nfs4.request.COMPOUND.args.argarray
 ```
 
 `part`는 Decoder의 `WireRef` 의미를 사용한다.
@@ -321,7 +324,7 @@ SemanticPredicate
 
 초기 contract는 general-purpose boolean expression language를 만들지 않는다.
 OR가 필요하면 Compiler가 non-overlapping alternative rule로 낮출 수 있는지
-검증하고, 그렇지 않으면 unsupported로 처리한다.
+검증하고, 그렇지 않으면 unsupported로 처리한다. alternative rule은 같은 `intent_id`를 가진다.
 
 ### 8. ValueRef
 
@@ -547,6 +550,11 @@ no cross-transaction value reference (else requires_state_lineage)
 application mode == all_matches
 runtime capability advertised
 ```
+
+실패는 typed reason으로 돌려준다. `unknown_path`, `type_mismatch`, `message_type_inconsistent`,
+`missing_required_field`는 Agent가 고칠 입력 오류이고, `unsupported_capability`와
+`requires_state_lineage`는 `HarnessGapIssue(gap_class=mutation_engine)`로 간다
+(`../02-llm-agent/08-mutation-rule-set.md` §12, issue #5).
 
 Compiler는 live record가 아직 없으므로 actual selector match, current field value,
 current WireRef offset, current TransactionEntry presence, runtime rule conflict를

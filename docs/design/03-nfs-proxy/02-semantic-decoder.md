@@ -426,6 +426,9 @@ claim.null.filename
 claim.previous.delegate_type
 ```
 
+NFSv4 COMPOUND 자체는 procedure node로 쓴다. operation array target의 path는
+`nfs4.request.COMPOUND.args.argarray`와 `nfs4.response.COMPOUND.result.resarray`다(`04` §5, issue #5).
+
 Array의 element index는 decoder output 안에서 structural metadata로 사용할 수 있지만
 Agent selector의 기본 identity로 사용하지 않는다.
 
