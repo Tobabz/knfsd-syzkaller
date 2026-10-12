@@ -14,8 +14,10 @@
 #include <unistd.h>
 
 #ifndef MSG_DONTWAIT
-/* Every listener/accepted arm fd is put in O_NONBLOCK mode before these flags
- * are used.  Linux also offers per-call MSG_DONTWAIT; Darwin does not. */
+/* MSG_DONTWAIT is not POSIX.  glibc defines it whatever the feature macros, so
+ * on Linux this block is never compiled.  Darwin has it too, but hides it under
+ * _POSIX_C_SOURCE (line 1).  0 is a correct stand-in: the flag is only passed
+ * with accepted arm fds, which nfsp_control_tick() makes O_NONBLOCK first. */
 #define MSG_DONTWAIT 0
 #endif
 

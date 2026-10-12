@@ -4,18 +4,23 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/relay/control tests under clang and a
-required ASan+UBSan toolchain pass (`SANCC`, default `gcc`). It also compiles
-the guest delta-replay probe as a build-only regression gate. On Darwin the
-ASan runtime does not support LeakSanitizer, so leak detection alone is
-disabled there; ASan+UBSan execution remains mandatory. Darwin also lacks
-`AF_UNIX/SOCK_SEQPACKET`, which is the real legacy control transport. Rather
-than substituting a stream socket or skipping that behavior, `build.sh` runs an
-exact Linux compatibility gate in `debian:bookworm` through Docker when the
-native runtime probe fails. `build-guest.sh --out FILE` creates a Debian bookworm ABI
-guest binary after those checks. The two backend listeners are routed solely
-by destination IP, and the source IP identifies the client. `SERVER_IMPL=both`
-provides `.1:2049 → knfsd :20490` and `.5:2049 → Ganesha :20491`.
+`build.sh` runs host framing/walk/delta/golden/relay/control tests under clang
+and a required ASan+UBSan toolchain pass (`SANCC`, default `gcc`).
+`test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2` delta files
+independently of their writer and reader. `build.sh` also compiles the guest
+delta-replay probe as a build-only regression gate. On Darwin the ASan runtime
+does not support LeakSanitizer, so leak detection alone is disabled there;
+ASan+UBSan execution remains mandatory. Two runtime tests need Linux behavior:
+`test_control` needs `AF_UNIX/SOCK_SEQPACKET`, the real legacy control
+transport, and `test_proxy` needs its loopback topology (listeners on
+`127.0.0.2`/`.3`, clients on `127.0.0.10`/`.11`). Darwin lacks the first and,
+without lo0 aliases, the second. Where either is missing, `build.sh` still
+compiles both and then runs the whole suite in `debian:bookworm` through
+Docker, rather than substitute a stream socket or another topology, or skip the
+test. `build-guest.sh --out FILE` creates a Debian bookworm ABI guest binary
+after those checks. The two backend listeners are routed solely by destination
+IP, and the source IP identifies the client. `SERVER_IMPL=both` provides
+`.1:2049 → knfsd :20490` and `.5:2049 → Ganesha :20491`.
 NFSv3 calls pass through the engine's TCP proxy; their MOUNT requests go directly to the
 backends on pinned ports. Typed operation matching is defined for NFSv4
 COMPOUND requests, while v3 messages expose only the RPC header and raw body.

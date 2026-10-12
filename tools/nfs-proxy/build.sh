@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # tools/nfs-proxy/build.sh -- build the proxy and run the host test suite.
 #
-# No cmake, no ninja, no root.  Native Linux needs only clang/gcc + libc.  A
-# host whose AF_UNIX implementation lacks SOCK_SEQPACKET (notably Darwin)
-# cannot execute the legacy control transport faithfully; on that host the
-# script requires Docker for an exact Linux runtime gate rather than substituting
-# a different socket type or silently skipping the test.
+# No cmake, no ninja, no root.  Native Linux needs only clang/gcc + libc.
+#
+# Two runtime tests need Linux behaviour that other hosts, notably Darwin, lack:
+# test_control needs AF_UNIX/SOCK_SEQPACKET, the legacy arm transport, and
+# test_proxy needs its loopback address topology (see test/test_proxy.c).  On
+# such a host both are still compiled natively, and then the script requires
+# Docker to run the whole suite in a Linux container -- the Linux gate below --
+# rather than substitute another socket type or topology, or skip the test.
 #
 # Usage:
 #   tools/nfs-proxy/build.sh            build + run every test
-#   tools/nfs-proxy/build.sh --test     run tests only (assumes built)
+#   tools/nfs-proxy/build.sh --test     run the existing binaries without
+#                                       rebuilding them; the Linux gate, when
+#                                       needed, still builds from source
 #   tools/nfs-proxy/build.sh --clean
 #
 # WHY THE TESTS COME FIRST
@@ -74,6 +79,8 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_golden:$TEST/test_golden.c:$SRC/delta.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
+# Units whose runtime test this host cannot run; the Linux gate runs them.
+DEFERRED=
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
 for c in "$CC" "$SANCC"; do
@@ -139,6 +146,32 @@ else
 	echo "  AF_UNIX/SOCK_SEQPACKET runtime: unavailable; Linux gate required"
 fi
 
+# ASAN_OPTIONS: abort on the first error so a finding cannot be lost in a long
+# log.  detect_leaks is on wherever LeakSanitizer exists -- a proxy that leaks
+# per connection would only show up after many trials -- and off only on
+# Darwin, whose ASan runtime has none (see the header).
+run_sanitized() {
+	ASAN_OPTIONS="detect_leaks=$ASAN_DETECT_LEAKS:abort_on_error=1" \
+	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 "$@"
+}
+
+# test_proxy refuses to run when its address topology does not work on this
+# host, before any thread exists (main() in test/test_proxy.c).  That refusal
+# is what keeps such a host out of the watchdog, so it is exercised on every
+# host: a refusal that stopped working must not pass for a host that has the
+# topology.
+check_proxy_guard() {
+	rc=0
+	out=$("$@" --simulate-unusable-addresses 2>&1) || rc=$?
+	case $out in
+	"FAIL: fixture addresses unusable: simulated; no test thread was started")
+		[ "$rc" -eq 3 ] && return 0 ;;
+	esac
+	echo "FATAL: $* did not refuse a simulated unusable topology (exit $rc):" >&2
+	printf '%s\n' "$out" >&2
+	return 1
+}
+
 run_unit() {
 	name=$1
 	shift
@@ -162,8 +195,25 @@ run_unit() {
 
 	[ -x "$primary" ] || { echo "FATAL: $primary missing" >&2; return 1; }
 	[ -x "$asan" ] || { echo "FATAL: $asan missing" >&2; return 1; }
+	defer=
 	if [ "$name" = test_control ] && [ "$NATIVE_SEQPACKET" -eq 0 ]; then
-		echo "  OK: $name compiled natively; exact runtime test deferred to Linux gate"
+		defer="no AF_UNIX/SOCK_SEQPACKET"
+	fi
+	if [ "$name" = test_proxy ]; then
+		check_proxy_guard "$primary" || return 1
+		check_proxy_guard run_sanitized "$asan" || return 1
+		rc=0
+		why=$("$primary" --check-addresses) || rc=$?
+		case $rc in
+		0) ;;
+		3) defer=${why#fixture addresses unusable: } ;;
+		*) echo "FATAL: $name --check-addresses exited $rc: $why" >&2
+		   return 1 ;;
+		esac
+	fi
+	if [ -n "$defer" ]; then
+		DEFERRED="$DEFERRED $name"
+		echo "  DEFERRED: $name compiled natively; runtime test goes to the Linux gate ($defer)"
 		return 0
 	fi
 
@@ -171,29 +221,38 @@ run_unit() {
 		echo "TEST FAILED: $name" >&2
 		return 1
 	fi
-	# ASAN_OPTIONS: abort on the first error so a finding cannot be lost in a
-	# long log; detect_leaks=1 because a proxy that leaks per connection would
-	# only show up after many trials.
-	if ! ASAN_OPTIONS="detect_leaks=$ASAN_DETECT_LEAKS:abort_on_error=1" \
-	     UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 "$asan"; then
+	if ! run_sanitized "$asan"; then
 		echo "SANITIZER FAILED: $name" >&2
 		return 1
 	fi
 	echo "  OK: $name (primary + sanitizer)"
 }
 
-run_linux_seqpacket_gate() {
-	[ "$NATIVE_SEQPACKET" -eq 0 ] || return 0
+# THE LINUX GATE runs when a unit was deferred above.  It copies this directory
+# into a fresh container (debian:bookworm unless NFSP_LINUX_TEST_IMAGE is set),
+# installs the toolchains with apt-get -- so it needs network access to a
+# Debian mirror -- and runs the full build.sh there, every unit included.  It
+# always builds from source, even under --test, because the host binaries are
+# not Linux binaries.  The container runs on Docker's native platform (e.g.
+# linux/arm64 on Apple silicon): it checks Linux socket behaviour, not the guest
+# architecture, which build-guest.sh pins.
+#
+# Packages: clang and gcc are the two strict toolchains (gcc also brings the
+# ASan/UBSan runtimes); libc6-dev supplies the C headers and crt objects, which
+# gcc only recommends; ca-certificates matters only if the image's apt sources
+# use HTTPS.
+run_linux_gate() {
+	[ -n "$DEFERRED" ] || return 0
 	command -v docker >/dev/null 2>&1 || {
-		echo "FATAL: host lacks AF_UNIX/SOCK_SEQPACKET and Docker is unavailable" >&2
+		echo "FATAL: the Linux gate must run$DEFERRED, and Docker is unavailable" >&2
 		return 1
 	}
 	docker info >/dev/null 2>&1 || {
-		echo "FATAL: host lacks AF_UNIX/SOCK_SEQPACKET and Docker daemon is not running" >&2
+		echo "FATAL: the Linux gate must run$DEFERRED, and the Docker daemon is not running" >&2
 		return 1
 	}
 	echo
-	echo "=== Linux SOCK_SEQPACKET compatibility gate ($LINUX_TEST_IMAGE) ==="
+	echo "=== Linux gate ($LINUX_TEST_IMAGE) for:$DEFERRED ==="
 	docker run --rm --init \
 		--mount "type=bind,src=$HERE,dst=/src,readonly" \
 		"$LINUX_TEST_IMAGE" bash -lc '
@@ -202,10 +261,13 @@ run_linux_seqpacket_gate() {
 			apt-get install -qq -y --no-install-recommends clang gcc libc6-dev ca-certificates \
 				>/tmp/nfsp-apt.log 2>&1 || { tail -80 /tmp/nfsp-apt.log >&2; exit 1; }
 			cp -a /src /tmp/nfs-proxy
+			# build/ holds the host binaries; build everything here.
+			rm -rf /tmp/nfs-proxy/build
 			cd /tmp/nfs-proxy
+			echo "Linux gate platform: $(uname -sm)"
 			./build.sh
 		'
-	echo "=== Linux SOCK_SEQPACKET compatibility gate: PASS ==="
+	echo "=== Linux gate: PASS ==="
 }
 
 # The guest replay probe is not runnable on the host -- it connects to the
@@ -229,7 +291,11 @@ build_guest_replay_probe() {
 
 	[ -x "$primary" ] || { echo "FATAL: $primary missing" >&2; return 1; }
 	[ -x "$asan" ] || { echo "FATAL: $asan missing" >&2; return 1; }
-	echo "  OK: guest-delta-replay compiles (host build-only gate)"
+	if [ "$MODE" = "--test" ]; then
+		echo "  OK: guest-delta-replay binaries present (--test does not rebuild them)"
+	else
+		echo "  OK: guest-delta-replay compiles (host build-only gate)"
+	fi
 }
 
 if [ "$MODE" != "--test" ]; then
@@ -248,7 +314,7 @@ else
 fi
 
 build_guest_replay_probe
-run_linux_seqpacket_gate
+run_linux_gate
 
 if [ "$MODE" != "--test" ]; then
 	echo "=== build: scoped nfs-proxy executable ($CC) ==="

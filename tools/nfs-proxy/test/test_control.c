@@ -79,6 +79,10 @@ static int connect_arm(const char *socket_path)
 	return fd;
 }
 
+/* nfsp_control_tick() sends the ack before it returns, so the ack is either
+ * queued already or was never sent.  A zero-timeout poll() and then a plain
+ * recv() checks that without blocking, as recv(..., MSG_DONTWAIT) did; that
+ * flag is hidden on Darwin under _POSIX_C_SOURCE (line 1). */
 static int wait_ack(int fd, uint8_t *ack)
 {
 	struct pollfd p = {fd, POLLIN, 0};
@@ -89,6 +93,10 @@ static int wait_ack(int fd, uint8_t *ack)
 	return recv(fd, ack, 1, 0) == 1 ? 0 : -1;
 }
 
+/* mkdtemp(3), which Darwin hides under _POSIX_C_SOURCE, built from mkstemp(3):
+ * the unique name mkstemp reserves is released before mkdir(2).  If another
+ * process takes the name in that window, mkdir fails with EEXIST and the test
+ * stops; it never shares a directory.  Mode 0700, as mkdtemp. */
 static int make_temp_dir(char *path)
 {
 	int fd = mkstemp(path);
