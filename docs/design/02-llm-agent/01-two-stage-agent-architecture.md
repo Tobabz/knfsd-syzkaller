@@ -477,6 +477,8 @@ live offset/current value/original bytes는 Proxy가 실제 RPC record를 decode
 semantic decoder/resolver 또는 concrete mutation capability가 없어 intent를 실행할 수 없으면
 `unsupported_by_current_harness`로 처리하고
 `HarnessGapIssue(gap_class=mutation_engine)`를 생성/연결한다.
+Agent는 M7 promotion을 통과한 semantic capability subset만 쓰며, intent를 legacy NFSPARM capability
+(HCAP-07/08/09)로 낮추지 않는다(issue #8).
 
 ## 6. Mutation Engine 연결
 
@@ -498,12 +500,16 @@ NFSPARM2
 현재 구현에서 재사용할 가치가 있는 invariant는 다음과 같다.
 
 ```text
-content-addressed predicate
-verify-before-patch
+semantic / content-addressed selection
+verify-before-apply
 apply-to-all matching semantics
-same live/replay apply implementation
-durable arm-N.delta
+same live/replay semantic path
+durable write-ahead mutation evidence before exposure
 ```
+
+`arm-N.delta`는 이 성질의 legacy 구현이며 target invariant가 아니다. NFSPARM/NFSPDLT는 사람이 작성한
+legacy/manual campaign 전용이며 Agent pipeline은 이를 쓰지 않는다(issue #8). 한 lane에서 legacy arm과
+target mode는 동시에 활성화되지 않는다(issue #2).
 
 목표 architecture에서도 ordinal/Nth-message 방식의 불안정한 replay identity는 허용하지 않는다.
 현재 NFSPARM1/2의 precomputed offset/original-byte 요구는 목표 architecture의 제약이 아니다.
@@ -711,7 +717,8 @@ target semantic 경로의 replay는 recorded rule set을 다시 설치하고 pro
 위치별로 semantic batch를 비교한다(`03-nfs-proxy/05`). numeric generation id는 correlation 값이며
 replay identity가 아니다. production concrete bytes는 evidence로 보존한다.
 
-legacy NFSPARM/NFSPDLT 경로의 재현 단위와 migration 중 사용 여부는 issue #8에서 정한다.
+legacy NFSPDLT replay는 legacy/manual campaign의 재현 계약으로만 남는다. Agent pipeline은 legacy 경로를
+쓰지 않는다(issue #8).
 
 ## 10. Agent SDK와 deterministic boundary
 

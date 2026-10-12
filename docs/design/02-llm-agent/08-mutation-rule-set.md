@@ -403,9 +403,13 @@ HCAP-08 -> NFSPARM2 variable-length mutation
 HCAP-09 -> current delta replay
 ```
 
-이 capability들은 target semantic Proxy architecture와 동일한 뜻이 아니다.
-Semantic decoder/resolver가 구현·검증되기 전에는 Agent가 현재 HCAP 지원 범위를 넘어선
-semantic mutation을 실행 가능하다고 가정하지 않는다.
+이 capability들은 manual/legacy campaign 전용이며 Agent의 MutationRuleSet이 쓰는 capability가 아니다
+(issue #8). Compiler는 intent를 NFSPARM anchor/offset/original bytes로 낮추지 않는다.
+
+Agent가 쓸 수 있는 semantic mutation capability는 M7 promotion gate를 통과한 subset뿐이다
+(`../03-nfs-proxy/06-implementation-gap-analysis.md` §30). 그런 subset이 없으면 Stage 2 intent는
+`unsupported_by_current_harness`로 처리하고 `HarnessGapIssue(gap_class=mutation_engine)`를 semantic
+runtime 구현·검증 작업에 연결한다. capability 표현의 authority는 issue #14에서 정한다.
 
 HCAP-08은 partially validated 상태이므로 미검증 조합은 그대로 미검증으로 남긴다.
 

@@ -127,7 +127,7 @@ Target Agent-facing path와 current compatibility path는 병존할 수 있다.
 | Forward completion lifecycle | `queue.pending_records`, aggregate delivered stats | missing | nonblocking queue/flush loop | per-record/batch token boundaries and full-write completion/failure callback | partial-write/full-write tests |
 | Semantic Replay loader/runtime | concrete NFSPDLT1/2 loader in `control.c` | replace | CLI replay mode, shared process path, legacy replay tests | load recorded CompiledMutationRule set, run the ordered `CrashContextWindow` programs, same semantic runtime path, separate replay log on the host sink | dynamic replay + multi-generation + compatibility tests |
 | ReplayResult comparator | none | missing | current applied-count diagnostics | per-position batch-signature multiset + delivery comparison and verdict, in the Controller-side validation layer over sealed production/replay evidence (issue #11) | equivalent/diverged/invalid tests |
-| Legacy compatibility | NFSPARM1/2 + NFSPDLT1/2 | reuse_as_is | validated current campaigns/tests | keep isolated from target semantic ABI; do not expose as semantic capability; never active on a lane together with a target rule set | full existing regression suite |
+| Legacy compatibility | NFSPARM1/2 + NFSPDLT1/2 | reuse_as_is | validated current campaigns/tests | keep isolated from target semantic ABI; do not expose as semantic capability; never active on a lane together with a target rule set; usable only by manual/legacy campaigns (HCAP-07/08/09), never lowered from an Agent MutationRuleSet (issue #8) | full existing regression suite |
 | Runner/main integration | `main.c` control or replay mode | extend | process lifecycle, route CLI, stats | schema/runtime inputs, semantic ruleset/replay artifact, replay log output | startup/mode integration tests |
 | HCAP registration | HCAP-07/08/09 describe current concrete layer | extend | stable current capability IDs/evidence | add/update semantic capability only after guest/runtime validation | HCAP source_refs + guest evidence |
 | Host journal sink (Runner) | none; deltas live in the guest | missing | read-only 9P host share exists for fixture input only | Runner-owned sink, guest-to-host channel, host ACK after full framed append, channel identity stamping, untrusted-event validation | 05 oracles 15-17 |
@@ -928,9 +928,15 @@ Legacy NFSPDLT1/2 replay는 compatibility path로 계속 regression test한다.
 
 Host unit tests만으로 target semantic capability를 current HCAP으로 올리지 않는다.
 
-Guest/runtime validation은 최소 semantic request/response mutation, dynamic state value,
-v4.1+ backchannel correlation, preserve/raw behavior, semantic Delta crash survival,
-dynamic-original semantic replay를 포함해야 한다.
+M7은 subset 단위로 반복하는 promotion gate다(issue #8). semantic subset S는 S에 필요한 M1–M6
+구성요소, host test, S의 guest/runtime 검증, target 계약이 요구하는 semantic replay/evidence 검증을
+통과한 뒤에만 Agent 사용 가능으로 등록한다. 다른 subset T는 같은 gate를 따로 통과한다. mutation
+적용과 journal만 있고 replay/evidence 계약을 만족하지 못하는 subset은 promotion하지 않는다.
+
+전체 semantic runtime의 guest/runtime validation은 최소 semantic request/response mutation, dynamic
+state value, v4.1+ backchannel correlation, preserve/raw behavior, semantic Delta crash survival,
+dynamic-original semantic replay를 포함해야 한다. 모든 subset은 semantic Delta crash survival과
+semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능에 해당할 때 통과한다.
 
 Validation evidence를 source_refs에 추가한 뒤에만 Harness Capability Specification을 갱신한다.
 

@@ -312,6 +312,7 @@ report/normal-flow-threads.md
 id: HCAP-07
 name: NFSPARM1 fixed-width proxy mutation
 usable_stage: [stage2]
+usable_by: manual_legacy_campaigns    # Agent Stage 2 아님 (issue #8)
 status: validated
 
 interface:
@@ -349,6 +350,7 @@ bundle/patches/syzkaller/0017-*
 id: HCAP-08
 name: NFSPARM2 variable-length proxy mutation
 usable_stage: [stage2]
+usable_by: manual_legacy_campaigns    # Agent Stage 2 아님 (issue #8)
 status: partially_validated
 
 interface:
@@ -391,6 +393,7 @@ bundle/patches/syzkaller/0019-*
 id: HCAP-09
 name: mutation delta record/replay
 usable_stage: [stage2]
+usable_by: manual_legacy_campaigns    # Agent Stage 2 아님 (issue #8)
 status: validated
 
 purpose:
@@ -424,6 +427,12 @@ Semantic decoder, Transaction Context, runtime field resolver 같은 목표 기�
 구현과 guest/runtime 검증이 끝나기 전에는 새 HCAP으로 지원된다고 간주하지 않는다.
 구현이 검증되면 Harness Capability Specification을 갱신한다.
 
+HCAP-07/08/09는 사람이 작성한 legacy/manual campaign만 쓴다. Agent의 Stage 2 pipeline은
+MutationRuleSet을 NFSPARM anchor/offset/original bytes로 낮추지 않으며 semantic→legacy adapter도 없다
+(issue #8). Agent가 쓰는 semantic mutation capability는 M7 promotion gate
+(`../03-nfs-proxy/06-implementation-gap-analysis.md` §30)를 통과한 subset만 등록한다. `usable_by`와
+subset scope의 machine-readable 표현은 issue #14에서 정한다.
+
 ## 5. Stage별 사용 범위
 
 ```text
@@ -440,10 +449,17 @@ STAGE 2
     HCAP-02 raw NFS/RPC send
     HCAP-03 remote KCOV
     HCAP-04 lane topology
+    semantic mutation capability (M7 promotion을 통과한 subset만)
+
+MANUAL / LEGACY CAMPAIGN (Agent pipeline 아님)
     HCAP-07 NFSPARM1 mutation
     HCAP-08 NFSPARM2 mutation (partially validated)
     HCAP-09 delta replay
 ```
+
+promotion된 semantic subset이 없으면 Agent Stage 2의 semantic 요청은 `unsupported_by_current_harness`로
+처리하고 `HarnessGapIssue(gap_class=mutation_engine)`를 semantic runtime 구현·검증 작업에 연결한다.
+legacy 경로를 manual 실험에 쓰더라도 Controller는 Agent intent가 지원된다고 주장하지 않는다(issue #8).
 
 Stage 1은 mutation capability를 Q1을 만들기 위한 우회 수단으로 사용하지 않는다.
 Stage 1은 정상 또는 protocol-valid reachability scenario를 먼저 확보하는 것을 목표로 한다.
