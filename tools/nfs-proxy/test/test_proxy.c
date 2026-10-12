@@ -3,6 +3,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
@@ -15,6 +17,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef INADDR_LOOPBACK
+#define INADDR_LOOPBACK 0x7f000001u
+#endif
 
 static unsigned checks, failures;
 #define CHECK(x, ...) do { checks++; if (!(x)) { failures++; \
@@ -62,6 +68,7 @@ struct fake {
 struct fixture {
 	struct nfsp_proxy_cfg cfg;
 	struct nfsp_proxy_stats stats;
+	char client_ip[2][INET_ADDRSTRLEN];
 	_Atomic int stop;
 	int ready, done, rc;
 	pthread_mutex_t mutex;
@@ -78,6 +85,71 @@ struct fixture {
 };
 
 struct job { struct fake *backend; int fd; };
+
+static int can_bind_source(const char *ip)
+{
+	struct sockaddr_in sa = {0};
+	int fd, rc;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return 0;
+	sa.sin_family = AF_INET;
+	if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {
+		close(fd);
+		return 0;
+	}
+	rc = bind(fd, (struct sockaddr *)&sa, sizeof(sa));
+	close(fd);
+	return rc == 0;
+}
+
+/* Linux accepts any 127/8 address on loopback, which is what this regression
+ * test historically used to give the two clients distinct source addresses.
+ * Darwin requires an address to be assigned before bind(2).  Keep the Linux
+ * addresses when they are available; otherwise use 127.0.0.1 plus one real,
+ * locally assigned IPv4 address.  The proxy still identifies clients solely
+ * from the peer source address -- this helper changes only the test fixture. */
+static int choose_client_ips(struct fixture *f)
+{
+	struct ifaddrs *all = NULL, *it;
+	const char *legacy0 = "127.0.0.10", *legacy1 = "127.0.0.11";
+
+	if (can_bind_source(legacy0) && can_bind_source(legacy1)) {
+		(void)snprintf(f->client_ip[0], sizeof(f->client_ip[0]), "%s", legacy0);
+		(void)snprintf(f->client_ip[1], sizeof(f->client_ip[1]), "%s", legacy1);
+		return 0;
+	}
+	if (!can_bind_source("127.0.0.1") || getifaddrs(&all) != 0)
+		return -1;
+	(void)snprintf(f->client_ip[0], sizeof(f->client_ip[0]), "%s", "127.0.0.1");
+	for (it = all; it != NULL; it = it->ifa_next) {
+		struct sockaddr_in *sa;
+		char ip[INET_ADDRSTRLEN];
+
+		if (it->ifa_addr == NULL || it->ifa_addr->sa_family != AF_INET)
+			continue;
+		sa = (struct sockaddr_in *)(void *)it->ifa_addr;
+		if (inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip)) == NULL)
+			continue;
+		if (strncmp(ip, "127.", 4) == 0 || !can_bind_source(ip))
+			continue;
+		(void)snprintf(f->client_ip[1], sizeof(f->client_ip[1]), "%s", ip);
+		freeifaddrs(all);
+		return 0;
+	}
+	freeifaddrs(all);
+	return -1;
+}
+
+static int configure_test_addresses(struct fixture *f, struct nfsp_proxy_cfg *cfg)
+{
+	if (choose_client_ips(f) != 0)
+		return -1;
+	cfg->client_ip[0] = f->client_ip[0];
+	cfg->client_ip[1] = f->client_ip[1];
+	return 0;
+}
 
 static void *serve(void *arg)
 {
@@ -212,10 +284,13 @@ static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrec
 	pthread_cond_init(&f->rendezvous_cond, NULL);
 	if (start_fake(f, 0, nrecords) != 0 || start_fake(f, 1, nrecords) != 0)
 		return -1;
-	f->cfg.client_ip[0] = "127.0.0.10";
-	f->cfg.client_ip[1] = "127.0.0.11";
-	f->cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", f->fake[0].port};
-	f->cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", f->fake[1].port};
+	if (configure_test_addresses(f, &f->cfg) != 0)
+		return -1;
+	/* Backend identity comes from the listener index, not the listener IP.  Using
+	 * one loopback address with separate ephemeral ports works on both Linux and
+	 * Darwin without changing the relay's route semantics. */
+	f->cfg.route[0] = (struct nfsp_route){"127.0.0.1", 0, "127.0.0.1", f->fake[0].port};
+	f->cfg.route[1] = (struct nfsp_route){"127.0.0.1", 0, "127.0.0.1", f->fake[1].port};
 	if (dead) {
 		f->dead_fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (f->dead_fd < 0) return -1;
@@ -481,10 +556,9 @@ static void test_resize_keeps_stream_in_sync(void)
 	rb.port = ntohs(sa.sin_port);
 	CHECK(pthread_create(&rb.thread, NULL, raw_backend_main, &rb) == 0, "backend thread");
 
-	cfg.client_ip[0] = "127.0.0.10";
-	cfg.client_ip[1] = "127.0.0.11";
-	cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", rb.port};
-	cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", rb.port};
+	CHECK(configure_test_addresses(&f, &cfg) == 0, "client address setup");
+	cfg.route[0] = (struct nfsp_route){"127.0.0.1", 0, "127.0.0.1", rb.port};
+	cfg.route[1] = (struct nfsp_route){"127.0.0.1", 0, "127.0.0.1", rb.port};
 	cfg.stop = &f.stop;
 	cfg.msg_limit = 64;
 	cfg.connect_timeout_ms = 500;
@@ -565,10 +639,9 @@ static void test_unframeable_output_refused(void)
 	      "raw backend setup");
 	rb.port = ntohs(sa.sin_port);
 	CHECK(pthread_create(&rb.thread, NULL, raw_backend_main, &rb) == 0, "backend thread");
-	f.cfg.client_ip[0] = "127.0.0.10";
-	f.cfg.client_ip[1] = "127.0.0.11";
-	f.cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", rb.port};
-	f.cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", rb.port};
+	CHECK(configure_test_addresses(&f, &f.cfg) == 0, "client address setup");
+	f.cfg.route[0] = (struct nfsp_route){"127.0.0.1", 0, "127.0.0.1", rb.port};
+	f.cfg.route[1] = (struct nfsp_route){"127.0.0.1", 0, "127.0.0.1", rb.port};
 	f.cfg.stop = &f.stop;
 	f.cfg.msg_limit = 64;
 	f.cfg.connect_timeout_ms = 500;

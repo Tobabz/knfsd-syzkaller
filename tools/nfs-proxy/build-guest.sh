@@ -14,8 +14,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 command -v docker >/dev/null
-command -v realpath >/dev/null
-out=$(realpath -m "$out")
+case "$out" in
+    /*) ;;
+    *) out="$PWD/$out" ;;
+esac
 [ ! -e "$out" ] || { echo "output already exists: $out" >&2; exit 2; }
 "$here/build.sh"
 mkdir -p "$work"

@@ -13,6 +13,12 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#ifndef MSG_DONTWAIT
+/* Every listener/accepted arm fd is put in O_NONBLOCK mode before these flags
+ * are used.  Linux also offers per-call MSG_DONTWAIT; Darwin does not. */
+#define MSG_DONTWAIT 0
+#endif
+
 #define NFSP_ARM_SLOTS 64u
 
 /* One armed rule, either v1 (fixed-width overwrite) or v2 (variable-length
