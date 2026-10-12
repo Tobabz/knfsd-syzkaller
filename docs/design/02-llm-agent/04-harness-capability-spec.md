@@ -100,6 +100,8 @@ interface:
     syz_open_nfs_lane$client0
     syz_open_nfs_lane$client1
     syz_open_nfs_lane_pair$client{0,1}_{knfsd,ganesha}
+    syz_open_nfs_lane_profile$client{0,1}_{knfsd_v3,knfsd_v40,
+        knfsd_v41,knfsd_v42,ganesha_v41}            # 0020, experimental
 
 purpose:
     mounted NFS filesystem을 일반 syscall 경로로 조작
@@ -107,6 +109,14 @@ purpose:
 constraints:
     lane client는 0/1
     backend pair는 knfsd/Ganesha
+    profile open은 fixture가 노출한 profile만 쓸 수 있다
+        single: knfsd-<version>, v4.1 both에서는 ganesha-v41도
+        broad-knfsd: knfsd-v3, knfsd-v40, knfsd-v41, knfsd-v42
+
+verification_note:
+    syz_open_nfs_lane / _pair 경로는 검증됨.
+    profile open(0020)과 broad-knfsd 노출은 이 명세가 참조할
+    guest 검증 기록이 아직 없다.
 ```
 
 source refs:
@@ -114,6 +124,8 @@ source refs:
 ```text
 bundle/patches/syzkaller/0015-*
 bundle/patches/syzkaller/0017-*
+bundle/patches/syzkaller/0020-*
+bundle/lane/lane.sh
 README.md
 ```
 
@@ -172,6 +184,9 @@ constraints:
     KCOV_NFSD_OBSERVE global stream은 Q1에 사용하지 않음
     local KCOV / tracepoint / kprobe 결과는 Q1에 사용하지 않음
     PC 존재만으로 cross-thread ordering은 증명하지 못함
+    lane NFS tracing(koov.nfs_trace=1)을 켜면 tracepoint 생성 코드의
+        PC가 remote coverage에 섞인다. 기본은 꺼짐이며, 켠 실행은
+        그 모드를 evidence에 기록해야 한다
 ```
 
 source refs:
@@ -181,6 +196,7 @@ README.md
 docs/design/01-overview/01-overview.md
 bundle/patches/kernel/0001-*
 bundle/patches/kernel/0002-*
+bundle/lane/lane.sh
 ```
 
 ### HCAP-04 — Four-lane execution topology
@@ -200,7 +216,11 @@ constraints:
         (top-level snapshot fuzzing mode; issue #3)
     vm.snapshot (qemu -snapshot disk overlay) keeps its default
     nfs.localio_enabled=N
-    koov.nfs_version=3|4.0|4.1|4.2
+    koov.nfs_version=3|4.0|4.1|4.2 (single fixture)
+    또는 koov.nfs_fixture=broad-knfsd (experimental)
+        lane마다 knfsd v3/v4.0/v4.1/v4.2를 함께 마운트
+        SERVER_IMPL=both 필요, knfsd lease 기본 90초
+    koov.nfs_trace=0 (default) | 1 (lane NFS tracing opt-in)
 
 verification_note:
     lane 구조 자체는 구현되어 있으나
@@ -212,6 +232,8 @@ source refs:
 ```text
 README.md
 bundle/corpus/nfs-normal/README.md
+bundle/lane/lane.sh
+bundle/lane/boot-fixture.sh
 tools/prepare-live-lane-config.py
 ```
 
@@ -226,15 +248,20 @@ status: validated_per_scenario
 purpose:
     이미 준비된 정상 NFS 상태/흐름을 Stage 1 scenario의 기반으로 재사용
 
-available scenarios:
-    NFSv3 basic
-    NFSv4.0 delegation recall
-    NFSv4.1 basic
-    NFSv4.1 delegation recall
-    NFSv4.2 async COPY
+interface:
+    bundle/corpus/nfs-normal/manifest.json (schema 3, native profile별 seed)
+    tools/build-normal-corpus.py --fixture broad-knfsd
+    tools/audit-normal-corpus.py
+
+available scenarios (native profile별):
+    knfsd-v3:    basic, procedures, create retry
+    knfsd-v40:   delegation recall, state namespace
+    knfsd-v41:   basic, delegation recall, session state
+    knfsd-v42:   async COPY, remote-KCOV max, remote-KCOV gaps
+    ganesha-v41: basic (Ganesha campaign only)
 ```
 
-각 seed의 실제 기능 oracle과 검증 한계는
+각 seed의 실제 기능 oracle, 실행 상태와 검증 한계는 `manifest.json`과
 `bundle/corpus/nfs-normal/README.md`가 authoritative detail이다.
 
 source refs:
@@ -242,6 +269,8 @@ source refs:
 ```text
 bundle/corpus/nfs-normal/
 bundle/corpus/nfs-normal/manifest.json
+tools/build-normal-corpus.py
+tools/audit-normal-corpus.py
 ```
 
 ### HCAP-06 — Flow-transition observation
