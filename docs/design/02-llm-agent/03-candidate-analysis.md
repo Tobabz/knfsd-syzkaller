@@ -89,6 +89,7 @@ Linux kernel source at candidate.kernel_commit
 
 Harness Capability Specification
     docs/design/02-llm-agent/04-harness-capability-spec.md
+    job에 묶인 harness의 hcap_revision (01 §11.2)
 ```
 
 Agent는 harness capability discovery를 위해 매 job마다 `knfsd-syzkaller` 전체를 다시 탐색하지 않는다.

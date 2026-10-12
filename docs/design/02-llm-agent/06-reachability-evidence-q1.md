@@ -76,11 +76,10 @@ ReachabilityEvidence
     candidate_id
 
     execution
-        kernel_build_identity
-        syzkaller_build_identity
+        execution_harness_identity # host-stamped (01 §11.2)
         nfs_version
         lane
-        lane_trace_mode            # koov.nfs_trace (HCAP-03)
+        lane_trace_mode            # identity의 koov.nfs_trace (HCAP-03)
         scenario_artifact
 
     fixture
@@ -139,6 +138,10 @@ target_observation
 
 function candidate는 path + symbol + resolved source range에 대응하는 code location이 관측되어야 한다.
 source-range candidate는 관측 PC가 build debug mapping을 통해 requested source range에 대응해야 한다.
+
+mapping은 evidence의 ExecutionHarnessIdentity가 가리키는 vmlinux와 KASLR 설정으로 한다. plan은 build를
+pin하지 않으므로 같은 plan을 다른 identity에서 다시 실행해도 mapping은 그 실행의 build로 다시 만든다
+(01 §11.2).
 
 ## 6. Q1 Judge 입력
 
@@ -224,6 +227,7 @@ Q1AdmissibilityProfile               # Q1 JudgeProfile (01 §11.1)
 ~~~text
 Q1Result
     candidate_id
+    execution_harness_id           # 봉인 evidence의 identity digest (01 §11.2)
     judge_profile_id
     evidence_manifest_sha256
     support_boundary_id            # 사용한 RemoteKcovSupportBoundary 버전
@@ -235,7 +239,7 @@ Q1Result
     reason                         # inconclusive이면 §10의 reason 하나
     gap_signal?                    # reason이 unsupported_attribution일 때
         gap_class                  # remote_kcov_attribution
-        missing_capability         # remote_kcov.context.<expected_context>
+        missing_capability_id      # remote_kcov.context.<expected_context>
     target_observed
     execution_valid
     observations[]

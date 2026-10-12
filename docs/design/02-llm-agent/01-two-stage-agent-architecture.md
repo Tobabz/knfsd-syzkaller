@@ -63,9 +63,13 @@ Stage 1 전에는 Controller의 intake/validation만 있다.
 1. Intake / Validation
    외부 caller가 VulnerabilityCandidate를 제출한다.
    Controller는 exact commit/path/symbol-or-range가 실제 source tree와 일치하는지만 검증한다.
+
+2. Harness binding
+   Controller는 candidate.kernel_commit용으로 검증된 harness build를 job에 묶는다(§11.2).
+   없으면 HarnessGapIssue를 연결하고 job을 blocked_harness_gap으로 둔다.
 ```
 
-Candidate가 승인되면 Agent는 Stage 1을 시작한다.
+harness가 묶이면 Agent는 Stage 1을 시작한다.
 
 ### 2.3 Actor 중심 전체 흐름
 
@@ -79,6 +83,8 @@ APPLICATION CONTROLLER
     |
     | validate exact commit/path/location
     | store candidate
+    | bind validated harness build for kernel_commit (§11.2)
+    |     none -> HarnessGapIssue -> blocked_harness_gap
              =====================================
              STAGE 1 — REACHABILITY HARNESS
              =====================================
@@ -232,6 +238,7 @@ Stage 2의 실행 단위는 둘로 나눈다(issue #2).
 Stage2Campaign
     한 candidate / harness / rule set의 fuzz campaign.
     여러 program execution, lane, VM instance에 걸친다.
+    ExecutionHarnessIdentity는 campaign 전체에서 하나다 (§11.2).
 
 ProgramGenerationExecution
     한 lane에서 remote-KCOV generation 하나로 실행한 syz program 하나.
@@ -347,8 +354,10 @@ Agent는 build, VM, KCOV PASS를 주장하지 않는다.
 ```text
 ReachabilityPlan
     candidate_id
+    hcap_revision                  # 계획에 쓴 HCAP (§11.2)
     target_oracle
-        exact symbol / code location / build identity
+        exact symbol / code location
+        # build별 PC mapping은 Q1 Judge가 evidence의 identity로 한다
     selected_path
     nfs_version
     scenario_steps[]
@@ -372,7 +381,7 @@ ReachabilityHarness
     manager/runtime config
     required capability IDs
     Q1 observation config
-    exact source/build identities
+    ExecutionHarnessIdentity                  # materialize 대상 (§11.2)
 ```
 
 ReachabilityHarness는 job-local runtime input이다.
@@ -400,7 +409,7 @@ Q1은 특정 stimulus와 target 사이의 causal ordering을 증명하는 oracle
 
 ```text
 candidate target PC/symbol mapping
-kernel build identity
+ExecutionHarnessIdentity (host-stamped, §11.2)
 seed/scenario artifact identity
 lane identity
 generation_begin / remote_start_ok / aggregate_published
@@ -429,6 +438,9 @@ Stage2Input
     ReachabilityEvidence
     Q1Result = reached
 ```
+
+Q1 evidence의 ExecutionHarnessIdentity는 Stage 2가 실행할 identity와 같아야 한다. 다르면 이 package는 Stage 2
+입력이 아니며, Controller가 Stage 1 harness를 새 identity에서 다시 실행한다(§11.2).
 
 따라서 Stage 2 repair가 Stage 1의 도달성을 우연히 깨뜨리는 것을 검출할 수 있어야 한다.
 이 검출은 fuzz campaign 전에 실행하는 baseline-with-rules gate(§3)가 맡는다. target이 ambient
@@ -612,6 +624,7 @@ MutationEvidence                 # Runner가 수집하고 봉인한다 (§11.1)
         rule_set_id
         program_digest           # cross-check
     candidate_id
+    execution_harness_identity   # host-stamped (§11.2)
     barrier_results              # activation / deactivation ACK 여부
     journal_identity
     journal_integrity
@@ -689,7 +702,7 @@ CrashEvidence
     M1(rule_id, CrashContextWindow) vector + delivery state
     intent / hypothesis M1 집계            # §7.1
     rule_set_id
-    kernel/syzkaller/image identities
+    ExecutionHarnessIdentity                 # §11.2
     sanitizer report
     dmesg / stack trace
     crash signature
@@ -710,8 +723,8 @@ CrashReproducer
         각 entry의 MutationDelta (generation 단위 semantic batch evidence)
     + recorded rule set (rule_set_id, CompiledMutationRule[])
     + ReachabilityHarness identity
-    + kernel/syzkaller source pins
-    + fixture/image identity
+    + ExecutionHarnessIdentity (§11.2)
+        kernel / syzkaller pin과 build, image, guest command line, proxy build
 ```
 
 target semantic 경로의 replay는 recorded rule set을 다시 설치하고 program을 순서대로 실행한 뒤
@@ -825,10 +838,10 @@ verdict = Judge(봉인된 evidence bundle, JudgeProfile, plan / rule set)
 - Controller는 받은 artifact의 SHA-256을 manifest와 대조한 뒤 Judge에 넘긴다.
 - Judge는 판정 중 guest에 추가 사실을 묻지 않고 봉인된 bundle만 읽는다.
 - verdict record는 `judge_profile_id`, `evidence_manifest_sha256`, 판정에 쓴 plan / rule set identity를
-  기록한다. Q1 verdict는 사용한 `RemoteKcovSupportBoundary` 버전도 기록한다(`06` §6.1). plan과
-  execution identity 체계는 issue #13에서 정한다.
+  기록한다. Q1 verdict는 사용한 `RemoteKcovSupportBoundary` 버전도 기록한다(`06` §6.1). execution
+  identity와 평가 identity는 §11.2가 정한다.
 - verdict record는 불변이다. 새 JudgeProfile로 다시 판정하면 같은 봉인 bundle에 대해 새 verdict를
-  만든다. bundle에 필요한 evidence가 모두 있으면 VM을 다시 실행하지 않는다(무효화 규칙은 issue #13).
+  만든다. bundle에 필요한 evidence가 모두 있으면 VM을 다시 실행하지 않는다(무효화 규칙은 §11.2).
 
 판정 의미와 실행 정책은 분리한다.
 
@@ -863,6 +876,117 @@ state(§7.2)는 M1과 분리된 evidence이며 어떤 policy도 M1 판정을 바
   봉인된 replay에서 비교 전제가 성립하지 않을 때만 쓴다(`03-nfs-proxy/05` §29).
 - evidence가 repair 입력으로 Agent에 전달될 때도 data로만 다루며 지시로 해석하지 않는다.
 
+### 11.2 Harness identity와 무효화
+
+이 절은 issue #13에서 합의했다. 네 identity는 서로 다른 질문에 답하며, 하나가 바뀌었다고 다른 것을
+무효로 만들지 않는다.
+
+```text
+Candidate identity          무엇을 조사하는가
+    kernel_commit + location (02 §4)
+
+ExecutionHarnessIdentity    어떤 계측·실행 시스템이 관측을 만들었는가
+    harness build           harness binding이 고른다
+        kernel     source commit, 계측 series digest,
+                   sanitizer variant의 config digest, bzImage / vmlinux digest
+        syzkaller  commit, 적용한 series digest, build identity
+        image      VM image digest (baked fixture 포함)
+        proxy      build id. semantic runtime을 쓰면 schema_id,
+                   semantic_runtime_version, build가 생성한 registry digest
+    runtime configuration   plan의 runtime_selection(05 §10)과 harness 설정
+        guest kernel command line 전체
+        route / topology identity
+
+EvaluationIdentity          봉인된 관측을 어떤 결정적 규칙으로 해석했는가
+    hcap_revision, RemoteKcovSupportBoundary 버전, judge_profile_id
+
+JobPolicy identity          Controller가 왜, 몇 번 실행했는가 (§11.1)
+```
+
+- `execution_harness_id`는 ExecutionHarnessIdentity의 canonical digest다.
+- command line은 `koov.*`만이 아니라 전체를 넣는다. `sunrpc.lane_attribution=0`은 lane attribution을 끄고,
+  `nfs.localio_enabled`는 실행되는 NFS code path를 바꾸며, KASLR 설정(`nokaslr`)은 runtime PC를 vmlinux
+  주소로 읽을 수 있는지를 정한다. lane script digest(`koov.lane_sha256`)도 command line에 들어 있다.
+- kernel의 결정적 식별자는 vmlinux digest다. source와 config가 같아도 toolchain이 다르면 PC가 달라진다.
+- sanitizer는 JobPolicy가 고르지만(`05` §10) variant마다 config와 vmlinux가 다르므로 고른 variant는
+  identity의 일부다. 한 variant에서 세운 Q1은 다른 variant의 Stage 2 입력이 아니다.
+- promotion된 semantic scope는 identity가 아니라 HCAP(`hcap_revision`)에 있다(`04` §4). build를 바꾸지 않는
+  promotion은 execution identity를 바꾸지 않는다.
+- program과 seed(ReachabilityHarness가 기록), rule set(Stage 2 입력), 실행마다 새로 붙는 `vm_instance_id`
+  (evidence correlation), 실행 방식과 budget(program을 실행하는 lane 수, procs, syz-execprog / syz-manager)은
+  identity가 아니다. 그래서 Stage 1의 단일 lane Q1 실행과 Stage 2의 manager 실행이 같은 identity를 쓴다.
+- Runner는 실제로 띄운 artifact와 설정에서 identity를 host-stamped로 기록한다. guest가 보고한 값(lane script
+  hash, `lane_attribution` 상태 등)은 cross-check이며, 다르면 §11.1의 evidence 불일치다.
+
+**Harness binding.** intake 직후, Agent task 전에 Controller가 한다.
+
+```text
+accepted Candidate
+    |
+    v
+harness binding (Controller)
+    |
+    +-- candidate.kernel_commit용 검증된 harness build 있음
+    |       -> job에 harness build와 같은 repository revision의 hcap_revision을 묶는다
+    |       -> Stage 1 (Candidate Analysis부터)
+    |
+    +-- 없음
+            -> HarnessGapIssue(remote_kcov_attribution,
+                   remote_kcov.kernel_revision.<commit>)        (07 §2)
+            -> blocked_harness_gap
+```
+
+- intake는 candidate의 source identity만 검증한다(`02` §3). harness가 없다고 candidate를 거부하지 않는다.
+- BASE harness로 다른 commit의 candidate를 대신 실행하지 않는다. 그 build의 PC는 candidate commit의 source와
+  대응하지 않는다.
+- binding이 Candidate Analysis 앞에 있는 이유는 Candidate Analysis(`03` §8)와 Reachability Planning이 읽는
+  HCAP이 특정 harness를 기술하기 때문이다. 묶인 harness가 없으면 읽을 HCAP도 없다.
+- 검증된 harness build란 계측 series를 그 commit에 적용해 build와 bootstrap 검증을 통과했고, 같은 repository
+  revision의 HCAP(HCAP-03의 boundary 포함)이 그 계측을 기술하는 build다. JobPolicy가 고른 sanitizer variant의
+  build를 묶는다.
+- harness를 다른 kernel revision으로 옮기는 일(`tools/bump-kernel.py`, `tools/fport-apply.sh`)은 사람이 검토하는
+  harness 유지보수이며 candidate마다 자동으로 하지 않는다. 검토 없이 옮긴 계측으로는 Q1을 믿을 수 없다.
+
+**기록 위치.**
+
+```text
+ReachabilityPlan        hcap_revision
+ReachabilityHarness     ExecutionHarnessIdentity (materialize 대상, manifest 포함)
+ReachabilityEvidence    ExecutionHarnessIdentity (host-stamped)
+MutationEvidence        ExecutionHarnessIdentity (host-stamped)
+verdict                 evidence_manifest_sha256, 판정에 쓴 EvaluationIdentity
+job / execution record  JobPolicy identity
+```
+
+plan은 build identity를 pin하지 않는다. target의 build별 PC mapping은 Q1 Judge가 evidence의 identity로
+한다(`06` §5). 그래서 같은 plan을 다른 execution identity에서 다시 쓸 수 있다.
+
+**무효화.**
+
+```text
+ExecutionHarnessIdentity 변경
+    -> 이전 Q1은 새 identity의 Stage 2 입력 자격이 없다
+    -> Controller가 저장된 plan을 새 hcap_revision으로 다시 검증한다
+           통과: plan 재사용        실패: Reachability Planning repair
+    -> 새 identity로 harness를 다시 materialize하고 Stage 1을 다시 실행한다
+
+EvaluationIdentity만 변경
+    hcap_revision
+        -> plan과 evidence를 새 HCAP으로 결정적으로 다시 검증한다
+    JudgeProfile / RemoteKcovSupportBoundary 버전
+        -> 봉인 bundle에 새 규칙이 요구하는 evidence가 모두 있으면 새 verdict만 만든다
+        -> 없으면 다시 실행한다
+
+JobPolicy 변경
+    -> 이후 scheduling / routing에만 영향. 기존 verdict를 다시 쓰지 않는다
+```
+
+- boundary 버전을 바꿔 다시 판정할 때도 boundary는 evidence의 kernel 계측과 맞아야 한다(`06` §6.1).
+- 같은 execution position을 주장하는 evidence를 서로 다른 ExecutionHarnessIdentity 사이에서 합치지 않는다.
+  Stage2Campaign은 identity가 같으면 VM 교체를 넘어 이어진다(§3, issue #2). 실행마다 host-stamped
+  `vm_instance_id`가 남고, `CrashContextWindow`는 VM instance를 넘지 않는다(§8.1).
+- identity가 바뀌면 새 identity에서 Stage 1 evidence lineage를 다시 세운 뒤 Stage 2로 간다.
+
 ## 12. Repair boundaries
 
 실패 원인에 따라 돌아갈 단계가 다르다.
@@ -877,6 +1001,10 @@ Harness Materializer 거부 (typed reason)
 Q1 INCONCLUSIVE(unsupported_attribution)
     -> HarnessGapSignal
     -> HarnessGapIssue(remote_kcov_attribution)
+
+harness binding 실패 (kernel_commit용 검증된 harness build 없음, §11.2)
+    -> HarnessGapIssue(remote_kcov_attribution)
+    -> blocked_harness_gap
 
 Reachability Planning unsupported
     -> HarnessGapIssue
@@ -913,6 +1041,8 @@ Q2 observed
            hypothesis 단위 결론은 §7.1의 window 집계로 내린다
 ```
 
+gap으로 막힌 job의 상태 전이(`retry_pending`, `parked`, `closed_unsupported`)는 `07` §7이 정한다(issue #13).
+
 build dependency, broken fixture, image/config mismatch는 LLM source repair로 보내지 않는다.
 
 ## 13. Crash Report 이후 Patch 경계
@@ -942,7 +1072,7 @@ Post-Crash Phase
 
 Harness gap은 별도 Harness Extension Work에서 해결한다. 이 workflow는 syzlang, pseudo-syscall/executor,
 fixture/tool, mutation-engine patch를 만들 수 있다. 해결 후 Harness Capability Specification을 갱신하고
-blocked candidate를 재시도한다.
+§11.2의 무효화 규칙에 따라 blocked candidate를 재시도한다.
 
 Linux kernel source observability patch는 pre-crash 자동 대상이 아니다. 필요 시 human-decision issue로
 관리한다.

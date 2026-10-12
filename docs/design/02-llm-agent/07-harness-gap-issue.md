@@ -40,11 +40,20 @@ INCONCLUSIVE(unsupported_attribution) + HarnessGapSignal (06 §7)
         |
         v
 create or link HarnessGapIssue(remote_kcov_attribution)
+
+Controller harness binding (01 §11.2)
+        |
+        v
+candidate.kernel_commit용 검증된 harness build 없음
+        |
+        v
+create or link HarnessGapIssue(remote_kcov_attribution,
+                               remote_kcov.kernel_revision.<commit>)
 ```
 
 Agent Task와 Q1 Judge는 gap을 알릴 뿐이며 issue 생성과 연결은 Controller가 한다(§1).
 
-같은 capability gap이 이미 open 상태라면 새 issue를 중복 생성하지 않고 기존 issue에 candidate를 연결할 수 있다.
+같은 gap(§3의 key)이 이미 open 상태라면 새 issue를 만들지 않고 기존 issue에 candidate를 연결한다.
 
 ## 3. Issue 데이터
 
@@ -59,9 +68,9 @@ HarnessGapIssue
         stage1_reachability
         stage2_mutation
 
-gap_class
+    gap_class
 
-    missing_capability
+    missing_capability_id      # HCAP data의 controlled vocabulary (04 §1.1)
 
     reason
 
@@ -77,7 +86,17 @@ gap_class
         resolved
         deferred
         wont_fix
+
+    resolution?                # status=resolved일 때
+        resolution_class       # §8
+        hcap_revision          # gap을 닫은 HCAP revision
+        execution_harness_id?  # harness build가 바뀌었으면 (01 §11.2)
 ```
+
+같은 gap의 key는 `(gap_class, missing_capability_id)`다(issue #13). `missing_capability_id`는 자유 텍스트가
+아니라 HCAP data의 controlled vocabulary이며, 서로 다른 작업을 구분하는 데 필요한 revision이나 scope를 담는다.
+예를 들어 kernel revision마다 harness가 따로 필요하므로 `remote_kcov.kernel_revision.<commit>`은 commit을
+포함한다.
 
 ## 4. gap_class
 
@@ -125,7 +144,8 @@ capability id의 machine-readable 표현은 HCAP data가 소유한다(04 §1.1).
 ### remote_kcov_attribution
 
 candidate를 실행할 수는 있지만 현재 program generation에 귀속되는 remote KCOV로
-target PC를 관측할 수 없는 경우.
+target PC를 관측할 수 없는 경우. candidate의 kernel revision용으로 계측을 옮기고 검증한 harness build가
+없는 경우도 이 class다(01 §11.2).
 
 예:
 
@@ -135,6 +155,7 @@ ownerless/background work
 새 async continuation path
 현재 propagation이 없는 callback/workqueue path
 client-side target without remote attribution
+candidate.kernel_commit용 harness build 없음 (remote_kcov.kernel_revision.<commit>)
 ```
 
 귀속 여부의 기준은 RemoteKcovSupportBoundary(06 §6.1)다. Q1 Judge는 target이 관측되지 않았고 plan의
@@ -207,6 +228,7 @@ human decision
 
 현재 checked-in kernel patch 0001~0004도 이 종류의 harness instrumentation precedent다.
 다만 target kernel code를 바꾸면 reachability와 timing 자체를 교란할 수 있으므로 human review가 필요하다.
+계측 series를 다른 kernel revision으로 옮기는 일도 같은 검토를 거친다(01 §11.2).
 
 ### Vulnerability-fix kernel patch — post-crash only
 
@@ -225,18 +247,30 @@ root cause
 kernel vulnerability fix patch
 ```
 
-## 7. Candidate 상태
+## 7. Candidate job 상태
 
-Harness gap이 있으면 candidate는 실패 완료가 아니라 blocked 상태로 남는다.
+Harness gap이 있으면 candidate job은 실패 완료가 아니라 blocked 상태로 남는다. Candidate 자체는
+immutable이며 아래 상태는 job workflow의 것이다(issue #13).
 
 ```text
 blocked_harness_gap
-    issue_ref
-    missing_capability
-    gap_class
+    issue_ref, gap_class, missing_capability_id
+        |
+        +-- issue resolved
+        |       -> retry_pending
+        |       -> 새 harness binding에 01 §11.2의 무효화 규칙을 적용하고 막힌 stage를 재개
+        |
+        +-- issue deferred
+        |       -> parked
+        |       -> issue가 다시 열리거나 resolved되면 다시 평가
+        |
+        +-- issue wont_fix
+                -> closed_unsupported(reason)        # terminal
 ```
 
-issue가 resolved되고 capability spec이 갱신되면 Controller가 Stage 1/2를 다시 시작할 수 있다.
+retry에서 ExecutionHarnessIdentity가 바뀌었으면 Stage 1 Q1을 새 identity에서 다시 세운 뒤 진행한다. build를
+바꾸지 않고 promotion만 바뀐 경우(예: `mutation_engine` gap을 닫은 subset promotion)에는 identity가 같으므로
+plan을 새 `hcap_revision`으로 다시 검증하고 MutationRuleSet을 다시 compile한 뒤 Stage 2를 재개한다.
 
 ## 8. 실제 patch 필요성 측정
 

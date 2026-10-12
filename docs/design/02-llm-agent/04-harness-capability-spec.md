@@ -39,8 +39,10 @@ rendered Markdown (이 문서)
     설명용 view. machine data에서 생성하거나 machine data와 대조한다
 ```
 
-- `hcap_revision`은 canonical machine-readable HCAP의 digest다. plan과 evidence가 이 값을 pin한다
-  (identity 체계는 issue #13).
+- `hcap_revision`은 canonical machine-readable HCAP의 digest다. Controller가 job을 harness에 묶을 때 그
+  harness를 기술하는 revision을 고르고, plan과 verdict가 이 값을 기록한다(`01` §11.2, issue #13).
+- HCAP data는 `missing_capability_id`의 controlled vocabulary도 담는다(`07` §3, issue #13). 예:
+  `state_lineage`, `remote_kcov.context.<context>`, `remote_kcov.kernel_revision.<commit>`.
 - Controller는 plan의 `required_capabilities`, `status`, `usable_by`를 이 데이터로 검증한다. Harness
   Materializer는 call을 capability `interface`와 대조하고, Mutation Rule Compiler는 promoted semantic
   registry(§4)를 쓴다.

@@ -67,6 +67,8 @@ Agent는 여러 가능성 중 하나의 primary scenario를 선택한다.
 ReachabilityPlan
     candidate_id
 
+    hcap_revision                 # 계획에 쓴 HCAP (04 §1.1, 01 §11.2)
+
     selected_path
 
     nfs_version
@@ -175,9 +177,9 @@ required_capabilities:
     - ...
 ```
 
-모든 ID는 machine-readable HCAP(04 §1.1)에 존재해야 하고, 그 entry의 `usable_by`에 `agent_stage1`이
-있어야 한다. `validated_subset`의 scope 밖이나 `partially_validated` / `experimental` capability를 쓰면 plan에
-명시한다(04 §3).
+모든 ID는 plan이 기록한 `hcap_revision`의 machine-readable HCAP(04 §1.1)에 존재해야 하고, 그 entry의
+`usable_by`에 `agent_stage1`이 있어야 한다. `validated_subset`의 scope 밖이나 `partially_validated` /
+`experimental` capability를 쓰면 plan에 명시한다(04 §3).
 
 capability가 없으면 plan을 억지로 만들지 않고:
 
@@ -289,7 +291,8 @@ HCAP이다(04 §1.1).
 공통 runtime 검사는 corpus tooling과 같은 논리를 재사용할 수 있다. `tools/audit-normal-corpus.py`의 corpus
 정리·admission 규칙은 harness 계약으로 따로 채택하지 않는 한 적용하지 않는다.
 
-review manifest는 실행 전에 검증된 program과 runtime selection을 hash로 묶는다(approval binding).
+review manifest는 실행 전에 검증된 program, runtime selection과 materialize 대상 ExecutionHarnessIdentity를
+hash로 묶는다(approval binding). identity가 바뀌면 harness를 다시 materialize한다(01 §11.2).
 
 현재 capability가 부족하면 Materializer가 source를 즉석에서 수정하지 않는다.
 별도 Harness Extension Work에서 필요한 syzlang/pseudo-syscall/fixture/tool 확장을 구현·검증한 뒤
@@ -309,6 +312,7 @@ ReachabilityHarness
     manager/runtime configuration
     required capability IDs
     Q1 observation configuration
+    ExecutionHarnessIdentity        # materialize 대상 (01 §11.2)
     review manifest hash
 ```
 
@@ -318,8 +322,8 @@ program의 profile-open call은 선택한 profile과 맞아야 한다. mixed-pro
 확장으로만 허용한다(issue #12).
 
 Stage 2로 넘길 harness는 Stage 2가 변조할 proxied route/topology에서 실행한다(issue #10). 현재 구체
-값은 `SERVER_IMPL=both`이지만 계약은 기록된 route/topology identity다. identity 체계는 issue #13에서
-정한다.
+값은 `SERVER_IMPL=both`이지만 계약은 기록된 route/topology identity이며, 이 값은 ExecutionHarnessIdentity의
+runtime configuration에 들어간다(01 §11.2).
 
 ## 13. 실패 분류
 
