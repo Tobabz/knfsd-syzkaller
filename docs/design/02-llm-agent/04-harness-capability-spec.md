@@ -11,13 +11,45 @@
 Harness Capability Specification
     Type:        REPOSITORY DESIGN DATA
     Maintained by: repository maintainers
-    Read by:     Agent SDK / Controller
+    Read by:     Agent SDK / Controller / Materializer / Rule Compiler
     Generated per job: NO
 ```
 
 이 문서는 Agent의 출력이 아니다.
 
 `knfsd-syzkaller` 구현이 바뀌었을 때 함께 갱신하는 **harness의 capability catalog**다.
+
+### 1.1 authority 구조
+
+capability 판단의 authority는 machine-readable HCAP 하나다(issue #14). 이 Markdown 문서는 그 데이터를
+설명하는 view이며 독립된 authority가 아니다.
+
+```text
+machine-readable HCAP (canonical)         hcap_revision = canonical digest
+    coarse repository capability
+    interface / constraints / usable_by
+    status + validated_scope
+    evidence_refs
+    authority_refs: 세부 authority artifact의 digest 참조
+        |
+        +-- RemoteKcovSupportBoundary / Q1AdmissibilityProfile (06 §6.1)
+        +-- promoted semantic capability registry (§4)
+
+rendered Markdown (이 문서)
+    설명용 view. machine data에서 생성하거나 machine data와 대조한다
+```
+
+- `hcap_revision`은 canonical machine-readable HCAP의 digest다. plan과 evidence가 이 값을 pin한다
+  (identity 체계는 issue #13).
+- Controller는 plan의 `required_capabilities`, `status`, `usable_by`를 이 데이터로 검증한다. Harness
+  Materializer는 call을 capability `interface`와 대조하고, Mutation Rule Compiler는 promoted semantic
+  registry(§4)를 쓴다.
+- 세부 지원 목록은 authority artifact가 소유하고 HCAP은 digest로 참조한다. 같은 목록을 HCAP이나 문서에
+  복제하지 않는다.
+- serialization 형식(JSON, YAML, TOML 등)은 구현 선택이다. schema와 하나의 canonical digest 표현이 있으면
+  된다.
+- artifact와 drift guard(§7.2)는 그것이 필요한 첫 implementation milestone에서 도입한다. 그 전까지는 이
+  Markdown이 interim catalog이며 §3 형식과 §7.1 규칙을 따른다.
 
 ## 2. 왜 필요한가
 
@@ -65,9 +97,14 @@ Capability
     name
     purpose
 
-    usable_stage[]
+    usable_stage[]              # 기능상 속하는 stage
         stage1
         stage2
+
+    usable_by[]                 # 이 capability를 쓸 수 있는 소비자 (issue #8)
+        agent_stage1
+        agent_stage2
+        manual_legacy_campaigns
 
     interface
     inputs
@@ -76,19 +113,26 @@ Capability
 
     status
         validated
+        validated_subset
         partially_validated
         experimental
+    validated_scope             # status=validated_subset이면 필수
 
+    evidence_refs[]             # 검증 기록
+    authority_refs[]            # 세부 authority artifact의 digest 참조 (§1.1)
     source_refs[]
 ```
 
-`status`는 기능 존재 여부와 runtime 검증 수준을 구분한다.
-Agent는 기본적으로 `validated` capability를 우선 사용하고,
-`partially_validated` / `experimental` 사용은 plan에 명시한다.
+`status`는 기능 존재 여부와 runtime 검증 수준을 구분한다. 검증된 범위는 status 값에 넣지 않고
+`validated_scope`에 데이터로 둔다(issue #14).
+Agent는 기본적으로 `validated` capability와 `validated_subset`의 scope 안을 우선 사용하고,
+`partially_validated` / `experimental` 사용과 scope 밖 사용은 plan에 명시한다.
+
+`usable_stage`는 capability가 기능상 어느 stage에 속하는지를, `usable_by`는 누가 그것을 쓸 수 있는지를
+나타낸다. `usable_by`에 `agent_stage1`이나 `agent_stage2`가 없는 capability는 Agent pipeline이 쓰지 않는다.
 
 Harness Materializer는 Agent가 제안한 program의 각 call이 plan의 required capability `interface`에
-속하는지 확인한다(`05` §11, issue #12). interface의 machine-readable 표현과 authority는 issue #14에서
-정한다.
+속하는지 확인한다(`05` §11, issue #12). interface의 authority는 machine-readable HCAP이다(§1.1).
 
 ## 4. 현재 capability catalog
 
@@ -98,7 +142,11 @@ Harness Materializer는 Agent가 제안한 program의 각 call이 plan의 requir
 id: HCAP-01
 name: NFS lane filesystem access
 usable_stage: [stage1]
-status: validated
+usable_by: [agent_stage1]
+status: validated_subset
+validated_scope:
+    syz_open_nfs_lane / syz_open_nfs_lane_pair 경로
+    profile open(0020)과 broad-knfsd 노출은 scope 밖 (experimental)
 
 interface:
     syz_open_nfs_lane$client0
@@ -118,7 +166,6 @@ constraints:
         broad-knfsd: knfsd-v3, knfsd-v40, knfsd-v41, knfsd-v42
 
 verification_note:
-    syz_open_nfs_lane / _pair 경로는 검증됨.
     profile open(0020)과 broad-knfsd 노출은 이 명세가 참조할
     guest 검증 기록이 아직 없다.
 ```
@@ -139,6 +186,7 @@ README.md
 id: HCAP-02
 name: raw NFS/RPC request send
 usable_stage: [stage1, stage2]
+usable_by: [agent_stage1, agent_stage2]
 status: validated
 
 interface:
@@ -170,7 +218,12 @@ bundle/patches/syzkaller/0018-*
 id: HCAP-03
 name: remote KCOV lane attribution
 usable_stage: [stage1, stage2]
+usable_by: [agent_stage1, agent_stage2]
 status: validated
+
+authority_refs:                     # digest 참조. artifact는 아직 없다 (§1.1)
+    RemoteKcovSupportBoundary       # 귀속 execution context 목록 (06 §6.1)
+    Q1AdmissibilityProfile          # Q1 JudgeProfile (06 §6.1)
 
 purpose:
     knfsd server-side fs/nfsd 및 net/sunrpc coverage를
@@ -188,8 +241,8 @@ constraints:
     KCOV_NFSD_OBSERVE global stream은 Q1에 사용하지 않음
     local KCOV / tracepoint / kprobe 결과는 Q1에 사용하지 않음
     PC 존재만으로 cross-thread ordering은 증명하지 못함
-    귀속되는 execution context 목록은 RemoteKcovSupportBoundary가 소유한다
-        (06 §6.1. 물리적 표현과 HCAP 참조 방식은 issue #14)
+    귀속되는 execution context 목록은 RemoteKcovSupportBoundary가 소유하며
+        이 entry에 복제하지 않는다 (authority_refs)
     lane NFS tracing(koov.nfs_trace=1)을 켜면 tracepoint 생성 코드의
         PC가 remote coverage에 섞인다. 기본은 꺼짐이며, 켠 실행은
         그 모드를 evidence에 기록해야 한다
@@ -211,6 +264,7 @@ bundle/lane/lane.sh
 id: HCAP-04
 name: four-lane execution topology
 usable_stage: [stage1, stage2]
+usable_by: [agent_stage1, agent_stage2]
 status: partially_validated
 
 purpose:
@@ -249,7 +303,19 @@ tools/prepare-live-lane-config.py
 id: HCAP-05
 name: normal-flow scenario seeds
 usable_stage: [stage1]
-status: validated_per_scenario
+usable_by: [agent_stage1]
+status: validated_subset
+validated_scope:
+    manifest.json의 seed별 oracle 중 그 seed의 evidence가 확인한 범위
+    evidence가 측정하지 않았다고 적은 부분은 scope 밖
+        (예: async-copy-v42의 callback attribution)
+
+evidence_refs:
+    bundle/corpus/nfs-normal/manifest.json (programs[].evidence)
+    report/normal-flow-corpus.md
+
+authority_refs:
+    bundle/corpus/nfs-normal/manifest.json    # seed 목록과 seed별 oracle
 
 purpose:
     이미 준비된 정상 NFS 상태/흐름을 Stage 1 scenario의 기반으로 재사용
@@ -267,8 +333,9 @@ available scenarios (native profile별):
     ganesha-v41: basic (Ganesha campaign only)
 ```
 
-각 seed의 실제 기능 oracle, 실행 상태와 검증 한계는 `manifest.json`과
-`bundle/corpus/nfs-normal/README.md`가 authoritative detail이다.
+위 목록은 설명용 요약이다. seed 목록, 각 seed의 기능 oracle, 실행 상태와 검증 한계는 `manifest.json`이
+authority이고 `bundle/corpus/nfs-normal/README.md`가 설명한다. machine-readable HCAP은 seed 목록을 복제하지
+않고 manifest를 참조한다(§1.1).
 
 source refs:
 
@@ -285,7 +352,14 @@ tools/audit-normal-corpus.py
 id: HCAP-06
 name: flow transition tracing
 usable_stage: [stage1]
-status: validated_for_documented_scenarios
+usable_by: [agent_stage1]
+status: validated_subset
+validated_scope:
+    report/normal-flow-threads.md가 측정 결과를 기록한 scenario
+    (tools/flow-trace/scenarios/의 S1, S2, S3, S3b, S4, S5, S5b)
+
+evidence_refs:
+    report/normal-flow-threads.md
 
 purpose:
     PC만으로 증명할 수 없는 thread handoff / ordering을 trace event로 관측
@@ -316,7 +390,7 @@ report/normal-flow-threads.md
 id: HCAP-07
 name: NFSPARM1 fixed-width proxy mutation
 usable_stage: [stage2]
-usable_by: manual_legacy_campaigns    # Agent Stage 2 아님 (issue #8)
+usable_by: [manual_legacy_campaigns]  # Agent Stage 2 아님 (issue #8)
 status: validated
 
 interface:
@@ -354,7 +428,7 @@ bundle/patches/syzkaller/0017-*
 id: HCAP-08
 name: NFSPARM2 variable-length proxy mutation
 usable_stage: [stage2]
-usable_by: manual_legacy_campaigns    # Agent Stage 2 아님 (issue #8)
+usable_by: [manual_legacy_campaigns]  # Agent Stage 2 아님 (issue #8)
 status: partially_validated
 
 interface:
@@ -397,7 +471,7 @@ bundle/patches/syzkaller/0019-*
 id: HCAP-09
 name: mutation delta record/replay
 usable_stage: [stage2]
-usable_by: manual_legacy_campaigns    # Agent Stage 2 아님 (issue #8)
+usable_by: [manual_legacy_campaigns]  # Agent Stage 2 아님 (issue #8)
 status: validated
 
 purpose:
@@ -434,8 +508,34 @@ Semantic decoder, Transaction Context, runtime field resolver 같은 목표 기�
 HCAP-07/08/09는 사람이 작성한 legacy/manual campaign만 쓴다. Agent의 Stage 2 pipeline은
 MutationRuleSet을 NFSPARM anchor/offset/original bytes로 낮추지 않으며 semantic→legacy adapter도 없다
 (issue #8). Agent가 쓰는 semantic mutation capability는 M7 promotion gate
-(`../03-nfs-proxy/06-implementation-gap-analysis.md` §30)를 통과한 subset만 등록한다. `usable_by`와
-subset scope의 machine-readable 표현은 issue #14에서 정한다.
+(`../03-nfs-proxy/06-implementation-gap-analysis.md` §30)를 통과한 subset만 등록한다. 그 subset의 세부
+범위는 아래 semantic capability registry가 소유한다.
+
+### Semantic capability registry
+
+semantic mutation의 세부 지원 범위는 HCAP entry에 나열하지 않는다(issue #14). Proxy build가 다음 registry를
+결정적으로 생성한다.
+
+```text
+semantic capability registry
+    semantic_runtime_version
+    schema_id
+    지원 semantic path / WireRef part
+    predicate operator
+    transform_id + type 계약
+    mutation kind / structure_policy
+    ValueRef source / context dependency 지원
+    implementation / build identity
+```
+
+- build가 생성한 registry는 그 build가 *구현한* 범위를 기술할 뿐이며 그대로는 Agent가 쓸 수 없다.
+- subset이 M7 gate를 통과하면 그 registry digest와 subset scope를 promotion한다. semantic mutation HCAP
+  entry는 promoted registry를 `authority_refs`로, 검증된 subset을 `validated_scope`로 참조한다.
+- Agent와 Mutation Rule Compiler는 promoted scope만 쓴다. 실행 중인 binary가 runtime에 광고하는 범위만으로는
+  쓰지 않는다(§7.1).
+- path, operator, transform 목록을 이 문서나 Agent·Proxy 설계 문서에 복제하지 않는다.
+
+promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다.
 
 ## 5. Stage별 사용 범위
 
@@ -453,7 +553,7 @@ STAGE 2
     HCAP-02 raw NFS/RPC send
     HCAP-03 remote KCOV
     HCAP-04 lane topology
-    semantic mutation capability (M7 promotion을 통과한 subset만)
+    semantic mutation capability (M7 promotion을 통과한 registry scope만, §4)
 
 MANUAL / LEGACY CAMPAIGN (Agent pipeline 아님)
     HCAP-07 NFSPARM1 mutation
@@ -518,5 +618,38 @@ flow-trace capability change
 runtime verification status change
 ```
 
-구현과 명세가 다르면 runtime의 실제 검증 결과가 우선하며,
-명세 불일치는 repository maintenance defect로 취급한다.
+### 7.1 runtime과 HCAP이 다를 때
+
+어느 쪽도 조용히 우선하지 않는다(issue #14).
+
+```text
+runtime / build identity와 promoted registry가 pin된 HCAP 참조와 일치
+    -> validated scope 안에서 사용
+
+runtime이 pin된 authority보다 적거나 다르게 보고
+    -> INCONCLUSIVE(infra) / 차단
+    -> repository maintenance defect
+
+runtime이 promotion되지 않은 capability를 더 노출
+    -> 사용하지 않는다
+    -> validation / promotion이 authority를 갱신하기 전에는 Agent capability가 아니다
+```
+
+### 7.2 drift guard
+
+machine-readable HCAP을 도입할 때 `tools/test-lane-inputs.py`와 같은 형식의 host test가 다음을 확인한다.
+
+```text
+patch manifest가 가리키는 파일이 모두 존재
+series에 들어가야 할 patch가 orphan으로 남지 않음
+HCAP interface가 pin되어 적용된 syzlang build에서 resolve됨
+참조한 corpus seed가 canonical manifest에 존재
+promoted semantic registry digest가 runtime / build identity와 일치
+rendered HCAP 문서가 machine data와 일치
+```
+
+같은 사실을 담은 목록 두 개를 계속 손으로 맞추지 않는다. 한 manifest를 authority로 정하고 나머지는 그것을
+읽는다. 예를 들어 syzkaller patch 적용 순서의 authority는 `bundle/patches/syzkaller/series`다.
+`tools/fport-apply.sh`는 지금 `*.patch` glob으로 patch를 적용하므로, 이후 tooling은 glob 대신 `series`(또는
+그것에서 생성한 목록)를 읽어야 한다. `4f10720`(series에서 빠진 0021)과 `8c43771`(HCAP 수동 재동기화)이 손으로
+고친 drift가 이 guard의 대상이다.

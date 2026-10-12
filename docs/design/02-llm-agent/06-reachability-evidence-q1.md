@@ -216,7 +216,8 @@ Q1AdmissibilityProfile               # Q1 JudgeProfile (01 §11.1)
   `lane_owner_failed`는 정상 동작으로 표시한다.
 - delta window는 context별로 profile이 정하며, FINISH 뒤에 거부되는 late section(예: callback)을 포함해야
   한다.
-- 두 artifact의 물리적 표현과 HCAP 참조 방식은 issue #14에서 정한다.
+- HCAP-03이 두 artifact를 `authority_refs`로 digest 참조한다(04 §1.1, issue #14). 두 artifact의
+  serialization도 HCAP과 같은 규칙(schema와 canonical digest)을 따른다.
 
 ## 7. Q1Result
 

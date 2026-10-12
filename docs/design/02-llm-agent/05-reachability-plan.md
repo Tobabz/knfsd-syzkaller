@@ -175,7 +175,9 @@ required_capabilities:
     - ...
 ```
 
-모든 ID는 Harness Capability Specification에 존재해야 한다.
+모든 ID는 machine-readable HCAP(04 §1.1)에 존재해야 하고, 그 entry의 `usable_by`에 `agent_stage1`이
+있어야 한다. `validated_subset`의 scope 밖이나 `partially_validated` / `experimental` capability를 쓰면 plan에
+명시한다(04 §3).
 
 capability가 없으면 plan을 억지로 만들지 않고:
 
@@ -281,8 +283,8 @@ ReachabilityHarness
 ```
 
 Materializer는 call을 만들거나 program을 고치거나 candidate에 도달하는 방법을 추론하지 않는다. 거부는
-typed reason으로 Reachability Planning에 돌려준다. capability interface의 machine-readable authority는
-issue #14에서 정한다.
+typed reason으로 Reachability Planning에 돌려준다. capability interface의 authority는 machine-readable
+HCAP이다(04 §1.1).
 
 공통 runtime 검사는 corpus tooling과 같은 논리를 재사용할 수 있다. `tools/audit-normal-corpus.py`의 corpus
 정리·admission 규칙은 harness 계약으로 따로 채택하지 않는 한 적용하지 않는다.

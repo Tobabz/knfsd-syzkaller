@@ -327,7 +327,7 @@ MutationRuleSet
 [COMPONENT] Mutation Rule Compiler
         |
         +-- ProtocolSchema(schema_id)로 name / path / type 검증
-        +-- semantic capability 확인 (authority는 issue #14)
+        +-- promoted semantic registry scope 확인 (04 §4)
         +-- traffic scope binding
         +-- context_dependencies 도출
         +-- typed value bind / 정규화
@@ -409,7 +409,8 @@ HCAP-09 -> current delta replay
 Agent가 쓸 수 있는 semantic mutation capability는 M7 promotion gate를 통과한 subset뿐이다
 (`../03-nfs-proxy/06-implementation-gap-analysis.md` §30). 그런 subset이 없으면 Stage 2 intent는
 `unsupported_by_current_harness`로 처리하고 `HarnessGapIssue(gap_class=mutation_engine)`를 semantic
-runtime 구현·검증 작업에 연결한다. capability 표현의 authority는 issue #14에서 정한다.
+runtime 구현·검증 작업에 연결한다. 세부 지원 범위의 authority는 promoted semantic capability
+registry다(`04-harness-capability-spec.md` §4, issue #14).
 
 HCAP-08은 partially validated 상태이므로 미검증 조합은 그대로 미검증으로 남긴다.
 

@@ -120,7 +120,7 @@ daemon, topology, timing, namespace, mount mode 등 runtime environment가 부�
 현재 Proxy capability로 필요한 semantic selector, runtime field resolution, mutation 또는 replay 의미를 표현할 수 없는 경우.
 
 예: 이전 transaction의 state를 참조하는 intent는 missing capability `state_lineage`다(issue #6).
-machine-readable capability id 표현은 issue #14에서 정한다.
+capability id의 machine-readable 표현은 HCAP data가 소유한다(04 §1.1).
 
 ### remote_kcov_attribution
 

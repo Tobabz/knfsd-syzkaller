@@ -548,7 +548,7 @@ context dependencies derivable
 request view named explicitly (request_forwarded / request_original)
 no cross-transaction value reference (else requires_state_lineage)
 application mode == all_matches
-runtime capability advertised
+promoted registry scope 안 (runtime 광고만으로는 부족, issue #14)
 ```
 
 실패는 typed reason으로 돌려준다. `unknown_path`, `type_mismatch`, `message_type_inconsistent`,
@@ -1056,8 +1056,9 @@ Expected:
 
 ### 지원 범위
 
-Agent가 semantic mutation intent를 사용할 수 있다고 가정하려면 다음이 모두 current
-Harness Capability Specification에서 지원/검증되어야 한다.
+Agent가 semantic mutation intent를 사용할 수 있다고 가정하려면 다음이 모두 promoted semantic capability
+registry scope 안에 있어야 한다(`../02-llm-agent/04-harness-capability-spec.md` §4, issue #14). 이 목록은
+registry가 기술하는 범주이며, 지원 값을 HCAP 문서에 복제하지 않는다.
 
 ```text
 target ProtocolSchema path

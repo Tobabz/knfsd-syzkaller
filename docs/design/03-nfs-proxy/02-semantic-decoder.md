@@ -706,11 +706,12 @@ schema exists
     !=
 runtime implementation validated
     !=
-HCAP supported
+promoted registry scope (Agent usable)
 ```
 
-Harness Capability Specification에는 guest/runtime validation이 끝난 subset만
-지원 capability로 등록한다.
+field 단위 지원 범위는 Harness Capability Specification에 나열하지 않고 Proxy build가 생성하는 semantic
+capability registry가 소유한다. guest/runtime validation(M7)을 통과한 subset의 registry digest와 scope만
+promotion되어 HCAP에서 참조된다(`../02-llm-agent/04-harness-capability-spec.md` §4, issue #14).
 
 ### 18. schema extension
 

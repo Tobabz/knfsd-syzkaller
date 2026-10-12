@@ -910,8 +910,10 @@ ConnectionRef 생성 가능
 CALL/REPLY correlation 구현 존재
 필요한 request semantic context 보존
 guest/runtime validation 완료
-Harness Capability Specification에 usable로 등록
+promoted semantic capability registry scope에 포함
 ```
+
+registry와 promotion 규칙은 `../02-llm-agent/04-harness-capability-spec.md` §4가 소유한다(issue #14).
 
 ### 비지원 범위
 
