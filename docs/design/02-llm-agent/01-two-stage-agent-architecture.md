@@ -131,7 +131,7 @@ APPLICATION CONTROLLER
 | [COMPONENT]                 |
 | Harness Materializer        |
 |                             |
-| plan -> concrete artifacts  |
+| validate / assemble program |
 +-------------+---------------+
               |
               | [DATA] ReachabilityHarness
@@ -367,7 +367,7 @@ Stage 1의 채택 가능한 산출물은 `ReachabilityHarness`다.
 
 ```text
 ReachabilityHarness
-    syz program / selected existing seed
+    syz program / selected existing seed      # Agent 제안, Materializer 검증 (05 §11)
     existing fixture actions
     manager/runtime config
     required capability IDs
@@ -378,6 +378,7 @@ ReachabilityHarness
 ReachabilityHarness는 job-local runtime input이다.
 Stage 1은 새 syzlang, pseudo-syscall, kernel instrumentation 또는 repository patch를 생성하지 않는다.
 현재 capability로 candidate에 도달할 수 없으면 `unsupported_by_current_harness`로 남긴다.
+기존 capability로 표현되는 새 sequence는 gap이 아니며 Agent가 job-local program으로 쓴다(issue #12).
 
 ### 4.6 Q1 판정
 
@@ -868,7 +869,10 @@ state(§7.2)는 M1과 분리된 evidence이며 어떤 policy도 M1 판정을 바
 
 ```text
 Q1 not reached
-    -> ReachabilityPlan / harness repair
+    -> ReachabilityPlan repair (Agent가 program을 고친다)
+
+Harness Materializer 거부 (typed reason)
+    -> Reachability Planning repair
 
 Q1 INCONCLUSIVE(unsupported_attribution)
     -> HarnessGapSignal

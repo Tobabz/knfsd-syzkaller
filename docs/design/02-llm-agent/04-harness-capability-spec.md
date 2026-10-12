@@ -86,6 +86,10 @@ Capability
 Agent는 기본적으로 `validated` capability를 우선 사용하고,
 `partially_validated` / `experimental` 사용은 plan에 명시한다.
 
+Harness Materializer는 Agent가 제안한 program의 각 call이 plan의 required capability `interface`에
+속하는지 확인한다(`05` §11, issue #12). interface의 machine-readable 표현과 authority는 issue #14에서
+정한다.
+
 ## 4. 현재 capability catalog
 
 ### HCAP-01 — Lane filesystem access

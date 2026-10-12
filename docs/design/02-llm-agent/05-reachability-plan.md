@@ -77,6 +77,10 @@ ReachabilityPlan
 
     q1_observation
 
+    program_proposal              # concrete syz program 또는 기존 seed (§11)
+
+    runtime_selection             # allowlist (§10)
+
     execution_constraints[]
 
     uncertainties[]
@@ -117,7 +121,8 @@ Scenario가 요구하는 NFS protocol version을 명시한다.
 
 ## 7. scenario_steps
 
-Scenario는 capability를 참조하는 ordered step으로 표현한다.
+Scenario는 capability를 참조하는 ordered step으로 표현한다. step은 `program_proposal`을 설명하고 검토하기
+위한 구조화된 서술이며 Materializer가 펼치는 입력이 아니다(§11, issue #12).
 
 ```text
 scenario_step
@@ -235,26 +240,54 @@ manager snapshot mode (top-level snapshot) disabled
 
 CPU/RAM quota, retry 횟수, timeout 같은 운영 policy는 ReachabilityPlan에 넣지 않는다.
 
+plan이 고를 수 있는 runtime surface는 다음 allowlist뿐이다(issue #12).
+
+```text
+runtime_selection
+    selected profile / NFS version     # 실행당 하나
+    fixture mode
+    route / topology identity          # Stage 2용 proxied route (issue #10)
+    enabled interface subset           # required capability interface의 부분집합
+    seed / program artifact
+    trace mode                         # 기본 off
+```
+
+sanitizer, resource limit, 반복 횟수, fuzz duration, retry budget은 trusted JobPolicy와 execution 설정이며
+plan이 정하지 않는다. allowlist 밖의 환경 동작이 필요하면 `fixture_or_tool` gap이다(07 §4).
+
 ## 11. Harness Materialization
 
-ReachabilityPlan 다음에는 Application Component가 concrete runtime input을 만든다.
+Reachability Planning(Agent)이 concrete syz program 또는 기존 seed를 제안한다. Application Component인
+Harness Materializer는 이를 검증하고 실행 harness로 조립할 뿐 program을 만들지 않는다(issue #12).
 
 ```text
 ReachabilityPlan
-      |
+      |  program proposal / selected seed
+      |  runtime_selection, required capabilities, q1_observation
       v
 [COMPONENT] Harness Materializer
       |
-      +-- existing syzlang을 사용하는 .prog
-      +-- existing corpus seed 선택/조합
-      +-- existing fixture action
-      +-- manager config overlay
+      +-- pinned syzkaller strict parse
+      +-- 모든 call이 required capability interface에 속하는지 확인
+      +-- NFS root / profile acquisition 확인
+      +-- profile / fixture / backend / client route 일관성 확인
+      +-- 금지되거나 쓸 수 없는 call 거부
+      +-- Stage 1 execution invariant 확인 (§10)
+      +-- trusted fixture / runtime input bind
+      +-- review manifest와 artifact hash 생성
       |
       v
 ReachabilityHarness
 ```
 
-Materializer는 **현재 capability를 사용하는 runtime artifact를 만든다.**
+Materializer는 call을 만들거나 program을 고치거나 candidate에 도달하는 방법을 추론하지 않는다. 거부는
+typed reason으로 Reachability Planning에 돌려준다. capability interface의 machine-readable authority는
+issue #14에서 정한다.
+
+공통 runtime 검사는 corpus tooling과 같은 논리를 재사용할 수 있다. `tools/audit-normal-corpus.py`의 corpus
+정리·admission 규칙은 harness 계약으로 따로 채택하지 않는 한 적용하지 않는다.
+
+review manifest는 실행 전에 검증된 program과 runtime selection을 hash로 묶는다(approval binding).
 
 현재 capability가 부족하면 Materializer가 source를 즉석에서 수정하지 않는다.
 별도 Harness Extension Work에서 필요한 syzlang/pseudo-syscall/fixture/tool 확장을 구현·검증한 뒤
@@ -265,18 +298,22 @@ Capability Specification을 갱신하고 이 candidate를 재시도한다.
 ```text
 ReachabilityHarness
     candidate_id
-    nfs_version
+    selected profile / NFS version  # 실행당 하나 (issue #12)
     fixture mode                    # single | broad-knfsd
     route / topology identity       # Stage 2가 변조할 proxied route
-    syz_program / selected seed
+    syz_program / selected seed     # Agent 제안, Materializer 검증 (§11)
     neutral control program         # ambient control (06 §11)
     fixture actions
     manager/runtime configuration
     required capability IDs
     Q1 observation configuration
+    review manifest hash
 ```
 
 이는 repository patch가 아니라 job-local runtime input이다.
+
+program의 profile-open call은 선택한 profile과 맞아야 한다. mixed-profile scenario는 이후 명시적인 계약
+확장으로만 허용한다(issue #12).
 
 Stage 2로 넘길 harness는 Stage 2가 변조할 proxied route/topology에서 실행한다(issue #10). 현재 구체
 값은 `SERVER_IMPL=both`이지만 계약은 기록된 route/topology identity다. identity 체계는 issue #13에서
@@ -290,9 +327,11 @@ Planning failure
     unsupported_by_current_harness
     Q1 observability unavailable
 
-Materialization failure
-    invalid scenario parameters
-    selected capability cannot render requested action
+Materialization failure (typed reason -> Reachability Planning repair)
+    parse failure
+    disallowed or unavailable call
+    profile / fixture / route mismatch
+    invalid runtime selection
 
 Runtime failure
     build

@@ -82,7 +82,6 @@ gap_class
 ## 4. gap_class
 
 ```text
-scenario_or_config
 syzlang
 pseudo_syscall_executor
 fixture_or_tool
@@ -90,9 +89,10 @@ mutation_engine
 remote_kcov_attribution
 ```
 
-### scenario_or_config
-
-기존 code capability는 충분하지만 새로운 seed, sequence, manager/runtime config가 필요한 경우.
+기존 capability로 표현되는 새 sequence나 seed는 gap이 아니다. Agent가 job-local program으로 쓰고
+Materializer가 검증한다(`05` §11, issue #12). 성공한 program을 `bundle/corpus`로 올리는 것은 선택적인
+유지보수이며 candidate를 막지 않는다. plan의 runtime allowlist(`05` §10) 밖의 환경 동작은
+`fixture_or_tool`, syscall/RPC/XDR 표현이 없으면 `syzlang` 또는 `pseudo_syscall_executor`다.
 
 ### syzlang
 
@@ -245,7 +245,6 @@ patch 필요 비율을 사전에 숫자로 가정하지 않는다.
 
 ```text
 existing_capability_only
-scenario_or_config_only
 syzlang_extension
 pseudo_syscall_extension
 fixture_or_tool_extension
@@ -262,7 +261,7 @@ remote_kcov_attribution_extension
 
 | 유형 | 예상 빈도 | 이유 |
 |---|---|---|
-| scenario/config만 추가 | **common** | 기존 VFS/raw RPC/lane/KCOV capability 조합으로 새 state sequence를 만드는 경우가 많음 |
+| 기존 capability와 job-local program만 사용 (gap 아님) | **common** | 기존 VFS/raw RPC/lane/KCOV capability 조합으로 새 state sequence를 만드는 경우가 많음 |
 | syzlang extension | **rare / conditional** | 현재 NFSv3/v4 TCP와 많은 NFSv4 op shape를 이미 표현; description에 없는 op/type/resource 관계일 때 필요 |
 | pseudo-syscall/executor extension | **very rare** | lane open/connect/raw send/proxy arm 같은 전용 primitive가 이미 존재; 새로운 executor-side primitive가 꼭 필요할 때만 해당 |
 | fixture/tool/topology extension | **conditional; unsupported 경계에서는 common** | pNFS, GSS/TLS, UDP/RDMA, LOCALIO, NAT, lane-veth NLM 등은 환경 capability 자체가 부족 |
