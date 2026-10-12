@@ -412,7 +412,7 @@ baseline-with-rules gate
 
 반복 횟수는 job policy가 정한다. gate의 Q1이 `NOT_REACHED`이면 gate 실패로 기록하고 target mode,
 rule, runtime 중 어디서 도달성이 퇴행했는지 진단한다. rule이 도달성을 깨뜨렸다고 바로 단정하지
-않는다. `NOT_REACHED`가 건전한 음성이 되는 조건은 issue #9에서 정한다.
+않는다. `NOT_REACHED`는 `06` §9의 조건을 만족할 때만 나온다(issue #9).
 
 gate의 Q1이 `REACHED`여도 gate가 평가한 rule 중 하나라도 M1이 `INCONCLUSIVE`이면 runtime/evidence
 path를 고친 뒤 gate를 다시 실행한다. mutation evidence 경로가 확정되기 전에는 fuzz campaign을 시작하지

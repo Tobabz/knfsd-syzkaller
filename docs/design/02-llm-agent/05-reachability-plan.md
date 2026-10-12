@@ -192,6 +192,10 @@ q1_observation
     target
         candidate source location
 
+    expected_context
+        selected_path가 target을 실행하는 execution context
+        (RemoteKcovSupportBoundary의 context 이름, 06 §6.1)
+
     oracle
         HCAP-03 remote KCOV
 
@@ -199,6 +203,10 @@ q1_observation
         target code location mapped PC observed in
         generation-attributed remote coverage
 ```
+
+`expected_context`는 Planning의 주장이며 Judge가 PC에서 추론하지 않는다. 이 값은 target이 관측되지
+않았을 때 `NOT_REACHED`를 내릴 수 있는지만 정하고, 관측된 target을 걸러내지 않는다(06 §8–§10).
+Planning이 support boundary 밖의 context를 고르면 실행 전에 gap으로 분류할 수 있다(07 §2).
 
 Q1은 remote KCOV만 사용한다.
 cross-thread ordering이나 handoff 분석이 필요해도 flow trace는 Q1 조건에 포함하지 않는다.

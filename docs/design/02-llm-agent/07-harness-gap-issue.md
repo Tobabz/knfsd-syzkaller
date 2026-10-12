@@ -32,7 +32,17 @@ unsupported_by_current_harness
         |
         v
 create or link HarnessGapIssue
+
+Q1 Judge
+        |
+        v
+INCONCLUSIVE(unsupported_attribution) + HarnessGapSignal (06 §7)
+        |
+        v
+create or link HarnessGapIssue(remote_kcov_attribution)
 ```
+
+Agent Task와 Q1 Judge는 gap을 알릴 뿐이며 issue 생성과 연결은 Controller가 한다(§1).
 
 같은 capability gap이 이미 open 상태라면 새 issue를 중복 생성하지 않고 기존 issue에 candidate를 연결할 수 있다.
 
@@ -123,6 +133,9 @@ ownerless/background work
 현재 propagation이 없는 callback/workqueue path
 client-side target without remote attribution
 ```
+
+귀속 여부의 기준은 RemoteKcovSupportBoundary(06 §6.1)다. Q1 Judge는 target이 관측되지 않았고 plan의
+`expected_context`가 boundary 밖일 때 이 class의 HarnessGapSignal을 낸다.
 
 지원이 필요하면 remote-KCOV attribution을 확장하는 kernel harness patch가 필요할 수 있다.
 이 patch는 vulnerability fix가 아니며 explicit human approval을 요구한다.

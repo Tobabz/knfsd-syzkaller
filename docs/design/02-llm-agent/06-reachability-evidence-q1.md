@@ -50,6 +50,7 @@ VM / fixture / scenario / KCOV
       +-- NOT_REACHED --> Reachability repair
       |
       +-- INCONCLUSIVE -> runtime/observability repair
+                          unsupported_attribution이면 HarnessGapSignal (§13)
 ~~~
 
 ## 3. 왜 boolean이 아닌가
@@ -79,6 +80,7 @@ ReachabilityEvidence
         syzkaller_build_identity
         nfs_version
         lane
+        lane_trace_mode            # koov.nfs_trace (HCAP-03)
         scenario_artifact
 
     fixture
@@ -100,6 +102,7 @@ ReachabilityEvidence
         scratch_overflow
         outstanding_tokens
         remote_refs
+        counter_deltas{}           # profile이 정한 context별 counter의 window delta (§6.1)
 
     target_observation
         mapping_method
@@ -138,9 +141,10 @@ source-range candidate는 관측 PC가 build debug mapping을 통해 requested s
 Q1 Judge
     inputs:
         VulnerabilityCandidate
-        ReachabilityPlan.q1_observation
+        ReachabilityPlan.q1_observation   # target, expected_context
         ReachabilityEvidence           # 봉인된 bundle. manifest hash 대조 후 사용
-        JudgeProfile (Q1)
+        JudgeProfile (Q1)              # Q1AdmissibilityProfile (§6.1)
+        RemoteKcovSupportBoundary      # §6.1
 ~~~
 
 Judge는 Agent의 자유 텍스트가 아니라 plan의 구조화된 observation requirement를 사용한다.
@@ -164,6 +168,51 @@ not allowed:
 debugfs counter와 fixture 상태는 Q1의 positive evidence가 아니다.
 remote KCOV 실행이 판정 가능한 상태였는지를 확인하는 health/admissibility gate다.
 
+### 6.1 support boundary와 admissibility profile
+
+`NOT_REACHED`를 판정 가능하게 하는 두 artifact를 둔다(issue #9).
+
+~~~text
+RemoteKcovSupportBoundary            # 버전이 있는 Repository Design Data
+    checked-in attribution patch가 program generation에 귀속하는 execution context
+    알려진 비귀속 context
+    attribution kernel patch를 바꾸는 commit에서 함께 갱신한다
+
+Q1AdmissibilityProfile               # Q1 JudgeProfile (01 §11.1)
+    generation integrity 요구
+    context별 loss / rejection counter, delta window, 허용 기준
+    정상 동작에서 움직이는 counter
+    trace mode / evidence 요구
+~~~
+
+첫 버전의 boundary는 kernel patch 0002–0004와 `docs/design/decisions/2026-10-05-callback-attribution.md`를
+근거로 한다.
+
+~~~text
+귀속 context
+    request        lane server netns의 request 처리 (0002)
+    async_copy     async COPY continuation (0003)
+    callback_v41   NFSv4.1 server callback (0004). D6 제외: bc_close, bc_destroy, CB_NULL
+
+비귀속 context
+    transport accept / pre-dispatch
+    ownerless background work
+    client-side code
+    NFSv4.0 callback
+~~~
+
+- Judge는 PC에서 context를 추론하지 않는다. context는 plan의 `expected_context`(05 §9)가 주장한다.
+- boundary 버전은 evidence의 kernel build에 들어간 attribution patch와 맞아야 한다. 맞지 않으면
+  `INCONCLUSIVE(evidence)`다.
+- profile의 counter 예: request는 window 안의 `lane_owner_failed`, async는 `async_child_rejected`,
+  `deferred_child_rejected`, `child_token_rejected`, callback은 `cb_section_owner_none`,
+  `cb_section_lane_unhealthy`, `cb_section_epoch_mismatch`, 모든 귀속 context는 `new_root_rejected_*`,
+  `remote_grant_rejected_*`다. program 사이의 `lane_owner_no_generation`과 FINISH 뒤 `close_fds()`가 만드는
+  `lane_owner_failed`는 정상 동작으로 표시한다.
+- delta window는 context별로 profile이 정하며, FINISH 뒤에 거부되는 late section(예: callback)을 포함해야
+  한다.
+- 두 artifact의 물리적 표현과 HCAP 참조 방식은 issue #14에서 정한다.
+
 ## 7. Q1Result
 
 ~~~text
@@ -171,73 +220,105 @@ Q1Result
     candidate_id
     judge_profile_id
     evidence_manifest_sha256
+    support_boundary_id            # 사용한 RemoteKcovSupportBoundary 버전
     status
         reached
         not_reached
         inconclusive
 
-    reason
+    reason                         # inconclusive이면 §10의 reason 하나
+    gap_signal?                    # reason이 unsupported_attribution일 때
+        gap_class                  # remote_kcov_attribution
+        missing_capability         # remote_kcov.context.<expected_context>
     target_observed
     execution_valid
     observations[]
 ~~~
 
+status는 세 값만 둔다. attribution 지원 여부는 reachability의 네 번째 값이 아니라 `INCONCLUSIVE`의 reason과
+gap signal로 표현한다(issue #9).
+
 ## 8. REACHED 조건
 
-기본적으로 다음이 모두 만족되어야 한다.
+§8–§10의 판정 순서는 다음과 같다(issue #9).
+
+~~~text
+1. 봉인 evidence / generation correlation이 유효하지 않거나 현재 generation의 aggregate가 없음
+       -> INCONCLUSIVE(infra | evidence | loss)
+2. target source -> PC mapping 불가
+       -> INCONCLUSIVE(mapping)
+3. published coverage에 target PC가 있음
+       -> REACHED
+4. target PC가 없음
+   a. expected_context가 RemoteKcovSupportBoundary 밖
+       -> INCONCLUSIVE(unsupported_attribution) + HarnessGapSignal
+   b. 그 context의 loss / rejection delta가 profile 허용 범위 밖
+       -> INCONCLUSIVE(loss)
+   c. 그 밖
+       -> NOT_REACHED
+~~~
+
+REACHED는 다음이 모두 만족될 때다.
 
 ~~~text
 VM boot valid
 fixture/lane valid
 remote KCOV collection valid
-remote KCOV is generation-attributed
+remote KCOV is generation-attributed (correlation이 host-stamped 값과 일치)
 generation_begin observed
 remote_start_ok valid
-aggregate_published valid
-generation_aborted == 0
-scratch_overflow == 0
-outstanding_tokens drained
-remote_refs drained
+current generation의 aggregate가 publish되어 수집됨
 target code location observed
 ~~~
 
-정확한 counter 기대값은 Q1 `JudgeProfile`이 소유하며(01 §11.1, 구체 내용은 issue #9) Agent가 임의로
-완화하지 않는다.
+kernel은 generation이 committed, drained, not aborted이고 `remote_result`가 VALID일 때만 aggregate를
+publish한다(patch 0001). scratch overflow와 merge truncation은 generation을 incomplete로 만들어 publish를
+막는다. 따라서 `generation_aborted == 0`, `scratch_overflow == 0`, outstanding token과 remote ref drain은
+publish의 전제이며, 이 counter들은 publish되지 않은 이유를 진단하는 데 쓴다.
+
+loss는 PC를 지울 뿐 만들지 않는다. 그러므로 유효하게 publish된 coverage에서 target이 관측되면 loss
+counter와 `expected_context`에 관계없이 REACHED다. 계획과 다른 attributed execution에서 실행됐어도
+같다(§11).
+
+정확한 counter 기대값은 Q1AdmissibilityProfile(§6.1)이 소유하며 Agent가 임의로 완화하지 않는다.
 
 ## 9. NOT_REACHED 조건
 
-실행과 관측이 정상이라는 전제에서 target만 관측되지 않았을 때 사용한다.
+실행과 관측이 정상이고, target이 없다는 사실을 loss로 설명할 수 없을 때만 사용한다.
 
 ~~~text
-execution_valid == true
-fixture_valid == true
-coverage_collection_valid == true
-target is inside the current generation-attributed remote-KCOV support boundary
+REACHED의 유효성 조건(target 관측 제외)이 모두 성립
+target source -> PC mapping 유효
 target_observed == false
+q1_observation.expected_context가 RemoteKcovSupportBoundary 안
+Q1AdmissibilityProfile이 그 context에 지정한 loss / rejection counter의 window delta가 허용 범위 안
 ~~~
 
-이 결과는 Stage 1 scenario/path/state 선택의 repair 근거가 된다.
+debugfs counter는 lane별이 아니라 전역이다. 다른 lane의 delta가 섞이면 NOT_REACHED를 막는 쪽으로만
+작용하므로 판정은 보수적으로 남는다. 그래도 Q1 판정 run(Stage 1, baseline-with-rules gate)은 한 lane만
+program을 실행해 이 오차를 줄인다.
+
+이 결과는 Stage 1 scenario/path/state 선택의 repair 근거가 된다. baseline-with-rules gate의 NOT_REACHED도
+같은 조건을 따른다(01 §3).
 
 ## 10. INCONCLUSIVE 조건
 
-다음과 같은 경우 candidate 미도달이라고 단정하지 않는다.
+다음과 같은 경우 candidate 미도달이라고 단정하지 않는다. reason은 하나를 기록한다.
 
 ~~~text
-VM boot failure
-fixture/lane failure
-remote KCOV collection failure
-coverage truncation/loss
-counter inconsistency
-evidence integrity failure (manifest hash mismatch)
-host-stamped / guest correlation mismatch
-coverage is not generation-attributed
-target source -> PC mapping unavailable
-target later turns out to be outside the current remote-KCOV propagation boundary
-runner terminated early
-required evidence missing
+infra                     VM boot / fixture / lane 실패, runner 조기 종료,
+                          generation abort / drain timeout으로 aggregate 미publish
+evidence                  필요한 evidence 없음, coverage가 generation-attributed가 아님,
+                          manifest hash / correlation / counter 불일치 (01 §11.1),
+                          support boundary 버전이 kernel build와 맞지 않음
+loss                      scratch overflow, merge truncation 등으로 aggregate 미publish,
+                          또는 target 미관측이고 expected_context의 loss / rejection delta가 허용 범위 밖
+mapping                   target source -> PC mapping 불가
+unsupported_attribution   target 미관측이고 expected_context가 support boundary 밖
 ~~~
 
-이 경우 Agent reasoning보다 runtime/observability 문제를 먼저 해결한다.
+`unsupported_attribution`은 HarnessGapSignal로, 나머지는 Agent reasoning보다 runtime/observability 문제를
+먼저 해결하는 쪽으로 보낸다(§13).
 
 ## 11. Remote KCOV 밖의 관측
 
@@ -253,8 +334,8 @@ Q1
 필요한 ordering/handoff를 remote KCOV로 증명할 수 없더라도 Q1 정의를 확장하지 않는다.
 그 정보는 별도 diagnostic/analysis concern으로 남긴다.
 
-현재 target 자체가 generation-attributed remote KCOV 범위 밖이라면
-`NOT_REACHED`가 아니라 `unsupported_by_current_harness`로 분류하고 HarnessGapIssue를 생성한다.
+target이 관측되지 않았고 plan의 `expected_context`가 RemoteKcovSupportBoundary 밖이면 `NOT_REACHED`가
+아니라 `INCONCLUSIVE(unsupported_attribution)`이며, Judge는 HarnessGapSignal을 낸다(§13).
 
 ### automatic / background execution
 
@@ -317,10 +398,12 @@ Q1 = NOT_REACHED
 
 Q1 = INCONCLUSIVE
     |
-    +-- VM/fixture issue
-    +-- KCOV/trace issue
-    +-- mapping/evidence issue
-           -> Runner / observability repair
+    +-- infra / loss / evidence / mapping
+    |      -> Runner / observability repair
+    |
+    +-- unsupported_attribution
+           -> HarnessGapSignal
+           -> Controller가 HarnessGapIssue(remote_kcov_attribution)를 생성하거나 연결 (07 §2)
 ~~~
 
 Q1 상태만으로 source patch를 생성하지 않는다.

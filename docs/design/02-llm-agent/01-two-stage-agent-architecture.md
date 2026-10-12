@@ -45,7 +45,7 @@ Stage 2는 Stage 1의 Q1이 증명되기 전에는 시작하지 않는다.
 | 종류 | 의미 | 예 |
 |---|---|---|
 | **Data** | 저장·전달되는 구조화 데이터 | `VulnerabilityCandidate`, `CandidateAnalysis`, `ReachabilityPlan` |
-| **Repository Design Data** | 저장소에 버전과 함께 두는 정적 명세 | `Harness Capability Specification`, `JudgeProfile` |
+| **Repository Design Data** | 저장소에 버전과 함께 두는 정적 명세 | `Harness Capability Specification`, `JudgeProfile`, `RemoteKcovSupportBoundary` |
 | **Component** | application code | Controller, Rule Compiler, Judges |
 | **Agent Task** | Agent SDK가 reasoning을 수행하는 작업 | Candidate Analysis, Reachability Planning, Mutation Strategy |
 | **Runner Task** | 격리된 실행 환경에서 실제 코드를 실행하는 작업 | build, VM, KCOV, fuzz |
@@ -249,8 +249,8 @@ fatal sanitizer report로 VM이 죽은 generation은 FINISH 전에 끝나 remote
 
 | Q1 (target mode/rules) | rule별 M1 | 경로 |
 |---|---|---|
-| NOT_REACHED | any | gate 실패. target mode, rule, runtime 중 어디서 도달성이 퇴행했는지 진단한다. NOT_REACHED가 건전한 음성이 되는 조건은 issue #9에서 정한다 |
-| INCONCLUSIVE | any | runtime/evidence repair 후 gate 재실행 |
+| NOT_REACHED | any | gate 실패. target mode, rule, runtime 중 어디서 도달성이 퇴행했는지 진단한다. NOT_REACHED는 `06` §9의 조건을 만족할 때만 나온다(issue #9) |
+| INCONCLUSIVE | any | runtime/evidence repair 후 gate 재실행. reason이 `unsupported_attribution`이면 `06` §13의 gap 경로 |
 | REACHED | gate가 평가한 rule 중 하나라도 INCONCLUSIVE | runtime/evidence repair 후 gate 재실행. mutation evidence 경로가 확정되기 전에는 fuzz campaign을 시작하지 않는다 |
 | REACHED | baseline traffic 대상으로 표시한 intent의 rule이 NOT_APPLIED (표시는 issue #5) | fuzzing 전에 rule/strategy repair |
 | REACHED | 그 밖 | fuzz campaign 시작 |
@@ -370,6 +370,8 @@ Stage 1은 새 syzlang, pseudo-syscall, kernel instrumentation 또는 repository
 Q1 target hit/miss는 **현재 program generation에 귀속된 remote KCOV만**으로 판정한다.
 global NFSD observer, local KCOV, flow trace, tracepoint, kprobe는 Q1 oracle이 아니다.
 fixture 상태와 debugfs counter는 remote KCOV 실행의 유효성을 확인하는 health gate로만 사용한다.
+plan의 `expected_context`와 `RemoteKcovSupportBoundary`는 target이 관측되지 않았을 때 `NOT_REACHED`를
+내릴 수 있는지만 정한다(`06` §8–§10, issue #9).
 
 target이 직접 syscall/RPC 처리에서 실행되든 timer, workqueue, callback, lease renewal 같은
 자동 kernel execution에서 실행되든 구분하지 않는다. 현재 program generation에 귀속된
@@ -387,6 +389,8 @@ generation_begin / remote_start_ok / aggregate_published
 remote .extra coverage
 target PC hit result
 generation_aborted / scratch_overflow
+context별 loss / rejection counter delta
+lane trace mode
 fixture/lane health
 ```
 
@@ -763,7 +767,8 @@ verdict = Judge(봉인된 evidence bundle, JudgeProfile, plan / rule set)
 - Controller는 받은 artifact의 SHA-256을 manifest와 대조한 뒤 Judge에 넘긴다.
 - Judge는 판정 중 guest에 추가 사실을 묻지 않고 봉인된 bundle만 읽는다.
 - verdict record는 `judge_profile_id`, `evidence_manifest_sha256`, 판정에 쓴 plan / rule set identity를
-  기록한다. plan과 execution identity 체계는 issue #13에서 정한다.
+  기록한다. Q1 verdict는 사용한 `RemoteKcovSupportBoundary` 버전도 기록한다(`06` §6.1). plan과
+  execution identity 체계는 issue #13에서 정한다.
 - verdict record는 불변이다. 새 JudgeProfile로 다시 판정하면 같은 봉인 bundle에 대해 새 verdict를
   만든다. bundle에 필요한 evidence가 모두 있으면 VM을 다시 실행하지 않는다(무효화 규칙은 issue #13).
 
@@ -771,7 +776,7 @@ verdict = Judge(봉인된 evidence bundle, JudgeProfile, plan / rule set)
 
 ```text
 JudgeProfile                     # 버전이 있는 Repository Design Data
-    Q1    remote-KCOV support boundary / admissibility (issue #9), evidence 유효성 규칙
+    Q1    Q1AdmissibilityProfile: generation integrity, context별 loss 규칙 (`06` §6.1)
     M1    §7 판정 의미, journal / evidence 유효성 규칙
     Q2    sanitizer / crash report 분류 규칙
 
@@ -804,6 +809,10 @@ state(§7.2)는 M1과 분리된 evidence이며 어떤 policy도 M1 판정을 바
 ```text
 Q1 not reached
     -> ReachabilityPlan / harness repair
+
+Q1 INCONCLUSIVE(unsupported_attribution)
+    -> HarnessGapSignal
+    -> HarnessGapIssue(remote_kcov_attribution)
 
 Reachability Planning unsupported
     -> HarnessGapIssue

@@ -184,6 +184,8 @@ constraints:
     KCOV_NFSD_OBSERVE global stream은 Q1에 사용하지 않음
     local KCOV / tracepoint / kprobe 결과는 Q1에 사용하지 않음
     PC 존재만으로 cross-thread ordering은 증명하지 못함
+    귀속되는 execution context 목록은 RemoteKcovSupportBoundary가 소유한다
+        (06 §6.1. 물리적 표현과 HCAP 참조 방식은 issue #14)
     lane NFS tracing(koov.nfs_trace=1)을 켜면 tracepoint 생성 코드의
         PC가 remote coverage에 섞인다. 기본은 꺼짐이며, 켠 실행은
         그 모드를 evidence에 기록해야 한다
