@@ -811,7 +811,8 @@ S1  syzkaller / Runner integration (병행 track, §34)
 ```
 
 각 milestone은 다음 단계의 input contract를 실제 코드/테스트로 제공한다. 화살표의 S1 항목은 해당
-milestone을 완료하기 전에 있어야 한다. M4/M5 전에 M1 판정 계약
+milestone을 완료하기 전에 있어야 한다. 단 M4/S1a는 component 단계이고 host-durable sink를 쓰는 live
+target-mode 통합은 M5/S1b gate다(§27, issue #18 F8). M4/M5 전에 M1 판정 계약
 (`../02-llm-agent/01-two-stage-agent-architecture.md` §7)이 고정되어 있어야 하며, issue #4에서 고정됐다.
 
 ### 23. M0 — Legacy baseline lock
@@ -896,6 +897,22 @@ semantic rule registration order permutation
 
 Legacy v1->v2 chain behavior는 compatibility path에만 남긴다.
 
+**M4 / S1a acceptance 범위 (issue #18 F8).** target rule 설치는 host-durable `RULESET`을, activation ACK는
+host-durable `GENERATION_OPEN`을, mutated output 노출은 host-durable `EXPOSURE_INTENT`를 요구한다
+(`05-mutation-delta-replay.md` §7, §11, §21). 그 sink는 M5/S1b에서 생긴다. 그래서 M4와 S1a의 완료는 다음
+범위로 한정한다.
+
+| 범위 | M4 / S1a에서 | 어디서 완료하는가 |
+|---|---|---|
+| Resolver, preflight, concrete edit adapter, eligibility, closure 판정 | host component test. sink는 test double로 바꿀 수 있다 | M4 |
+| executor barrier, activation endpoint 격리, barrier 실패 처리 | syzkaller/Runner component test. Proxy 쪽 ACK는 test double로 바꿀 수 있다 | S1a |
+| RULESET 설치, `GENERATION_OPEN` 뒤 activation ACK, `EXPOSURE_INTENT` 뒤 노출을 실제 host sink로 하는 live target-mode 실행 | 하지 않는다 | M5 / S1b gate |
+
+- test double로 얻은 성공은 component 결과로만 기록한다. host/guest durability, Agent 사용 가능성, M7
+  promotion의 근거가 아니다.
+- 실제 sink가 없거나 거부하는 상태의 target mode는 mutated output을 노출하지 않는다. M4 build도 이 규칙을
+  지킨다. sink 없이 노출하는 test-only 경로를 production build에 두지 않는다.
+
 M4는 activation 창 eligibility도 구현한다. 새 CALL은 activation ACK와 deactivation ACK 사이에서만,
 REPLY는 CALL의 `activation_generation`으로 판단하며, 창 밖 record는 `outside_activation_window`로
 센다(`01-architecture.md` §16). resolver 결과는 rule별로 집계해 M5의 `GENERATION_COMPLETE`에 넘긴다.
@@ -923,6 +940,9 @@ Required:
 
 이 단계 전에는 target M1 delivery evidence contract가 구현됐다고 볼 수 없다.
 
+M5 gate는 M4/S1a component와 실제 S1b sink를 묶은 live target-mode 실행을 포함한다(§27). 이 gate에서 처음으로
+target rule 설치, activation, mutated output 노출을 host durability와 함께 검증한다.
+
 ### 29. M6 — Semantic Replay / ReplayResult
 
 M1-M5의 같은 runtime components를 replay mode에서도 사용한다.
@@ -942,7 +962,8 @@ Legacy NFSPDLT1/2 replay는 compatibility path로 계속 regression test한다.
 
 ### 30. M7 — Guest/runtime validation / capability promotion
 
-Host unit tests만으로 target semantic capability를 current HCAP으로 올리지 않는다.
+Host unit tests만으로 target semantic capability를 current HCAP으로 올리지 않는다. M4/S1a의 test double 결과도
+promotion evidence가 아니다(§27).
 
 M7은 subset 단위로 반복하는 promotion gate다(issue #8). semantic subset S는 S에 필요한 M1–M6
 구성요소, host test, S의 guest/runtime 검증, target 계약이 요구하는 semantic replay/evidence 검증을
