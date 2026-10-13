@@ -68,13 +68,27 @@ label (`TK_LINK` → `tk_link`); a `default:` arm is `default`.
 Each of these is a build error, because the runtime could only handle it by
 guessing: `float`/`double`/`quadruple`; type cycles other than the XDR linked
 list `struct T { ...; T *next; }`; optional-data (`T *x`) that is not such a
-list; arrays of zero-size elements; union case values outside the
-discriminant's type; duplicate case values; nesting deeper than
-`NFSP_DECODE_MAX_DEPTH`; minor versions that disagree on the layout before the
-minor-version field; a `branch` annotation that names nothing reachable.
+list, `opaque *x` and `string *x` included; arrays of zero-size elements;
+union case values outside the discriminant's type; duplicate case values; more
+union arms than a 16-bit arm index holds; a smallest encoding longer than
+32 bits; nesting deeper than `NFSP_DECODE_MAX_DEPTH`; minor versions that
+disagree on the layout before the minor-version field; a `branch` annotation
+that names nothing reachable.
 
-Declarations that no exposed procedure reaches are dropped, so they neither
-need to be supported nor change the tables.
+A semantic path names one position in the schema (array and list elements
+and repeated operations repeat it), so these are build errors too:
+duplicate struct member names or procedure names; a union arm whose branch
+repeats the discriminant's name; two different arms of one union with the same
+branch; one union named as the operation of both directions; an operation
+leaf that repeats the operation discriminant's name; an operation or procedure
+whose name is only its prefix, or an operation named like a procedure; a
+leaf, in `leaf` or `operation`, that is not an identifier.
+
+The parser reads every declaration in a source file, so a syntax error,
+`float`/`double`/`quadruple`, a multi-argument procedure, or a duplicate
+member or procedure name fails the build wherever it appears. The other
+checks only see declarations an exposed procedure reaches; everything else is
+dropped and does not change the tables.
 
 ## schema_id
 

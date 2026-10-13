@@ -35,7 +35,7 @@ struct dec {
 	unsigned depth;
 	int response;
 	uint32_t op;		/* current operation, or NFSP_FIELD_NONE */
-	int op_leaf_seen;
+	uint32_t op_start;	/* payload offset where its result begins */
 	enum nfsp_decode_status st;
 };
 
@@ -141,16 +141,17 @@ static void meta(struct dec *d, uint32_t me, uint32_t role, uint32_t off,
 	sp->len = len;
 }
 
-/* The first leaf of a response operation's result is its status when it has
- * the annotated status type (every NFSv4 resop arm starts with nfsstat4). */
-static void leaf_seen(struct dec *d, uint16_t t, uint64_t value)
+/* A response operation's status is the value of the annotated status type
+ * that its result starts with (every NFSv4 resop arm starts with nfsstat4).
+ * It is decided by offset, not by reading order: a count or link word at the
+ * start means no status whatever the element count, and a later status-typed
+ * member can never take the status's place (PR #25 reviews). */
+static void status_at(struct dec *d, uint16_t t, uint32_t at, uint64_t value)
 {
 	struct nfsp_decoded_op *op;
 
-	if (d->op == NFSP_FIELD_NONE || d->op_leaf_seen)
-		return;
-	d->op_leaf_seen = 1;
-	if (!d->response || !(d->s->types[t].flags & NFSP_STF_STATUS))
+	if (d->op == NFSP_FIELD_NONE || !d->response || at != d->op_start ||
+	    !(d->s->types[t].flags & NFSP_STF_STATUS))
 		return;
 	op = &d->m->ops[d->op];
 	op->has_status = 1;
@@ -187,6 +188,7 @@ static int dec_scalar(struct dec *d, uint16_t t, uint32_t me)
 	const struct nfsp_schema_type *ty = &d->s->types[t];
 	uint32_t size = ty->kind == NFSP_XK_HYPER ||
 			ty->kind == NFSP_XK_UHYPER ? 8u : 4u;
+	uint32_t at = d->off;
 	uint64_t v;
 
 	if (remaining(d) < size)
@@ -204,7 +206,7 @@ static int dec_scalar(struct dec *d, uint16_t t, uint32_t me)
 	F(d, me)->value = v;
 	F(d, me)->wire.value.len = size;
 	d->off += size;
-	leaf_seen(d, t, v);
+	status_at(d, t, at, v);
 	return 0;
 }
 
@@ -247,7 +249,6 @@ static int dec_bytes(struct dec *d, uint16_t t, uint32_t me)
 	if (pad)
 		meta(d, me, NFSP_META_PADDING, at, pad);
 	d->off = at + pad;
-	leaf_seen(d, t, 0);
 	return 0;
 }
 
@@ -385,12 +386,11 @@ static int dec_union(struct dec *d, uint16_t t, uint32_t parent,
 	int is_op = (ty->flags & (NFSP_STF_OPS_REQUEST |
 				  NFSP_STF_OPS_RESPONSE)) != 0;
 	uint32_t start = d->off, w, me, dn, saved_op = d->op;
-	int saved_seen = d->op_leaf_seen, rc = 0;
+	uint32_t saved_start = d->op_start;
+	int rc = 0;
 
-	/* saved_op/saved_seen are restored only when this union is an
-	 * operation boundary.  An ordinary union inside an operation must
-	 * leave op_leaf_seen as its members set it, or a later status-typed
-	 * leaf would overwrite the operation status (PR #25 review). */
+	/* An operation boundary sets op/op_start for its arm and restores the
+	 * enclosing ones after it.  An ordinary union changes neither. */
 
 	if (remaining(d) < 4)
 		return fail(d, NFSP_DECODE_TRUNCATED, t, "record ends here");
@@ -417,7 +417,6 @@ static int dec_union(struct dec *d, uint16_t t, uint32_t parent,
 		if (new_op(d, t, w, arm->branch, index))
 			return -1;
 		d->op = d->m->nops - 1;
-		d->op_leaf_seen = 0;
 		root = arm->branch;
 		component = NULL;
 	}
@@ -435,8 +434,10 @@ static int dec_union(struct dec *d, uint16_t t, uint32_t parent,
 	F(d, dn)->wire.value.len = 4;
 	d->off += 4;
 	F(d, dn)->wire.encoded.len = 4;
-	if (!is_op)
-		leaf_seen(d, ty->sub, w);
+	if (is_op)
+		d->op_start = d->off;	/* the result follows the opcode */
+	else
+		status_at(d, ty->sub, start, w);
 
 	F(d, me)->wire.value.off = d->off;
 	if (arm->type != NFSP_SCHEMA_NONE &&
@@ -450,7 +451,7 @@ out_fail:
 out:
 	if (is_op) {
 		d->op = saved_op;
-		d->op_leaf_seen = saved_seen;
+		d->op_start = saved_start;
 	}
 	return rc;
 }
@@ -625,6 +626,13 @@ nfsp_nfs_decode(const struct nfsp_schema_family *const *families,
 			       "no schema for this program and version");
 			goto done;
 		}
+		if (rpc->cred.flavor == NFSP_RPC_RPCSEC_GSS) {
+			/* Before the minor-version probe, which already reads
+			 * the body as arguments. */
+			refuse(&d, NFSP_DECODE_UNSUPPORTED_SCHEMA,
+			       "RPCSEC_GSS body is not decoded");
+			goto done;
+		}
 		s = fam->schemas[0];
 		if (fam->has_minor) {
 			if (rpc->proc != s->selector_proc ||
@@ -688,6 +696,13 @@ nfsp_nfs_decode(const struct nfsp_schema_family *const *families,
 		if (!fam) {
 			refuse(&d, NFSP_DECODE_UNSUPPORTED_SCHEMA,
 			       "no schema for this program and version");
+			goto done;
+		}
+		if (rd->cred_flavor == NFSP_RPC_RPCSEC_GSS ||
+		    (rpc->reply_stat == NFSP_RPC_MSG_ACCEPTED &&
+		     rpc->verf.flavor == NFSP_RPC_RPCSEC_GSS)) {
+			refuse(&d, NFSP_DECODE_UNSUPPORTED_SCHEMA,
+			       "RPCSEC_GSS body is not decoded");
 			goto done;
 		}
 		s = fam->schemas[0];

@@ -8,6 +8,7 @@ time.  Run: python3 -m unittest tools/nfs-proxy/schema/test_normalize.py
 """
 
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -66,12 +67,14 @@ def types_by_name(schema):
     return {t["name"]: t for t in schema["types"] if t.get("name")}
 
 
-class Refusals(unittest.TestCase):
+class RefusalCase(unittest.TestCase):
     def refused(self, body, needle, ann=ANN):
         with self.assertRaises(nz.SchemaError) as cm:
             norm(body, ann)
         self.assertIn(needle, str(cm.exception))
 
+
+class Refusals(RefusalCase):
     def test_float(self):
         self.refused("struct ARGS { float f; }; struct RES { st s; };",
                      "float is not supported")
@@ -149,6 +152,53 @@ program P { version V { void PROC_DO(A, A) = 1; } = 1; } = 1;"""
                 nz.normalize(a)
         self.assertIn("multi-argument", str(cm.exception))
 
+    def test_parser_refusals_reach_unreachable_declarations(self):
+        # README: the parser reads the whole file; only the other checks
+        # are limited to what an exposed procedure reaches.
+        self.refused("struct ARGS { uint32_t x; }; struct RES { st s; };"
+                     "struct unused { double d; };", "double is not supported")
+
+    def test_optional_opaque_and_string(self):
+        # Not XDR (opaque and string are not type-specifiers); they used to
+        # decode as an unbounded opaque<> / string<>.
+        self.refused("struct ARGS { opaque *x; }; struct RES { st s; };",
+                     "opaque must be declared with [] or <>")
+        self.refused("struct ARGS { string *x; }; struct RES { st s; };",
+                     "string must be declared with <>")
+        self.refused("typedef string *name; struct ARGS { name x; };"
+                     "struct RES { st s; };", "string must be declared with <>")
+
+    def test_typedef_cycle_through_list_link_terminates(self):
+        # The list-idiom check followed aliases without a cycle guard and
+        # hung; run in a subprocess so a regression fails instead of hanging.
+        xdr = HEAD + "typedef a b; typedef b a;" \
+            "struct ARGS { uint32_t x; a *p; }; struct RES { st s; };" + \
+            PROGRAM
+        with Tmp(xdr) as a:
+            r = subprocess.run([sys.executable, "-I",
+                                str(HERE / "normalize.py"), str(a), "--json"],
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("defined through itself", r.stderr)
+
+    def test_smallest_encoding_beyond_32_bits(self):
+        self.refused("struct ARGS { opaque a[4294967280]; "
+                     "opaque b[4294967280]; }; struct RES { st s; };",
+                     "smallest encoding exceeds 32 bits")
+
+    def test_arm_index_limit(self):
+        # 65535 labels plus default put the default at index 0xffff, which
+        # the runtime reads as "no default".
+        def union(labels, default):
+            arms = "".join(f"case {i}: " for i in range(labels)) + "void;"
+            if default:
+                arms += " default: uint32_t other;"
+            return (f"union ARGS switch (unsigned int d) {{ {arms} }};"
+                    "struct RES { st s; };")
+        self.refused(union(0xFFFF, True), "16-bit arm index")
+        (sch,) = norm_ok(union(0xFFFE, True))
+        self.assertEqual(len(types_by_name(sch)["ARGS"]["arms"]), 0xFFFE)
+
 
 class Naming(unittest.TestCase):
     def test_arm_components(self):
@@ -191,6 +241,123 @@ struct ARGS { uint32_t x; };
 def norm_ok(body, ann=ANN):
     _, schemas = norm(body, ann)
     return schemas
+
+
+OPS = """
+enum opnum { OP_A = 1, OP_B = 2 };
+struct A_body { uint32_t v; };
+"""
+OPS_ANN = ANN + "operation request argop args OP_\n" \
+    "operation response resop result OP_\n"
+
+
+class Paths(RefusalCase):
+    """A semantic path names one position in the schema (design 02 §8):
+    each case below would give two positions one path."""
+
+    def test_duplicate_member(self):
+        self.refused("struct ARGS { uint32_t a; hyper a; };"
+                     "struct RES { st s; };", "duplicate member a")
+
+    def test_duplicate_procedure(self):
+        xdr = HEAD + "struct A { uint32_t x; };" + """
+program P { version V {
+    void PROC_A(A) = 1;
+    void PROC_A(A) = 2;
+} = 1; } = 1;"""
+        with Tmp(xdr) as a:
+            with self.assertRaises(nz.SchemaError) as cm:
+                nz.normalize(a)
+        self.assertIn("duplicate procedure PROC_A", str(cm.exception))
+
+    def test_procedure_only_prefix(self):
+        xdr = HEAD + "struct A { uint32_t x; };" + """
+program P { version V { void PROC_(A) = 1; } = 1; } = 1;"""
+        with Tmp(xdr) as a:
+            with self.assertRaises(nz.SchemaError) as cm:
+                nz.normalize(a)
+        self.assertIn("only the prefix", str(cm.exception))
+
+    def test_struct_arm_branch_repeats_discriminant(self):
+        # Legal XDR: the lowercased label STATUS is the discriminant's name,
+        # so `RES.status` would be both the enum word and the struct arm.
+        self.refused("enum kind { STATUS = 0, OTHER = 1 };"
+                     "struct body { uint32_t v; }; struct ARGS { uint32_t x; };"
+                     "union RES switch (kind status) { case STATUS: body b; "
+                     "case OTHER: void; };", "repeats the discriminant name")
+
+    def test_annotated_branch_repeats_discriminant(self):
+        self.refused("struct ARGS { uint32_t x; };"
+                     "union RES switch (st status) { case S_OK: uint32_t v; "
+                     "default: void; };", "repeats the discriminant name",
+                     ANN + "branch S_OK status\n")
+
+    def test_two_arms_one_branch(self):
+        self.refused("struct ARGS { uint32_t x; };"
+                     "union RES switch (st s) { case S_OK: uint32_t a; "
+                     "case S_ERR: hyper a; };", "with one branch x",
+                     ANN + "branch S_OK x\nbranch S_ERR x\n")
+
+    def test_labels_of_one_arm_may_share_a_branch(self):
+        (sch,) = norm_ok("struct ARGS { uint32_t x; };"
+                         "union RES switch (st s) { case S_OK: case S_ERR: "
+                         "uint32_t a; };",
+                         ANN + "branch S_OK x\nbranch S_ERR x\n")
+        arms = types_by_name(sch)["RES"]["arms"]
+        self.assertEqual([a["component"] for a in arms], ["x.a", "x.a"])
+
+    def test_one_union_for_both_directions(self):
+        # One arm component cannot be .args in a CALL and .result in a REPLY.
+        self.refused(OPS + "union op switch (opnum code) { case OP_A: "
+                     "A_body a; case OP_B: void; };"
+                     "struct ARGS { op argarray<>; };"
+                     "struct RES { op resarray<>; };",
+                     "named for both request and response",
+                     ANN + "operation request op args OP_\n"
+                     "operation response op result OP_\n")
+
+    def test_operation_leaf_repeats_discriminant(self):
+        self.refused(OPS + "union argop switch (opnum args) { case OP_A: "
+                     "A_body a; case OP_B: void; };"
+                     "union resop switch (opnum code) { case OP_A: "
+                     "A_body a; case OP_B: void; };"
+                     "struct ARGS { argop ops<>; };"
+                     "struct RES { resop ops<>; };",
+                     "leaf args repeats the discriminant name", OPS_ANN)
+
+    def test_operation_named_like_a_procedure(self):
+        # OP_DO -> DO, a root beside procedure DO: DO.args twice.
+        self.refused("enum opnum { OP_A = 1, OP_DO = 2 };"
+                     "struct A_body { uint32_t v; };"
+                     "union argop switch (opnum code) { case OP_A: A_body a; "
+                     "case OP_DO: A_body d; };"
+                     "union resop switch (opnum code) { case OP_A: void; "
+                     "case OP_DO: void; };"
+                     "struct ARGS { argop ops<>; };"
+                     "struct RES { resop ops<>; };",
+                     "name of a procedure", OPS_ANN)
+
+    def test_operation_label_only_prefix(self):
+        self.refused("enum opnum { OP_ = 1 };"
+                     "union argop switch (opnum code) { case OP_: void; };"
+                     "union resop switch (opnum code) { case OP_: void; };"
+                     "struct ARGS { argop ops<>; };"
+                     "struct RES { resop ops<>; };",
+                     "only the prefix", OPS_ANN)
+
+    def test_leaf_must_be_an_identifier(self):
+        body = "struct ARGS { uint32_t x; }; struct RES { st s; };"
+        self.refused(body, "leaf must be an identifier",
+                     ANN + "leaf a.b result\n")
+        self.refused(OPS + "union argop switch (opnum code) { case OP_A: "
+                     "A_body a; case OP_B: void; };"
+                     "union resop switch (opnum code) { case OP_A: "
+                     "A_body a; case OP_B: void; };"
+                     "struct ARGS { argop ops<>; };"
+                     "struct RES { resop ops<>; };",
+                     "leaf must be an identifier",
+                     ANN + "operation request argop x[] OP_\n"
+                     "operation response resop result OP_\n")
 
 
 class Identity(unittest.TestCase):

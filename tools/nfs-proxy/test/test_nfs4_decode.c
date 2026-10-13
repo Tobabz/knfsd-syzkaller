@@ -344,8 +344,10 @@ static void build_seek_call(struct msg *m, uint32_t minor, uint32_t opcode)
 
 static struct nfsp_reply_dispatch dispatch(uint32_t minor)
 {
+	/* The CALLs here carry AUTH_SYS, as the Linux client sends them. */
 	return (struct nfsp_reply_dispatch){ NFS4_PROG, NFS_V4, 1, 1, minor,
-					     NFSP_DISPATCH_TEST_FIXTURE };
+					     NFSP_DISPATCH_TEST_FIXTURE,
+					     NFSP_RPC_AUTH_SYS };
 }
 
 static enum nfsp_decode_status

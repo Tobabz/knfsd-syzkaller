@@ -42,6 +42,15 @@
  *   Request context (the CALL's decoded operations, for request-dependent
  *   predicates and request/result consistency) comes from the Transaction
  *   Context in M3.  M2 never has it, so `request_context` is always 0.
+ *
+ * RPCSEC_GSS
+ *
+ *   Under RPCSEC_GSS integrity or privacy the body is an RFC 2203 wrapper
+ *   (rpc_gss_integ_data, rpc_gss_priv_data), not the procedure's arguments
+ *   or results, though its bytes may still fit the procedure's schema.  So a
+ *   CALL with an RPCSEC_GSS credential, and a REPLY whose CALL had one or
+ *   whose own verifier is RPCSEC_GSS, is unsupported_schema, whatever the
+ *   service.  The fuzzer sends such credentials (syzkaller patch 0006).
  */
 #ifndef NFSP_NFS_DECODE_H
 #define NFSP_NFS_DECODE_H
@@ -82,6 +91,7 @@ struct nfsp_reply_dispatch {
 	int has_minor;
 	uint32_t minor_version;
 	enum nfsp_dispatch_source source;
+	uint32_t cred_flavor;	/* the CALL's credential flavor */
 };
 
 struct nfsp_decode_input {
@@ -131,7 +141,8 @@ struct nfsp_decoded_op {
 	const char *name;
 	uint32_t sequence_index;	/* position in argarray/resarray */
 	uint32_t field;			/* the operation's union node */
-	int has_status;			/* response: first leaf is the status */
+	int has_status;			/* response: its result starts with a
+					 * value of the status type */
 	uint32_t status;
 };
 

@@ -28,6 +28,18 @@ WHAT IT REFUSES
   members of the discriminant's type, duplicate case values, and nesting
   deeper than the runtime's fixed limit.
 
+  A semantic path must name one position in the schema (array and list
+  elements and repeated operations repeat it), so anything that would give
+  two positions one path is refused too: duplicate struct members or
+  procedure names, a union arm whose branch repeats the discriminant's name,
+  two arm declarations sharing a branch, one union named as the operation
+  of both directions, and the rest that schema/README.md lists.
+
+  The parser reads every declaration in a file, so its refusals (syntax,
+  float/double/quadruple, multi-argument procedures, duplicate member or
+  procedure names) apply even to declarations nothing reaches.  The other
+  checks see only what an exposed procedure reaches.
+
 DETERMINISM
 
   Same XDR + same annotations => byte-identical output.  Types are numbered in
@@ -56,6 +68,9 @@ UNBOUNDED = 0xFFFFFFFF
 # Must match NFSP_DECODE_MAX_DEPTH in src/nfs_decode.h.
 MAX_DEPTH = 64
 NONE = 0xFFFF
+# A path word an annotation supplies: no `.` or `[]`, so a path still splits
+# back into the words that built it.
+IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class SchemaError(Exception):
@@ -241,6 +256,10 @@ class Parser:
                 self.take(val=";")
                 if d["spec"] == ("void",):
                     self.err("void struct member")
+                if any(f["name"] == d["name"] for f in fields):
+                    # RFC 4506 §6.4; it would also be one path for two
+                    # nodes
+                    self.err(f"duplicate member {d['name']}")
                 fields.append(d)
             if not fields:
                 self.err("empty struct")
@@ -307,6 +326,13 @@ class Parser:
             return {"name": None, "spec": spec, "shape": "plain",
                     "size": None}
         if self.accept("*"):
+            # opaque and string are not type-specifiers (RFC 4506 §6.3), so
+            # they have no optional-data form; without this they would
+            # silently become opaque<> and string<>.
+            if spec == ("opaque",):
+                self.err("opaque must be declared with [] or <>")
+            if spec == ("string",):
+                self.err("string must be declared with <>")
             return {"name": self.ident(), "spec": spec, "shape": "optional",
                     "size": None}
         name = self.ident()
@@ -338,6 +364,8 @@ class Parser:
             while not self.accept("}"):
                 ret = self.proc_type()
                 proc = self.ident()
+                if any(p["name"] == proc for p in procs):
+                    self.err(f"duplicate procedure {proc}")
                 self.take(val="(")
                 arg = self.proc_type()
                 if self.peek()[1] == ",":
@@ -399,6 +427,9 @@ def parse_annotations(path):
             ann["procedure_prefix"] = args[0]
         elif kw == "leaf":
             want(2)
+            for leaf in args:
+                if not IDENT.fullmatch(leaf):
+                    raise SchemaError(f"{where}: leaf must be an identifier")
             ann["leaf"] = tuple(args)
         elif kw == "operation":
             want(4)
@@ -406,6 +437,8 @@ def parse_annotations(path):
             if direction not in ("request", "response"):
                 raise SchemaError(f"{where}: direction must be request or "
                                   f"response")
+            if not IDENT.fullmatch(leaf):
+                raise SchemaError(f"{where}: leaf must be an identifier")
             if direction in ann["operations"]:
                 raise SchemaError(f"{where}: second {direction} operation")
             ann["operations"][direction] = (union, leaf, prefix)
@@ -634,6 +667,12 @@ class Normalizer:
                 seen.add(v)
                 out.append({"value": v, "label": self.label_text(lab),
                             "decl": d["name"], "type": t})
+        if len(out) + (default is not None) > NONE:
+            # An arm index, the default's included, is a uint16_t, and
+            # NFSP_SCHEMA_NONE (0xffff) means "no default": the runtime
+            # would skip an arm at that index.
+            raise SchemaError(f"union {name}: too many case labels for a "
+                              f"16-bit arm index")
         node["arms"] = out
         if default is not None:
             t = None if default["spec"] == ("void",) else \
@@ -645,8 +684,12 @@ class Normalizer:
 
     def ref_target(self, spec):
         # Follow plain typedef aliases to the struct name they denote.
+        seen = set()
         while spec[0] == "ref":
             name = spec[1]
+            if name in seen:
+                raise SchemaError(f"type {name} is defined through itself")
+            seen.add(name)
             kind, payload = self.p.types.get(name, (None, None))
             if kind == "typedef" and payload["shape"] == "plain":
                 spec = payload["spec"]
@@ -693,6 +736,8 @@ class Normalizer:
             nm = pr["name"]
             if prefix and not nm.startswith(prefix):
                 raise SchemaError(f"procedure {nm} lacks prefix {prefix}")
+            if nm == prefix:
+                raise SchemaError(f"procedure {nm} is only the prefix")
             arg = None if pr["arg"] == ("void",) else self.spec(pr["arg"])
             res = None if pr["res"] == ("void",) else self.spec(pr["res"])
             for t in (arg, res):
@@ -705,7 +750,7 @@ class Normalizer:
         if len(set(nums)) != len(nums):
             raise SchemaError("duplicate procedure number")
         self.check_structure()
-        self.annotate()
+        self.annotate({p["name"] for p in procs})
         sel = None
         if self.ann["minor_field"]:
             sel = self.selector(procs)
@@ -763,9 +808,6 @@ class Normalizer:
                 m = 4
             elif k == "array_fixed":
                 m = n["bound"] * visit(n["sub"])
-                if m > UNBOUNDED:
-                    raise SchemaError(f"fixed array {n['name'] or ''} "
-                                      f"exceeds 32 bits")
             elif k == "optional":
                 sub = self.nodes[n["sub"]]
                 if sub["kind"] != "struct" or not sub.get("listed"):
@@ -787,6 +829,10 @@ class Normalizer:
                             for a in arms)
             else:
                 raise SchemaError(f"unknown kind {k}")
+            if m > UNBOUNDED:
+                # min_size is a uint32_t, and no record can be this long
+                raise SchemaError(f"{k} {n['name'] or ''}: smallest "
+                                  f"encoding exceeds 32 bits")
             if k in ("array_fixed", "array_var"):
                 sub = self.nodes[n["sub"]]
                 if sub["kind"] == "struct" and sub.get("listed"):
@@ -834,31 +880,51 @@ class Normalizer:
         memo[i] = d
         return d
 
-    def annotate(self):
+    def annotate(self, procedures):
+        # Besides naming arms, this proves that no two schema positions
+        # share a path: under a union the discriminant and the chosen arm are
+        # the only children, and an operation's arms are path roots beside
+        # the procedures.  Struct members are unique from the parser.
         ops = {}
         for direction, (uname, leaf, prefix) in self.ann["operations"].items():
             idx = self.by_name.get(uname)
             if idx is None or self.nodes[idx]["kind"] != "union":
                 raise SchemaError(f"operation union {uname} is not a "
                                   f"reachable union")
+            if idx in ops:
+                # One arm component cannot be both .args and .result.
+                raise SchemaError(f"operation union {uname} is named for "
+                                  f"both request and response")
             ops[idx] = (direction, leaf, prefix)
         branches = self.ann["branches"]
         for i, n in enumerate(self.nodes):
             if n["kind"] != "union":
                 continue
+            uname = n["name"] or "(anonymous)"
+            disc = n["disc"][0]
             if i in ops:
                 direction, leaf, prefix = ops[i]
                 n["operations"] = direction
+                if leaf == disc:
+                    raise SchemaError(f"operation union {uname}: leaf "
+                                      f"{leaf} repeats the discriminant name")
                 for a in n["arms"]:
                     if not a["label"].startswith(prefix):
                         raise SchemaError(f"operation label {a['label']} "
                                           f"lacks prefix {prefix}")
                     a["branch"] = a["label"][len(prefix):]
+                    if not a["branch"]:
+                        raise SchemaError(f"operation label {a['label']} is "
+                                          f"only the prefix")
+                    if a["branch"] in procedures:
+                        raise SchemaError(f"operation {a['branch']} has the "
+                                          f"name of a procedure")
                     a["component"] = None if a["type"] is None else leaf
                 if n["default"] is not None:
                     raise SchemaError(f"operation union {n['name']} has a "
                                       f"default arm")
                 continue
+            by_branch = {}
             for a in n["arms"] + ([n["default"]] if n["default"] else []):
                 lab = a["label"]
                 if lab in branches:
@@ -871,10 +937,19 @@ class Normalizer:
                 a["branch"] = br
                 if a["type"] is None:
                     a["component"] = None
-                elif self.nodes[a["type"]]["kind"] == "struct":
+                    continue
+                if self.nodes[a["type"]]["kind"] == "struct":
                     a["component"] = br              # spliced struct arm
                 else:
                     a["component"] = f"{br}.{a['decl']}"
+                if br == disc:
+                    raise SchemaError(f"union {uname}: branch {br} of case "
+                                      f"{lab} repeats the discriminant name")
+                prev = by_branch.setdefault(br, a)
+                if (prev["decl"], prev["type"]) != (a["decl"], a["type"]):
+                    raise SchemaError(f"union {uname}: cases {prev['label']} "
+                                      f"and {lab} are different arms with "
+                                      f"one branch {br}")
 
     def selector(self, procs):
         sname, fname = self.ann["minor_field"]
