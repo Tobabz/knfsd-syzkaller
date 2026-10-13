@@ -571,7 +571,9 @@ class Machine:
 
     def _set_resume(self, c: _Call, t: Target, base: Target) -> None:
         """09 §5: a re-evaluation event on a waiting job moves only its
-        resume_point."""
+        resume_point.  A result that is a waiting state resumes where that
+        result resumes, not at the base point an earlier re-evaluation may
+        have moved (rationale 16)."""
         j = c.job
         if j.state is JobState.BLOCKED_OPERATOR:
             here = Target(kind=TargetKind.BLOCKED_OPERATOR,
@@ -579,10 +581,12 @@ class Machine:
         else:
             here = Target(kind=TargetKind.BLOCKED_HARNESS_GAP, gap=j.gap)
         place = t.model_copy(update={"inner": None})
-        if t == base or place == here:
+        if t == base:
             j.resume_point = base
-        elif t.kind in WAITING_KINDS:
-            j.resume_point = t.model_copy(update={"inner": base})
+        elif place == here:
+            # Already waiting there: ending the wait goes where the result
+            # goes.
+            j.resume_point = t.inner
         else:
             j.resume_point = t
 

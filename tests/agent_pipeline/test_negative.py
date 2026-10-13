@@ -360,3 +360,63 @@ def test_issue_resolved_before_the_hcap_notice_checks_the_plan(world):
     world.c.on_registry_changed()                   # the late notice
     assert len(world.store.transitions(j)) == n
     world.c.replay(j)
+
+
+def rejudge(w, j, bundle, profile, status, reason=None):
+    w.judge.add(bundle, binding().execution_harness_id,
+                w.job(j).candidate.candidate_id, status, reason,
+                profile=profile)
+    w.c.on_judge_versions(VERSIONS.model_copy(
+        update={"judge_profile_id": profile}))
+
+
+def test_rejudge_back_to_the_waiting_state_does_not_keep_reached(world):
+    """09 rationale 16: evidence -> re-judged REACHED -> re-judged
+    INCONCLUSIVE(evidence) again: resume runs again, it does not enter
+    s1_reached on a verdict that is not REACHED."""
+    j = blocked_on_evidence(world)
+    bundle = world.job(j).last_verdict.bundle_ref
+    rejudge(world, j, bundle, "jp-2", Q1Status.REACHED)
+    assert world.job(j).resume_point.kind is TargetKind.REACHED
+    rejudge(world, j, bundle, "jp-3", Q1Status.INCONCLUSIVE, "evidence")
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.resume_point.kind is TargetKind.RUNNING
+    assert job.last_verdict.result.judge_profile_id == "jp-3"
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.stage2_input is None
+    world.c.replay(j)
+
+
+def test_rejudge_to_another_waiting_state_keeps_its_own_resume(world):
+    j = blocked_on_evidence(world)
+    bundle = world.job(j).last_verdict.bundle_ref
+    rejudge(world, j, bundle, "jp-2", Q1Status.REACHED)
+    rejudge(world, j, bundle, "jp-3", Q1Status.INCONCLUSIVE, "mapping")
+    rp = world.job(j).resume_point
+    assert rp.kind is TargetKind.BLOCKED_OPERATOR
+    assert rp.reason is BlockedReason.Q1_MAPPING
+    assert rp.inner.kind is TargetKind.RUNNING
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == BlockedReason.Q1_MAPPING.value
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.stage2_input is None
+    world.c.replay(j)
+
+
+def test_reached_is_entered_only_on_a_reached_verdict(world):
+    j = blocked_on_evidence(world)
+    bundle = world.job(j).last_verdict.bundle_ref
+    rejudge(world, j, bundle, "jp-2", Q1Status.REACHED)
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    assert job.last_verdict.result.status is Q1Status.REACHED
+    assert job.stage2_input.q1_verdict_id == \
+        job.last_verdict.result.verdict_id

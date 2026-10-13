@@ -73,12 +73,20 @@ class InMemoryIssues:
     """One issue per gap key (07 §3)."""
 
     def __init__(self) -> None:
-        self.issues: dict[GapRef, str] = {}
+        self.issues: dict[GapRef, str] = {}       # the open issue per gap
         self.links: dict[GapRef, list[str]] = {}
+        self.opened = 0
 
     def open_or_link(self, gap: GapRef, job_id: str) -> str:
-        ref = self.issues.setdefault(gap, f"gap-{len(self.issues) + 1}")
-        jobs = self.links.setdefault(gap, [])
-        if job_id not in jobs:
-            jobs.append(job_id)
-        return ref
+        if gap not in self.issues:
+            self.opened += 1
+            self.issues[gap] = f"gap-{self.opened}"
+            self.links[gap] = []
+        if job_id not in self.links[gap]:
+            self.links[gap].append(job_id)
+        return self.issues[gap]
+
+    def resolve(self, gap: GapRef) -> None:
+        """Close the gap's issue; the gap next time opens a new one."""
+        self.issues.pop(gap)
+        self.links.pop(gap)

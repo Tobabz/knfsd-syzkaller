@@ -258,6 +258,7 @@ class World:
                               OTHER_COMMIT: {"fs/nfsd/nfs4xdr.c": SOURCE}})
         self.artifacts = ArtifactStore(self.tmp / "artifacts")
         self.ids = 0
+        self.expected_failures = 0
         self.controller = self._controller()
 
     def _new_id(self) -> str:

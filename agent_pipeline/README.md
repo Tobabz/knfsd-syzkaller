@@ -18,7 +18,7 @@ uv run pytest            # tests/agent_pipeline: oracles 1-5 of 09, intake
 | `artifacts.py` | SHA-256 content-addressed artifact store |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |
 | `controller/store.py` | SQLite: one transaction per transition |
-| `controller/service.py` | events in, tasks out after commit; `recover()` after a restart; `replay()` |
+| `controller/service.py` | events in, tasks out after commit; `poll()` and `recover()` send a failed or unanswered call again (each failure is recorded per job in `effect_failures`, and the other jobs go on); `replay()` |
 | `controller/tasks.py` | the Runner and Agent executor task contracts (09 §8) |
 
 Not here yet: the Agent Tasks themselves (PydanticAI, decision record decision

@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS gap_links (
     job_id TEXT NOT NULL, gap_class TEXT NOT NULL,
     missing_capability_id TEXT NOT NULL,
     PRIMARY KEY (job_id, gap_class, missing_capability_id));
+CREATE TABLE IF NOT EXISTS effect_failures (
+    job_id TEXT NOT NULL, effect TEXT NOT NULL, error TEXT NOT NULL,
+    at TEXT NOT NULL);
 """
 
 
@@ -128,6 +131,16 @@ class Store:
                                    prev_seq))
             if cur.rowcount != 1:
                 raise StaleJob(job.job_id)
+            # A job's issue link lasts while it waits on that gap; the same
+            # gap later is a new wait that is linked again (07 §2).
+            waiting = job.state in (JobState.BLOCKED_HARNESS_GAP,
+                                    JobState.PARKED) and job.gap is not None
+            self.db.execute(
+                "DELETE FROM gap_links WHERE job_id = ? AND NOT "
+                "(? AND gap_class = ? AND missing_capability_id = ?)",
+                (job.job_id, waiting,
+                 job.gap.gap_class.value if waiting else "",
+                 job.gap.missing_capability_id if waiting else ""))
             self._append(transition)
             for v in verdicts:
                 self.db.execute("INSERT OR IGNORE INTO verdicts VALUES "
@@ -189,7 +202,7 @@ class Store:
                    job_id: str | None = None) -> None:
         """The gap's issue, and that `job_id` is linked to it."""
         with self._tx():
-            self.db.execute("INSERT OR IGNORE INTO gap_issues VALUES "
+            self.db.execute("INSERT OR REPLACE INTO gap_issues VALUES "
                             "(?, ?, ?)", (gap.gap_class.value,
                                           gap.missing_capability_id,
                                           issue_ref))
@@ -197,6 +210,24 @@ class Store:
                 self.db.execute("INSERT OR IGNORE INTO gap_links VALUES "
                                 "(?, ?, ?)", (job_id, gap.gap_class.value,
                                               gap.missing_capability_id))
+
+    def record_failure(self, job_id: str, effect: str, error: str,
+                       at: str) -> None:
+        """A side effect sent after commit failed; it stays due and is sent
+        again by poll() or recover()."""
+        with self._tx():
+            self.db.execute("INSERT INTO effect_failures (job_id, effect, "
+                            "error, at) VALUES (?, ?, ?, ?)",
+                            (job_id, effect, error, at))
+
+    def effect_failures(self, job_id: str | None = None
+                        ) -> list[tuple[str, str, str, str]]:
+        q = "SELECT job_id, effect, error, at FROM effect_failures"
+        args: tuple = ()
+        if job_id is not None:
+            q += " WHERE job_id = ?"
+            args = (job_id,)
+        return self.db.execute(q + " ORDER BY rowid", args).fetchall()
 
     def is_linked(self, job_id: str, gap: GapRef) -> bool:
         return self.db.execute(

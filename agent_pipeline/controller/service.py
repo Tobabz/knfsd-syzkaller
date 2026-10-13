@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import uuid
+from dataclasses import dataclass
 from typing import Callable
 
 from ..artifacts import ArtifactStore
@@ -31,6 +32,15 @@ FINAL = ("sealed", "ended_unsealed")
 
 class ReplayMismatch(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class EffectFailure:
+    """A call sent after commit that failed.  The job keeps it due."""
+
+    job_id: str
+    effect: str
+    error: str
 
 
 def _utc_now() -> str:
@@ -56,6 +66,7 @@ class Controller:
         self.judge_versions = judge_versions
         self.clock = clock
         self.new_id = new_id
+        self.failures: list[EffectFailure] = []
 
     # ------------------------------------------------------------ intake
 
@@ -186,25 +197,36 @@ class Controller:
         return self._apply(job_id, ev.OperatorAction(
             action=action, action_id=f"op-{self.new_id()}"))
 
-    def poll(self) -> None:
+    def poll(self) -> list[EffectFailure]:
         """Ask the Runner about every job's Runner tasks and finish what a
         lost answer left undone (09 §8): a cancel not yet confirmed is sent
         again, a pending task the Runner does not know is submitted again
         with its task_id, and a gap job not linked to its issue is
-        linked."""
+        linked.  A failing call is recorded for its job and the other jobs
+        go on; returns this call's failures."""
+        self.failures = []
         for job in list(self.store.jobs()):
             self._settle(job.job_id)
+        return self.failures
 
     def _settle(self, job_id: str) -> None:
         job = self.store.job(job_id)
         for task_id in job.cancelling_tasks:
-            st = self.runner.status(task_id)
-            if st.state in FINAL:
-                self._apply(job_id, ev.CancelConfirmed(task_id=task_id))
-            else:
-                self._cancel(job_id, task_id)
+            self._guard(job_id, f"cancel:{task_id}",
+                        lambda t=task_id: self._recancel(job_id, t))
+        self._guard(job_id, "link_issue",
+                    lambda: self._link_gap(self.store.job(job_id)))
+        self._guard(job_id, "runner_status",
+                    lambda: self._poll_pending(job_id))
+
+    def _recancel(self, job_id: str, task_id: str) -> None:
+        if self.runner.status(task_id).state in FINAL:
+            self._apply(job_id, ev.CancelConfirmed(task_id=task_id))
+        else:
+            self._cancel(job_id, task_id)
+
+    def _poll_pending(self, job_id: str) -> None:
         job = self.store.job(job_id)
-        self._link_gap(job)
         p = job.pending_task
         if p is None or p.kind is not TaskKind.RUNNER or \
                 job.cancelling_tasks:
@@ -217,27 +239,36 @@ class Controller:
 
     # ------------------------------------------------------------ restart
 
-    def recover(self) -> None:
+    def recover(self) -> list[EffectFailure]:
         """09 §8: settle cancels first, then re-attach to the Runner task by
         task_id, send a new attempt of an Agent task, and process the
-        queue states."""
+        queue states.  Failures are recorded per job, as in poll()."""
+        self.failures = []
         for job in list(self.store.jobs()):
-            for task_id in job.cancelling_tasks:
-                self._cancel(job.job_id, task_id)
-            job = self.store.job(job.job_id)
-            self._link_gap(job)
-            p = job.pending_task
-            if p is None:
-                if job.state is JobState.SUBMITTED:
-                    self._intake(job.job_id)
-                elif job.state is JobState.RETRY_PENDING:
-                    self._rebind(job)
-                continue
-            if p.kind is TaskKind.RUNNER:
-                self._dispatch(job.job_id)
-            elif p.kind is TaskKind.AGENT:
-                self._apply(job.job_id, ev.AgentAttemptRestarted(
-                    task_id=p.task_id, attempt=p.attempt + 1))
+            self._guard(job.job_id, "recover",
+                        lambda j=job.job_id: self._recover(j))
+        return self.failures
+
+    def _recover(self, job_id: str) -> None:
+        job = self.store.job(job_id)
+        for task_id in job.cancelling_tasks:
+            self._guard(job_id, f"cancel:{task_id}",
+                        lambda t=task_id: self._cancel(job_id, t))
+        self._guard(job_id, "link_issue",
+                    lambda: self._link_gap(self.store.job(job_id)))
+        job = self.store.job(job_id)
+        p = job.pending_task
+        if p is None:
+            if job.state is JobState.SUBMITTED:
+                self._intake(job_id)
+            elif job.state is JobState.RETRY_PENDING:
+                self._rebind(job)
+            return
+        if p.kind is TaskKind.RUNNER:
+            self._dispatch(job_id)
+        elif p.kind is TaskKind.AGENT:
+            self._apply(job_id, ev.AgentAttemptRestarted(
+                task_id=p.task_id, attempt=p.attempt + 1))
 
     def replay(self, job_id: str) -> Job:
         """Apply every stored event again from the first record; each step
@@ -282,11 +313,27 @@ class Controller:
             if a is not None and a.status == "running":
                 self.store.save_attempt(a.model_copy(
                     update={"status": "abandoned"}))
+        # Committed already: a failing call is recorded and sent again by
+        # poll() or recover(), and does not stop the next one.
+        j = new.job_id
         for task_id in new.cancelling_tasks:
             if task_id not in old.cancelling_tasks:
-                self._cancel(new.job_id, task_id)
-        self._dispatch(new.job_id)
-        self._link_gap(self.store.job(new.job_id))
+                self._guard(j, f"cancel:{task_id}",
+                            lambda t=task_id: self._cancel(j, t))
+        self._guard(j, "dispatch", lambda: self._dispatch(j))
+        self._guard(j, "link_issue",
+                    lambda: self._link_gap(self.store.job(j)))
+
+    def _guard(self, job_id: str, effect: str,
+               call: Callable[[], None]) -> bool:
+        try:
+            call()
+            return True
+        except Exception as e:      # any failure of the outside call
+            f = EffectFailure(job_id=job_id, effect=effect, error=repr(e))
+            self.store.record_failure(job_id, effect, f.error, self.clock())
+            self.failures.append(f)
+            return False
 
     def _link_gap(self, job: Job) -> None:
         """07 §2: the Controller creates or links the issue.  Idempotent,
