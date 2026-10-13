@@ -1086,6 +1086,54 @@ static void test_random_edits(void)
 	nfsp_decoded_msg_free(&m);
 }
 
+/* A table whose CALL reaches a response operation union is refused, not
+ * read as a second request operation list.  The normalizer never emits
+ * one (test_normalize: test_operation_union_of_the_other_direction). */
+static void test_other_direction_op_union(void)
+{
+	const struct nfsp_protocol_schema *orig =
+		nfsp_schema_family_tproto.schemas[0];
+	static struct nfsp_schema_type types[64];
+	static struct nfsp_protocol_schema sch;
+	const struct nfsp_protocol_schema *schs[1] = { &sch };
+	struct nfsp_schema_family fam = nfsp_schema_family_tproto;
+	const struct nfsp_schema_family *f[1] = { &fam };
+	struct nfsp_rpc_envelope env;
+	struct nfsp_decode_input in;
+	struct nfsp_decoded_msg m = {0};
+	struct msg c;
+	uint32_t i, op = NFSP_SCHEMA_NONE;
+
+	printf("tables: an operation union of the other direction\n");
+	CHECK(orig->ntypes <= 64, "tproto.0 has %u types", orig->ntypes);
+	if (orig->ntypes > 64)
+		return;
+	memcpy(types, orig->types, orig->ntypes * sizeof(types[0]));
+	for (i = 0; i < orig->ntypes; i++)
+		if (types[i].flags & NFSP_STF_OPS_REQUEST)
+			op = i;
+	CHECK(op != NFSP_SCHEMA_NONE, "no request operation union");
+	if (op == NFSP_SCHEMA_NONE)
+		return;
+	types[op].flags = (uint8_t)((types[op].flags & ~NFSP_STF_OPS_REQUEST) |
+				    NFSP_STF_OPS_RESPONSE);
+	sch = *orig;
+	sch.types = types;
+	fam.schemas = schs;
+	fam.nschemas = 1;
+
+	build_compound_call(&c, 0);
+	memset(&in, 0, sizeof(in));
+	in.payload = c.b;
+	in.len = c.n;
+	in.rpc = &env;
+	nfsp_rpc_decode(c.b, c.n, &env);
+	CHECK(nfsp_nfs_decode(f, 1, &in, &m) ==
+	      NFSP_DECODE_UNSUPPORTED_SCHEMA && m.nops == 0,
+	      "%s, nops %u", nfsp_decode_strstatus(m.status), m.nops);
+	nfsp_decoded_msg_free(&m);
+}
+
 static void test_bad_input(void)
 {
 	struct nfsp_decoded_msg m = {0};
@@ -1129,6 +1177,7 @@ int main(void)
 	test_resource_limit();
 	test_address_oracle();
 	test_random_edits();
+	test_other_direction_op_union();
 	test_bad_input();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

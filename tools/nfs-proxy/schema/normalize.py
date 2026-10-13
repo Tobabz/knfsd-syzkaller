@@ -733,6 +733,7 @@ class Normalizer:
             raise SchemaError("duplicate procedure number")
         self.check_structure()
         self.annotate({p["name"] for p in procs})
+        self.check_directions(procs)
         sel = None
         if self.ann["minor_field"]:
             sel = self.selector(procs)
@@ -850,6 +851,27 @@ class Normalizer:
                                      if a["type"] is not None]
         return []
 
+    def check_directions(self, procs):
+        """The decoder promotes an operation union to an operation of the
+        message it is read in.  One reached in the other direction's
+        message would be a second operation list with another schema
+        position under the same path, so it is refused."""
+        for p in procs:
+            for t, mine, other in ((p["arg"], "request", "response"),
+                                   (p["res"], "response", "request")):
+                todo, seen = [t] if t is not None else [], set()
+                while todo:
+                    i = todo.pop()
+                    if i in seen:
+                        continue
+                    seen.add(i)
+                    n = self.nodes[i]
+                    if n.get("operations") == other:
+                        raise SchemaError(
+                            f"procedure {p['name']}: {other} operation union "
+                            f"{n['name']} reached in the {mine}")
+                    todo.extend(self.children(n))
+
     def depth(self, i, memo=None):
         if i is None:
             return 0
@@ -951,29 +973,38 @@ class Normalizer:
                 "prefix": [self.canon(t) for _, t in
                            self.nodes[sidx]["fields"][:fi + 1]]}
 
-    def canon(self, i, seen=None):
-        """Structural form of a type, independent of table indices."""
-        seen = seen or set()
-        n = self.nodes[i]
-        if i in seen:
-            return ["ref", n["name"]]
-        seen = seen | {i}
-        k = n["kind"]
-        out = [k, n.get("bound")]
-        if k == "enum":
-            out.append([v for _, v in n["values"]])
-        elif k == "struct":
-            out.append([self.canon(t, seen) for _, t in n["fields"]])
-            out.append(bool(n.get("listed")))
-        elif k == "union":
-            out.append(self.canon(n["disc"][1], seen))
-            arms = list(n["arms"]) + ([dict(n["default"], value="default")]
-                                      if n["default"] else [])
-            out.append([[a["value"], None if a["type"] is None
-                         else self.canon(a["type"], seen)] for a in arms])
-        else:
-            out.extend(self.canon(c, seen) for c in self.children(n))
-        return out
+    def canon(self, i):
+        """Structural form of a type, independent of table indices.
+
+        A type already written out is referred to by its position in the
+        order of first appearance, so a shared subtype costs one entry per
+        use and the form stays linear in the number of types."""
+        order = {}
+
+        def visit(i):
+            if i in order:
+                return ["ref", order[i]]
+            order[i] = len(order)
+            n = self.nodes[i]
+            k = n["kind"]
+            form = [k, n.get("bound")]
+            if k == "enum":
+                form.append([v for _, v in n["values"]])
+            elif k == "struct":
+                form.append([visit(t) for _, t in n["fields"]])
+                form.append(bool(n.get("listed")))
+            elif k == "union":
+                form.append(visit(n["disc"][1]))
+                arms = list(n["arms"]) + (
+                    [dict(n["default"], value="default")]
+                    if n["default"] else [])
+                form.append([[a["value"], None if a["type"] is None
+                              else visit(a["type"])] for a in arms])
+            else:
+                form.extend(visit(c) for c in self.children(n))
+            return form
+
+        return visit(i)
 
 
 def normalize(ann_path):

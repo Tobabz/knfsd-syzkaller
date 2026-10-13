@@ -316,6 +316,24 @@ program P { version V { void PROC_(A) = 1; } = 1; } = 1;"""
                      ANN + "operation request op args OP_\n"
                      "operation response op result OP_\n")
 
+    def test_operation_union_of_the_other_direction(self):
+        # A response op echoed inside a CALL would be a second request
+        # operation list: A at two schema positions under one path.
+        unions = ("union argop switch (opnum code) { case OP_A: "
+                  "uint32_t v; case OP_B: void; };"
+                  "union resop switch (opnum code) { case OP_A: "
+                  "hyper v; case OP_B: void; };")
+        self.refused(OPS + unions +
+                     "struct ARGS { argop ops<>; resop echoed; };"
+                     "struct RES { resop ops<>; };",
+                     "response operation union resop reached in the "
+                     "request", OPS_ANN)
+        self.refused(OPS + unions +
+                     "struct ARGS { argop ops<>; };"
+                     "struct RES { resop ops<>; argop echoed[1]; };",
+                     "request operation union argop reached in the "
+                     "response", OPS_ANN)
+
     def test_operation_leaf_repeats_discriminant(self):
         self.refused(OPS + "union argop switch (opnum args) { case OP_A: "
                      "A_body a; case OP_B: void; };"
@@ -401,6 +419,21 @@ class Minors(unittest.TestCase):
             with self.assertRaises(nz.SchemaError) as cm:
                 nz.normalize(a)
         self.assertIn("disagree", str(cm.exception))
+
+    def test_shared_prefix_types_stay_linear(self):
+        # Each L<n> uses L<n-1> twice: written out as a tree the prefix
+        # would hold 2**30 L0s.  Depth 63, inside MAX_DEPTH.
+        chain = "struct L0 { uint32_t value; };" + "".join(
+            f"struct L{i} {{ L{i - 1} a<>; L{i - 1} b<>; }};"
+            for i in range(1, 31))
+        x = HEAD + chain + \
+            "struct ARGS { L30 prefix; uint32_t minor; };" \
+            "struct RES { st s; };"
+        with Tmp(x + PROGRAM, self.MANN, {"u.x": x + PROGRAM}) as a:
+            _, schemas = nz.normalize(a)
+        self.assertEqual(schemas[0]["selector"]["prefix"],
+                         schemas[1]["selector"]["prefix"])
+        self.assertLess(len(repr(schemas[0]["selector"]["prefix"])), 4096)
 
     def test_ids_differ_per_minor(self):
         x = HEAD + "struct ARGS { uint32_t minor; }; struct RES { st s; };"
