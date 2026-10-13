@@ -203,11 +203,15 @@ Evidence: `evidence/nfsd-tracec-autostart-20261009T152248Z/`. `result.json` cont
 lane and kernel hashes, Build IDs, checks and per-function PC counts. Each variant directory
 contains the raw coverage, trace, guest command outputs and dmesg.
 
-## NFS proxy M0 legacy baseline acceptance (2026-10-13)
+## NFS proxy M0 legacy baseline initial run (2026-10-13, superseded)
 
-PR #17의 M0 변경을 독립 검토한 뒤 코드 커밋
+이 절은 당시 작성 에이전트의 자체 실행 기록이다. 이후 확인 결과 guest
+kernel이 현재 4개가 아닌 3개 patch만 포함했으므로 아래 rebuild rerun으로
+대체되며, 독립 review 근거로 사용하지 않는다.
+
+PR #17의 M0 변경을 자체 검토한 뒤 코드 커밋
 `eec30fdd768f822da3d5c3439330b9004c52a8bd`에서 Linux 호스트와 실제
-x86_64 KVM guest 검증을 다시 수행했다. 검토 범위는 `583896c`의 독립
+x86_64 KVM guest 검증을 수행했다. 검토 범위는 `583896c`의 별도 parser 기반
 `NFSPDLT1`/`NFSPDLT2` golden vector, `93ba2ee`의 Linux topology 및
 fail-closed gate, `20ada7b`의 `linux/amd64` guest build, 사용자 결정에
 따라 Darwin 지원을 범위에서 제거한 `83e4cdb`, 이 코드 커밋의 자동 guest
@@ -303,6 +307,34 @@ docs/handoff/proxy-variable-length-edits/run-verify.sh env kasan raw
 x86_64 KVM guest 범위를 충족한다. Darwin host와 Docker fallback은
 2026-10-13 사용자 결정 및 `83e4cdb`에 따라 M0 범위에서 제외되었고,
 그 플랫폼에 대한 지원이나 검증 완료를 주장하지 않는다.
+
+## NFS proxy M0 current-series rebuild rerun (2026-10-13)
+
+Issue #20의 최신 결정에 따라 `--skip-build` 없이 `env/`를 다시 만들고,
+코드 커밋 `f51d8fee2d49308e14d8c8b0b86f483046abad25`에서 L1–L8과
+R1–R5를 모두 재실행했다. 실행 에이전트는 **OpenAI Codex (GPT-5 기반)**다.
+이는 작성 에이전트의 자체 실행이며 독립 review라고 부르지 않는다.
+
+| 항목 | 재빌드 결과 |
+| --- | --- |
+| kernel | base `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`, 4 commits, tip `7bd83d51f06a0a47a9135d3330eb72392795e4b7` |
+| kernel series | `bb2b3d825e86c0a99607835ca9a8838f211590822b5fd21e129dbd2e0ded51f1` |
+| syzkaller | base `801f0966669a37e048adabf9e5f38ce52825ea82`, 21 commits, tip `51df18e17ade097520080f812f57fff257021451` |
+| syzkaller series | `ef819dd8f3c4a46df9bc67a827ec09c32634a357aba88b052e73500a305b8271` |
+| guest kernel | 모든 arm에서 x86_64 `7.3.0-rc5-00004-g7bd83d51f06a` |
+| guest relay / replay probe | 같은 Debian 12.15 amd64 build, 둘 다 ELF64 x86-64, 최대 `GLIBC_2.34` |
+
+L1–L3은 각각 4 proc × 30으로 `rc=0`과 `.extra` 30/30을 기록했다.
+L4/L5/L8의 live counter, L6/L7의 `edit_applied=3`, R1–R5의 exact 및
+fail-closed replay가 모두 기대값과 일치했다. 모든 성공 arm의 proxy error와
+fatal dmesg는 0이었다. 의도적으로 invalid workload를 넣은 별도 negative
+test는 wrapper `rc=1`을 반환하면서 `executor.log`, `dmesg.txt`,
+`result.json`을 모두 보존해 실패 진단 경로도 확인했다.
+
+전체 manifest, commit 목록, arm별 guest identity와 실행 로그, delta 및
+replay log는 [rebuild rerun 증거](evidence/m0-legacy-baseline-20261013-rerun/)에
+있다. 이전 3-patch 실행은 historical record로만 남고 이 결과가 이를
+대체한다.
 
 ## Related records
 

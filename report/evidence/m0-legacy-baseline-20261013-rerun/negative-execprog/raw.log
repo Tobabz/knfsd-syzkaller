@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/fuzzer/fuzz/knfsd-syzkaller/docs/handoff/proxy-variable-length-edits/verify-lane.py", line 486, in <module>
+    main()
+  File "/home/fuzzer/fuzz/knfsd-syzkaller/docs/handoff/proxy-variable-length-edits/verify-lane.py", line 411, in main
+    raise ValueError("syz-execprog failed: %s" % result["execprog_rc"])
+ValueError: syz-execprog failed: rc=1

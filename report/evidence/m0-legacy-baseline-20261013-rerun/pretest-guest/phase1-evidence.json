@@ -1,0 +1,43 @@
+{
+  "commands": [
+    {
+      "command": "uname -m; uname -r",
+      "duration_seconds": 0.250562,
+      "returncode": 0,
+      "stage": "pretest-identity",
+      "stderr": "commands/001-pretest-identity.stderr",
+      "stdout": "commands/001-pretest-identity.stdout"
+    }
+  ],
+  "runtime": {
+    "qemu": [
+      "qemu-system-x86_64",
+      "-enable-kvm",
+      "-cpu",
+      "host",
+      "-m",
+      "4096",
+      "-smp",
+      "4",
+      "-display",
+      "none",
+      "-serial",
+      "stdio",
+      "-no-reboot",
+      "-snapshot",
+      "-drive",
+      "file=/home/fuzzer/prune-env-image.raw,format=raw,if=ide",
+      "-kernel",
+      "/home/fuzzer/fuzz/knfsd-syzkaller/env/images/kasan/bzImage",
+      "-append",
+      "root=/dev/sda console=ttyS0 nokaslr nfs.localio_enabled=N",
+      "-device",
+      "e1000,netdev=net0",
+      "-netdev",
+      "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:53627-:22"
+    ],
+    "qemu_pid": 3512271,
+    "ssh_port": 53627,
+    "ssh_ready_at": "2026-10-13T02:49:58Z"
+  }
+}

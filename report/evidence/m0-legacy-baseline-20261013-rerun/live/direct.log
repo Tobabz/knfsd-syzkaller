@@ -1,0 +1,55 @@
+{
+ "workload": "/home/fuzzer/prune-evidence/inputs/workload-direct.prog",
+ "procs": 4,
+ "executions": 30,
+ "legacy_profile": null,
+ "input_sha256": {
+  "workload": "1c25d93578d42604fa3b69620e6b853afcf6f5616864ce2e1666c7b80683f494",
+  "deps": "d0e000c71484ec3910cfeab2319d54876e577602281d02c74bbdce67a05151be"
+ },
+ "guest_inventory": [
+  "x86_64",
+  "7.3.0-rc5-00004-g7bd83d51f06a",
+  "1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /opt/kcov-nfs/deps/usr/sbin/nfs-proxy"
+ ],
+ "lane_state": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+ "execprog_rc": "rc=0",
+ "calls": 1020,
+ "calls_errno_nonzero": 30,
+ "errno_by_call": [
+  [
+   14,
+   11
+  ]
+ ],
+ "lane_states": {
+  "0": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+  "1": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 1 lane_epoch 2 valid 1 unhealthy 0 owner 2\n",
+  "2": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 2 lane_epoch 3 valid 1 unhealthy 0 owner 3\n",
+  "3": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 3 lane_epoch 4 valid 1 unhealthy 0 owner 4\n"
+ },
+ "proxy_lanes": {
+  "0": {
+   "stats": "",
+   "control": ""
+  },
+  "1": {
+   "stats": "",
+   "control": ""
+  },
+  "2": {
+   "stats": "",
+   "control": ""
+  },
+  "3": {
+   "stats": "",
+   "control": ""
+  }
+ },
+ "dmesg_fatal": [],
+ "extra_files": 30,
+ "extra_nonempty": 30,
+ "extra_pcs": 8501,
+ "extra_fs_nfsd": 1955,
+ "extra_net_sunrpc": 653
+}

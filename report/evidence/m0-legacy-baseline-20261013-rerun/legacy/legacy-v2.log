@@ -1,0 +1,127 @@
+{
+ "workload": "/home/fuzzer/prune-evidence/inputs/workload-legacy-v2.prog",
+ "procs": 1,
+ "executions": 1,
+ "legacy_profile": "v2",
+ "input_sha256": {
+  "workload": "728b3cb67bee05e20dd62c33695efec79fe99c30beaebd18c7a3d202e579813c",
+  "deps": "d0e000c71484ec3910cfeab2319d54876e577602281d02c74bbdce67a05151be",
+  "replay_probe": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c"
+ },
+ "guest_inventory": [
+  "x86_64",
+  "7.3.0-rc5-00004-g7bd83d51f06a",
+  "1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /opt/kcov-nfs/deps/usr/sbin/nfs-proxy",
+  "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c  /opt/frozen-phase9/replay-probe"
+ ],
+ "lane_state": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+ "execprog_rc": "rc=0",
+ "calls": 9,
+ "calls_errno_nonzero": 0,
+ "errno_by_call": [],
+ "lane_states": {
+  "0": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n"
+ },
+ "proxy_lanes": {
+  "0": {
+   "stats": "peak_active=5 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=1 expired=1 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=1 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  }
+ },
+ "legacy_control": {
+  "mode": "live",
+  "armed": 1,
+  "expired": 1,
+  "applied": 0,
+  "refused_orig": 0,
+  "refused_bounds": 0,
+  "unknown_layout": 0,
+  "invalid_arms": 0,
+  "edit_applied": 1,
+  "edit_refused_orig": 0,
+  "edit_refused_bounds": 0,
+  "edit_refused_unknown": 0,
+  "edit_refused_overlap": 0,
+  "edit_refused_toobig": 0
+ },
+ "deltas": [
+  {
+   "file": "arm-0.delta",
+   "sha256": "2f33b3b7015c344cc32dad0159f0ac04ae4133cecf4d6b96147006b4b7c51b78",
+   "bytes": 92,
+   "magic": "NFSPDLT2",
+   "version": 2,
+   "seed": "0x0000000000000000",
+   "record": {
+    "dir": 0,
+    "backend": 0,
+    "client": 0,
+    "first_opcode": 4294967295,
+    "anchor_off": 4,
+    "anchor_len": 4,
+    "mode": 1,
+    "nedits": 1,
+    "applied_count": 1,
+    "reserved": 0,
+    "edits": [
+     {
+      "kind": 0,
+      "offset": 60,
+      "orig_len": 4,
+      "data_len": 8
+     }
+    ]
+   }
+  }
+ ],
+ "replay": [
+  {
+   "case": "v2-exact",
+   "delta": "arm-0.delta",
+   "delta_sha256": "2f33b3b7015c344cc32dad0159f0ac04ae4133cecf4d6b96147006b4b7c51b78",
+   "target": "10.89.0.1",
+   "request_xid": "0x11111111",
+   "expected_response_xid": "0x11111111",
+   "probe_rc": 0,
+   "proxy_rc": 0,
+   "rule": "replay rule=0 edit=1 expected=1 applied=1 refused_orig=0",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v2-exact.log",
+   "log_sha256": "0c3a6375495fd08b117d679cc829f4dcb8838ad21f4cc126953ddf04ce521ae5"
+  },
+  {
+   "case": "v2-original-mismatch",
+   "delta": "v2-original-mismatch.delta",
+   "delta_sha256": "b05a34c36be18e8581980632f60b69e4fa8a7d8f64acc84f6b05efcf15f5bd64",
+   "target": "10.89.0.1",
+   "request_xid": "0x11111111",
+   "expected_response_xid": "0x11111111",
+   "probe_rc": 0,
+   "proxy_rc": 1,
+   "rule": "replay rule=0 edit=1 expected=1 applied=0 refused_orig=1",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v2-original-mismatch.log",
+   "log_sha256": "7d9b0eb9029685968f9610eed9582bf94e5a673ff41c395c52bed4bbfc010fd8"
+  },
+  {
+   "case": "v2-count-mismatch",
+   "delta": "v2-count-mismatch.delta",
+   "delta_sha256": "7bf214873daf2f128297881de8d09bef3f24f6fecaf40787bc176df1233dcecc",
+   "target": "10.89.0.1",
+   "request_xid": "0x11111111",
+   "expected_response_xid": "0x11111111",
+   "probe_rc": 0,
+   "proxy_rc": 1,
+   "rule": "replay rule=0 edit=1 expected=2 applied=1 refused_orig=0",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v2-count-mismatch.log",
+   "log_sha256": "ca6fc4245842a7e007dab59c4abbbcd3a52165140ae19e504de8936bd73ea1b6"
+  }
+ ],
+ "dmesg_fatal": [],
+ "extra_files": 1,
+ "extra_nonempty": 1,
+ "extra_pcs": 2340,
+ "extra_fs_nfsd": 501,
+ "extra_net_sunrpc": 220
+}

@@ -1,0 +1,75 @@
+2026/10/13 03:04:53 parsed 0 programs
+usage: execprog [flags] file-with-programs-or-corpus.db+
+  -arch string
+    	target arch (default "amd64")
+  -collide
+    	(DEPRECATED) collide syscalls to provoke data races
+  -cover
+    	collect feedback signals (coverage)
+  -coverfile string
+    	write coverage to the file
+  -cpuprofile string
+    	write CPU profile to this file
+  -debug
+    	debug output from executor
+  -disable string
+    	enable all additional features except listed (default "none")
+  -enable string
+    	enable only listed additional features (default "none")
+  -executor string
+    	path to executor binary (default "./syz-executor")
+  -gdb
+    	start executor under gdb
+  -glob string
+    	run glob expansion request
+  -hints
+    	do a hints-generation run
+  -memprofile string
+    	write memory profile to this file
+  -optional string
+    	optional flags for programmatic use only
+  -os string
+    	target os (default "linux")
+  -output
+    	write programs and results to stdout
+  -procs int
+    	number of parallel processes to execute programs (default 12)
+  -remote-cover
+    	collect extra/remote coverage (equivalent to experimental.remote_cover) (default true)
+  -repeat int
+    	repeat execution that many times (0 for infinite loop) (default 1)
+  -sandbox string
+    	sandbox for fuzzing (none/setuid/namespace/android) (default "none")
+  -sandbox_arg int
+    	argument for sandbox runner to adjust it via config
+  -slowdown int
+    	execution slowdown caused by emulation/instrumentation (default 1)
+  -stress
+    	enable stress mode (local fuzzer)
+  -syscalls string
+    	comma-separated list of enabled syscalls for the stress mode
+  -threaded
+    	use threaded mode in executor (default true)
+  -type string
+    	target VM type
+  -unsafe
+    	use unsafe program deserialization mode
+  -vmarch string
+    	target VM arch (if different from -arch)
+  -vv int
+    	verbosity
+available features for -enable and -disable:
+  binfmt_misc - setup binfmt_misc for testing
+  cgroups - setup cgroups for testing
+  close_fds - close fds after each program
+  devlink_pci - setup devlink PCI device
+  ieee802154 - setup and use mac802154_hwsim for emulation
+  net_dev - setup more network devices for testing
+  net_reset - reset network namespace between programs
+  nic_vf - setup NIC VF device
+  swap - setup and use a swap file
+  sysctl - setup sysctl's for fuzzing
+  tun - setup and use /dev/tun for packet injection
+  usb - setup and use /dev/raw-gadget for USB emulation
+  vhci - setup and use /dev/vhci for hci packet injection
+  wifi - setup and use mac80211_hwsim for wifi emulation

@@ -1,0 +1,167 @@
+{
+ "workload": "/home/fuzzer/prune-evidence/inputs/workload-legacy-v1.prog",
+ "procs": 1,
+ "executions": 1,
+ "legacy_profile": "v1",
+ "input_sha256": {
+  "workload": "aa4f8a651c6e106fe69ba20c4e24f43347635cc4ed17d8df4b3191bb269c1b76",
+  "deps": "d0e000c71484ec3910cfeab2319d54876e577602281d02c74bbdce67a05151be",
+  "replay_probe": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c"
+ },
+ "guest_inventory": [
+  "x86_64",
+  "7.3.0-rc5-00004-g7bd83d51f06a",
+  "1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /opt/kcov-nfs/deps/usr/sbin/nfs-proxy",
+  "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c  /opt/frozen-phase9/replay-probe"
+ ],
+ "lane_state": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+ "execprog_rc": "rc=0",
+ "calls": 29,
+ "calls_errno_nonzero": 0,
+ "errno_by_call": [],
+ "lane_states": {
+  "0": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n"
+ },
+ "proxy_lanes": {
+  "0": {
+   "stats": "peak_active=8 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=2 expired=2 applied=2 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=0 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  }
+ },
+ "legacy_control": {
+  "mode": "live",
+  "armed": 2,
+  "expired": 2,
+  "applied": 2,
+  "refused_orig": 0,
+  "refused_bounds": 0,
+  "unknown_layout": 0,
+  "invalid_arms": 0,
+  "edit_applied": 0,
+  "edit_refused_orig": 0,
+  "edit_refused_bounds": 0,
+  "edit_refused_unknown": 0,
+  "edit_refused_overlap": 0,
+  "edit_refused_toobig": 0
+ },
+ "deltas": [
+  {
+   "file": "arm-0.delta",
+   "sha256": "42350d9b6483eaf26d1df200f6e55408aa929660c911d458c594ba55a3cbfc23",
+   "bytes": 72,
+   "magic": "NFSPDLT1",
+   "version": 1,
+   "seed": "0x0000000000000000",
+   "record": {
+    "dir": 0,
+    "backend": 1,
+    "client": 0,
+    "first_opcode": 4294967295,
+    "match_index": 4294967295,
+    "anchor_off": 4,
+    "anchor_len": 4,
+    "patch_off": 4,
+    "patch_w": 4,
+    "applied_count": 1
+   }
+  },
+  {
+   "file": "arm-1.delta",
+   "sha256": "97dc4237d57aeb4cb3900812b6d68a4cd153b14d533a19ea82d12b1eefc65849",
+   "bytes": 72,
+   "magic": "NFSPDLT1",
+   "version": 1,
+   "seed": "0x0000000000000000",
+   "record": {
+    "dir": 1,
+    "backend": 1,
+    "client": 0,
+    "first_opcode": 4294967295,
+    "match_index": 4294967295,
+    "anchor_off": 4,
+    "anchor_len": 4,
+    "patch_off": 4,
+    "patch_w": 4,
+    "applied_count": 1
+   }
+  }
+ ],
+ "replay": [
+  {
+   "case": "v1-exact-0",
+   "delta": "arm-0.delta",
+   "delta_sha256": "42350d9b6483eaf26d1df200f6e55408aa929660c911d458c594ba55a3cbfc23",
+   "target": "10.89.0.5",
+   "request_xid": "0x22222222",
+   "expected_response_xid": "0x22222223",
+   "probe_rc": 0,
+   "proxy_rc": 0,
+   "rule": "replay rule=0 edit=0 expected=1 applied=1 refused_orig=0",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v1-exact-0.log",
+   "log_sha256": "bb23dc1f11b918881b63864626a3b19f07a80441146c743c73dd5b1effeaefad"
+  },
+  {
+   "case": "v1-exact-1",
+   "delta": "arm-1.delta",
+   "delta_sha256": "97dc4237d57aeb4cb3900812b6d68a4cd153b14d533a19ea82d12b1eefc65849",
+   "target": "10.89.0.5",
+   "request_xid": "0x22222223",
+   "expected_response_xid": "0x22222222",
+   "probe_rc": 0,
+   "proxy_rc": 0,
+   "rule": "replay rule=0 edit=0 expected=1 applied=1 refused_orig=0",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v1-exact-1.log",
+   "log_sha256": "4e718562768d105d1d34b16ef1c7a269288ae746f48cbb19be0d52e0a2462130"
+  },
+  {
+   "case": "v1-unmatched-count",
+   "delta": "arm-0.delta",
+   "delta_sha256": "42350d9b6483eaf26d1df200f6e55408aa929660c911d458c594ba55a3cbfc23",
+   "target": "10.89.0.5",
+   "request_xid": "0x22222224",
+   "expected_response_xid": "0x22222224",
+   "probe_rc": 0,
+   "proxy_rc": 1,
+   "rule": "replay rule=0 edit=0 expected=1 applied=0 refused_orig=0",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v1-unmatched-count.log",
+   "log_sha256": "11a24ee52ad73d2903d0196ce250c5c5a603f173e46d26ec60a4dc71812f7744"
+  },
+  {
+   "case": "v1-original-mismatch",
+   "delta": "v1-original-mismatch.delta",
+   "delta_sha256": "d642fe67889240e39093fdc5e12ca0b8e4be7a563545317c40904fd358248d63",
+   "target": "10.89.0.5",
+   "request_xid": "0x22222222",
+   "expected_response_xid": "0x22222222",
+   "probe_rc": 0,
+   "proxy_rc": 1,
+   "rule": "replay rule=0 edit=0 expected=1 applied=0 refused_orig=1",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v1-original-mismatch.log",
+   "log_sha256": "1c49cda409ef8636046f667947b127c7ee8964414ff7952ee36736b0a8cca8e2"
+  },
+  {
+   "case": "v1-count-mismatch",
+   "delta": "v1-count-mismatch.delta",
+   "delta_sha256": "1bcc70cbe9ccdce0fd92eb75e96838532623e454930318993fc4b2b2bf3982da",
+   "target": "10.89.0.5",
+   "request_xid": "0x22222222",
+   "expected_response_xid": "0x22222223",
+   "probe_rc": 0,
+   "proxy_rc": 1,
+   "rule": "replay rule=0 edit=0 expected=2 applied=1 refused_orig=0",
+   "probe_sha256": "612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c",
+   "log": "v1-count-mismatch.log",
+   "log_sha256": "0bcc161e76c2930aff33bdc6851dd2e6f422148f68ca2927f9b2712ff8194027"
+  }
+ ],
+ "dmesg_fatal": [],
+ "extra_files": 1,
+ "extra_nonempty": 1,
+ "extra_pcs": 2331,
+ "extra_fs_nfsd": 501,
+ "extra_net_sunrpc": 221
+}

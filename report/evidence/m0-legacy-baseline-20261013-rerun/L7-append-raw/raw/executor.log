@@ -1,0 +1,439 @@
+2026/10/13 03:00:34 parsed 1 programs
+2026/10/13 03:00:34 serving rpc on tcp://42379
+2026/10/13 03:00:34 runner 0 connected
+connected to manager: procs=1 cover_edges=1 kernel_64_bit=1 slowdown=1 syscall_timeout=50 program_timeout=5000 features=0xffffffffffc027ff
+reading file /proc/cpuinfo: size=8862 exists=1 error=
+reading file /proc/modules: size=0 exists=1 error=
+reading file /proc/kallsyms: size=9742342 exists=1 error=
+glob /sys/module/*/sections/.text resolved to 0 files
+glob /sys/module/kvm*/parameters/* resolved to 0 files
+reading file /proc/version: size=196 exists=1 error=
+reading file /proc/filesystems: size=362 exists=1 error=
+reading file /sys/kernel/security/lsm: size=18 exists=1 error=
+write to /proc/sys/kernel/hung_task_check_interval_secs failed: No such file or directory
+write to /proc/sys/net/core/bpf_jit_kallsyms failed: No such file or directory
+write to /proc/sys/net/core/bpf_jit_harden failed: No such file or directory
+write to /proc/sys/kernel/softlockup_all_cpu_backtrace failed: No such file or directory
+write to /sys/kernel/debug/failslab/task-filter failed: No such file or directory
+write to /sys/kernel/debug/fail_futex/task-filter failed: No such file or directory
+write to /sys/kernel/debug/fail_usercopy/task-filter failed: No such file or directory
+write to /sys/kernel/debug/fail_make_request/task-filter failed: No such file or directory
+write to /sys/kernel/debug/fail_io_timeout/task-filter failed: No such file or directory
+write to /sys/kernel/debug/fail_iommufd/task-filter failed: No such file or directory
+mount(/syzcgroup/net, net) failed: 22
+mount(/syzcgroup/net, blkio) failed: 16
+mount(/syzcgroup/cpu, cpuset) failed: 22
+mount(/syzcgroup/cpu, rlimit) failed: 22
+mount(/syzcgroup/cpu, memory) failed: 22
+setting up feature DelayKcovMmap
+setting up feature KcovResetIoctl
+failed: kernel does not support ioctl(KCOV_RESET_TRACE)
+setting up feature Fault
+failed to write /sys/kernel/debug/failslab/ignore-gfp-wait: 2
+failed: failed to write fault injection file
+setting up feature Leak
+failed: failed to write(kmemleak, "scan=off")
+setting up feature KCSAN
+failed: write(/sys/kernel/debug/kcsan, on) failed
+setting up feature MemoryDump
+failed: makedumpfile is missing
+received info reply: covfilter=0
+recv exec request 1: type=0 flags=0x3 env=0x3813 exec=0x13 size=74
+proc 0: handshaking to execute request 1
+recv exec request 2: type=0 flags=0x3 env=0x3813 exec=0x18 size=74
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: spawned loop pid 1022
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+mount(fusectl) failed: 2
+proc 0: got handshake reply
+proc 0: start executing request 1
+proc 0: got output: [96ms] exec opts: reqid=1 type=0 procid=0 threaded=1 cover=1 comps=0 dedup=0 signal=1  sandbox=1/0/0/0 timeouts=50/5000/1 kernel_64_bit=1
+recv exec request 3: type=0 flags=0x3 env=0x3811 exec=0x10 size=74
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [100ms] -> mmap(0x1ffffffff000, 0x1000, 0x0
+proc 0: got output: , 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [100ms] <- mmap=0x1ffffffff000 cover=957
+proc 0: got output: #0 [102ms] -> mmap(0x200000000000, 0x1000000, 0x7, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [102ms] <- mmap=0x200000000000 cover=714
+proc 0: got output: #0 [102ms] -> mmap(0x200001000000, 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [102ms] <- mmap=0x200001000000 cover=709
+proc 0: got execute reply
+handle completion: completed=3 output_size=10485760
+proc 0: start executing request 2
+proc 0: got output: [109ms] exec opts: reqid=2 type=0 procid=0 threaded=1 cover=0 comps=1 dedup=0 signal=0  sandbox=1/0/0/0 timeouts=50/5000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 4
+proc 0: got output: #0 [113ms] -> mmap(0x1ffffffff000, 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0
+proc 0: got output: )
+#0 [113ms] <- mmap=0x1ffffffff000 cover=739
+proc 0: got output: #0 [114ms] -> mmap(0x200000000000, 0x1000000, 0x7, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [114ms] <- mmap=0x200000000000 cover=526
+proc 0: got output: #0 [114ms] -> mmap(0x200001000000, 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [114ms] <- mmap=0x200001000000 cover=533
+proc 0: got execute reply
+handle completion: completed=3 output_size=14680064
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 3
+proc 0: got output: spawned loop pid 1030
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+mkdir(/dev/gadgetfs) failed: 17
+recv exec request 4: type=0 flags=0x3 env=0x3821 exec=0x10 size=74
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+proc 0: got output: mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+proc 0: got output: mount(fusectl) failed: 2
+mkdir(/syzcgroup/unified/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/cpu/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/net/syz0) failed: 17
+proc 0: got handshake reply
+proc 0: start executing request 3
+recv exec request 5: type=0 flags=0x3 env=0x3841 exec=0x10 size=74
+proc 0: got output: [52ms] exec opts: reqid=3 type=0 procid=0 threaded=1 cover=0 comps=0 dedup=0 signal=0  sandbox=1/0/0/0 timeouts=50/5000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [54ms] -> mmap(0x1ffffffff000, 
+proc 0: got output: 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [55ms] <- mmap=0x1ffffffff000
+proc 0: got output: #0 [55ms] -> mmap(0x200000000000, 0x1000000, 0x7, 0x32
+proc 0: got output: , 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [55ms] <- mmap=0x200000000000
+proc 0: got output: #0 [56ms] -> mmap(0x200001000000, 0x1000, 0x0, 0x32
+proc 0: got output: , 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [56ms] <- mmap=0x200001000000
+proc 0: got execute reply
+handle completion: completed=3 output_size=262144
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 4
+proc 0: got output: spawned loop pid 1037
+proc 0: got output: mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+proc 0: got output: mount(fusectl) failed: 2
+proc 0: got output: mkdir(/syzcgroup/unified/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/cpu/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/net/syz0) failed: 17
+proc 0: got handshake reply
+proc 0: start executing request 4
+proc 0: got output: [29ms] exec opts: reqid=4 type=0 procid=0 threaded=1 cover=0 comps=0 dedup=0 signal=0  sandbox=0/1/0/0 timeouts=50/5000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [32ms] -> mmap(
+proc 0: got output: 0x1ffffffff000
+proc 0: got output: , 
+proc 0: got output: 0x1000, 
+proc 0: got output: 0x0
+proc 0: got output: , 0x32
+proc 0: got output: , 
+proc 0: got output: 0xffffffffffffffff, 
+proc 0: got output: 0x0
+proc 0: got output: )
+proc 0: got output: #0 [33ms] <- mmap=0x1ffffffff000
+proc 0: got output: #0 [33ms] -> mmap(0x200000000000, 0x1000000
+proc 0: got output: , 0x7, 0x32
+proc 0: got output: , 0xffffffffffffffff, 
+proc 0: got output: 0x0)
+proc 0: got output: #0 [33ms] <- mmap=0x200000000000
+proc 0: got output: #0 [33ms] -> mmap(0x200001000000
+proc 0: got output: , 0x1000, 
+proc 0: got output: 0x0, 
+proc 0: got output: 0x32, 
+proc 0: got output: 0xffffffffffffffff, 
+proc 0: got output: 0x0)
+proc 0: got output: #0 [33ms] <- mmap=0x200001000000
+recv exec request 6: type=0 flags=0x3 env=0x3913 exec=0x13 size=74
+proc 0: got execute reply
+handle completion: completed=3 output_size=262144
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 5
+proc 0: got output: spawned loop pid 1042
+proc 0: got output: write(/proc/sys/net/ipv4/ping_group_range) failed: 22
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+mkdir(/dev/gadgetfs) failed: 17
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+mount(fusectl) failed: 2
+proc 0: got output: mkdir(/syzcgroup/unified/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/cpu/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/net/syz0) failed: 17
+proc 0: got handshake reply
+proc 0: start executing request 5
+recv exec request 7: type=0 flags=0x3 env=0x23813 exec=0x13 size=74
+proc 0: got output: [53ms] exec opts: reqid=5 type=0 procid=0 threaded=1 cover=0 comps=0 dedup=0 signal=0  sandbox=0/0/1/0 timeouts=50/5000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [55ms] -> mmap(0x1ffffffff000, 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0
+proc 0: got output: )
+proc 0: got output: #0 [55ms] <- mmap=0x1ffffffff000
+proc 0: got output: #0 [56ms] -> mmap(0x200000000000, 0x1000000, 0x7, 0x32, 0xffffffffffffffff
+proc 0: got output: , 0x0)
+proc 0: got output: #0 [56ms] <- mmap=0x200000000000
+proc 0: got output: #0 [56ms] -> mmap(0x200001000000, 0x1000, 0x0, 0x32, 
+proc 0: got output: 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [56ms] <- mmap=0x200001000000
+proc 0: got execute reply
+handle completion: completed=3 output_size=262144
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 6
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: spawned loop pid 1048
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+mkdir(/dev/gadgetfs) failed: 17
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+proc 0: got output: mount(fusectl) failed: 2
+mkdir(/syzcgroup/unified/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/cpu/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/net/syz0) failed: 17
+proc 0: got handshake reply
+proc 0: start executing request 6
+recv exec request 8: type=0 flags=0x3 env=0x3881 exec=0x10 size=74
+proc 0: got output: [67ms] exec opts: reqid=6 type=0 procid=0 threaded=1 cover=1 comps=0 dedup=0 signal=1  sandbox=1/0/0/0 timeouts=50/5000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [100ms] -> mmap(0x1ffffffff000, 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0)
+#0 [100ms] <- mmap=0x1ffffffff000 cover=994
+proc 0: got output: #0 [100ms] -> mmap(0x200000000000, 0x1000000, 0x7, 0x32, 0xffffffffffffffff, 
+proc 0: got output: 0x0)
+#0 [100ms] <- mmap=0x200000000000 cover=814
+proc 0: got output: #0 [101ms] -> mmap(0x200001000000, 0x1000, 0x0, 0x32, 
+proc 0: got output: 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [101ms] <- mmap=0x200001000000 cover=809
+proc 0: got output: 
+proc 0: got execute reply
+handle completion: completed=3 output_size=10485760
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 7
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: spawned loop pid 1054
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+proc 0: got output: mkdir(/dev/gadgetfs) failed: 17
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+mount(fusectl) failed: 2
+proc 0: got output: mkdir(/syzcgroup/unified/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/cpu/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/net/syz0) failed: 17
+proc 0: got handshake reply
+proc 0: start executing request 7
+proc 0: got output: [62ms] exec opts: reqid=7 type=0 procid=0 threaded=1 cover=1 comps=0 dedup=0 signal=1  sandbox=1/0/0/0 timeouts=50/5000/1 kernel_64_bit=1
+recv exec request 9: type=0 flags=0x3 env=0x3815 exec=0x10 size=74
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [66ms] -> mmap(
+proc 0: got output: 0x1ffffffff000
+proc 0: got output: , 0x1000
+proc 0: got output: , 
+proc 0: got output: 0x0, 
+proc 0: got output: 0x32, 
+proc 0: got output: 0xffffffffffffffff
+proc 0: got output: , 0x0
+proc 0: got output: )
+proc 0: got output: #0 [66ms] <- mmap=0x1ffffffff000 cover=804
+proc 0: got output: 
+proc 0: got output: #0 [67ms] -> mmap(0x200000000000
+proc 0: got output: , 0x1000000, 0x7, 
+proc 0: got output: 0x32, 
+proc 0: got output: 0xffffffffffffffff, 
+proc 0: got output: 0x0
+proc 0: got output: )
+proc 0: got output: #0 [67ms] <- mmap=0x200000000000 cover=775
+proc 0: got output: 
+proc 0: got output: #0 [67ms] -> mmap(0x200001000000, 
+proc 0: got output: 0x1000, 0x0
+proc 0: got output: , 0x32
+proc 0: got output: , 0xffffffffffffffff
+proc 0: got output: , 0x0)
+proc 0: got output: #0 [68ms] <- mmap=0x200001000000 cover=781
+proc 0: got execute reply
+handle completion: completed=3 output_size=10485760
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 8
+proc 0: got output: mount(fusectl) failed: 2
+proc 0: got output: executor received sandbox_arg=0
+proc 0: got output: mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+proc 0: got output: NOTFAIL: setfilecon: setxattr failed
+ (errno 22: Invalid argument)
+proc 0: response pipe EOF
+proc 0: restarting subprocess, current state 1 attempts 0
+proc 0: subprocess exit status 67
+proc 0: output pipe EOF
+handle completion: completed=0 output_size=14680064
+proc 0: handshaking to execute request 9
+recv exec request 10: type=2 flags=0x1 env=0x11 exec=0x0 size=10
+proc 0: got output: spawned loop pid 1062
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+proc 0: got output: mkdir(/dev/gadgetfs) failed: 17
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+mount(fusectl) failed: 2
+proc 0: got output: mkdir(/syzcgroup/unified/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/cpu/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/net/syz0) failed: 17
+proc 0: got handshake reply
+proc 0: start executing request 9
+proc 0: got output: [48ms] exec opts: reqid=9 type=0 procid=0 threaded=1 cover=0 comps=0 dedup=0 signal=0  sandbox=1/0/0/0 timeouts=50/5000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [50ms] -> mmap(0x1ffffffff000, 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [51ms] <- mmap=0x1ffffffff000
+proc 0: got output: #0 [51ms] -> mmap(0x200000000000, 0x1000000, 0x7, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [51ms] <- mmap=0x200000000000
+proc 0: got output: #0 [51ms] -> mmap(0x200001000000, 0x1000, 0x0, 0x32, 0xffffffffffffffff, 0x0)
+proc 0: got output: #0 [51ms] <- mmap=0x200001000000
+proc 0: got execute reply
+handle completion: completed=3 output_size=262144
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 10
+proc 0: got output: spawned loop pid 1068
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+mkdir(/dev/gadgetfs) failed: 17
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+mount(fusectl) failed: 2
+proc 0: got handshake reply
+proc 0: start executing request 10
+proc 0: got output: [36ms] exec opts: reqid=10 type=2 procid=0 threaded=0 cover=0 comps=0 dedup=0 signal=0  sandbox=1/0/0/0 timeouts=50/50000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 2
+proc 0: got output: glob /sys/**/* resolved to 31 files
+proc 0: got execute reply
+handle completion: completed=0 output_size=14680064
+2026/10/13 03:00:36 machine check:
+BinFmtMisc              : disabled by user
+Comparisons             : enabled
+Coverage                : enabled
+DelayKcovMmap           : enabled
+DevlinkPCI              : disabled by user
+ExtraCoverage           : enabled
+Fault                   : failed to write fault injection file
+KCSAN                   : write(/sys/kernel/debug/kcsan, on) failed
+KcovResetIoctl          : kernel does not support ioctl(KCOV_RESET_TRACE)
+LRWPANEmulation         : disabled by user
+Leak                    : failed to write(kmemleak, "scan=off")
+MemoryDump              : makedumpfile is missing
+NetDevices              : disabled by user
+NetInjection            : disabled by user
+NicVF                   : disabled by user
+SandboxAndroid          : mount(fusectl) failed: 2. executor received sandbox_arg=0. mkdir(/dev/binderfs) failed: 17. mount of binder at /dev/binderfs failed: 19. NOTFAIL: setfilecon: setxattr failed.  (errno 22: Invalid argument). . process exited with status 67.
+SandboxNamespace        : enabled
+SandboxNone             : enabled
+SandboxSetuid           : enabled
+Swap                    : disabled by user
+USBEmulation            : disabled by user
+VhciInjection           : disabled by user
+WifiEmulation           : disabled by user
+syscalls                : 0/8377
+
+recv corpus triaged
+2026/10/13 03:00:36 executed programs: 0
+recv exec request 11: type=0 flags=0x0 env=0x23913 exec=0x3 size=403
+proc 0: restarting subprocess, current state 2 attempts 0
+proc 0: subprocess exit status 9
+proc 0: handshaking to execute request 11
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: pkey protection enabled
+proc 0: got output: spawned loop pid 1073
+proc 0: got output: NFS fuzz lane bound: proc=0 clients-only source=/syz-nfs-lanes/proc-0 target=/nfs-lane
+proc 0: got output: pivot_root OK
+proc 0: got output: NFS fuzz lane isolated: proc=0 marker-hidden source-tree-hidden=/syz-nfs-lanes
+mkdir(/dev/gadgetfs) failed: 17
+proc 0: got output: mount of gadgetfs at /dev/gadgetfs failed: 19
+mkdir(/dev/binderfs) failed: 17
+proc 0: got output: mount of binder at /dev/binderfs failed: 19
+proc 0: got output: mount(fusectl) failed: 2
+mkdir(/syzcgroup/unified/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/cpu/syz0) failed: 17
+proc 0: got output: mkdir(/syzcgroup/net/syz0) failed: 17
+proc 0: got handshake reply
+proc 0: start executing request 11
+proc 0: got output: [62ms] exec opts: reqid=11 type=0 procid=0 threaded=0 cover=1 comps=0 dedup=0 signal=1  sandbox=1/0/0/0 timeouts=50/5000/1 kernel_64_bit=1
+proc 0: got output: spawned worker pid 2
+proc 0: got output: #0 [84ms] -> syz_arm_nfs_proxy_v2$scoped(0x200000001000, 0x40
+proc 0: got output: )
+proc 0: got output: #0 [128ms] <- syz_arm_nfs_proxy_v2$scoped=0x4 cover=4325
+proc 0: got output: #0 [129ms] -> syz_open_nfs_lane_pair$client0_knfsd(0x0, 0x0)
+proc 0: got output: #0 [143ms] <- syz_open_nfs_lane_pair$client0_knfsd=0x6 cover=6369
+proc 0: got output: #0 [144ms] -> syz_socket_connect_nfs_pair$client0_knfsd(0x0, 0x0)
+proc 0: got output: #0 [146ms] <- syz_socket_connect_nfs_pair$client0_knfsd=0x8 cover=6041
+proc 0: got output: #0 [147ms] -> syz_send_nfs_fuzz$new(0x8, 0x200000003000, 0x3c, 0x1, 
+proc 0: got output: 0x1)
+proc 0: got output: #0 [148ms] <- syz_send_nfs_fuzz$new=0x40 cover=1393
+proc 0: got output: #0 [148ms] -> nanosleep(0x200000008000, 0x0)
+proc 0: got output: #0 [648ms] <- nanosleep=0x0 cover=227
+#0 [649ms] -> recvfrom(0x8, 0x200000009000, 0x100, 0x40, 0x0, 0x0)
+proc 0: got output: #0 [649ms] <- recvfrom=0x30 cover=520
+#0 [649ms] -> close(0x8)
+proc 0: got output: #0 [649ms] <- close=0x0 cover=1017
+proc 0: got output: #0 [649ms] -> close(0x6)
+#0 [649ms] <- close=0x0 cover=223
+#0 [649ms] -> close$nfs_proxy_arm(
+proc 0: got output: 0x4)
+#0 [649ms] <- close$nfs_proxy_arm=0x0 cover=402
+proc 0: got execute reply
+handle completion: completed=10 output_size=10485760
+2026/10/13 03:00:37 CALL 0: signal 2317, coverage 4325 errno 0
+2026/10/13 03:00:37 CALL 1: signal 2785, coverage 6369 errno 0
+2026/10/13 03:00:37 CALL 2: signal 3454, coverage 6041 errno 0
+2026/10/13 03:00:37 CALL 3: signal 1260, coverage 1393 errno 0
+2026/10/13 03:00:37 CALL 4: signal 219, coverage 227 errno 0
+2026/10/13 03:00:37 CALL 5: signal 484, coverage 520 errno 0
+2026/10/13 03:00:37 CALL 6: signal 930, coverage 1017 errno 0
+2026/10/13 03:00:37 CALL 7: signal 196, coverage 223 errno 0
+2026/10/13 03:00:37 CALL 8: signal 344, coverage 402 errno 0
+2026/10/13 03:00:37 call #0: signal 2317, coverage 4325
+2026/10/13 03:00:37 call #1: signal 2785, coverage 6369
+2026/10/13 03:00:37 call #2: signal 3454, coverage 6041
+2026/10/13 03:00:37 call #3: signal 1260, coverage 1393
+2026/10/13 03:00:37 call #4: signal 219, coverage 227
+2026/10/13 03:00:37 call #5: signal 484, coverage 520
+2026/10/13 03:00:37 call #6: signal 930, coverage 1017
+2026/10/13 03:00:37 call #7: signal 196, coverage 223
+2026/10/13 03:00:37 call #8: signal 344, coverage 402
+2026/10/13 03:00:37 extra: signal 2422, coverage 5365
