@@ -269,6 +269,7 @@ Core event:
 
 ```text
 RULESET
+GENERATION_OPEN
 EXPOSURE_INTENT
 FORWARD_COMPLETE
 FORWARD_FAILED
@@ -627,11 +628,25 @@ EXPOSURE_INTENT + FORWARD_FAILED
 
 이 distinction을 in-place counter 하나로 압축하지 않는다.
 
-### 21. GENERATION_COMPLETE / RUN_COMPLETE
+### 21. GENERATION_OPEN / GENERATION_COMPLETE / RUN_COMPLETE
 
-program generation이 clean하게 끝나면 그 generation의 deactivation 처리에서 mandatory
-`GENERATION_COMPLETE`를 append한다(issue #4). normal non-match는 record마다 기록하지 않고 여기에
-rule별로 집계한다.
+generation G의 lifecycle(admitting, draining, closed)은 `01-architecture.md` §16이 소유한다. journal에는
+G의 처음과 끝이 남는다.
+
+```text
+GENERATION_OPEN
+    program_generation_correlation
+    rule_set_id
+```
+
+Proxy는 activation(G)을 처리할 때 `GENERATION_OPEN`을 append하고 host ACK `(D)`를 받은 뒤에만
+activation을 ACK한다. host sink는 이 event로 G를 Proxy session과 lane에 bind한다. G의 다른 event는 이
+binding이 있어야 받아들인다(§6).
+
+forward가 끝나지 않은 batch는 connection close 때 `FORWARD_FAILED`로 끝난다(§18). Proxy는 G의 closure를
+판정하고 G의 모든 batch가 `FORWARD_COMPLETE`/`FORWARD_FAILED`를 남긴 뒤 G의 마지막
+event로 mandatory `GENERATION_COMPLETE`를 append한다(issue #4, issue #18 F1). normal non-match는 record마다
+기록하지 않고 여기에 rule별로 집계한다.
 
 ```text
 GENERATION_COMPLETE
@@ -642,11 +657,36 @@ GENERATION_COMPLETE
     outside_activation_window
     evidence_path_failures
     resolver_summary[]        # rule_id별 04 §31 taxonomy count
+    closure
+        reason                # drained | reply_unresolved | aborted
+        drain_bound
+        reply_unresolved_count
 ```
 
-M1 `NOT_APPLIED`는 activation/deactivation barrier가 모두 ACK되고, clean durable
-`GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없을 때만 성립한다. crash로 summary가
-없으면 그 generation의 M1은 `INCONCLUSIVE`다(`../02-llm-agent/01-two-stage-agent-architecture.md` §7).
+| closure reason | 조건 |
+|---|---|
+| `drained` | G의 모든 entry가 `replied` 또는 `expired(connection_closed)`로 끝났다 |
+| `reply_unresolved` | closure 때 `awaiting_reply`가 남았거나(drain bound 만료), timeout/capacity reclaim으로 REPLY를 G로 처리하지 못한 entry가 있다(`03-transaction-context.md` §5). 그 수가 `reply_unresolved_count`다 |
+| `aborted` | generation ABORT 통지로 닫혔다 |
+
+closure가 rule에 대해 clean인지는 rule의 `selector.rpc.message_type`(`04-semantic-mutation-runtime.md` §4)에
+따라 정한다.
+
+| closure reason | `call` rule | `reply` rule |
+|---|---|---|
+| `drained` | clean | clean |
+| `reply_unresolved` | clean. CALL admission은 deactivation에서 이미 닫혔다 | clean 아님 |
+| `aborted` | clean 아님 | clean 아님 |
+
+M1 `NOT_APPLIED`는 activation/deactivation barrier가 모두 ACK되고, 그 rule에 대해 clean인 closure를 가진
+durable `GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없을 때만 성립한다. crash나 session
+종료로 summary가 없으면 그 generation의 M1은 `INCONCLUSIVE`다
+(`../02-llm-agent/01-two-stage-agent-architecture.md` §7).
+
+`GENERATION_COMPLETE(G)`가 `(D)`에 도달하면 host sink는 G binding을 closed로 바꾸고, 그 뒤에 오는 G의
+event를 거부하며 거부 사실을 host 기록으로 남긴다. 봉인된 G journal에 summary 뒤의 G event나 그 거부
+기록이 있으면 내부 불일치다. Judge는 그 generation에 확정 verdict를 내리지 않는다
+(`../02-llm-agent/01-two-stage-agent-architecture.md` §11.1).
 
 Proxy session이 clean하게 끝나면 optional `RUN_COMPLETE` event를 append할 수 있다.
 
@@ -1300,6 +1340,18 @@ Expected:
 - replay가 위치별로 비교한다;
 - G의 evidence가 없으면 multi-generation attribution은 `INCONCLUSIVE`다.
 
+### 19. generation closure
+
+G에서 시작한 CALL의 eligible REPLY를 deactivation(G) 전후와 closure(G) 전후로 옮긴다. drain 중에 같은
+lane에서 G+1을 활성화한다.
+
+Expected:
+- closure 전에 도착한 REPLY의 application은 G의 `EXPOSURE_INTENT`로 남고 G의 summary 앞에 온다;
+- closure 뒤에 도착한 REPLY는 변조되지 않고 `late_after_close`로 세어진다;
+- draining G의 event는 G+1로 바뀌지 않고 G binding으로 검증된다;
+- drain bound 만료로 닫힌 G에서 `reply` rule의 M1은 `NOT_APPLIED`가 아니다;
+- 봉인된 clean `NOT_APPLIED` 뒤에 G의 application이 추가되면 FAIL이다.
+
 ## 실패 양상과 진단
 
 | 증상 | 가능한 원인 | 구분하는 관측 | 조치 |
@@ -1317,6 +1369,8 @@ Expected:
 | middle corruption | storage corruption/bug | integrity/sequence failure | artifact invalid |
 | replay orig verify 실패 | replay-time TOCTOU/wrong buffer | current precondition bytes | apply refusal |
 | host ACK 없음 | sink 장애, channel 단절, ACK 유실 | sink/transport 상태, host journal의 intent 존재 여부 | mutated output 노출 안 함, generation evidence 불완전 |
+| G summary 뒤 G event 또는 sink의 post-close 거부 기록 | Proxy closure 구현 오류, correlation 오류 | 봉인 journal의 event 순서, host 거부 기록 | 그 generation 확정 verdict 없음, Proxy lifecycle 수정 |
+| `reply` rule이 `reply_unresolved`로 `INCONCLUSIVE` 반복 | drain bound가 짧음, timeout/capacity 설정 | `reply_unresolved_count`, entry 종료 사유 | bound/capacity 조정 |
 | crash window 선행 entry 없음 | window bound 초과, program/delta artifact 유실 | `CrashContextWindow` 보존 기록 | multi-generation attribution `INCONCLUSIVE` |
 
 ## 한계와 미결 사항
@@ -1334,7 +1388,10 @@ Expected:
 - **결정됨:** EXPOSURE_INTENT는 mutated output을 relay에 노출하기 전에 host sink `(D)`에 도달해야 한다.
 - **결정됨:** failure domain은 Proxy process, guest kernel, VM teardown, Runner process 장애다. host
   OS/storage 손실은 범위 밖이며 per-event `fsync`는 요구하지 않는다(issue #3).
-- **결정됨:** clean generation마다 `GENERATION_COMPLETE`를 남긴다(issue #4).
+- **결정됨:** generation마다 `GENERATION_OPEN`으로 시작해 closure 뒤 마지막 event인
+  `GENERATION_COMPLETE`로 끝난다. clean 여부는 closure reason과 rule의 message type으로 정한다
+  (§21, issue #4, issue #18 F1).
+- **미결:** drain bound의 숫자.
 - **결정됨:** production journal은 append-only lifecycle events를 사용한다.
 - **결정됨:** socket delivery와 disk commit의 atomicity gap은 `delivery_unknown`으로 표현한다.
 - **결정됨:** production MutationDelta는 replay 중 immutable이다.

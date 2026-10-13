@@ -260,6 +260,13 @@ generation이며, activation 창 밖에서 관측한 CALL은 값이 없다. REPL
 값으로 판단한다. 그래서 G 안에서 시작한 CALL의 REPLY는 deactivation 뒤 drain 중에 도착해도 G의
 rule set으로 처리하고, 창 밖 CALL의 REPLY는 변조하지 않는다(`01-architecture.md` §16, issue #2).
 
+drain은 G의 closure에서 끝난다(`01-architecture.md` §16, issue #18 F1). closure 뒤에 도착한 G entry의
+REPLY는 변조하지 않는다. `activation_generation`은 entry가 끝날 때까지 바뀌지 않으며, 같은 lane에서
+G+1이 활성화돼도 G+1로 다시 쓰지 않는다. closure summary에 쓰도록 Transaction Context는 G entry가
+어떻게 끝났는지를 구분한다. `replied`와 `expired(connection_closed)`는 REPLY를 놓친 것이 아니다.
+그 밖의 `expired`(timeout, capacity reclaim)와 closure 때 남은 `awaiting_reply`는 REPLY를 G로 처리하지
+못한 entry다.
+
 ### 6. CALL 관측 순서
 
 CALL은 두 단계로 context에 반영될 수 있다.

@@ -895,13 +895,19 @@ M4는 activation 창 eligibility도 구현한다. 새 CALL은 activation ACK와 
 REPLY는 CALL의 `activation_generation`으로 판단하며, 창 밖 record는 `outside_activation_window`로
 센다(`01-architecture.md` §16). resolver 결과는 rule별로 집계해 M5의 `GENERATION_COMPLETE`에 넘긴다.
 
+M4는 generation의 admitting/draining/closed 단계와 closure 판정도 구현한다(`01-architecture.md` §16,
+issue #18 F1). deactivation은 CALL admission만 닫고, draining G의 REPLY는 G로 처리하며, closure 뒤 G
+REPLY는 변조하지 않는다. closure reason과 `reply_unresolved_count`를 만든다.
+
 ### 28. M5 — Semantic Delta journal / relay completion
 
 Required:
 - semantic RULESET durable registration (host sink `(D)`).
 - EXPOSURE_INTENT host ACK before enqueue/exposure.
 - every event carries `program_generation_correlation`.
-- GENERATION_COMPLETE with per-rule resolver summary, `outside_activation_window`, evidence-path failure counters.
+- `GENERATION_OPEN` host ACK before activation ACK; host sink keeps per-generation open/closed binding.
+- GENERATION_COMPLETE as the generation's last event, with per-rule resolver summary, `outside_activation_window`, evidence-path failure counters and closure (`05` §21).
+- sink rejects and records G events after G's summary; Runner seals G only after the summary or session/channel/VM end.
 - queue record/token metadata.
 - full-write complete/failure callback.
 - FORWARD_COMPLETE/FORWARD_FAILED append.
@@ -1007,6 +1013,8 @@ syzkaller patch series와 Runner에 속한다.
   executor sandbox에만 bind되므로 별도 경로가 필요하다.
 - executor가 remote-KCOV BEGIN 뒤 activation(G)를 보내고 ACK를 받은 다음 program syscall을 실행하며,
   FINISH/ABORT 전에 deactivation(G)를 보내고 ACK를 받는다(syzkaller 0001/0002의 generation 경계 위).
+  deactivation ACK는 CALL admission 종료만 뜻한다. executor는 G의 drain/closure를 기다리지 않는다
+  (`01-architecture.md` §16).
 - activation ACK가 없으면 program을 실행하지 않고 generation을 ABORT한다. deactivation ACK가 없거나 비활성
   상태를 확인할 수 없으면 lane을 재사용하지 않고 격리/재시작한다. 기존 0008 fail-closed runner 경로를
   쓸 수 있다.
@@ -1022,6 +1030,8 @@ syzkaller patch series와 Runner에 속한다.
 - framed event append 전체를 마친 뒤 host-generated ACK를 보낸다. guest write-back cache로는 ACK를 만족할
   수 없다.
 - channel identity(`vm_instance_id` 등)를 host가 기록하고, guest event는 untrusted data로 검증한다.
+- `GENERATION_OPEN`/`GENERATION_COMPLETE`로 generation별 open/closed binding을 유지하고, draining G의
+  event를 그 binding으로 검증한다(`05-mutation-delta-replay.md` §21).
 
 #### S1c — CrashContextWindow와 replay sequence
 

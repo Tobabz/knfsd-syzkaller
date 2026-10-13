@@ -548,10 +548,12 @@ M1Status
 | 판정 | 조건 |
 |---|---|
 | `APPLIED` | 그 generation에 그 rule의 유효한 host-durable `EXPOSURE_INTENT`가 있다 |
-| `NOT_APPLIED` | activation과 deactivation barrier가 모두 ACK됐고, clean durable `GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없다 |
-| `INCONCLUSIVE` | 그 밖의 모든 경우. crash 뒤 summary가 없는 경우와 barrier 실패를 포함한다 |
+| `NOT_APPLIED` | activation과 deactivation barrier가 모두 ACK됐고, 그 rule에 대해 clean인 closure를 가진 durable `GENERATION_COMPLETE`가 있으며(`03-nfs-proxy/05` §21), 그 rule의 `EXPOSURE_INTENT`가 없다 |
+| `INCONCLUSIVE` | 그 밖의 모든 경우. crash 뒤 summary가 없는 경우, barrier 실패, 그 rule에 clean이 아닌 closure, summary 뒤의 G event나 sink의 post-close 거부 기록(§11.1의 내부 불일치)을 포함한다 |
 
-crash 뒤 `EXPOSURE_INTENT`가 없다는 사실만으로 `NOT_APPLIED`를 추론하지 않는다.
+crash 뒤 `EXPOSURE_INTENT`가 없다는 사실만으로 `NOT_APPLIED`를 추론하지 않는다. deactivation ACK는
+CALL admission 종료만 뜻하며 G의 application evidence 종료가 아니다. 종료는 Proxy가 closure 뒤 남기는
+`GENERATION_COMPLETE`가 정한다(`03-nfs-proxy/01` §16, issue #18 F1).
 
 rule M1은 intent와 hypothesis로 집계한다(issue #5). intent 하나는 Compiler가 만든 rule 하나 이상을 가진다
 (`08` §12).
@@ -599,19 +601,9 @@ delivery_state
 
 ### 7.3 non-application evidence
 
-normal non-match를 하나씩 durable하게 기록하지 않는다. generation마다 terminal summary를 남긴다
-(`03-nfs-proxy/05` §21).
-
-```text
-GENERATION_COMPLETE
-    program_generation_correlation   # §7.4, issue #2
-    rule_set_id
-    records_seen
-    exposure_batch_count
-    outside_activation_window
-    evidence_path_failures
-    resolver_summary[]           # rule_id별 03-nfs-proxy/04 §31 taxonomy count
-```
+normal non-match를 하나씩 durable하게 기록하지 않는다. generation마다 terminal summary
+`GENERATION_COMPLETE`를 남긴다. field와 closure 규칙은 `03-nfs-proxy/05` §21이 소유한다. summary에는
+rule_id별 resolver taxonomy count(`03-nfs-proxy/04` §31)와 closure reason이 있다.
 
 ### 7.4 MutationEvidence
 
@@ -629,6 +621,7 @@ MutationEvidence                 # Runner가 수집하고 봉인한다 (§11.1)
     journal_identity
     journal_integrity
     terminal_summary_present
+    generation_closure?          # summary의 closure (03-nfs-proxy/05 §21)
     resolver_summary[]
     applied_batches[]
         batch_id
