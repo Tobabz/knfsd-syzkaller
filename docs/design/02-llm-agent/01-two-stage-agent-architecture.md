@@ -1160,3 +1160,5 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
 13. Agent SDK concrete selection and agent/tool definitions — 선택은
     [`decisions/2026-10-13-agent-implementation-stack.md`](../decisions/2026-10-13-agent-implementation-stack.md)에
     기록했다(PydanticAI). agent/tool definitions는 첫 Stage 1 구현에서 정한다
+14. Runner task 실행 — Controller task 계약([`09`](09-job-state-graph.md) §8)의 Runner 쪽 구현. task·cancel 기록의
+    durable 저장, Runner 재시작 뒤 실행 복원, campaign evidence의 봉인 단위
