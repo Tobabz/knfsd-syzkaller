@@ -387,11 +387,14 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 	s->stats = stats;
 	s->limit = cfg->msg_limit ? cfg->msg_limit : NFSP_MSG_LIMIT_DEFAULT;
 	s->next_connection_id = 1;
+	/* Sentinels before the first goto out: calloc's zeros are valid fds
+	 * and would make `out` close fd 0 and report never-opened slots as
+	 * closed connections. */
+	for (b = 0; b < NFSP_BACKENDS; b++) s->listeners[b] = -1;
+	for (i = 0; i < NFSP_MAX_CONNS; i++) s->conns[i].client_fd = -1;
 	if (s->limit > SIZE_MAX - NFSP_FRAG_HEADER_LEN - NFSP_READ_CHUNK ||
 	    s->limit < NFSP_FRAG_HEADER_LEN) goto out;
 	memset(stats, 0, sizeof(*stats));
-	for (b = 0; b < NFSP_BACKENDS; b++) s->listeners[b] = -1;
-	for (i = 0; i < NFSP_MAX_CONNS; i++) s->conns[i].client_fd = -1;
 	for (b = 0; b < NFSP_CLIENTS; b++)
 		if (cfg->client_ip[b] == NULL ||
 		    inet_pton(AF_INET, cfg->client_ip[b], &s->clients[b]) != 1) goto out;

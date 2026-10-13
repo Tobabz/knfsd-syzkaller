@@ -185,6 +185,27 @@ static void test_fail_closed(void)
 	CHECK(nfsp_rpc_decode(m.b, m.n, &e) == NFSP_RPC_BAD_REJECT_STAT,
 	      "reject_stat 2");
 
+	/* auth_stat: RPCSEC_GSS 13/14 are the last defined values. */
+	{
+		const uint32_t ok[] = {0, 13, 14};
+		const uint32_t bad[] = {15, 0xffffffffu};
+		for (unsigned i = 0; i < 3; i++) {
+			m.n = 0;
+			w32(&m, 1); w32(&m, 1); w32(&m, 1);
+			w32(&m, NFSP_RPC_AUTH_ERROR); w32(&m, ok[i]);
+			CHECK(nfsp_rpc_decode(m.b, m.n, &e) == NFSP_RPC_OK &&
+			      e.auth_stat == ok[i], "auth_stat %u must decode", ok[i]);
+		}
+		for (unsigned i = 0; i < 2; i++) {
+			m.n = 0;
+			w32(&m, 1); w32(&m, 1); w32(&m, 1);
+			w32(&m, NFSP_RPC_AUTH_ERROR); w32(&m, bad[i]);
+			CHECK(nfsp_rpc_decode(m.b, m.n, &e) == NFSP_RPC_BAD_AUTH_STAT,
+			      "auth_stat %u must fail closed: %s", bad[i],
+			      nfsp_rpc_strerror(e.status));
+		}
+	}
+
 	CHECK(nfsp_rpc_decode(NULL, 4, &e) == NFSP_RPC_TRUNCATED, "NULL");
 	CHECK(nfsp_rpc_decode(m.b, 0, &e) == NFSP_RPC_TRUNCATED, "empty");
 }

@@ -63,6 +63,9 @@ enum nfsp_rpc_reject_stat {
 	NFSP_RPC_AUTH_ERROR = 1
 };
 
+/* auth_stat: AUTH_OK (0) through RPCSEC_GSS_CTXPROBLEM (14), RFC 5531 §9. */
+#define NFSP_RPC_AUTH_STAT_MAX	14u
+
 enum nfsp_rpc_status {
 	NFSP_RPC_OK = 0,
 	NFSP_RPC_TRUNCATED,		/* payload ends inside the envelope */
@@ -72,6 +75,7 @@ enum nfsp_rpc_status {
 	NFSP_RPC_BAD_REPLY_STAT,	/* reply_stat not ACCEPTED/DENIED */
 	NFSP_RPC_BAD_ACCEPT_STAT,	/* accept_stat outside RFC 5531 */
 	NFSP_RPC_BAD_REJECT_STAT,	/* reject_stat outside RFC 5531 */
+	NFSP_RPC_BAD_AUTH_STAT,		/* auth_stat outside RFC 5531 */
 	NFSP_RPC_TOO_LONG		/* payload offsets would not fit u32 */
 };
 

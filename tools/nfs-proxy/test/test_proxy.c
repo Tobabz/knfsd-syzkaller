@@ -747,6 +747,32 @@ static int wait_closed(struct conn_log *l, unsigned want)
 	return -1;
 }
 
+/* A configuration refused before any listener exists opens nothing, so it
+ * must report no lifecycle events at all. */
+static void test_refused_config_reports_no_connections(void)
+{
+	struct nfsp_proxy_cfg cfg = {0};
+	struct nfsp_proxy_stats stats;
+	struct conn_log log;
+	_Atomic int stop = 0;
+	int rc;
+	printf("a refused configuration emits no connection events\n");
+	memset(&log, 0, sizeof(log));
+	cfg.client_ip[0] = fixture_client_ip[0];
+	cfg.client_ip[1] = fixture_client_ip[1];
+	cfg.route[0] = (struct nfsp_route){fixture_listen_ip[0], 0, "127.0.0.1", 1};
+	cfg.route[1] = (struct nfsp_route){fixture_listen_ip[1], 0, "127.0.0.1", 1};
+	cfg.stop = &stop;
+	cfg.msg_limit = 1;	/* below one record marker: refused */
+	cfg.on_connection = log_conn;
+	cfg.on_connection_arg = &log;
+	rc = nfsp_proxy_run(&cfg, &stats, NULL, NULL);
+	CHECK(rc == -1, "msg_limit=1 must be refused, rc=%d", rc);
+	CHECK(atomic_load(&log.nev) == 0,
+	      "%u lifecycle events for a run that opened nothing",
+	      atomic_load(&log.nev));
+}
+
 static void test_connection_id_not_reused(void)
 {
 	struct fixture f;
@@ -1010,6 +1036,7 @@ int main(int argc, char **argv)
 	test_three_coalesced_and_split();
 	test_resize_keeps_stream_in_sync();
 	test_unframeable_output_refused();
+	test_refused_config_reports_no_connections();
 	test_connection_id_not_reused();
 	test_rpc_record_observer();
 	test_rpc_record_refusal();

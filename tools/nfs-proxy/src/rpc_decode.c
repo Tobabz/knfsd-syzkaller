@@ -142,6 +142,8 @@ static enum nfsp_rpc_status decode_reply(struct cur *c,
 			out->auth_stat = cur_u32(c);
 			if (!c->ok)
 				return stop(out, c, NFSP_RPC_TRUNCATED);
+			if (out->auth_stat > NFSP_RPC_AUTH_STAT_MAX)
+				return stop(out, c, NFSP_RPC_BAD_AUTH_STAT);
 			return NFSP_RPC_OK;
 		default:
 			return stop(out, c, NFSP_RPC_BAD_REJECT_STAT);
@@ -208,6 +210,8 @@ const char *nfsp_rpc_strerror(enum nfsp_rpc_status status)
 		return "unrecognised accept_stat";
 	case NFSP_RPC_BAD_REJECT_STAT:
 		return "unrecognised reject_stat";
+	case NFSP_RPC_BAD_AUTH_STAT:
+		return "unrecognised auth_stat";
 	case NFSP_RPC_TOO_LONG:
 		return "payload too long for u32 offsets";
 	}
