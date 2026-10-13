@@ -519,6 +519,7 @@ MutationDelta
     program_generation_correlation
     append-only journal[]
         GENERATION_OPEN
+        GENERATION_DRAINING
         EXPOSURE_INTENT
         APPLY_REFUSAL
         FORWARD_COMPLETE / FORWARD_FAILED
@@ -653,7 +654,7 @@ Stage2Campaign
     |         (Proxy: GENERATION_OPEN(G) host ACK 뒤 ACK)
     |       program syscall 실행
     |       deactivation(G) 요청, Proxy ACK 대기
-    |         (Proxy: G의 CALL admission만 닫음)
+    |         (Proxy: GENERATION_DRAINING(G) host ACK 뒤 ACK)
     |       FINISH / ABORT
     |     Proxy: G drain -> closure -> GENERATION_COMPLETE(G)
     |
@@ -690,7 +691,7 @@ closed      closure(G) 뒤. G 이름의 application event는 더 생기지 않�
 | 전환 | 소유자 | 조건 | ACK / 기록의 의미 |
 |---|---|---|---|
 | activation(G) | executor 요청, Proxy 처리 | Proxy가 `GENERATION_OPEN(G)`을 host sink `(D)`에 기록한 뒤 ACK한다 | host가 G를 이 Proxy session과 lane의 generation으로 bind했다. sink ACK가 없으면 activation ACK도 없다(아래 barrier 실패 표) |
-| deactivation(G) | executor 요청, Proxy 처리 | Proxy가 G의 CALL admission을 닫은 뒤 ACK한다 | 새 CALL admission 종료만 뜻한다. draining 중인 G의 REPLY 처리는 계속된다 |
+| deactivation(G) | executor 요청, Proxy 처리 | Proxy가 G의 CALL admission을 닫고 `GENERATION_DRAINING(G)`을 host sink `(D)`에 기록한 뒤 ACK한다 | 새 CALL admission 종료만 뜻한다. host도 G를 draining으로 안다. draining 중인 G의 REPLY 처리는 계속된다. sink ACK가 없으면 deactivation ACK도 없다(아래 barrier 실패 표) |
 | closure(G) | Proxy | deactivation(G)을 처리한 뒤 다음 중 먼저 오는 것: G의 `awaiting_reply` entry가 0개가 됨, drain bound 만료, generation ABORT 통지 | closure 순간부터 G entry의 REPLY는 변조하지 않고 relay하며 session counter `late_after_close`로 센다. G의 모든 batch가 forward 종료 event를 남긴 뒤 G의 마지막 event로 `GENERATION_COMPLETE`를 append한다. closure reason은 그 summary에 남는다(`05-mutation-delta-replay.md` §21) |
 
 drain bound는 Runner가 Proxy session 설정으로 정하고 `GENERATION_COMPLETE`에 기록한다. 숫자는 미결이다.
@@ -708,7 +709,7 @@ barrier 실패:
 | 상황 | 동작 |
 |---|---|
 | activation ACK 없음 (`GENERATION_OPEN`의 host ACK 실패 포함) | program을 실행하지 않는다. activation lease를 해제하고 generation을 ABORT하며, 실행과 evidence를 `INCONCLUSIVE`로 표시한다 |
-| deactivation ACK 없음 | kernel generation이 멈추지 않게 FINISH/ABORT는 진행한다. 남은 activation이 해제됐음을 확인할 때까지 그 lane에서 target mode generation을 더 실행하지 않는다 |
+| deactivation ACK 없음 (`GENERATION_DRAINING`의 host ACK 실패 포함) | kernel generation이 멈추지 않게 FINISH/ABORT는 진행한다. 남은 activation이 해제됐음을 확인할 때까지 그 lane에서 target mode generation을 더 실행하지 않는다 |
 | orphan (BEGIN과 FINISH 사이에 program process 종료) | ABORT 전에 deactivation과 lease 해제를 시도한다 |
 | 위 경우에 비활성 상태를 확인할 수 없음 | 재사용 전에 Proxy/lane을 격리하거나 재시작한다. 예: syzkaller 0008의 fail-closed runner 경로(VM/lane 재생성) |
 

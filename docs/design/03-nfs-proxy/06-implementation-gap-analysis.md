@@ -123,7 +123,7 @@ Target Agent-facing path와 current compatibility path는 병존할 수 있다.
 | Edit Applier | `delta.c`, `edit.c` | reuse_with_adapter | verify-before-patch, original-coordinate rebuild, overlap refusal, one-pass output rebuild | consume conflict-free concrete edit batches instead of matching raw rules; remove semantic dependence on rule order | current tests + batch adapter tests |
 | Structure derivation | `edit.c` op-count + record-marker rebuild | extend | COMPOUND op-count bump, final marker rebuild | schema-derived length/count/padding/discriminant fixups from final structure | preserve/raw semantic tests |
 | Rule-set same-snapshot preflight | v1 then v2 sequential in `control.c` | replace | v2 multi-rule batch aggregation idea | all semantic rules resolve on original record; global conflict preflight; one final apply | registration-order permutation tests |
-| Delta Recorder | NFSPDLT1/2 writer (guest `O_SYNC` file) | replace | bounded binary IO, corruption refusal; guest `O_SYNC` stays legacy only | per-generation semantic journal events (RULESET/GENERATION_OPEN/EXPOSURE_INTENT/APPLY_REFUSAL/FORWARD_*/GENERATION_COMPLETE) with generation correlation, sent to the host sink | 05 crash-cut oracle incl. guest crash after host ACK |
+| Delta Recorder | NFSPDLT1/2 writer (guest `O_SYNC` file) | replace | bounded binary IO, corruption refusal; guest `O_SYNC` stays legacy only | per-generation semantic journal events (RULESET/GENERATION_OPEN/GENERATION_DRAINING/EXPOSURE_INTENT/APPLY_REFUSAL/FORWARD_*/GENERATION_COMPLETE) with generation correlation, sent to the host sink | 05 crash-cut oracle incl. guest crash after host ACK |
 | Forward completion lifecycle | `queue.pending_records`, aggregate delivered stats | missing | nonblocking queue/flush loop | per-record/batch token boundaries and full-write completion/failure callback | partial-write/full-write tests |
 | Semantic Replay loader/runtime | concrete NFSPDLT1/2 loader in `control.c` | replace | CLI replay mode, shared process path, legacy replay tests | load recorded CompiledMutationRule set, run the ordered `CrashContextWindow` programs, same semantic runtime path, separate replay log on the host sink | dynamic replay + multi-generation + compatibility tests |
 | ReplayResult comparator | none | missing | current applied-count diagnostics | per-position batch-signature multiset + delivery comparison and verdict, in the Controller-side validation layer over sealed production/replay evidence (issue #11) | equivalent/diverged/invalid tests |
@@ -532,7 +532,7 @@ write가 성공해야 mutated output을 relay에 반환한다.
 #### Gap
 
 Target MutationDelta는 one `ProgramGenerationExecution`, recorded CompiledMutationRule[],
-append-only RULESET/GENERATION_OPEN/EXPOSURE_INTENT/APPLY_REFUSAL/FORWARD_*/GENERATION_COMPLETE journal, generation
+append-only RULESET/GENERATION_OPEN/GENERATION_DRAINING/EXPOSURE_INTENT/APPLY_REFUSAL/FORWARD_*/GENERATION_COMPLETE journal, generation
 correlation, batch signatures와 concrete evidence를 요구한다.
 
 Current one-arm file + in-place count model은 이 lifecycle을 표현하지 못한다.
@@ -898,7 +898,7 @@ semantic rule registration order permutation
 Legacy v1->v2 chain behavior는 compatibility path에만 남긴다.
 
 **M4 / S1a acceptance 범위 (issue #18 F8).** target rule 설치는 host-durable `RULESET`을, activation ACK는
-host-durable `GENERATION_OPEN`을, mutated output 노출은 host-durable `EXPOSURE_INTENT`를 요구한다
+host-durable `GENERATION_OPEN`을, deactivation ACK는 host-durable `GENERATION_DRAINING`을, mutated output 노출은 host-durable `EXPOSURE_INTENT`를 요구한다
 (`05-mutation-delta-replay.md` §7, §11, §21). 그 sink는 M5/S1b에서 생긴다. 그래서 M4와 S1a의 완료는 다음
 범위로 한정한다.
 
@@ -906,7 +906,7 @@ host-durable `GENERATION_OPEN`을, mutated output 노출은 host-durable `EXPOSU
 |---|---|---|
 | Resolver, preflight, concrete edit adapter, eligibility, closure 판정 | host component test. sink는 test double로 바꿀 수 있다 | M4 |
 | executor barrier, activation endpoint 격리, barrier 실패 처리 | syzkaller/Runner component test. Proxy 쪽 ACK는 test double로 바꿀 수 있다 | S1a |
-| RULESET 설치, `GENERATION_OPEN` 뒤 activation ACK, `EXPOSURE_INTENT` 뒤 노출을 실제 host sink로 하는 live target-mode 실행 | 하지 않는다 | M5 / S1b gate |
+| RULESET 설치, `GENERATION_OPEN` 뒤 activation ACK, `GENERATION_DRAINING` 뒤 deactivation ACK, `EXPOSURE_INTENT` 뒤 노출을 실제 host sink로 하는 live target-mode 실행 | 하지 않는다 | M5 / S1b gate |
 
 - test double로 얻은 성공은 component 결과로만 기록한다. host/guest durability, Agent 사용 가능성, M7
   promotion의 근거가 아니다.
@@ -928,8 +928,10 @@ Required:
 - EXPOSURE_INTENT host ACK before enqueue/exposure.
 - every event carries the host-stamped `session_binding`; generation-scoped events also carry `program_generation_correlation`, session-scoped `RULESET`/`RUN_COMPLETE` do not.
 - sink admission per `05` §6: event scope table, per-session `event_seq`/`batch_id` ranges, idempotent re-ACK of identical retransmissions, rejection and host record of conflicts, stale sessions and wrong lanes, Proxy/Runner restart rules.
-- `GENERATION_OPEN` host ACK before activation ACK; host sink keeps per-generation open/closed binding.
-- first hard refusal per (generation, rule) as a write-ahead `APPLY_REFUSAL` before the refused record is relayed; no relay of the refused record without a host response (retransmit the same event on timeout); `evidence_path_degraded` marking on explicit sink rejection (`05` §21).
+- `GENERATION_OPEN` host ACK before activation ACK; `GENERATION_OPEN` rejected while the lane still has an admitting generation, and its `draining_generations[]` must equal the host's draining set.
+- `GENERATION_DRAINING` host ACK before deactivation ACK; the host moves G from admitting to draining and then rejects and records G's CALL-context `EXPOSURE_INTENT`/`APPLY_REFUSAL` while still accepting G's REPLY-context events, with or without G+1. A missing or rejected ACK means no deactivation ACK and the barrier-failure path (`01` §16, `05` §21, PR #22 review).
+- one outstanding event per session, sent in `event_seq` order; record relay waits only on the same connection·direction, so other connections keep relaying records that need no event (`05` §6, §21).
+- first hard refusal per (generation, rule) as a write-ahead `APPLY_REFUSAL` before the refused record is relayed, including same-rule refusals on other connections while that first event is unACKed; no relay of the refused record without a host response (retransmit the same event on timeout); `evidence_path_degraded` marking on explicit sink rejection (`05` §21).
 - GENERATION_COMPLETE as the generation's last event, with per-rule resolver summary, `outside_activation_window`, evidence-path failure counters and closure (`05` §21).
 - sink rejects and records G events after G's summary; Runner seals G only after the summary or session/channel/VM end.
 - queue record/token metadata.
@@ -1042,8 +1044,9 @@ syzkaller patch series와 Runner에 속한다.
   executor sandbox에만 bind되므로 별도 경로가 필요하다.
 - executor가 remote-KCOV BEGIN 뒤 activation(G)를 보내고 ACK를 받은 다음 program syscall을 실행하며,
   FINISH/ABORT 전에 deactivation(G)를 보내고 ACK를 받는다(syzkaller 0001/0002의 generation 경계 위).
-  deactivation ACK는 CALL admission 종료만 뜻한다. executor는 G의 drain/closure를 기다리지 않는다
-  (`01-architecture.md` §16).
+  deactivation ACK는 Proxy가 CALL admission을 닫고 `GENERATION_DRAINING(G)`의 host ACK를 받았다는 뜻이다.
+  executor는 G의 drain/closure를 기다리지 않는다(`01-architecture.md` §16). S1a에서 이 host ACK는 test
+  double이다(위 M4/S1a acceptance 범위).
 - activation ACK가 없으면 program을 실행하지 않고 generation을 ABORT한다. deactivation ACK가 없거나 비활성
   상태를 확인할 수 없으면 lane을 재사용하지 않고 격리/재시작한다. 기존 0008 fail-closed runner 경로를
   쓸 수 있다.
@@ -1059,8 +1062,8 @@ syzkaller patch series와 Runner에 속한다.
 - framed event append 전체를 마친 뒤 host-generated ACK를 보낸다. guest write-back cache로는 ACK를 만족할
   수 없다.
 - channel identity(`vm_instance_id` 등)를 host가 기록하고, guest event는 untrusted data로 검증한다.
-- `GENERATION_OPEN`/`GENERATION_COMPLETE`로 generation별 open/closed binding을 유지하고, draining G의
-  event를 그 binding으로 검증한다(`05-mutation-delta-replay.md` §21).
+- `GENERATION_OPEN`/`GENERATION_DRAINING`/`GENERATION_COMPLETE`로 generation별 admitting/draining/closed
+  binding을 유지하고, draining G의 CALL-context event는 거부하며 REPLY event는 그 binding으로 검증한다(`05-mutation-delta-replay.md` §21).
 
 #### S1c — CrashContextWindow와 replay sequence
 
