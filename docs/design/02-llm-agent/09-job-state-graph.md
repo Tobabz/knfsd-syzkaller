@@ -279,7 +279,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 
 | 이벤트 | 대상 | 처리 | 근거 |
 |---|---|---|---|
-| issue resolved | `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding하고, identity가 바뀌었으면 아래 identity 변경 규칙을 적용한 뒤 `resume_point`로 간다 | `07` §7 |
+| issue resolved | `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding한 뒤 `resume_point`로 간다. binding이 바뀌었으면 먼저 표 위 규칙대로 `resume_point`를 바꾼다. identity가 바뀌었으면 아래 identity 변경 행을, identity가 같고 `hcap_revision`만 바뀌었으면(build를 바꾸지 않은 promotion) 아래 `hcap_revision` 변경 행을 적용한다. 그 `hcap_revision`의 변경 이벤트가 issue 이벤트보다 늦게 오거나 오지 않아도 같다 | `07` §7 |
 | issue deferred | `blocked_harness_gap` | `parked` | `07` §7 |
 | issue wont_fix | `blocked_harness_gap`, `parked` | `closed_unsupported(reason)` | `07` §7 |
 | bound ExecutionHarnessIdentity 변경(harness build 교체·폐기) | binding 뒤의 비종료 상태(`s2_replaying` 제외) | 진행 중인 task는 결과를 받지 않는다. 다시 binding하고 identity 재수립 지점(표 아래)으로 간다. 대기 상태는 표 위 규칙대로 `resume_point`만 바꾼다 | `01` §11.2, `07` §7 |
@@ -543,6 +543,10 @@ bundle fixture로 대신한다.
    - `s2_strategy`에서 `hcap_revision`이 바뀌고 plan이 새 HCAP 검증에 실패하면 Mutation Strategy를 다시 부르지
      않고 `s1_planning`(repair, `hcap_changed`)으로 간다. Compiler 거부로 `blocked_harness_gap(mutation_engine)`에
      있는 job은 gap을 닫은 promotion 뒤 Mutation Strategy를 다시 부르지 않고 저장된 rule set을 다시 compile한다.
+   - 같은 identity에서 gap을 닫은 promotion의 issue resolved가 그 `hcap_revision`의 변경 이벤트보다 먼저 와도
+     `retry_pending`은 plan을 새 HCAP으로 다시 검증한다. 실패하면 `s1_planning`(repair, `hcap_changed`)으로 가고,
+     통과하면 저장된 rule set을 다시 compile한다. 뒤에 온 변경 이벤트는 job의 binding이 이미 그 revision이므로
+     아무것도 바꾸지 않는다.
    - approval policy가 승인을 요구하도록 바뀐 뒤에는 대기 중 계산한 `resume_point`가 `s1_running`이어도, `resume`은
      승인되지 않은 harness를 실행하지 않고 `s1_approval`로 간다.
    - `s2_replaying` 중 identity나 `hcap_revision`이 바뀌어도 replay 결과는 `crash_review`로 간다. 그 `resume`은
