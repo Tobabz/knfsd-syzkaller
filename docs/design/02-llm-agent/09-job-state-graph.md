@@ -98,7 +98,7 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
    | REPLAY_*
    v
  crash_review [H]
-   +-- resume ------------------------------> s2_campaign
+   +-- resume ------------------------------> resume_point (default s2_campaign)
    | close
    v
  closed(crash_reported)
@@ -116,6 +116,9 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
    +-- issue resolved -> retry_pending -> {re-binding} -> resume_point
    +-- issue deferred -> parked [I] -> issue reopened or resolved -> re-evaluate
    +-- issue wont_fix -> closed_unsupported
+
+ waiting states: blocked_operator, crash_review, blocked_harness_gap, parked
+   +-- identity / HCAP / JudgeProfile change -> state kept, resume_point updated
 
  [I] issue tracker   {re-binding} applies the invalidation rules of 01 §11.2
 ```
@@ -150,8 +153,12 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
 - 결정적 component(intake 검증, harness binding, HCAP 검사, Materializer, Compiler, Q1·M1·Q2 Judge, replay
   comparator)는 상태가 아니다. 전이 안에서 실행한다.
 - job의 미완료 task는 최대 하나다(`pending_task`). Agent, Runner, 사람에게 보낸 요청은 `task_id`를 가진다.
-- `blocked_harness_gap`, `blocked_operator`, `parked`, `retry_pending`은 막힌 위치 `resume_point`(다시 들어갈
+  새 요청(재실행, repair 포함)은 새 `task_id`를 받는다. 같은 `task_id`로 다시 보내는 것은 같은 요청이다(§8).
+- `blocked_harness_gap`, `blocked_operator`, `parked`, `retry_pending`, `crash_review`는 `resume_point`(다시 들어갈
   상태와 그 입력)를 기억한다.
+- `blocked_operator`, `crash_review`, `blocked_harness_gap`, `parked`는 사람이나 issue의 결정을 기다리는 대기
+  상태다. 대기 상태는 그 상태의 operator 동작이나 issue 이벤트로만 끝난다. 외부 이벤트는 `resume_point`만
+  바꾼다(§5).
 
 ### 2. 전이 규칙
 
@@ -176,8 +183,8 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
   artifact로 저장만 한다.
 - `task_id`가 맞지만 아래 표에 없는 결과(새 reason 값, 상태에 맞지 않는 결과)는 `blocked_operator(unexpected_event)`로
   보낸다. 앞 단계를 건너뛰거나 가장 가까운 행으로 해석하지 않는다.
-- Runner가 봉인 bundle 없이 끝나면 Judge를 부르지 않고 verdict도 만들지 않는다. 이 경우는 §3–§4의 "봉인
-  bundle 없는 Runner 종료" 행(재실행)으로 처리한다.
+- Runner가 봉인 bundle 없이 끝나면(§8의 `ended_unsealed`) Judge를 부르지 않고 verdict도 만들지 않는다. 이 경우는
+  §3–§4의 "봉인 bundle 없는 Runner 종료" 행(재실행)으로 처리한다.
 
 ### 3. Stage 1 전이
 
@@ -236,11 +243,11 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation에서 `APPLIED`, Q2 미관측 | campaign 정지, `s2_strategy` (repair, `campaign_no_signal`) | agent_repair | `01` §12 |
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation의 M1 `INCONCLUSIVE` 반복 | campaign 정지, `blocked_operator(evidence_path)` | — | `01` §3 |
 | `s2_campaign` | fuzz budget 소진 | campaign 정지, `blocked_operator(campaign_budget_exhausted)` | — | `01` §11.1 |
-| `s2_replaying` | 비교 verdict(`REPLAY_EQUIVALENT`, `REPLAY_DIVERGED`, `REPLAY_INCONCLUSIVE`, `REPLAY_INVALID`) | `crash_review` | — | `../03-nfs-proxy/05` §29 |
+| `s2_replaying` | 비교 verdict(`REPLAY_EQUIVALENT`, `REPLAY_DIVERGED`, `REPLAY_INCONCLUSIVE`, `REPLAY_INVALID`) | `crash_review`. `resume_point`는 `s2_campaign`이다. campaign의 binding(identity, `hcap_revision`)이 job의 지금 binding과 다르면 `s2_campaign`에 §5의 해당 변경 행을 적용한 지점이다 | — | `../03-nfs-proxy/05` §29, `01` §11.2 |
 | `s2_replaying` | 봉인 bundle 없는 Runner 종료 | `s2_replaying` 재실행 | runtime_retry | |
 | `s2_replaying` | replay bundle의 manifest·correlation 검증 실패 | `blocked_operator(replay_evidence)`. evidence를 고친 뒤 `resume`이 replay를 다시 실행한다 | — | `../03-nfs-proxy/05` §29 |
 | `crash_review` | close | `closed(crash_reported)` | — | `01` §13 |
-| `crash_review` | resume | `s2_campaign` | — | |
+| `crash_review` | resume | `resume_point` | — | |
 
 - triage 항목은 job 상태를 바꾸지 않는 사람 검토 목록이다. job id, 봉인 bundle 참조, 그 bundle의 Q2·M1 verdict를
   담는다.
@@ -249,18 +256,31 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 
 ### 5. 외부 이벤트와 operator 동작
 
+대기 상태(§1)는 외부 이벤트로 끝나지 않는다. 대기 상태의 job에 아래 표의 identity, `hcap_revision`, JudgeProfile
+변경이 오면 Controller는 다시 binding하고, job이 `resume_point`의 상태에 있었다면 표가 만들었을 결과로
+`resume_point`를 바꾼다. 결과가 지금 상태와 같으면 기록만 한다. 상태, `state_reason`, 기다리던 사람 task와 issue는
+그대로 두고, 그 상태의 operator 동작이나 issue 이벤트가 job을 `resume_point`로 보낸다.
+
 | 이벤트 | 대상 | 처리 | 근거 |
 |---|---|---|---|
 | issue resolved | `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding하고, identity가 바뀌었으면 아래 identity 변경 규칙을 적용한 뒤 `resume_point`로 간다 | `07` §7 |
 | issue deferred | `blocked_harness_gap` | `parked` | `07` §7 |
 | issue wont_fix | `blocked_harness_gap`, `parked` | `closed_unsupported(reason)` | `07` §7 |
-| bound ExecutionHarnessIdentity 변경(harness build 교체·폐기) | binding 뒤의 비종료 상태 | 진행 중인 Runner task는 결과를 받지 않는다. 다시 binding한다. 저장된 plan이 있으면 새 `hcap_revision`으로 다시 검증해 통과하면 다시 materialize해 `s1_running`(승인이 필요하면 `s1_approval`)으로, 실패하면 `s1_planning`(repair, `hcap_changed`)으로 간다. plan이 없으면 진행 중이던 Agent 상태를 다시 시작한다. Stage 2에 있었어도 Q1을 새 identity에서 다시 세운다 | `01` §11.2, `07` §7 |
-| `hcap_revision`만 변경 | 비종료 상태 | plan과 evidence를 새 HCAP으로 결정적으로 다시 검증한다. 실패하면 `s1_planning`(repair, `hcap_changed`). Stage 2였으면 MutationRuleSet을 다시 compile해 `s2_gate`로 간다(거부는 §4의 Compiler 행) | `01` §11.2, `07` §7 |
-| JudgeProfile 또는 RemoteKcovSupportBoundary 새 버전 채택 | 비종료 상태 | job이 마지막으로 소비한 verdict의 봉인 bundle에 새 verdict를 만든다. status와 reason이 같으면 아무것도 하지 않는다. 다르면 그 verdict를 소비한 전이의 출발 상태에서 §3–§4 표를 다시 적용하고, 진행 중인 task는 결과를 받지 않는다. 새 규칙이 요구하는 evidence가 bundle에 없으면 그 Runner 단계를 다시 실행한다 | `01` §11.2 |
+| bound ExecutionHarnessIdentity 변경(harness build 교체·폐기) | binding 뒤의 비종료 상태(`s2_replaying` 제외) | 진행 중인 task는 결과를 받지 않는다. 다시 binding하고 identity 재수립 지점(표 아래)으로 간다. 대기 상태는 표 위 규칙대로 `resume_point`만 바꾼다 | `01` §11.2, `07` §7 |
+| 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 crash evidence의 harness identity로 계속한다(`../03-nfs-proxy/05` §25). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2, §12 |
+| `hcap_revision`만 변경 | 비종료 상태(`s2_replaying` 제외. 대기 상태는 표 위 규칙) | plan과 evidence를 새 HCAP으로 결정적으로 다시 검증한다. 실패하면 `s1_planning`(repair, `hcap_changed`). Stage 2였으면 MutationRuleSet을 다시 compile해 `s2_gate`로 간다(거부는 §4의 Compiler 행) | `01` §11.2, `07` §7 |
+| 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 기록된 rule set을 쓰고 Compiler를 다시 부르지 않는다(`../03-nfs-proxy/05` §26). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2 |
+| JudgeProfile 또는 RemoteKcovSupportBoundary 새 버전 채택 | 비종료 상태(대기 상태는 표 위 규칙) | job이 마지막으로 소비한 verdict의 봉인 bundle에 새 verdict를 만든다. status와 reason이 같으면 아무것도 하지 않는다. 다르면 그 verdict를 소비한 전이의 출발 상태에서 §3–§4 표를 다시 적용하고, 진행 중인 task는 결과를 받지 않는다. 새 규칙이 요구하는 evidence가 bundle에 없으면 그 Runner 단계를 다시 실행한다 | `01` §11.2 |
 | JobPolicy 변경 | 비종료 상태 | 이후 전이에만 적용한다. 기존 verdict와 전이 기록은 바꾸지 않는다 | `01` §11.1 |
 | operator `resume` | `blocked_operator` | `resume_point`로 간다. 소진된 counter를 0으로 되돌리고 그 사실을 기록한다 | |
-| operator `route(to)` | `blocked_operator(gate_regression)` | `s2_gate` 또는 `s2_strategy` | |
+| operator `route(to)` | `blocked_operator(gate_regression)` | `s2_gate` 또는 `s2_strategy`. job의 bound identity에서 세운 Q1 `REACHED`가 없으면(gate 뒤 identity 변경) 받지 않고 기록만 한다. 그때는 `resume`이 `resume_point`로 보낸다 | `01` §5.1 |
 | operator `close`, `cancel` | 비종료 상태 | `closed(operator_closed)`, `closed(cancelled)`. 진행 중인 task는 결과를 받지 않는다 | |
+
+**identity 재수립 지점.** 저장된 plan이 있으면 새 `hcap_revision`으로 다시 검증하고 다시 materialize한다. 둘 다
+통과하면 `s1_running`(승인이 필요하면 `s1_approval`)이다. 실패하면 §3의 HCAP 검사·Materializer 행이 정하는 곳이며,
+repair로 가면 cause는 `hcap_changed`다. plan이 없으면 Stage 1의 Agent 상태(`s1_analysis` 또는 `s1_planning`)를 다시
+시작한다. Stage 2에 있었어도 Q1을 새 identity에서 다시 세운다(`01` §11.2). 대기 상태에서는 이 검증과 materialize를
+identity 변경 때 하고, 그 결과가 `resume_point`가 된다.
 
 외부 이벤트가 부른 재실행(`hcap_changed` 포함)은 budget을 쓰지 않는다. 원인은 전이 기록에 남는다.
 
@@ -271,12 +291,13 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `agent_repair[stage1]` | Stage 1에서 `(repair)` 전이의 수(cause `hcap_changed` 제외). 전이마다 Agent Task 하나를 부른다 | operator `resume` | `blocked_operator(stage1_repair_budget)` |
 | `agent_repair[stage2]` | Stage 2에서 `(repair)` 전이의 수(cause `hcap_changed` 제외) | operator `resume` | `blocked_operator(stage2_repair_budget)` |
 | `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공 | `blocked_operator(agent_failure)` |
-| `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s2_gate`, `s2_replaying`) | 유효한 verdict, Runner 입력 변경 | `blocked_operator(runtime_retry_exhausted)` |
+| `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s2_gate`, `s2_replaying`) | 그 단계가 재실행이 아닌 행으로 끝날 때, Runner 입력이 바뀔 때. 재실행 행으로 가는 결과는 판정된 verdict여도(`INCONCLUSIVE(loss)`, gate의 M1 `INCONCLUSIVE`) 되돌리지 않는다 | `blocked_operator(runtime_retry_exhausted)` |
 | campaign 임계값, fuzz budget | `01` §11.1, §12 | — | §4 표 |
 
 - 한도 값은 JobPolicy가 소유한다(`01` §11.1의 retry / repair budget, campaign repair 임계값). Stage 2 시작 여부
   `run_stage2`와 approval policy도 JobPolicy 값이다.
-- 외부 이벤트(§5)와 Controller 재시작(§8)이 부른 재실행은 budget을 쓰지 않는다.
+- 외부 이벤트(§5)가 부른 재실행과 Controller 재시작은 budget을 쓰지 않는다. 재시작 뒤 Runner task는 새 실행 없이
+  기존 실행을 다시 받고, `abandoned`로 기록한 Agent 실행은 `agent_retry`에 세지 않는다(§8).
 - budget 소진은 결론이 아니다. `blocked_operator`는 "도달 불가"나 "취약점 없음"을 뜻하지 않으며, 그런 결론
   필드를 기록하지 않는다(`01` §3, §12).
 
@@ -317,7 +338,8 @@ Job
     job_policy_id
     counters               # §6
     pending_task?          # task_id, kind (agent | runner | human), 입력 digest
-    resume_point?          # blocked_* / parked / retry_pending일 때
+    cancelling_task?       # cancel을 보내고 종료 응답을 기다리는 Runner task
+    resume_point?          # 대기 상태(§1)와 retry_pending일 때
 
 Transition                 # append-only
     job_id, seq
@@ -336,13 +358,38 @@ AgentAttempt
     usage
 ```
 
+Controller가 Runner에 요구하는 task 계약은 다음과 같다. Runner task 하나는 실행 하나다.
+
+```text
+submit(task_id, input)    task_id를 durable하게 기록한 뒤 실행을 시작한다.
+                          이미 받은 task_id면 새로 실행하지 않고 그 상태를
+                          돌려준다. 같은 task_id에 다른 input이면 거부한다
+status(task_id)           unknown | running | sealed(bundle_refs)
+                          | ended_unsealed(reason)
+cancel(task_id)           실행을 멈추고, 끝난 뒤 최종 status를 돌려준다
+```
+
 - 전이 하나는 `Transition` 추가, `Job` 갱신, 다음 task의 `pending_task` 기록을 한 SQLite transaction으로 commit한다.
   task 발송은 commit 뒤에 한다.
+- Runner task 발송이 실패하거나 응답이 없으면 같은 `task_id`로 다시 submit한다. submit은 `task_id`에 대해
+  멱등이므로 몇 번 보내도 실행은 하나다.
+- 결과를 받지 않기로 한 Runner task(§5의 외부 이벤트, operator `close`·`cancel`, campaign 정지)에는 `cancel`을
+  보내고 `cancelling_task`에 둔다. 같은 job의 다음 Runner task는 Runner가 이전 task의 종료를 답한 뒤에 보낸다.
+  그래서 job의 Runner 실행은 한 번에 하나다. 그 뒤에 온 bundle은 전이를 만들지 않는다(§2). campaign evidence는
+  §4대로 triage 항목만 만든다.
 - 결정적 component는 입력의 순수 함수다. commit 전에 Controller가 죽으면 같은 이벤트로 전이를 다시 계산한다.
-- Controller가 재시작하면 `pending_task`가 있는 job을 다시 본다.
-  - Runner task: 그 `task_id`의 봉인 bundle이 있으면 받고, 없으면 같은 입력으로 다시 보낸다.
-  - Agent task: 이전 실행을 `abandoned`로 기록하고 같은 입력으로 새 실행을 보낸다. LLM 대화를 이어 붙이지 않는다.
+- Controller가 재시작하면 `pending_task`나 `cancelling_task`가 있는 job을 다시 본다.
+  - Runner task: 같은 `task_id`로 다시 submit해 상태를 받는다. Runner가 이미 받은 task면 새로 실행하지 않는다.
+    `sealed`면 그 bundle을 결과로 받고, `running`이면 계속 기다리고, `ended_unsealed`면 §3–§4의 "봉인 bundle 없는
+    Runner 종료" 행으로 처리한다. Runner가 받지 못한 task(commit 뒤 발송 전에 Controller가 죽었다)는 이 submit으로
+    시작한다. Runner가 응답하지 않으면 다시 실행하지 않고 기다린다.
+  - `cancelling_task`: `cancel`을 다시 보낸다.
+  - Agent task: 이전 실행을 `abandoned`로 기록하고 같은 `task_id`, 같은 입력으로 새 실행을 보낸다. LLM 대화를
+    이어 붙이지 않는다. Agent Task는 read-only tool만 쓰므로(`../decisions/2026-10-13-agent-implementation-stack.md`
+    결정 2) 이전 실행이 남아 있어도 영향은 비용뿐이다.
   - 사람 task: 계속 기다린다.
+- Runner는 자신이 재시작한 뒤 이어 갈 수 없는 실행을 `ended_unsealed(runner_restart)`로 답한다. 이 계약의 Runner 쪽
+  구현은 Runner 설계가 정한다(한계와 미결 사항).
 - 현재 상태는 `Transition`을 처음부터 다시 적용한 결과와 같아야 한다.
 - 여러 verdict를 모아 경로를 정한 전이(gate, campaign 임계값)는 소비한 verdict와 JobPolicy identity를 `consumed[]`와
   `job_policy_id`로 남긴다(`01` §11.1).
@@ -371,12 +418,28 @@ AgentAttempt
    정한다(`crash_review`의 `resume`).
 9. **job당 미완료 task는 하나이고 결과는 `task_id`로 대조한다.** 전이마다 소비한 verdict를 정확히 하나의 시도에
    묶어야 evidence lineage가 섞이지 않는다(`01` §11.1).
-10. **재시작 때 재발행은 budget을 쓰지 않는다.** 실패한 것은 Controller이지 scenario가 아니다.
+10. **재시작은 Runner 실행을 새로 만들지 않는다.** Controller는 같은 `task_id`로 다시 submit하고, Runner는
+    `task_id`마다 실행을 하나만 둔다. 실패한 것은 Controller이므로 scenario를 다시 실행하지도 budget을 쓰지도 않는다.
+    한 Runner task가 두 번 실행되면 VM 비용이 늘고, 한 `task_id`에 bundle이 둘 생겨 어느 쪽을 소비했는지에 따라
+    evidence lineage가 갈린다. 결과를 버린 Runner task도 종료를 확인한 뒤에 다음 task를 보내므로 job의 Runner 실행은
+    한 번에 하나다.
 11. **Stage 2 시작은 JobPolicy `run_stage2`가 정한다.** Stage 1을 먼저 구현하는 동안
     (`../decisions/2026-10-13-agent-implementation-stack.md` 결정 1) `REACHED` job은 `s1_reached`에서 기다린다.
     promotion된 semantic subset이 없는 동안 Mutation Strategy를 부르면 `mutation_engine` gap만 생긴다(`04` §5).
 12. **승인 단계는 approval policy가 요구할 때만 둔다.** approval policy는 trusted controller의 execution policy이고
     (`02` §8), 승인 대상은 review manifest가 hash로 묶는다(`05` §11).
+13. **외부 이벤트는 대기 상태를 끝내지 않는다.** `blocked_operator`와 `crash_review`는 사람이 이어 갈지 정하는
+    지점이고(§6, `01` §12), gap 상태는 issue가 정한다(`07` §7). harness 교체나 HCAP·JudgeProfile 변경은 그 결정을
+    대신하지 않으므로 `resume_point`만 바꾼다. 상태를 옮기면 승인이 필요 없는 정책에서 harness 교체만으로 실행이
+    재개되고, `run_stage2`가 참이면 campaign까지 다시 돈다. `s1_approval`은 대기 상태에 넣지 않는다. identity가
+    바뀌면 승인할 harness 자체가 바뀌므로 새 review manifest의 승인을 다시 기다린다.
+14. **replay는 identity나 HCAP이 바뀌어도 기록된 입력으로 마친다.** replay 입력은 crash와 같은 harness identity와
+    기록된 rule set이다(`../03-nfs-proxy/05` §25, §26). 새 binding으로 옮기면 비교의 전제가 깨지고, Stage 1이나
+    gate로 돌리면 window에 `APPLIED` rule이 있는 crash가 사람 검토에 닿지 않는다(`01` §12). 바뀐 binding은 검토 뒤
+    campaign을 이어 갈 지점(`crash_review`의 `resume_point`)에만 쓴다.
+15. **`runtime_retry`는 재실행을 끝내는 결과에서만 0으로 돌아간다.** 판정된 `INCONCLUSIVE(loss)`와 gate의 M1
+    `INCONCLUSIVE`도 유효한 verdict지만 같은 입력을 다시 실행하게 한다. 이런 결과로 counter를 되돌리면 반복되는
+    관측 실패가 한도에 닿지 않는다.
 
 ## 검토한 대안
 
@@ -389,24 +452,30 @@ AgentAttempt
 | job 전체 budget 하나 | 단순하다 | infra 재실행이 Agent repair 몫을 먹는다. `01` §12는 둘을 다른 문제로 나눈다 | 채택 안 함 |
 | vocabulary에 없는 gap id를 Agent에 돌려보냄 | 자동화 | 맞지 않는 id에 묶일 수 있다 | 채택 안 함. vocabulary가 안정되면 재검토 |
 | `APPLIED` crash 뒤에도 campaign 계속 | 같은 budget으로 더 탐색한다 | review 전에 같은 crash를 반복할 수 있고, 계속할지는 사람 판단이다 | 채택 안 함. `crash_review`에서 `resume`할 수 있다 |
+| 외부 이벤트가 대기 상태의 job도 옮긴다 | 사람 개입 없이 새 harness로 이어 간다 | budget 소진이나 crash 검토로 멈춘 job이 harness 교체만으로 다시 실행되고, `run_stage2`가 참이면 campaign까지 간다 | 채택 안 함. 대기 사유별로 자동 재개 조건을 정하게 되면 재검토 |
+| 대기 중 identity 변경을 재개할 때 적용한다 | 대기 중 여러 번 바뀌어도 한 번만 계산한다 | `resume_point`가 실제로 갈 곳을 보여 주지 않는다 | 채택 안 함. 대기 중 다시 materialize하는 비용이 커지면 재검토 |
+| 재시작 때 Runner의 실행을 모두 멈추고 다시 보낸다 | Runner 계약이 단순하다 | 진행 중인 VM 시간을 버리고, 멈췄다는 확인이 여전히 필요하다 | 채택 안 함. Runner가 task 기록을 durable하게 둘 수 없으면 재검토 |
+| Runner 실행을 Controller의 자식 프로세스로 둔다 | Controller와 함께 끝나므로 중복 실행이 없다 | Controller 재시작마다 campaign이 끊기고, Runner를 다른 호스트로 옮길 수 없다 | 채택 안 함 |
+| `runtime_retry`를 유효한 verdict에서 0으로 되돌린다 | verdict가 나왔으면 관측 경로가 동작한 것으로 본다 | 판정된 `INCONCLUSIVE(loss)`나 gate의 M1 `INCONCLUSIVE`가 반복되면 한도에 닿지 않는다 | 채택 안 함. 한도가 재실행 loop를 끝내는 유일한 장치다 |
 
 ## 영향
 
 - **상류**: Q1·M1·Q2·Replay의 status와 reason(`06` §7, §10, `01` §7.1, §8.2, `../03-nfs-proxy/05` §29), Materializer와
   Compiler의 거부 사유(`05` §13, `08` §12), gap 상태(`07` §7), identity 무효화(`01` §11.2)가 바뀌면 §3–§5 표를 함께
   고친다. 표에 없는 새 값은 §2에 따라 `blocked_operator(unexpected_event)`로 가므로 조용히 잘못 라우팅되지 않는다.
-- **하류**: Controller의 job 저장소 schema, Agent Task 출력 variant(§2), JobPolicy 항목(§6), triage 목록. 이 표가
-  틀리면 Q1 없는 Stage 2 진입, 잘못된 repair, 끝나지 않는 loop가 생긴다.
+- **하류**: Controller의 job 저장소 schema, Agent Task 출력 variant(§2), JobPolicy 항목(§6), triage 목록, Runner가
+  구현할 task 계약(§8). 이 표가 틀리면 Q1 없는 Stage 2 진입, 잘못된 repair, 끝나지 않는 loop가 생긴다.
 - **운영**: budget이 LLM 호출과 VM 시간을 묶는다. `blocked_operator`가 사람 개입 지점이라 한도가 작으면 사람
-  부담이 커지고, 크면 비용이 커진다.
+  부담이 커지고, 크면 비용이 커진다. job의 Runner 실행은 한 번에 하나라(§8) Runner의 `cancel` 응답이 늦으면 그
+  job의 다음 Runner task도 늦어진다.
 
 ## 신뢰성 요구
 
 | 항목 | 내용 |
 |---|---|
-| 오류 방향 | 거짓 진행이 더 위험하다. Stage 2 진입, crash report, gap 해소 뒤 재시도는 근거 verdict가 기록된 경우에만 일어나야 한다. 거짓 정지(불필요한 `blocked_operator`)는 사람 시간만 쓴다 |
+| 오류 방향 | 거짓 진행이 더 위험하다. Stage 2 진입, crash report, gap 해소 뒤 재시도는 근거 verdict가 기록된 경우에만, 대기 상태의 재개는 그 상태의 operator 동작이나 issue 이벤트가 기록된 경우에만 일어나야 한다. 거짓 정지(불필요한 `blocked_operator`)는 사람 시간만 쓴다 |
 | 실패 방식 | fail-closed. 정의되지 않은 결과, 알 수 없는 reason, 검증 실패는 `blocked_operator`로 간다. 앞 단계를 건너뛰지 않는다 |
-| 관측 가능성 | `Transition` 기록이 이벤트, 소비한 verdict와 artifact, JobPolicy identity를 남긴다. `blocked_*`는 reason과 `resume_point`를 가진다 |
+| 관측 가능성 | `Transition` 기록이 이벤트, 소비한 verdict와 artifact, JobPolicy identity를 남긴다. `blocked_*`는 reason을, 대기 상태와 `retry_pending`은 `resume_point`를 가진다. Runner task의 상태는 `status(task_id)`로 확인한다 |
 | 재현성 | 같은 상태, 이벤트, component 출력, JobPolicy에서 같은 전이가 나온다. Agent 출력은 재현되지 않으므로 artifact로 저장하고 다시 만들지 않는다 |
 
 ## 검증 오라클
@@ -421,10 +490,25 @@ bundle fixture로 대신한다.
    - `INCONCLUSIVE`(`infra`, `loss`, `evidence`, `mapping`)는 Agent Task를 부르지 않는다.
    - `task_id`가 다른 결과는 전이를 만들지 않는다.
    - 표에 없는 reason 값은 `blocked_operator(unexpected_event)`로 간다.
-3. 종료성: 모든 한도를 1로 둔 JobPolicy에서 항상 repair를 부르는 결과만 주면 유한한 전이 뒤 `blocked_operator`에
-   닿는다.
+   - 대기 상태(`blocked_operator`, `crash_review`, `blocked_harness_gap`, `parked`)에서 identity, `hcap_revision`,
+     JudgeProfile 변경은 상태와 `state_reason`을 바꾸지 않고 `resume_point`만 바꾼다. 그 뒤 `resume`은 바뀐
+     `resume_point`로 가고, identity 변경 뒤의 `route(to)`는 받지 않는다. `blocked_operator(replay_evidence)`의
+     `resume_point`(replay)는 identity나 `hcap_revision`이 바뀌어도 그대로다.
+   - `s2_replaying` 중 identity나 `hcap_revision`이 바뀌어도 replay 결과는 `crash_review`로 간다. 그 `resume`은
+     `s2_campaign`이 아니라 identity가 바뀌었으면 identity 재수립 지점으로, `hcap_revision`만 바뀌었으면 다시
+     compile한 `s2_gate`로 간다.
+3. 종료성: 모든 한도를 1로 둔 JobPolicy에서 항상 repair나 재실행을 부르는 결과만 주면 유한한 전이 뒤
+   `blocked_operator`에 닿는다. 판정된 `INCONCLUSIVE`가 counter를 되돌리지 않는지는 `runtime_retry` 한도를 2 이상으로
+   두고 아래 순서로 확인한다. 재실행이 한도만큼 일어난 다음 결과는 재실행 대신
+   `blocked_operator(runtime_retry_exhausted)`로 가고, 그동안 `runtime_retry`는 0으로 돌아가지 않는다.
+   - `s1_running`: Q1 `INCONCLUSIVE(infra)`와 `INCONCLUSIVE(loss)`를 번갈아 준다.
+   - `s2_gate`: Q1 `REACHED`이고 M1 `INCONCLUSIVE`인 결과와 Q1 `INCONCLUSIVE(loss)`를 번갈아 준다.
 4. 재시작: 각 상태에서 commit 직후 Controller를 죽였다 살리면 같은 상태와 `pending_task`로 이어지고, `Transition`을
    처음부터 다시 적용한 상태가 저장된 상태와 같다.
+5. Runner 중복 실행 없음: fake Runner가 `task_id`별 submit 횟수와 실행 시작 횟수를 센다.
+   - 실행 중에 Controller를 재시작하면 실행 시작은 한 번이고, 그 실행의 bundle로 전이가 일어난다.
+   - commit 뒤 발송 전에 Controller를 죽이면 재시작 뒤 실행이 한 번 시작된다.
+   - 결과를 버린 Runner task가 끝났다는 응답 전에는 같은 job의 다음 Runner task를 보내지 않는다.
 
 증명하지 않는 것: Agent 출력의 품질, Runner와 Judge의 정확성(각자의 오라클: `06`, `01` §8.2, `../03-nfs-proxy/05`),
 실제 provider 장애 양상.
@@ -433,16 +517,20 @@ bundle fixture로 대신한다.
 
 | 증상 | 가능한 원인 | 구분하는 관측 | 조치 |
 |---|---|---|---|
-| job이 `s1_running`에 오래 머문다 | Runner가 죽었거나 bundle을 봉인하지 못했다 | Runner task 상태, 그 `task_id`의 봉인 bundle 유무 | Runner 확인. Controller 재시작 시 §8 규칙으로 재발행된다 |
+| job이 Runner를 기다리는 상태(`s1_running` 등)에 오래 머문다 | Runner가 응답하지 않는다, 실행이 끝나지 않는다, 결과를 버린 이전 task의 `cancel` 응답이 오지 않는다 | `status(task_id)` 응답, job의 `pending_task`와 `cancelling_task`, Runner의 task 기록 | Runner를 확인한다. Controller는 Runner가 끝났다고 답하기 전에는 그 task를 다시 실행하지 않고 다음 Runner task도 보내지 않는다 |
 | `s1_planning`과 `s1_running`을 오간 끝에 `blocked_operator(stage1_repair_budget)` | 시나리오 선택 실패, 분석 오류, Q1 관측 범위 문제. 어느 쪽인지 모를 수 있다 | `AgentAttempt`의 `RepairInput`과 Q1Result 순서, `observations` | 사람이 검토해 budget을 늘려 `resume`하거나 close |
 | 여러 job이 같은 `runtime_retry_exhausted` | 인프라 문제(VM, fixture) | Q1 reason이 `infra`, 같은 harness build | harness·infra를 고친 뒤 `resume` |
 | `blocked_operator(unexpected_event)` | Controller 구현과 이 표의 불일치, 또는 상류 문서의 새 reason | `Transition`의 event와 상태 | 표나 구현을 고친다 |
 | `blocked_operator(gap_id_unknown)` | HCAP vocabulary에 없는 capability가 필요하다 | `unsupported` 출력의 `reason`에 적힌 필요한 capability | vocabulary를 확장해 `resume`하거나 close |
 | issue가 해결됐는데 `blocked_harness_gap`에 남아 있다 | issue 상태 이벤트를 받지 못했다 | tracker 상태와 job의 issue 참조 | 원인 모름. tracker 연동을 확인한다 |
+| operator `route(to)`가 받아지지 않는다 | gate 뒤 identity가 바뀌어 bound identity에서 세운 Q1 `REACHED`가 없다 | `Transition`의 identity 변경 기록, `resume_point` | `resume`으로 identity 재수립 지점에 보낸다 |
 
 ## 한계와 미결 사항
 
-- **결정됨:** 상태 목록, 전이 규칙(§2), Stage 1 전이(§3), budget counter의 종류(§6), 기록과 재시작 규칙(§8).
+- **결정됨:** 상태 목록, 전이 규칙(§2), Stage 1 전이(§3), 대기 상태와 외부 이벤트 규칙(§5), budget counter의
+  종류와 되돌리는 조건(§6), 기록과 재시작 규칙, Controller가 요구하는 Runner task 계약(§8).
+- **미결:** Runner task 계약의 Runner 쪽 구현. task 기록을 어디에 durable하게 두는지, Runner가 재시작한 뒤 어떤
+  실행을 이어 갈 수 있는지는 Runner 설계에서 정한다.
 - **미결:** JobPolicy의 한도 값, `run_stage2` 기본값, approval policy 기본값. 첫 Stage 1 구현에서 정한다.
 - **미결:** gate를 여러 번 반복할 때 반복 결과를 합치는 규칙. `01` §3은 반복 횟수만 JobPolicy에 맡겼다. 제안: 각
   반복에 gate 표를 적용하고 가장 위의 행을 gate 결과로 한다. Stage 2 구현 전에 `01` §3에서 고정한다.

@@ -858,6 +858,7 @@ bounded syz-manager fuzz
 sanitizer/crash collection
 evidence 수집과 봉인 (EvidenceManifest, §11.1)
 operational health check (verdict 아님)
+Controller와의 task 계약 (task_id당 실행 하나, status, cancel. 09 §8)
 ```
 
 ### 11.1 Judge 위치와 evidence 신뢰 경계
