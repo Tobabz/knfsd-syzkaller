@@ -1,0 +1,682 @@
+"""The Stage 1 job state machine (09 §2, §3, §5, §6).
+
+handle(job, event) is a function of the job, the event, the job's JobPolicy
+and the deterministic components.  It returns the next job and what the
+transition consumed, or None when the event makes no transition (a stale
+result, an action the state does not take).  It sends nothing: the service
+commits the transition, then sends the tasks it names (09 §8).
+
+Routing reads only verdict status and reason, typed refusal reasons and the
+Agent output variant (09 §2).  A value the tables do not name goes to
+blocked_operator(unexpected_event); nothing is mapped to the nearest row.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Callable
+
+from ..components import HcapChecker, Materializer, Q1Judge
+from ..contracts import (NEUTRAL_CONTROL_UNAVAILABLE, TASK_VARIANTS, AgentTask,
+                         GapClass, GapRef, HarnessBinding, JobPolicy,
+                         MaterializeRejected, Q1Result, Q1Status,
+                         kernel_revision_gap)
+from . import events as ev
+from .records import (TERMINAL, WAITING, BlockedReason, ConsumedVerdict,
+                      Job, JobState, PendingTask, RepairCause, RepairInput,
+                      Stage2Input, Target, TargetKind, TaskKind)
+
+AGENT_STATES = {JobState.S1_ANALYSIS: AgentTask.CANDIDATE_ANALYSIS,
+                JobState.S1_PLANNING: AgentTask.REACHABILITY_PLANNING}
+WAITING_KINDS = {TargetKind.BLOCKED_OPERATOR, TargetKind.BLOCKED_HARNESS_GAP}
+
+#: Counter an operator `resume` puts back to 0 (09 §5, §6).
+RESET_ON_RESUME = {
+    BlockedReason.STAGE1_REPAIR_BUDGET: "agent_repair_stage1",
+    BlockedReason.AGENT_FAILURE: "agent_retry",
+    BlockedReason.RUNTIME_RETRY_EXHAUSTED: "runtime_retry",
+}
+
+
+@dataclass
+class Env:
+    policy: Callable[[str], JobPolicy]
+    hcap: HcapChecker
+    materializer: Materializer
+    judge: Q1Judge
+
+
+@dataclass
+class Outcome:
+    job: Job
+    reason: str | None
+    consumed: list[str]
+    verdicts: list[Q1Result]
+    abandoned_attempt: tuple[str, int] | None
+
+
+@dataclass
+class _Call:
+    job: Job
+    policy: JobPolicy
+    reason: str | None = None
+    consumed: list[str] = field(default_factory=list)
+    verdicts: list[Q1Result] = field(default_factory=list)
+    abandoned: tuple[str, int] | None = None
+
+
+def digest(obj) -> str:
+    text = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class Machine:
+    def __init__(self, env: Env) -> None:
+        self.env = env
+
+    # ------------------------------------------------------------ entry
+
+    def handle(self, job: Job, event) -> Outcome | None:
+        j = job.model_copy(deep=True)
+        if j.state in TERMINAL and not isinstance(
+                event, (ev.RunnerFinished, ev.CancelConfirmed)):
+            return None
+        c = _Call(j, self.env.policy(j.job_policy_id))
+        if not getattr(self, "_on_" + event.type)(c, event):
+            return None
+        if j.state is not JobState.S1_REACHED:
+            j.stage2_input = None
+        j.seq += 1
+        return Outcome(j, c.reason, c.consumed, c.verdicts, c.abandoned)
+
+    # ------------------------------------------------------------ events
+
+    def _on_intake_checked(self, c: _Call, e: ev.IntakeChecked) -> bool:
+        j = c.job
+        if j.state is not JobState.SUBMITTED:
+            return False
+        j.judge_versions = e.judge_versions
+        if e.rejection or e.candidate is None:
+            j.state = JobState.REJECTED
+            j.state_reason = e.rejection or "no_candidate"
+            return True
+        j.candidate = e.candidate
+        binding = self._usable(c, e.binding)
+        if binding is None:
+            self._goto(c, Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
+                                 gap=kernel_revision_gap(
+                                     e.candidate.kernel_commit),
+                                 inner=Target(kind=TargetKind.ANALYSIS)))
+        else:
+            j.binding = binding
+            self._goto(c, Target(kind=TargetKind.ANALYSIS))
+        return True
+
+    def _on_agent_succeeded(self, c: _Call, e: ev.AgentSucceeded) -> bool:
+        j = c.job
+        p = j.pending_task
+        if not self._is_pending(p, TaskKind.AGENT, e.task_id, e.attempt):
+            return False
+        here = self._here(j)
+        j.pending_task = None
+        j.counters = j.counters.model_copy(update={"agent_retry": 0})
+        out = e.output
+        if out.variant not in TASK_VARIANTS[p.agent_task]:
+            return self._unexpected(c, here)
+        if out.variant == "analysis":
+            j.analysis_ref = out.analysis_ref
+            c.consumed.append(out.analysis_ref)
+            self._goto(c, Target(kind=TargetKind.PLANNING))
+        elif out.variant == "plan":
+            j.plan_ref = out.plan_ref
+            j.harness = None
+            c.consumed.append(out.plan_ref)
+            self._goto(c, self._materialize(c))
+        elif out.variant == "unsupported":
+            gap = GapRef(gap_class=out.gap_class,
+                         missing_capability_id=out.missing_capability_id)
+            if not out.missing_capability_id or \
+                    not self.env.hcap.knows_capability(
+                        j.binding.hcap_revision, out.missing_capability_id):
+                self._block(c, BlockedReason.GAP_ID_UNKNOWN,
+                            Target(kind=TargetKind.PLANNING))
+            else:
+                self._goto(c, Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
+                                     gap=gap,
+                                     inner=Target(kind=TargetKind.PLANNING)))
+        else:
+            self._goto(c, Target(kind=TargetKind.ANALYSIS,
+                                 cause=RepairCause.REANALYSIS_REQUESTED,
+                                 findings=(out.reason,)))
+        return True
+
+    def _on_agent_failed(self, c: _Call, e: ev.AgentFailed) -> bool:
+        j = c.job
+        p = j.pending_task
+        if not self._is_pending(p, TaskKind.AGENT, e.task_id, e.attempt):
+            return False
+        j.pending_task = None
+        c.reason = "agent_failed"
+        if j.counters.agent_retry >= c.policy.agent_retry_limit:
+            # The same request again on resume, already charged.
+            self._block(c, BlockedReason.AGENT_FAILURE,
+                        self._agent_target(p, charged=True))
+            return True
+        j.counters = j.counters.model_copy(
+            update={"agent_retry": j.counters.agent_retry + 1})
+        self._start_agent(c, p.agent_task, p.repair, retry=True)
+        return True
+
+    def _on_agent_attempt_restarted(self, c: _Call,
+                                    e: ev.AgentAttemptRestarted) -> bool:
+        j = c.job
+        p = j.pending_task
+        if p is None or p.kind is not TaskKind.AGENT or \
+                p.task_id != e.task_id or e.attempt <= p.attempt:
+            return False
+        c.abandoned = (p.task_id, p.attempt)
+        j.pending_task = p.model_copy(update={"attempt": e.attempt})
+        c.reason = "agent_attempt_restarted"
+        return True
+
+    def _on_runner_finished(self, c: _Call, e: ev.RunnerFinished) -> bool:
+        j = c.job
+        if e.task_id in j.cancelling_tasks:
+            j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
+                                       if t != e.task_id)
+            c.reason = "cancel_settled"
+            return True
+        p = j.pending_task
+        if not self._is_pending(p, TaskKind.RUNNER, e.task_id) or \
+                j.state is not JobState.S1_RUNNING:
+            return False
+        j.pending_task = None
+        if e.state == "ended_unsealed" or not e.bundle_ref:
+            c.reason = f"runner_ended_unsealed:{e.reason or ''}"
+            self._goto(c, Target(kind=TargetKind.RUNNING, rerun=True))
+            return True
+        r = self.env.judge.judge(e.bundle_ref, j.plan_ref,
+                                 j.candidate.candidate_id, j.judge_versions)
+        c.verdicts.append(r)
+        c.consumed.append(r.verdict_id)
+        j.last_verdict = ConsumedVerdict(result=r, bundle_ref=e.bundle_ref,
+                                         binding=j.binding,
+                                         plan_ref=j.plan_ref,
+                                         harness_ref=j.harness.harness_ref)
+        self._goto(c, self._q1_target(c, r))
+        return True
+
+    def _on_approval_given(self, c: _Call, e: ev.ApprovalGiven) -> bool:
+        j = c.job
+        if j.state is not JobState.S1_APPROVAL or \
+                not self._is_pending(j.pending_task, TaskKind.HUMAN,
+                                     e.task_id):
+            return False
+        c.consumed.append(e.decision_id)
+        if e.review_manifest_sha256 != j.harness.review_manifest_sha256:
+            # 09 §3: not an approval of this harness; keep waiting.
+            c.reason = "approval_hash_mismatch"
+            return True
+        j.approved_manifests = j.approved_manifests + (
+            e.review_manifest_sha256,)
+        j.pending_task = None
+        self._goto(c, Target(kind=TargetKind.RUNNING))
+        return True
+
+    def _on_approval_denied(self, c: _Call, e: ev.ApprovalDenied) -> bool:
+        j = c.job
+        if j.state is not JobState.S1_APPROVAL or \
+                not self._is_pending(j.pending_task, TaskKind.HUMAN,
+                                     e.task_id):
+            return False
+        j.pending_task = None
+        self._goto(c, Target(kind=TargetKind.PLANNING,
+                             cause=RepairCause.REVIEWER_DENIED,
+                             findings=(e.note,)))
+        return True
+
+    def _on_issue_changed(self, c: _Call, e: ev.IssueChanged) -> bool:
+        j = c.job
+        if j.state not in (JobState.BLOCKED_HARNESS_GAP, JobState.PARKED) \
+                or j.gap != e.gap:
+            return False
+        c.reason = f"issue_{e.status}"
+        if e.status == "resolved":
+            j.state = JobState.RETRY_PENDING
+        elif e.status == "deferred" and \
+                j.state is JobState.BLOCKED_HARNESS_GAP:
+            j.state = JobState.PARKED
+        elif e.status == "reopened" and j.state is JobState.PARKED:
+            j.state = JobState.BLOCKED_HARNESS_GAP
+        elif e.status == "wont_fix":
+            j.state = JobState.CLOSED_UNSUPPORTED
+            j.state_reason = e.resolution or "wont_fix"
+            j.resume_point = None
+        else:
+            return False
+        return True
+
+    def _on_binding_changed(self, c: _Call, e: ev.BindingChanged) -> bool:
+        j = c.job
+        new = self._usable(c, e.binding)
+        if j.state is JobState.SUBMITTED:
+            return False
+        if j.state is JobState.RETRY_PENDING:
+            base = j.resume_point
+            t = self._rebind(c, new, base)
+            j.gap = None
+            j.resume_point = None
+            c.reason = "rebind"
+            self._goto(c, t)
+            return True
+        if new == j.binding:
+            return False
+        if j.state in WAITING:
+            base = self._waiting_base(j)
+            self._set_resume(c, self._rebind(c, new, base), base)
+            c.reason = "binding_changed"
+            return True
+        old = j.binding
+        here = self._here(j)
+        c.reason = "binding_changed"
+        if new is not None and old is not None and \
+                new.execution_harness_id == old.execution_harness_id:
+            # hcap_revision only (09 §5).
+            j.binding = new
+            if j.state in AGENT_STATES:
+                # The same Agent Task again, on the new hcap_revision.
+                self._goto(c, self._agent_target(j.pending_task,
+                                                 charged=True))
+                return True
+            if j.plan_ref:
+                chk = self.env.hcap.check_plan(j.plan_ref, new.hcap_revision)
+                if not chk.ok:
+                    self._goto(c, Target(kind=TargetKind.PLANNING,
+                                         cause=RepairCause.HCAP_CHANGED,
+                                         findings=chk.violations))
+            return True
+        self._goto(c, self._rebind(c, new, here))
+        return True
+
+    def _on_judge_versions_changed(self, c: _Call,
+                                   e: ev.JudgeVersionsChanged) -> bool:
+        j = c.job
+        j.judge_versions = e.judge_versions
+        c.reason = "judge_versions_changed"
+        lv = j.last_verdict
+        if lv is None or j.state is JobState.SUBMITTED:
+            return True
+        # Routes only under the binding the verdict was consumed with, and
+        # only while the job still runs that plan and harness (09 §5).
+        same_binding = lv.binding == j.binding and \
+            lv.plan_ref == j.plan_ref and j.harness is not None and \
+            lv.harness_ref == j.harness.harness_ref
+        if not self.env.judge.has_required_evidence(lv.bundle_ref,
+                                                    e.judge_versions):
+            if not same_binding:
+                return True
+            t = Target(kind=TargetKind.RUNNING, rerun=True)
+            external = True
+        else:
+            r = self.env.judge.judge(lv.bundle_ref, lv.plan_ref,
+                                     j.candidate.candidate_id,
+                                     e.judge_versions)
+            c.verdicts.append(r)
+            # Recorded always; routes only when the verdict changed.
+            if not same_binding or (r.status, r.reason) == \
+                    (lv.result.status, lv.result.reason):
+                return True
+            c.consumed.append(r.verdict_id)
+            j.last_verdict = lv.model_copy(update={"result": r})
+            t = self._q1_target(c, r)
+            external = False
+        if j.state in WAITING or j.state is JobState.RETRY_PENDING:
+            self._set_resume(c, t, self._waiting_base(j))
+        else:
+            self._goto(c, t, external=external)
+        return True
+
+    def _on_policy_changed(self, c: _Call, e: ev.PolicyChanged) -> bool:
+        if e.job_policy_id == c.job.job_policy_id:
+            return False
+        c.job.job_policy_id = e.job_policy_id
+        c.reason = "policy_changed"
+        return True
+
+    def _on_operator(self, c: _Call, e: ev.OperatorAction) -> bool:
+        j = c.job
+        c.consumed.append(e.action_id)
+        if e.action == "resume":
+            if j.state is not JobState.BLOCKED_OPERATOR:
+                return False
+            counter = RESET_ON_RESUME.get(BlockedReason(j.state_reason))
+            if counter:
+                j.counters = j.counters.model_copy(update={counter: 0})
+            t = j.resume_point
+            if t is None:
+                return False
+            j.resume_point = None
+            j.state_reason = None
+            c.reason = "operator_resume"
+            self._goto(c, t)
+            return True
+        self._drop_task(c)
+        j.state = JobState.CLOSED
+        j.state_reason = "operator_closed" if e.action == "close" \
+            else "cancelled"
+        j.resume_point = None
+        c.reason = j.state_reason
+        return True
+
+    def _on_cancel_confirmed(self, c: _Call, e: ev.CancelConfirmed) -> bool:
+        j = c.job
+        if e.task_id not in j.cancelling_tasks:
+            return False
+        j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
+                                   if t != e.task_id)
+        c.reason = "cancel_settled"
+        return True
+
+    # ------------------------------------------------------------ targets
+
+    def _goto(self, c: _Call, t: Target, external: bool = False) -> None:
+        j = c.job
+        if not (t.kind is TargetKind.RUNNING and t.rerun):
+            # 09 §6: runtime_retry ends with any row that is not a rerun.
+            j.counters = j.counters.model_copy(update={"runtime_retry": 0})
+        if t.kind in (TargetKind.ANALYSIS, TargetKind.PLANNING):
+            task = AgentTask.CANDIDATE_ANALYSIS \
+                if t.kind is TargetKind.ANALYSIS \
+                else AgentTask.REACHABILITY_PLANNING
+            repair = None
+            if t.cause is not None:
+                charged = t.charged or t.cause is RepairCause.HCAP_CHANGED
+                n = j.counters.agent_repair_stage1
+                if not charged:
+                    if n >= c.policy.stage1_repair_budget:
+                        self._block(c, BlockedReason.STAGE1_REPAIR_BUDGET, t)
+                        return
+                    n += 1
+                    j.counters = j.counters.model_copy(
+                        update={"agent_repair_stage1": n})
+                repair = RepairInput(
+                    job_id=j.job_id, attempt=n, agent_task=task,
+                    cause=t.cause,
+                    previous_outputs=tuple(r for r in (j.analysis_ref,
+                                                       j.plan_ref) if r),
+                    findings=t.findings,
+                    evidence_refs=(j.last_verdict.bundle_ref,)
+                    if j.last_verdict else (),
+                    remaining_budget=c.policy.stage1_repair_budget - n)
+            self._start_agent(c, task, repair)
+        elif t.kind is TargetKind.MATERIALIZE:
+            self._goto(c, self._materialize(c), external)
+        elif t.kind is TargetKind.RUNNING:
+            self._enter_running(c, t.rerun, external)
+        elif t.kind is TargetKind.REACHED:
+            self._drop_task(c)
+            lv = j.last_verdict
+            j.state = JobState.S1_REACHED
+            j.state_reason = None
+            j.stage2_input = Stage2Input(
+                q1_verdict_id=lv.result.verdict_id, bundle_ref=lv.bundle_ref,
+                plan_ref=lv.plan_ref, harness_ref=lv.harness_ref,
+                execution_harness_id=lv.result.execution_harness_id)
+        elif t.kind is TargetKind.BLOCKED_OPERATOR:
+            self._drop_task(c)
+            j.state = JobState.BLOCKED_OPERATOR
+            j.state_reason = t.reason.value
+            j.resume_point = t.inner
+        else:
+            self._drop_task(c)
+            j.state = JobState.BLOCKED_HARNESS_GAP
+            j.state_reason = t.gap.gap_class.value
+            j.gap = t.gap
+            j.resume_point = t.inner
+
+    def _block(self, c: _Call, reason: BlockedReason, resume: Target) -> None:
+        self._goto(c, Target(kind=TargetKind.BLOCKED_OPERATOR, reason=reason,
+                             inner=resume))
+
+    def _unexpected(self, c: _Call, resume: Target) -> bool:
+        c.reason = "unexpected_event"
+        self._block(c, BlockedReason.UNEXPECTED_EVENT, resume)
+        return True
+
+    def _materialize(self, c: _Call,
+                     failure_cause: RepairCause | None = None) -> Target:
+        """HCAP check, then the Materializer, on the stored plan (09 §3).
+        Stores the harness on success."""
+        j = c.job
+        chk = self.env.hcap.check_plan(j.plan_ref, j.binding.hcap_revision)
+        if not chk.ok:
+            return Target(kind=TargetKind.PLANNING,
+                          cause=failure_cause or RepairCause.HCAP_INVALID,
+                          findings=chk.violations)
+        m = self.env.materializer.materialize(j.plan_ref, j.binding)
+        if isinstance(m, MaterializeRejected):
+            if m.reason == NEUTRAL_CONTROL_UNAVAILABLE:
+                if not m.profile:
+                    return self._unexpected_target(TargetKind.MATERIALIZE)
+                return Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
+                              gap=GapRef(
+                                  gap_class=GapClass.FIXTURE_OR_TOOL,
+                                  missing_capability_id=
+                                  f"neutral_control.{m.profile}"),
+                              inner=Target(kind=TargetKind.MATERIALIZE))
+            return Target(kind=TargetKind.PLANNING,
+                          cause=failure_cause or
+                          RepairCause.MATERIALIZER_REJECTED,
+                          findings=(m.reason, m.detail))
+        if m.execution_harness_id != j.binding.execution_harness_id:
+            return self._unexpected_target(TargetKind.MATERIALIZE)
+        j.harness = m
+        return Target(kind=TargetKind.RUNNING)
+
+    def _q1_target(self, c: _Call, r: Q1Result) -> Target:
+        """09 §3, the s1_running rows."""
+        j = c.job
+        running = Target(kind=TargetKind.RUNNING)
+        if r.candidate_id != j.candidate.candidate_id or \
+                r.execution_harness_id != j.binding.execution_harness_id:
+            return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                          reason=BlockedReason.Q1_EVIDENCE, inner=running)
+        if r.status is Q1Status.REACHED:
+            return Target(kind=TargetKind.REACHED)
+        if r.status is Q1Status.NOT_REACHED:
+            return Target(kind=TargetKind.PLANNING,
+                          cause=RepairCause.Q1_NOT_REACHED,
+                          findings=(r.model_dump_json(),))
+        if r.reason in ("infra", "loss"):
+            return Target(kind=TargetKind.RUNNING, rerun=True)
+        if r.reason in ("evidence", "mapping"):
+            return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                          reason=BlockedReason("q1_" + r.reason),
+                          inner=running)
+        g = r.gap_signal
+        if r.reason == "unsupported_attribution" and g is not None and \
+                g.gap_class is GapClass.REMOTE_KCOV_ATTRIBUTION and \
+                g.missing_capability_id.startswith("remote_kcov.context."):
+            return Target(kind=TargetKind.BLOCKED_HARNESS_GAP, gap=g,
+                          inner=running)
+        c.reason = "unexpected_event"
+        return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                      reason=BlockedReason.UNEXPECTED_EVENT, inner=running)
+
+    @staticmethod
+    def _unexpected_target(kind: TargetKind) -> Target:
+        return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                      reason=BlockedReason.UNEXPECTED_EVENT,
+                      inner=Target(kind=kind))
+
+    def _rebind(self, c: _Call, new: HarnessBinding | None,
+                base: Target) -> Target:
+        """Where a binding change sends a job whose base point is `base`
+        (09 §5, the identity re-establishment point)."""
+        j = c.job
+        old = j.binding
+        if new is None:
+            j.binding = None
+            return Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
+                          gap=kernel_revision_gap(j.candidate.kernel_commit),
+                          inner=base)
+        j.binding = new
+        if old is None or new.execution_harness_id != \
+                old.execution_harness_id:
+            j.harness = None
+            if j.plan_ref:
+                return self._materialize(c, RepairCause.HCAP_CHANGED)
+            if j.analysis_ref:
+                return Target(kind=TargetKind.PLANNING)
+            return Target(kind=TargetKind.ANALYSIS)
+        if new.hcap_revision != old.hcap_revision and j.plan_ref and \
+                base.kind not in (TargetKind.ANALYSIS, TargetKind.PLANNING):
+            chk = self.env.hcap.check_plan(j.plan_ref, new.hcap_revision)
+            if not chk.ok:
+                return Target(kind=TargetKind.PLANNING,
+                              cause=RepairCause.HCAP_CHANGED,
+                              findings=chk.violations)
+        return base
+
+    @staticmethod
+    def _waiting_base(j: Job) -> Target:
+        rp = j.resume_point
+        if rp is not None and rp.kind in WAITING_KINDS:
+            return rp.inner
+        return rp
+
+    def _set_resume(self, c: _Call, t: Target, base: Target) -> None:
+        """09 §5: a re-evaluation event on a waiting job moves only its
+        resume_point."""
+        j = c.job
+        if j.state is JobState.BLOCKED_OPERATOR:
+            here = Target(kind=TargetKind.BLOCKED_OPERATOR,
+                          reason=BlockedReason(j.state_reason))
+        else:
+            here = Target(kind=TargetKind.BLOCKED_HARNESS_GAP, gap=j.gap)
+        place = t.model_copy(update={"inner": None})
+        if t == base or place == here:
+            j.resume_point = base
+        elif t.kind in WAITING_KINDS:
+            j.resume_point = t.model_copy(update={"inner": base})
+        else:
+            j.resume_point = t
+
+    # ------------------------------------------------------------ tasks
+
+    def _start_agent(self, c: _Call, task: AgentTask,
+                     repair: RepairInput | None, retry: bool = False) -> None:
+        j = c.job
+        self._drop_task(c)
+        if not retry:
+            j.counters = j.counters.model_copy(update={"agent_retry": 0})
+        task_input = {
+            "agent_task": task.value,
+            "candidate": j.candidate.model_dump(mode="json"),
+            "hcap_revision": j.binding.hcap_revision,
+            "analysis_ref": j.analysis_ref,
+            "plan_ref": j.plan_ref if task is
+            AgentTask.REACHABILITY_PLANNING else None,
+            "repair": repair.model_dump(mode="json") if repair else None,
+        }
+        j.pending_task = PendingTask(task_id=self._mint(j),
+                                     kind=TaskKind.AGENT,
+                                     input_digest=digest(task_input),
+                                     agent_task=task, repair=repair)
+        j.state = JobState.S1_ANALYSIS if \
+            task is AgentTask.CANDIDATE_ANALYSIS else JobState.S1_PLANNING
+        j.state_reason = repair.cause.value if repair else None
+        j.resume_point = None
+        j.gap = None
+
+    def _enter_running(self, c: _Call, rerun: bool, external: bool) -> None:
+        """Every entry into s1_running applies the approval policy of the
+        moment (09 §3)."""
+        j = c.job
+        if rerun and not external:
+            n = j.counters.runtime_retry
+            if n >= c.policy.runtime_retry_limit:
+                self._block(c, BlockedReason.RUNTIME_RETRY_EXHAUSTED,
+                            Target(kind=TargetKind.RUNNING, rerun=True))
+                return
+            j.counters = j.counters.model_copy(
+                update={"runtime_retry": n + 1})
+        self._drop_task(c)
+        h = j.harness
+        if c.policy.approval_required and \
+                h.review_manifest_sha256 not in j.approved_manifests:
+            j.pending_task = PendingTask(
+                task_id=self._mint(j), kind=TaskKind.HUMAN,
+                input_digest=h.review_manifest_sha256)
+            j.state = JobState.S1_APPROVAL
+        else:
+            j.pending_task = PendingTask(
+                task_id=self._mint(j), kind=TaskKind.RUNNER,
+                input_digest=digest({"harness_ref": h.harness_ref,
+                                     "execution_harness_id":
+                                     h.execution_harness_id}))
+            j.state = JobState.S1_RUNNING
+        j.state_reason = "rerun" if rerun else None
+        j.resume_point = None
+        j.gap = None
+
+    def _drop_task(self, c: _Call) -> None:
+        """The job will not take this task's result.  A Runner task is
+        cancelled after commit and the job's next Runner task waits for
+        its end (09 §8)."""
+        j = c.job
+        p = j.pending_task
+        if p is None:
+            return
+        if p.kind is TaskKind.RUNNER:
+            j.cancelling_tasks = j.cancelling_tasks + (p.task_id,)
+        elif p.kind is TaskKind.AGENT:
+            c.abandoned = (p.task_id, p.attempt)
+        j.pending_task = None
+
+    @staticmethod
+    def _mint(j: Job) -> str:
+        j.task_seq += 1
+        return f"{j.job_id}.t{j.task_seq}"
+
+    # ------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _is_pending(p: PendingTask | None, kind: TaskKind, task_id: str,
+                    attempt: int | None = None) -> bool:
+        return p is not None and p.kind is kind and p.task_id == task_id \
+            and (attempt is None or p.attempt == attempt)
+
+    def _usable(self, c: _Call, b: HarnessBinding | None
+                ) -> HarnessBinding | None:
+        """A binding for another commit or sanitizer is no binding."""
+        j = c.job
+        commit = j.candidate.kernel_commit if j.candidate else None
+        if b is None or b.kernel_commit != commit or \
+                b.sanitizer is not c.policy.sanitizer:
+            return None
+        return b
+
+    @staticmethod
+    def _agent_target(p: PendingTask, charged: bool) -> Target:
+        kind = TargetKind.ANALYSIS if \
+            p.agent_task is AgentTask.CANDIDATE_ANALYSIS \
+            else TargetKind.PLANNING
+        if p.repair is None:
+            return Target(kind=kind)
+        return Target(kind=kind, cause=p.repair.cause,
+                      findings=p.repair.findings, charged=charged)
+
+    def _here(self, j: Job) -> Target:
+        """The job's present place as a target, for a resume point."""
+        if j.state in AGENT_STATES and j.pending_task is not None:
+            return self._agent_target(j.pending_task, charged=True)
+        if j.state is JobState.S1_PLANNING:
+            return Target(kind=TargetKind.PLANNING)
+        if j.state is JobState.S1_ANALYSIS:
+            return Target(kind=TargetKind.ANALYSIS)
+        if j.state is JobState.S1_REACHED:
+            return Target(kind=TargetKind.REACHED)
+        return Target(kind=TargetKind.RUNNING)
