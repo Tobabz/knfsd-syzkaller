@@ -784,7 +784,9 @@ legacy NFSPDLT replay는 legacy/manual campaign의 재현 계약으로만 남는
 
 ## 10. Agent SDK와 deterministic boundary
 
-Agent SDK는 reasoning runtime으로 사용한다.
+Agent SDK는 reasoning runtime으로 사용한다. 이 문서의 "Agent SDK"는 특정 제품이 아니라 그 runtime을 가리킨다.
+구체 선택(여러 provider를 쓰는 PydanticAI)과 근거는 `../decisions/2026-10-13-agent-implementation-stack.md`가
+기록한다.
 
 ```text
 Agent SDK owns
@@ -1152,4 +1154,6 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
     - complete log, 닫힌 collection window, `runner_stopped`이고 report가 없을 때만 `NOT_OBSERVED`다.
     - profile을 바꾼 재판정은 기존 verdict를 고치지 않고 새 verdict를 만든다.
 12. repair/state graph
-13. Agent SDK concrete selection and agent/tool definitions
+13. Agent SDK concrete selection and agent/tool definitions — 선택은
+    [`decisions/2026-10-13-agent-implementation-stack.md`](../decisions/2026-10-13-agent-implementation-stack.md)에
+    기록했다(PydanticAI). agent/tool definitions는 첫 Stage 1 구현에서 정한다
