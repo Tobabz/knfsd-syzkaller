@@ -710,7 +710,9 @@ Proxy는 deactivation(G)을 처리할 때 G의 CALL admission을 닫고 `GENERAT
 ACK `(D)`를 받아야 deactivation을 ACK한다(PR #22 review). host는 이 event로 G를 draining으로 바꾸고, 그 뒤에
 오는 G의 CALL-context `EXPOSURE_INTENT`/`APPLY_REFUSAL`을 거부한다. G+1이 열리지 않아도 이 전이는 일어난다.
 host ACK가 오지 않거나 sink가 거부하면 deactivation은 ACK되지 않고 barrier 실패 경로를 따른다
-(`01-architecture.md` §16). 그 generation의 M1은 확정되지 않는다.
+(`01-architecture.md` §16). 그때 G의 rule에는 M1 `NOT_APPLIED`를 내리지 않는다. 유효한 host-durable
+`EXPOSURE_INTENT`가 있는 rule은 `APPLIED`를 유지하고(§11), 없는 rule은 `INCONCLUSIVE`다. ACK 실패는 적용
+사실을 취소하지 않는다. journal 손상이나 correlation 불일치는 별도의 invalid-evidence 규칙을 따른다(§6, §24).
 
 forward가 끝나지 않은 batch는 connection close 때 `FORWARD_FAILED`로 끝난다(§18). Proxy는 G의 closure를
 판정하고 G의 모든 batch가 `FORWARD_COMPLETE`/`FORWARD_FAILED`를 남긴 뒤 G의 마지막
@@ -1527,8 +1529,9 @@ Expected:
 - generation이 없을 때의 `RULESET`은 받아들인다;
 - G+1 없이 deactivation(G)을 처리한다. `GENERATION_DRAINING(G)`의 host ACK 뒤에만 deactivation이 ACK되고,
   그 뒤 G의 CALL-context event는 거부되어 기록되며, G의 eligible REPLY event는 받아들여진다;
-- `GENERATION_DRAINING(G)`의 host ACK를 막으면 deactivation은 ACK되지 않고 barrier 실패로 처리되며, G의
-  M1은 `NOT_APPLIED`가 아니다;
+- `GENERATION_DRAINING(G)`의 host ACK를 막으면 deactivation은 ACK되지 않고 barrier 실패로 처리된다. 그 전에
+  유효한 `EXPOSURE_INTENT(G, rule=r)`가 ACK된 rule r은 `APPLIED`를 유지하고, `EXPOSURE_INTENT`가 없는 rule은
+  `INCONCLUSIVE`다. 어느 rule도 `NOT_APPLIED`가 되면 FAIL이다;
 - 같은 lane에 admitting generation이 남아 있을 때의 `GENERATION_OPEN`은 거부된다;
 - generation-scoped event는 open generation binding 없이는 거부한다;
 - 재전송은 다시 ACK되고 application이 한 번만 세어진다;
