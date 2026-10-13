@@ -206,7 +206,7 @@ contains the raw coverage, trace, guest command outputs and dmesg.
 ## NFS proxy M0 legacy baseline acceptance (2026-10-13)
 
 PR #17의 M0 변경을 독립 검토한 뒤 코드 커밋
-`2e4d1ab49646205170493fb55911d148cfbc28a4`에서 Linux 호스트와 실제
+`eec30fdd768f822da3d5c3439330b9004c52a8bd`에서 Linux 호스트와 실제
 x86_64 KVM guest 검증을 다시 수행했다. 검토 범위는 `583896c`의 독립
 `NFSPDLT1`/`NFSPDLT2` golden vector, `93ba2ee`의 Linux topology 및
 fail-closed gate, `20ada7b`의 `linux/amd64` guest build, 사용자 결정에
@@ -217,10 +217,13 @@ replay gate다.
 
 | 항목 | 식별값 |
 | --- | --- |
-| 검증 대상 코드 커밋 | `2e4d1ab49646205170493fb55911d148cfbc28a4` |
+| 검증 대상 코드 커밋 | `eec30fdd768f822da3d5c3439330b9004c52a8bd` |
 | kernel base / patched tip | `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e` / `7f1a35fcc0e5eac322241632125d2bd926ca31b5` |
 | syzkaller base / patched tip | `801f0966669a37e048adabf9e5f38ce52825ea82` / `bb6b482c4951566957f30e29a4d3b0c96de60a59` |
-| host | Linux `5.15.0-198-generic`, x86_64 |
+| host | Linux `5.15.0-198-generic`, x86_64, Intel Xeon Silver 4215R, WSL 아님 |
+| guest kernel | `7.3.0-rc5-00003-g7f1a35fcc0e5`, x86_64, GNU Build ID `88a6f604bb4dd4911d51a29dd1001af2eb1f17d5` |
+| KASAN kernel | `bzImage` SHA-256 `f12b9d2b5b219e71e06bf3b3c8eaa5de4fd30a2a319674e3959b285581da94d7`; `vmlinux` SHA-256 `99e3ade05ac68ac3fff351a5c5b087f13fbb66b49e839dbf034813701228b5ce` |
+| guest image | qcow2 SHA-256 `bb0829d84d24491d6cefe0f3f41e07740abe626660bc54cd573c41d7c4878a2f`; raw SHA-256 `50ca1ecc19291073e0499539ff19533893a6ef057dfba07c8046a654071bef49` |
 | guest relay | Debian 12 `linux/amd64`, SHA-256 `1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38` |
 | guest replay probe | SHA-256 `e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241` |
 | guest deps | SHA-256 `1bc0097d9b6f55b779ad9f47cb37a0ed80e5643915c9d7321c098f3daacaa938` |
@@ -247,13 +250,56 @@ docs/handoff/proxy-variable-length-edits/run-verify.sh \
 
 | arm | live oracle | 생성 delta 및 replay | 결과 |
 | --- | --- | --- | --- |
-| `legacy-v1` | 네 client/backend route가 모두 connect 및 양방향 전달, `armed=2`, `expired=2`, `applied=2`, 오류 counter 0 | C2S/S2C `NFSPDLT1` 두 개 exact replay 성공; original mismatch와 `applied_count` mismatch는 proxy `rc=1` | arm `rc=0`, KCOV `.extra` 1/1, fatal dmesg 0 |
+| `legacy-v1` | 네 client/backend route가 모두 connect 및 양방향 전달, `armed=2`, `expired=2`, `applied=2`, 오류 counter 0 | C2S/S2C `NFSPDLT1` 두 개 exact replay 성공; unmatched count, original mismatch, 변조한 `applied_count` mismatch는 proxy `rc=1` | arm `rc=0`, KCOV `.extra` 1/1, fatal dmesg 0 |
 | `legacy-v2` | `edit_applied=1`, 오류 counter 0 | resize `NFSPDLT2` exact replay 성공; original mismatch와 `applied_count` mismatch는 proxy `rc=1` | arm `rc=0`, KCOV `.extra` 1/1, fatal dmesg 0 |
 | `legacy-v2-refusal` | `edit_applied=0`, `edit_refused_orig=1` | live refusal delta의 replay도 `expected=0`, `applied=0`, `refused_orig=1`, proxy `rc=1` | arm `rc=0`, KCOV `.extra` 1/1, fatal dmesg 0 |
 
+#20의 L1–L3, L6, L7은 다음 명령으로 추가 실행했다. L4, L5, L8은 위
+`legacy-v1`, `legacy-v2`, `legacy-v2-refusal` 실행이 각각 같은 workload와
+oracle을 더 엄격한 replay gate와 함께 수행한다.
+
+```sh
+OUT=/home/fuzzer/prune-evidence/m0-issue20-live-baselines \
+IMAGE=/home/fuzzer/prune-env-image.raw PROCS=4 \
+docs/handoff/proxy-variable-length-edits/run-verify.sh \
+  env kasan direct proxy raw
+
+OUT=/home/fuzzer/prune-evidence/m0-issue20-L6-append \
+IMAGE=/home/fuzzer/prune-env-image.raw EXECUTIONS=1 PROCS=1 \
+WORKLOAD=$PWD/tools/nfs-proxy/test/guest-syzkaller-v2-append.prog \
+docs/handoff/proxy-variable-length-edits/run-verify.sh env kasan raw
+
+OUT=/home/fuzzer/prune-evidence/m0-issue20-L7-append-raw \
+IMAGE=/home/fuzzer/prune-env-image.raw EXECUTIONS=1 PROCS=1 \
+WORKLOAD=$PWD/tools/nfs-proxy/test/guest-syzkaller-v2-append-raw.prog \
+docs/handoff/proxy-variable-length-edits/run-verify.sh env kasan raw
+```
+
+| # | 경로 | 판정 근거 | 결과 |
+| --- | --- | --- | --- |
+| L1 | direct, 4 proc × 30 | `execprog rc=0`, KCOV `.extra` 30/30, `fs/nfsd` PC 1867 | PASS, fatal dmesg 0 |
+| L2 | no-edit proxy, 4 proc × 30 | 네 lane 모두 proxy 오류 0, KCOV `.extra` 30/30, `fs/nfsd` PC 1868 | PASS, fatal dmesg 0 |
+| L3 | raw 4-route, 4 proc × 30 | 네 lane 각각 네 client/backend tuple에서 `connected`, `c2s`, `s2c`가 모두 1 이상이고 `failed=0`; KCOV `.extra` 30/30 | PASS, fatal dmesg 0 |
+| L4 | v1 mutation | `applied=2`, `refused_orig=0` | PASS |
+| L5 | v2 replace | `edit_applied=1`, `edit_refused_orig=0` | PASS |
+| L6 | v2 struct append | `edit_applied=3`, proxy 오류 0, KCOV `.extra` 1/1 | PASS, fatal dmesg 0 |
+| L7 | v2 raw append | `edit_applied=3`, proxy 오류 0, KCOV `.extra` 1/1 | PASS, fatal dmesg 0 |
+| L8 | v2 wrong original | `edit_applied=0`, `edit_refused_orig=1` | PASS |
+
+| # | replay 판정 | 결과 |
+| --- | --- | --- |
+| R1 | v1 C2S exact: `expected=1 applied=1 refused_orig=0`, 응답 XID `0x22222223` | probe `rc=0`, relay `rc=0` |
+| R2 | v1 S2C exact: `expected=1 applied=1 refused_orig=0`, 응답 XID `0x22222222` | probe `rc=0`, relay `rc=0` |
+| R3 | 원본 v1 delta에 XID `0x22222224`를 보내 미적용: `expected=1 applied=0 refused_orig=0` | 변조 없는 응답, probe `rc=0`, relay `rc=1` |
+| R4 | v1 delta의 original 필드 4바이트만 변경: `expected=1 applied=0 refused_orig=1` | 변조 없는 응답, probe `rc=0`, relay `rc=1` |
+| R5 | v2 resize exact: `edit=1 expected=1 applied=1 refused_orig=0` | probe `rc=0`, relay `rc=0` |
+
+추가로 v1/v2 delta의 `applied_count`를 2로 바꿔 실제 적용 1회와 불일치할
+때도 relay `rc=1`인지, v2 original mismatch가 `refused_orig=1`인지 확인했다.
+
 원본 delta, 파생 mismatch delta, bounded log, `result.json`, 실행 명령과
 입력 해시는 [보존 증거](evidence/m0-legacy-baseline-20261013/)에 있으며
-`SHA256SUMS` 33개 항목을 모두 재검증했다. 이 검증은 Linux 호스트와
+`SHA256SUMS` 62개 항목을 모두 재검증했다. 이 검증은 Linux 호스트와
 x86_64 KVM guest 범위를 충족한다. Darwin host와 Docker fallback은
 2026-10-13 사용자 결정 및 `83e4cdb`에 따라 M0 범위에서 제외되었고,
 그 플랫폼에 대한 지원이나 검증 완료를 주장하지 않는다.
