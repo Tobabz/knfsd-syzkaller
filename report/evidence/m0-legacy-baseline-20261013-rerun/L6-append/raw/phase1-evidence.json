@@ -1,0 +1,235 @@
+{
+  "commands": [
+    {
+      "command": "mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug",
+      "duration_seconds": 0.269728,
+      "returncode": 0,
+      "stage": "debugfs",
+      "stderr": "commands/001-debugfs.stderr",
+      "stdout": "commands/001-debugfs.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/inputs/deps-ganesha-proxy.tar.gz /tmp/deps.tar.gz",
+      "duration_seconds": 0.413259,
+      "returncode": 0,
+      "stage": "deps",
+      "stderr": "commands/002-deps.stderr",
+      "stdout": "commands/002-deps.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/inputs/lane-proxy.sh /tmp/lane.sh",
+      "duration_seconds": 0.263923,
+      "returncode": 0,
+      "stage": "fixture",
+      "stderr": "commands/003-fixture.stderr",
+      "stdout": "commands/003-fixture.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/fuzz/knfsd-syzkaller/tools/nfs-proxy/test/guest-syzkaller-v2-append.prog /tmp/w.prog",
+      "duration_seconds": 0.236651,
+      "returncode": 0,
+      "stage": "workload",
+      "stderr": "commands/004-workload.stderr",
+      "stdout": "commands/004-workload.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/fuzz/knfsd-syzkaller/env/syzkaller/bin/linux_amd64/syz-executor /tmp/syz-executor",
+      "duration_seconds": 0.349548,
+      "returncode": 0,
+      "stage": "executor",
+      "stderr": "commands/005-executor.stderr",
+      "stdout": "commands/005-executor.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/fuzz/knfsd-syzkaller/env/syzkaller/bin/linux_amd64/syz-execprog /tmp/syz-execprog",
+      "duration_seconds": 1.068064,
+      "returncode": 0,
+      "stage": "execprog",
+      "stderr": "commands/006-execprog.stderr",
+      "stdout": "commands/006-execprog.stdout"
+    },
+    {
+      "command": "set -eu; install -d /opt/kcov-nfs/deps /opt/frozen-phase9; tar -xzf /tmp/deps.tar.gz -C /opt/kcov-nfs/deps; install -m 0755 /tmp/lane.sh /opt/frozen-phase9/lane.sh; install -m 0644 /tmp/w.prog /opt/frozen-phase9/w.prog; install -m 0755 /tmp/syz-executor /opt/frozen-phase9/syz-executor; install -m 0755 /tmp/syz-execprog /opt/frozen-phase9/syz-execprog",
+      "duration_seconds": 0.970159,
+      "returncode": 0,
+      "stage": "install",
+      "stderr": "commands/007-install.stderr",
+      "stdout": "commands/007-install.stdout"
+    },
+    {
+      "command": "uname -m; uname -r; sha256sum /opt/kcov-nfs/deps/usr/sbin/nfs-proxy",
+      "duration_seconds": 0.26482,
+      "returncode": 0,
+      "stage": "guest-inventory",
+      "stderr": "commands/008-guest-inventory.stderr",
+      "stdout": "commands/008-guest-inventory.stdout"
+    },
+    {
+      "command": "mktemp -d /tmp/frozen-phase9.XXXXXX",
+      "duration_seconds": 0.248484,
+      "returncode": 0,
+      "stage": "root",
+      "stderr": "commands/009-root.stderr",
+      "stdout": "commands/009-root.stdout"
+    },
+    {
+      "command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.0JbPcv 1",
+      "duration_seconds": 6.177657,
+      "returncode": 0,
+      "stage": "setup",
+      "stderr": "commands/010-setup.stderr",
+      "stdout": "commands/010-setup.stdout"
+    },
+    {
+      "command": "sleep 11",
+      "duration_seconds": 11.254267,
+      "returncode": 0,
+      "stage": "grace",
+      "stderr": "commands/011-grace.stderr",
+      "stdout": "commands/011-grace.stdout"
+    },
+    {
+      "command": "for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do echo \"== $f\"; cat $f; done",
+      "duration_seconds": 0.27907,
+      "returncode": 0,
+      "stage": "stats-before",
+      "stderr": "commands/012-stats-before.stderr",
+      "stdout": "commands/012-stats-before.stdout"
+    },
+    {
+      "command": "ip netns exec f9l0s nsenter -t 1 -m -- cat /sys/kernel/debug/sunrpc_fuzz/lane_state",
+      "duration_seconds": 0.248062,
+      "returncode": 0,
+      "stage": "lane-state",
+      "stderr": "commands/013-lane-state.stderr",
+      "stdout": "commands/013-lane-state.stdout"
+    },
+    {
+      "command": "rm -rf /tmp/cov; mkdir /tmp/cov; timeout 600 /opt/frozen-phase9/syz-execprog -executor=/opt/frozen-phase9/syz-executor -os=linux -arch=amd64 -vmarch=amd64 -sandbox=none -procs=1 -repeat=1 -threaded=false -cover=true -coverfile=/tmp/cov/cover -remote-cover=true -disable=all -debug -vv=1 -slowdown=1 /opt/frozen-phase9/w.prog > /tmp/exec.log 2>&1; echo rc=$?",
+      "duration_seconds": 3.752789,
+      "returncode": 0,
+      "stage": "execprog",
+      "stderr": "commands/014-execprog.stderr",
+      "stdout": "commands/014-execprog.stdout"
+    },
+    {
+      "command": "cat /tmp/exec.log",
+      "duration_seconds": 0.225263,
+      "returncode": 0,
+      "stage": "exec-log",
+      "stderr": "commands/015-exec-log.stderr",
+      "stdout": "commands/015-exec-log.stdout"
+    },
+    {
+      "command": "sleep 10",
+      "duration_seconds": 10.225221,
+      "returncode": 0,
+      "stage": "drain",
+      "stderr": "commands/016-drain.stderr",
+      "stdout": "commands/016-drain.stdout"
+    },
+    {
+      "command": "for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do echo \"== $f\"; cat $f; done",
+      "duration_seconds": 0.256141,
+      "returncode": 0,
+      "stage": "stats-after",
+      "stderr": "commands/017-stats-after.stderr",
+      "stdout": "commands/017-stats-after.stdout"
+    },
+    {
+      "command": "ip netns exec f9l0s nsenter -t 1 -m -- cat /sys/kernel/debug/sunrpc_fuzz/lane_state",
+      "duration_seconds": 0.263732,
+      "returncode": 0,
+      "stage": "lane-state-0",
+      "stderr": "commands/018-lane-state-0.stderr",
+      "stdout": "commands/018-lane-state-0.stdout"
+    },
+    {
+      "command": "cat /tmp/frozen-phase9.0JbPcv/lane0/server/proxy.pid",
+      "duration_seconds": 0.233734,
+      "returncode": 0,
+      "stage": "proxy-pid-0",
+      "stderr": "commands/019-proxy-pid-0.stderr",
+      "stdout": "commands/019-proxy-pid-0.stdout"
+    },
+    {
+      "command": "kill -USR1 809",
+      "duration_seconds": 0.250026,
+      "returncode": 0,
+      "stage": "proxy-snapshot-0",
+      "stderr": "commands/020-proxy-snapshot-0.stderr",
+      "stdout": "commands/020-proxy-snapshot-0.stdout"
+    },
+    {
+      "command": "sleep 1",
+      "duration_seconds": 1.259192,
+      "returncode": 0,
+      "stage": "proxy-snapshot-drain",
+      "stderr": "commands/021-proxy-snapshot-drain.stderr",
+      "stdout": "commands/021-proxy-snapshot-drain.stdout"
+    },
+    {
+      "command": "cat /tmp/frozen-phase9.0JbPcv/lane0/server/proxy.log",
+      "duration_seconds": 0.214452,
+      "returncode": 0,
+      "stage": "proxy-log-0",
+      "stderr": "commands/022-proxy-log-0.stderr",
+      "stdout": "commands/022-proxy-log-0.stdout"
+    },
+    {
+      "command": "tar -C /tmp/cov -czf /tmp/cov.tgz .",
+      "duration_seconds": 0.234969,
+      "returncode": 0,
+      "stage": "tar",
+      "stderr": "commands/023-tar.stderr",
+      "stdout": "commands/023-tar.stdout"
+    },
+    {
+      "command": "/opt/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.0JbPcv",
+      "duration_seconds": 3.621294,
+      "returncode": 0,
+      "stage": "cleanup",
+      "stderr": "commands/024-cleanup.stderr",
+      "stdout": "commands/024-cleanup.stdout"
+    },
+    {
+      "command": "dmesg",
+      "duration_seconds": 0.245913,
+      "returncode": 0,
+      "stage": "dmesg",
+      "stderr": "commands/025-dmesg.stderr",
+      "stdout": "commands/025-dmesg.stdout"
+    }
+  ],
+  "runtime": {
+    "qemu": [
+      "qemu-system-x86_64",
+      "-enable-kvm",
+      "-cpu",
+      "host",
+      "-m",
+      "6144",
+      "-smp",
+      "6",
+      "-display",
+      "none",
+      "-serial",
+      "stdio",
+      "-no-reboot",
+      "-snapshot",
+      "-drive",
+      "file=/home/fuzzer/prune-env-image.raw,format=raw,if=ide",
+      "-kernel",
+      "/home/fuzzer/kv-kasan/arch/x86/boot/bzImage",
+      "-append",
+      "root=/dev/sda console=ttyS0 nokaslr nfs.localio_enabled=N",
+      "-device",
+      "e1000,netdev=net0",
+      "-netdev",
+      "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:39931-:22"
+    ],
+    "qemu_pid": 3529313,
+    "ssh_port": 39931,
+    "ssh_ready_at": "2026-10-13T02:58:54Z"
+  }
+}

@@ -84,6 +84,42 @@ static int wait_ack(int fd, uint8_t *ack)
 	return recv(fd, ack, 1, MSG_DONTWAIT) == 1 ? 0 : -1;
 }
 
+/* M0 compatibility lock: these values are the public legacy wire/file ABI.
+ * The lifecycle/replay tests below exercise behavior, but without these
+ * assertions a producer and reader could drift together and still pass. */
+static void test_legacy_abi_constants(void)
+{
+	printf("legacy ABI constants: NFSPARM1/2 and NFSPDLT1/2\n");
+	CHECK(sizeof(NFSP_ARM_MAGIC) - 1u == 8u &&
+	      memcmp(NFSP_ARM_MAGIC, "NFSPARM1", 8) == 0,
+	      "v1 arm magic changed");
+	CHECK(NFSP_ARM_WIRE_LEN == 140u, "v1 arm wire length %u != 140",
+	      (unsigned)NFSP_ARM_WIRE_LEN);
+	CHECK(NFSP_ARM_WORDS == 9u && NFSP_DELTA_ANCHOR_MAX == 64u &&
+	      NFSP_DELTA_PATCH_MAX == 16u,
+	      "v1 arm geometry changed");
+
+	CHECK(sizeof(NFSP_EDIT_ARM_MAGIC) - 1u == 8u &&
+	      memcmp(NFSP_EDIT_ARM_MAGIC, "NFSPARM2", 8) == 0,
+	      "v2 arm magic changed");
+	CHECK(NFSP_EDIT_ARM_HDR_LEN == 44u,
+	      "v2 arm header length %u != 44", (unsigned)NFSP_EDIT_ARM_HDR_LEN);
+	CHECK(NFSP_EDIT_ARM_FIELD_HDR_LEN == 16u && NFSP_EDIT_MAX == 8u,
+	      "v2 arm edit header/count geometry changed");
+
+	CHECK(sizeof(NFSP_DELTA_MAGIC) - 1u == 8u &&
+	      memcmp(NFSP_DELTA_MAGIC, "NFSPDLT1", 8) == 0 &&
+	      NFSP_DELTA_VERSION == 1u,
+	      "v1 delta magic/version changed");
+	CHECK(NFSP_DELTA_REC_HDR_LEN == 40u,
+	      "v1 delta record header length %u != 40",
+	      (unsigned)NFSP_DELTA_REC_HDR_LEN);
+	CHECK(sizeof(NFSP_EDIT_DELTA_MAGIC) - 1u == 8u &&
+	      memcmp(NFSP_EDIT_DELTA_MAGIC, "NFSPDLT2", 8) == 0 &&
+	      NFSP_EDIT_DELTA_VERSION == 2u,
+	      "v2 delta magic/version changed");
+}
+
 /* ---- v1 scenario (same as before the on_record signature changed) -------- */
 
 static void test_v1_lifecycle(struct nfsp_control *live, const char *socket_path,
@@ -387,6 +423,7 @@ int main(void)
 	char socket_path[64], delta_dir[64], delta_path[96];
 	struct nfsp_control *live = NULL;
 
+	test_legacy_abi_constants();
 	printf("control FD lifetime, four scopes, durable delta, same replay apply\n");
 	CHECK(mkdtemp(dir) != NULL, "mkdtemp");
 	if (failures) return 1;

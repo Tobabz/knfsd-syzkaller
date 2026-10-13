@@ -1,0 +1,26 @@
+platform: x86_64, dpkg amd64, Debian 12.15
+relay_elf: class=ELF64 machine=Advanced Micro Devices X86-64
+probe_elf: class=ELF64 machine=Advanced Micro Devices X86-64
+relay_glibc_max: GLIBC_2.34
+probe_glibc_max: GLIBC_2.34
+gcc (Debian 12.2.0-14+deb12u1) 12.2.0
+ldd (Debian GLIBC 2.36-9+deb12u14) 2.36
+GNU readelf (GNU Binutils for Debian) 2.40
+9648888e3658c4661c2e64a745dfe6a693e8498468eb01b37ecabd233437e59e  /src/main.c
+c08744e4770968d1431ccaefa26d7b7d3f899a1cf694c4d9b804b2ffc6c452b3  /src/proxy.c
+01f8acdc97ee434ead9be644850112107539bb70ca1ed4287663b7a1f42c3c38  /src/proxy.h
+9f6a8f721ec4fbef934d610ef4fea66ba4a65d03496da3eff2b64702f071d721  /src/framing.c
+db12c8831624df19c8da4c89206e94b35ab175e3af63196ef3099f78141b12d1  /src/framing.h
+7052cb5436e3d24fc7adb65e45540870c4b5dc143efd45d7e21c371db37b9385  /src/control.c
+ce6609f20fec347a02f03fe05482ea163cdcc068de2a3dd010be56a5fbb01f7c  /src/control.h
+dfb7c66236e0f7105412748c7bfc82ef41396d001bc48af1705204eaf5963285  /src/delta.c
+62ee2753f28613a761fed9c1b9b194d6479ed2ff2072466ea459b1419750ee9e  /src/delta.h
+06cb1b5930a4ce0084608286c0d4492e9de9fe0540aa1d71006fa086c2edf4c6  /src/walk.c
+b9529e954658e7da27b20caa3736b995d132d4fba4da2d031245279315f1ead0  /src/walk.h
+ae09139d37e928f344ce009ba934c74c2da016bd007b03144b6ac7b708828eac  /src/edit.c
+56919d9010c8ecc9c9fa597ccef1334f0fe60ff6bc60a23402c47df266a91d3a  /src/edit.h
+a849520c82eb1d0a642fdfa5734197ce865987e4241e0788eee2604ad87a718a  /test/guest-delta-replay.c
+1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /work/nfs-proxy
+612059336553c16b6f937a6285de77233aeb660074c27435bb7fcff413d82c0c  /work/guest-delta-replay
+docker run --platform linux/amd64 debian:bookworm
+image: sha256:a1dd2f4ae2a9f34d85cfa5a568df5382d7c71b22dfc29493b5205d1c4729b9f5 linux/amd64 debian@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26

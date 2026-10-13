@@ -1,11 +1,9 @@
 """Recreate the verification inputs under ~/prune-evidence/inputs."""
-import io
 import os
 import subprocess
-import tarfile
 from pathlib import Path
 
-R = Path("/home/idealinsane/projects/knfsd-syzkaller")
+R = Path(__file__).resolve().parents[3]
 I = Path.home() / "prune-evidence/inputs"
 I.mkdir(parents=True, exist_ok=True)
 
@@ -43,6 +41,12 @@ for c in ("client0", "client1"):
     wl = wl.replace("nfs-lane/%s\\x00" % c, "nfs-lane/%s-knfsd\\x00" % c)
 (I / "workload-proxy.prog").write_text(wl)
 for src, dst in (("tools/nfs-proxy/test/guest-syzkaller-four.prog", "workload-raw.prog"),
+                 ("tools/nfs-proxy/test/guest-syzkaller-mutate.prog",
+                  "workload-legacy-v1.prog"),
+                 ("tools/nfs-proxy/test/guest-syzkaller-v2-replace.prog",
+                  "workload-legacy-v2.prog"),
+                 ("tools/nfs-proxy/test/guest-syzkaller-v2-replace-wrongorig.prog",
+                  "workload-legacy-v2-refusal.prog"),
                  ("bundle/corpus/nfs-normal/async-copy-v42-tcp.prog", "workload-copy.prog")):
     (I / dst).write_bytes((R / src).read_bytes())
 (I / "lane-v42.sh").write_text(per_run(lane, "NFS_VERSION=4.2; export NFS_VERSION\n"))

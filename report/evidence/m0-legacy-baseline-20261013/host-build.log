@@ -1,0 +1,160 @@
+=== sanitizer toolchain probe (gcc) ===
+  gcc -fsanitize=address,undefined: usable
+
+=== build: test_framing (clang) ===
+=== build: test_framing + ASan/UBSan (gcc) ===
+framing tests
+single-fragment message
+multi-fragment message
+byte-at-a-time delivery
+two messages in one read
+fragment header split across reads
+zero-length non-final fragment
+zero-length final fragment
+oversized fragment
+second fragment header crosses the message limit
+append is bounded
+many small fragments
+
+213 checks, 0 failures
+framing tests
+single-fragment message
+multi-fragment message
+byte-at-a-time delivery
+two messages in one read
+fragment header split across reads
+zero-length non-final fragment
+zero-length final fragment
+oversized fragment
+second fragment header crosses the message limit
+append is bounded
+many small fragments
+
+213 checks, 0 failures
+  OK: test_framing (primary + sanitizer)
+
+=== build: test_walk (clang) ===
+=== build: test_walk + ASan/UBSan (gcc) ===
+walk tests
+CALL: exact offsets of every certain field
+REPLY: exact offsets, including the leading nfsstat4
+truncation sweep over every length
+truncation sweep, REPLY
+hostile cred length
+hostile cred length that would wrap when padded
+hostile compound tag length
+hostile op count
+non-COMPOUND call (NFSv3 proc)
+fragmented record is refused
+slots are emitted in increasing offset order
+
+1694 checks, 0 failures
+walk tests
+CALL: exact offsets of every certain field
+REPLY: exact offsets, including the leading nfsstat4
+truncation sweep over every length
+truncation sweep, REPLY
+hostile cred length
+hostile cred length that would wrap when padded
+hostile compound tag length
+hostile op count
+non-COMPOUND call (NFSv3 proc)
+fragmented record is refused
+slots are emitted in increasing offset order
+
+1694 checks, 0 failures
+  OK: test_walk (primary + sanitizer)
+
+=== build: test_delta (clang) ===
+=== build: test_delta + ASan/UBSan (gcc) ===
+delta tests
+rule validation rejects impossible rules
+apply: patches only when the recorded bytes are present
+predicate: direction, backend, client, opcode, anchor
+predicate: first_opcode
+predicate: literal anchor
+out-of-range is reported as out-of-range, not as a byte mismatch
+round trip: every field survives
+order independence: same rules, reversed delivery
+replay identity: file alone reproduces the mutation
+corrupt files are refused, not believed
+
+86 checks, 0 failures
+delta tests
+rule validation rejects impossible rules
+apply: patches only when the recorded bytes are present
+predicate: direction, backend, client, opcode, anchor
+predicate: first_opcode
+predicate: literal anchor
+out-of-range is reported as out-of-range, not as a byte mismatch
+round trip: every field survives
+order independence: same rules, reversed delivery
+replay identity: file alone reproduces the mutation
+corrupt files are refused, not believed
+
+86 checks, 0 failures
+  OK: test_delta (primary + sanitizer)
+
+=== build: test_edit (clang) ===
+=== build: test_edit + ASan/UBSan (gcc) ===
+edit tests
+
+84 checks, 0 failures
+edit tests
+
+84 checks, 0 failures
+  OK: test_edit (primary + sanitizer)
+
+=== build: test_golden (clang) ===
+=== build: test_golden + ASan/UBSan (gcc) ===
+NFSPDLT1 reader decodes the golden file
+NFSPDLT1 writer produces the golden file byte for byte
+NFSPDLT1 reader refuses truncation and corrupt fields
+NFSPDLT2 reader decodes the golden file
+NFSPDLT2 writer produces the golden file byte for byte
+NFSPDLT2 reader refuses truncation and corrupt fields
+422 checks, 0 failures
+NFSPDLT1 reader decodes the golden file
+NFSPDLT1 writer produces the golden file byte for byte
+NFSPDLT1 reader refuses truncation and corrupt fields
+NFSPDLT2 reader decodes the golden file
+NFSPDLT2 writer produces the golden file byte for byte
+NFSPDLT2 reader refuses truncation and corrupt fields
+422 checks, 0 failures
+  OK: test_golden (primary + sanitizer)
+
+=== build: test_proxy (clang) ===
+=== build: test_proxy + ASan/UBSan (gcc) ===
+four client/backend tuples, all at the backend before any reply
+dead backend cannot block or substitute a healthy backend
+coalesced records and a split header share a single connection
+a grown record keeps the next coalesced record framed
+an unframeable rewritten record is refused, not forwarded
+56 checks, 0 failures
+four client/backend tuples, all at the backend before any reply
+dead backend cannot block or substitute a healthy backend
+coalesced records and a split header share a single connection
+a grown record keeps the next coalesced record framed
+an unframeable rewritten record is refused, not forwarded
+56 checks, 0 failures
+  OK: test_proxy (primary + sanitizer)
+
+=== build: test_control (clang) ===
+=== build: test_control + ASan/UBSan (gcc) ===
+legacy ABI constants: NFSPARM1/2 and NFSPDLT1/2
+control FD lifetime, four scopes, durable delta, same replay apply
+v2 (variable-length edit) arm lifecycle and replay
+v1 and v2 arms chained on one record
+82 checks, 0 failures
+legacy ABI constants: NFSPARM1/2 and NFSPDLT1/2
+control FD lifetime, four scopes, durable delta, same replay apply
+v2 (variable-length edit) arm lifecycle and replay
+v1 and v2 arms chained on one record
+82 checks, 0 failures
+  OK: test_control (primary + sanitizer)
+
+=== build-only: guest-delta-replay (clang) ===
+=== build-only: guest-delta-replay + ASan/UBSan (gcc) ===
+  OK: guest-delta-replay compiles (host build-only gate)
+=== build: scoped nfs-proxy executable (clang) ===
+=== host test suite: PASS ===

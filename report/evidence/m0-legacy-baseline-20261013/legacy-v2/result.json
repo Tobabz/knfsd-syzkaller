@@ -1,0 +1,129 @@
+{
+ "workload": "/home/fuzzer/prune-evidence/inputs/workload-legacy-v2.prog",
+ "procs": 1,
+ "executions": 1,
+ "legacy_profile": "v2",
+ "input_sha256": {
+  "workload": "728b3cb67bee05e20dd62c33695efec79fe99c30beaebd18c7a3d202e579813c",
+  "deps": "1bc0097d9b6f55b779ad9f47cb37a0ed80e5643915c9d7321c098f3daacaa938",
+  "replay_probe": "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241"
+ },
+ "guest_inventory": [
+  "x86_64",
+  "1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /opt/kcov-nfs/deps/usr/sbin/nfs-proxy",
+  "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241  /opt/frozen-phase9/replay-probe"
+ ],
+ "fixture": "{\"lane_count\":1,\"fixture_mode\":\"single\",\"profiles\":[\"knfsd-v41\",\"ganesha-v41\"],\"nfs_version\":\"4.1\",\"nfs_minor\":1,\"nfs_trace\":0,\"localio\":\"N\",\"lanes\":[{\"lane_id\":0,\"lane_epoch\":1,\"proc\":0,\"server_namespace\":\"f9l0s\",\"client0_namespace\":\"f9l0c0\",\"client1_namespace\":\"f9l0c1\",\"server0_ip\":\"10.89.0.1\",\"client0_ip\":\"10.89.0.2\",\"server1_ip\":\"10.89.0.5\",\"client1_ip\":\"10.89.0.6\",\"backing_root\":\"/tmp/frozen-",
+ "stats_before": "== /sys/kernel/debug/sunrpc_fuzz/lane_stats\nlane_epoch_allocated 1\nlane_epoch_collision 0\nlane_epoch_immutable_violation 0\ndomain_created 1\ndomain_joined 2\ndomain_retired 0\nlane_owner_attributed 0\nlane_owner_no_generation 32\nlane_owner_failed 0\nrecord_ownerless 32\nnested_transport_close 0\nlane_attribution 1\n== /sys/kernel/debug/sunrpc_fuzz/phase4_stats\ngeneration_created 0\ngeneration_begin 0\ngeneration_bind_ok 0\ngeneration_bind_unbound 0\ngeneration_bind_stale 0\ngeneration_exit_abort 0\ngeneration_abort_fd_current 0\ngeneration_begin_publish_gap_entered 0\ngeneration_begin_publish_gap_interrupted 0\ngeneration_finish 0\ngeneration_closing 0\ngeneration_committed 0\ngeneration_aborted 0\ngeneration_dead 0\nroot_token_created 0\nroot_token_completed 0\nroot_token_canceled 0\nchild_token_granted 0\nchild_token_rejected 0\ntoken_created 0\ntoken_completed 0\ntoken_double_complete 0\nnew_root_rejected_closing 0\nnew_root_rejected_aborted 0\nclosing_retry_granted 0\nabort_retry_owner_none 0\nwork_owner_none_after_abort 0\nfalse_drain_prevented 0\nlate_completion_safe 0\ngeneration_lookup_miss 0\nabort_connection_reset 0\nabort_lane_reset 0\nroot_final_release_task 0\nroot_final_exit_task 0\nwire_token_server_consumed 0\nwire_token_connection_closed 0\nselftest_runs 0\nselftest_failures 0\nselftest_exact_once 0\nselftest_late_completion 0\nselftest_closing_new_root_rejected 0\nselftest_closing_existing_retry 0\nselftest_abort_owner_none 0\nselftest_false_drain 0\nselftest_object_lifetime 0\nselftest_cancel_vs_rx 0\nselftest_conn_close_vs_abort 0\nselftest_task_final_vs_abort 0\nselftest_parent_abort_killed_child 0\nselftest_wire_token_terminal 0\nselftest_root_release_task 0\nselftest_begin_orphan_abort 0\noutstanding_tokens 0\nobject_refs 0\n== /sys/kernel/debug/sunrpc_fuzz/phase5_stats\nremote_grant_attempt 0\nremote_start_granted 0\nremote_grant_rejected_generation 0\nremote_grant_rejected_root 0\nremote_grant_rejected_token 0\nmapping_exact_owner_match 0\nmapping_exact_owner_mismatch 0\nremote_scratch_reserved 0\nremote_scratch_returned 0\nremote_target_pinned 0\nremote_target_unpinned 0\nremote_ref_acquired 0\nremote_ref_released 0\nremote_start_ok 0\nremote_start_incomplete 0\nremote_start_nested 0\nremote_stop 0\nstop_without_start 0\nremote_result_incomplete 0\nremote_result_invalid 0\nnested_attempted_invalid 0\nnested_incumbent_invalid 0\nnested_same_generation 0\nnested_cross_generation 0\nnested_incumbent_unknown 0\nlane_unhealthy 0\nfault_pause_after_grant_entered 0\nfault_pause_after_grant_released 0\nstart_after_abort_ok 0\nwire_work_attached 0\nwire_work_ownerless 32\nwire_work_terminal 0\nremote_ticket_created 0\nremote_ticket_completed 0\nremote_ticket_canceled 0\nremote_stop_double 0\ngrant_order_violation 0\nstart_transaction_violation 0\nabort_after_grant 0\ngrant_revoked_after_abort 0\nremote_result_valid 0\nfault_start_fail 0\nselftest_runs 0\nselftest_failures 0\nselftest_transactional_failure 0\nselftest_nested_same 0\nselftest_nested_cross 0\nselftest_grant_order 0\nselftest_exclusive_scratch 0\nselftest_stop_exact_once 0\nselftest_abort_after_grant 0\nselftest_mapping_classification 0\nsvc_rqst_fuzz_reset 0\nsvc_rqst_stale_attachment 0\nsvc_rqst_callback_reset 0\nsvc_rqst_short_record_reset 0\nnested_incumbent_active_match 0\nnested_without_active_incumbent 0\nnested_ownerless_fallback 0\nnested_transport_close 0\nnested_client_force_disconnect 0\nnested_client_already_closing 0\nnested_client_disconnect_miss 0\nremote_refs 0\n== /sys/kernel/debug/sunrpc_fuzz/phase6_stats\nremote_section_created 0\nremote_section_completed 0\nremote_section_discarded 0\nscratch_reserved 0\nscratch_active 0\nscratch_completed 0\nscratch_returned 0\nscratch_overflow 0\nscratch_address_collision 0\nscratch_trace_entries 0\naggregate_allocated 0\naggregate_merge_started 0\naggregate_merge_completed 0\naggregate_merge_truncated 0\naggregate_merge_overlap 0\naggregate_entries_merged 0\naggregate_direct_trace_write 0\nlate_merge_after_refs_zero 0\naggregate_committed 0\naggregate_quarantined 0\naggregate_discarded 0\naggregate_publishing 0\naggregate_published 0\naggregate_publish_suppressed 0\naggregate_entries_published 0\naggregate_reuse_blocked_reader 0\naggregate_reuse_while_reader 0\npublisher_read_lease_get 0\npublisher_read_lease_put 0\npublish_copy_outside_lock 0\npublish_copy_under_gen_lock 0\nremote_ref_put_before_scratch_return 0\nresult_degrade_after_ref_release 0\ncommit_with_tokens 0\ncommit_with_refs 0\ncommit_nonvalid 0\ncommit_bad_state 0\nincomplete_published 0\ninvalid_published 0\naborted_published 0\nfault_hold_after_grant_entered 0\nfault_hold_after_grant_released 0\nfault_scratch_limit 0\nfault_aggregate_limit 0\nfault_pause_publish_entered 0\nfault_pause_publish_released 0\ndestination_seed_overwritten 0\nlate_generic_remote_append 0\npublish_abort_blocked 0\npublish_begin_blocked 0\npublish_exit_reset_deferred 0\npublish_exit_reset_completed 0\nselftest_runs 0\nselftest_failures 0\nselftest_exclusive_scratch 0\nselftest_overflow 0\nselftest_truncation 0\nselftest_serialized_merge 0\nselftest_result_before_release 0\nselftest_commit_eligibility 0\nselftest_publish_lease 0\nselftest_abort_discard 0\nselftest_managed_generation_isolation 0\nremote_refs 0\nscratch_in_use 0\nscratch_peak 0\npublish_readers 0\n== /sys/kernel/debug/sunrpc_fuzz/saved_work_stats\ndeferred_child_created 0\ndeferred_child_rejected 0\ndeferred_restored 0\ndeferred_redeferred 0\ndeferred_grant_ok 0\ndeferred_owner_none 0\ndeferred_start_ok 0\ndeferred_start_incomplete 0\ndeferred_start_nested 0\ndeferred_completed 0\ndeferred_dropped 0\nasync_child_created 0\nasync_child_rejected 0\nasync_grant_ok 0\nasync_owner_none 0\nasync_start_ok 0\nasync_start_incomplete 0\nasync_start_nested 0\nasync_completed 0\nasync_dropped 0\nsaved_work_double_attach 0\nlive_saved_work 0\n",
+ "lane_state": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+ "execprog_rc": "rc=0",
+ "calls": 9,
+ "calls_errno_nonzero": 0,
+ "errno_by_call": [],
+ "stats_after": "== /sys/kernel/debug/sunrpc_fuzz/lane_stats\nlane_epoch_allocated 1\nlane_epoch_collision 0\nlane_epoch_immutable_violation 0\ndomain_created 1\ndomain_joined 2\ndomain_retired 0\nlane_owner_attributed 3\nlane_owner_no_generation 35\nlane_owner_failed 0\nrecord_ownerless 35\nnested_transport_close 0\nlane_attribution 1\n== /sys/kernel/debug/sunrpc_fuzz/phase4_stats\ngeneration_created 2\ngeneration_begin 2\ngeneration_bind_ok 14\ngeneration_bind_unbound 12\ngeneration_bind_stale 0\ngeneration_exit_abort 0\ngeneration_abort_fd_current 0\ngeneration_begin_publish_gap_entered 0\ngeneration_begin_publish_gap_interrupted 0\ngeneration_finish 2\ngeneration_closing 2\ngeneration_committed 2\ngeneration_aborted 0\ngeneration_dead 2\nroot_token_created 3\nroot_token_completed 3\nroot_token_canceled 0\nchild_token_granted 3\nchild_token_rejected 0\ntoken_created 6\ntoken_completed 6\ntoken_double_complete 0\nnew_root_rejected_closing 0\nnew_root_rejected_aborted 0\nclosing_retry_granted 0\nabort_retry_owner_none 0\nwork_owner_none_after_abort 0\nfalse_drain_prevented 0\nlate_completion_safe 0\ngeneration_lookup_miss 0\nabort_connection_reset 0\nabort_lane_reset 0\nroot_final_release_task 0\nroot_final_exit_task 0\nwire_token_server_consumed 3\nwire_token_connection_closed 0\nselftest_runs 0\nselftest_failures 0\nselftest_exact_once 0\nselftest_late_completion 0\nselftest_closing_new_root_rejected 0\nselftest_closing_existing_retry 0\nselftest_abort_owner_none 0\nselftest_false_drain 0\nselftest_object_lifetime 0\nselftest_cancel_vs_rx 0\nselftest_conn_close_vs_abort 0\nselftest_task_final_vs_abort 0\nselftest_parent_abort_killed_child 0\nselftest_wire_token_terminal 0\nselftest_root_release_task 0\nselftest_begin_orphan_abort 0\noutstanding_tokens 0\nobject_refs 0\n== /sys/kernel/debug/sunrpc_fuzz/phase5_stats\nremote_grant_attempt 3\nremote_start_granted 3\nremote_grant_rejected_generation 0\nremote_grant_rejected_root 0\nremote_grant_rejected_token 0\nmapping_exact_owner_match 3\nmapping_exact_owner_mismatch 0\nremote_scratch_reserved 3\nremote_scratch_returned 3\nremote_target_pinned 3\nremote_target_unpinned 3\nremote_ref_acquired 3\nremote_ref_released 3\nremote_start_ok 3\nremote_start_incomplete 0\nremote_start_nested 0\nremote_stop 3\nstop_without_start 0\nremote_result_incomplete 0\nremote_result_invalid 0\nnested_attempted_invalid 0\nnested_incumbent_invalid 0\nnested_same_generation 0\nnested_cross_generation 0\nnested_incumbent_unknown 0\nlane_unhealthy 0\nfault_pause_after_grant_entered 0\nfault_pause_after_grant_released 0\nstart_after_abort_ok 0\nwire_work_attached 3\nwire_work_ownerless 35\nwire_work_terminal 3\nremote_ticket_created 3\nremote_ticket_completed 3\nremote_ticket_canceled 0\nremote_stop_double 0\ngrant_order_violation 0\nstart_transaction_violation 0\nabort_after_grant 0\ngrant_revoked_after_abort 0\nremote_result_valid 2\nfault_start_fail 0\nselftest_runs 0\nselftest_failures 0\nselftest_transactional_failure 0\nselftest_nested_same 0\nselftest_nested_cross 0\nselftest_grant_order 0\nselftest_exclusive_scratch 0\nselftest_stop_exact_once 0\nselftest_abort_after_grant 0\nselftest_mapping_classification 0\nsvc_rqst_fuzz_reset 3\nsvc_rqst_stale_attachment 0\nsvc_rqst_callback_reset 0\nsvc_rqst_short_record_reset 0\nnested_incumbent_active_match 0\nnested_without_active_incumbent 0\nnested_ownerless_fallback 0\nnested_transport_close 0\nnested_client_force_disconnect 0\nnested_client_already_closing 0\nnested_client_disconnect_miss 0\nremote_refs 0\n== /sys/kernel/debug/sunrpc_fuzz/phase6_stats\nremote_section_created 3\nremote_section_completed 3\nremote_section_discarded 0\nscratch_reserved 3\nscratch_active 3\nscratch_completed 3\nscratch_returned 3\nscratch_overflow 0\nscratch_address_collision 0\nscratch_trace_entries 5304\naggregate_allocated 2\naggregate_merge_started 3\naggregate_merge_completed 3\naggregate_merge_truncated 0\naggregate_merge_overlap 0\naggregate_entries_merged 5304\naggregate_direct_trace_write 0\nlate_merge_after_refs_zero 0\naggregate_committed 2\naggregate_quarantined 0\naggregate_discarded 0\naggregate_publishing 2\naggregate_published 2\naggregate_publish_suppressed 0\naggregate_entries_published 5304\naggregate_reuse_blocked_reader 0\naggregate_reuse_while_reader 0\npublisher_read_lease_get 2\npublisher_read_lease_put 2\npublish_copy_outside_lock 2\npublish_copy_under_gen_lock 0\nremote_ref_put_before_scratch_return 0\nresult_degrade_after_ref_release 0\ncommit_with_tokens 0\ncommit_with_refs 0\ncommit_nonvalid 0\ncommit_bad_state 0\nincomplete_published 0\ninvalid_published 0\naborted_published 0\nfault_hold_after_grant_entered 0\nfault_hold_after_grant_released 0\nfault_scratch_limit 0\nfault_aggregate_limit 0\nfault_pause_publish_entered 0\nfault_pause_publish_released 0\ndestination_seed_overwritten 0\nlate_generic_remote_append 0\npublish_abort_blocked 0\npublish_begin_blocked 0\npublish_exit_reset_deferred 0\npublish_exit_reset_completed 0\nselftest_runs 0\nselftest_failures 0\nselftest_exclusive_scratch 0\nselftest_overflow 0\nselftest_truncation 0\nselftest_serialized_merge 0\nselftest_result_before_release 0\nselftest_commit_eligibility 0\nselftest_publish_lease 0\nselftest_abort_discard 0\nselftest_managed_generation_isolation 0\nremote_refs 0\nscratch_in_use 0\nscratch_peak 1\npublish_readers 0\n== /sys/kernel/debug/sunrpc_fuzz/saved_work_stats\ndeferred_child_created 0\ndeferred_child_rejected 0\ndeferred_restored 0\ndeferred_redeferred 0\ndeferred_grant_ok 0\ndeferred_owner_none 0\ndeferred_start_ok 0\ndeferred_start_incomplete 0\ndeferred_start_nested 0\ndeferred_completed 0\ndeferred_dropped 0\nasync_child_created 0\nasync_child_rejected 0\nasync_grant_ok 0\nasync_owner_none 0\nasync_start_ok 0\nasync_start_incomplete 0\nasync_start_nested 0\nasync_completed 0\nasync_dropped 0\nsaved_work_double_attach 0\nlive_saved_work 0\n",
+ "lane_states": {
+  "0": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n"
+ },
+ "proxy_lanes": {
+  "0": {
+   "stats": "peak_active=5 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=1 expired=1 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=1 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  }
+ },
+ "legacy_control": {
+  "mode": "live",
+  "armed": 1,
+  "expired": 1,
+  "applied": 0,
+  "refused_orig": 0,
+  "refused_bounds": 0,
+  "unknown_layout": 0,
+  "invalid_arms": 0,
+  "edit_applied": 1,
+  "edit_refused_orig": 0,
+  "edit_refused_bounds": 0,
+  "edit_refused_unknown": 0,
+  "edit_refused_overlap": 0,
+  "edit_refused_toobig": 0
+ },
+ "deltas": [
+  {
+   "file": "arm-0.delta",
+   "sha256": "2f33b3b7015c344cc32dad0159f0ac04ae4133cecf4d6b96147006b4b7c51b78",
+   "bytes": 92,
+   "magic": "NFSPDLT2",
+   "version": 2,
+   "seed": "0x0000000000000000",
+   "record": {
+    "dir": 0,
+    "backend": 0,
+    "client": 0,
+    "first_opcode": 4294967295,
+    "anchor_off": 4,
+    "anchor_len": 4,
+    "mode": 1,
+    "nedits": 1,
+    "applied_count": 1,
+    "reserved": 0,
+    "edits": [
+     {
+      "kind": 0,
+      "offset": 60,
+      "orig_len": 4,
+      "data_len": 8
+     }
+    ]
+   }
+  }
+ ],
+ "replay": [
+  {
+   "case": "v2-exact",
+   "delta": "arm-0.delta",
+   "delta_sha256": "2f33b3b7015c344cc32dad0159f0ac04ae4133cecf4d6b96147006b4b7c51b78",
+   "target": "10.89.0.1",
+   "request_xid": "0x11111111",
+   "expected_response_xid": "0x11111111",
+   "probe_rc": 0,
+   "proxy_rc": 0,
+   "rule": "replay rule=0 edit=1 expected=1 applied=1 refused_orig=0",
+   "probe_sha256": "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241",
+   "log": "v2-exact.log",
+   "log_sha256": "0c3a6375495fd08b117d679cc829f4dcb8838ad21f4cc126953ddf04ce521ae5"
+  },
+  {
+   "case": "v2-original-mismatch",
+   "delta": "v2-original-mismatch.delta",
+   "delta_sha256": "b05a34c36be18e8581980632f60b69e4fa8a7d8f64acc84f6b05efcf15f5bd64",
+   "target": "10.89.0.1",
+   "request_xid": "0x11111111",
+   "expected_response_xid": "0x11111111",
+   "probe_rc": 0,
+   "proxy_rc": 1,
+   "rule": "replay rule=0 edit=1 expected=1 applied=0 refused_orig=1",
+   "probe_sha256": "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241",
+   "log": "v2-original-mismatch.log",
+   "log_sha256": "7d9b0eb9029685968f9610eed9582bf94e5a673ff41c395c52bed4bbfc010fd8"
+  },
+  {
+   "case": "v2-count-mismatch",
+   "delta": "v2-count-mismatch.delta",
+   "delta_sha256": "7bf214873daf2f128297881de8d09bef3f24f6fecaf40787bc176df1233dcecc",
+   "target": "10.89.0.1",
+   "request_xid": "0x11111111",
+   "expected_response_xid": "0x11111111",
+   "probe_rc": 0,
+   "proxy_rc": 1,
+   "rule": "replay rule=0 edit=1 expected=2 applied=1 refused_orig=0",
+   "probe_sha256": "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241",
+   "log": "v2-count-mismatch.log",
+   "log_sha256": "ca6fc4245842a7e007dab59c4abbbcd3a52165140ae19e504de8936bd73ea1b6"
+  }
+ ],
+ "dmesg_fatal": [],
+ "extra_files": 1,
+ "extra_nonempty": 1,
+ "extra_pcs": 2303,
+ "extra_fs_nfsd": 501,
+ "extra_net_sunrpc": 221
+}

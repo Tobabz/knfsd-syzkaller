@@ -1,0 +1,9 @@
+relay ready: knfsd=2049 ganesha=2049
+stats_begin snapshot
+client=0 backend=0 accepted=2 connected=2 failed=0 c2s=20 s2c=20 sent_c2s=20 sent_s2c=20
+client=0 backend=1 accepted=1 connected=1 failed=0 c2s=14 s2c=14 sent_c2s=14 sent_s2c=14
+client=1 backend=0 accepted=1 connected=1 failed=0 c2s=18 s2c=18 sent_c2s=18 sent_s2c=18
+client=1 backend=1 accepted=1 connected=1 failed=0 c2s=14 s2c=14 sent_c2s=14 sent_s2c=14
+peak_active=5 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0
+stats_end snapshot
+control mode=live armed=1 expired=1 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=0 edit_refused_orig=1 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0

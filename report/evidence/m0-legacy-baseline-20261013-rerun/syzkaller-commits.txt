@@ -1,0 +1,21 @@
+ac6279c3a005b74c5d4b6eb684aa98711c0f9a95 executor: bind KCOV request generations per program
+c15eb9294eb459af61ebec57dabfcc6e7c8c976e executor: finish KCOV generation before closing fds
+fffae7624669aef46a1ba7f83ae771b6ebe32c99 executor: retain KCOV generation across syscall reruns
+a74d70ac0e9a011f40d16799df950b5e498c7259 executor: close KCOV begin watchdog race
+0fb88ed188e917964a2b655d49af7f03dd42cd34 executor: publish managed remote coverage before fd cleanup
+5144de294bc7eac2f1f0b62e2f3a482431545b4d sys/linux: describe opt-in SunRPC fuzz messages
+45f696bda7cc9e848778eecb66d2834e49dfeffc executor: bind proc-specific NFS fuzz lane
+876f9510f92da9579eec0bf7deb4b63ecf8c6d3e executor: fail closed on hung fixed NFS lane
+923de2dc254153bc89e978df4677bf8b12a873d3 executor: expose fixed NFS lane in request workdirs
+de0ad25b1cdf89526f736f10c59510e051ce5c5f executor: verify NFS lane source isolation after chroot
+8e102ff937ca8c38a8711822abdac5a902e076ee tools/execprog: add remote coverage measurement toggle
+772fcef97d4eed41a32f88b892f9dbb9af4ee289 tools/execprog: timestamp coverage samples
+13d4145db205bb35feecdbe6830bc138f0152016 executor: distinguish fixed-lane hangs from explicit failures
+0156589b1a1d402ec7913cbcd11b5d264dffe0e5 executor: hide fixed lane marker from fuzz programs
+ecd2ba279252b1707f21eaf11ff466f41892f6ff sys/linux: add protocol-shaped NFS fuzz operations
+8f09fa05a8a729fda657f8ca2b5ab9f98a7719e0 executor: size the coverage output buffer from the remote cover area
+cfa0bd6cfb62b1b2bbc75f1b313a05aa42374872 executor: route four NFS pairs and arm scoped wire rules
+cecb1f44b79e66ef24e0bd7252ea6e5f428f976b sys/linux, executor: send raw NFS RPCs over plain TCP
+be26f636afafdc72d9b8ab99ca929dedf519503f sys/linux, executor: add a variable-length proxy arm packet
+09f561b3d544f6151c08c696b0c6ee45593cf4a3 sys/linux: select versioned NFS lane profiles
+51df18e17ade097520080f812f57fff257021451 tools/syz-nfs-corpus: recognize profile and typed NFS roots

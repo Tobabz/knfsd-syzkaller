@@ -5,6 +5,10 @@
 # it is the constraint this repository operates under (see
 # tools/build-ganesha-deps.sh for the same reasoning applied to the guest side).
 #
+# Linux only.  test_control needs AF_UNIX/SOCK_SEQPACKET, the legacy arm
+# transport, and test_proxy binds 127.0.0.2/.3 and 127.0.0.10/.11, which Linux
+# routes to loopback without setup.  No other host is supported.
+#
 # Usage:
 #   tools/nfs-proxy/build.sh            build + run every test
 #   tools/nfs-proxy/build.sh --test     run tests only (assumes built)
@@ -62,6 +66,7 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_walk:$TEST/test_walk.c:$SRC/walk.c\
        test_delta:$TEST/test_delta.c:$SRC/delta.c\
        test_edit:$TEST/test_edit.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
+       test_golden:$TEST/test_golden.c:$SRC/delta.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
 
@@ -94,6 +99,24 @@ EOF
 	echo "  $SANCC -fsanitize=address,undefined: usable"
 fi
 
+# test_proxy refuses to start, before any thread exists, when its loopback
+# topology does not work on this host (main() in test/test_proxy.c), so a
+# broken host fails at once with the cause instead of in the watchdog.  The
+# refusal is forced here on every run, so that it cannot stop working unseen.
+check_proxy_guard() {
+	rc=0
+	out=$(ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+	      UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+	      "$1" --simulate-unusable-addresses 2>&1) || rc=$?
+	case $out in
+	"FAIL: fixture addresses unusable: simulated; no test thread was started")
+		[ "$rc" -eq 3 ] && return 0 ;;
+	esac
+	echo "FATAL: $1 did not refuse a simulated unusable topology (exit $rc):" >&2
+	printf '%s\n' "$out" >&2
+	return 1
+}
+
 run_unit() {
 	name=$1
 	shift
@@ -117,6 +140,10 @@ run_unit() {
 
 	[ -x "$primary" ] || { echo "FATAL: $primary missing" >&2; return 1; }
 	[ -x "$asan" ] || { echo "FATAL: $asan missing" >&2; return 1; }
+	if [ "$name" = test_proxy ]; then
+		check_proxy_guard "$primary" || return 1
+		check_proxy_guard "$asan" || return 1
+	fi
 
 	if ! "$primary"; then
 		echo "TEST FAILED: $name" >&2
@@ -133,6 +160,34 @@ run_unit() {
 	echo "  OK: $name (primary + sanitizer)"
 }
 
+# The guest replay probe is not runnable on the host -- it connects to the
+# fixed guest lane address -- but it is part of the legacy reproduction path.
+# Build it with both strict toolchains so semantic refactors cannot silently
+# leave the guest smoke source uncompilable.  Actual guest execution remains a
+# VM smoke test, not a host unit test.
+build_guest_replay_probe() {
+	primary="$BUILD/guest-delta-replay"
+	asan="$BUILD/guest-delta-replay.asan"
+	source="$TEST/guest-delta-replay.c"
+
+	if [ "$MODE" != "--test" ]; then
+		echo "=== build-only: guest-delta-replay ($CC) ==="
+		# shellcheck disable=SC2086
+		$CC $CFLAGS -I"$SRC" -o "$primary" "$source" -lm
+		echo "=== build-only: guest-delta-replay + ASan/UBSan ($SANCC) ==="
+		# shellcheck disable=SC2086
+		$SANCC $SANFLAGS -I"$SRC" -o "$asan" "$source" -lm
+	fi
+
+	[ -x "$primary" ] || { echo "FATAL: $primary missing" >&2; return 1; }
+	[ -x "$asan" ] || { echo "FATAL: $asan missing" >&2; return 1; }
+	if [ "$MODE" = "--test" ]; then
+		echo "  OK: guest-delta-replay binaries present (--test does not rebuild them)"
+	else
+		echo "  OK: guest-delta-replay compiles (host build-only gate)"
+	fi
+}
+
 if [ "$MODE" != "--test" ]; then
 	echo
 	for unit in $UNITS; do
@@ -147,6 +202,8 @@ else
 		run_unit "${unit%%:*}"
 	done
 fi
+
+build_guest_replay_probe
 
 if [ "$MODE" != "--test" ]; then
 	echo "=== build: scoped nfs-proxy executable ($CC) ==="

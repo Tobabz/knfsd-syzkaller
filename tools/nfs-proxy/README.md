@@ -4,11 +4,19 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/relay/control tests under clang and
-GCC ASan+UBSan. `build-guest.sh --out FILE` creates a Debian bookworm ABI
-guest binary after those checks. The two backend listeners are routed solely
-by destination IP, and the source IP identifies the client. `SERVER_IMPL=both`
-provides `.1:2049 → knfsd :20490` and `.5:2049 → Ganesha :20491`.
+`build.sh` runs host framing/walk/delta/golden/relay/control tests under clang
+and GCC ASan+UBSan. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
+delta files independently of their writer and reader. `build.sh` also compiles
+the guest delta-replay probe as a build-only regression gate. The host tests
+run on Linux only: `test_control` uses `AF_UNIX/SOCK_SEQPACKET`, the real legacy
+control transport, and `test_proxy` binds its loopback topology (listeners on
+`127.0.0.2`/`.3`, clients on `127.0.0.10`/`.11`). `build-guest.sh --out FILE`
+then creates Debian bookworm ABI binaries for the relay and replay probe: it
+builds for `linux/amd64` whatever the host architecture, checks each ELF machine
+and glibc requirement, and records provenance next to both binaries. The two backend listeners are routed
+solely by destination IP, and the source IP identifies the client.
+`SERVER_IMPL=both` provides `.1:2049 → knfsd :20490` and
+`.5:2049 → Ganesha :20491`.
 NFSv3 calls pass through the engine's TCP proxy; their MOUNT requests go directly to the
 backends on pinned ports. Typed operation matching is defined for NFSv4
 COMPOUND requests, while v3 messages expose only the RPC header and raw body.
@@ -89,11 +97,14 @@ original does not match what was recorded.
 ## Building
 
 ```sh
-tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-control-guest
+tools/nfs-proxy/build-guest.sh \
+  --out bundle/src/nfs-proxy-control-guest \
+  --probe-out bundle/src/guest-delta-replay
 ```
 
 Host tests are under `test/`; `build.sh` builds and runs them.
-`test/guest-delta-replay.c` provides a guest replay probe.
+`test/guest-delta-replay.c` provides the replay probe source. Do not use the
+host-build copy for guest validation; use the `--probe-out` artifact above.
 
 Build the syzkaller integration with [bootstrap](../../README.md#2-provision-the-fuzzing-environment-build--bake),
 which applies the complete checked-in patch series and builds the binaries.

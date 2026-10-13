@@ -1,0 +1,3 @@
+kasan	legacy-v1	rc=0
+kasan	legacy-v2	rc=0
+kasan	legacy-v2-refusal	rc=0

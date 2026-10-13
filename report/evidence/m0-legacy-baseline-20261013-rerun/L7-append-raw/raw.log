@@ -1,0 +1,35 @@
+{
+ "workload": "/home/fuzzer/fuzz/knfsd-syzkaller/tools/nfs-proxy/test/guest-syzkaller-v2-append-raw.prog",
+ "procs": 1,
+ "executions": 1,
+ "legacy_profile": null,
+ "input_sha256": {
+  "workload": "ab37a63b36098ad0d25fb6fac3f29811c9845e017cde09909eaabbc534f595be",
+  "deps": "d0e000c71484ec3910cfeab2319d54876e577602281d02c74bbdce67a05151be"
+ },
+ "guest_inventory": [
+  "x86_64",
+  "7.3.0-rc5-00004-g7bd83d51f06a",
+  "1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /opt/kcov-nfs/deps/usr/sbin/nfs-proxy"
+ ],
+ "lane_state": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+ "execprog_rc": "rc=0",
+ "calls": 9,
+ "calls_errno_nonzero": 0,
+ "errno_by_call": [],
+ "lane_states": {
+  "0": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n"
+ },
+ "proxy_lanes": {
+  "0": {
+   "stats": "peak_active=5 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=1 expired=1 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=3 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  }
+ },
+ "dmesg_fatal": [],
+ "extra_files": 1,
+ "extra_nonempty": 1,
+ "extra_pcs": 2330,
+ "extra_fs_nfsd": 501,
+ "extra_net_sunrpc": 220
+}

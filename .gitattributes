@@ -1,0 +1,2 @@
+# Evidence logs are kept byte-for-byte (SHA256SUMS); exempt them from whitespace checks.
+report/evidence/** -whitespace

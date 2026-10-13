@@ -79,6 +79,95 @@ struct fixture {
 
 struct job { struct fake *backend; int fd; };
 
+/* THE FIXTURE TOPOLOGY
+ *
+ *   Each proxy listener has its own loopback address and each client its own
+ *   source address, so the four (client, backend) tuples are four distinct TCP
+ *   4-tuples, as in the guest lane topology.  Linux routes all of 127/8 to the
+ *   loopback device and binds these with no setup.  main() checks that the
+ *   topology works before starting any thread. */
+static const char *const fixture_listen_ip[2] = {"127.0.0.2", "127.0.0.3"};
+static const char *const fixture_client_ip[2] = {"127.0.0.10", "127.0.0.11"};
+
+/* Connect from `client_ip` to a listener on `listen_ip` and check that the
+ * accepted peer is `client_ip`.  bind() alone proves nothing: with the
+ * loopback device down, Linux still binds 127/8 addresses and every connect
+ * then fails.  The kernel completes the handshake into the backlog, so this
+ * needs no thread. */
+static int pair_works(const char *listen_ip, const char *client_ip,
+		      char *why, size_t whylen)
+{
+	struct sockaddr_in la = {0}, ca = {0}, peer = {0};
+	socklen_t len = sizeof(la);
+	struct pollfd p;
+	int lfd = -1, cfd = -1, afd = -1, err = 0, ok = 0, n;
+	const char *step = "parse";
+
+	la.sin_family = ca.sin_family = AF_INET;
+	if (inet_pton(AF_INET, listen_ip, &la.sin_addr) != 1 ||
+	    inet_pton(AF_INET, client_ip, &ca.sin_addr) != 1)
+		goto out;
+	step = "socket";
+	if ((lfd = socket(AF_INET, SOCK_STREAM, 0)) < 0 ||
+	    (cfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		goto fail;
+	step = "bind listener";
+	if (bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0)
+		goto fail;
+	step = "listen";
+	if (listen(lfd, 1) != 0 ||
+	    getsockname(lfd, (struct sockaddr *)&la, &len) != 0)
+		goto fail;
+	step = "bind client";
+	if (bind(cfd, (struct sockaddr *)&ca, sizeof(ca)) != 0)
+		goto fail;
+	step = "connect";
+	timeout_socket(cfd);
+	if (connect(cfd, (struct sockaddr *)&la, sizeof(la)) != 0)
+		goto fail;
+	step = "accept";
+	p.fd = lfd;
+	p.events = POLLIN;
+	p.revents = 0;
+	n = poll(&p, 1, 3000);
+	if (n == 0)
+		errno = ETIMEDOUT;
+	len = sizeof(peer);
+	if (n != 1 || (afd = accept(lfd, (struct sockaddr *)&peer, &len)) < 0)
+		goto fail;
+	step = "peer is not the client address";
+	ok = peer.sin_addr.s_addr == ca.sin_addr.s_addr;
+	goto out;
+fail:
+	err = errno;
+out:
+	if (!ok)
+		(void)snprintf(why, whylen, "%s -> %s: %s%s%s", client_ip,
+			       listen_ip, step, err ? ": " : "",
+			       err ? strerror(err) : "");
+	if (afd >= 0) close(afd);
+	if (cfd >= 0) close(cfd);
+	if (lfd >= 0) close(lfd);
+	return ok;
+}
+
+/* 1 when every client address reaches every listener address, else 0 with the
+ * first reason in `why`.  `simulate` reports failure without probing, so that
+ * build.sh can check on every run that the refusal in main() still happens. */
+static int fixture_addresses_usable(int simulate, char *why, size_t whylen)
+{
+	if (simulate) {
+		(void)snprintf(why, whylen, "simulated");
+		return 0;
+	}
+	for (unsigned l = 0; l < 2; l++)
+		for (unsigned c = 0; c < 2; c++)
+			if (!pair_works(fixture_listen_ip[l],
+					fixture_client_ip[c], why, whylen))
+				return 0;
+	return 1;
+}
+
 static void *serve(void *arg)
 {
 	struct job *job = arg;
@@ -212,10 +301,10 @@ static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrec
 	pthread_cond_init(&f->rendezvous_cond, NULL);
 	if (start_fake(f, 0, nrecords) != 0 || start_fake(f, 1, nrecords) != 0)
 		return -1;
-	f->cfg.client_ip[0] = "127.0.0.10";
-	f->cfg.client_ip[1] = "127.0.0.11";
-	f->cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", f->fake[0].port};
-	f->cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", f->fake[1].port};
+	f->cfg.client_ip[0] = fixture_client_ip[0];
+	f->cfg.client_ip[1] = fixture_client_ip[1];
+	f->cfg.route[0] = (struct nfsp_route){fixture_listen_ip[0], 0, "127.0.0.1", f->fake[0].port};
+	f->cfg.route[1] = (struct nfsp_route){fixture_listen_ip[1], 0, "127.0.0.1", f->fake[1].port};
 	if (dead) {
 		f->dead_fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (f->dead_fd < 0) return -1;
@@ -481,10 +570,10 @@ static void test_resize_keeps_stream_in_sync(void)
 	rb.port = ntohs(sa.sin_port);
 	CHECK(pthread_create(&rb.thread, NULL, raw_backend_main, &rb) == 0, "backend thread");
 
-	cfg.client_ip[0] = "127.0.0.10";
-	cfg.client_ip[1] = "127.0.0.11";
-	cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", rb.port};
-	cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", rb.port};
+	cfg.client_ip[0] = fixture_client_ip[0];
+	cfg.client_ip[1] = fixture_client_ip[1];
+	cfg.route[0] = (struct nfsp_route){fixture_listen_ip[0], 0, "127.0.0.1", rb.port};
+	cfg.route[1] = (struct nfsp_route){fixture_listen_ip[1], 0, "127.0.0.1", rb.port};
 	cfg.stop = &f.stop;
 	cfg.msg_limit = 64;
 	cfg.connect_timeout_ms = 500;
@@ -565,10 +654,10 @@ static void test_unframeable_output_refused(void)
 	      "raw backend setup");
 	rb.port = ntohs(sa.sin_port);
 	CHECK(pthread_create(&rb.thread, NULL, raw_backend_main, &rb) == 0, "backend thread");
-	f.cfg.client_ip[0] = "127.0.0.10";
-	f.cfg.client_ip[1] = "127.0.0.11";
-	f.cfg.route[0] = (struct nfsp_route){"127.0.0.2", 0, "127.0.0.1", rb.port};
-	f.cfg.route[1] = (struct nfsp_route){"127.0.0.3", 0, "127.0.0.1", rb.port};
+	f.cfg.client_ip[0] = fixture_client_ip[0];
+	f.cfg.client_ip[1] = fixture_client_ip[1];
+	f.cfg.route[0] = (struct nfsp_route){fixture_listen_ip[0], 0, "127.0.0.1", rb.port};
+	f.cfg.route[1] = (struct nfsp_route){fixture_listen_ip[1], 0, "127.0.0.1", rb.port};
 	f.cfg.stop = &f.stop;
 	f.cfg.msg_limit = 64;
 	f.cfg.connect_timeout_ms = 500;
@@ -603,10 +692,31 @@ static void test_unframeable_output_refused(void)
 }
 
 
-int main(void)
+/* Exit status: 0 pass, 1 a check failed, 2 usage, 3 the fixture topology does
+ * not work on this host (no test was run), 97 the watchdog fired.
+ * --simulate-unusable-addresses runs as if the topology did not work. */
+int main(int argc, char **argv)
 {
+	char why[160];
+	int simulate = 0;
+
+	if (argc == 2 && strcmp(argv[1], "--simulate-unusable-addresses") == 0) {
+		simulate = 1;
+	} else if (argc != 1) {
+		fprintf(stderr, "usage: %s [--simulate-unusable-addresses]\n",
+			argv[0]);
+		return 2;
+	}
 	signal(SIGALRM, watchdog);
 	alarm(20);
+	/* Before any thread exists.  Otherwise a host without the topology fails
+	 * inside a test with backend threads running, and a backend blocked in
+	 * accept() leaves a join that only the watchdog ends. */
+	if (!fixture_addresses_usable(simulate, why, sizeof(why))) {
+		fprintf(stderr, "FAIL: fixture addresses unusable: %s; "
+			"no test thread was started\n", why);
+		return 3;
+	}
 	test_four();
 	test_dead();
 	test_three_coalesced_and_split();

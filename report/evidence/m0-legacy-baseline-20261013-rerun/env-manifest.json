@@ -1,0 +1,75 @@
+{
+  "target": "/home/fuzzer/fuzz/knfsd-syzkaller/env",
+  "nfs_version": "4.2",
+  "repo": "/home/fuzzer/fuzz/knfsd-syzkaller/bundle",
+  "timing_seconds": {
+    "kernel_clone": 79.8,
+    "kernel_apply": 2.1,
+    "kernel_build_kasan": 324.2,
+    "kernel_export": 0.6,
+    "syzkaller_clone": 48.3,
+    "syzkaller_apply": 1.5,
+    "syzkaller_build": 39.2,
+    "bake": 102.0,
+    "verify": 38.4,
+    "total": 654.1
+  },
+  "kernel": {
+    "ref": "v7.3-rc5",
+    "base": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
+    "series_sha256": "bb2b3d825e86c0a99607835ca9a8838f211590822b5fd21e129dbd2e0ded51f1",
+    "head": "7bd83d51f06a0a47a9135d3330eb72392795e4b7",
+    "variants": {
+      "kasan": {
+        "config_sha256": "ce2c9e31bb35663d918fb8cd77cd16f9b35a27cb8dad40ceff8fe8c0a2cd7b85",
+        "bzImage_sha256": "3a6264281e5ac88f15b4bfb2de7eb90a2c5e90a9e4df04d1538f6f5fdd12293b",
+        "vmlinux_sha256": "13148ddd18a154cf83ee911ad1bb5a6715606b5adbded47e7805060aab51c98c"
+      }
+    }
+  },
+  "syzkaller": {
+    "base": "801f0966669a37e048adabf9e5f38ce52825ea82",
+    "series_sha256": "ef819dd8f3c4a46df9bc67a827ec09c32634a357aba88b052e73500a305b8271",
+    "head": "51df18e17ade097520080f812f57fff257021451"
+  },
+  "bake": {
+    "output": "/home/fuzzer/fuzz/knfsd-syzkaller/env/images/bookworm-kcov-fresh.qcow2",
+    "sha256": "c7f7870d2185af70cb01b656b6f04ee05026dee97611656e80a50e4c99629b9c",
+    "bytes": 838860800,
+    "base_image": "/home/fuzzer/shared/qemu-images/bookworm.img",
+    "base_sha256": "b9cd5e4544f6067309b42dd300288fb2bf044aa03fddc26b8a3bffcddf9ab440",
+    "baker_sha256": "901b8d977b30cf523f2c8165c616b9a74b83a313a7a49acdfd892972286feeda",
+    "boot_fixture_sha256": "8e8e7dc87b02f4117d755f923af73a87ca6a4d643651d54ce93e361acae90fb9",
+    "service_sha256": "b9f41a136862f33b41778b416559de65b2e9f6973cd7e3b03248c98ed1b33e12",
+    "deps_tar_sha256": "3ab67120ef4b8093184577bb0db22cea6da03965e8e3b85688c287512899f302",
+    "boot_kernel_variant": "kasan"
+  },
+  "verify": {
+    "mode": "base",
+    "fixture_root": "/tmp/frozen-phase9.manager",
+    "lane_count": 4,
+    "variants": {
+      "kasan": {
+        "fixture_root": "/tmp/frozen-phase9.manager",
+        "lane_count": 4,
+        "nfs_version": "4.2",
+        "nfs_minor": 2,
+        "lane_script_sha256": "2fc0b6ebeea08be9941848a5f8ffd9b6a9fcd047149c163cca5f0a7d94d30608",
+        "nfs_trace": false,
+        "mem_sanitizer": "kasan",
+        "target_kasan": true,
+        "target_kcsan": false,
+        "seconds": 38.4
+      }
+    }
+  },
+  "status": "pass",
+  "changes": {
+    "axis": "scenario",
+    "kernel_base": false,
+    "kernel_series": true,
+    "syzkaller_base": false,
+    "syzkaller_series": true,
+    "syzkaller_inputs_changed": true
+  }
+}

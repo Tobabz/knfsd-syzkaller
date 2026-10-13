@@ -1,0 +1,3 @@
+kasan	direct	rc=0
+kasan	proxy	rc=0
+kasan	raw	rc=0
