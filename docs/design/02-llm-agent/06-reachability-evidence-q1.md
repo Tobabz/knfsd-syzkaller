@@ -109,9 +109,12 @@ ReachabilityEvidence
         observed_locations[]
 
     ambient_control                # non-oracle evidence (§11, issue #10)
-        control_evidence_ref       # neutral run의 봉인 evidence
+        control_program_digest     # catalog에서 고른 neutral bytes (05 §11)
+        control_evidence_ref?      # neutral run의 봉인 evidence
         control_window
-        target_ambient_observed    # true | false
+        control_status             # valid | invalid | not_run (§11)
+        control_status_reason?
+        target_ambient_observed?   # control_status = valid일 때만 true | false
 
     runtime_errors[]
 ~~~
@@ -391,6 +394,19 @@ neutral program
     lease 설정, trace mode, 비교 가능한 관측 window
 ~~~
 
+neutral bytes는 Materializer가 trusted catalog에서 고르고 검증한 것만 쓴다(05 §11, issue #18 F6).
+
+`target_ambient_observed`를 기록하기 전에 control evidence 자체의 유효성을 기록한다.
+
+| `control_status` | 조건 | `target_ambient_observed` |
+|---|---|---|
+| `valid` | neutral run의 evidence가 manifest 검증을 통과하고, Q1AdmissibilityProfile(§6.1)이 scenario run에 요구하는 generation integrity와 수집 완료 조건을 만족한다 | `true` 또는 `false` |
+| `invalid` | 실행했지만 위 조건을 만족하지 않는다(수집 실패, 유실, generation abort 등). 이유를 `control_status_reason`에 남긴다 | 없음 |
+| `not_run` | neutral run이 실행되지 않았다 | 없음 |
+
+`invalid`와 `not_run`은 "관측했지만 target 없음"이 아니다. 이때는 ambient 실행 여부를 모른다고 기록할 뿐
+`false`로 바꾸지 않는다.
+
 결과는 비대칭으로 해석한다.
 
 ~~~text
@@ -403,7 +419,8 @@ target_ambient_observed = false
     ambient 실행이 불가능하다거나 scenario가 Q1을 일으켰다는 증명이 아니다.
 ~~~
 
-ambient control은 oracle이 아니며 Q1, M1, Q2를 바꾸지 않는다. Stage 2에서의 해석은 01 §3이 정한다.
+ambient control은 oracle이 아니며 Q1, M1, Q2를 바꾸지 않는다. control의 `invalid`, `not_run`, 또는 control hit만으로
+valid scenario run의 Q1 `REACHED`를 `INCONCLUSIVE`로 바꾸지 않는다. Stage 2에서의 해석은 01 §3이 정한다.
 
 ## 12. Stage 2 handoff
 

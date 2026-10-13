@@ -173,7 +173,8 @@ resolve된 batch 관계를 잃는다.
 implementation detail이며 replay identity가 아니다. Logical artifact는 한 generation의 rule set과
 application journal이다.
 
-각 event는 다음 correlation을 가진다.
+generation-scoped event는 다음 correlation을 가진다. session-scoped event(`RULESET`, `RUN_COMPLETE`)는
+generation이 생기기 전이나 뒤에 오므로 이 correlation을 갖지 않는다(§6).
 
 ```text
 program_generation_correlation
@@ -184,8 +185,8 @@ program_generation_correlation
     program_digest      # cross-check
 ```
 
-host sink는 guest가 보낸 값을 Runner가 설치한 rule set과 현재 activation 상태에 대조한다
-(`01-architecture.md` §16).
+host sink는 guest가 보낸 값을 Runner가 설치한 rule set과 host가 bind한 generation 상태에 대조한다
+(§6, `01-architecture.md` §16).
 
 ### 3. MutationDelta
 
@@ -260,6 +261,7 @@ Target journal은 append-only event stream이다.
 
 ```text
 JournalEvent
+    session_binding         # host-stamped (아래)
     event_seq
     event_type
     payload
@@ -269,7 +271,10 @@ Core event:
 
 ```text
 RULESET
+GENERATION_OPEN
+GENERATION_DRAINING
 EXPOSURE_INTENT
+APPLY_REFUSAL
 FORWARD_COMPLETE
 FORWARD_FAILED
 GENERATION_COMPLETE
@@ -278,6 +283,59 @@ RUN_COMPLETE
 
 `event_seq`는 journal integrity/order용 local sequence다.
 Semantic replay selector나 mutation identity가 아니다.
+
+**event scope와 admission (issue #18 F3).** 물리 journal은 여러 generation을 multiplex할 수 있으므로(§2)
+host sink는 event마다 scope를 확인한다.
+
+```text
+session_binding                 # host가 channel과 session 설치에서 기록
+    vm_instance_id
+    channel_id
+    proxy_session_id            # Runner가 rule set을 설치할 때 정한다
+    rule_set_id
+```
+
+| event | scope | 필수 identity | 금지 / 선행 조건 |
+|---|---|---|---|
+| `RULESET` | session | `session_binding` | `program_generation_correlation` 없음. session의 첫 event이며 첫 `GENERATION_OPEN`보다 먼저 `(D)`에 도달한다 |
+| `GENERATION_OPEN` | generation | `session_binding`, `program_generation_correlation`, `draining_generations[]` | `kcov_generation`은 이 session에서 처음 bind된다. 같은 lane에 admitting인 generation이 남아 있으면 거부한다. `draining_generations[]`는 같은 lane에서 `GENERATION_DRAINING` 뒤 아직 summary가 없는 generation 목록이며, host가 그 lane에 draining으로 가진 집합과 같아야 한다. 다르면 거부한다. 받아들이면 새 generation은 admitting이다 |
+| `GENERATION_DRAINING` | generation | 위와 같음 | admitting인 generation에만 한 번 온다. 받아들이면 host는 그 generation을 draining으로 바꾼다. Proxy는 이 event의 host ACK 뒤에만 deactivation을 ACK한다(`01-architecture.md` §16) |
+| `EXPOSURE_INTENT`, `APPLY_REFUSAL` | generation | 위와 같음 | correlation이 이 session의 evidence-open generation binding(lane, `kcov_generation`, `rule_set_id`)과 맞아야 한다. draining generation에서는 `record_context`가 REPLY인 event만 받는다. CALL-context event는 거부하고 기록한다(PR #22 review) |
+| `FORWARD_COMPLETE`, `FORWARD_FAILED` | generation | 위와 같음, `batch_id` | 같은 session과 generation에서 받아들인 `EXPOSURE_INTENT`의 `batch_id`를 참조한다. batch마다 forward 종료 event는 하나다 |
+| `GENERATION_COMPLETE` | generation | 위와 같음 | evidence-open generation의 마지막 event. 받은 뒤 그 binding은 closed다(§21) |
+| `RUN_COMPLETE` | session | `session_binding` | `program_generation_correlation` 없음. 그 session의 마지막 event |
+
+identifier 범위:
+
+- `event_seq`는 Proxy session마다 0부터 빈틈없이 증가한다. 여러 session이 한 물리 journal을 공유해도 범위는
+  session이다.
+- Proxy는 session의 event를 `event_seq` 순서로 하나씩 보낸다. host 응답이 없는 event가 있는 동안 그 session의
+  다음 event는 보내지 않는다. 그래서 여러 connection이 event를 만들어도 sink가 보는 순서는 `event_seq` 순서이고,
+  빈틈은 구현 오류다(아래 sequence violation).
+- `batch_id`는 `EXPOSURE_INTENT`가 정하며 Proxy session 안에서 유일하다. forward 종료 event는 새 batch가 아니라
+  그 batch의 lifecycle 전이이므로 같은 `batch_id`를 다른 payload로 참조한다.
+- host binding의 generation 상태는 evidence 상태다. `GENERATION_OPEN`부터 `GENERATION_COMPLETE`까지
+  evidence-open이며, 그 안에서 admitting(`GENERATION_OPEN` 뒤)과 draining(`GENERATION_DRAINING` 뒤)을
+  구분한다. host가 lane마다 admitting generation을 하나만 두는 것은 `GENERATION_OPEN`의 거부 규칙이 보장한다. CALL admission은 Proxy가 lane마다 하나의
+  generation에만 준다(`01-architecture.md` §16). 같은 lane에서 draining G와 admitting G+1이 함께
+  evidence-open일 수 있다.
+- `proxy_session_id`는 Runner가 정하고 host가 기록한다. guest가 보낸 값은 대조만 한다.
+
+재수신과 충돌:
+
+| 상황 | sink 동작 |
+|---|---|
+| 같은 session, 같은 `event_seq`, byte-identical payload (ACK 유실 뒤 재전송) | 다시 append하지 않고 같은 ACK를 다시 보낸다. 새 application으로 세지 않는다 |
+| 같은 `event_seq`에 다른 payload | 거부하고 session journal conflict를 host 기록으로 남긴다. 그 session의 open generation은 summary가 와도 내부 불일치다 |
+| 이미 받은 `batch_id`로 두 번째 `EXPOSURE_INTENT`, 또는 이미 forward 종료 event가 있는 batch에 다른 `event_seq`의 두 번째 종료 event | 위와 같다 |
+| 받지 않은 `batch_id`를 참조하는 forward 종료 event | 거부하고 기록한다 |
+| `event_seq` 빈틈 또는 역행 | 거부하고 sequence violation을 기록한다. 그 session의 open generation은 내부 불일치다 |
+| 알 수 없는 또는 이미 끝난 `proxy_session_id` (stale session) | 거부하고 기록한다. 다른 session이나 새 generation에 편입하지 않는다 |
+| 다른 lane, 없는 generation, closed generation의 correlation | 거부하고 기록한다. host 값으로 고쳐 받아들이지 않는다 |
+| Proxy process 재시작 | 새 Proxy session이다. Runner가 rule set을 다시 설치하고 새 `proxy_session_id`를 정한다. 이전 session의 open generation은 summary 없이 끝난다 |
+| Runner process 재시작 | sink는 durable journal에서 session별 다음 `event_seq`, batch, generation binding을 복원한 뒤 수신을 재개한다. 복원할 수 없는 session의 event는 거부한다 |
+
+어느 경우에도 guest가 보낸 값을 host 값으로 바꿔 성공시키지 않는다(`../02-llm-agent/01` §11.1).
 
 ### 7. RULESET event
 
@@ -627,11 +685,39 @@ EXPOSURE_INTENT + FORWARD_FAILED
 
 이 distinction을 in-place counter 하나로 압축하지 않는다.
 
-### 21. GENERATION_COMPLETE / RUN_COMPLETE
+### 21. GENERATION_OPEN / GENERATION_DRAINING / APPLY_REFUSAL / GENERATION_COMPLETE / RUN_COMPLETE
 
-program generation이 clean하게 끝나면 그 generation의 deactivation 처리에서 mandatory
-`GENERATION_COMPLETE`를 append한다(issue #4). normal non-match는 record마다 기록하지 않고 여기에
-rule별로 집계한다.
+generation G의 lifecycle(admitting, draining, closed)은 `01-architecture.md` §16이 소유한다. journal에는
+G의 처음과 끝이 남는다.
+
+```text
+GENERATION_OPEN
+    program_generation_correlation
+    rule_set_id
+```
+
+Proxy는 activation(G)을 처리할 때 `GENERATION_OPEN`을 append하고 host ACK `(D)`를 받은 뒤에만
+activation을 ACK한다. host sink는 이 event로 G를 Proxy session과 lane에 bind한다. G의 다른 event는 이
+binding이 있어야 받아들인다(§6).
+
+```text
+GENERATION_DRAINING
+    program_generation_correlation
+    rule_set_id
+```
+
+Proxy는 deactivation(G)을 처리할 때 G의 CALL admission을 닫고 `GENERATION_DRAINING`을 append한 뒤, host
+ACK `(D)`를 받아야 deactivation을 ACK한다(PR #22 review). host는 이 event로 G를 draining으로 바꾸고, 그 뒤에
+오는 G의 CALL-context `EXPOSURE_INTENT`/`APPLY_REFUSAL`을 거부한다. G+1이 열리지 않아도 이 전이는 일어난다.
+host ACK가 오지 않거나 sink가 거부하면 deactivation은 ACK되지 않고 barrier 실패 경로를 따른다
+(`01-architecture.md` §16). 그때 G의 rule에는 M1 `NOT_APPLIED`를 내리지 않는다. 유효한 host-durable
+`EXPOSURE_INTENT`가 있는 rule은 `APPLIED`를 유지하고(§11), 없는 rule은 `INCONCLUSIVE`다. ACK 실패는 적용
+사실을 취소하지 않는다. journal 손상이나 correlation 불일치는 별도의 invalid-evidence 규칙을 따른다(§6, §24).
+
+forward가 끝나지 않은 batch는 connection close 때 `FORWARD_FAILED`로 끝난다(§18). Proxy는 G의 closure를
+판정하고 G의 모든 batch가 `FORWARD_COMPLETE`/`FORWARD_FAILED`를 남긴 뒤 G의 마지막
+event로 mandatory `GENERATION_COMPLETE`를 append한다(issue #4, issue #18 F1). normal non-match는 record마다
+기록하지 않고 여기에 rule별로 집계한다.
 
 ```text
 GENERATION_COMPLETE
@@ -642,11 +728,65 @@ GENERATION_COMPLETE
     outside_activation_window
     evidence_path_failures
     resolver_summary[]        # rule_id별 04 §31 taxonomy count
+    closure
+        reason                # drained | reply_unresolved | aborted
+        drain_bound
+        reply_unresolved_count
 ```
 
-M1 `NOT_APPLIED`는 activation/deactivation barrier가 모두 ACK되고, clean durable
-`GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없을 때만 성립한다. crash로 summary가
-없으면 그 generation의 M1은 `INCONCLUSIVE`다(`../02-llm-agent/01-two-stage-agent-architecture.md` §7).
+| closure reason | 조건 |
+|---|---|
+| `drained` | G의 모든 entry가 `replied` 또는 `expired(connection_closed)`로 끝났다 |
+| `reply_unresolved` | closure 때 `awaiting_reply`가 남았거나(drain bound 만료), timeout/capacity reclaim으로 REPLY를 G로 처리하지 못한 entry가 있다(`03-transaction-context.md` §5). 그 수가 `reply_unresolved_count`다 |
+| `aborted` | generation ABORT 통지로 닫혔다 |
+
+closure가 rule에 대해 clean인지는 rule의 `selector.rpc.message_type`(`04-semantic-mutation-runtime.md` §4)에
+따라 정한다.
+
+| closure reason | `call` rule | `reply` rule |
+|---|---|---|
+| `drained` | clean | clean |
+| `reply_unresolved` | clean. CALL admission은 deactivation에서 이미 닫혔다 | clean 아님 |
+| `aborted` | clean 아님 | clean 아님 |
+
+M1 `NOT_APPLIED`는 activation/deactivation barrier가 모두 ACK되고, 그 rule에 대해 clean인 closure를 가진
+durable `GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없을 때만 성립한다. crash나 session
+종료로 summary가 없으면 그 generation의 M1은 `INCONCLUSIVE`다
+(`../02-llm-agent/01-two-stage-agent-architecture.md` §7).
+
+`GENERATION_COMPLETE(G)`가 `(D)`에 도달하면 host sink는 G binding을 closed로 바꾸고, 그 뒤에 오는 G의
+event를 거부하며 거부 사실을 host 기록으로 남긴다. 봉인된 G journal에 summary 뒤의 G event나 그 거부
+기록이 있으면 내부 불일치다. Judge는 그 generation에 확정 verdict를 내리지 않는다
+(`../02-llm-agent/01-two-stage-agent-architecture.md` §11.1).
+
+summary는 crash-cut에서 사라질 수 있다. 그래서 replay 비교에 필요한 hard refusal 사실은 summary와 별도로
+write-ahead한다(issue #18 F2). hard refusal인지는 JudgeProfile(Replay)의 분류(§29)가 정한다.
+
+```text
+APPLY_REFUSAL
+    program_generation_correlation
+    rule_id
+    refusal            # 04 §31 taxonomy 값 또는 apply_precondition_failed
+    record_context     # direction / rpc message type / program / version / procedure
+```
+
+- Proxy는 (generation, rule_id)마다 첫 hard refusal의 `APPLY_REFUSAL`을 append하고 host ACK `(D)`를 받은
+  뒤에 거부된 record를 relay한다. 두 번째부터는 summary의 count에만 남긴다. 비교에는 위치마다 hard
+  refusal의 존재만 필요하기 때문이다. 첫 `APPLY_REFUSAL`이 아직 ACK되지 않은 동안 같은 (generation, rule_id)의
+  hard refusal이 다른 connection에서 나오면, 그 record도 첫 event의 ACK를 기다린 뒤 relay한다. 그래야 어느
+  connection에서 relay된 refusal이든 durable `APPLY_REFUSAL`이 앞선다.
+- normal non-match는 이 event를 만들지 않는다. 지금처럼 summary에만 집계한다.
+- Proxy는 host 응답(ACK 또는 거부) 없이 거부된 record를 relay하지 않는다. 응답이 없으면 같은 `event_seq`로
+  같은 event를 다시 보낸다(§6의 재수신 규칙).
+- 기다림의 범위는 둘이다. record relay는 그 record와 같은 connection·방향에서만 멈춘다(순서 보존). event
+  전송은 session 전체에서 멈춘다(§6, 한 번에 하나). 그래서 다른 connection에서 event가 필요 없는 record는
+  계속 relay되고, event가 필요한 record(application, 첫 hard refusal)는 앞 event의 응답을 기다린다.
+- 이 두 규칙 때문에 relay된 hard refusal record에는 durable `APPLY_REFUSAL`이 이미 있다. guest가 응답을
+  기다리는 중에 종료되면 기다리던 record는 peer에 닿지 않았으므로 production prefix 밖이다. sink가 응답하지
+  않는 상태가 계속되면 traffic이 멈추고, Runner가 stall을 종료 원인으로 기록한다(§29의 `unknown`).
+- sink가 명시적으로 거부하면 host가 그 거부를 기록한다. Proxy는 record를 변조 없이 relay하고(§11과 같다)
+  session을 `evidence_path_degraded`로 표시하며, 이후 event와 summary의 `evidence_path_failures`에 남긴다.
+- summary가 있으면 rule별 hard refusal count가 0보다 큰데 `APPLY_REFUSAL`이 없는 것은 내부 불일치다.
 
 Proxy session이 clean하게 끝나면 optional `RUN_COMPLETE` event를 append할 수 있다.
 
@@ -813,9 +953,13 @@ ReplayResult
         production
             batch_signature_multiset
             forward_complete_multiset
+            hard_refusals[]          # rule_id, refusal
+            refusal_evidence         # complete | prefix_complete | unknown
         replay
             batch_signature_multiset
             forward_complete_multiset
+            hard_refusals[]
+            refusal_evidence
         differences[]
 
     runtime_errors[]
@@ -834,15 +978,21 @@ Semantic replay는 successful exposure-intent batch semantics를 stream position
 ```text
 REPLAY_EQUIVALENT
 REPLAY_DIVERGED
+REPLAY_INCONCLUSIVE
 REPLAY_INVALID
 ```
 
 `REPLAY_EQUIVALENT`는 delta/runtime/schema가 compatible하고, window의 모든 위치에서
-production/replay의 `EXPOSURE_INTENT` semantic batch signature multiset이 동일하며, hard
-semantic/apply refusal이 없음을 뜻한다.
+production/replay의 `EXPOSURE_INTENT` semantic batch signature multiset이 동일하며, 양쪽 모두 hard
+semantic/apply refusal이 없음이 증명됨을 뜻한다.
 
 `REPLAY_DIVERGED`는 실행은 valid하지만 missing/extra batch, batch composition 또는
-cardinality가 production과 다름을 뜻한다.
+cardinality가 production과 다르거나, 어느 쪽에 hard refusal이 있음을 뜻한다. 양쪽에 같은 hard refusal이
+있어도 equivalent로 올리지 않는다. hard refusal은 그 위치에서 rule set이 의도대로 적용되지 않았다는
+사실이기 때문이다.
+
+`REPLAY_INCONCLUSIVE`는 비교 전제는 성립하고 divergence도 관측되지 않았지만, 어느 위치에서 hard refusal이
+없었다는 사실을 증명할 수 없음을 뜻한다(issue #18 F2).
 
 `REPLAY_INVALID`는 delta corruption, schema/runtime incompatibility, unsupported
 transform, invalid fixture/resource failure 등으로 의미 있는 비교 자체가 불가능한 경우다.
@@ -850,6 +1000,38 @@ transform, invalid fixture/resource failure 등으로 의미 있는 비교 자�
 `REPLAY_INVALID`는 manifest와 correlation 검증을 통과한 봉인 evidence에서만 나온다. 검증에 실패한
 bundle로는 비교 verdict를 내지 않는다. comparator는 그 replay 시도를 invalid evidence로 기록하며,
 evidence를 고친 뒤 replay를 다시 실행한다(`../02-llm-agent/01` §11.1, issue #11).
+
+**refusal 분류.** JudgeProfile(Replay)은 resolver taxonomy(`04-semantic-mutation-runtime.md` §31)와 Edit
+Applier refusal을 다음처럼 분류한다. 아래는 첫 profile의 내용이다. 분류를 바꾸면 새 profile version이다.
+
+| 분류 | 값 | 비교에서의 의미 |
+|---|---|---|
+| normal non-match | `scope_miss`, `rpc_selector_miss`, `target_not_found`, `predicate_false` | 영향 없음. record마다 기록하지 않는다 |
+| hard refusal | `schema_mismatch`, `decode_unavailable`, `transaction_context_missing`, `transaction_context_unusable`, `target_ambiguous`, `predicate_reference_ambiguous`, `transform_failed`, `conflict`, `structure_constraint_failed`, `apply_precondition_failed` | 그 위치를 `REPLAY_EQUIVALENT`에서 제외한다 |
+| incompatibility | `transform_unsupported` | `REPLAY_INVALID`(§39) |
+
+**refusal evidence 완전성.** comparator는 위치와 쪽마다 hard refusal 사실의 완전성을 봉인 bundle에서
+정한다.
+
+| 값 | 조건 |
+|---|---|
+| `complete` | durable `GENERATION_COMPLETE`가 있고 `evidence_path_failures`가 0이다. hard refusal 존재는 summary count와 `APPLY_REFUSAL`이 함께 정한다 |
+| `prefix_complete` | summary가 없다(crash-cut). journal prefix가 integrity 검증을 통과하고(torn final tail은 허용, §24), `evidence_path_degraded` 표시, sink의 append 실패·거부 기록, channel 장애 기록이 없으며, Runner가 기록한 종료 원인이 guest crash 또는 VM teardown이다(sink 무응답으로 인한 stall은 해당하지 않는다). host 응답 전 relay 금지 규칙(§21) 때문에 relay된 record의 hard refusal은 모두 prefix에 있다. 응답을 기다리며 relay되지 않은 record는 peer에 닿지 않았으므로 cut 뒤의 traffic과 같이 production prefix 밖이다 |
+| `unknown` | 그 밖의 경우 |
+
+crash-cut prefix라는 사실만으로는 `unknown`이 아니다. `delivery_unknown`도 이 완전성과 무관하며 semantic
+divergence로 바꾸지 않는다(§37).
+
+**판정 순서.** 위에서부터 처음 맞는 행을 적용한다.
+
+| 순서 | 조건 | 결과 |
+|---|---|---|
+| 1 | manifest / correlation 검증 실패 | verdict 없음. invalid evidence 기록 |
+| 2 | format / runtime / schema / transform 비호환, fixture·resource 실패, incompatibility 분류 refusal | `REPLAY_INVALID` |
+| 3 | 어느 위치든 batch signature multiset이 다름 | `REPLAY_DIVERGED` |
+| 4 | 어느 위치든 어느 쪽에 hard refusal이 있음 | `REPLAY_DIVERGED` |
+| 5 | 어느 위치든 어느 쪽의 `refusal_evidence`가 `unknown` | `REPLAY_INCONCLUSIVE` |
+| 6 | 그 밖 | `REPLAY_EQUIVALENT` |
 
 이 verdict는 Q2 crash reproduced/not reproduced와 별개다.
 
@@ -962,7 +1144,9 @@ replay execution
     -> ReplayResult
 ```
 
-Crash가 replay 중 발생해도 마지막 replay mutation candidate가 durable해야 한다.
+Crash가 replay 중 발생해도 마지막 replay mutation candidate가 durable해야 한다. replay journal도
+`APPLY_REFUSAL` write-ahead 규칙(§21)을 따른다. 그래서 replay 쪽 refusal evidence 완전성도 production과
+같은 규칙(§29)으로 정한다.
 
 ### 37. delivery evidence
 
@@ -1300,6 +1484,62 @@ Expected:
 - replay가 위치별로 비교한다;
 - G의 evidence가 없으면 multi-generation attribution은 `INCONCLUSIVE`다.
 
+### 19. generation closure
+
+G에서 시작한 CALL의 eligible REPLY를 deactivation(G) 전후와 closure(G) 전후로 옮긴다. drain 중에 같은
+lane에서 G+1을 활성화한다.
+
+Expected:
+- closure 전에 도착한 REPLY의 application은 G의 `EXPOSURE_INTENT`로 남고 G의 summary 앞에 온다;
+- closure 뒤에 도착한 REPLY는 변조되지 않고 `late_after_close`로 세어진다;
+- draining G의 event는 G+1로 바뀌지 않고 G binding으로 검증된다;
+- drain bound 만료로 닫힌 G에서 `reply` rule의 M1은 `NOT_APPLIED`가 아니다;
+- 봉인된 clean `NOT_APPLIED` 뒤에 G의 application이 추가되면 FAIL이다.
+
+### 20. crash-cut hard refusal
+
+성공 batch multiset은 같고 한쪽에만 hard refusal이 있는 두 실행을 만든다. 각각 summary 전에 종료시킨다.
+
+Expected:
+- refusal이 있는 쪽의 `APPLY_REFUSAL`이 거부된 record의 relay 전에 host journal에 있다;
+- comparator가 둘을 `REPLAY_DIVERGED`로 구분한다;
+- 한쪽의 `APPLY_REFUSAL`을 sink가 거부하게 하면 `refusal_evidence = unknown`이고 `REPLAY_INCONCLUSIVE`다;
+- 한쪽의 `APPLY_REFUSAL` 요청이 host에 닿지 않게 하고 ACK timeout 뒤 guest를 종료한다. 거부된 record와 그
+  connection·방향의 뒤 record가 peer에 relay되지 않았어야 한다. timeout 뒤 원본 record가 relay됐는데
+  `prefix_complete`나 `REPLAY_EQUIVALENT`가 나오면 FAIL이다;
+- sink 무응답으로 traffic이 멈춰 종료된 실행은 `refusal_evidence = unknown`이고 `REPLAY_INCONCLUSIVE`다;
+- 여러 connection에서 같은 rule의 hard refusal을 동시에 만든다. 첫 `APPLY_REFUSAL`의 ACK 전에는 어느
+  connection에서도 거부된 record가 peer에 relay되지 않아야 하고(peer capture로 확인), 다른 connection의
+  event가 필요 없는 record는 계속 relay되어야 한다;
+- 거부된 record가 relay되기 전에 guest를 종료하면 `prefix_complete`이고, relay된 traffic만으로 비교한다.
+  refusal이 없는 쪽과 relay된 traffic이 같으면 `REPLAY_EQUIVALENT`가 될 수 있다;
+- host 응답 없이 거부된 record가 relay된 것이 peer capture에 보이면 구현 오류이며 test FAIL이다;
+- 여러 connection이 event를 만들 때 sink가 `event_seq` 빈틈을 보면 sequence violation이고, 그 session은
+  내부 불일치다;
+- refusal이 없는 정당한 crash-cut prefix 두 개는 `REPLAY_EQUIVALENT`가 될 수 있다. crash-cut이라는 이유만으로
+  비교를 막으면 FAIL이다;
+- `delivery_unknown`만 다른 두 실행을 `REPLAY_DIVERGED`로 판정하면 FAIL이다.
+
+### 21. event scope와 재수신
+
+ACK를 유실시켜 같은 event를 다시 보내고, 같은 `event_seq`에 다른 payload, stale `proxy_session_id`, 다른 lane의
+correlation을 보낸다. 활성 generation이 없을 때 `RULESET`을 보낸다.
+
+Expected:
+- generation이 없을 때의 `RULESET`은 받아들인다;
+- G+1 없이 deactivation(G)을 처리한다. `GENERATION_DRAINING(G)`의 host ACK 뒤에만 deactivation이 ACK되고,
+  그 뒤 G의 CALL-context event는 거부되어 기록되며, G의 eligible REPLY event는 받아들여진다;
+- `GENERATION_DRAINING(G)`의 host ACK를 막으면 deactivation은 ACK되지 않고 barrier 실패로 처리된다. 그 전에
+  유효한 `EXPOSURE_INTENT(G, rule=r)`가 ACK된 rule r은 `APPLIED`를 유지하고, `EXPOSURE_INTENT`가 없는 rule은
+  `INCONCLUSIVE`다. 어느 rule도 `NOT_APPLIED`가 되면 FAIL이다;
+- 같은 lane에 admitting generation이 남아 있을 때의 `GENERATION_OPEN`은 거부된다;
+- generation-scoped event는 open generation binding 없이는 거부한다;
+- 재전송은 다시 ACK되고 application이 한 번만 세어진다;
+- `GENERATION_DRAINING(G)` 뒤 같은 lane의 `GENERATION_OPEN(G+1)`(`draining_generations = [G]`)을 받아들이고, 그 뒤 G의
+  REPLY event와 G+1의 event를 각각의 binding으로 받는다;
+- `EXPOSURE_INTENT(batch=b)` 뒤의 `FORWARD_COMPLETE(batch=b)`를 받아들이고, b의 두 번째 종료 event는 거부한다;
+- 충돌, stale session, wrong lane은 새 generation에 편입되지 않고 거부와 함께 host에 기록된다.
+
 ## 실패 양상과 진단
 
 | 증상 | 가능한 원인 | 구분하는 관측 | 조치 |
@@ -1317,6 +1557,8 @@ Expected:
 | middle corruption | storage corruption/bug | integrity/sequence failure | artifact invalid |
 | replay orig verify 실패 | replay-time TOCTOU/wrong buffer | current precondition bytes | apply refusal |
 | host ACK 없음 | sink 장애, channel 단절, ACK 유실 | sink/transport 상태, host journal의 intent 존재 여부 | mutated output 노출 안 함, generation evidence 불완전 |
+| G summary 뒤 G event 또는 sink의 post-close 거부 기록 | Proxy closure 구현 오류, correlation 오류 | 봉인 journal의 event 순서, host 거부 기록 | 그 generation 확정 verdict 없음, Proxy lifecycle 수정 |
+| `reply` rule이 `reply_unresolved`로 `INCONCLUSIVE` 반복 | drain bound가 짧음, timeout/capacity 설정 | `reply_unresolved_count`, entry 종료 사유 | bound/capacity 조정 |
 | crash window 선행 entry 없음 | window bound 초과, program/delta artifact 유실 | `CrashContextWindow` 보존 기록 | multi-generation attribution `INCONCLUSIVE` |
 
 ## 한계와 미결 사항
@@ -1334,7 +1576,15 @@ Expected:
 - **결정됨:** EXPOSURE_INTENT는 mutated output을 relay에 노출하기 전에 host sink `(D)`에 도달해야 한다.
 - **결정됨:** failure domain은 Proxy process, guest kernel, VM teardown, Runner process 장애다. host
   OS/storage 손실은 범위 밖이며 per-event `fsync`는 요구하지 않는다(issue #3).
-- **결정됨:** clean generation마다 `GENERATION_COMPLETE`를 남긴다(issue #4).
+- **결정됨:** generation마다 `GENERATION_OPEN`으로 시작해 closure 뒤 마지막 event인
+  `GENERATION_COMPLETE`로 끝난다. clean 여부는 closure reason과 rule의 message type으로 정한다
+  (§21, issue #4, issue #18 F1).
+- **미결:** drain bound의 숫자.
+- **결정됨:** (generation, rule)마다 첫 hard refusal은 relay 전에 `APPLY_REFUSAL`로 write-ahead한다.
+  replay 판정은 refusal 분류, refusal evidence 완전성, 판정 순서(§29)를 따른다(issue #18 F2).
+- **결정됨:** `APPLY_REFUSAL`에 host 응답이 없으면 거부된 record를 relay하지 않고 같은 event를 다시
+  보낸다. 그래서 host에 닿지 않은 refusal 뒤에 relay된 record는 없다. 완전성을 이 규칙으로 입증할 수 없는
+  종료(sink 거부, sink 무응답 stall)는 `unknown`이다(§21, §29, PR #22 review).
 - **결정됨:** production journal은 append-only lifecycle events를 사용한다.
 - **결정됨:** socket delivery와 disk commit의 atomicity gap은 `delivery_unknown`으로 표현한다.
 - **결정됨:** production MutationDelta는 replay 중 immutable이다.
@@ -1346,6 +1596,8 @@ Expected:
 - **미결:** concrete output snapshot 전체를 inline할지 여부.
 - **미결:** ReplayResult on-disk representation.
 - **미결:** guest-to-host journal transport와 host sink framing 세부.
+- **결정됨:** event는 session-scoped와 generation-scoped로 나뉜다. sink admission, identifier 범위, 재수신과
+  충돌 처리는 §6의 표를 따른다(issue #18 F3).
 - **미결:** ACK timeout으로 노출을 포기한 batch에 sink 복구 뒤
   `FORWARD_FAILED(reason=not_exposed_after_ack_timeout)`를 남길지. issue #3에 비차단 제안으로 올렸고
   아직 합의되지 않았다. 남기지 않아도 그 batch는 `delivery_unknown`으로 안전하게 남는다.

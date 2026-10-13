@@ -190,34 +190,11 @@ NFSv4 COMPOUND
               +-- stateid
 ```
 
-출력은 semantic field와 live byte span을 함께 가진다.
+출력은 `DecodedRpcMessage`다. 각 operation의 `fields[]`(`SemanticField`)는 semantic path, 값과 live
+`RpcRecord.rpc_payload` 위의 `wire_ref`를 함께 가진다. field 이름과 형식은
+[`02-semantic-decoder.md`](02-semantic-decoder.md) §7–§10이 소유하며 여기에 다시 쓰지 않는다.
 
-```text
-DecodedRpcMessage
-    rpc
-        message_type
-        xid
-        program
-        version
-        procedure
-
-    protocol
-        family
-        nfs_version
-        minor_version?
-
-    operations[]
-        operation
-        semantic_fields[]
-            path
-            value
-            byte_span
-
-    decode_status
-```
-
-`byte_span`은 live `RpcRecord.rpc_payload`에서 decoder가 확인한 위치다.
-Agent나 Compiler가 미리 계산하지 않는다.
+`wire_ref`는 decoder가 live payload에서 확인한 위치다. Agent나 Compiler가 미리 계산하지 않는다.
 
 Codec은 protocol/version 단위 registry로 확장한다.
 
@@ -541,7 +518,10 @@ MutationDelta
     rule_set[]
     program_generation_correlation
     append-only journal[]
+        GENERATION_OPEN
+        GENERATION_DRAINING
         EXPOSURE_INTENT
+        APPLY_REFUSAL
         FORWARD_COMPLETE / FORWARD_FAILED
         GENERATION_COMPLETE
 ```
@@ -671,9 +651,12 @@ Stage2Campaign
     |     program generation마다 (executor)
     |       BEGIN -> generation G
     |       activation(G) 요청, Proxy ACK 대기
+    |         (Proxy: GENERATION_OPEN(G) host ACK 뒤 ACK)
     |       program syscall 실행
     |       deactivation(G) 요청, Proxy ACK 대기
+    |         (Proxy: GENERATION_DRAINING(G) host ACK 뒤 ACK)
     |       FINISH / ABORT
+    |     Proxy: G drain -> closure -> GENERATION_COMPLETE(G)
     |
     +-- mutation evidence / MutationDelta는 host sink에 누적
     +-- Proxy session 종료
@@ -693,12 +676,40 @@ eligibility:
 - deactivation 직전에 변조된 record가 CLOSING 이후 knfsd에 도착하면 coverage 귀속을 잃는다.
   journal은 그 record를 G에 남긴다. 이 잔여 위험은 문서화된 한계다.
 
+generation 종료(issue #18 F1). deactivation은 G의 application evidence 종료가 아니다. Proxy는 lane마다
+generation을 세 단계로 다룬다.
+
+```text
+admitting   activation(G) ACK ~ deactivation(G) ACK
+            새 CALL entry에 activation_generation = G를 붙인다
+draining    deactivation(G) ACK ~ closure(G)
+            새 CALL은 G에 들어오지 않는다. activation_generation = G인
+            awaiting_reply entry의 REPLY만 G의 rule set으로 처리한다
+closed      closure(G) 뒤. G 이름의 application event는 더 생기지 않는다
+```
+
+| 전환 | 소유자 | 조건 | ACK / 기록의 의미 |
+|---|---|---|---|
+| activation(G) | executor 요청, Proxy 처리 | Proxy가 `GENERATION_OPEN(G)`을 host sink `(D)`에 기록한 뒤 ACK한다 | host가 G를 이 Proxy session과 lane의 generation으로 bind했다. sink ACK가 없으면 activation ACK도 없다(아래 barrier 실패 표) |
+| deactivation(G) | executor 요청, Proxy 처리 | Proxy가 G의 CALL admission을 닫고 `GENERATION_DRAINING(G)`을 host sink `(D)`에 기록한 뒤 ACK한다 | 새 CALL admission 종료만 뜻한다. host도 G를 draining으로 안다. draining 중인 G의 REPLY 처리는 계속된다. sink ACK가 없으면 deactivation ACK도 없다(아래 barrier 실패 표) |
+| closure(G) | Proxy | deactivation(G)을 처리한 뒤 다음 중 먼저 오는 것: G의 `awaiting_reply` entry가 0개가 됨, drain bound 만료, generation ABORT 통지 | closure 순간부터 G entry의 REPLY는 변조하지 않고 relay하며 session counter `late_after_close`로 센다. G의 모든 batch가 forward 종료 event를 남긴 뒤 G의 마지막 event로 `GENERATION_COMPLETE`를 append한다. closure reason은 그 summary에 남는다(`05-mutation-delta-replay.md` §21) |
+
+drain bound는 Runner가 Proxy session 설정으로 정하고 `GENERATION_COMPLETE`에 기록한다. 숫자는 미결이다.
+draining G가 끝나기 전에 같은 lane에서 G+1이 admitting이 될 수 있다. admitting generation은 lane마다
+하나다. draining G의 REPLY로 만든 event는 TransactionEntry의 G correlation을 그대로 쓰며, G+1로 바꾸지
+않는다. host sink는 이 event를 "현재 activation"이 아니라 host가 bind한 G의 상태(open/closed)에 대조한다
+(`05-mutation-delta-replay.md` §6). deactivation(G)를 처리하지 못한 G는 closure 없이 session 종료로
+끝나며 summary가 없다. timeout, ABORT, 확인하지 못한 drain을 clean closure로 합성하지 않는다.
+
+Runner는 G의 evidence를 `GENERATION_COMPLETE(G)`가 `(D)`에 도달한 뒤, 또는 Proxy session·channel·VM
+종료로 G의 event가 더 올 수 없게 된 뒤에만 봉인한다. 뒤의 경우 summary가 없다.
+
 barrier 실패:
 
 | 상황 | 동작 |
 |---|---|
-| activation ACK 없음 | program을 실행하지 않는다. activation lease를 해제하고 generation을 ABORT하며, 실행과 evidence를 `INCONCLUSIVE`로 표시한다 |
-| deactivation ACK 없음 | kernel generation이 멈추지 않게 FINISH/ABORT는 진행한다. 남은 activation이 해제됐음을 확인할 때까지 그 lane에서 target mode generation을 더 실행하지 않는다 |
+| activation ACK 없음 (`GENERATION_OPEN`의 host ACK 실패 포함) | program을 실행하지 않는다. activation lease를 해제하고 generation을 ABORT하며, 실행과 evidence를 `INCONCLUSIVE`로 표시한다 |
+| deactivation ACK 없음 (`GENERATION_DRAINING`의 host ACK 실패 포함) | kernel generation이 멈추지 않게 FINISH/ABORT는 진행한다. 남은 activation이 해제됐음을 확인할 때까지 그 lane에서 target mode generation을 더 실행하지 않는다 |
 | orphan (BEGIN과 FINISH 사이에 program process 종료) | ABORT 전에 deactivation과 lease 해제를 시도한다 |
 | 위 경우에 비활성 상태를 확인할 수 없음 | 재사용 전에 Proxy/lane을 격리하거나 재시작한다. 예: syzkaller 0008의 fail-closed runner 경로(VM/lane 재생성) |
 
@@ -942,6 +953,9 @@ failed precondition
 - **결정됨:** rule 내용은 Runner가 Proxy session마다 불변 rule set으로 설치하고, 활성 구간은
   executor가 program generation마다 ACK barrier로 정한다(§16, issue #2).
 - **미결:** rule set 설치 경로와 activation/deactivation 메시지의 serialization/versioning.
+- **결정됨:** deactivation ACK는 CALL admission 종료만 뜻한다. G의 application evidence는 Proxy가
+  closure를 판정하고 G의 마지막 event로 `GENERATION_COMPLETE`를 남길 때 닫힌다(§16, issue #18 F1).
+- **미결:** drain bound의 숫자.
 - **미결:** runtime-derived `value_or_transform`의 DSL/typed representation.
 - **결정됨:** write-ahead commit point `(D)`는 Runner host journal sink가 framed event append 전체를
   마친 뒤 보내는 ACK다(§12, `05-mutation-delta-replay.md`, issue #3).

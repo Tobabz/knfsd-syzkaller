@@ -6,8 +6,8 @@
 ## 요약
 
 이 도구는 LLM Agent가 식별한 NFS 취약 시나리오를 syzkaller 환경에서 실행하고, KASAN/KCSAN이
-보고하는 이상으로 재현을 판정한다. Agent는 이 설계 문서를 읽고 시나리오에 필요한 syzlang과
-pseudo-syscall을 만들며, 목표는 현재 퍼징 환경이 지원하는 범위 안에서 그것을 만드는 것이다.
+보고하는 이상으로 재현을 판정한다. Agent pipeline의 target 계약(무엇을 제안하고 무엇을 판정하지 않는가)은
+`docs/design/02-llm-agent/01-two-stage-agent-architecture.md`가 소유하며, 이 개요는 그것을 요약하지 않는다.
 시나리오가 의도한 서버 경로까지 도달했는지는 remote KCOV로 확인하고, 시나리오가 요구하는 변조는
 프록시 기반의 NFS 특화 Mutation Engine (`nfs-proxy`)이 주입한다.
 도달 여부를 잘못 읽으면 "재현 실패"와 "seed 오동작"을 구분할 수 없다.
@@ -38,12 +38,19 @@ Mutation Engine의 실행 대상 선택 확장은 후속 계획이다.
 
 ## 구조
 
-### 재현 흐름
+### 재현 흐름 (legacy / manual 경로)
+
+이 절의 그림은 지금 구현된 legacy/manual 경로(Layer 0, NFSPARM arm)를 설명한다. target 계약이 아니다.
+target Agent pipeline에서 Agent는 program을 제안하고 Harness Materializer가 검증한다
+(`02-llm-agent/05-reachability-plan.md` §11). syzlang·pseudo-syscall 확장은 별도 Harness Extension Work다
+(`02-llm-agent/07-harness-gap-issue.md`). Agent pipeline은 legacy arm을 쓰지 않는다
+(`02-llm-agent/04-harness-capability-spec.md` §5, issue #8). target 흐름은 `02-llm-agent/01` §2와
+`03-nfs-proxy/01-architecture.md` §16이 소유한다.
 
 ```text
- +-----------+   설계 문서를 읽고 syzlang / pseudo-syscall / arm 규칙 생성
- | LLM Agent |------------------------------------------+
- +-----------+   (저장소에 구현 없음. 문서가 유일한 입력)   |
+ +-----------+   seed / syzlang / pseudo-syscall / arm 규칙 작성
+ |  manual   |------------------------------------------+
+ +-----------+   (legacy 경로. Agent pipeline 미사용)   |
                                                           v
 +------------------------- guest VM (KASAN | KCSAN) ------------------------+
 |                                                                           |
@@ -66,7 +73,7 @@ Mutation Engine의 실행 대상 선택 확장은 후속 계획이다.
 
  (K)=서버 처리 지점  (R)=remote KCOV 계측  (S)=sanitizer 보고
  (W)=프록시 기반의 NFS 특화 Mutation Engine (`nfs-proxy`)
- 읽는 순서: Agent에서 시작해 위에서 아래로. 기본 이미지의 NFS 마운트는 Mutation Engine을 거친다.
+ 읽는 순서: 수동 캠페인에서 시작해 위에서 아래로. 기본 이미지의 NFS 마운트는 Mutation Engine을 거친다.
 ```
 
 기본 이미지는 `bundle/lane/lane.sh` 하나를 사용하며 `SERVER_IMPL=both`로 두 서버를 Mutation Engine 뒤에 둔다.
@@ -134,7 +141,11 @@ Ganesha 피드백은 로컬 클라이언트 커널 KCOV이며 사용자 공간 �
 실행 중인 NFS 세션의 서버 전환이나 양쪽 요청 복제 기능은 구현되어 있지 않다.
 서버별 상태 격리, 결과 구분과 처리량 이득은 후속 검토 대상이다.
 
-### 판정 논리
+### 판정 논리 (legacy / manual 캠페인 해석)
+
+아래 표는 manual 캠페인의 결과를 사람이 읽는 요약이다. target pipeline의 Q1/M1/Q2 판정과 경로는
+`02-llm-agent/01` §3, §7, §8.2와 `02-llm-agent/06-reachability-evidence-q1.md`가 소유하며, 이 표에서 판정
+규칙을 가져오지 않는다.
 
 | Q1 도달 | Q2 sanitizer 보고 | 해석 | 다음 행동 |
 |---|---|---|---|
@@ -149,13 +160,13 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 
 | 요소 | 역할 | 구현 상태 | 상세 문서 |
 |---|---|---|---|
-| LLM Agent 연동 | 설계 문서로 syzlang, pseudo-syscall, arm 규칙을 생성 | 저장소에 생성기 **없음** | 요소별 설계 문서 미작성 |
+| 2-Stage Agent pipeline | candidate 분석, reachability plan과 program 제안, semantic mutation intent | **미구현** | `docs/design/02-llm-agent/` |
 | pseudo-syscall, 기술 파일 | seed가 NFS 프로토콜을 다루게 함 | 구현됨 | syzkaller 패치 시리즈 |
 | lane, namespace | 프로세스별 격리된 NFS 환경 | 구현됨 | `bundle/lane/`, `tools/README.md` |
 | remote KCOV | 서버 경로 도달 관측 | 구현됨 (knfsd 한정) | kernel 패치 0001~0004 |
 | NFS 특화 Mutation Engine (`nfs-proxy`) | 프록시 기반 RPC/XDR 변조 | 고정 경로, 같은 폭 편집(v1)과 길이 변경 편집(v2, 호스트+4-lane 게스트 검증) 구현 | `tools/nfs-proxy/README.md` |
 | Ganesha 백엔드 | 별도 서버 대상 | 서버별 corpus로 순차 퍼징 | `bundle/corpus/nfs-normal/README.md` |
-| 재현 판정 | Q1, Q2 종합 | 통합 판정 도구 **없음** | `report/normal-flow-corpus.md` |
+| Q1 / M1 / Q2 Judge | Controller 측 결정적 판정 | **미구현** | `docs/design/02-llm-agent/01-two-stage-agent-architecture.md` §11.1 |
 
 기본 운용 방식은 서버별 `syz-manager` 퍼징이다. 현재 실행 방법은
 `bundle/corpus/nfs-normal/README.md`에, 검증 기록은 `report/validation-history.md`에 정리되어 있다.
@@ -172,7 +183,8 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
 
 ## 설계
 
-1. **판정을 둘로 나눈다.** 도달(Q1)과 이상 보고(Q2)를 별개의 관측으로 유지한다.
+1. **판정을 나눈다.** 도달(Q1)과 이상 보고(Q2)를 별개의 관측으로 유지한다. target pipeline은 mutation
+   적용(M1)을 더한 세 관측으로 나누며, 그 계약은 `02-llm-agent/01` §3이 소유한다.
 2. **도달은 remote KCOV와 카운터로 판정한다.** 서버 스레드의 PC를 시나리오 실행에 귀속한다.
    귀속 단위는 **lane**이다. lane N의 서버가 받은 요청은 proc N이 그때 실행 중인 프로그램의 것이다(kernel 0002).
 3. **변조는 Mutation Engine 한 곳에서 한다.** legacy NFSPARM 경로에서는 변조 규칙이 seed에 포함되어 프로그램과
@@ -256,8 +268,8 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 
 | 항목 | 상태 |
 |---|---|
-| Agent가 넘기는 seed의 정확한 계약과 확장 절차 | 미결. 요소별 설계 문서 미작성 |
-| 재현 판정의 통합 절차 (Q1 + Q2) | 미결. 통합 판정 도구·문서 없음 |
+| Agent가 넘기는 program/seed의 계약과 확장 절차 | `02-llm-agent/05-reachability-plan.md` §11, `07-harness-gap-issue.md`가 소유. 구현 없음 |
+| 재현 판정의 통합 절차 (Q1 + M1 + Q2) | `02-llm-agent/01` §3, §7, §8.2가 소유. 통합 판정 도구 없음 |
 | `syz-manager` 기반 운용 | 서버별 설정·DB·재개 명령은 `bundle/corpus/nfs-normal/README.md` 참조. 부팅 인자 `nfs.localio_enabled=N`이 필수다 |
 | Mutation Engine 경유 시 knfsd remote KCOV 귀속 | lane 단위 귀속 구현. lane은 proc 하나가 단독 점유해야 한다 |
 | lane 귀속의 경계: 프로그램 종료 뒤 늦게 발생하는 작업 | 다음 프로그램 시작 뒤 늦게 도착하는 요청의 오귀속 위험이 남는다 |
