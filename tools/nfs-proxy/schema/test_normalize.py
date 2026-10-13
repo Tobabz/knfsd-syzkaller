@@ -435,6 +435,30 @@ class Minors(unittest.TestCase):
                          schemas[1]["selector"]["prefix"])
         self.assertLess(len(repr(schemas[0]["selector"]["prefix"])), 4096)
 
+    def minors(self, x0, x1):
+        with Tmp(HEAD + x0 + PROGRAM, self.MANN,
+                 {"u.x": HEAD + x1 + PROGRAM}) as a:
+            return nz.normalize(a)[1]
+
+    def test_equivalent_types_agree_shared_or_not(self):
+        # The same layout through one shared type or two equal ones.
+        rest = "struct ARGS { Pair p; uint32_t minor; }; struct RES { st s; };"
+        self.minors("struct Item { uint32_t v; };"
+                    "struct Pair { Item a; Item b; };" + rest,
+                    "struct Item { uint32_t v; };"
+                    "struct Equivalent { uint32_t w; };"
+                    "struct Pair { Item a; Equivalent b; };" + rest)
+
+    def test_a_different_part_behind_a_shared_type_disagrees(self):
+        rest = "struct ARGS { Pair p; uint32_t minor; }; struct RES { st s; };"
+        with self.assertRaises(nz.SchemaError) as cm:
+            self.minors("struct Item { uint32_t v; };"
+                        "struct Pair { Item a; Item b; };" + rest,
+                        "struct Item { uint32_t v; };"
+                        "struct Other { hyper v; };"
+                        "struct Pair { Item a; Other b; };" + rest)
+        self.assertIn("disagree", str(cm.exception))
+
     def test_ids_differ_per_minor(self):
         x = HEAD + "struct ARGS { uint32_t minor; }; struct RES { st s; };"
         with Tmp(x + PROGRAM, self.MANN, {"u.x": x + PROGRAM}) as a:

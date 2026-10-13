@@ -69,7 +69,9 @@ list, `opaque *x` and `string *x` included; arrays of zero-size elements;
 union case values outside the discriminant's type; duplicate case values; more
 union arms than a 16-bit arm index holds; a smallest encoding longer than
 32 bits; nesting deeper than `NFSP_DECODE_MAX_DEPTH`; minor versions that
-disagree on the layout before the minor-version field; a `branch` annotation
+disagree on the layout before the minor-version field (compared by wire layout
+only: member names, and whether two members share one type or use two equal
+ones, do not count); a `branch` annotation
 that names nothing reachable.
 
 A semantic path names one position in the schema (array and list elements
