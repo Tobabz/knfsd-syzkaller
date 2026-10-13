@@ -34,6 +34,7 @@ machine-readable HCAP (canonical)         hcap_revision = canonical digest
         |
         +-- RemoteKcovSupportBoundary / Q1AdmissibilityProfile (06 §6.1)
         +-- promoted semantic capability registry (§4)
+        +-- CallAdmissionProfile (§3.1)
 
 rendered Markdown (이 문서)
     설명용 view. machine data에서 생성하거나 machine data와 대조한다
@@ -44,8 +45,8 @@ rendered Markdown (이 문서)
 - HCAP data는 `missing_capability_id`의 controlled vocabulary도 담는다(`07` §3, issue #13). 예:
   `state_lineage`, `remote_kcov.context.<context>`, `remote_kcov.kernel_revision.<commit>`.
 - Controller는 plan의 `required_capabilities`, `status`, `usable_by`를 이 데이터로 검증한다. Harness
-  Materializer는 call을 capability `interface`와 대조하고, Mutation Rule Compiler는 promoted semantic
-  registry(§4)를 쓴다.
+  Materializer는 program의 call을 `CallAdmissionProfile`(§3.1)로 capability에 대조하고, Mutation Rule
+  Compiler는 promoted semantic registry(§4)를 쓴다.
 - 세부 지원 목록은 authority artifact가 소유하고 HCAP은 digest로 참조한다. 같은 목록을 HCAP이나 문서에
   복제하지 않는다.
 - serialization 형식(JSON, YAML, TOML 등)은 구현 선택이다. schema와 하나의 canonical digest 표현이 있으면
@@ -133,8 +134,40 @@ Agent는 기본적으로 `validated` capability와 `validated_subset`의 scope �
 `usable_stage`는 capability가 기능상 어느 stage에 속하는지를, `usable_by`는 누가 그것을 쓸 수 있는지를
 나타낸다. `usable_by`에 `agent_stage1`이나 `agent_stage2`가 없는 capability는 Agent pipeline이 쓰지 않는다.
 
-Harness Materializer는 Agent가 제안한 program의 각 call이 plan의 required capability `interface`에
-속하는지 확인한다(`05` §11, issue #12). interface의 authority는 machine-readable HCAP이다(§1.1).
+Harness Materializer는 Agent가 제안한 program의 각 call이 plan의 required capability에 admission되는지
+확인한다(`05` §11, issue #12). admission의 authority는 §3.1의 `CallAdmissionProfile`이다.
+
+`interface`에서 `interface.syz_calls`는 syz program 안에서 실행되는 call이고, `interface.host_tooling`은
+repository maintainer가 host에서 쓰는 command와 file이다. 그 밖의 `interface` 항목(HCAP-03의 manager 설정과
+counter 등)도 program call이 아니다. `host_tooling`은 실행 가능한 syz interface가 아니며 program call이나
+runtime 입력이 될 수 없다. program call admission에는 `CallAdmissionProfile`만 쓴다.
+
+### 3.1 CallAdmissionProfile
+
+program call admission의 authority는 하나다(issue #18 F5).
+
+```text
+CallAdmissionProfile              # repository authority artifact, HCAP authority_refs로 digest 참조
+    syzkaller_build               # ExecutionHarnessIdentity의 syzkaller build와 같아야 한다
+    target                        # 예: linux/amd64
+    entries[]
+        call                      # pinned build가 resolve하는 정확한 syzlang 이름(variant 포함)
+        capability_id             # 이 call을 admission하는 HCAP entry
+        resource_constraints[]    # 예: lane resource에서 온 fd/path만 인자로 받는다
+```
+
+- profile은 pinned syzkaller build의 call table에서 생성하고, 그 build에서 resolve되지 않는 이름을 담지 않는다.
+  drift guard(§7.2)가 이를 확인한다.
+- profile에 없는 call은 admission되지 않는다. "일반 syscall은 예외" 같은 permissive fallback은 없다.
+- 한 call이 여러 capability에 admission될 수 있다. Materializer는 그 중 하나가 plan의
+  `required_capabilities`에 있고 `usable_by`에 `agent_stage1`이 있을 때만 받아들인다.
+- seed provenance(HCAP-05)는 program bytes가 manifest의 seed와 같고 그 seed의 recorded oracle/evidence가
+  있다는 것만 보증한다. seed 안의 call도 제안 program의 call과 똑같이 profile로 검사한다. seed라는 이유로
+  검사를 건너뛰지 않는다.
+- 첫 profile의 내용은 HCAP-01과 HCAP-02의 `validated_scope`에서 시작한다. 예: HCAP-01은 lane acquisition
+  pseudo-call과, lane resource에 대해 validated seed가 실제로 쓰는 filesystem syscall을 admission한다.
+  목록은 profile이 소유하며 이 문서에 복제하지 않는다.
+- artifact는 첫 Stage 1 Materializer 통합에서 도입한다(§1.1의 milestone 규칙).
 
 ## 4. 현재 capability catalog
 
@@ -150,12 +183,19 @@ validated_scope:
     syz_open_nfs_lane / syz_open_nfs_lane_pair 경로
     profile open(0020)과 broad-knfsd 노출은 scope 밖 (experimental)
 
-interface:
-    syz_open_nfs_lane$client0
-    syz_open_nfs_lane$client1
-    syz_open_nfs_lane_pair$client{0,1}_{knfsd,ganesha}
-    syz_open_nfs_lane_profile$client{0,1}_{knfsd_v3,knfsd_v40,
-        knfsd_v41,knfsd_v42,ganesha_v41}            # 0020, experimental
+interface.syz_calls:
+    lane acquisition
+        syz_open_nfs_lane$client0
+        syz_open_nfs_lane$client1
+        syz_open_nfs_lane_pair$client{0,1}_{knfsd,ganesha}
+        syz_open_nfs_lane_profile$client{0,1}_{knfsd_v3,knfsd_v40,
+            knfsd_v41,knfsd_v42,ganesha_v41}        # 0020, experimental
+    lane filesystem syscalls
+        lane resource를 인자로 받는 일반 syscall.
+        목록은 CallAdmissionProfile이 소유한다 (§3.1)
+
+authority_refs:
+    CallAdmissionProfile            # §3.1. artifact는 아직 없다
 
 purpose:
     mounted NFS filesystem을 일반 syscall 경로로 조작
@@ -191,7 +231,7 @@ usable_stage: [stage1, stage2]
 usable_by: [agent_stage1, agent_stage2]
 status: validated
 
-interface:
+interface.syz_calls:
     syz_socket_connect_nfs*
     syz_socket_connect_nfs_pair*
     syz_send_nfs_fuzz$new
@@ -322,7 +362,11 @@ authority_refs:
 purpose:
     이미 준비된 정상 NFS 상태/흐름을 Stage 1 scenario의 기반으로 재사용
 
-interface:
+interface.syz_calls:
+    없음. seed program의 call은 그 call을 admission하는 capability
+    (HCAP-01, HCAP-02 등)로 검사한다 (§3.1)
+
+interface.host_tooling:             # 실행 가능한 syz interface가 아니다
     bundle/corpus/nfs-normal/manifest.json (schema 3, native profile별 seed)
     tools/build-normal-corpus.py --fixture broad-knfsd
     tools/audit-normal-corpus.py
@@ -368,7 +412,7 @@ purpose:
     Candidate Analysis 및 진단에 사용
     Q1 oracle로는 사용하지 않음
 
-interface:
+interface.host_tooling:
     tools/flow-trace/capture.py
     tools/flow-trace/handoffs.py
     tools/flow-trace/scenarios/*.json
@@ -395,7 +439,7 @@ usable_stage: [stage2]
 usable_by: [manual_legacy_campaigns]  # Agent Stage 2 아님 (issue #8)
 status: validated
 
-interface:
+interface.syz_calls:
     syz_arm_nfs_proxy$scoped
     NFSPARM1
 
@@ -433,7 +477,7 @@ usable_stage: [stage2]
 usable_by: [manual_legacy_campaigns]  # Agent Stage 2 아님 (issue #8)
 status: partially_validated
 
-interface:
+interface.syz_calls:
     syz_arm_nfs_proxy_v2$scoped
     NFSPARM2
 
@@ -645,6 +689,7 @@ machine-readable HCAP을 도입할 때 `tools/test-lane-inputs.py`와 같은 형
 patch manifest가 가리키는 파일이 모두 존재
 series에 들어가야 할 patch가 orphan으로 남지 않음
 HCAP interface가 pin되어 적용된 syzlang build에서 resolve됨
+CallAdmissionProfile의 모든 call이 같은 build에서 resolve되고 HCAP entry를 가리킴
 참조한 corpus seed가 canonical manifest에 존재
 promoted semantic registry digest가 runtime / build identity와 일치
 rendered HCAP 문서가 machine data와 일치

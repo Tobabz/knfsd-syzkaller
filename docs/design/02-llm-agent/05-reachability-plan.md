@@ -272,7 +272,8 @@ ReachabilityPlan
 [COMPONENT] Harness Materializer
       |
       +-- pinned syzkaller strict parse
-      +-- 모든 call이 required capability interface에 속하는지 확인
+      +-- 모든 call이 required capability에 admission되는지 확인
+      |     (CallAdmissionProfile, 04 §3.1; seed의 call 포함)
       +-- NFS root / profile acquisition 확인
       +-- profile / fixture / backend / client route 일관성 확인
       +-- 금지되거나 쓸 수 없는 call 거부
@@ -285,8 +286,10 @@ ReachabilityHarness
 ```
 
 Materializer는 call을 만들거나 program을 고치거나 candidate에 도달하는 방법을 추론하지 않는다. 거부는
-typed reason으로 Reachability Planning에 돌려준다. capability interface의 authority는 machine-readable
-HCAP이다(04 §1.1).
+typed reason으로 Reachability Planning에 돌려준다. call admission의 authority는 HCAP이 참조하는
+`CallAdmissionProfile`이다(04 §3.1, issue #18 F5). 기존 seed를 고른 plan도 seed 안의 모든 call이 plan의
+required capability에 admission되어야 한다. HCAP-05의 `host_tooling`(manifest, corpus tool)은 program이나
+runtime 입력이 아니다.
 
 공통 runtime 검사는 corpus tooling과 같은 논리를 재사용할 수 있다. `tools/audit-normal-corpus.py`의 corpus
 정리·admission 규칙은 harness 계약으로 따로 채택하지 않는 한 적용하지 않는다.
@@ -335,6 +338,8 @@ Planning failure
 
 Materialization failure (typed reason -> Reachability Planning repair)
     parse failure
+    call_unresolved              # pinned build에 없는 call
+    call_not_admitted            # CallAdmissionProfile에 없거나 required capability 밖
     disallowed or unavailable call
     profile / fixture / route mismatch
     invalid runtime selection
