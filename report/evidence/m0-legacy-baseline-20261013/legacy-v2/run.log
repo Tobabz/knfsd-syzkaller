@@ -5,12 +5,12 @@
  "legacy_profile": "v2",
  "input_sha256": {
   "workload": "728b3cb67bee05e20dd62c33695efec79fe99c30beaebd18c7a3d202e579813c",
-  "deps": "4661229a45d4ccc224743189690e39263c13cb4092502a12b855a20ca91a286b",
+  "deps": "1bc0097d9b6f55b779ad9f47cb37a0ed80e5643915c9d7321c098f3daacaa938",
   "replay_probe": "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241"
  },
  "guest_inventory": [
   "x86_64",
-  "05db7a5b50bee84830c355b9e1d3a765581f1de220e7323a9a240bd714d65361  /opt/kcov-nfs/deps/usr/sbin/nfs-proxy",
+  "1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /opt/kcov-nfs/deps/usr/sbin/nfs-proxy",
   "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241  /opt/frozen-phase9/replay-probe"
  ],
  "lane_state": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
@@ -120,7 +120,7 @@
  "dmesg_fatal": [],
  "extra_files": 1,
  "extra_nonempty": 1,
- "extra_pcs": 2312,
+ "extra_pcs": 2303,
  "extra_fs_nfsd": 501,
  "extra_net_sunrpc": 221
 }

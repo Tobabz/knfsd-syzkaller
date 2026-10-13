@@ -203,6 +203,61 @@ Evidence: `evidence/nfsd-tracec-autostart-20261009T152248Z/`. `result.json` cont
 lane and kernel hashes, Build IDs, checks and per-function PC counts. Each variant directory
 contains the raw coverage, trace, guest command outputs and dmesg.
 
+## NFS proxy M0 legacy baseline acceptance (2026-10-13)
+
+PR #17의 M0 변경을 독립 검토한 뒤 코드 커밋
+`2e4d1ab49646205170493fb55911d148cfbc28a4`에서 Linux 호스트와 실제
+x86_64 KVM guest 검증을 다시 수행했다. 검토 범위는 `583896c`의 독립
+`NFSPDLT1`/`NFSPDLT2` golden vector, `93ba2ee`의 Linux topology 및
+fail-closed gate, `20ada7b`의 `linux/amd64` guest build, 사용자 결정에
+따라 Darwin 지원을 범위에서 제거한 `83e4cdb`, 이 코드 커밋의 자동 guest
+replay gate다.
+
+사용한 기준과 산출물은 다음과 같다.
+
+| 항목 | 식별값 |
+| --- | --- |
+| 검증 대상 코드 커밋 | `2e4d1ab49646205170493fb55911d148cfbc28a4` |
+| kernel base / patched tip | `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e` / `7f1a35fcc0e5eac322241632125d2bd926ca31b5` |
+| syzkaller base / patched tip | `801f0966669a37e048adabf9e5f38ce52825ea82` / `bb6b482c4951566957f30e29a4d3b0c96de60a59` |
+| host | Linux `5.15.0-198-generic`, x86_64 |
+| guest relay | Debian 12 `linux/amd64`, SHA-256 `1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38` |
+| guest replay probe | SHA-256 `e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241` |
+| guest deps | SHA-256 `1bc0097d9b6f55b779ad9f47cb37a0ed80e5643915c9d7321c098f3daacaa938` |
+
+호스트에서는 `tools/nfs-proxy/build.sh`와
+`tools/nfs-proxy/build.sh --test`를 각각 실행했다. primary 및
+ASan/UBSan 조합에서 framing 213, walk 1694, delta 86, edit 84,
+golden 422, proxy 56, control 82 checks가 모두 실패 0건으로 통과했다.
+Docker guest build는 실제 `linux/amd64` ELF를 만들었고 provenance와
+이미지 digest를 함께 보존했다. `python3 -m py_compile`, `bash -n`,
+`git diff --check`, syzkaller `go test ./sys/linux/...`도 통과했다.
+`shellcheck`는 이 호스트에 설치되어 있지 않아 실행하지 않았다. 존재하지
+않는 arm은 arm별 `rc=2`, 전체 `rc=1`로 종료되어 wrapper가 실패를 숨기지
+않음을 확인했다.
+
+다음 명령으로 동일 KASAN guest에서 세 arm을 각각 한 번 실행했다.
+
+```sh
+OUT=/home/fuzzer/prune-evidence/m0-issue19-final-83e4 \
+IMAGE=/home/fuzzer/prune-env-image.raw \
+docs/handoff/proxy-variable-length-edits/run-verify.sh \
+  env kasan legacy-v1 legacy-v2 legacy-v2-refusal
+```
+
+| arm | live oracle | 생성 delta 및 replay | 결과 |
+| --- | --- | --- | --- |
+| `legacy-v1` | 네 client/backend route가 모두 connect 및 양방향 전달, `armed=2`, `expired=2`, `applied=2`, 오류 counter 0 | C2S/S2C `NFSPDLT1` 두 개 exact replay 성공; original mismatch와 `applied_count` mismatch는 proxy `rc=1` | arm `rc=0`, KCOV `.extra` 1/1, fatal dmesg 0 |
+| `legacy-v2` | `edit_applied=1`, 오류 counter 0 | resize `NFSPDLT2` exact replay 성공; original mismatch와 `applied_count` mismatch는 proxy `rc=1` | arm `rc=0`, KCOV `.extra` 1/1, fatal dmesg 0 |
+| `legacy-v2-refusal` | `edit_applied=0`, `edit_refused_orig=1` | live refusal delta의 replay도 `expected=0`, `applied=0`, `refused_orig=1`, proxy `rc=1` | arm `rc=0`, KCOV `.extra` 1/1, fatal dmesg 0 |
+
+원본 delta, 파생 mismatch delta, bounded log, `result.json`, 실행 명령과
+입력 해시는 [보존 증거](evidence/m0-legacy-baseline-20261013/)에 있으며
+`SHA256SUMS` 33개 항목을 모두 재검증했다. 이 검증은 Linux 호스트와
+x86_64 KVM guest 범위를 충족한다. Darwin host와 Docker fallback은
+2026-10-13 사용자 결정 및 `83e4cdb`에 따라 M0 범위에서 제외되었고,
+그 플랫폼에 대한 지원이나 검증 완료를 주장하지 않는다.
+
 ## Related records
 
 - [Normal-flow scope](normal-flow-corpus.md)

@@ -1,6 +1,5 @@
 === sanitizer toolchain probe (gcc) ===
-  gcc -fsanitize=address,undefined: usable (detect_leaks=1)
-  AF_UNIX/SOCK_SEQPACKET runtime: native
+  gcc -fsanitize=address,undefined: usable
 
 === build: test_framing (clang) ===
 === build: test_framing + ASan/UBSan (gcc) ===

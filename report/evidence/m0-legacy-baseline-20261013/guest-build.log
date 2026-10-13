@@ -1,6 +1,5 @@
 === sanitizer toolchain probe (gcc) ===
-  gcc -fsanitize=address,undefined: usable (detect_leaks=1)
-  AF_UNIX/SOCK_SEQPACKET runtime: native
+  gcc -fsanitize=address,undefined: usable
 
 === build: test_framing (clang) ===
 === build: test_framing + ASan/UBSan (gcc) ===
@@ -160,5 +159,5 @@ v1 and v2 arms chained on one record
 === build: scoped nfs-proxy executable (clang) ===
 === host test suite: PASS ===
 bookworm x86-64 guest relay ABI: PASS
-05db7a5b50bee84830c355b9e1d3a765581f1de220e7323a9a240bd714d65361  /tmp/issue19-nfs-proxy
-bookworm relay: /tmp/issue19-nfs-proxy
+1013d4456a86ede71310f8d4f305e814806ac7e4e78b4932fbb2f3c7e48b5d38  /tmp/knfsd-issue19-final-guest.pVLh8G/nfs-proxy
+bookworm relay: /tmp/knfsd-issue19-final-guest.pVLh8G/nfs-proxy
