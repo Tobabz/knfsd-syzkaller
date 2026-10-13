@@ -269,9 +269,9 @@ Protocol Schema Normalizer
 ProtocolSchema(schema_id)
 ```
 
-Gap analysis 단계에서 exact implementation language/file format을 확정하지 않는다.
-첫 implementation milestone에서 source placement, normalizer language, generated
-artifact format을 함께 결정한다.
+M2에서 normalizer language와 generated artifact format을 정했다. Python 표준 라이브러리 script
+(`tools/nfs-proxy/schema/normalize.py`)가 commit된 C table을 만들고, `build.sh`가 table이 최신인지
+확인한다. 상세는 `02-semantic-decoder.md`의 한계와 미결 사항에 있다. NFS XDR source 반입은 남았다.
 
 ### 6. NFS Semantic Decoder
 

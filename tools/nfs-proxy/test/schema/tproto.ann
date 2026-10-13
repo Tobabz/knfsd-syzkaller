@@ -1,0 +1,13 @@
+# Semantic annotations for the tproto host-test protocol.
+family tproto
+program TPROTO_PROGRAM TPROTO_V1
+procedure-prefix TPPROC_
+leaf args result
+operation request tp_argop args OP_
+operation response tp_resop result OP_
+status-type tp_status
+minor-field COMPOUND_args minorversion
+minor 0 tproto-m0.x
+minor 1 tproto-m1.x
+# Every other case label keeps its lowercased XDR name (tk_file, ...).
+branch TP_OK ok

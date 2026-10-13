@@ -4,8 +4,8 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/relay/control tests under clang
-and GCC ASan+UBSan. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
+`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/relay/control tests under clang
+and GCC ASan+UBSan, after the ProtocolSchema normalizer's tests and a freshness check of every generated schema table. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
 delta files independently of their writer and reader. `build.sh` also compiles
 the guest delta-replay probe as a build-only regression gate. The host tests
 run on Linux only: `test_control` uses `AF_UNIX/SOCK_SEQPACKET`, the real legacy
@@ -114,6 +114,25 @@ beside the legacy arm path and change none of its bytes or coordinates.
   `nfsp_rpc_record` before the legacy `on_record` and may refuse it, which closes the
   connection without forwarding (`record_refused`). With both callbacks NULL, as in
   `main.c` today, the relay behaves exactly as before.
+
+## Target semantic path: ProtocolSchema and NFS Semantic Decoder (M2)
+
+[06 §25](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+contract in [02](../../docs/design/03-nfs-proxy/02-semantic-decoder.md).
+
+- `schema/normalize.py` reads pinned XDR and an annotation file and writes constant C tables
+  (`src/schema.h`). The tables are committed; `build.sh` regenerates them and fails on any
+  difference. See [schema/README.md](schema/README.md) for the annotation grammar, path rules
+  and what the normalizer refuses.
+- `src/nfs_decode.*` interprets those tables over a CALL or REPLY body and emits one
+  `SemanticField` per XDR node, each with a `WireRef` (encoded, value and length/count/
+  discriminant/padding spans in `rpc_payload` coordinates). Any status other than `decoded`
+  leaves no fields behind.
+- A REPLY is decoded only from `reply_dispatch`. Without it the status is
+  `transaction_context_missing`; for NFSv4 without a minor version it is `dispatch_incomplete`.
+  `test_fixture` dispatch is refused outside host tests.
+- Only synthetic test schemas exist so far (`test/schema/`). NFS XDR is not yet in the
+  repository, so every NFS message is `unsupported_schema`. Nothing in `main.c` calls the decoder.
 
 ## Building
 

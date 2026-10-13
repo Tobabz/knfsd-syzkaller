@@ -1,0 +1,7 @@
+# Semantic annotations for the tflat host-test protocol.
+family tflat
+program TFLAT_PROGRAM TFLAT_V2
+procedure-prefix TFPROC_
+status-type tf_status
+source tflat.x
+branch TF_OK ok
