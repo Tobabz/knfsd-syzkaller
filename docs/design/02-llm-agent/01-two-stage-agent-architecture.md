@@ -306,7 +306,7 @@ gate의 neutral run에도 rule set을 설치한다. 결과는 oracle이 아니�
 CrashEvidence는 rule별·intent별·generation별 vector 전체를 보존한다. hypothesis 단위 결론은 §7.1의
 `HypothesisM1(CrashContextWindow)`로 내린다(issue #5).
 
-`Q2=no`는 `M1=NOT_APPLIED`와 절대 같은 결과로 취급하지 않는다. `M1=APPLIED`이고 `Q2=no`여도
+`Q2=NOT_OBSERVED`는 `M1=NOT_APPLIED`와 절대 같은 결과로 취급하지 않는다. `M1=APPLIED`이고 `Q2=NOT_OBSERVED`여도
 "유효한 non-trigger"라는 결론은 내리지 않는다.
 
 ## 4. Stage 1 — Reachability Harness
@@ -711,6 +711,74 @@ CrashEvidence
     replay result
 ```
 
+### 8.2 Q2 판정
+
+이 절은 issue #18 F7에서 고정했다. Q2 Judge는 Controller 측 validation layer에서 실행하고(§11.1), Runner가
+봉인한 bundle만 읽는다. 단위는 Stage 2 execution 하나(baseline gate 실행, fuzz VM instance의 실행 구간, replay
+실행)다.
+
+```text
+Q2Status
+    OBSERVED
+    NOT_OBSERVED
+    INCONCLUSIVE
+```
+
+Judge 입력(Runner가 수집하고 봉인한다):
+
+```text
+Q2Evidence
+    execution_harness_identity       # host-stamped. sanitizer variant config 포함 (§11.2)
+    console_log_ref                  # host가 캡처한 guest console
+    console_log_completeness         # complete | truncated | missing (host가 기록)
+    manager_crash_reports[]          # syz-manager가 만든 report 원문
+    vm_termination                   # host-observed: runner_stopped | guest_crashed | lost | unknown
+    collection_window                # 수집 시작 / 끝 marker
+```
+
+Q2 JudgeProfile은 다음을 정한다. 바꾸면 새 profile version이며, 같은 봉인 bundle에 새 verdict를 만든다.
+기존 evidence와 verdict는 고치지 않는다(§11.1).
+
+```text
+JudgeProfile(Q2)
+    signal_classes[]       # 신호로 세는 report 종류. 예: KASAN, KMSAN, UBSAN, KCSAN, WARNING,
+                           # BUG, panic, hang. 각 class에 fatal / nonfatal 표시
+    parse_rules            # report를 class로 분류하는 규칙, 잘린 report의 처리
+    completeness_rule      # NOT_OBSERVED에 필요한 관측 완료 조건
+    termination_rules      # vm_termination 값별 해석
+```
+
+판정 순서. 위에서부터 처음 맞는 행을 적용한다.
+
+| 순서 | 조건 | 결과 |
+|---|---|---|
+| 1 | manifest 검증 실패, correlation 불일치, 내부 모순(§11.1) | `INCONCLUSIVE(invalid_evidence)` |
+| 2 | profile의 `signal_classes`로 분류된 report가 하나 이상 있다 | `OBSERVED` |
+| 3 | report가 없고 `completeness_rule`을 만족한다. 기본: console log `complete`, `collection_window`가 닫힘, `vm_termination = runner_stopped` | `NOT_OBSERVED` |
+| 4 | 그 밖. 예: log `truncated` / `missing`, `vm_termination`이 `lost` / `unknown`, 분류할 수 없는 report, report 없이 `guest_crashed` | `INCONCLUSIVE(reason)` |
+
+```text
+Q2Result                         # Q2 Judge 출력
+    evidence_manifest_sha256
+    judge_profile_id
+    status
+    reason?
+    signals[]
+        class
+        fatal                    # report class의 성질. VM 종료 여부와 별개다
+        report_ref
+    vm_termination
+    candidate_association?       # triage metadata. 판정에 쓰지 않는다 (§8)
+```
+
+- nonfatal report(VM이 계속 실행된 WARNING, 복구된 sanitizer report)도 `OBSERVED`다. VM 종료는 별도 field이며
+  신호의 조건이 아니다.
+- 유효한 신호는 crash site나 stack에 candidate symbol이 없다는 이유로 거부하지 않는다. candidate 연관은
+  `candidate_association` triage와 이후 review가 다룬다.
+- 로그 유실, 잘림, 수집 실패를 관측 완료 증거 없이 `NOT_OBSERVED`로 합성하지 않는다.
+- `OBSERVED`는 candidate 원인성이나 semantic replay equivalence를 주장하지 않는다. 그 판단은 §3의 표와
+  `03-nfs-proxy/05` §29가 한다.
+
 ## 9. Reproduction identity
 
 Mutation-driven crash의 재현 단위는 syz program 하나가 아니다.
@@ -848,7 +916,7 @@ verdict = Judge(봉인된 evidence bundle, JudgeProfile, plan / rule set)
 JudgeProfile                     # 버전이 있는 Repository Design Data
     Q1    Q1AdmissibilityProfile: generation integrity, context별 loss 규칙 (`06` §6.1)
     M1    §7 판정 의미, journal / evidence 유효성 규칙
-    Q2    sanitizer / crash report 분류 규칙
+    Q2    signal class, report 분류, 관측 완료 조건, 종료 해석 (§8.2)
     Replay  batch-signature / delivery 비교 의미, schema·runtime 호환 확인, evidence 유효성 규칙,
             refusal 분류(normal non-match / hard refusal / incompatibility), refusal evidence
             완전성, 판정 순서 (`03-nfs-proxy/05` §29, issue #18 F2)
@@ -872,7 +940,7 @@ state(§7.2)는 M1과 분리된 evidence이며 어떤 policy도 M1 판정을 바
 - manifest hash가 맞지 않는 bundle은 invalid evidence다.
 - invalid evidence, 내부 불일치(서로 모순인 counter, sequence가 끊긴 journal), correlation 불일치로는 확정
   verdict(REACHED / NOT_REACHED, APPLIED / NOT_APPLIED)를 내리지 않는다. 그 Judge는 `INCONCLUSIVE`와
-  reason을 기록한다. Q2 상태 집합은 Q2 judge 세부에서 정하되 같은 규칙을 따른다.
+  reason을 기록한다. Q2는 §8.2의 순서 1에서 같은 규칙을 따른다.
 - replay 비교도 같다. 검증에 실패한 bundle로는 비교 verdict를 내지 않는다. `REPLAY_INVALID`는 유효하게
   봉인된 replay에서 비교 전제가 성립하지 않을 때만 쓴다(`03-nfs-proxy/05` §29).
 - evidence가 repair 입력으로 Agent에 전달될 때도 data로만 다루며 지시로 해석하지 않는다.
@@ -1094,6 +1162,13 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
 10. `MutationEvidence` / M1 judge — 판정 계약은 §7(issue #4), judge 실행 위치와 evidence 신뢰 경계는
     §11.1(issue #11)에 고정
 11. `CrashEvidence` / Q2 judge — Q2 경계와 `CrashContextWindow`는 §8(issue #2, #4), judge 실행 위치는
-    §11.1(issue #11)에 고정. Q2 분류 규칙(`JudgeProfile` Q2)은 미정
+    §11.1(issue #11), 입력·상태·판정 순서·`Q2Result`는 §8.2(issue #18 F7)에 고정. 첫 `JudgeProfile(Q2)`의
+    `signal_classes`와 `parse_rules` 내용은 Q2 Judge 구현에서 정한다. Q2 Judge 통합은 Proxy milestone과 별개의
+    acceptance gate를 가진다. Proxy replay 완료가 이 gate를 대신하지 않는다.
+    - stack에 candidate symbol이 없는 유효한 sanitizer report fixture가 `OBSERVED`다.
+    - nonfatal report fixture가 VM 종료 없이 `OBSERVED`다.
+    - log를 자르거나 지운 bundle은 `NOT_OBSERVED`가 아니라 `INCONCLUSIVE`다.
+    - complete log, 닫힌 collection window, `runner_stopped`이고 report가 없을 때만 `NOT_OBSERVED`다.
+    - profile을 바꾼 재판정은 기존 verdict를 고치지 않고 새 verdict를 만든다.
 12. repair/state graph
 13. Agent SDK concrete selection and agent/tool definitions
