@@ -156,7 +156,13 @@ runtime-only -> replay identity 아님
 `connection_id`가 될 수 없다. 이 값들은 reuse될 수 있거나 같은 route에 여러
 connection이 동시에 존재할 수 있다.
 
-Concrete ID 생성 방식은 구현 단계에서 정한다.
+구현(M1)은 `connection_id`를 Proxy 실행마다 1부터 시작하는 64-bit 단조 증가 카운터로 정했다.
+accept할 때 하나를 할당하고 slot이나 fd에서 유도하지 않는다. 0은 할당되지 않은 slot을 뜻하므로
+ID로 쓰지 않는다. 64-bit라 한 실행 안에서 wrap에 도달할 수 없다고 보고 wrap 처리는 두지 않는다.
+실행마다 다시 1부터 시작하므로 Proxy process 경계를 넘는 identity로는 쓸 수 없고, 이는 위의
+runtime-only 요구와 같다. 구현은 `tools/nfs-proxy/src/proxy.c`의 `next_connection_id`와
+`tools/nfs-proxy/src/rpc_record.h`의 `struct nfsp_connection_ref`이고, slot을 재사용한 연결이
+새 ID를 받는지는 `tools/nfs-proxy/test/test_proxy.c`의 `test_connection_id_not_reused`가 확인한다.
 
 ### 3. TransactionKey
 
@@ -894,7 +900,7 @@ Transaction Context가 correct request/reply semantic context를 공급함만 �
   response decode와 consistency 검증은 `forwarded`를 쓴다(issue #7).
 - **결정됨:** context memory/lifetime은 bounded여야 한다.
 - **결정됨:** full raw request 장기 보존은 기본 계약이 아니다.
-- **미결:** concrete `connection_id` 생성 방식.
+- **결정됨:** `connection_id`는 Proxy 실행마다 1부터 시작하는 64-bit 단조 증가 카운터다(§2, M1).
 - **미결:** timeout / completed-retention / capacity의 numeric values.
 - **미결:** request equivalence fingerprint 구현 방식.
 - **미결:** rule dependency에 따른 `semantic_context[]` exact typed representation.
