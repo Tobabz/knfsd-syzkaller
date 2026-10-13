@@ -50,6 +50,16 @@ def tar_member_sha256(path, suffix):
         return hashlib.sha256(stream.read()).hexdigest()
 
 
+def capture_dmesg(vm, output, result):
+    dmesg = vm.guest("dmesg", "dmesg", check=False).stdout
+    (output / "dmesg.txt").write_text(dmesg)
+    result["dmesg_fatal"] = [m.group(0) for m in FATAL.finditer(dmesg)][:5]
+
+
+def write_result(output, result):
+    (output / "result.json").write_text(json.dumps(result, indent=1))
+
+
 def delta_metadata(path):
     data = path.read_bytes()
     if len(data) < 60:
@@ -355,15 +365,25 @@ def main():
         if args.replay_probe:
             install += "; install -m 0755 /tmp/replay-probe %s/replay-probe" % DRV
         vm.guest("install", install, timeout=120)
-        if args.legacy_profile:
-            relay_sha256 = tar_member_sha256(args.deps, "/usr/sbin/nfs-proxy")
-            inventory = vm.guest(
-                "guest-inventory",
-                "uname -m; sha256sum /opt/kcov-nfs/deps/usr/sbin/nfs-proxy "
-                "%s/replay-probe" % DRV).stdout.strip()
-            result["guest_inventory"] = inventory.splitlines()
-            if not inventory.startswith("x86_64\n") or relay_sha256 not in inventory:
-                raise ValueError("guest architecture/relay identity mismatch: %r" % inventory)
+        relay_sha256 = tar_member_sha256(args.deps, "/usr/sbin/nfs-proxy")
+        inventory_command = (
+            "uname -m; uname -r; "
+            "sha256sum /opt/kcov-nfs/deps/usr/sbin/nfs-proxy")
+        if args.replay_probe:
+            inventory_command += " %s/replay-probe" % DRV
+        inventory = vm.guest("guest-inventory", inventory_command).stdout.strip()
+        inventory_lines = inventory.splitlines()
+        result["guest_inventory"] = inventory_lines
+        identity_mismatch = (len(inventory_lines) < 3 or
+                             inventory_lines[0] != "x86_64" or
+                             not inventory_lines[1] or
+                             relay_sha256 not in inventory)
+        if args.replay_probe:
+            identity_mismatch = (identity_mismatch or
+                                 sha256(args.replay_probe) not in inventory)
+        if identity_mismatch:
+            raise ValueError("guest architecture/kernel/binary identity mismatch: %r" %
+                             inventory)
         root = vm.guest("root", "mktemp -d /tmp/frozen-phase9.XXXXXX").stdout.strip()
         setup = vm.guest("setup", shlex.join([DRV + "/lane.sh", "setup", root,
                                               str(args.procs)]), timeout=300)
@@ -383,10 +403,12 @@ def main():
                        "timeout 600 %s > /tmp/exec.log 2>&1; echo rc=$?"
                        % shlex.join(cmd), timeout=700)
         result["execprog_rc"] = run.stdout.strip()
-        if result["execprog_rc"] != "rc=0":
-            raise ValueError("syz-execprog failed: %s" % result["execprog_rc"])
         log = vm.guest("exec-log", "cat /tmp/exec.log", check=False).stdout
         (args.output / "executor.log").write_text(log)
+        if result["execprog_rc"] != "rc=0":
+            capture_dmesg(vm, args.output, result)
+            write_result(args.output, result)
+            raise ValueError("syz-execprog failed: %s" % result["execprog_rc"])
         calls = re.findall(r"CALL (\d+): signal \d+, coverage \d+ errno (\d+)", log)
         result["calls"] = len(calls)
         result["calls_errno_nonzero"] = sum(1 for _, e in calls if e != "0")
@@ -435,10 +457,9 @@ def main():
                         str(args.output / "cov.tgz")], check=True)
         vm.guest("cleanup", shlex.join([DRV + "/lane.sh", "cleanup", root]),
                  timeout=300, check=False)
-        dmesg = vm.guest("dmesg", "dmesg", check=False).stdout
-        (args.output / "dmesg.txt").write_text(dmesg)
-        result["dmesg_fatal"] = [m.group(0) for m in FATAL.finditer(dmesg)][:5]
-        if args.legacy_profile and result["dmesg_fatal"]:
+        capture_dmesg(vm, args.output, result)
+        if result["dmesg_fatal"]:
+            write_result(args.output, result)
             raise ValueError("fatal guest diagnostics: %r" % result["dmesg_fatal"])
     finally:
         vm.stop()
@@ -456,7 +477,7 @@ def main():
     result["extra_pcs"] = len(pcs)
     result["extra_fs_nfsd"] = sum(1 for l in lines if "fs/nfsd/" in l)
     result["extra_net_sunrpc"] = sum(1 for l in lines if "net/sunrpc/" in l)
-    (args.output / "result.json").write_text(json.dumps(result, indent=1))
+    write_result(args.output, result)
     print(json.dumps({k: v for k, v in result.items()
                       if not k.startswith("stats_") and k != "fixture"}, indent=1))
 

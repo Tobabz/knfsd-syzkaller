@@ -11,8 +11,10 @@
 #   python3 mkinputs.py                         # once; recreates ~/prune-evidence/inputs
 #   qemu-img convert -O raw ENV_DIR/images/bookworm-kcov-fresh.qcow2 ~/prune-env-image.raw
 # To test a rebuilt proxy, build it elsewhere and rebuild the deps tarball:
-#   tools/nfs-proxy/build-guest.sh --out ~/nfsp-build/nfs-proxy-v2
+#   tools/nfs-proxy/build-guest.sh --out ~/nfsp-build/nfs-proxy-v2 \
+#     --probe-out ~/nfsp-build/guest-delta-replay
 #   NFSP_PROXY=~/nfsp-build/nfs-proxy-v2 python3 mkinputs.py
+#   REPLAY_PROBE=~/nfsp-build/guest-delta-replay run-verify.sh ... legacy-v1
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
@@ -58,7 +60,7 @@ for arm in "$@"; do
         --fixture "$fix" --workload "$w" --syz-dir "$env_dir/syzkaller"
         --executions "$executions" --procs "$arm_procs" --output "$out/$arm")
   if [ -n "$profile" ]; then
-    replay_probe=${REPLAY_PROBE:-$repo/tools/nfs-proxy/build/guest-delta-replay}
+    replay_probe=${REPLAY_PROBE:?legacy profiles require the guest-built replay probe from build-guest.sh}
     args+=(--legacy-profile "$profile" --replay-probe "$replay_probe")
   fi
   rc=0

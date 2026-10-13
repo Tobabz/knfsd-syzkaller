@@ -210,9 +210,12 @@ tools/nfs-proxy/build.sh          # clang 빌드 + 단위 테스트 + gcc ASan/U
 그 경로를 `mkinputs.py`에 넘겨 deps를 다시 만든다.
 
 ```sh
-tools/nfs-proxy/build-guest.sh --out ~/nfsp-build/nfs-proxy-v2
+tools/nfs-proxy/build-guest.sh --out ~/nfsp-build/nfs-proxy-v2 \
+  --probe-out ~/nfsp-build/guest-delta-replay
 NFSP_PROXY=~/nfsp-build/nfs-proxy-v2 uv run python docs/handoff/proxy-variable-length-edits/mkinputs.py
 PROCS=4 WORKLOAD=<v2 arm 프로그램> docs/handoff/proxy-variable-length-edits/run-verify.sh <ENV_DIR> kasan raw
+REPLAY_PROBE=~/nfsp-build/guest-delta-replay \
+  docs/handoff/proxy-variable-length-edits/run-verify.sh <ENV_DIR> kasan legacy-v1
 ```
 
 M0 레거시 gate는 `EXECUTIONS=1`, `PROCS=1`로 고정된다. `legacy-v1`은 네

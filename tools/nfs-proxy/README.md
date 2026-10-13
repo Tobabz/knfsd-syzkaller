@@ -11,9 +11,9 @@ the guest delta-replay probe as a build-only regression gate. The host tests
 run on Linux only: `test_control` uses `AF_UNIX/SOCK_SEQPACKET`, the real legacy
 control transport, and `test_proxy` binds its loopback topology (listeners on
 `127.0.0.2`/`.3`, clients on `127.0.0.10`/`.11`). `build-guest.sh --out FILE`
-then creates a Debian bookworm ABI binary for the x86_64 guest: it builds for
-`linux/amd64` whatever the host architecture, checks the ELF machine, and
-records provenance next to the binary. The two backend listeners are routed
+then creates Debian bookworm ABI binaries for the relay and replay probe: it
+builds for `linux/amd64` whatever the host architecture, checks each ELF machine
+and glibc requirement, and records provenance next to both binaries. The two backend listeners are routed
 solely by destination IP, and the source IP identifies the client.
 `SERVER_IMPL=both` provides `.1:2049 → knfsd :20490` and
 `.5:2049 → Ganesha :20491`.
@@ -97,11 +97,14 @@ original does not match what was recorded.
 ## Building
 
 ```sh
-tools/nfs-proxy/build-guest.sh --out bundle/src/nfs-proxy-control-guest
+tools/nfs-proxy/build-guest.sh \
+  --out bundle/src/nfs-proxy-control-guest \
+  --probe-out bundle/src/guest-delta-replay
 ```
 
 Host tests are under `test/`; `build.sh` builds and runs them.
-`test/guest-delta-replay.c` provides a guest replay probe.
+`test/guest-delta-replay.c` provides the replay probe source. Do not use the
+host-build copy for guest validation; use the `--probe-out` artifact above.
 
 Build the syzkaller integration with [bootstrap](../../README.md#2-provision-the-fuzzing-environment-build--bake),
 which applies the complete checked-in patch series and builds the binaries.
