@@ -2,8 +2,10 @@
 failed, is recorded for its job and sent again by poll() or recover()
 until it is done.  One job's failing call never stops the others."""
 
+import sqlite3
+
 from agent_pipeline.contracts import (AnalysisOutput, GapClass, GapRef,
-                                      Q1Status)
+                                      PlanOutput, Q1Status)
 from agent_pipeline.controller.records import JobState
 
 from .fakes import OTHER_COMMIT, binding, function_submission, sha
@@ -210,4 +212,75 @@ def test_failed_agent_start_on_recover_is_sent_again(world):
     assert world.agents.requests[-1].attempt == 3
     world.analysis(j)
     assert world.job(j).state is JobState.S1_PLANNING
+    world.expected_failures = 1
+
+
+def lock_next_commit(world):
+    """The next transition commit fails as if another writer held the
+    database; the attempt row written before it stays."""
+    real = world.store.commit
+    hit = []
+
+    def commit(*a, **kw):
+        if not hit:
+            hit.append(1)
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **kw)
+    world.store.commit = commit
+
+
+def test_stored_agent_result_is_applied_by_poll(world):
+    j = world.submit()
+    p = world.job(j).pending_task
+    lock_next_commit(world)
+    world.analysis(j)
+    assert world.store.attempt(p.task_id, 1).status == "succeeded"
+    job = world.job(j)
+    assert job.state is JobState.S1_ANALYSIS and job.pending_task == p
+    assert effects(world, j) == ["agent_result"]
+    assert world.c.poll() == []
+    job = world.job(j)
+    assert job.state is JobState.S1_PLANNING
+    assert job.analysis_ref == sha("analysis-1")
+    world.c.replay(j)
+    world.expected_failures = 1
+
+
+def test_stored_agent_failure_is_applied_by_poll(world):
+    j = world.submit()
+    p = world.job(j).pending_task
+    lock_next_commit(world)
+    world.c.on_agent_failure(p.task_id, 1, "model_timeout")
+    assert world.store.attempt(p.task_id, 1).status == "failed"
+    assert world.job(j).counters.agent_retry == 0
+    world.c.poll()
+    job = world.job(j)
+    assert job.counters.agent_retry == 1               # retried once
+    assert job.state is JobState.S1_ANALYSIS
+    assert job.pending_task.task_id != p.task_id
+    assert world.agents.requests[-1].task_id == job.pending_task.task_id
+    world.c.poll()                                     # applied once
+    assert world.job(j).counters.agent_retry == 1
+    world.expected_failures = 1
+
+
+def test_result_inside_start_with_a_failed_commit(world):
+    """The executor answers from inside start(); the transition of that
+    answer fails to commit."""
+    j = world.submit()
+    world.analysis(j)                      # planning is pending now
+    world.agents.start = lambda req: (
+        lock_next_commit(world),
+        world.c.on_agent_result(req.task_id, req.attempt,
+                                PlanOutput(plan_ref=sha("plan-1")), "m"))
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()          # restarts planning
+    job = world.job(j)
+    assert job.state is JobState.S1_PLANNING
+    assert world.store.attempt(job.pending_task.task_id,
+                               job.pending_task.attempt).status == \
+        "succeeded"
+    world.c.poll()
+    assert world.job(j).state is JobState.S1_RUNNING
+    world.c.replay(j)
     world.expected_failures = 1

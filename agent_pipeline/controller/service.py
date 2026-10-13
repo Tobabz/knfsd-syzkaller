@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable
 
+from pydantic import TypeAdapter
+
 from ..artifacts import ArtifactStore
 from ..components import HarnessRegistry, IssueTracker
 from ..contracts import (AgentOutput, CandidateSubmission, GapRef,
@@ -30,6 +32,7 @@ from .tasks import AgentExecutor, AgentRequest, Runner, RunnerInput
 FINAL = ("sealed", "ended_unsealed")
 #: Agent attempt states that can still give a result.
 LIVE = ("sending", "running")
+AGENT_OUTPUT = TypeAdapter(AgentOutput)
 
 
 class ReplayMismatch(Exception):
@@ -135,9 +138,11 @@ class Controller:
             self.store.save_attempt(a.model_copy(update={
                 "status": "succeeded", "model_id": model_id,
                 "output_ref": ref}))
-        self._apply(job_id, ev.AgentSucceeded(task_id=task_id,
-                                              attempt=attempt, output=output,
-                                              model_id=model_id))
+        # Stored first: if this transition fails, poll() applies it from
+        # the stored attempt.
+        self._guard(job_id, "agent_result", lambda: self._apply(
+            job_id, ev.AgentSucceeded(task_id=task_id, attempt=attempt,
+                                      output=output, model_id=model_id)))
 
     def on_agent_failure(self, task_id: str, attempt: int,
                          failure: str) -> None:
@@ -145,8 +150,10 @@ class Controller:
         if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
                 "status": "failed", "failure": failure}))
-        self._apply(job_of(task_id), ev.AgentFailed(
-            task_id=task_id, attempt=attempt, failure=failure))
+        job_id = job_of(task_id)
+        self._guard(job_id, "agent_result", lambda: self._apply(
+            job_id, ev.AgentFailed(task_id=task_id, attempt=attempt,
+                                   failure=failure)))
 
     def approve(self, job_id: str, task_id: str, review_manifest_sha256: str,
                 decision_id: str) -> None:
@@ -238,6 +245,17 @@ class Controller:
                 # late result of this one makes no transition (09 §8).
                 self._apply(job_id, ev.AgentAttemptRestarted(
                     task_id=p.task_id, attempt=p.attempt + 1))
+            elif a.status == "succeeded":
+                # The result was stored but its transition did not commit.
+                self._apply(job_id, ev.AgentSucceeded(
+                    task_id=p.task_id, attempt=p.attempt,
+                    output=AGENT_OUTPUT.validate_json(
+                        self.artifacts.get(a.output_ref)),
+                    model_id=a.model_id or ""))
+            elif a.status == "failed":
+                self._apply(job_id, ev.AgentFailed(
+                    task_id=p.task_id, attempt=p.attempt,
+                    failure=a.failure or ""))
             return
         if p is None or p.kind is not TaskKind.RUNNER or \
                 job.cancelling_tasks:
