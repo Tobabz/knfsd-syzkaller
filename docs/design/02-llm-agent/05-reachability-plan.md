@@ -294,8 +294,17 @@ runtime 입력이 아니다.
 공통 runtime 검사는 corpus tooling과 같은 논리를 재사용할 수 있다. `tools/audit-normal-corpus.py`의 corpus
 정리·admission 규칙은 harness 계약으로 따로 채택하지 않는 한 적용하지 않는다.
 
-review manifest는 실행 전에 검증된 program, runtime selection과 materialize 대상 ExecutionHarnessIdentity를
-hash로 묶는다(approval binding). identity가 바뀌면 harness를 다시 materialize한다(01 §11.2).
+**neutral control program (issue #18 F6).** ambient control(06 §11)의 neutral program은 Agent가 만들지 않는다.
+Materializer는 repository가 관리하는 neutral control catalog에서 harness의 runtime selection(profile / NFS
+version, fixture mode, route / topology)에 맞는 entry 하나를 고른다. catalog는 HCAP이 `authority_refs`로 digest를
+참조하는 trusted artifact이며 위치는 첫 Stage 1 Materializer 통합에서 정한다. 고른 bytes도 scenario program과
+같은 parse와 call admission 검사(04 §3.1)를 거치며, lane acquisition 밖의 call이 있으면 거부한다. 맞는 entry가
+없으면 Materializer는 `neutral_control_unavailable`로 거부하고, Controller는 `fixture_or_tool` gap
+(`missing_capability_id = neutral_control.<profile>`)으로 보낸다(07 §4). Agent가 제안한 neutral program은 받지
+않는다.
+
+review manifest는 실행 전에 검증된 program, neutral control program, runtime selection과 materialize 대상
+ExecutionHarnessIdentity를 hash로 묶는다(approval binding). identity가 바뀌면 harness를 다시 materialize한다(01 §11.2).
 
 현재 capability가 부족하면 Materializer가 source를 즉석에서 수정하지 않는다.
 별도 Harness Extension Work에서 필요한 syzlang/pseudo-syscall/fixture/tool 확장을 구현·검증한 뒤
@@ -310,7 +319,7 @@ ReachabilityHarness
     fixture mode                    # single | broad-knfsd
     route / topology identity       # Stage 2가 변조할 proxied route
     syz_program / selected seed     # Agent 제안, Materializer 검증 (§11)
-    neutral control program         # ambient control (06 §11)
+    neutral control program         # catalog에서 선택, Materializer 검증 (§11, 06 §11)
     fixture actions
     manager/runtime configuration
     required capability IDs
@@ -341,6 +350,7 @@ Materialization failure (typed reason -> Reachability Planning repair)
     call_unresolved              # pinned build에 없는 call
     call_not_admitted            # CallAdmissionProfile에 없거나 required capability 밖
     disallowed or unavailable call
+    neutral_control_unavailable  # catalog에 맞는 neutral entry 없음 -> fixture_or_tool gap
     profile / fixture / route mismatch
     invalid runtime selection
 

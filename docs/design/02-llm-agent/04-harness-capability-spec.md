@@ -43,7 +43,8 @@ rendered Markdown (이 문서)
 - `hcap_revision`은 canonical machine-readable HCAP의 digest다. Controller가 job을 harness에 묶을 때 그
   harness를 기술하는 revision을 고르고, plan과 verdict가 이 값을 기록한다(`01` §11.2, issue #13).
 - HCAP data는 `missing_capability_id`의 controlled vocabulary도 담는다(`07` §3, issue #13). 예:
-  `state_lineage`, `remote_kcov.context.<context>`, `remote_kcov.kernel_revision.<commit>`.
+  `state_lineage`, `remote_kcov.context.<context>`, `remote_kcov.kernel_revision.<commit>`,
+  `neutral_control.<profile>`(`05` §11).
 - Controller는 plan의 `required_capabilities`, `status`, `usable_by`를 이 데이터로 검증한다. Harness
   Materializer는 program의 call을 `CallAdmissionProfile`(§3.1)로 capability에 대조하고, Mutation Rule
   Compiler는 promoted semantic registry(§4)를 쓴다.

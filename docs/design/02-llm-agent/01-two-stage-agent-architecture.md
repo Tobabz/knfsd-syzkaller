@@ -276,6 +276,11 @@ gate의 neutral run에도 rule set을 설치한다. 결과는 oracle이 아니�
 - gate의 neutral run에서 `APPLIED`인 rule은 `ambient_applied`로 기록한다. M1 판정은 바뀌지 않는다.
 - 관측되지 않음은 그 control window에서 보지 못했다는 뜻일 뿐이다. scenario가 Q1이나 M1을 일으켰다는
   증명이 아니다.
+- control evidence가 invalid하거나 control을 실행하지 못했으면 `ambient_control_unavailable`을 기록한다
+  (`06` §11, issue #18 F6). 관측되지 않음으로도, scenario 도달성이 유지됐다는 확인으로도 바꾸지 않는다. gate의
+  neutral run에서 M1이 `INCONCLUSIVE`인 rule은 `ambient_applied`도 알 수 없다고 기록한다. 이 경우도 위 표의
+  경로와 Q1/M1/Q2 판정을 바꾸지 않는다.
+- neutral program은 Agent가 아니라 repository의 trusted catalog에서 Materializer가 고르고 검증한다(`05` §11).
 - 두 flag는 인과 해석만 한정한다. scenario traffic을 주장하는 hypothesis에는 그 traffic을 구분하는 typed
   selector/predicate나 matched-control evidence가 필요하다. background traffic을 의도한 strategy에서는
   `ambient_applied` rule도 hypothesis에 남을 수 있다. campaign 경로는 §7.1의 hypothesis 집계를
@@ -701,7 +706,8 @@ CrashEvidence
     crash signature
     candidate association triage metadata?   # oracle 아님
     ambient control flags                    # target_ambient_observed, ambient_applied[],
-                                             # q1_preservation_unverifiable (§3)
+                                             # q1_preservation_unverifiable,
+                                             # ambient_control_unavailable (§3)
     replay result
 ```
 
