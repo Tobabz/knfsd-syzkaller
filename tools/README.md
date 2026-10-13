@@ -61,6 +61,9 @@ Ganesha·Mutation Engine 스크립트가 읽는 `KOOV_GANESHA_*`, `KOOV_NFS_PROX
 ## syzkaller 재빌드 조건과 두 축
 
 bootstrap은 기본적으로 syzkaller를 처음부터 빌드합니다. `--skip-build`는 기존 커널·syzkaller 산출물을 재사용합니다.
+빌드할 때 적용한 시리즈 지문을 `images/<variant>/build.json`과 `syzkaller/bin/build.json`에 기록하고,
+`--skip-build`는 기록이 없거나 현재 시리즈와 다르면 재사용하지 않고 이유를 출력하며 실패합니다.
+manifest의 `series_sha256`·`commits`는 이 기록에서 가져옵니다.
 재빌드가 필요한 경우는 아래와 같습니다.
 `make`는 `sys/*/*.txt`·`sys/*/*.const`가 바뀌면 설명 생성(`syz-sysgen`)을 다시 하고, manager·execprog·db·executor가
 모두 그 생성물에 의존하므로 설명이 바뀌면 이들을 함께 다시 만들어야 합니다.

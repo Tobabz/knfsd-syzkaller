@@ -193,7 +193,9 @@ uv run python tools/bootstrap-kcov-env.py env ... --update
 
 Re-running bootstrap with `--update` rebuilds the selected kernels (both by default) and syzkaller
 into the same `env/`, so only the latest kernel images are kept. `--skip-build` reuses existing build
-outputs. The VM image is reused when its bytes and the base image, baker, boot wrapper, service and
+outputs only when the series fingerprint recorded with them (`images/<variant>/build.json`,
+`syzkaller/bin/build.json`) matches the checked-in series; otherwise it fails and asks for a
+rebuild, and the manifest's `series_sha256` and `commits` come from that record. The VM image is reused when its bytes and the base image, baker, boot wrapper, service and
 guest dependencies still match the image metadata; the kernel, lane script and selected version do
 not require a re-bake. By default, every selected variant is booted and checked again.
 

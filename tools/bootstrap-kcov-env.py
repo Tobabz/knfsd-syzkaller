@@ -18,9 +18,11 @@ variant and records its mem_sanitizer.
 TARGET_DIR layout:
   linux/                        patched kernel source tree (never built in)
   syzkaller/                    patched syzkaller tree, binaries in bin/
+                                (bin/build.json: series fingerprint of the binaries)
   build/<variant>/              out-of-tree kernel build (disposable)
   images/<variant>/bzImage      run-time kernel image
   images/<variant>/vmlinux      symbol source for coverage symbolization
+  images/<variant>/build.json   series fingerprint the image was built from
   images/bookworm-kcov-fresh.qcow2 (+ .json)   version-neutral VM image
   manifest.json
 
@@ -30,7 +32,8 @@ Usage (all paths explicit, no host defaults besides REPO auto-detect):
       [--kernel-ref TAG|latest] [--variant kasan|kcsan ...] [--jobs N] \\
       [--skip-build] [--skip-verify]
 
-  --skip-build rebuilds nothing: verifies prebuilt trees only.
+  --skip-build rebuilds nothing: verifies prebuilt trees only. It refuses a
+  build whose recorded series fingerprint differs from the checked-in series.
   --skip-verify stops after the bake (no VM run).
 """
 import argparse
@@ -93,6 +96,52 @@ def series_fingerprint(kind):
     for path in sorted((BUNDLE / kind).glob("*.patch")):
         digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
     return digest.hexdigest()
+
+
+BUILD_RECORD = "build.json"
+
+
+def git_head(tree):
+    return subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, timeout=60,
+                          check=True).stdout.strip()
+
+
+def build_record(kind, tree, base):
+    """What a fresh build was made from: taken right after the series is applied."""
+    head = git_head(tree)
+    commits = int(subprocess.run(
+        ["git", "-C", str(tree), "rev-list", "--count", "%s..%s" % (base, head)],
+        capture_output=True, text=True, timeout=60, check=True).stdout.strip())
+    return {"series_sha256": series_fingerprint(kind), "base": base,
+            "head": head, "commits": commits}
+
+
+def read_build_record(path):
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def stale_build(kind, tree, record_path):
+    """Why a prebuilt output must not be reused, or None when it matches the series.
+
+    Sentinels only show that some series was applied; the record says which one.
+    """
+    record = read_build_record(record_path)
+    if record is None:
+        return "%s has no build record (built before series tracking)" % record_path
+    current = series_fingerprint(kind)
+    if record.get("series_sha256") != current:
+        return "%s series changed since the build: built %s, checked-in %s" % (
+            kind, record.get("series_sha256"), current)
+    head = git_head(tree)
+    if record.get("head") != head:
+        return "%s tree moved since the build: built %s, tree %s" % (
+            kind, record.get("head"), head)
+    return None
 
 
 def describe_changes(previous, current):
@@ -260,7 +309,7 @@ def build_kernel_variant(args, linux, variant):
          "bzImage"], timeout=5400)
 
 
-def export_kernel_images(args, variant):
+def export_kernel_images(args, variant, record):
     """Copy the run-time kernel artifacts out of the disposable build tree.
 
     The new images are staged next to the old ones and swapped in at the end, so a
@@ -282,6 +331,7 @@ def export_kernel_images(args, variant):
     vmlinux = out / "vmlinux"
     if vmlinux.is_file():
         shutil.copy2(vmlinux, staged / "vmlinux")
+    (staged / BUILD_RECORD).write_text(json.dumps(record, indent=2) + "\n")
     if images.exists():
         os.replace(images, previous)
     os.replace(staged, images)
@@ -293,14 +343,20 @@ def export_kernel_images(args, variant):
 def stage_kernel(args, manifest, reuse):
     linux = args.target / "linux"
     rebuilt = True
-    base_commit = KERNEL_COMMIT if args.kernel_ref == KERNEL_TAG else None
     if (reuse and kernel_sentinel(linux) and all(
             (image_dir(args, v) / "bzImage").is_file()
             and (image_dir(args, v) / "bzImage").stat().st_size > 0
             and (image_dir(args, v) / ".config").is_file()
             for v in args.variants)):
+        for variant in args.variants:
+            reason = stale_build("kernel", linux, image_dir(args, variant) / BUILD_RECORD)
+            if reason:
+                raise RuntimeError("--skip-build refuses the %s kernel build: %s; "
+                                   "rerun without --skip-build" % (variant, reason))
         print("reusing kernel build", flush=True)
         rebuilt = False
+        records = {v: read_build_record(image_dir(args, v) / BUILD_RECORD)
+                   for v in args.variants}
     else:
         if args.skip_build:
             raise RuntimeError("--skip-build requires an existing patched kernel tree, variant bzImages and configs")
@@ -327,12 +383,16 @@ def stage_kernel(args, manifest, reuse):
                 raise RuntimeError("linux tree not clean")
             with timed(manifest, "kernel_apply"):
                 run([str(FPORT_APPLY), "kernel", str(linux)], timeout=600)
+            record = build_record("kernel", linux, base_commit)
             for variant in args.variants:
                 with timed(manifest, "kernel_build_" + variant):
                     build_kernel_variant(args, linux, variant)
         with timed(manifest, "kernel_export"):
             for variant in args.variants:
-                export_kernel_images(args, variant)
+                export_kernel_images(args, variant, record)
+        records = {v: record for v in args.variants}
+    # Every variant comes from the one patched tree, so their records agree.
+    record = records[args.variants[0]]
     kernels = {}
     variants = {}
     for variant in args.variants:
@@ -346,12 +406,10 @@ def stage_kernel(args, manifest, reuse):
         }
     manifest["kernel"] = {
         "ref": args.kernel_ref,
-        "base": base_commit,
-        "series_sha256": series_fingerprint("kernel"),
-        "head": subprocess.run(
-            ["git", "-C", str(linux), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=60,
-            check=True).stdout.strip(),
+        "base": record["base"],
+        "series_sha256": record["series_sha256"],
+        "head": record["head"],
+        "commits": record["commits"],
         "variants": variants,
     }
     return kernels, rebuilt
@@ -377,7 +435,12 @@ def syz_binaries_ok(syz):
 
 def stage_syzkaller(args, manifest, reuse):
     syz = args.target / "syzkaller"
+    record_path = syz / "bin" / BUILD_RECORD
     if reuse and syz_binaries_ok(syz) and syz_sentinel(syz):
+        reason = stale_build("syzkaller", syz, record_path)
+        if reason:
+            raise RuntimeError("--skip-build refuses the syzkaller build: %s; "
+                               "rerun without --skip-build" % reason)
         print("reusing syzkaller build", flush=True)
     else:
         if args.skip_build:
@@ -397,17 +460,18 @@ def stage_syzkaller(args, manifest, reuse):
                 raise RuntimeError("syzkaller tree not clean")
             with timed(manifest, "syzkaller_apply"):
                 run([str(FPORT_APPLY), "syzkaller", str(syz)], timeout=600)
+            record = build_record("syzkaller", syz, SYZ_COMMIT)
             with timed(manifest, "syzkaller_build"):
                 run(["make", "-C", str(syz), "-j%d" % args.jobs], timeout=3600)
         if not syz_binaries_ok(syz):
             raise RuntimeError("missing build output after build")
+        record_path.write_text(json.dumps(record, indent=2) + "\n")
+    record = read_build_record(record_path)
     manifest["syzkaller"] = {
-        "base": SYZ_COMMIT,
-        "series_sha256": series_fingerprint("syzkaller"),
-        "head": subprocess.run(
-            ["git", "-C", str(syz), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=60,
-            check=True).stdout.strip(),
+        "base": record["base"],
+        "series_sha256": record["series_sha256"],
+        "head": record["head"],
+        "commits": record["commits"],
     }
     return syz
 
