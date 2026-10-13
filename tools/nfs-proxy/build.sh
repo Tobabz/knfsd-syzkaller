@@ -67,7 +67,9 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_delta:$TEST/test_delta.c:$SRC/delta.c\
        test_edit:$TEST/test_edit.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
        test_golden:$TEST/test_golden.c:$SRC/delta.c:$SRC/edit.c:$SRC/walk.c:$SRC/framing.c\
-       test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c\
+       test_rpc_record:$TEST/test_rpc_record.c:$SRC/rpc_record.c:$SRC/framing.c\
+       test_rpc_decode:$TEST/test_rpc_decode.c:$SRC/rpc_decode.c:$SRC/rpc_record.c:$SRC/walk.c\
+       test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c:$SRC/rpc_record.c:$SRC/rpc_decode.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
@@ -209,7 +211,7 @@ if [ "$MODE" != "--test" ]; then
 	echo "=== build: scoped nfs-proxy executable ($CC) ==="
 	# shellcheck disable=SC2086
 	$CC $CFLAGS -I"$SRC" -o "$BUILD/nfs-proxy" \
-		"$SRC/main.c" "$SRC/proxy.c" "$SRC/framing.c" \
+		"$SRC/main.c" "$SRC/proxy.c" "$SRC/framing.c" "$SRC/rpc_record.c" \
 		"$SRC/control.c" "$SRC/delta.c" "$SRC/walk.c" "$SRC/edit.c"
 fi
 

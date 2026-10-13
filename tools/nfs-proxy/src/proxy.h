@@ -5,10 +5,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rpc_record.h"
+
 #define NFSP_CLIENTS 2u
 #define NFSP_BACKENDS 2u
 #define NFSP_DIR_C2S 0
 #define NFSP_DIR_S2C 1
+
+/* ConnectionRef lifecycle events (on_connection). */
+#define NFSP_CONN_OPENED 0
+#define NFSP_CONN_CLOSED 1
 
 /* One listening address per backend.  Routing is the accepting listener,
  * never arrival order or an RPC field.  Both client source addresses must be
@@ -29,6 +35,8 @@ struct nfsp_proxy_stats {
 	uint32_t delivered[NFSP_CLIENTS][NFSP_BACKENDS][2];
 	uint32_t framing_errors, relay_errors, mutation_errors, rejected_client;
 	uint32_t active, peak_active;
+	/* records the on_rpc_record observer refused, or could not be given */
+	uint32_t record_refused;
 };
 
 struct nfsp_proxy_cfg {
@@ -53,6 +61,23 @@ struct nfsp_proxy_cfg {
 			 const uint8_t *record, size_t len,
 			 const uint8_t **out, size_t *out_len, void *arg);
 	void *on_record_arg;
+	/* The target-path view of the same record (M1): its ConnectionRef,
+	 * direction and marker-free rpc_payload (rpc_record.h).  It runs before
+	 * on_record, sees the record exactly as received, and cannot change
+	 * it; the legacy on_record contract above is untouched.  Returns 0 to
+	 * continue, negative to refuse the record and close this connection
+	 * without forwarding it.  NULL skips canonicalisation entirely, so the
+	 * legacy path pays nothing for it. */
+	int (*on_rpc_record)(const struct nfsp_rpc_record *record, void *arg);
+	void *on_rpc_record_arg;
+	/* ConnectionRef lifecycle: NFSP_CONN_OPENED when a client connection is
+	 * accepted onto a route (before any of its records), NFSP_CONN_CLOSED
+	 * exactly once when it is torn down for any reason, including relay
+	 * shutdown.  A connection whose backend connect fails is opened and
+	 * then closed.  The pointer is valid only during the call. */
+	void (*on_connection)(const struct nfsp_connection_ref *conn, int event,
+			      void *arg);
+	void *on_connection_arg;
 	/* Called by the relay event loop, never from a signal handler.  The
 	 * pointer is an in-thread snapshot; do not retain it after return. */
 	void (*on_stats)(const struct nfsp_proxy_stats *, void *arg);

@@ -4,7 +4,7 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/golden/relay/control tests under clang
+`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/relay/control tests under clang
 and GCC ASan+UBSan. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
 delta files independently of their writer and reader. `build.sh` also compiles
 the guest delta-replay probe as a build-only regression gate. The host tests
@@ -93,6 +93,27 @@ replay for v2 arms uses the distinct `NFSPDLT2` file magic and the same
 `nfsp_apply_edit_rules` function live mode calls; `nfsp_control_close` in
 replay mode fails the same way v1 does when an applied count or a verified
 original does not match what was recorded.
+
+## Target semantic path: RpcRecord, RPC Decoder, ConnectionRef (M1)
+
+These are the first target-architecture components
+([06 §24](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md)). They sit
+beside the legacy arm path and change none of its bytes or coordinates.
+
+- `src/rpc_record.*` turns a framed record into its canonical marker-free
+  `rpc_payload` (a view for one fragment, a concatenation for several) and frames a
+  payload back as one last fragment. Offset 0 of the target coordinate space is the
+  first RPC byte; legacy `walk.c`/`edit.c` offsets still include the marker.
+- `src/rpc_decode.*` decodes only the RFC 5531 envelope of an `rpc_payload`: CALL
+  xid/prog/vers/proc, cred and verifier spans, every REPLY arm, and the body offset.
+  Values outside RFC 5531 fail closed with a named status. A REPLY never claims a
+  procedure.
+- `proxy.c` gives every accepted connection a `connection_id` that is nonzero,
+  monotonic over the run and never derived from a slot or fd. `on_connection` reports
+  opened and closed events; `on_rpc_record` observes each record as an
+  `nfsp_rpc_record` before the legacy `on_record` and may refuse it, which closes the
+  connection without forwarding (`record_refused`). With both callbacks NULL, as in
+  `main.c` today, the relay behaves exactly as before.
 
 ## Building
 

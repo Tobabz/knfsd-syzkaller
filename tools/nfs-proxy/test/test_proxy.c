@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "proxy.h"
+#include "rpc_decode.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -46,6 +47,14 @@ static void timeout_socket(int fd)
 	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+struct conn_event { struct nfsp_connection_ref ref; int event; };
+
+/* Written only by the proxy thread; nev is published after the entry. */
+struct conn_log {
+	struct conn_event ev[64];
+	_Atomic unsigned nev, nclosed;
+};
+
 struct fixture;
 struct fake {
 	struct fixture *parent;
@@ -75,6 +84,7 @@ struct fixture {
 	pthread_mutex_t rendezvous_mutex;
 	pthread_cond_t rendezvous_cond;
 	_Atomic unsigned mutations;
+	struct conn_log conns;
 };
 
 struct job { struct fake *backend; int fd; };
@@ -288,6 +298,18 @@ static int mutate(unsigned client, unsigned backend, int dir,
 	return 0;
 }
 
+static void log_conn(const struct nfsp_connection_ref *ref, int event, void *arg)
+{
+	struct conn_log *l = arg;
+	unsigned n = atomic_load(&l->nev);
+	if (n < 64u) {
+		l->ev[n].ref = *ref;
+		l->ev[n].event = event;
+		atomic_store(&l->nev, n + 1u);
+	}
+	if (event == NFSP_CONN_CLOSED) atomic_fetch_add(&l->nclosed, 1u);
+}
+
 static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrecords)
 {
 	struct sockaddr_in sa = {0};
@@ -323,6 +345,8 @@ static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrec
 	f->cfg.connect_timeout_ms = 250;
 	f->cfg.on_record = mutate;
 	f->cfg.on_record_arg = f;
+	f->cfg.on_connection = log_conn;
+	f->cfg.on_connection_arg = &f->conns;
 	if (pthread_create(&f->proxy_thread, NULL, run_proxy, f) != 0) return -1;
 	pthread_mutex_lock(&f->mutex);
 	while (!f->ready && !f->done)
@@ -420,6 +444,22 @@ static void test_four(void)
 	}
 	CHECK(atomic_load(&f.mutations) == 2, "one C2S and one S2C should mutate, got %u",
 	      atomic_load(&f.mutations));
+	{
+		unsigned n = atomic_load(&f.conns.nev), opened = 0;
+		for (unsigned i = 0; i < n; i++) {
+			if (f.conns.ev[i].event != NFSP_CONN_OPENED) continue;
+			opened++;
+			for (unsigned j = 0; j < i; j++)
+				CHECK(f.conns.ev[j].event != NFSP_CONN_OPENED ||
+				      f.conns.ev[j].ref.connection_id !=
+				      f.conns.ev[i].ref.connection_id,
+				      "two concurrent connections share id %llu",
+				      (unsigned long long)f.conns.ev[i].ref.connection_id);
+		}
+		CHECK(opened == 4 && atomic_load(&f.conns.nclosed) == 4,
+		      "ConnectionRef events opened=%u closed=%u, want 4/4", opened,
+		      atomic_load(&f.conns.nclosed));
+	}
 	CHECK(f.stats.relay_errors == 0 && f.stats.framing_errors == 0,
 	      "unexpected relay/framing error: %u/%u",
 	      f.stats.relay_errors, f.stats.framing_errors);
@@ -502,8 +542,9 @@ static void watchdog(int sig)
 struct raw_backend {
 	int listener;
 	uint16_t port;
-	uint8_t got[64];
+	uint8_t got[256];
 	size_t got_len;
+	size_t want;		/* bytes to wait for; zero means 16 */
 	pthread_t thread;
 };
 
@@ -517,7 +558,7 @@ static void *raw_backend_main(void *arg)
 		ssize_t n = recv(fd, b->got + b->got_len, sizeof(b->got) - b->got_len, 0);
 		if (n <= 0) break;
 		b->got_len += (size_t)n;
-		if (b->got_len >= 16u) break;	/* 10 grown + 6 intact */
+		if (b->got_len >= (b->want ? b->want : 16u)) break;	/* default: 10 grown + 6 intact */
 	}
 	close(fd);
 	return NULL;
@@ -691,6 +732,253 @@ static void test_unframeable_output_refused(void)
 	pthread_cond_destroy(&f.cond);
 }
 
+/* ---- ConnectionRef and the canonical RpcRecord (M1) ----------------------
+ *
+ * The Transaction Context keys on connection_id, so an id that came back
+ * after a reconnect would let a late REPLY find an old connection's CALL. */
+
+static int wait_closed(struct conn_log *l, unsigned want)
+{
+	struct timespec ts = {0, 5 * 1000 * 1000};
+	for (unsigned i = 0; i < 400u; i++) {
+		if (atomic_load(&l->nclosed) >= want) return 0;
+		nanosleep(&ts, NULL);
+	}
+	return -1;
+}
+
+static void test_connection_id_not_reused(void)
+{
+	struct fixture f;
+	uint64_t ids[3] = {0, 0, 0};
+	unsigned n;
+	printf("a reconnect on a reused slot gets a new connection_id\n");
+	if (fixture_up(&f, 0, 0, 1) != 0) { CHECK(0, "fixture setup"); return; }
+	for (unsigned i = 0; i < 3; i++) {
+		int fd = client_socket(&f, 0, 0);
+		CHECK(fd >= 0, "connect %u", i);
+		if (fd < 0) break;
+		CHECK(request(fd, 0, 0, i) == 0 && reply(fd, 0, 0, i) == 0,
+		      "round trip %u", i);
+		close(fd);
+		/* Wait for the proxy to free the slot before reconnecting, so
+		 * the next accept takes the same conns[] slot, the first free
+		 * one. */
+		CHECK(wait_closed(&f.conns, i + 1u) == 0, "connection %u never closed", i);
+	}
+	fixture_down(&f);
+	n = atomic_load(&f.conns.nev);
+	CHECK(n == 6, "%u lifecycle events, want 6", n);
+	for (unsigned i = 0; i < 3 && 2u * i + 1u < n; i++) {
+		const struct conn_event *o = &f.conns.ev[2u * i];
+		const struct conn_event *c = &f.conns.ev[2u * i + 1u];
+		CHECK(o->event == NFSP_CONN_OPENED && c->event == NFSP_CONN_CLOSED,
+		      "connection %u: events must be opened then closed", i);
+		CHECK(o->ref.connection_id == c->ref.connection_id &&
+		      o->ref.client == 0 && o->ref.backend == 0,
+		      "connection %u: close names a different ConnectionRef", i);
+		ids[i] = o->ref.connection_id;
+	}
+	CHECK(ids[0] != 0 && ids[0] < ids[1] && ids[1] < ids[2],
+	      "ids %llu %llu %llu must be nonzero and strictly increasing",
+	      (unsigned long long)ids[0], (unsigned long long)ids[1],
+	      (unsigned long long)ids[2]);
+}
+
+struct observed {
+	unsigned n;
+	struct {
+		uint64_t connection_id;
+		unsigned client, backend;
+		int dir;
+		uint32_t nfrags, xid;
+		size_t len;
+		enum nfsp_rpc_status st;
+		uint8_t payload[64];
+	} rec[4];
+	int refuse;
+};
+
+static int observe_record(const struct nfsp_rpc_record *r, void *arg)
+{
+	struct observed *o = arg;
+	struct nfsp_rpc_envelope e;
+	if (o->refuse) return -1;
+	if (o->n < 4u) {
+		o->rec[o->n].connection_id = r->conn.connection_id;
+		o->rec[o->n].client = r->conn.client;
+		o->rec[o->n].backend = r->conn.backend;
+		o->rec[o->n].dir = r->direction;
+		o->rec[o->n].nfrags = r->nfrags;
+		o->rec[o->n].len = r->rpc_payload_len;
+		o->rec[o->n].st = nfsp_rpc_decode(r->rpc_payload, r->rpc_payload_len, &e);
+		o->rec[o->n].xid = e.xid;
+		memcpy(o->rec[o->n].payload, r->rpc_payload,
+		       r->rpc_payload_len < 64u ? r->rpc_payload_len : 64u);
+		o->n++;
+	}
+	return 0;
+}
+
+/* A 40-byte NFSv4 COMPOUND CALL envelope with AUTH_NONE cred and verifier. */
+static void rpc_call(uint8_t *p, uint32_t xid)
+{
+	const uint32_t w[10] = {xid, 0, 2, 100003, 4, 1, 0, 0, 0, 0};
+	for (unsigned i = 0; i < 10; i++) {
+		uint32_t be = htonl(w[i]);
+		memcpy(p + 4u * i, &be, 4);
+	}
+}
+
+/* One raw backend behind both routes, observed by observe_record. */
+static int raw_proxy_up(struct fixture *f, struct raw_backend *rb, struct observed *o)
+{
+	struct sockaddr_in sa = {0};
+	socklen_t slen = sizeof(sa);
+	memset(f, 0, sizeof(*f));
+	pthread_mutex_init(&f->mutex, NULL);
+	pthread_cond_init(&f->cond, NULL);
+	rb->listener = socket(AF_INET, SOCK_STREAM, 0);
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (rb->listener < 0 || bind(rb->listener, (struct sockaddr *)&sa, slen) != 0 ||
+	    listen(rb->listener, 4) != 0 ||
+	    getsockname(rb->listener, (struct sockaddr *)&sa, &slen) != 0)
+		return -1;
+	rb->port = ntohs(sa.sin_port);
+	if (pthread_create(&rb->thread, NULL, raw_backend_main, rb) != 0) return -1;
+	f->cfg.client_ip[0] = fixture_client_ip[0];
+	f->cfg.client_ip[1] = fixture_client_ip[1];
+	f->cfg.route[0] = (struct nfsp_route){fixture_listen_ip[0], 0, "127.0.0.1", rb->port};
+	f->cfg.route[1] = (struct nfsp_route){fixture_listen_ip[1], 0, "127.0.0.1", rb->port};
+	f->cfg.stop = &f->stop;
+	f->cfg.msg_limit = 128;
+	f->cfg.connect_timeout_ms = 500;
+	f->cfg.on_rpc_record = observe_record;
+	f->cfg.on_rpc_record_arg = o;
+	f->cfg.on_connection = log_conn;
+	f->cfg.on_connection_arg = &f->conns;
+	if (pthread_create(&f->proxy_thread, NULL, run_proxy, f) != 0) return -1;
+	pthread_mutex_lock(&f->mutex);
+	while (!f->ready && !f->done) pthread_cond_wait(&f->cond, &f->mutex);
+	if (f->ready && !f->done) f->port[0] = f->stats.bound_port[0];
+	pthread_mutex_unlock(&f->mutex);
+	return f->port[0] ? 0 : -1;
+}
+
+/* Stop the proxy first, so the backend's accept or recv ends, then join it. */
+static void raw_proxy_down(struct fixture *f, struct raw_backend *rb)
+{
+	atomic_store(&f->stop, 1);
+	pthread_join(f->proxy_thread, NULL);
+	shutdown(rb->listener, SHUT_RDWR);
+	close(rb->listener);
+	pthread_join(rb->thread, NULL);
+	pthread_mutex_destroy(&f->mutex);
+	pthread_cond_destroy(&f->cond);
+}
+
+/* A three-fragment CALL and a one-fragment CALL in one write: the observer
+ * must see two marker-free 40-byte payloads under the connection's id, and
+ * the backend must still receive the original bytes, markers and all. */
+static void test_rpc_record_observer(void)
+{
+	struct raw_backend rb = {0};
+	struct fixture f;
+	struct observed o = {0};
+	const size_t cut[3] = {16, 16, 8};
+	uint8_t call_a[40], call_b[40], wire[96];
+	size_t off = 0, src = 0;
+	int fd;
+
+	printf("the observer gets canonical payloads; the wire stays byte-identical\n");
+	rpc_call(call_a, 0xa1a2a3a4u);
+	rpc_call(call_b, 0xb1b2b3b4u);
+	for (unsigned i = 0; i < 3; i++) {
+		uint32_t h = htonl((uint32_t)cut[i] | (i == 2 ? 0x80000000u : 0u));
+		memcpy(wire + off, &h, 4);
+		memcpy(wire + off + 4, call_a + src, cut[i]);
+		off += 4 + cut[i];
+		src += cut[i];
+	}
+	stamp(wire + off, 40);
+	memcpy(wire + off + 4, call_b, 40);
+	off += 44;
+	rb.want = off;
+
+	if (raw_proxy_up(&f, &rb, &o) != 0) { CHECK(0, "proxy setup"); return; }
+	fd = client_socket(&f, 1, 0);
+	CHECK(fd >= 0, "client connect");
+	if (fd >= 0)
+		CHECK(send(fd, wire, off, MSG_NOSIGNAL) == (ssize_t)off, "send");
+	/* The backend returns once it has `want` bytes (or times out), and only
+	 * then is the proxy stopped, so a stop cannot race the relay. */
+	pthread_join(rb.thread, NULL);
+	if (fd >= 0) close(fd);
+	atomic_store(&f.stop, 1);
+	pthread_join(f.proxy_thread, NULL);
+	close(rb.listener);
+	pthread_mutex_destroy(&f.mutex);
+	pthread_cond_destroy(&f.cond);
+
+	CHECK(rb.got_len == off && memcmp(rb.got, wire, off) == 0,
+	      "backend got %zu/%zu bytes or different bytes", rb.got_len, off);
+	CHECK(o.n == 2, "observer saw %u records, want 2", o.n);
+	CHECK(atomic_load(&f.conns.nev) >= 1 &&
+	      f.conns.ev[0].event == NFSP_CONN_OPENED, "no opened event");
+	for (unsigned i = 0; i < o.n && i < 2; i++) {
+		const uint8_t *want = i == 0 ? call_a : call_b;
+		CHECK(o.rec[i].len == 40 && memcmp(o.rec[i].payload, want, 40) == 0,
+		      "record %u payload is not the marker-free CALL", i);
+		CHECK(o.rec[i].nfrags == (i == 0 ? 3u : 1u), "record %u nfrags %u",
+		      i, o.rec[i].nfrags);
+		CHECK(o.rec[i].st == NFSP_RPC_OK &&
+		      o.rec[i].xid == (i == 0 ? 0xa1a2a3a4u : 0xb1b2b3b4u),
+		      "record %u: %s xid %08x", i, nfsp_rpc_strerror(o.rec[i].st),
+		      o.rec[i].xid);
+		CHECK(o.rec[i].connection_id == f.conns.ev[0].ref.connection_id &&
+		      o.rec[i].client == 1 && o.rec[i].backend == 0 &&
+		      o.rec[i].dir == NFSP_DIR_C2S,
+		      "record %u carries the wrong ConnectionRef or direction", i);
+	}
+	CHECK(f.stats.record_refused == 0 && f.stats.framing_errors == 0,
+	      "unexpected refused=%u framing=%u", f.stats.record_refused,
+	      f.stats.framing_errors);
+}
+
+/* An observer refusal closes the connection and forwards nothing. */
+static void test_rpc_record_refusal(void)
+{
+	struct raw_backend rb = {0};
+	struct fixture f;
+	struct observed o = {0};
+	uint8_t wire[44];
+	int fd;
+
+	printf("a refused record is not forwarded and closes the connection\n");
+	o.refuse = 1;
+	stamp(wire, 40);
+	rpc_call(wire + 4, 1);
+	if (raw_proxy_up(&f, &rb, &o) != 0) { CHECK(0, "proxy setup"); return; }
+	fd = client_socket(&f, 0, 0);
+	CHECK(fd >= 0, "client connect");
+	if (fd >= 0) {
+		uint8_t sink;
+		ssize_t n;
+		CHECK(send(fd, wire, sizeof(wire), MSG_NOSIGNAL) == (ssize_t)sizeof(wire),
+		      "send");
+		n = recv(fd, &sink, 1, 0);
+		CHECK(n <= 0, "connection should be closed, recv=%zd", n);
+		close(fd);
+	}
+	raw_proxy_down(&f, &rb);
+	CHECK(rb.got_len == 0, "backend received %zu bytes of a refused record",
+	      rb.got_len);
+	CHECK(f.stats.record_refused == 1 && f.stats.records[0][0][0] == 0,
+	      "record_refused=%u records=%u", f.stats.record_refused,
+	      f.stats.records[0][0][0]);
+	CHECK(atomic_load(&f.conns.nclosed) == 1, "refusal did not close the ConnectionRef");
+}
 
 /* Exit status: 0 pass, 1 a check failed, 2 usage, 3 the fixture topology does
  * not work on this host (no test was run), 97 the watchdog fired.
@@ -722,6 +1010,9 @@ int main(int argc, char **argv)
 	test_three_coalesced_and_split();
 	test_resize_keeps_stream_in_sync();
 	test_unframeable_output_refused();
+	test_connection_id_not_reused();
+	test_rpc_record_observer();
+	test_rpc_record_refusal();
 	printf("%u checks, %u failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

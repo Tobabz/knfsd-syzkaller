@@ -17,6 +17,7 @@ gcc -std=c11 -O2 -g -pthread -Wall -Wextra -Werror -Wshadow \
     -Wconversion -Wsign-conversion -Wpointer-arith -Wcast-qual \
     -Wwrite-strings -Wmissing-prototypes -Wstrict-prototypes -Wformat=2 \
     -I/src -o /work/nfs-proxy /src/main.c /src/proxy.c /src/framing.c \
+    /src/rpc_record.c \
     /src/control.c /src/delta.c /src/walk.c /src/edit.c
 gcc -std=c11 -O2 -g -Wall -Wextra -Werror -Wshadow -Wconversion \
     -Wsign-conversion -Wpointer-arith -Wcast-qual -Wwrite-strings \
@@ -62,6 +63,7 @@ validate_binary /work/guest-delta-replay replay-probe
     ldd --version 2>&1 | sed -n '1p'
     readelf --version | sed -n '1p'
     sha256sum /src/main.c /src/proxy.c /src/proxy.h /src/framing.c /src/framing.h \
+        /src/rpc_record.c /src/rpc_record.h \
         /src/control.c /src/control.h /src/delta.c /src/delta.h \
         /src/walk.c /src/walk.h /src/edit.c /src/edit.h \
         /test/guest-delta-replay.c
