@@ -929,7 +929,7 @@ Required:
 - every event carries the host-stamped `session_binding`; generation-scoped events also carry `program_generation_correlation`, session-scoped `RULESET`/`RUN_COMPLETE` do not.
 - sink admission per `05` §6: event scope table, per-session `event_seq`/`batch_id` ranges, idempotent re-ACK of identical retransmissions, rejection and host record of conflicts, stale sessions and wrong lanes, Proxy/Runner restart rules.
 - `GENERATION_OPEN` host ACK before activation ACK; host sink keeps per-generation open/closed binding.
-- first hard refusal per (generation, rule) as a write-ahead `APPLY_REFUSAL` before the refused record is relayed; `evidence_path_degraded` marking on ACK failure (`05` §21).
+- first hard refusal per (generation, rule) as a write-ahead `APPLY_REFUSAL` before the refused record is relayed; no relay of the refused record without a host response (retransmit the same event on timeout); `evidence_path_degraded` marking on explicit sink rejection (`05` §21).
 - GENERATION_COMPLETE as the generation's last event, with per-rule resolver summary, `outside_activation_window`, evidence-path failure counters and closure (`05` §21).
 - sink rejects and records G events after G's summary; Runner seals G only after the summary or session/channel/VM end.
 - queue record/token metadata.

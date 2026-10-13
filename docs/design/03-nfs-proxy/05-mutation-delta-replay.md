@@ -297,17 +297,22 @@ session_binding                 # host가 channel과 session 설치에서 기록
 | event | scope | 필수 identity | 금지 / 선행 조건 |
 |---|---|---|---|
 | `RULESET` | session | `session_binding` | `program_generation_correlation` 없음. session의 첫 event이며 첫 `GENERATION_OPEN`보다 먼저 `(D)`에 도달한다 |
-| `GENERATION_OPEN` | generation | `session_binding`, `program_generation_correlation` | 같은 session과 lane에 open generation이 이미 있으면 거부한다. 앞 generation이 draining이어도 그 lane의 admitting generation은 하나다(`01-architecture.md` §16) |
-| `EXPOSURE_INTENT`, `APPLY_REFUSAL` | generation | 위와 같음 | correlation이 이 session의 open generation binding(lane, `kcov_generation`, `rule_set_id`)과 맞아야 한다 |
-| `FORWARD_COMPLETE`, `FORWARD_FAILED` | generation | 위와 같음, `batch_id` | 같은 session과 generation에서 받아들인 `EXPOSURE_INTENT`의 `batch_id`여야 하며 batch마다 하나다 |
-| `GENERATION_COMPLETE` | generation | 위와 같음 | open generation의 마지막 event. 받은 뒤 그 binding은 closed다(§21) |
+| `GENERATION_OPEN` | generation | `session_binding`, `program_generation_correlation`, `draining_generations[]` | `kcov_generation`은 이 session에서 처음 bind된다. `draining_generations[]`는 Proxy가 deactivation을 처리했고 아직 summary가 없는 같은 lane의 generation 목록이며, host가 그 lane에 evidence-open으로 가진 집합과 같아야 한다. 다르면 거부한다. 받아들이면 그 generation들을 draining으로 표시한다 |
+| `EXPOSURE_INTENT`, `APPLY_REFUSAL` | generation | 위와 같음 | correlation이 이 session의 evidence-open generation binding(lane, `kcov_generation`, `rule_set_id`)과 맞아야 한다. host가 draining으로 표시한 generation에서는 `record_context`가 REPLY인 event만 받는다 |
+| `FORWARD_COMPLETE`, `FORWARD_FAILED` | generation | 위와 같음, `batch_id` | 같은 session과 generation에서 받아들인 `EXPOSURE_INTENT`의 `batch_id`를 참조한다. batch마다 forward 종료 event는 하나다 |
+| `GENERATION_COMPLETE` | generation | 위와 같음 | evidence-open generation의 마지막 event. 받은 뒤 그 binding은 closed다(§21) |
 | `RUN_COMPLETE` | session | `session_binding` | `program_generation_correlation` 없음. 그 session의 마지막 event |
 
 identifier 범위:
 
 - `event_seq`는 Proxy session마다 0부터 빈틈없이 증가한다. 여러 session이 한 물리 journal을 공유해도 범위는
   session이다.
-- `batch_id`는 Proxy session 안에서 유일하다.
+- `batch_id`는 `EXPOSURE_INTENT`가 정하며 Proxy session 안에서 유일하다. forward 종료 event는 새 batch가 아니라
+  그 batch의 lifecycle 전이이므로 같은 `batch_id`를 다른 payload로 참조한다.
+- host binding의 generation 상태는 evidence 상태다. `GENERATION_OPEN`부터 `GENERATION_COMPLETE`까지
+  evidence-open이며, 그 안에서 admitting과 draining을 구분한다. CALL admission은 Proxy가 lane마다 하나의
+  generation에만 준다(`01-architecture.md` §16). 같은 lane에서 draining G와 admitting G+1이 함께
+  evidence-open일 수 있다.
 - `proxy_session_id`는 Runner가 정하고 host가 기록한다. guest가 보낸 값은 대조만 한다.
 
 재수신과 충돌:
@@ -315,7 +320,9 @@ identifier 범위:
 | 상황 | sink 동작 |
 |---|---|
 | 같은 session, 같은 `event_seq`, byte-identical payload (ACK 유실 뒤 재전송) | 다시 append하지 않고 같은 ACK를 다시 보낸다. 새 application으로 세지 않는다 |
-| 같은 `event_seq` 또는 같은 `batch_id`에 다른 payload | 거부하고 session journal conflict를 host 기록으로 남긴다. 그 session의 open generation은 summary가 와도 내부 불일치다 |
+| 같은 `event_seq`에 다른 payload | 거부하고 session journal conflict를 host 기록으로 남긴다. 그 session의 open generation은 summary가 와도 내부 불일치다 |
+| 이미 받은 `batch_id`로 두 번째 `EXPOSURE_INTENT`, 또는 이미 forward 종료 event가 있는 batch에 다른 `event_seq`의 두 번째 종료 event | 위와 같다 |
+| 받지 않은 `batch_id`를 참조하는 forward 종료 event | 거부하고 기록한다 |
 | `event_seq` 빈틈 또는 역행 | 거부하고 sequence violation을 기록한다. 그 session의 open generation은 내부 불일치다 |
 | 알 수 없는 또는 이미 끝난 `proxy_session_id` (stale session) | 거부하고 기록한다. 다른 session이나 새 generation에 편입하지 않는다 |
 | 다른 lane, 없는 generation, closed generation의 correlation | 거부하고 기록한다. host 값으로 고쳐 받아들이지 않는다 |
@@ -747,8 +754,13 @@ APPLY_REFUSAL
   뒤에 거부된 record를 relay한다. 두 번째부터는 summary의 count에만 남긴다. 비교에는 위치마다 hard
   refusal의 존재만 필요하기 때문이다.
 - normal non-match는 이 event를 만들지 않는다. 지금처럼 summary에만 집계한다.
-- ACK가 없거나 sink가 거부하면 record는 변조 없이 relay한다(§11과 같다). Proxy는 그 session을
-  `evidence_path_degraded`로 표시하고, 이후 event와 summary의 `evidence_path_failures`에 그 사실을 남긴다.
+- Proxy는 host 응답(ACK 또는 거부) 없이 거부된 record를 relay하지 않는다. 응답이 없으면 같은 `event_seq`로
+  같은 event를 다시 보내고(§6의 재수신 규칙), 그 동안 그 record와 같은 connection·방향의 뒤 record를 relay하지
+  않는다. host에 닿지 않은 refusal 뒤에는 peer로 나간 record가 없으므로, guest가 그 사이 종료되어도 relay된
+  record의 refusal 사실이 빠지지 않는다. sink가 응답하지 않는 상태가 계속되면 traffic이 멈추고, Runner가
+  stall을 종료 원인으로 기록한다(§29의 `unknown`).
+- sink가 명시적으로 거부하면 host가 그 거부를 기록한다. Proxy는 record를 변조 없이 relay하고(§11과 같다)
+  session을 `evidence_path_degraded`로 표시하며, 이후 event와 summary의 `evidence_path_failures`에 남긴다.
 - summary가 있으면 rule별 hard refusal count가 0보다 큰데 `APPLY_REFUSAL`이 없는 것은 내부 불일치다.
 
 Proxy session이 clean하게 끝나면 optional `RUN_COMPLETE` event를 append할 수 있다.
@@ -979,7 +991,7 @@ Applier refusal을 다음처럼 분류한다. 아래는 첫 profile의 내용이
 | 값 | 조건 |
 |---|---|
 | `complete` | durable `GENERATION_COMPLETE`가 있고 `evidence_path_failures`가 0이다. hard refusal 존재는 summary count와 `APPLY_REFUSAL`이 함께 정한다 |
-| `prefix_complete` | summary가 없다(crash-cut). journal prefix가 integrity 검증을 통과하고(torn final tail은 허용, §24), `evidence_path_degraded` 표시와 sink의 append 실패·거부 기록이 없으며, Runner가 기록한 종료 원인이 guest crash 또는 VM teardown이다. write-ahead 규칙 때문에 relay된 hard refusal은 모두 prefix에 있다 |
+| `prefix_complete` | summary가 없다(crash-cut). journal prefix가 integrity 검증을 통과하고(torn final tail은 허용, §24), `evidence_path_degraded` 표시와 sink의 append 실패·거부 기록이 없으며, Runner가 기록한 종료 원인이 guest crash 또는 VM teardown이다(sink 무응답으로 인한 stall은 해당하지 않는다). host 응답 전 relay 금지 규칙(§21) 때문에 relay된 record의 hard refusal은 모두 prefix에 있다. 응답을 기다리며 relay되지 않은 record는 peer에 닿지 않았으므로 cut 뒤의 traffic과 같이 production prefix 밖이다 |
 | `unknown` | 그 밖의 경우 |
 
 crash-cut prefix라는 사실만으로는 `unknown`이 아니다. `delivery_unknown`도 이 완전성과 무관하며 semantic
@@ -1466,7 +1478,11 @@ Expected:
 Expected:
 - refusal이 있는 쪽의 `APPLY_REFUSAL`이 거부된 record의 relay 전에 host journal에 있다;
 - comparator가 둘을 `REPLAY_DIVERGED`로 구분한다;
-- 한쪽의 `APPLY_REFUSAL` append를 실패시키면 `refusal_evidence = unknown`이고 `REPLAY_INCONCLUSIVE`다;
+- 한쪽의 `APPLY_REFUSAL`을 sink가 거부하게 하면 `refusal_evidence = unknown`이고 `REPLAY_INCONCLUSIVE`다;
+- 한쪽의 `APPLY_REFUSAL` 요청이 host에 닿지 않게 하고 ACK timeout 뒤 guest를 종료한다. 거부된 record와 그
+  connection·방향의 뒤 record가 peer에 relay되지 않았어야 한다. timeout 뒤 원본 record가 relay됐는데
+  `prefix_complete`나 `REPLAY_EQUIVALENT`가 나오면 FAIL이다;
+- sink 무응답으로 traffic이 멈춰 종료된 실행은 `refusal_evidence = unknown`이다;
 - refusal이 없는 정당한 crash-cut prefix 두 개는 `REPLAY_EQUIVALENT`가 될 수 있다. crash-cut이라는 이유만으로
   비교를 막으면 FAIL이다;
 - `delivery_unknown`만 다른 두 실행을 `REPLAY_DIVERGED`로 판정하면 FAIL이다.
@@ -1480,6 +1496,9 @@ Expected:
 - generation이 없을 때의 `RULESET`은 받아들인다;
 - generation-scoped event는 open generation binding 없이는 거부한다;
 - 재전송은 다시 ACK되고 application이 한 번만 세어진다;
+- G가 draining인 동안 같은 lane의 `GENERATION_OPEN(G+1)`(`draining_generations = [G]`)을 받아들이고, 그 뒤 G의
+  REPLY event와 G+1의 event를 각각의 binding으로 받는다;
+- `EXPOSURE_INTENT(batch=b)` 뒤의 `FORWARD_COMPLETE(batch=b)`를 받아들이고, b의 두 번째 종료 event는 거부한다;
 - 충돌, stale session, wrong lane은 새 generation에 편입되지 않고 거부와 함께 host에 기록된다.
 
 ## 실패 양상과 진단
@@ -1524,10 +1543,9 @@ Expected:
 - **미결:** drain bound의 숫자.
 - **결정됨:** (generation, rule)마다 첫 hard refusal은 relay 전에 `APPLY_REFUSAL`로 write-ahead한다.
   replay 판정은 refusal 분류, refusal evidence 완전성, 판정 순서(§29)를 따른다(issue #18 F2).
-- **미결:** `APPLY_REFUSAL`의 ACK가 실패한 직후 다음 event가 host에 닿기 전에 guest가 종료되고, host가 그
-  요청을 전혀 받지 못한 경우는 host가 알 수 없다. 이 경우 refusal evidence가 `prefix_complete`로 잘못 남을
-  수 있다. sink 장애와 crash가 겹쳐야 생기며, S1b transport가 guest 쪽 ACK timeout을 host에 드러낼 수
-  있는지 구현에서 확인한다.
+- **결정됨:** `APPLY_REFUSAL`에 host 응답이 없으면 거부된 record를 relay하지 않고 같은 event를 다시
+  보낸다. 그래서 host에 닿지 않은 refusal 뒤에 relay된 record는 없다. 완전성을 이 규칙으로 입증할 수 없는
+  종료(sink 거부, sink 무응답 stall)는 `unknown`이다(§21, §29, PR #22 review).
 - **결정됨:** production journal은 append-only lifecycle events를 사용한다.
 - **결정됨:** socket delivery와 disk commit의 atomicity gap은 `delivery_unknown`으로 표현한다.
 - **결정됨:** production MutationDelta는 replay 중 immutable이다.
