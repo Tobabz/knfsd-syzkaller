@@ -242,12 +242,13 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s2_gate` | 그 밖 | `s2_campaign` | — | `01` §3 |
 | `s2_campaign` | Q2 `OBSERVED`, `CrashContextWindow`에 `APPLIED` rule이 있음 | campaign 정지, `s2_replaying` | — | `01` §3, §12 |
 | `s2_campaign` | Q2 `OBSERVED`이고 window에 `APPLIED` rule이 없음, 또는 Q2 `INCONCLUSIVE` | 상태 유지. crash evidence를 보존하고 triage 항목을 만든다 | — | `01` §3, §12 |
+| `s2_campaign` | Q2 `NOT_OBSERVED`. 아래 JobPolicy 임계값과 fuzz budget에 닿지 않음 | 상태 유지. verdict를 기록하고 임계값 집계에 더한다. 실행 중인 campaign task를 계속 기다린다 | — | `01` §11.1, §12 |
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation에서 hypothesis가 계속 `NOT_APPLIED` | campaign 정지, `s2_strategy` (repair, `campaign_not_applied`) | agent_repair | `01` §12 |
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation에서 `APPLIED`, Q2 미관측 | campaign 정지, `s2_strategy` (repair, `campaign_no_signal`) | agent_repair | `01` §12 |
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation의 M1 `INCONCLUSIVE` 반복 | campaign 정지, `blocked_operator(evidence_path)` | — | `01` §3 |
 | `s2_campaign` | fuzz budget 소진 | campaign 정지, `blocked_operator(campaign_budget_exhausted)` | — | `01` §11.1 |
 | `s2_campaign` | 봉인 bundle 없는 Runner 종료. 그 전에 봉인한 bundle은 위 행대로 처리한다 | `s2_campaign` (같은 rule set으로 campaign을 이어 가는 새 task) | runtime_retry | `01` §11.2 |
-| `s2_campaign` | campaign task가 마지막 bundle을 봉인하고 끝남(`sealed`). 그 bundle은 위 행대로 먼저 처리한다 | fuzz budget이 남았으면 `s2_campaign` (campaign을 이어 가는 새 task), 아니면 위의 fuzz budget 소진 행 | — | `01` §11.1 |
+| `s2_campaign` | campaign task가 마지막 bundle을 봉인하고 끝남(`sealed`). 그 bundle을 위 행대로 먼저 처리하고, campaign이 정지하지 않았을 때 | fuzz budget이 남았으면 `s2_campaign` (campaign을 이어 가는 새 task), 아니면 위의 fuzz budget 소진 행 | — | `01` §11.1 |
 | `s2_replaying` | 비교 verdict(`REPLAY_EQUIVALENT`, `REPLAY_DIVERGED`, `REPLAY_INCONCLUSIVE`, `REPLAY_INVALID`) | `crash_review`. `resume_point`는 `s2_campaign`이다. campaign의 binding(identity, `hcap_revision`)이 job의 지금 binding과 다르면 `s2_campaign`에 §5의 해당 변경 행을 적용한 지점이다 | — | `../03-nfs-proxy/05` §29, `01` §11.2 |
 | `s2_replaying` | 봉인 bundle 없는 Runner 종료 | `s2_replaying` 재실행 | runtime_retry | |
 | `s2_replaying` | replay bundle의 manifest·correlation 검증 실패 | `blocked_operator(replay_evidence)`. evidence를 고친 뒤 `resume`이 replay를 다시 실행한다 | — | `../03-nfs-proxy/05` §29 |
@@ -283,7 +284,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 | 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 crash evidence의 harness identity로 계속한다(`../03-nfs-proxy/05` §25). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2, §12 |
 | `hcap_revision`만 변경 | 비종료 상태(`s2_replaying` 제외. 대기 상태는 표 위 규칙) | `s1_analysis`, `s1_planning`은 진행 중인 task의 결과를 받지 않고 같은 Agent Task를 새 `hcap_revision`으로 다시 시작한다. 그 밖의 상태는 plan과 evidence를 새 HCAP으로 결정적으로 다시 검증해, 실패하면 `s1_planning`(repair, `hcap_changed`)으로 간다. 통과하면 MutationRuleSet을 입력으로 쓰는 지점(`s2_gate`, `s2_campaign`, §4의 Compiler 거부 행이 정한 `resume_point`)은 그 rule set을 다시 compile해 `s2_gate`로 가고(거부는 §4의 Compiler 행), Mutation Strategy를 기다리는 `s2_strategy`는 진행 중인 task의 결과를 받지 않고 그 Agent Task를 새 `hcap_revision`으로 다시 시작한다. 나머지 상태는 그대로 둔다 | `01` §11.2, `07` §7 |
 | 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 기록된 rule set을 쓰고 Compiler를 다시 부르지 않는다(`../03-nfs-proxy/05` §26). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2 |
-| JudgeProfile 또는 RemoteKcovSupportBoundary 새 버전 채택 | 비종료 상태(대기 상태는 표 위 규칙) | job이 마지막으로 소비한 verdict의 봉인 bundle에 새 verdict를 만든다. status와 reason이 같으면 아무것도 하지 않는다. 다르면 그 verdict를 소비한 전이의 출발 상태에서 §3–§4 표를 다시 적용하고, 진행 중인 task는 결과를 받지 않는다. 새 규칙이 요구하는 evidence가 bundle에 없으면 그 Runner 단계를 다시 실행한다 | `01` §11.2 |
+| JudgeProfile 또는 RemoteKcovSupportBoundary 새 버전 채택 | 비종료 상태(대기 상태는 표 위 규칙) | job이 마지막으로 소비한 verdict의 봉인 bundle에 새 verdict를 만들어 기록한다. status와 reason이 같거나, 그 verdict를 소비할 때의 binding(identity, `hcap_revision`)이 job의 지금 binding과 다르면 전이를 만들지 않는다. binding이 다르면 binding 변경이 정한 경로(identity 재수립 지점, `hcap_revision` 행)가 그대로 남는다. 그 밖에는 그 verdict를 소비한 전이의 출발 상태에서 §3–§4 표를 다시 적용하고(binding이 같으므로 `Stage2Input`도 유효하다, `01` §5.1), 진행 중인 task는 결과를 받지 않는다. 새 규칙이 요구하는 evidence가 bundle에 없으면 그 Runner 단계를 다시 실행한다 | `01` §11.2 |
 | JobPolicy 변경 | 비종료 상태 | 이후 전이에만 적용한다. 기존 verdict와 전이 기록은 바꾸지 않는다 | `01` §11.1 |
 | operator `resume` | `blocked_operator` | `resume_point`로 간다. 소진된 counter를 0으로 되돌리고 그 사실을 기록한다 | |
 | operator `route(to)` | `blocked_operator(gate_regression)` | `s2_gate` 또는 `s2_strategy`. `resume_point`가 이 상태에 들어올 때와 다르면(재평가 이벤트가 binding을 바꿨거나 gate verdict를 다르게 판정했다) 받지 않고 기록만 한다. 그때는 `resume`이 지금 `resume_point`로 보낸다 | `01` §5.1, §11.2 |
@@ -463,7 +464,9 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
     지점이고(§6, `01` §12), gap 상태는 issue가 정한다(`07` §7). harness 교체나 HCAP·JudgeProfile 변경은 그 결정을
     대신하지 않으므로 `resume_point`만 바꾼다. 상태를 옮기면 승인이 필요 없는 정책에서 harness 교체만으로 실행이
     재개되고, `run_stage2`가 참이면 campaign까지 다시 돈다. `s1_approval`은 대기 상태에 넣지 않는다. identity가
-    바뀌면 승인할 harness 자체가 바뀌므로 새 review manifest의 승인을 다시 기다린다.
+    바뀌면 승인할 harness 자체가 바뀌므로 새 review manifest의 승인을 다시 기다린다. 이전 binding에서 소비한
+    verdict의 재판정은 기록만 한다. 그 verdict로 세운 경로는 binding 변경이 이미 무효로 했기 때문이다(`01` §11.2).
+    재판정이 이 순서를 뒤집으면 새 identity에서 Q1을 다시 세우지 않고 이전 gate 결과로 campaign에 간다.
 14. **replay는 identity나 HCAP이 바뀌어도 기록된 입력으로 마친다.** replay 입력은 crash와 같은 harness identity와
     기록된 rule set이다(`../03-nfs-proxy/05` §25, §26). 새 binding으로 옮기면 비교의 전제가 깨지고, Stage 1이나
     gate로 돌리면 window에 `APPLIED` rule이 있는 crash가 사람 검토에 닿지 않는다(`01` §12). 바뀐 binding은 검토 뒤
@@ -528,6 +531,11 @@ bundle fixture로 대신한다.
      `blocked_operator(replay_evidence)`의 `resume_point`(replay)는 identity나 `hcap_revision`이 바뀌어도 그대로다.
    - 재평가 결과가 다른 대기 상태여서 그 상태로 재개한 job은 그 상태를 끝내면 기준 지점으로 간다. 그 뒤 재평가
      결과가 다시 지금 상태와 같아지면 `resume_point`는 기준 지점으로 돌아간다.
+   - gate Q1 `INCONCLUSIVE(evidence)`로 `blocked_operator(q1_evidence)`에 있는 job에서 identity를 바꾼 뒤 support
+     boundary가 바뀌어 이전 gate가 `REACHED`와 통과하는 M1로 재판정돼도, `resume`은 `s2_campaign`이 아니라 새
+     identity의 identity 재수립 지점으로 간다. 재판정한 verdict는 기록만 된다.
+   - 임계값과 fuzz budget 아래의 Q2 `NOT_OBSERVED` campaign bundle은 campaign을 멈추지 않는다. 실행 중에 받은
+     bundle이면 같은 task를 계속 기다리고, `sealed`로 끝난 task의 마지막 bundle이면 처리한 뒤 다음 task로 이어 간다.
    - `s2_strategy`에서 `hcap_revision`이 바뀌고 plan이 새 HCAP 검증에 실패하면 Mutation Strategy를 다시 부르지
      않고 `s1_planning`(repair, `hcap_changed`)으로 간다. Compiler 거부로 `blocked_harness_gap(mutation_engine)`에
      있는 job은 gap을 닫은 promotion 뒤 Mutation Strategy를 다시 부르지 않고 저장된 rule set을 다시 compile한다.
