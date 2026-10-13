@@ -387,6 +387,11 @@ static int dec_union(struct dec *d, uint16_t t, uint32_t parent,
 	uint32_t start = d->off, w, me, dn, saved_op = d->op;
 	int saved_seen = d->op_leaf_seen, rc = 0;
 
+	/* saved_op/saved_seen are restored only when this union is an
+	 * operation boundary.  An ordinary union inside an operation must
+	 * leave op_leaf_seen as its members set it, or a later status-typed
+	 * leaf would overwrite the operation status (PR #25 review). */
+
 	if (remaining(d) < 4)
 		return fail(d, NFSP_DECODE_TRUNCATED, t, "record ends here");
 	w = rd32(d, d->off);
@@ -443,8 +448,10 @@ static int dec_union(struct dec *d, uint16_t t, uint32_t parent,
 out_fail:
 	rc = -1;
 out:
-	d->op = saved_op;
-	d->op_leaf_seen = saved_seen;
+	if (is_op) {
+		d->op = saved_op;
+		d->op_leaf_seen = saved_seen;
+	}
 	return rc;
 }
 
@@ -759,50 +766,77 @@ static size_t put(char *buf, size_t cap, size_t at, const char *s)
 	return at + n;
 }
 
-size_t nfsp_field_path(const struct nfsp_decoded_msg *m, uint32_t idx,
-		       char *buf, size_t cap)
+/* A path is never materialised in the message: it is the concatenation of
+ * static pieces (family, direction, root, components).  Both the formatter
+ * and the matcher walk the same pieces, so neither has a length limit of its
+ * own (PR #25 review: a fixed buffer made long valid paths unfindable). */
+#define CHAIN_MAX	(2u * NFSP_DECODE_MAX_DEPTH + 2u)
+#define SEGS_MAX	(3u + 2u * CHAIN_MAX)
+
+static size_t path_segments(const struct nfsp_decoded_msg *m, uint32_t idx,
+			    const char **seg)
 {
-	uint32_t chain[2 * NFSP_DECODE_MAX_DEPTH + 2];
-	size_t n = 0, at = 0;
+	uint32_t chain[CHAIN_MAX];
+	size_t n = 0, k = 0;
 	uint32_t i = idx;
 
-	if (cap)
-		buf[0] = '\0';
 	if (!m || !m->schema || idx >= m->nfields)
 		return 0;
 	for (;;) {
-		if (n == sizeof(chain) / sizeof(chain[0]) || i >= m->nfields)
+		if (n == CHAIN_MAX || i >= m->nfields)
 			return 0;
 		chain[n++] = i;
 		if (m->fields[i].root)
 			break;
 		i = m->fields[i].parent;
 	}
-	at = put(buf, cap, at, m->schema->family);
-	at = put(buf, cap, at, m->msg_type == NFSP_RPC_CALL ?
-		 ".request." : ".response.");
-	at = put(buf, cap, at, m->fields[chain[n - 1]].root);
+	seg[k++] = m->schema->family;
+	seg[k++] = m->msg_type == NFSP_RPC_CALL ? ".request." : ".response.";
+	seg[k++] = m->fields[chain[n - 1]].root;
 	while (n--) {
 		const char *c = m->fields[chain[n]].component;
 
 		if (!c)
 			continue;
 		if (strcmp(c, "[]"))
-			at = put(buf, cap, at, ".");
-		at = put(buf, cap, at, c);
+			seg[k++] = ".";
+		seg[k++] = c;
 	}
+	return k;
+}
+
+size_t nfsp_field_path(const struct nfsp_decoded_msg *m, uint32_t idx,
+		       char *buf, size_t cap)
+{
+	const char *seg[SEGS_MAX];
+	size_t n, at = 0;
+
+	if (cap)
+		buf[0] = '\0';
+	n = path_segments(m, idx, seg);
+	for (size_t k = 0; k < n; k++)
+		at = put(buf, cap, at, seg[k]);
 	return at;
 }
 
 uint32_t nfsp_field_find(const struct nfsp_decoded_msg *m, const char *path,
 			 uint32_t from)
 {
-	char buf[512];
+	const char *seg[SEGS_MAX];
 
-	for (uint32_t i = from; m && i < m->nfields; i++) {
-		size_t n = nfsp_field_path(m, i, buf, sizeof(buf));
+	for (uint32_t i = from; m && path && i < m->nfields; i++) {
+		size_t n = path_segments(m, i, seg);
+		const char *p = path;
+		size_t k;
 
-		if (n && n < sizeof(buf) && !strcmp(buf, path))
+		for (k = 0; k < n; k++) {
+			size_t len = strlen(seg[k]);
+
+			if (strncmp(p, seg[k], len))
+				break;
+			p += len;
+		}
+		if (n && k == n && !*p)
 			return i;
 	}
 	return NFSP_FIELD_NONE;

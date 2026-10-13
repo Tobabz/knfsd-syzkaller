@@ -173,12 +173,14 @@ nfsp_nfs_decode(const struct nfsp_schema_family *const *families,
 void nfsp_decoded_msg_free(struct nfsp_decoded_msg *m);
 
 /* Write field idx's semantic path into buf (always NUL-terminated when
- * cap > 0).  Returns the full path length, or 0 for a bad index. */
+ * cap > 0; buf may be NULL when cap is 0).  Returns the full path length,
+ * which may exceed cap, or 0 for a bad index. */
 size_t nfsp_field_path(const struct nfsp_decoded_msg *m, uint32_t idx,
 		       char *buf, size_t cap);
 
 /* The first field whose path is `path`, at or after `from`, or
- * NFSP_FIELD_NONE.  For tests and diagnostics; it is linear. */
+ * NFSP_FIELD_NONE.  Any path length.  For tests and diagnostics; it is
+ * linear. */
 uint32_t nfsp_field_find(const struct nfsp_decoded_msg *m, const char *path,
 			 uint32_t from);
 

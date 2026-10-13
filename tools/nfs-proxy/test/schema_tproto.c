@@ -3,8 +3,8 @@
  * annotations: tproto.ann
  * source:      tproto-m0.x sha256:461286d237ad9c4a5c87d250a1abe7b7caddbdd21d46eaa8b07350017d8556b4
  * schema_id:   tproto.0/sha256:2f12995ae927c488497917f8acffb09e57da31eda6fdc364e77a3cbcf8b98575
- * source:      tproto-m1.x sha256:0ba67f3c2fc40e256aeed94fcdbb605f42f1855fcf8e64f5d9b0d127cb43318d
- * schema_id:   tproto.1/sha256:5773876f52e71b2178913741112742f7226461f17c3a492a0f9884328cb560bc
+ * source:      tproto-m1.x sha256:41df442f57817cd1bed6d8d0edcbb03c4bc2b46cee7b5096ce46d440a1769d27
+ * schema_id:   tproto.1/sha256:b1f09069a65c8b6ee372c4cc75197ff9fb319283987b41b291be6b2d8148fe56
  *
  * build.sh regenerates this file and fails when it differs, so an
  * edit here cannot survive; change the XDR or annotations instead.
@@ -137,7 +137,7 @@ const struct nfsp_protocol_schema nfsp_schema_tproto_0 = {
 	.max_depth = 8u,
 };
 
-/* ---- tproto.1/sha256:5773876f52e71b2178913741112742f7226461f17c3a492a0f9884328cb560bc */
+/* ---- tproto.1/sha256:b1f09069a65c8b6ee372c4cc75197ff9fb319283987b41b291be6b2d8148fe56 */
 
 static const struct nfsp_schema_type tproto_1_types[] = {
 	/*    0 */ { "COMPOUND_args", NFSP_XK_STRUCT, 0, NFSP_SCHEMA_NONE, 0u, 0u, 3u, NFSP_SCHEMA_NONE, NULL, 12u },
@@ -172,8 +172,9 @@ static const struct nfsp_schema_type tproto_1_types[] = {
 	/*   29 */ { "entry", NFSP_XK_STRUCT, NFSP_STF_LISTED, NFSP_SCHEMA_NONE, 0u, 24u, 2u, NFSP_SCHEMA_NONE, NULL, 16u },
 	/*   30 */ { NULL, NFSP_XK_LIST, 0, 29, 0u, 0u, 0u, NFSP_SCHEMA_NONE, NULL, 4u },
 	/*   31 */ { "STAT_res", NFSP_XK_STRUCT, 0, NFSP_SCHEMA_NONE, 0u, 26u, 2u, NFSP_SCHEMA_NONE, NULL, 8u },
-	/*   32 */ { "ILLEGAL_res", NFSP_XK_STRUCT, 0, NFSP_SCHEMA_NONE, 0u, 28u, 1u, NFSP_SCHEMA_NONE, NULL, 4u },
-	/*   33 */ { NULL, NFSP_XK_ARRAY_VAR, 0, 23, NFSP_XDR_UNBOUNDED, 0u, 0u, NFSP_SCHEMA_NONE, NULL, 4u },
+	/*   32 */ { "STAT_value", NFSP_XK_UNION, 0, 22, 0u, 18u, 2u, 1, "status", 4u },
+	/*   33 */ { "ILLEGAL_res", NFSP_XK_STRUCT, 0, NFSP_SCHEMA_NONE, 0u, 28u, 1u, NFSP_SCHEMA_NONE, NULL, 4u },
+	/*   34 */ { NULL, NFSP_XK_ARRAY_VAR, 0, 23, NFSP_XDR_UNBOUNDED, 0u, 0u, NFSP_SCHEMA_NONE, NULL, 4u },
 };
 
 static const struct nfsp_schema_field tproto_1_fields[] = {
@@ -195,7 +196,7 @@ static const struct nfsp_schema_field tproto_1_fields[] = {
 	{ "which", 2 },
 	{ "status", 22 },
 	{ "tag", 1 },
-	{ "resarray", 33 },
+	{ "resarray", 34 },
 	{ "status", 22 },
 	{ "count", 2 },
 	{ "id", 6 },
@@ -203,8 +204,8 @@ static const struct nfsp_schema_field tproto_1_fields[] = {
 	{ "eof", 11 },
 	{ "cookie", 8 },
 	{ "name", 18 },
-	{ "status", 22 },
-	{ "value", 2 },
+	{ "first", 32 },
+	{ "later", 22 },
 	{ "status", 22 },
 };
 
@@ -221,11 +222,13 @@ static const struct nfsp_schema_arm tproto_1_arms[] = {
 	{ 0x00000002u, "OP_WRITE", "WRITE", "result", 25 },
 	{ 0x00000003u, "OP_LOOKUP", "LOOKUP", "result", 27 },
 	{ 0x00000004u, "OP_STAT", "STAT", "result", 31 },
-	{ 0x0000271cu, "OP_ILLEGAL", "ILLEGAL", "result", 32 },
+	{ 0x0000271cu, "OP_ILLEGAL", "ILLEGAL", "result", 33 },
 	{ 0x00000000u, "TP_OK", "ok", "ok", 26 },
 	{ 0x0000000du, "TP_ERR_DENIED", "tp_err_denied", "tp_err_denied.owner", 18 },
 	{ 0x00000000u, "default", "default", NULL, NFSP_SCHEMA_NONE },
 	{ 0x00000000u, "TP_OK", "ok", "ok", 28 },
+	{ 0x00000000u, "default", "default", NULL, NFSP_SCHEMA_NONE },
+	{ 0x00000000u, "TP_OK", "ok", "ok.value", 2 },
 	{ 0x00000000u, "default", "default", NULL, NFSP_SCHEMA_NONE },
 };
 
@@ -249,7 +252,7 @@ static const struct nfsp_schema_proc tproto_1_procs[] = {
 };
 
 const struct nfsp_protocol_schema nfsp_schema_tproto_1 = {
-	.schema_id = "tproto.1/sha256:5773876f52e71b2178913741112742f7226461f17c3a492a0f9884328cb560bc",
+	.schema_id = "tproto.1/sha256:b1f09069a65c8b6ee372c4cc75197ff9fb319283987b41b291be6b2d8148fe56",
 	.family = "tproto",
 	.program = 536871065u,
 	.version = 1u,
@@ -258,7 +261,7 @@ const struct nfsp_protocol_schema nfsp_schema_tproto_1 = {
 	.request_leaf = "args",
 	.response_leaf = "result",
 	.types = tproto_1_types,
-	.ntypes = 34u,
+	.ntypes = 35u,
 	.fields = tproto_1_fields,
 	.arms = tproto_1_arms,
 	.enums = tproto_1_enums,

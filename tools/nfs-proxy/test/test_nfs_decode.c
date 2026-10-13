@@ -608,6 +608,90 @@ static void test_reply_dispatch(void)
 	nfsp_decoded_msg_free(&m);
 }
 
+/* PR #25 review P2: an operation's status is its first leaf.  STAT_res in
+ * minor 1 is { union on tp_status first; tp_status later; }, so decoding the
+ * nested union must not let `later` overwrite the status. */
+static void test_status_after_nested_union(void)
+{
+	struct nfsp_decoded_msg m = {0};
+	struct nfsp_reply_dispatch rd = tproto_dispatch;
+	struct msg r;
+
+	printf("REPLY: operation status stays the first leaf past a nested "
+	       "union\n");
+	rd.minor_version = 1;
+	reply_header(&r, 0);
+	w32(&r, 0);		/* 24 COMPOUND status TP_OK */
+	wopaque(&r, "");	/* 28 tag */
+	w32(&r, 1);		/* 32 resarray count */
+	w32(&r, 4);		/* 36 OP_STAT */
+	w32(&r, 0);		/* 40 first.status TP_OK */
+	w32(&r, 7);		/* 44 first.ok.value */
+	w32(&r, 5);		/* 48 later TP_ERR_IO */
+	CHECK(run(r.b, r.n, &rd, 1, 0, &m) == NFSP_DECODE_DECODED,
+	      "STAT reply: %s", nfsp_decode_strstatus(m.status));
+	CHECK(m.nops == 1 && m.ops[0].has_status && m.ops[0].status == 0,
+	      "op status %u/%u, want the first leaf 0",
+	      m.nops ? m.ops[0].has_status : 0, m.nops ? m.ops[0].status : 0);
+	EXPECT(&m, "tproto.response.STAT.result.first.status", 0, 40, 4, 40, 4,
+	       0);
+	EXPECT(&m, "tproto.response.STAT.result.first.ok.value", 0, 44, 4, 44,
+	       4, 7);
+	EXPECT(&m, "tproto.response.STAT.result.later", 0, 48, 4, 48, 4, 5);
+	nfsp_decoded_msg_free(&m);
+}
+
+/* PR #25 review P3: path lookup has no length limit of its own.  A message
+ * is built by hand with components long enough to pass 512 characters. */
+static void test_long_paths(void)
+{
+	static char longa[400], longb[400];
+	struct nfsp_semantic_field f[3];
+	struct nfsp_decoded_msg m;
+	char small[10];
+	char *full;
+	size_t len;
+
+	printf("paths: formatting and lookup beyond 512 characters\n");
+	memset(longa, 'a', sizeof(longa) - 1);
+	memset(longb, 'b', sizeof(longb) - 1);
+	memset(f, 0, sizeof(f));
+	memset(&m, 0, sizeof(m));
+	f[0].parent = NFSP_FIELD_NONE;
+	f[0].root = "LONG";
+	f[0].component = longa;
+	f[1].parent = 0;
+	f[1].component = longb;
+	f[2].parent = 1;
+	f[2].component = "[]";
+	m.schema = nfsp_schema_family_tproto.schemas[0];
+	m.msg_type = NFSP_RPC_CALL;
+	m.fields = f;
+	m.nfields = 3;
+
+	len = nfsp_field_path(&m, 2, NULL, 0);
+	CHECK(len == strlen("tproto.request.LONG.") + 399 + 1 + 399 + 2,
+	      "path length %zu", len);
+	CHECK(nfsp_field_path(&m, 2, small, sizeof(small)) == len &&
+	      strlen(small) == sizeof(small) - 1, "truncated formatting");
+	full = malloc(len + 1);
+	if (!full) {
+		CHECK(0, "malloc");
+		return;
+	}
+	nfsp_field_path(&m, 2, full, len + 1);
+	CHECK(nfsp_field_find(&m, full, 0) == 2, "element path not found");
+	full[len - 2] = '\0';		/* drop "[]": the parent's path */
+	CHECK(nfsp_field_find(&m, full, 0) == 1, "member path not found");
+	full[len - 3] = '\0';		/* a proper prefix matches nothing */
+	CHECK(nfsp_field_find(&m, full, 0) == NFSP_FIELD_NONE,
+	      "prefix matched");
+	CHECK(nfsp_field_find(&m, "tproto.request.LONG", 0) ==
+	      NFSP_FIELD_NONE, "root without its component matched");
+	CHECK(nfsp_field_find(&m, NULL, 0) == NFSP_FIELD_NONE, "NULL path");
+	free(full);
+}
+
 /* Oracle 2: every proper prefix fails, and leaves nothing behind. */
 static void truncate_all(const struct msg *full,
 			 const struct nfsp_reply_dispatch *rd, uint32_t body,
@@ -903,6 +987,8 @@ int main(void)
 	test_reply_golden();
 	test_minor_selection();
 	test_reply_dispatch();
+	test_status_after_nested_union();
+	test_long_paths();
 	test_truncation();
 	test_malformed();
 	test_resource_limit();

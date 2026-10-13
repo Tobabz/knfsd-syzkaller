@@ -5,6 +5,9 @@
  * accepts is exercised by a vector whose offsets are written out in
  * test/test_nfs_decode.c, independently of any RFC.  Minor version 1:
  * adds OP_STAT, so the same opcode is malformed in minor 0 and decoded in 1.
+ * STAT_res starts with a union on tp_status and ends with another
+ * tp_status, so the operation status must stay the first leaf even after a
+ * nested union has been decoded.
  */
 %/* rpcgen pass-through lines are ignored by the normalizer */
 
@@ -107,9 +110,16 @@ struct STAT_args {
 	uint32_t	which;
 };
 
-struct STAT_res {
-	tp_status	status;
+union STAT_value switch (tp_status status) {
+case TP_OK:
 	uint32_t	value;
+default:
+	void;
+};
+
+struct STAT_res {
+	STAT_value	first;
+	tp_status	later;
 };
 
 struct PING_res {
