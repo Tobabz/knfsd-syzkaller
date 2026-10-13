@@ -5,22 +5,16 @@ NFS clients and servers. It applies mutation rules supplied by syzkaller program
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
 `build.sh` runs host framing/walk/delta/golden/relay/control tests under clang
-and a required ASan+UBSan toolchain pass (`SANCC`, default `gcc`).
-`test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2` delta files
-independently of their writer and reader. `build.sh` also compiles the guest
-delta-replay probe as a build-only regression gate. On Darwin the ASan runtime
-does not support LeakSanitizer, so leak detection alone is disabled there;
-ASan+UBSan execution remains mandatory. Two runtime tests need Linux behavior:
-`test_control` needs `AF_UNIX/SOCK_SEQPACKET`, the real legacy control
-transport, and `test_proxy` needs its loopback topology (listeners on
-`127.0.0.2`/`.3`, clients on `127.0.0.10`/`.11`). Darwin lacks the first and,
-without lo0 aliases, the second. Where either is missing, `build.sh` still
-compiles both and then runs the whole suite in `debian:bookworm` through
-Docker, rather than substitute a stream socket or another topology, or skip the
-test. `build-guest.sh --out FILE` then creates a Debian bookworm ABI binary for
-the x86_64 guest: it builds for `linux/amd64` on any host, checks the ELF
-machine, and records provenance next to the binary. The two backend listeners
-are routed solely by destination IP, and the source IP identifies the client.
+and GCC ASan+UBSan. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
+delta files independently of their writer and reader. `build.sh` also compiles
+the guest delta-replay probe as a build-only regression gate. The host tests
+run on Linux only: `test_control` uses `AF_UNIX/SOCK_SEQPACKET`, the real legacy
+control transport, and `test_proxy` binds its loopback topology (listeners on
+`127.0.0.2`/`.3`, clients on `127.0.0.10`/`.11`). `build-guest.sh --out FILE`
+then creates a Debian bookworm ABI binary for the x86_64 guest: it builds for
+`linux/amd64` whatever the host architecture, checks the ELF machine, and
+records provenance next to the binary. The two backend listeners are routed
+solely by destination IP, and the source IP identifies the client.
 `SERVER_IMPL=both` provides `.1:2049 → knfsd :20490` and
 `.5:2049 → Ganesha :20491`.
 NFSv3 calls pass through the engine's TCP proxy; their MOUNT requests go directly to the

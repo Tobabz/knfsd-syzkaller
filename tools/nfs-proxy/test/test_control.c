@@ -4,7 +4,6 @@
 
 #include <errno.h>
 #include <limits.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,33 +78,10 @@ static int connect_arm(const char *socket_path)
 	return fd;
 }
 
-/* nfsp_control_tick() sends the ack before it returns, so the ack is either
- * queued already or was never sent.  A zero-timeout poll() and then a plain
- * recv() checks that without blocking, as recv(..., MSG_DONTWAIT) did; that
- * flag is hidden on Darwin under _POSIX_C_SOURCE (line 1). */
 static int wait_ack(int fd, uint8_t *ack)
 {
-	struct pollfd p = {fd, POLLIN, 0};
-
 	*ack = 255;
-	if (poll(&p, 1, 0) != 1 || (p.revents & POLLIN) == 0)
-		return -1;
-	return recv(fd, ack, 1, 0) == 1 ? 0 : -1;
-}
-
-/* mkdtemp(3), which Darwin hides under _POSIX_C_SOURCE, built from mkstemp(3):
- * the unique name mkstemp reserves is released before mkdir(2).  If another
- * process takes the name in that window, mkdir fails with EEXIST and the test
- * stops; it never shares a directory.  Mode 0700, as mkdtemp. */
-static int make_temp_dir(char *path)
-{
-	int fd = mkstemp(path);
-
-	if (fd < 0)
-		return -1;
-	if (close(fd) != 0 || unlink(path) != 0)
-		return -1;
-	return mkdir(path, 0700);
+	return recv(fd, ack, 1, MSG_DONTWAIT) == 1 ? 0 : -1;
 }
 
 /* M0 compatibility lock: these values are the public legacy wire/file ABI.
@@ -449,7 +425,7 @@ int main(void)
 
 	test_legacy_abi_constants();
 	printf("control FD lifetime, four scopes, durable delta, same replay apply\n");
-	CHECK(make_temp_dir(dir) == 0, "make temp directory");
+	CHECK(mkdtemp(dir) != NULL, "mkdtemp");
 	if (failures) return 1;
 	(void)snprintf(socket_path, sizeof(socket_path), "%s/arm.sock", dir);
 	(void)snprintf(delta_dir, sizeof(delta_dir), "%s/deltas", dir);

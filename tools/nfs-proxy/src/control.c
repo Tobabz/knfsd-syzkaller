@@ -13,14 +13,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#ifndef MSG_DONTWAIT
-/* MSG_DONTWAIT is not POSIX.  glibc defines it whatever the feature macros, so
- * on Linux this block is never compiled.  Darwin has it too, but hides it under
- * _POSIX_C_SOURCE (line 1).  0 is a correct stand-in: the flag is only passed
- * with accepted arm fds, which nfsp_control_tick() makes O_NONBLOCK first. */
-#define MSG_DONTWAIT 0
-#endif
-
 #define NFSP_ARM_SLOTS 64u
 
 /* One armed rule, either v1 (fixed-width overwrite) or v2 (variable-length

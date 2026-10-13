@@ -3,7 +3,6 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
@@ -16,10 +15,6 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
-
-#ifndef INADDR_LOOPBACK
-#define INADDR_LOOPBACK 0x7f000001u
-#endif
 
 static unsigned checks, failures;
 #define CHECK(x, ...) do { checks++; if (!(x)) { failures++; \
@@ -89,11 +84,8 @@ struct job { struct fake *backend; int fd; };
  *   Each proxy listener has its own loopback address and each client its own
  *   source address, so the four (client, backend) tuples are four distinct TCP
  *   4-tuples, as in the guest lane topology.  Linux routes all of 127/8 to the
- *   loopback device and binds these with no setup.  Darwin binds only addresses
- *   assigned to an interface, and lo0 has just 127.0.0.1 unless an
- *   administrator adds aliases.  There the fixture cannot be built: main()
- *   checks the topology before starting any thread, and build.sh runs this test
- *   in its Linux gate rather than substitute a weaker topology. */
+ *   loopback device and binds these with no setup.  main() checks that the
+ *   topology works before starting any thread. */
 static const char *const fixture_listen_ip[2] = {"127.0.0.2", "127.0.0.3"};
 static const char *const fixture_client_ip[2] = {"127.0.0.10", "127.0.0.11"};
 
@@ -161,7 +153,7 @@ out:
 
 /* 1 when every client address reaches every listener address, else 0 with the
  * first reason in `why`.  `simulate` reports failure without probing, so that
- * build.sh can check on any host that the refusal in main() still happens. */
+ * build.sh can check on every run that the refusal in main() still happens. */
 static int fixture_addresses_usable(int simulate, char *why, size_t whylen)
 {
 	if (simulate) {
@@ -702,22 +694,17 @@ static void test_unframeable_output_refused(void)
 
 /* Exit status: 0 pass, 1 a check failed, 2 usage, 3 the fixture topology does
  * not work on this host (no test was run), 97 the watchdog fired.
- *
- *   --check-addresses               only report whether the topology works
- *   --simulate-unusable-addresses   run as if it did not */
+ * --simulate-unusable-addresses runs as if the topology did not work. */
 int main(int argc, char **argv)
 {
 	char why[160];
-	int check_only = 0, simulate = 0;
+	int simulate = 0;
 
-	if (argc == 2 && strcmp(argv[1], "--check-addresses") == 0) {
-		check_only = 1;
-	} else if (argc == 2 &&
-		   strcmp(argv[1], "--simulate-unusable-addresses") == 0) {
+	if (argc == 2 && strcmp(argv[1], "--simulate-unusable-addresses") == 0) {
 		simulate = 1;
 	} else if (argc != 1) {
-		fprintf(stderr, "usage: %s [--check-addresses | "
-			"--simulate-unusable-addresses]\n", argv[0]);
+		fprintf(stderr, "usage: %s [--simulate-unusable-addresses]\n",
+			argv[0]);
 		return 2;
 	}
 	signal(SIGALRM, watchdog);
@@ -726,17 +713,9 @@ int main(int argc, char **argv)
 	 * inside a test with backend threads running, and a backend blocked in
 	 * accept() leaves a join that only the watchdog ends. */
 	if (!fixture_addresses_usable(simulate, why, sizeof(why))) {
-		if (check_only) {
-			printf("fixture addresses unusable: %s\n", why);
-			return 3;
-		}
 		fprintf(stderr, "FAIL: fixture addresses unusable: %s; "
 			"no test thread was started\n", why);
 		return 3;
-	}
-	if (check_only) {
-		printf("fixture addresses usable\n");
-		return 0;
 	}
 	test_four();
 	test_dead();
