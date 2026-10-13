@@ -293,7 +293,7 @@ sentinel PC의 존재는 구간 도달 증거이지 같은 요청의 순서나 �
 
 | 경로 | 내용 | 상태 |
 |---|---|---|
-| `docs/design/02-llm-agent/` | 2-Stage Agent 설계(Candidate부터 MutationRuleSet까지) | 설계 리뷰 중(issue #5–#14) |
+| `docs/design/02-llm-agent/` | 2-Stage Agent 설계(Candidate부터 MutationRuleSet까지, job 상태 기계) | 설계 리뷰 중(issue #5–#14) |
 | `docs/design/03-nfs-proxy/` | NFS Proxy semantic mutation target 설계와 구현 갭 분석 | 설계 리뷰 중 |
 | `docs/design/04-observation/` | NFSD tracepoint의 KCOV 수집 설계(opt-in) | draft |
 
