@@ -352,28 +352,9 @@ Agent는 build, VM, KCOV PASS를 주장하지 않는다.
 
 ### 4.4 ReachabilityPlan
 
-`ReachabilityPlan`은 실행 가능한 shell script가 아니라 semantic plan이다.
-
-예시 필드:
-
-```text
-ReachabilityPlan
-    candidate_id
-    hcap_revision                  # 계획에 쓴 HCAP (§11.2)
-    target_oracle
-        exact symbol / code location
-        # build별 PC mapping은 Q1 Judge가 evidence의 identity로 한다
-    selected_path
-    nfs_version
-    scenario_steps[]
-        capability_id
-        action
-        parameters
-    required_capabilities[]
-    q1_observation
-    execution_constraints[]
-    uncertainties[]
-```
+`ReachabilityPlan`은 실행 가능한 shell script가 아니라 semantic plan이다. field와 의미는 `05` §4가 소유하며
+여기에 다시 쓰지 않는다. Q1 target은 `q1_observation`(`05` §9)에 있고, build별 PC mapping은 Q1 Judge가
+evidence의 identity로 한다(`06` §5).
 
 ### 4.5 Harness artifact
 

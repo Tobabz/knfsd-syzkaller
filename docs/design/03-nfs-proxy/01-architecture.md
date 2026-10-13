@@ -190,34 +190,11 @@ NFSv4 COMPOUND
               +-- stateid
 ```
 
-출력은 semantic field와 live byte span을 함께 가진다.
+출력은 `DecodedRpcMessage`다. 각 operation의 `fields[]`(`SemanticField`)는 semantic path, 값과 live
+`RpcRecord.rpc_payload` 위의 `wire_ref`를 함께 가진다. field 이름과 형식은
+[`02-semantic-decoder.md`](02-semantic-decoder.md) §7–§10이 소유하며 여기에 다시 쓰지 않는다.
 
-```text
-DecodedRpcMessage
-    rpc
-        message_type
-        xid
-        program
-        version
-        procedure
-
-    protocol
-        family
-        nfs_version
-        minor_version?
-
-    operations[]
-        operation
-        semantic_fields[]
-            path
-            value
-            byte_span
-
-    decode_status
-```
-
-`byte_span`은 live `RpcRecord.rpc_payload`에서 decoder가 확인한 위치다.
-Agent나 Compiler가 미리 계산하지 않는다.
+`wire_ref`는 decoder가 live payload에서 확인한 위치다. Agent나 Compiler가 미리 계산하지 않는다.
 
 Codec은 protocol/version 단위 registry로 확장한다.
 
