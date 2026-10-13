@@ -1,0 +1,13 @@
+replay_target=10.89.0.1 request_xid=0x11111111 response_xid=0x11111111
+__ready=1 __probe_rc=0 __proxy_rc=1
+relay ready: knfsd=20549 ganesha=20549
+stats_begin final
+client=0 backend=0 accepted=1 connected=1 failed=0 c2s=1 s2c=1 sent_c2s=1 sent_s2c=1
+client=0 backend=1 accepted=0 connected=0 failed=0 c2s=0 s2c=0 sent_c2s=0 sent_s2c=0
+client=1 backend=0 accepted=0 connected=0 failed=0 c2s=0 s2c=0 sent_c2s=0 sent_s2c=0
+client=1 backend=1 accepted=0 connected=0 failed=0 c2s=0 s2c=0 sent_c2s=0 sent_s2c=0
+peak_active=1 active=0 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0
+stats_end final
+control mode=replay armed=1 expired=0 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=0 edit_refused_orig=1 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0
+replay rule=0 edit=1 expected=0 applied=0 refused_orig=1
+proxy setup, poll or replay failed

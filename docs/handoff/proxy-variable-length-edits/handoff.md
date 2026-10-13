@@ -200,7 +200,7 @@ tools/nfs-proxy/build.sh          # clang 빌드 + 단위 테스트 + gcc ASan/U
 |---|---|
 | `mkinputs.py` | 검증 입력(VM 도우미, lane fixture 세 종, 워크로드, 프록시를 넣은 deps)을 `~/prune-evidence/inputs`에 다시 만든다. VM 도우미는 `git show ab353b0:bundle/ab-runner/phases/run_frozen_phase1_vm.py`에서 복원한다. deps는 `tools/assemble-guest-deps.py`로 `bundle/src/guest-deps-ganesha-v15.6.tar.gz`와 프록시(`NFSP_PROXY`, 기본 `bundle/src/nfs-proxy-lane`)를 합쳐 만든다 |
 | `verify-lane.py` | VM 한 대를 띄워 fixture, `syz-execprog`(원격 커버리지 켬), 카운터와 `.extra`, `dmesg`를 확인하고 `result.json`을 쓴다 |
-| `run-verify.sh` | 위를 부트스트랩 산출물 기준으로 감싼 실행 스크립트 (`kasan`/`kcsan` × `direct`/`proxy`/`raw`/`copy`) |
+| `run-verify.sh` | 위를 부트스트랩 산출물 기준으로 감싼 실행 스크립트 (`kasan`/`kcsan` × `direct`/`proxy`/`raw`/`copy`). M0용 `legacy-v1`/`legacy-v2`/`legacy-v2-refusal`은 각 arm의 종료 코드를 보존하고 하나라도 실패하면 전체도 실패한다. |
 
 필요한 것: 부트스트랩이 만든 환경(`env/images/<variant>/{bzImage,vmlinux}`, `env/syzkaller/bin`,
 버전 중립 이미지 `env/images/bookworm-kcov-fresh.qcow2`의 raw 사본), Ganesha deps(`tools/build-ganesha-v15.sh`),
@@ -214,6 +214,14 @@ tools/nfs-proxy/build-guest.sh --out ~/nfsp-build/nfs-proxy-v2
 NFSP_PROXY=~/nfsp-build/nfs-proxy-v2 uv run python docs/handoff/proxy-variable-length-edits/mkinputs.py
 PROCS=4 WORKLOAD=<v2 arm 프로그램> docs/handoff/proxy-variable-length-edits/run-verify.sh <ENV_DIR> kasan raw
 ```
+
+M0 레거시 gate는 `EXECUTIONS=1`, `PROCS=1`로 고정된다. `legacy-v1`은 네
+client/backend route의 실제 왕복과 두 `NFSPDLT1`의 C2S/S2C replay를,
+`legacy-v2`는 `NFSPDLT2` resize replay를 검사한다. 두 profile 모두
+original-byte mismatch와 `applied_count` mismatch가 guest proxy의 nonzero
+exit로 거부되는지 확인한다. `legacy-v2-refusal`은 잘못된 original을 가진
+arm이 live 경로에서도 적용되지 않는지 별도로 검사한다. 결과는 arm별
+`result.json`, delta, bounded replay log와 최상위 `arm-status.tsv`에 남는다.
 
 **통과 기준 (프록시 경유, 편집 규칙을 켠 상태):**
 

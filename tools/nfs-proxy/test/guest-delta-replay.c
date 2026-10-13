@@ -37,6 +37,19 @@ static uint32_t get32(const uint8_t *p)
 	       ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
+static int parse_u32(const char *text, uint32_t *out)
+{
+	char *end;
+	unsigned long value;
+
+	errno = 0;
+	value = strtoul(text, &end, 0);
+	if (errno != 0 || *text == '\0' || *end != '\0' || value > UINT32_MAX)
+		return -1;
+	*out = (uint32_t)value;
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const uint32_t words[15] = {
@@ -45,20 +58,34 @@ int main(int argc, char **argv)
 	struct sockaddr_in peer = {0};
 	struct timeval timeout = {.tv_sec = 5};
 	uint8_t req[4 + sizeof(words)], marker[4], data[4096];
-	uint32_t expected, reply_xid = 0;
-	int fd, dir;
-	if (argc != 2 || (strcmp(argv[1], "0") && strcmp(argv[1], "1") &&
-	                  strcmp(argv[1], "2")))
+	uint32_t request_xid, expected, reply_xid = 0;
+	const char *target = "10.89.0.5";
+	int fd, dir = -1;
+
+	/* The one-argument form preserves the original NFSPDLT1 probe.  The
+	 * explicit form also drives anchored NFSPDLT2 records without teaching
+	 * this program anything about a mutation's contents. */
+	if (argc == 2 && (!strcmp(argv[1], "0") || !strcmp(argv[1], "1") ||
+	                  !strcmp(argv[1], "2"))) {
+		dir = argv[1][0] - '0';
+		request_xid = dir == 0 ? 0x22222222u :
+		              dir == 1 ? 0x22222223u : 0x22222224u;
+		expected = dir == 0 ? 0x22222223u :
+		           dir == 1 ? 0x22222222u : 0x22222224u;
+	} else if (argc == 4 && parse_u32(argv[2], &request_xid) == 0 &&
+	           parse_u32(argv[3], &expected) == 0) {
+		target = argv[1];
+	} else {
+		fprintf(stderr, "usage: %s 0|1|2 | TARGET REQUEST_XID EXPECTED_XID\n",
+		        argv[0]);
 		return 2;
-	dir = argv[1][0] - '0';
+	}
 	for (unsigned i = 0; i < 15; i++)
-		put32(req + 4u + 4u * i, i == 0 ?
-		      (dir == 0 ? 0x22222222u :
-		       dir == 1 ? 0x22222223u : 0x22222224u) : words[i]);
+		put32(req + 4u + 4u * i, i == 0 ? request_xid : words[i]);
 	put32(req, 0x80000000u | (uint32_t)sizeof(words));
 	peer.sin_family = AF_INET;
 	peer.sin_port = htons(20549);
-	if (inet_pton(AF_INET, "10.89.0.5", &peer.sin_addr) != 1) return 1;
+	if (inet_pton(AF_INET, target, &peer.sin_addr) != 1) return 1;
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) return 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
@@ -84,14 +111,16 @@ int main(int argc, char **argv)
 			n -= (uint32_t)chunk;
 		}
 		if (last) {
-			expected = dir == 0 ? 0x22222223u :
-			           dir == 1 ? 0x22222222u : 0x22222224u;
 			close(fd);
 			if (reply_xid != expected) {
 				fprintf(stderr, "replay xid %#x != %#x\n", reply_xid, expected);
 				return 1;
 			}
-			printf("replay_direction=%d response_xid=%#x\n", dir, reply_xid);
+			if (dir >= 0)
+				printf("replay_direction=%d response_xid=%#x\n", dir, reply_xid);
+			else
+				printf("replay_target=%s request_xid=%#x response_xid=%#x\n",
+				       target, request_xid, reply_xid);
 			return 0;
 		}
 	}

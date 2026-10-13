@@ -1,0 +1,331 @@
+{
+  "commands": [
+    {
+      "command": "mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug",
+      "duration_seconds": 0.245628,
+      "returncode": 0,
+      "stage": "debugfs",
+      "stderr": "commands/001-debugfs.stderr",
+      "stdout": "commands/001-debugfs.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/inputs/deps-ganesha-proxy.tar.gz /tmp/deps.tar.gz",
+      "duration_seconds": 0.368812,
+      "returncode": 0,
+      "stage": "deps",
+      "stderr": "commands/002-deps.stderr",
+      "stdout": "commands/002-deps.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/inputs/lane-proxy.sh /tmp/lane.sh",
+      "duration_seconds": 0.278219,
+      "returncode": 0,
+      "stage": "fixture",
+      "stderr": "commands/003-fixture.stderr",
+      "stdout": "commands/003-fixture.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/inputs/workload-legacy-v1.prog /tmp/w.prog",
+      "duration_seconds": 0.303196,
+      "returncode": 0,
+      "stage": "workload",
+      "stderr": "commands/004-workload.stderr",
+      "stdout": "commands/004-workload.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/fuzz/knfsd-syzkaller/env/syzkaller/bin/linux_amd64/syz-executor /tmp/syz-executor",
+      "duration_seconds": 0.319031,
+      "returncode": 0,
+      "stage": "executor",
+      "stderr": "commands/005-executor.stderr",
+      "stdout": "commands/005-executor.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/fuzz/knfsd-syzkaller/env/syzkaller/bin/linux_amd64/syz-execprog /tmp/syz-execprog",
+      "duration_seconds": 1.226598,
+      "returncode": 0,
+      "stage": "execprog",
+      "stderr": "commands/006-execprog.stderr",
+      "stdout": "commands/006-execprog.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/fuzz/knfsd-syzkaller/tools/nfs-proxy/build/guest-delta-replay /tmp/replay-probe",
+      "duration_seconds": 0.231972,
+      "returncode": 0,
+      "stage": "replay-probe",
+      "stderr": "commands/007-replay-probe.stderr",
+      "stdout": "commands/007-replay-probe.stdout"
+    },
+    {
+      "command": "set -eu; install -d /opt/kcov-nfs/deps /opt/frozen-phase9; tar -xzf /tmp/deps.tar.gz -C /opt/kcov-nfs/deps; install -m 0755 /tmp/lane.sh /opt/frozen-phase9/lane.sh; install -m 0644 /tmp/w.prog /opt/frozen-phase9/w.prog; install -m 0755 /tmp/syz-executor /opt/frozen-phase9/syz-executor; install -m 0755 /tmp/syz-execprog /opt/frozen-phase9/syz-execprog; install -m 0755 /tmp/replay-probe /opt/frozen-phase9/replay-probe",
+      "duration_seconds": 0.912931,
+      "returncode": 0,
+      "stage": "install",
+      "stderr": "commands/008-install.stderr",
+      "stdout": "commands/008-install.stdout"
+    },
+    {
+      "command": "uname -m; sha256sum /opt/kcov-nfs/deps/usr/sbin/nfs-proxy /opt/frozen-phase9/replay-probe",
+      "duration_seconds": 0.266292,
+      "returncode": 0,
+      "stage": "guest-inventory",
+      "stderr": "commands/009-guest-inventory.stderr",
+      "stdout": "commands/009-guest-inventory.stdout"
+    },
+    {
+      "command": "mktemp -d /tmp/frozen-phase9.XXXXXX",
+      "duration_seconds": 0.239855,
+      "returncode": 0,
+      "stage": "root",
+      "stderr": "commands/010-root.stderr",
+      "stdout": "commands/010-root.stdout"
+    },
+    {
+      "command": "/opt/frozen-phase9/lane.sh setup /tmp/frozen-phase9.QMkN97 1",
+      "duration_seconds": 6.53855,
+      "returncode": 0,
+      "stage": "setup",
+      "stderr": "commands/011-setup.stderr",
+      "stdout": "commands/011-setup.stdout"
+    },
+    {
+      "command": "sleep 11",
+      "duration_seconds": 11.271585,
+      "returncode": 0,
+      "stage": "grace",
+      "stderr": "commands/012-grace.stderr",
+      "stdout": "commands/012-grace.stdout"
+    },
+    {
+      "command": "for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do echo \"== $f\"; cat $f; done",
+      "duration_seconds": 0.325376,
+      "returncode": 0,
+      "stage": "stats-before",
+      "stderr": "commands/013-stats-before.stderr",
+      "stdout": "commands/013-stats-before.stdout"
+    },
+    {
+      "command": "ip netns exec f9l0s nsenter -t 1 -m -- cat /sys/kernel/debug/sunrpc_fuzz/lane_state",
+      "duration_seconds": 0.274395,
+      "returncode": 0,
+      "stage": "lane-state",
+      "stderr": "commands/014-lane-state.stderr",
+      "stdout": "commands/014-lane-state.stdout"
+    },
+    {
+      "command": "rm -rf /tmp/cov; mkdir /tmp/cov; timeout 600 /opt/frozen-phase9/syz-execprog -executor=/opt/frozen-phase9/syz-executor -os=linux -arch=amd64 -vmarch=amd64 -sandbox=none -procs=1 -repeat=1 -threaded=false -cover=true -coverfile=/tmp/cov/cover -remote-cover=true -disable=all -debug -vv=1 -slowdown=1 /opt/frozen-phase9/w.prog > /tmp/exec.log 2>&1; echo rc=$?",
+      "duration_seconds": 3.967813,
+      "returncode": 0,
+      "stage": "execprog",
+      "stderr": "commands/015-execprog.stderr",
+      "stdout": "commands/015-execprog.stdout"
+    },
+    {
+      "command": "cat /tmp/exec.log",
+      "duration_seconds": 0.231425,
+      "returncode": 0,
+      "stage": "exec-log",
+      "stderr": "commands/016-exec-log.stderr",
+      "stdout": "commands/016-exec-log.stdout"
+    },
+    {
+      "command": "sleep 10",
+      "duration_seconds": 10.222674,
+      "returncode": 0,
+      "stage": "drain",
+      "stderr": "commands/017-drain.stderr",
+      "stdout": "commands/017-drain.stdout"
+    },
+    {
+      "command": "for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do echo \"== $f\"; cat $f; done",
+      "duration_seconds": 0.281246,
+      "returncode": 0,
+      "stage": "stats-after",
+      "stderr": "commands/018-stats-after.stderr",
+      "stdout": "commands/018-stats-after.stdout"
+    },
+    {
+      "command": "ip netns exec f9l0s nsenter -t 1 -m -- cat /sys/kernel/debug/sunrpc_fuzz/lane_state",
+      "duration_seconds": 0.306824,
+      "returncode": 0,
+      "stage": "lane-state-0",
+      "stderr": "commands/019-lane-state-0.stderr",
+      "stdout": "commands/019-lane-state-0.stdout"
+    },
+    {
+      "command": "cat /tmp/frozen-phase9.QMkN97/lane0/server/proxy.pid",
+      "duration_seconds": 0.283526,
+      "returncode": 0,
+      "stage": "proxy-pid-0",
+      "stderr": "commands/020-proxy-pid-0.stderr",
+      "stdout": "commands/020-proxy-pid-0.stdout"
+    },
+    {
+      "command": "kill -USR1 793",
+      "duration_seconds": 0.201164,
+      "returncode": 0,
+      "stage": "proxy-snapshot-0",
+      "stderr": "commands/021-proxy-snapshot-0.stderr",
+      "stdout": "commands/021-proxy-snapshot-0.stdout"
+    },
+    {
+      "command": "sleep 1",
+      "duration_seconds": 1.247052,
+      "returncode": 0,
+      "stage": "proxy-snapshot-drain",
+      "stderr": "commands/022-proxy-snapshot-drain.stderr",
+      "stdout": "commands/022-proxy-snapshot-drain.stdout"
+    },
+    {
+      "command": "cat /tmp/frozen-phase9.QMkN97/lane0/server/proxy.log",
+      "duration_seconds": 0.273085,
+      "returncode": 0,
+      "stage": "proxy-log-0",
+      "stderr": "commands/023-proxy-log-0.stderr",
+      "stdout": "commands/023-proxy-log-0.stdout"
+    },
+    {
+      "command": "find /tmp/frozen-phase9.QMkN97/lane0/server/deltas -maxdepth 1 -type f -name 'arm-*.delta' -printf '%f\\n' | sort -V",
+      "duration_seconds": 0.246075,
+      "returncode": 0,
+      "stage": "delta-list",
+      "stderr": "commands/024-delta-list.stderr",
+      "stdout": "commands/024-delta-list.stdout"
+    },
+    {
+      "command": "base64 -w0 /tmp/frozen-phase9.QMkN97/lane0/server/deltas/arm-0.delta",
+      "duration_seconds": 0.260573,
+      "returncode": 0,
+      "stage": "delta-0",
+      "stderr": "commands/025-delta-0.stderr",
+      "stdout": "commands/025-delta-0.stdout"
+    },
+    {
+      "command": "base64 -w0 /tmp/frozen-phase9.QMkN97/lane0/server/deltas/arm-1.delta",
+      "duration_seconds": 0.255668,
+      "returncode": 0,
+      "stage": "delta-1",
+      "stderr": "commands/026-delta-1.stderr",
+      "stdout": "commands/026-delta-1.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/m0-issue19-final/legacy-v1/deltas/arm-0.delta /tmp/v1-exact-0.delta",
+      "duration_seconds": 0.225188,
+      "returncode": 0,
+      "stage": "put-v1-exact-0",
+      "stderr": "commands/027-put-v1-exact-0.stderr",
+      "stdout": "commands/027-put-v1-exact-0.stdout"
+    },
+    {
+      "command": "set -u\nlog=/tmp/v1-exact-0.log\nrm -f \"$log\"\nip netns exec f9l0s /opt/kcov-nfs/deps/usr/sbin/nfs-proxy \\\n    10.89.0.2 10.89.0.6 10.89.0.1:20549 10.89.0.5:20549 \\\n    10.89.0.1:20490 10.89.0.5:20491 --replay /tmp/v1-exact-0.delta >\"$log\" 2>&1 &\npid=$!\ni=0\nready=0\nwhile test \"$i\" -lt 80; do\n    if grep -q '^relay ready:' \"$log\"; then ready=1; break; fi\n    kill -0 \"$pid\" 2>/dev/null || break\n    i=$((i + 1))\n    sleep 0.1\ndone\nprobe_rc=99\nif test \"$ready\" -eq 1; then\n    ip netns exec f9l0c0 /opt/frozen-phase9/replay-probe 10.89.0.5 0x22222222 0x22222223\n    probe_rc=$?\nfi\nkill -TERM \"$pid\" 2>/dev/null || true\nproxy_rc=0\nwait \"$pid\" || proxy_rc=$?\nprintf '__ready=%s __probe_rc=%s __proxy_rc=%s\\n' \"$ready\" \"$probe_rc\" \"$proxy_rc\"\ncat \"$log\"\n",
+      "duration_seconds": 0.398191,
+      "returncode": 0,
+      "stage": "replay-v1-exact-0",
+      "stderr": "commands/028-replay-v1-exact-0.stderr",
+      "stdout": "commands/028-replay-v1-exact-0.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/m0-issue19-final/legacy-v1/deltas/arm-1.delta /tmp/v1-exact-1.delta",
+      "duration_seconds": 0.26132,
+      "returncode": 0,
+      "stage": "put-v1-exact-1",
+      "stderr": "commands/029-put-v1-exact-1.stderr",
+      "stdout": "commands/029-put-v1-exact-1.stdout"
+    },
+    {
+      "command": "set -u\nlog=/tmp/v1-exact-1.log\nrm -f \"$log\"\nip netns exec f9l0s /opt/kcov-nfs/deps/usr/sbin/nfs-proxy \\\n    10.89.0.2 10.89.0.6 10.89.0.1:20549 10.89.0.5:20549 \\\n    10.89.0.1:20490 10.89.0.5:20491 --replay /tmp/v1-exact-1.delta >\"$log\" 2>&1 &\npid=$!\ni=0\nready=0\nwhile test \"$i\" -lt 80; do\n    if grep -q '^relay ready:' \"$log\"; then ready=1; break; fi\n    kill -0 \"$pid\" 2>/dev/null || break\n    i=$((i + 1))\n    sleep 0.1\ndone\nprobe_rc=99\nif test \"$ready\" -eq 1; then\n    ip netns exec f9l0c0 /opt/frozen-phase9/replay-probe 10.89.0.5 0x22222223 0x22222222\n    probe_rc=$?\nfi\nkill -TERM \"$pid\" 2>/dev/null || true\nproxy_rc=0\nwait \"$pid\" || proxy_rc=$?\nprintf '__ready=%s __probe_rc=%s __proxy_rc=%s\\n' \"$ready\" \"$probe_rc\" \"$proxy_rc\"\ncat \"$log\"\n",
+      "duration_seconds": 0.397917,
+      "returncode": 0,
+      "stage": "replay-v1-exact-1",
+      "stderr": "commands/030-replay-v1-exact-1.stderr",
+      "stdout": "commands/030-replay-v1-exact-1.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/m0-issue19-final/legacy-v1/deltas/v1-original-mismatch.delta /tmp/v1-original-mismatch.delta",
+      "duration_seconds": 0.26884,
+      "returncode": 0,
+      "stage": "put-v1-original-mismatch",
+      "stderr": "commands/031-put-v1-original-mismatch.stderr",
+      "stdout": "commands/031-put-v1-original-mismatch.stdout"
+    },
+    {
+      "command": "set -u\nlog=/tmp/v1-original-mismatch.log\nrm -f \"$log\"\nip netns exec f9l0s /opt/kcov-nfs/deps/usr/sbin/nfs-proxy \\\n    10.89.0.2 10.89.0.6 10.89.0.1:20549 10.89.0.5:20549 \\\n    10.89.0.1:20490 10.89.0.5:20491 --replay /tmp/v1-original-mismatch.delta >\"$log\" 2>&1 &\npid=$!\ni=0\nready=0\nwhile test \"$i\" -lt 80; do\n    if grep -q '^relay ready:' \"$log\"; then ready=1; break; fi\n    kill -0 \"$pid\" 2>/dev/null || break\n    i=$((i + 1))\n    sleep 0.1\ndone\nprobe_rc=99\nif test \"$ready\" -eq 1; then\n    ip netns exec f9l0c0 /opt/frozen-phase9/replay-probe 10.89.0.5 0x22222224 0x22222224\n    probe_rc=$?\nfi\nkill -TERM \"$pid\" 2>/dev/null || true\nproxy_rc=0\nwait \"$pid\" || proxy_rc=$?\nprintf '__ready=%s __probe_rc=%s __proxy_rc=%s\\n' \"$ready\" \"$probe_rc\" \"$proxy_rc\"\ncat \"$log\"\n",
+      "duration_seconds": 0.415667,
+      "returncode": 0,
+      "stage": "replay-v1-original-mismatch",
+      "stderr": "commands/032-replay-v1-original-mismatch.stderr",
+      "stdout": "commands/032-replay-v1-original-mismatch.stdout"
+    },
+    {
+      "command": "scp /home/fuzzer/prune-evidence/m0-issue19-final/legacy-v1/deltas/v1-count-mismatch.delta /tmp/v1-count-mismatch.delta",
+      "duration_seconds": 0.265268,
+      "returncode": 0,
+      "stage": "put-v1-count-mismatch",
+      "stderr": "commands/033-put-v1-count-mismatch.stderr",
+      "stdout": "commands/033-put-v1-count-mismatch.stdout"
+    },
+    {
+      "command": "set -u\nlog=/tmp/v1-count-mismatch.log\nrm -f \"$log\"\nip netns exec f9l0s /opt/kcov-nfs/deps/usr/sbin/nfs-proxy \\\n    10.89.0.2 10.89.0.6 10.89.0.1:20549 10.89.0.5:20549 \\\n    10.89.0.1:20490 10.89.0.5:20491 --replay /tmp/v1-count-mismatch.delta >\"$log\" 2>&1 &\npid=$!\ni=0\nready=0\nwhile test \"$i\" -lt 80; do\n    if grep -q '^relay ready:' \"$log\"; then ready=1; break; fi\n    kill -0 \"$pid\" 2>/dev/null || break\n    i=$((i + 1))\n    sleep 0.1\ndone\nprobe_rc=99\nif test \"$ready\" -eq 1; then\n    ip netns exec f9l0c0 /opt/frozen-phase9/replay-probe 10.89.0.5 0x22222222 0x22222223\n    probe_rc=$?\nfi\nkill -TERM \"$pid\" 2>/dev/null || true\nproxy_rc=0\nwait \"$pid\" || proxy_rc=$?\nprintf '__ready=%s __probe_rc=%s __proxy_rc=%s\\n' \"$ready\" \"$probe_rc\" \"$proxy_rc\"\ncat \"$log\"\n",
+      "duration_seconds": 0.444599,
+      "returncode": 0,
+      "stage": "replay-v1-count-mismatch",
+      "stderr": "commands/034-replay-v1-count-mismatch.stderr",
+      "stdout": "commands/034-replay-v1-count-mismatch.stdout"
+    },
+    {
+      "command": "tar -C /tmp/cov -czf /tmp/cov.tgz .",
+      "duration_seconds": 0.290782,
+      "returncode": 0,
+      "stage": "tar",
+      "stderr": "commands/035-tar.stderr",
+      "stdout": "commands/035-tar.stdout"
+    },
+    {
+      "command": "/opt/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.QMkN97",
+      "duration_seconds": 3.560243,
+      "returncode": 0,
+      "stage": "cleanup",
+      "stderr": "commands/036-cleanup.stderr",
+      "stdout": "commands/036-cleanup.stdout"
+    },
+    {
+      "command": "dmesg",
+      "duration_seconds": 0.207072,
+      "returncode": 0,
+      "stage": "dmesg",
+      "stderr": "commands/037-dmesg.stderr",
+      "stdout": "commands/037-dmesg.stdout"
+    }
+  ],
+  "runtime": {
+    "qemu": [
+      "qemu-system-x86_64",
+      "-enable-kvm",
+      "-cpu",
+      "host",
+      "-m",
+      "6144",
+      "-smp",
+      "6",
+      "-display",
+      "none",
+      "-serial",
+      "stdio",
+      "-no-reboot",
+      "-snapshot",
+      "-drive",
+      "file=/home/fuzzer/prune-env-image.raw,format=raw,if=ide",
+      "-kernel",
+      "/home/fuzzer/kv-kasan/arch/x86/boot/bzImage",
+      "-append",
+      "root=/dev/sda console=ttyS0 nokaslr nfs.localio_enabled=N",
+      "-device",
+      "e1000,netdev=net0",
+      "-netdev",
+      "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:59927-:22"
+    ],
+    "qemu_pid": 3313736,
+    "ssh_port": 59927,
+    "ssh_ready_at": "2026-10-13T01:34:01Z"
+  }
+}
