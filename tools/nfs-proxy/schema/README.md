@@ -82,6 +82,8 @@ and repeated operations repeat it), so these are build errors too:
 duplicate struct member names or procedure names; a union arm whose branch
 repeats the discriminant's name; two different arms of one union with the same
 branch; one union named as the operation of both directions; an operation
+union reached in the other direction's message (a response operation inside
+a CALL argument, or the reverse); an operation
 leaf that repeats the operation discriminant's name; an operation or procedure
 whose name is only its prefix, or an operation named like a procedure; a
 leaf, in `leaf` or `operation`, that is not an identifier.

@@ -383,8 +383,9 @@ static int dec_union(struct dec *d, uint16_t t, uint32_t parent,
 {
 	const struct nfsp_schema_type *ty = &d->s->types[t];
 	const struct nfsp_schema_arm *arm = NULL;
-	int is_op = (ty->flags & (NFSP_STF_OPS_REQUEST |
-				  NFSP_STF_OPS_RESPONSE)) != 0;
+	uint8_t mine = d->response ? NFSP_STF_OPS_RESPONSE :
+				     NFSP_STF_OPS_REQUEST;
+	int is_op = (ty->flags & mine) != 0;
 	uint32_t start = d->off, w, me, dn, saved_op = d->op;
 	uint32_t saved_start = d->op_start;
 	int rc = 0;
@@ -392,6 +393,11 @@ static int dec_union(struct dec *d, uint16_t t, uint32_t parent,
 	/* An operation boundary sets op/op_start for its arm and restores the
 	 * enclosing ones after it.  An ordinary union changes neither. */
 
+	/* The normalizer refuses an operation union of the other direction
+	 * in a message; a table that has one was not made by it. */
+	if (ty->flags & (NFSP_STF_OPS_REQUEST | NFSP_STF_OPS_RESPONSE) & ~mine)
+		return fail(d, NFSP_DECODE_UNSUPPORTED_SCHEMA, t,
+			    "operation union of the other direction");
 	if (remaining(d) < 4)
 		return fail(d, NFSP_DECODE_TRUNCATED, t, "record ends here");
 	w = rd32(d, d->off);
