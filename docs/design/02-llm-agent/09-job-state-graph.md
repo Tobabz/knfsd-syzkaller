@@ -115,7 +115,8 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
 
  blocked_harness_gap [I]                                           (07 §7)
    +-- issue resolved -> retry_pending -> {re-binding} -> resume_point
-   +-- issue deferred -> parked [I] -> issue reopened or resolved -> re-evaluate
+   +-- issue deferred -> parked [I] -> issue reopened -> blocked_harness_gap
+   |                                   issue resolved -> retry_pending
    +-- issue wont_fix -> closed_unsupported
 
  waiting states: blocked_operator, crash_review, blocked_harness_gap, parked
@@ -270,10 +271,17 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point`를 바꾼다. 기준 지점은 `resume_point`이고,
 `resume_point`가 대기 상태면 그 대기 상태의 `resume_point`다.
 
-- 결과가 기준 지점이나 지금 상태(reason 포함)와 같으면 `resume_point`는 기준 지점이다. 바뀐 것이 없으면 기록만 한다.
-- 결과가 다른 대기 상태면(예: reason이 다른 `blocked_operator`) 그 상태가 `resume_point`가 되고, 기준 지점은 그
-  대기 상태의 `resume_point`가 된다. 재개하면 job은 그 대기 상태로 들어가고, 그 상태를 끝내는 동작이 기준 지점으로
+- 결과가 기준 지점과 같으면 `resume_point`는 기준 지점이다. 바뀐 것이 없으면 기록만 한다.
+- 결과가 지금 상태(reason 포함)와 같으면 `resume_point`는 그 결과의 `resume_point`다. job은 이미 그 상태에서
+  기다리므로, 그 상태를 끝내는 동작이 결과가 갈 곳으로 보낸다.
+- 결과가 다른 대기 상태면(예: reason이 다른 `blocked_operator`) 그 상태가 자기 `resume_point`와 함께
+  `resume_point`가 된다. 재개하면 job은 그 대기 상태로 들어가고, 그 상태를 끝내는 동작이 그 `resume_point`로
   보낸다.
+- 결과인 대기 상태의 `resume_point`는 표가 정한다. 행이 따로 정하지 않으면 그 결과를 낸 단계이고(Q1 판정이면
+  `s1_running`), 교체 없는 폐기로 생긴 `blocked_harness_gap`은 기준 지점이다. 앞선 재평가가 기준 지점을 바꿔
+  놓았어도 재개는 지금 판정이 정한 곳으로 간다(근거 16).
+- 재판정 결과로 `resume_point`를 정하면 job은 그 verdict를 소비한 것으로 기록하고, 다음 재판정은 그 verdict와
+  비교한다.
 - 상태, `state_reason`, 기다리던 사람 task와 issue는 그대로 둔다. job을 `resume_point`로 보내는 것은 그 상태의
   operator 동작이나 issue 이벤트뿐이다.
 
@@ -281,6 +289,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 |---|---|---|---|
 | issue resolved | `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding한 뒤 `resume_point`로 간다. binding이 바뀌었으면 먼저 표 위 규칙대로 `resume_point`를 바꾼다. identity가 바뀌었으면 아래 identity 변경 행을, identity가 같고 `hcap_revision`만 바뀌었으면(build를 바꾸지 않은 promotion) 아래 `hcap_revision` 변경 행을 적용한다. 그 `hcap_revision`의 변경 이벤트가 issue 이벤트보다 늦게 오거나 오지 않아도 같다 | `07` §7 |
 | issue deferred | `blocked_harness_gap` | `parked` | `07` §7 |
+| issue reopened | `parked` | `blocked_harness_gap`. 같은 gap과 `resume_point`로 issue를 다시 기다린다 | `07` §7 |
 | issue wont_fix | `blocked_harness_gap`, `parked` | `closed_unsupported(reason)` | `07` §7 |
 | bound ExecutionHarnessIdentity 변경(harness build 교체·폐기) | binding 뒤의 비종료 상태(`s2_replaying` 제외) | 진행 중인 task는 결과를 받지 않는다. 다시 binding하고 identity 재수립 지점(표 아래)으로 간다. 대기 상태는 표 위 규칙대로 `resume_point`만 바꾼다 | `01` §11.2, `07` §7 |
 | 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 crash evidence의 harness identity로 계속한다(`../03-nfs-proxy/05` §25). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2, §12 |
@@ -479,6 +488,10 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 15. **`runtime_retry`는 재실행을 끝내는 결과에서만 0으로 돌아간다.** 판정된 `INCONCLUSIVE(loss)`와 gate의 M1
     `INCONCLUSIVE`도 유효한 verdict지만 같은 입력을 다시 실행하게 한다. 이런 결과로 counter를 되돌리면 반복되는
     관측 실패가 한도에 닿지 않는다.
+16. **대기 상태 결과의 `resume_point`는 그 결과의 것이다.** 기준 지점은 앞선 재평가가 바꿔 놓은 곳일 수 있다. 재판정이
+    `resume_point`를 `s1_reached`로 바꾼 뒤 다음 재판정이 지금 상태와 같은 `INCONCLUSIVE(evidence)`를 주면, 기준
+    지점으로 돌아가는 규칙은 `REACHED`가 아닌 verdict로 `s1_reached`에 들어가 `Stage2Input`을 고정한다. 결과가 정한
+    `resume_point`는 지금 판정이 갈 곳이고, 대기 상태가 아닌 job이 같은 이벤트로 가는 곳과 같다.
 
 ## 검토한 대안
 
@@ -533,8 +546,11 @@ bundle fixture로 대신한다.
      `state_reason`을 바꾸지 않고 `resume_point`만 바꾼다. 그 뒤 `resume`은 바뀐 `resume_point`로 가고, gate 뒤
      재평가 이벤트(binding 변경, gate verdict 재판정)로 `resume_point`가 바뀐 job의 `route(to)`는 받지 않는다.
      `blocked_operator(replay_evidence)`의 `resume_point`(replay)는 identity나 `hcap_revision`이 바뀌어도 그대로다.
-   - 재평가 결과가 다른 대기 상태여서 그 상태로 재개한 job은 그 상태를 끝내면 기준 지점으로 간다. 그 뒤 재평가
-     결과가 다시 지금 상태와 같아지면 `resume_point`는 기준 지점으로 돌아간다.
+   - 재평가 결과가 다른 대기 상태여서 그 상태로 재개한 job은 그 상태를 끝내면 그 결과의 `resume_point`로 간다. 그 뒤
+     재평가 결과가 다시 지금 상태와 같아지면 `resume_point`는 그 결과의 `resume_point`로 돌아간다.
+   - `blocked_operator(q1_evidence)`에서 재판정이 `resume_point`를 `s1_reached`로 바꾼 뒤 다음 재판정이 다시
+     `INCONCLUSIVE(evidence)`를 주면, `resume`은 `s1_reached`가 아니라 `s1_running`으로 간다. `REACHED`가 아닌
+     verdict로 `Stage2Input`을 고정하지 않는다.
    - gate Q1 `INCONCLUSIVE(evidence)`로 `blocked_operator(q1_evidence)`에 있는 job에서 identity를 바꾼 뒤 support
      boundary가 바뀌어 이전 gate가 `REACHED`와 통과하는 M1로 재판정돼도, `resume`은 `s2_campaign`이 아니라 새
      identity의 identity 재수립 지점으로 간다. 재판정한 verdict는 기록만 된다.
