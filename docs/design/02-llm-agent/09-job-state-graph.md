@@ -114,7 +114,8 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
 
  blocked_harness_gap [I]                                           (07 §7)
    +-- issue resolved -> retry_pending -> {re-binding} -> resume_point
-   +-- issue deferred -> parked [I] -> issue reopened or resolved -> re-evaluate
+   +-- issue deferred -> parked [I] -> issue reopened -> blocked_harness_gap
+   |                                   issue resolved -> retry_pending
    +-- issue wont_fix -> closed_unsupported
 
  waiting states: blocked_operator, crash_review, blocked_harness_gap, parked
@@ -286,6 +287,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 |---|---|---|---|
 | issue resolved | `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding한 뒤 `resume_point`로 간다. binding이 바뀌었으면 먼저 표 위 규칙대로 `resume_point`를 바꾼다. identity가 바뀌었으면 아래 identity 변경 행을, identity가 같고 `hcap_revision`만 바뀌었으면(build를 바꾸지 않은 promotion) 아래 `hcap_revision` 변경 행을 적용한다. 그 `hcap_revision`의 변경 이벤트가 issue 이벤트보다 늦게 오거나 오지 않아도 같다 | `07` §7 |
 | issue deferred | `blocked_harness_gap` | `parked` | `07` §7 |
+| issue reopened | `parked` | `blocked_harness_gap`. 같은 gap과 `resume_point`로 issue를 다시 기다린다 | `07` §7 |
 | issue wont_fix | `blocked_harness_gap`, `parked` | `closed_unsupported(reason)` | `07` §7 |
 | bound ExecutionHarnessIdentity 변경(harness build 교체·폐기) | binding 뒤의 비종료 상태(`s2_replaying` 제외) | 진행 중인 task는 결과를 받지 않는다. 다시 binding하고 identity 재수립 지점(표 아래)으로 간다. 대기 상태는 표 위 규칙대로 `resume_point`만 바꾼다 | `01` §11.2, `07` §7 |
 | 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 crash evidence의 harness identity로 계속한다(`../03-nfs-proxy/05` §25). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2, §12 |
