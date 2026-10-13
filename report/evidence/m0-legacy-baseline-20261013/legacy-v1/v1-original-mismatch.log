@@ -1,4 +1,4 @@
-replay_target=10.89.0.5 request_xid=0x22222224 response_xid=0x22222224
+replay_target=10.89.0.5 request_xid=0x22222222 response_xid=0x22222222
 __ready=1 __probe_rc=0 __proxy_rc=1
 relay ready: knfsd=20549 ganesha=20549
 stats_begin final

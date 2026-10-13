@@ -1,0 +1,50 @@
+{
+ "workload": "/home/fuzzer/prune-evidence/inputs/workload-proxy.prog",
+ "procs": 4,
+ "executions": 30,
+ "legacy_profile": null,
+ "input_sha256": {
+  "workload": "f74ea8afb11971a0df56cf5fc6e5ec48a26d1605486944f209f5a96ce2e660dc",
+  "deps": "1bc0097d9b6f55b779ad9f47cb37a0ed80e5643915c9d7321c098f3daacaa938"
+ },
+ "lane_state": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+ "execprog_rc": "rc=0",
+ "calls": 1020,
+ "calls_errno_nonzero": 30,
+ "errno_by_call": [
+  [
+   14,
+   11
+  ]
+ ],
+ "lane_states": {
+  "0": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n",
+  "1": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 1 lane_epoch 2 valid 1 unhealthy 0 owner 2\n",
+  "2": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 2 lane_epoch 3 valid 1 unhealthy 0 owner 3\n",
+  "3": "live_tickets 0 live_svc_attachments 0 remote_refs 0\nglobal_lane_unhealthy 0\nlane_id 3 lane_epoch 4 valid 1 unhealthy 0 owner 4\n"
+ },
+ "proxy_lanes": {
+  "0": {
+   "stats": "peak_active=4 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=0 expired=0 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=0 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  },
+  "1": {
+   "stats": "peak_active=4 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=0 expired=0 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=0 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  },
+  "2": {
+   "stats": "peak_active=4 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=0 expired=0 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=0 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  },
+  "3": {
+   "stats": "peak_active=4 active=4 framing_errors=0 relay_errors=0 mutation_errors=0 rejected_client=0",
+   "control": "control mode=live armed=0 expired=0 applied=0 refused_orig=0 refused_bounds=0 unknown_layout=0 invalid_arms=0 edit_applied=0 edit_refused_orig=0 edit_refused_bounds=0 edit_refused_unknown=0 edit_refused_overlap=0 edit_refused_toobig=0"
+  }
+ },
+ "dmesg_fatal": [],
+ "extra_files": 30,
+ "extra_nonempty": 30,
+ "extra_pcs": 7746,
+ "extra_fs_nfsd": 1868,
+ "extra_net_sunrpc": 230
+}

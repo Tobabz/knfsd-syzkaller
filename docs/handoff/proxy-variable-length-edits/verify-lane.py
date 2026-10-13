@@ -193,15 +193,21 @@ def exercise_legacy_replay(vm, args, deltas):
             replay.append(replay_once(vm, args.replay_probe, deltas[index],
                                       "v1-exact-%d" % index, target, request, response,
                                       0, 0, 1, 1, 0, args.output))
+        replay.append(replay_once(vm, args.replay_probe, deltas[0],
+                                  "v1-unmatched-count", "10.89.0.5",
+                                  0x22222224, 0x22222224, 1, 0, 1, 0, 0,
+                                  args.output))
         base = bytearray(deltas[0].read_bytes())
-        if metadata[0]["record"]["anchor_len"] != 4:
-            raise ValueError("v1 refusal requires the four-byte XID anchor")
-        put_be32(base, 60, 0x22222224)
+        if (metadata[0]["record"]["anchor_len"],
+                metadata[0]["record"]["patch_w"]) != (4, 4):
+            raise ValueError("v1 refusal requires four-byte XID anchor and patch")
+        original_off = 60 + metadata[0]["record"]["anchor_len"]
+        put_be32(base, original_off, 0x22222224)
         refusal = args.output / "deltas/v1-original-mismatch.delta"
         refusal.write_bytes(base)
         replay.append(replay_once(vm, args.replay_probe, refusal,
                                   "v1-original-mismatch", "10.89.0.5",
-                                  0x22222224, 0x22222224, 1, 0, 1, 0, 1,
+                                  0x22222222, 0x22222222, 1, 0, 1, 0, 1,
                                   args.output))
         count = bytearray(deltas[0].read_bytes())
         put_be32(count, 56, 2)

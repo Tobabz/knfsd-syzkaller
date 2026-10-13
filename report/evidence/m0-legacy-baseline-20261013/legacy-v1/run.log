@@ -115,18 +115,32 @@
    "log_sha256": "4e718562768d105d1d34b16ef1c7a269288ae746f48cbb19be0d52e0a2462130"
   },
   {
-   "case": "v1-original-mismatch",
-   "delta": "v1-original-mismatch.delta",
-   "delta_sha256": "3b02b7126a32ed461e8d2b7140ae6792513c2d457c7127a047a015561e34b7b8",
+   "case": "v1-unmatched-count",
+   "delta": "arm-0.delta",
+   "delta_sha256": "42350d9b6483eaf26d1df200f6e55408aa929660c911d458c594ba55a3cbfc23",
    "target": "10.89.0.5",
    "request_xid": "0x22222224",
    "expected_response_xid": "0x22222224",
    "probe_rc": 0,
    "proxy_rc": 1,
+   "rule": "replay rule=0 edit=0 expected=1 applied=0 refused_orig=0",
+   "probe_sha256": "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241",
+   "log": "v1-unmatched-count.log",
+   "log_sha256": "11a24ee52ad73d2903d0196ce250c5c5a603f173e46d26ec60a4dc71812f7744"
+  },
+  {
+   "case": "v1-original-mismatch",
+   "delta": "v1-original-mismatch.delta",
+   "delta_sha256": "d642fe67889240e39093fdc5e12ca0b8e4be7a563545317c40904fd358248d63",
+   "target": "10.89.0.5",
+   "request_xid": "0x22222222",
+   "expected_response_xid": "0x22222222",
+   "probe_rc": 0,
+   "proxy_rc": 1,
    "rule": "replay rule=0 edit=0 expected=1 applied=0 refused_orig=1",
    "probe_sha256": "e6b78937aad28ac5024585bf80f10c558b6a754068d2d60a756098ddfb097241",
    "log": "v1-original-mismatch.log",
-   "log_sha256": "a7815d66691c8b27bf7453e2962acaecbf46bd50c853a8bb6d7a7a6f2b05c55e"
+   "log_sha256": "1c49cda409ef8636046f667947b127c7ee8964414ff7952ee36736b0a8cca8e2"
   },
   {
    "case": "v1-count-mismatch",
@@ -146,7 +160,7 @@
  "dmesg_fatal": [],
  "extra_files": 1,
  "extra_nonempty": 1,
- "extra_pcs": 2349,
+ "extra_pcs": 2350,
  "extra_fs_nfsd": 501,
  "extra_net_sunrpc": 220
 }
