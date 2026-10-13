@@ -122,7 +122,7 @@ def load_rfc(n, pin, rfc_dir):
 
 def run_extract(e, rfc_text):
     """Run the RFC's own extraction pipeline on the RFC text."""
-    lines = rfc_text.decode("ascii").split("\n")
+    lines = rfc_text.decode("utf-8-sig").split("\n")
     if e["cmd"] not in (ln.strip() for ln in lines):
         raise SourceError(f"{e['file']}: extraction command is not a line "
                           f"of RFC {e['rfc']}")
@@ -148,7 +148,7 @@ def commented_typedefs(name, text):
 
 
 def copy_definition(n, rfc_text, keyword, name):
-    lines = rfc_text.decode("ascii").split("\n")
+    lines = rfc_text.decode("utf-8-sig").split("\n")
     head = f"{keyword} {name} {{"
     starts = [i for i, ln in enumerate(lines) if ln.strip() == head]
     if len(starts) != 1:

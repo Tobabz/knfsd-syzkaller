@@ -43,6 +43,8 @@ One directive per line, `#` starts a comment.
 | `status-type ENUM` | the enum whose value at the start of a response operation is its status |
 | `source FILE` | the single XDR file, for a family without minor versions |
 | `prelude FILE` | XDR read before every source file, into the same namespace; a name defined in both is an error |
+| `extension N FILE` | an NFSv4 extension (RFC 8178) applied after minor `N`'s source: new definitions join the namespace, an enum restated with more values replaces the old one (every old value must stay), and the RFC's own `/* Following lines are to be added to [enum\|union] NAME */` blocks add their lines to `NAME`; nothing else may change an existing definition |
+| `alias-arm UNION LABEL LIKE` | a case value the XDR declares with no arm in `UNION` is decoded with `LIKE`'s arm. The only layout fact an annotation may state; each use names the implementation it follows. A `LABEL` that already has an arm, a `LIKE` with none, or an alias used in no minor version is an error |
 | `notice TEXT` | one line copied into the generated file's header, for a license notice the sources require |
 | `minor N FILE` | one XDR file per minor version |
 | `minor-field STRUCT FIELD` | the CALL argument member that carries the minor version |
@@ -128,11 +130,17 @@ The RFC texts are not committed; their pins are enough to fetch and check them.
 
 | Annotation | Table | Source | Status |
 |---|---|---|---|
-| `nfs4/nfs4.ann` | `../src/schema_nfs4.c` | RFC 7531 (4.0), RFC 5662 (4.1), RFC 7863 (4.2) | NFSv4 COMPOUND, CALL and REPLY |
+| `nfs4/nfs4.ann` | `../src/schema_nfs4.c` | RFC 7531 (4.0), RFC 5662 (4.1), RFC 7863 + RFC 8276 + RFC 9754 (4.2) | NFSv4 COMPOUND, CALL and REPLY |
 | `../test/schema/tproto.ann` | `../test/schema_tproto.c` | written for the tests | synthetic, host tests only |
 | `../test/schema/tflat.ann` | `../test/schema_tflat.c` | written for the tests | synthetic, host tests only |
 
 NFSv3 has no schema yet (RFC 1813 has no extractable XDR file), so an NFSv3
-message is `unsupported_schema`. NFSv4.2 is RFC 7863 as published: later
-extensions such as the RFC 8276 xattr operations or the RFC 9754 delegation
-types are undeclared there, so a message that uses them is `malformed`.
+message is `unsupported_schema`. NFSv4.2 is RFC 7863 plus the extensions knfsd
+implements: the RFC 8276 xattr operations and the RFC 9754 attribute
+delegation types. RFC 9754 declares delegation types 4 and 5 but no
+`open_delegation4` arm for them; `nfs4.ann` aliases them to the READ and WRITE
+arms, as knfsd encodes them (`nfsd4_encode_open_delegation4`). Any other
+extension is undeclared, so a message that uses it is `malformed`.
+
+Errata: an erratum is applied only when it is Verified and changes the XDR;
+`SOURCES` records the errata of every pinned RFC and the decision.

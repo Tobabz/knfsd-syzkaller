@@ -56,7 +56,7 @@ static const struct nfsp_schema_family *const fams[] = {
 #define OP_READDIR	26u
 #define OP_SEQUENCE	53u
 #define OP_SEEK		69u	/* NFSv4.2 */
-#define OP_GETXATTR	72u	/* RFC 8276, not in RFC 7863 */
+#define OP_GETXATTR	72u	/* RFC 8276, an NFSv4.2 extension */
 
 #define SESSIONID	"sess-0123456789a"	/* sessionid4[16] */
 #define DIRFH		"dir-fh-00001"		/* nfs_fh4, 12 bytes */
@@ -341,6 +341,76 @@ static void build_seek_call(struct msg *m, uint32_t minor, uint32_t opcode)
 	w64(m, 0x1000);			/* 152 sa_offset */
 	w32(m, 1);			/* 160 sa_what NFS4_CONTENT_HOLE */
 }					/* 164 */
+
+/* RFC 8276 GETXATTR as the Linux client's nfs4_xdr_enc_getxattr sends it:
+ * SEQUENCE, PUTFH, GETXATTR.  152 bytes. */
+static void build_getxattr_call(struct msg *m)
+{
+	call_header(m, 1);
+	w32(m, 0);			/*  64 tag */
+	w32(m, 2);			/*  68 minorversion */
+	w32(m, 3);			/*  72 argarray count */
+	sequence_args(m, 0x14, 0);	/*  76 SEQUENCE, 80..111 */
+	w32(m, OP_PUTFH);		/* 112 */
+	wopaque(m, FILEFH);		/* 116 object: len, 120..131 */
+	w32(m, OP_GETXATTR);		/* 132 */
+	wopaque(m, "user.test");	/* 136 gxa_name: len, 140..148, pad */
+}					/* 152 */
+
+/* knfsd's reply: the value "abc".  104 bytes. */
+static void build_getxattr_reply(struct msg *m)
+{
+	reply_header(m);
+	w32(m, 0);			/*  24 status NFS4_OK */
+	w32(m, 0);			/*  28 tag */
+	w32(m, 3);			/*  32 resarray count */
+	sequence_res(m, 0x14);		/*  36 SEQUENCE, 40..79 */
+	w32(m, OP_PUTFH);		/*  80 */
+	w32(m, 0);			/*  84 status */
+	w32(m, OP_GETXATTR);		/*  88 */
+	w32(m, 0);			/*  92 gxr_status NFS4_OK */
+	wopaque(m, "abc");		/*  96 gxr_value: len, 100..102, pad */
+}					/* 104 */
+
+/* build_open_reply with an RFC 9754 read attribute delegation, which knfsd
+ * encodes with the open_read_delegation4 arm.  224 bytes. */
+static void build_open_reply_rdeleg(struct msg *m)
+{
+	build_open_reply(m);
+	m->n = 148;
+	w32(m, 4);			/* 148 OPEN_DELEGATE_READ_ATTRS_DELEG */
+	w32(m, 2);			/* 152 stateid.seqid */
+	wraw(m, OTHER, 12);		/* 156 stateid.other */
+	w32(m, 0);			/* 168 recall */
+	w32(m, 0);			/* 172 permissions.type ALLOWED */
+	w32(m, 0);			/* 176 permissions.flag */
+	w32(m, 1);			/* 180 permissions.access_mask */
+	wopaque(m, "EVERYONE@");	/* 184 who: len, 188..196, pad */
+	w32(m, OP_GETFH);		/* 200 */
+	w32(m, 0);			/* 204 status */
+	wopaque(m, FILEFH);		/* 208 object: len, 212..223 */
+}					/* 224 */
+
+/* The write attribute delegation: the open_write_delegation4 arm, with a
+ * size limit.  236 bytes. */
+static void build_open_reply_wdeleg(struct msg *m)
+{
+	build_open_reply(m);
+	m->n = 148;
+	w32(m, 5);			/* 148 OPEN_DELEGATE_WRITE_ATTRS_DELEG */
+	w32(m, 2);			/* 152 stateid.seqid */
+	wraw(m, OTHER, 12);		/* 156 stateid.other */
+	w32(m, 0);			/* 168 recall */
+	w32(m, 1);			/* 172 space_limit NFS_LIMIT_SIZE */
+	w64(m, 0x100000);		/* 176 filesize */
+	w32(m, 0);			/* 184 permissions.type */
+	w32(m, 0);			/* 188 permissions.flag */
+	w32(m, 1);			/* 192 permissions.access_mask */
+	wopaque(m, "EVERYONE@");	/* 196 who: len, 200..208, pad */
+	w32(m, OP_GETFH);		/* 212 */
+	w32(m, 0);			/* 216 status */
+	wopaque(m, FILEFH);		/* 220 object: len, 224..235 */
+}					/* 236 */
 
 static struct nfsp_reply_dispatch dispatch(uint32_t minor)
 {
@@ -922,7 +992,6 @@ static void test_minor_selection(void)
 /* Where knfsd or Ganesha and the pinned XDR part ways. */
 static void test_cross_check(void)
 {
-	struct nfsp_reply_dispatch rd = dispatch(2);
 	struct nfsp_decoded_msg m = {0};
 	struct msg v;
 
@@ -943,24 +1012,92 @@ static void test_cross_check(void)
 		       4, 176, 4, 1);
 	}
 
-	/* knfsd v7.3-rc5 can answer OPEN with delegation_type 4 or 5
-	 * (OPEN_DELEGATE_{READ,WRITE}_ATTRS_DELEG, RFC 9754).  RFC 7863 does
-	 * not declare them, so the reply is malformed there, never decoded
-	 * with a guessed arm. */
-	build_open_reply(&v);
-	CHECK(run(&v, v.n, &rd, &m) == NFSP_DECODE_DECODED, "base 4.2 reply");
-	put32(&v, 148, 5);
-	CHECK(run(&v, v.n, &rd, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 148 && m.nfields == 0,
-	      "WRITE_ATTRS_DELEG: %s at %u", nfsp_decode_strstatus(m.status),
-	      m.failure.offset);
+	nfsp_decoded_msg_free(&m);
+}
 
-	/* Likewise the RFC 8276 xattr operations knfsd decodes (72..75). */
-	build_seek_call(&v, 2, OP_GETXATTR);
+/* The NFSv4.2 extensions knfsd v7.3-rc5 speaks: RFC 8276 xattr operations
+ * and the RFC 9754 attribute delegation types.  They exist only in minor
+ * 2; in 4.1 the same bytes stay malformed, never decoded with a guessed
+ * layout. */
+static void test_extensions(void)
+{
+	struct nfsp_reply_dispatch rd = dispatch(2), rd41 = dispatch(1);
+	struct nfsp_decoded_msg m = {0};
+	static const char *const xnames[] = { "SEQUENCE", "PUTFH",
+					      "GETXATTR" };
+	static const uint32_t ok3[] = { 0, 0, 0 };
+	static const uint32_t noxattr[] = { 0, 0, 10095 };
+	struct msg v;
+
+	printf("NFSv4.2 extensions: RFC 8276 xattr, RFC 9754 delegations\n");
+	build_getxattr_call(&v);
+	CHECK(v.n == 152, "getxattr call length %zu", v.n);
+	if (decoded(&v, NULL, &m, "GETXATTR call")) {
+		CHECK(schema_is(&m, 2), "schema is not nfs4.2");
+		expect_ops(&m, 3, xnames, 0, NULL);
+		EXPECT(&m, "nfs4.request.GETXATTR.args.gxa_name", 0, 136, 16,
+		       140, 9, 0);
+		META(&m, "nfs4.request.GETXATTR.args.gxa_name", 0,
+		     NFSP_META_PADDING, 149, 3);
+	}
+	put32(&v, 68, 1);
 	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 132,
-	      "GETXATTR in 4.2: %s at %u", nfsp_decode_strstatus(m.status),
-	      m.failure.offset);
+	      m.failure.offset == 132, "GETXATTR in 4.1: %s at %u",
+	      nfsp_decode_strstatus(m.status), m.failure.offset);
+
+	build_getxattr_reply(&v);
+	CHECK(v.n == 104, "getxattr reply length %zu", v.n);
+	if (decoded(&v, &rd, &m, "GETXATTR reply")) {
+		expect_ops(&m, 3, xnames, 1, ok3);
+		EXPECT(&m, "nfs4.response.GETXATTR.result.gxr_status", 0, 92,
+		       4, 92, 4, 0);
+		EXPECT(&m, "nfs4.response.GETXATTR.result.ok.gxr_value", 0, 96,
+		       8, 100, 3, 0);
+	}
+	put32(&v, 92, 10095);		/* NFS4ERR_NOXATTR, RFC 8276 */
+	v.n = 96;
+	if (decoded(&v, &rd, &m, "GETXATTR NOXATTR"))
+		expect_ops(&m, 3, xnames, 1, noxattr);
+	CHECK(run(&v, v.n, &rd41, &m) == NFSP_DECODE_MALFORMED,
+	      "GETXATTR reply in 4.1: %s", nfsp_decode_strstatus(m.status));
+
+	build_open_reply_rdeleg(&v);
+	CHECK(v.n == 224, "rdeleg reply length %zu", v.n);
+	if (decoded(&v, &rd, &m, "READ_ATTRS_DELEG reply")) {
+		EXPECT(&m, "nfs4.response.OPEN.result.ok.delegation."
+		       "delegation_type", 0, 148, 4, 148, 4, 4);
+		EXPECT(&m, "nfs4.response.OPEN.result.ok.delegation."
+		       "open_delegate_read_attrs_deleg.stateid.seqid", 0, 152,
+		       4, 152, 4, 2);
+		EXPECT(&m, "nfs4.response.OPEN.result.ok.delegation."
+		       "open_delegate_read_attrs_deleg.recall", 0, 168, 4,
+		       168, 4, 0);
+		EXPECT(&m, "nfs4.response.OPEN.result.ok.delegation."
+		       "open_delegate_read_attrs_deleg.permissions.who", 0,
+		       184, 16, 188, 9, 0);
+		EXPECT(&m, "nfs4.response.GETFH.result.ok.object", 0, 208, 16,
+		       212, 12, 0);
+	}
+	CHECK(run(&v, v.n, &rd41, &m) == NFSP_DECODE_MALFORMED &&
+	      m.failure.offset == 148, "READ_ATTRS_DELEG in 4.1: %s at %u",
+	      nfsp_decode_strstatus(m.status), m.failure.offset);
+
+	build_open_reply_wdeleg(&v);
+	CHECK(v.n == 236, "wdeleg reply length %zu", v.n);
+	if (decoded(&v, &rd, &m, "WRITE_ATTRS_DELEG reply")) {
+		EXPECT(&m, "nfs4.response.OPEN.result.ok.delegation."
+		       "delegation_type", 0, 148, 4, 148, 4, 5);
+		EXPECT(&m, "nfs4.response.OPEN.result.ok.delegation."
+		       "open_delegate_write_attrs_deleg.space_limit."
+		       "nfs_limit_size.filesize", 0, 176, 8, 176, 8, 0x100000);
+		EXPECT(&m, "nfs4.response.OPEN.result.ok.delegation."
+		       "open_delegate_write_attrs_deleg.permissions.who", 0,
+		       196, 16, 200, 9, 0);
+	}
+	put32(&v, 148, 6);		/* no type 6 anywhere */
+	CHECK(run(&v, v.n, &rd, &m) == NFSP_DECODE_MALFORMED &&
+	      m.failure.offset == 148, "delegation type 6: %s at %u",
+	      nfsp_decode_strstatus(m.status), m.failure.offset);
 	nfsp_decoded_msg_free(&m);
 }
 
@@ -987,6 +1124,10 @@ static const struct golden goldens[] = {
 	{ "4.0 call", build_v40_call, 0, 0, 7 },
 	{ "4.0 reply", build_v40_reply, 1, 0, 1 },
 	{ "4.2 seek", build_seek42, 0, 2, 8 },
+	{ "4.2 getxattr call", build_getxattr_call, 0, 2, 6 },
+	{ "4.2 getxattr reply", build_getxattr_reply, 1, 2, 7 },
+	{ "4.2 read attrs deleg", build_open_reply_rdeleg, 1, 2, 20 },
+	{ "4.2 write attrs deleg", build_open_reply_wdeleg, 1, 2, 21 },
 };
 #define NGOLDEN (sizeof(goldens) / sizeof(goldens[0]))
 
@@ -1201,6 +1342,7 @@ int main(void)
 	test_minor0();
 	test_minor_selection();
 	test_cross_check();
+	test_extensions();
 	test_truncation();
 	test_malformed();
 	test_address_oracle();

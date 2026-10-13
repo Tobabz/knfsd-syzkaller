@@ -498,11 +498,104 @@ class Nfs4(unittest.TestCase):
 
     def test_operations_per_minor(self):
         # RFC 7531 has 38 arms (OP_ACCESS..OP_RELEASE_LOCKOWNER and
-        # OP_ILLEGAL), RFC 5662 adds 19, RFC 7863 adds 13.
+        # OP_ILLEGAL), RFC 5662 adds 19, RFC 7863 adds 13 and the RFC 8276
+        # extension 4 more in minor 2.
         counts = [len(next(t for t in s["types"]
                            if t.get("operations") == "request")["arms"])
                   for s in self.schemas]
-        self.assertEqual(counts, [38, 57, 70])
+        self.assertEqual(counts, [38, 57, 74])
+
+
+EXT_BASE = HEAD + """
+enum opnum { OP_A = 1 };
+enum dtype { D_NONE = 0, D_READ = 1 };
+struct rdeleg { uint32_t sid; };
+union deleg switch (dtype t) { case D_NONE: void; case D_READ: rdeleg read; };
+union argop switch (opnum op) { case OP_A: void; };
+struct ARGS { uint32_t minor; argop ops<>; };
+struct RES { deleg d; st s; };
+""" + PROGRAM
+
+EXT_ANN = ANN.replace("source t.x\n", "") + \
+    "minor-field ARGS minor\nminor 0 t.x\nminor 2 u.x\nextension 2 e.x\n"
+
+# RFC 8276's form: instruction comments with lines whose own comments end
+# with */ before the block's closing */.
+EXT_8276 = """
+struct X_args { uint32_t key; };
+/* Following lines are to be added to enum opnum */
+/*
+OP_X = 72, /* new op */
+*/
+/* Following lines are to be added to argop */
+/*
+case OP_X: X_args opx;
+*/
+/* Following lines are to be added to enum st */
+/*
+ S_NEW = 10095 /* new status */
+*/
+"""
+
+
+class Extensions(unittest.TestCase):
+    def run_ext(self, ext, ann=EXT_ANN):
+        with Tmp(EXT_BASE, ann, {"u.x": EXT_BASE, "e.x": ext}) as a:
+            return nz.normalize(a)[1]
+
+    def refused(self, ext, needle, ann=EXT_ANN):
+        with self.assertRaises(nz.SchemaError) as cm:
+            self.run_ext(ext, ann)
+        self.assertIn(needle, str(cm.exception))
+
+    def test_instruction_blocks_add_values_and_arms(self):
+        m0, m2 = self.run_ext(EXT_8276)
+        t0, t2 = types_by_name(m0), types_by_name(m2)
+        self.assertEqual([a["label"] for a in t2["argop"]["arms"]],
+                         ["OP_A", "OP_X"])
+        self.assertIn(("OP_X", 72), t2["opnum"]["values"])
+        self.assertIn(("S_NEW", 10095), t2["st"]["values"])
+        self.assertNotIn("X_args", t0)               # minor 2 only
+        self.assertEqual(len(t0["argop"]["arms"]), 1)
+        self.assertNotEqual(m0["schema_id"].split("/")[1],
+                            m2["schema_id"].split("/")[1])
+
+    def test_restated_enum_must_keep_every_value(self):
+        (_, m2) = self.run_ext("enum dtype { D_NONE = 0, D_READ = 1, "
+                               "D_READ_X = 4 };")
+        self.assertIn(("D_READ_X", 4), types_by_name(m2)["dtype"]["values"])
+        self.refused("enum dtype { D_NONE = 0, D_READ = 2 };",
+                     "redefinition of D_READ")
+        self.refused("enum dtype { D_NONE = 0 };", "changes or drops")
+
+    def test_other_redefinitions_stay_errors(self):
+        self.refused("struct rdeleg { hyper sid; };", "redefinition")
+
+    def test_addition_needs_a_target(self):
+        self.refused("/* Following lines are to be added to enum nosuch */\n"
+                     "/*\nX = 1\n*/\n", "no enum nosuch")
+
+    def test_alias_arm(self):
+        ann = EXT_ANN + "alias-arm deleg D_READ_X D_READ\n"
+        (_, m2) = self.run_ext("enum dtype { D_NONE = 0, D_READ = 1, "
+                               "D_READ_X = 4 };", ann)
+        arms = {a["label"]: a for a in types_by_name(m2)["deleg"]["arms"]}
+        self.assertEqual(arms["D_READ_X"]["type"], arms["D_READ"]["type"])
+        self.assertEqual(arms["D_READ_X"]["value"], 4)
+        self.assertEqual(arms["D_READ_X"]["component"], "d_read_x")
+
+    def test_alias_arm_refusals(self):
+        restate = "enum dtype { D_NONE = 0, D_READ = 1, D_READ_X = 4 };"
+        self.refused(restate, "already has an arm",
+                     EXT_ANN + "alias-arm deleg D_READ D_NONE\n")
+        self.refused(restate, "no arm for D_GONE",
+                     EXT_ANN + "alias-arm deleg D_READ_X D_GONE\n")
+        self.refused(restate, "applies in no minor version",
+                     EXT_ANN + "alias-arm deleg D_NOWHERE D_READ\n")
+
+    def test_extension_needs_its_minor(self):
+        self.refused("", "no minor 3",
+                     EXT_ANN.replace("extension 2", "extension 3"))
 
 
 class Committed(unittest.TestCase):

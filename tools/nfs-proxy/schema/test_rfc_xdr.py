@@ -127,6 +127,11 @@ class Extraction(unittest.TestCase):
             self.assertEqual(t.run("--verify"), 0)
             self.assertEqual(quiet([str(t.manifest), "--check"]), 0)
 
+    def test_utf8_rfc_text_with_bom(self):
+        # RFC 9754 and later v3-format RFCs are UTF-8 with a BOM.
+        with Tree(rfc1="\ufeff" + RFC1) as t:
+            self.assertEqual(t.run("--verify"), 0)
+
     def test_write_reproduces_files(self):
         with Tree() as t:
             (t.dir / "a.x").write_text("stale\n")

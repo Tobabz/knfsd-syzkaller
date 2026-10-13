@@ -2,11 +2,12 @@
 #
 # The XDR is RFC 7531, RFC 5662 and RFC 7863, extracted and pinned by
 # SOURCES.  This file names things; it never states a field, offset or width.
-notice Derived from the IETF Code Components of RFC 7531, RFC 5662 and
-notice RFC 7863 (Copyright IETF Trust and the persons identified as authors
-notice of the code) under the Simplified BSD License, whose text heads
-notice tools/nfs-proxy/schema/nfs4/rfc7531.x, rfc5662.x and rfc7863.x, and
-notice from two RFC 5531 definitions; see THIRD-PARTY-LICENSES.md.
+notice Derived from the IETF Code Components of RFC 7531, RFC 5662, RFC 7863,
+notice RFC 8276 and RFC 9754 (Copyright IETF Trust and the persons identified
+notice as authors of the code) under the Simplified (Revised) BSD License,
+notice whose text heads tools/nfs-proxy/schema/nfs4/rfc7531.x, rfc5662.x,
+notice rfc7863.x and rfc8276.x, and from two RFC 5531 definitions; see
+notice THIRD-PARTY-LICENSES.md.
 family nfs4
 program NFS4_PROGRAM NFS_V4
 procedure-prefix NFSPROC4_
@@ -19,5 +20,15 @@ prelude prelude.x
 minor 0 rfc7531.x
 minor 1 rfc5662.x
 minor 2 rfc7863.x
+# NFSv4.2 extensions (RFC 8178) that knfsd implements: xattr operations
+# (RFC 8276) and the attribute delegation types (RFC 9754).
+extension 2 rfc8276.x
+extension 2 rfc9754.x
+# RFC 9754 adds open_delegation_type4 values 4 and 5 but no
+# open_delegation4 arm for them.  knfsd encodes them with the READ and WRITE
+# arms (fs/nfsd/nfs4xdr.c nfsd4_encode_open_delegation4), and so does the
+# Linux client's decoder.
+alias-arm open_delegation4 OPEN_DELEGATE_READ_ATTRS_DELEG OPEN_DELEGATE_READ
+alias-arm open_delegation4 OPEN_DELEGATE_WRITE_ATTRS_DELEG OPEN_DELEGATE_WRITE
 # Every other case label keeps its lowercased XDR name (nfs4err_denied, ...).
 branch NFS4_OK ok

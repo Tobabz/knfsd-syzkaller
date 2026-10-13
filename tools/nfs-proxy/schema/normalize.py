@@ -19,6 +19,11 @@ WHAT THIS IS
   basic typedefs, authsys_parms) come from a `prelude` file read before it,
   which rfc_xdr.py builds from pinned RFC text like the sources themselves.
 
+  NFSv4 extensions (RFC 8178), such as RFC 8276 and RFC 9754 for 4.2, are
+  `extension` files applied after a minor version's source by fixed rules
+  (Parser.extend); `alias-arm` is the one annotation that states a layout
+  fact, for a case value an extension declares without an arm.
+
 WHAT IT REFUSES
 
   Anything the runtime cannot decode with a proven boundary is a build error,
@@ -71,6 +76,10 @@ NONE = 0xFFFF
 # A path word an annotation supplies: no `.` or `[]`, so a path still splits
 # back into the words that built it.
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# RFC 8276's instruction for lines to splice into an existing definition.
+ADDITION = re.compile(r"/\*\s*Following lines are to be added to\s+"
+                      r"(?:(enum|union)\s+)?([A-Za-z_]\w*)\s*\*/\s*"
+                      r"/\*[ \t]*\n(.*?)\n[ \t]*\*/", re.S)
 
 
 class SchemaError(Exception):
@@ -150,6 +159,8 @@ class Parser:
         self.types = {}          # name -> (kind, payload); kind typedef|spec
         self.enumconsts = {}     # enum constant -> Value
         self.programs = {}       # name -> {"number", "versions"}
+        self.extending = False   # inside extend()
+        self.widening = None     # the enum an extension is restating
         self.order = []          # declaration order of type names
 
     def err(self, msg):
@@ -189,6 +200,16 @@ class Parser:
         return ("id", self.ident())
 
     def define(self, name, entry):
+        if self.widening == name:
+            # An extension restates an enum with more values (RFC 9754
+            # open_delegation_type4): every old value must stay as it was.
+            old = dict(self.types[name][1][1])
+            new = dict(entry[1][1])
+            if any(new.get(n) != v for n, v in old.items()):
+                self.err(f"extension of enum {name} changes or drops a "
+                         f"value")
+            self.types[name] = entry
+            return
         if name in self.types or name in self.consts or \
                 name in self.enumconsts:
             self.err(f"redefinition of {name}")
@@ -200,6 +221,75 @@ class Parser:
         source).  A name defined twice is still a redefinition error."""
         self.t, self.i, self.origin = toks, 0, origin
         return self.parse()
+
+    def extend(self, text, origin):
+        """Apply an NFSv4 extension file (RFC 8178) on top of the source:
+        new definitions join the namespace, an enum restated with more
+        values replaces the old one, and the RFC's own instruction blocks
+
+            /* Following lines are to be added to [enum|union] NAME */
+            /*
+            ...lines...
+            */
+
+        add their lines to NAME (RFC 8276).  Nothing else may change an
+        existing definition."""
+        additions = []
+
+        def take_block(m):
+            lines = []
+            for ln in m.group(3).split("\n"):
+                ln = re.sub(r"/\*.*?\*/", "", ln).strip()
+                if ln:
+                    lines.append(ln)
+            line = text.count("\n", 0, m.start()) + 1
+            additions.append((m.group(1), m.group(2), " ".join(lines), line))
+            return "\n" * m.group(0).count("\n")
+
+        rest = ADDITION.sub(take_block, text)
+        self.extending = True
+        try:
+            self.include(tokenize(rest, origin), origin)
+        finally:
+            self.extending = False
+        for kind, name, body, line in additions:
+            where = f"{origin}:{line}"
+            entry = self.types.get(name)
+            if entry is None or entry[0] != "spec" or \
+                    entry[1][0] not in ("enum", "union") or \
+                    (kind and entry[1][0] != kind):
+                raise SchemaError(f"{where}: no {kind or 'enum or union'} "
+                                  f"{name} to add to")
+            p = Parser(tokenize(body, origin), origin)
+            p.consts, p.types, p.enumconsts = \
+                self.consts, self.types, self.enumconsts
+            if entry[1][0] == "enum":
+                vals = list(entry[1][1])
+                while p.peek()[0] != "eof":
+                    n = p.ident()
+                    p.take(val="=")
+                    v = p.value()
+                    if n in self.enumconsts or n in self.consts:
+                        raise SchemaError(f"{where}: redefinition of {n}")
+                    self.enumconsts[n] = v
+                    vals.append((n, v))
+                    p.accept(",")
+                self.types[name] = ("spec", ("enum", vals))
+            else:
+                _, disc, arms, default = entry[1]
+                arms = list(arms)
+                while p.peek()[0] != "eof":
+                    labels = []
+                    while p.accept("case"):
+                        labels.append(p.value())
+                        p.take(val=":")
+                    if not labels:
+                        p.err("expected case")
+                    d = p.decl()
+                    p.take(val=";")
+                    arms.append((labels, d))
+                self.types[name] = ("spec", ("union", disc, arms, default))
+        return self
 
     def parse(self):
         while self.peek()[0] != "eof":
@@ -223,9 +313,16 @@ class Parser:
             elif w in ("enum", "struct", "union"):
                 self.take()
                 name = self.ident()
-                spec = self.body(w)
-                self.take(val=";")
-                self.define(name, ("spec", spec))
+                old = self.types.get(name)
+                if self.extending and w == "enum" and old is not None and \
+                        old[0] == "spec" and old[1][0] == "enum":
+                    self.widening = name
+                try:
+                    spec = self.body(w)
+                    self.take(val=";")
+                    self.define(name, ("spec", spec))
+                finally:
+                    self.widening = None
             elif w == "program":
                 self.program()
             else:
@@ -240,7 +337,10 @@ class Parser:
                 n = self.ident()
                 self.take(val="=")
                 v = self.value()
-                if n in self.enumconsts or n in self.consts:
+                restated = self.widening is not None and \
+                    (n, v) in self.types[self.widening][1][1]
+                if (n in self.enumconsts or n in self.consts) and \
+                        not restated:
                     self.err(f"redefinition of {n}")
                 self.enumconsts[n] = v
                 vals.append((n, v))
@@ -402,7 +502,7 @@ def parse_annotations(path):
     ann = {"family": None, "program": None, "procedure_prefix": "",
            "leaf": ("args", "result"), "operations": {}, "status_type": None,
            "minor_field": None, "minors": [], "branches": {}, "source": None,
-           "preludes": [], "notice": []}
+           "preludes": [], "notice": [], "extensions": [], "aliases": {}}
     for no, raw in enumerate(Path(path).read_text().split("\n"), 1):
         line = raw.split("#", 1)[0].split()
         if not line:
@@ -457,6 +557,16 @@ def parse_annotations(path):
         elif kw == "prelude":
             want(1)
             ann["preludes"].append(args[0])
+        elif kw == "extension":
+            want(2)
+            ann["extensions"].append((int(args[0]), args[1]))
+        elif kw == "alias-arm":
+            want(3)
+            union, label, like = args
+            arms = ann["aliases"].setdefault(union, [])
+            if any(a[0] == label for a in arms):
+                raise SchemaError(f"{where}: second alias-arm for {label}")
+            arms.append((label, like))
         elif kw == "notice":
             if not args:
                 raise SchemaError(f"{where}: notice takes text")
@@ -505,6 +615,7 @@ class Normalizer:
         self.by_name = {}        # named type -> index (also in-progress)
         self.by_key = {}         # structural key -> index (anonymous)
         self.used_branches = set()
+        self.used_aliases = set()
 
     # -- values
 
@@ -667,6 +778,24 @@ class Normalizer:
                 seen.add(v)
                 out.append({"value": v, "label": self.label_text(lab),
                             "decl": d["name"], "type": t})
+        for label, like in self.ann["aliases"].get(name, ()):
+            # alias-arm: a case value the XDR declares without an arm, which
+            # implementations encode with another case's arm (README).  Only
+            # where the label exists; normalize() refuses one used nowhere.
+            if label not in self.p.enumconsts and label not in self.p.consts:
+                continue
+            v = self.case_value(name, dt, ("id", label))
+            if v in seen:
+                raise SchemaError(f"union {name}: alias-arm {label} already "
+                                  f"has an arm")
+            target = [a for a in out if a["label"] == like]
+            if not target:
+                raise SchemaError(f"union {name}: alias-arm {label}: no arm "
+                                  f"for {like}")
+            seen.add(v)
+            out.append({"value": v, "label": label,
+                        "decl": target[0]["decl"], "type": target[0]["type"]})
+            self.used_aliases.add((name, label))
         if len(out) + (default is not None) > NONE:
             # An arm index, the default's included, is a uint16_t, and
             # NFSP_SCHEMA_NONE (0xffff) means "no default": the runtime
@@ -1000,8 +1129,14 @@ def normalize(ann_path):
     sources = ([(None, ann["source"])] if ann["source"]
                else sorted(ann["minors"]))
     preludes = [(p, (base / p).read_bytes()) for p in ann["preludes"]]
+    extensions = [(m, f, (base / f).read_bytes())
+                  for m, f in ann["extensions"]]
+    for m, f, _ in extensions:
+        if m not in dict(sources):
+            raise SchemaError(f"extension {f}: no minor {m}")
     schemas = []
     used = set()
+    used_aliases = set()
     for minor, src in sources:
         path = base / src
         data = path.read_bytes()
@@ -1010,12 +1145,16 @@ def normalize(ann_path):
             toks = tokenize(text.decode("ascii"), str(name))
             spec = Parser(toks, str(name)).parse() if spec is None \
                 else spec.include(toks, str(name))
+        mine = [(f, t) for m, f, t in extensions if m == minor]
+        for f, t in mine:
+            spec.extend(t.decode("ascii"), f)
         norm = Normalizer(spec, ann, minor)
         try:
             sch = norm.run()
         except SchemaError as e:
             raise SchemaError(f"{src}: {e}") from None
         used |= norm.used_branches
+        used_aliases |= norm.used_aliases
         canon = json.dumps(sch, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(canon.encode()).hexdigest()
         tag = ann["family"] + (f".{minor}" if minor is not None else "")
@@ -1024,7 +1163,15 @@ def normalize(ann_path):
                          "sha256": hashlib.sha256(data).hexdigest()}
         sch["preludes"] = [{"file": p, "sha256": hashlib.sha256(t).hexdigest()}
                            for p, t in preludes]
+        sch["extensions"] = [{"file": f,
+                              "sha256": hashlib.sha256(t).hexdigest()}
+                             for f, t in mine]
         schemas.append(sch)
+    stale = {(u, l) for u, arms in ann["aliases"].items()
+             for l, _ in arms} - used_aliases
+    if stale:
+        raise SchemaError(f"alias-arm {', '.join(sorted(l for _, l in stale))}"
+                          f" applies in no minor version")
     unused = set(ann["branches"]) - used
     if unused:
         # A stale annotation would silently stop naming anything.
@@ -1078,6 +1225,8 @@ def emit_c(ann_path, ann, schemas):
     for s in schemas:
         w(f" * source:      {s['source']['file']} "
           f"sha256:{s['source']['sha256']}")
+        for x in s["extensions"]:
+            w(f" * extension:   {x['file']} sha256:{x['sha256']}")
         w(f" * schema_id:   {s['schema_id']}")
     w(" *")
     w(" * build.sh regenerates this file and fails when it differs, so an")

@@ -272,7 +272,8 @@ ProtocolSchema(schema_id)
 M2에서 normalizer language와 generated artifact format을 정했다. Python 표준 라이브러리 script
 (`tools/nfs-proxy/schema/normalize.py`)가 commit된 C table을 만들고, `build.sh`가 table이 최신인지
 확인한다. 상세는 `02-semantic-decoder.md`의 한계와 미결 사항에 있다. NFSv4.0/4.1/4.2 XDR은 RFC
-7531/5662/7863에서 pin해 반입했다(`tools/nfs-proxy/schema/nfs4/`). NFSv3 source와 RFC 7863 이후 확장은 남았다.
+7531/5662/7863에서 pin해 반입했고, 4.2에는 knfsd가 구현하는 RFC 8276, RFC 9754 확장을 합쳤다
+(`tools/nfs-proxy/schema/nfs4/`). NFSv3 source는 남았다.
 
 ### 6. NFS Semantic Decoder
 
