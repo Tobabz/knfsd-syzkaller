@@ -308,11 +308,11 @@ remote_kcov.kernel_revision.<commit>)`이다. 대기 상태에서는 이 검증�
 |---|---|---|---|
 | `agent_repair[stage1]` | Stage 1에서 `(repair)` 전이의 수(cause `hcap_changed` 제외). 전이마다 Agent Task 하나를 부른다 | operator `resume` | `blocked_operator(stage1_repair_budget)` |
 | `agent_repair[stage2]` | Stage 2에서 `(repair)` 전이의 수(cause `hcap_changed` 제외) | operator `resume` | `blocked_operator(stage2_repair_budget)` |
-| `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공 | `blocked_operator(agent_failure)` |
+| `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공, 새 요청 시작 | `blocked_operator(agent_failure)` |
 | `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s2_gate`, `s2_campaign`, `s2_replaying`) | 그 단계가 재실행이 아닌 행으로 끝날 때, Runner 입력이 바뀔 때. `s2_campaign`은 이어 간 campaign이 bundle을 봉인할 때도(campaign evidence는 §4의 campaign 임계값이 따로 센다). 재실행 행으로 가는 결과는 판정된 verdict여도(`INCONCLUSIVE(loss)`, gate의 M1 `INCONCLUSIVE`) 되돌리지 않는다 | `blocked_operator(runtime_retry_exhausted)` |
 | campaign 임계값, fuzz budget | `01` §11.1, §12 | — | §4 표 |
 
-- 한도 N은 센 일이 N번까지 일어날 수 있다는 뜻이다. counter가 N인 상태에서 한 번 더 일어나면 그 일 대신
+- 한도 N은 재시도 횟수다. 처음 한 번 뒤에 센 일이 N번까지 일어날 수 있다. counter가 N인 상태에서 한 번 더 일어나면 그 일 대신
   `blocked_operator`로 간다.
 - 한도 값은 JobPolicy가 소유한다(`01` §11.1의 retry / repair budget, campaign repair 임계값). Stage 2 시작 여부
   `run_stage2`와 approval policy도 JobPolicy 값이다.
@@ -592,9 +592,13 @@ bundle fixture로 대신한다.
   뒤 어떤 실행을 이어 갈 수 있는지는 `01` §14 14번에서 정한다.
 - **미결:** 정지 중인 campaign에서 늦게 온 bundle의 crash 중 window에 `APPLIED` rule이 있는 것을 `01` §12의 replay와
   검토 경로로 보내는 방법. 지금은 표시한 triage 항목으로만 남는다(§4). Stage 2 구현 전에 정한다.
-- **결정됨:** `run_stage2`는 Stage 2 구현 전까지 거짓만 받는다. approval policy 기본값은 승인 불필요다
+- **결정됨(2026-10-13, 저장소 소유자):** JobPolicy 기본값은 Stage 1 repair 한도 3회, 실행 전 사람 승인 불필요다.
+  `run_stage2`는 Stage 2 구현 전까지 거짓만 받고, 구현 뒤 기본값을 참으로 바꾼다
   (`agent_pipeline/contracts.py`의 `JobPolicy`).
-- **미결:** JobPolicy의 한도 값. 구현은 기본값을 두지 않고 policy마다 적게 한다.
+- **결정됨(2026-10-13, 저장소 소유자):** `agent_retry`는 요청 단위로 센다. 새 요청이 시작되면 0에서 센다.
+- **결정됨(2026-10-13, 저장소 소유자):** candidate 하나에 job 여러 개(예: sanitizer별)를 둘 수 있다. 같은
+  target(commit, location)은 같은 `candidate_id`다(`02` §7).
+- **미결:** `agent_retry`와 `runtime_retry`의 한도 값. 구현은 기본값을 두지 않고 policy마다 적게 한다.
 - **미결:** gate를 여러 번 반복할 때 반복 결과를 합치는 규칙. `01` §3은 반복 횟수만 JobPolicy에 맡겼다. 제안: 각
   반복에 gate 표를 적용하고 가장 위의 행을 gate 결과로 한다. Stage 2 구현 전에 `01` §3에서 고정한다.
 - **미결:** gate Q1 `NOT_REACHED`의 자동 진단. 지금은 사람 결정(`blocked_operator(gate_regression)`)이다. 후보는 같은

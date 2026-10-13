@@ -13,7 +13,7 @@ uv run pytest            # tests/agent_pipeline: oracles 1-5 of 09, intake
 | Module | What |
 |---|---|
 | `contracts.py` | Pydantic forms of the data contracts (candidate, JobPolicy, binding, Q1Result, Agent output variants) |
-| `intake.py` | candidate intake validation (02 §3) over git plumbing |
+| `intake.py` | candidate intake validation (02 §3) over git plumbing. `Controller.register()` stores a candidate once per target; `start_job()` starts another job for it (e.g. another sanitizer) |
 | `components.py` | interfaces of the HCAP checker, Materializer, Q1 Judge, harness registry, issue tracker |
 | `artifacts.py` | SHA-256 content-addressed artifact store |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |

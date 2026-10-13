@@ -46,7 +46,8 @@ def test_inconclusive_never_calls_an_agent(make_world, reason):
 def test_reached_from_another_identity_is_not_reached(world):
     j = world.to_running()
     p = world.job(j).pending_task
-    world.judge.add("foreign", binding("build-2").execution_harness_id, j,
+    world.judge.add("foreign", binding("build-2").execution_harness_id,
+                    world.job(j).candidate.candidate_id,
                     Q1Status.REACHED)
     world.runner.finish(p.task_id, bundle="foreign")
     world.c.poll()
@@ -178,7 +179,8 @@ def test_rejudge_under_an_older_identity_is_recorded_not_routed(world):
     bundle = world.job(j).last_verdict.bundle_ref
     world.registry.put(binding("build-2"))
     world.c.on_registry_changed()
-    world.judge.add(bundle, binding().execution_harness_id, j,
+    world.judge.add(bundle, binding().execution_harness_id,
+                    world.job(j).candidate.candidate_id,
                     Q1Status.REACHED, profile="jp-2")
     world.c.on_judge_versions(VERSIONS.model_copy(
         update={"judge_profile_id": "jp-2"}))
@@ -199,7 +201,8 @@ def test_rejudge_under_an_older_identity_is_recorded_not_routed(world):
 def test_rejudge_under_the_same_binding_routes_from_the_origin(world):
     j = blocked_on_evidence(world)
     bundle = world.job(j).last_verdict.bundle_ref
-    world.judge.add(bundle, binding().execution_harness_id, j,
+    world.judge.add(bundle, binding().execution_harness_id,
+                    world.job(j).candidate.candidate_id,
                     Q1Status.REACHED, profile="jp-2")
     world.c.on_judge_versions(VERSIONS.model_copy(
         update={"judge_profile_id": "jp-2"}))

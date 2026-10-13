@@ -12,7 +12,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterator
 
-from ..contracts import GapRef, JobPolicy, Q1Result
+from ..contracts import GapRef, JobPolicy, Q1Result, VulnerabilityCandidate
 from .records import AgentAttempt, Job, JobState, Transition
 
 SCHEMA = """
@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS verdicts (
 CREATE TABLE IF NOT EXISTS attempts (
     task_id TEXT NOT NULL, attempt INTEGER NOT NULL, job_id TEXT NOT NULL,
     body TEXT NOT NULL, PRIMARY KEY (task_id, attempt));
+CREATE TABLE IF NOT EXISTS candidates (
+    candidate_id TEXT PRIMARY KEY, target TEXT NOT NULL UNIQUE,
+    body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gap_issues (
     gap_class TEXT NOT NULL, missing_capability_id TEXT NOT NULL,
     issue_ref TEXT NOT NULL, PRIMARY KEY (gap_class, missing_capability_id));
@@ -73,6 +76,34 @@ class Store:
         if row is None:
             raise KeyError(policy_id)
         return JobPolicy.model_validate_json(row[0])
+
+    # ---------------------------------------------------------- candidates
+
+    def register_candidate(self, c: VulnerabilityCandidate
+                           ) -> VulnerabilityCandidate:
+        """Store an accepted candidate, or return the one already stored for
+        the same target.  A candidate is immutable and one candidate can have
+        many jobs, e.g. one per sanitizer (02 §7)."""
+        target = c.model_dump_json(exclude={"candidate_id"})
+        with self._tx():
+            row = self.db.execute("SELECT body FROM candidates WHERE "
+                                  "target = ?", (target,)).fetchone()
+            if row:
+                return VulnerabilityCandidate.model_validate_json(row[0])
+            self.db.execute("INSERT INTO candidates VALUES (?, ?, ?)",
+                            (c.candidate_id, target, c.model_dump_json()))
+        return c
+
+    def candidate(self, candidate_id: str) -> VulnerabilityCandidate:
+        row = self.db.execute("SELECT body FROM candidates WHERE "
+                              "candidate_id = ?", (candidate_id,)).fetchone()
+        if row is None:
+            raise KeyError(candidate_id)
+        return VulnerabilityCandidate.model_validate_json(row[0])
+
+    def jobs_for(self, candidate_id: str) -> list[Job]:
+        return [j for j in self.jobs()
+                if j.candidate and j.candidate.candidate_id == candidate_id]
 
     # ---------------------------------------------------------- jobs
 

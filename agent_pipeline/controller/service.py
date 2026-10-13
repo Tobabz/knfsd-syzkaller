@@ -16,7 +16,8 @@ from typing import Callable
 from ..artifacts import ArtifactStore
 from ..components import HarnessRegistry, IssueTracker
 from ..contracts import (AgentOutput, CandidateSubmission, GapRef,
-                         JudgeVersions)
+                         JudgeVersions, LocationRequest,
+                         VulnerabilityCandidate)
 from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
 from .machine import Env, Machine, Outcome
@@ -58,7 +59,30 @@ class Controller:
 
     # ------------------------------------------------------------ intake
 
+    def register(self, submission: CandidateSubmission
+                 ) -> VulnerabilityCandidate | IntakeRejected:
+        """Intake only (02 §3): store the candidate, or say why not.  The
+        same target always gets the same candidate_id."""
+        result = validate(submission, self.tree,
+                          candidate_id=f"VC-{self.new_id()}")
+        if isinstance(result, IntakeRejected):
+            return result
+        return self.store.register_candidate(result)
+
+    def start_job(self, candidate_id: str, policy_id: str) -> str:
+        """A new job for a registered candidate, e.g. under another
+        sanitizer's policy."""
+        c = self.store.candidate(candidate_id)
+        loc = c.location
+        return self.submit(CandidateSubmission(
+            kernel_commit=c.kernel_commit, location=LocationRequest(
+                kind=loc.kind, path=loc.path, symbol=loc.symbol,
+                start_line=loc.start_line, end_line=loc.end_line)),
+            policy_id)
+
     def submit(self, submission: CandidateSubmission, policy_id: str) -> str:
+        """Register the candidate and start a job for it.  A submission
+        intake refuses still gets a job, which ends rejected (09 §3)."""
         self.store.policy(policy_id)            # must exist
         job = Job(job_id=f"job-{self.new_id()}", submission=submission,
                   job_policy_id=policy_id)
@@ -71,7 +95,7 @@ class Controller:
 
     def _intake(self, job_id: str) -> None:
         job = self.store.job(job_id)
-        result = validate(job.submission, self.tree, candidate_id=job_id)
+        result = self.register(job.submission)
         if isinstance(result, IntakeRejected):
             event = ev.IntakeChecked(
                 rejection=f"{result.reason}:{result.detail}",

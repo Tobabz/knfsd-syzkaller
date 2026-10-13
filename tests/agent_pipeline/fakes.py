@@ -319,8 +319,8 @@ class World:
         p = j.pending_task
         assert p is not None and p.kind is TaskKind.RUNNER, p
         bundle = name or f"bundle-{p.task_id}"
-        self.judge.add(bundle, j.binding.execution_harness_id, job_id,
-                       status, reason, gap)
+        self.judge.add(bundle, j.binding.execution_harness_id,
+                       j.candidate.candidate_id, status, reason, gap)
         self.runner.finish(p.task_id, bundle=bundle)
         self.c.poll()
         return bundle
