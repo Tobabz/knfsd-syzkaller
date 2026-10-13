@@ -85,8 +85,9 @@ class JobPolicy(Record):
     and the next blocks.
 
     Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
-    Agent retries, three Runner reruns, no human approval before a run.  run_stage2 becomes true by default once Stage 2
-    is implemented; until then it only accepts false."""
+    Agent retries, three Runner reruns, no human approval before a run.
+    run_stage2 becomes true by default once Stage 2 is implemented; until
+    then it only accepts false."""
 
     policy_id: str
     sanitizer: Sanitizer

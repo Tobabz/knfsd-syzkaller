@@ -259,10 +259,14 @@ class Machine:
         return True
 
     def _on_binding_changed(self, c: _Call, e: ev.BindingChanged) -> bool:
-        j = c.job
-        new = self._usable(c, e.binding)
-        if j.state is JobState.SUBMITTED:
+        if c.job.state is JobState.SUBMITTED:
             return False
+        return self._binding_change(c, e.binding)
+
+    def _binding_change(self, c: _Call, binding: HarnessBinding | None
+                        ) -> bool:
+        j = c.job
+        new = self._usable(c, binding)
         if j.state is JobState.RETRY_PENDING:
             base = j.resume_point
             t = self._rebind(c, new, base)
@@ -318,7 +322,6 @@ class Machine:
             if not same_binding:
                 return True
             t = Target(kind=TargetKind.RUNNING, rerun=True)
-            external = True
         else:
             r = self.env.judge.judge(lv.bundle_ref, lv.plan_ref,
                                      j.candidate.candidate_id,
@@ -331,17 +334,36 @@ class Machine:
             c.consumed.append(r.verdict_id)
             j.last_verdict = lv.model_copy(update={"result": r})
             t = self._q1_target(c, r)
-            external = False
+        # 09 §5, §6: a rerun this event asks for spends no budget, also
+        # when it waits in a resume point first.
+        t = self._external(t)
         if j.state in WAITING or j.state is JobState.RETRY_PENDING:
             self._set_resume(c, t, self._waiting_base(j))
         else:
-            self._goto(c, t, external=external)
+            self._goto(c, t)
         return True
 
+    @classmethod
+    def _external(cls, t: Target) -> Target:
+        if t.kind is TargetKind.RUNNING and t.rerun:
+            return t.model_copy(update={"external": True})
+        if t.inner is not None:
+            return t.model_copy(update={"inner": cls._external(t.inner)})
+        return t
+
     def _on_policy_changed(self, c: _Call, e: ev.PolicyChanged) -> bool:
-        if e.job_policy_id == c.job.job_policy_id:
+        """Later transitions only (09 §5), but the binding belongs to the
+        sanitizer the policy selects (01 §11.2): a sanitizer change is a
+        binding change, with the binding the service looked up for it."""
+        j = c.job
+        if e.job_policy_id == j.job_policy_id:
             return False
-        c.job.job_policy_id = e.job_policy_id
+        old = c.policy
+        j.job_policy_id = e.job_policy_id
+        c.policy = self.env.policy(e.job_policy_id)
+        if c.policy.sanitizer is not old.sanitizer and \
+                j.state is not JobState.SUBMITTED:
+            self._binding_change(c, e.binding)
         c.reason = "policy_changed"
         return True
 
@@ -414,7 +436,7 @@ class Machine:
         elif t.kind is TargetKind.MATERIALIZE:
             self._goto(c, self._materialize(c), external)
         elif t.kind is TargetKind.RUNNING:
-            self._enter_running(c, t.rerun, external)
+            self._enter_running(c, t.rerun, external or t.external)
         elif t.kind is TargetKind.REACHED:
             self._drop_task(c)
             lv = j.last_verdict

@@ -4,11 +4,12 @@ import pytest
 from pydantic import ValidationError
 
 from agent_pipeline.contracts import (AnalysisOutput, GapClass, GapRef,
-                                      PlanOutput, Q1Status)
+                                      HarnessBinding, PlanOutput, Q1Status,
+                                      Sanitizer)
 from agent_pipeline.controller.records import (BlockedReason, JobState,
                                                TargetKind, TaskKind)
 
-from .fakes import VERSIONS, binding, policy, sha
+from .fakes import COMMIT, VERSIONS, binding, policy, sha
 
 
 def test_stage2_cannot_be_switched_on():
@@ -263,3 +264,99 @@ def test_hcap_change_while_running_keeps_the_run(world):
     assert job.state is JobState.S1_RUNNING
     assert job.pending_task.task_id == task
     assert world.runner.cancel_calls[task] == 0
+
+
+def test_sanitizer_policy_change_rebinds(world):
+    """01 §11.2: the job runs the build of the sanitizer its policy
+    selects, also after the policy changes."""
+    kcsan = HarnessBinding(kernel_commit=COMMIT, sanitizer=Sanitizer.KCSAN,
+                           execution_harness_id=sha("build-kcsan"),
+                           hcap_revision="hcap-1")
+    world.registry.put(kcsan)
+    world.store.save_policy(policy("kcsan", sanitizer=Sanitizer.KCSAN))
+    j = world.submit()
+    world.analysis(j)
+    world.c.set_policy(j, "kcsan")
+    job = world.job(j)
+    assert job.binding == kcsan
+    assert job.state is JobState.S1_PLANNING       # the same Agent Task
+    world.plan(j)
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert world.runner.tasks[job.pending_task.task_id]["input"] \
+        .execution_harness_id == kcsan.execution_harness_id
+    world.c.replay(j)
+
+
+def test_sanitizer_policy_change_while_running_stops_the_run(world):
+    world.store.save_policy(policy("kcsan", sanitizer=Sanitizer.KCSAN))
+    j = world.to_running()
+    old = world.job(j).pending_task.task_id
+    world.c.set_policy(j, "kcsan")                 # no KCSAN build
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_HARNESS_GAP
+    assert job.binding is None
+    assert world.runner.cancel_calls[old] == 1
+    world.registry.put(HarnessBinding(
+        kernel_commit=COMMIT, sanitizer=Sanitizer.KCSAN,
+        execution_harness_id=sha("build-kcsan"), hcap_revision="hcap-1"))
+    world.c.on_issue(job.gap, "resolved")
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.harness.execution_harness_id == sha("build-kcsan")
+
+
+def test_rejudge_rerun_spends_no_runtime_budget(make_world):
+    w = make_world(runtime_retry_limit=1)
+    j = w.to_running()
+    bundle = w.run(j, Q1Status.INCONCLUSIVE, "infra")    # rerun 1 of 1
+    assert w.job(j).counters.runtime_retry == 1
+    running = w.job(j).pending_task.task_id
+    w.judge.add(bundle, binding().execution_harness_id,
+                w.job(j).candidate.candidate_id, Q1Status.INCONCLUSIVE,
+                "loss", profile="jp-2")
+    w.c.on_judge_versions(VERSIONS.model_copy(
+        update={"judge_profile_id": "jp-2"}))
+    job = w.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.counters.runtime_retry == 1
+    assert job.pending_task.task_id != running
+
+
+def test_rejudge_rerun_through_a_waiting_state_spends_no_budget(world):
+    j = blocked_on_evidence(world)
+    bundle = world.job(j).last_verdict.bundle_ref
+    world.judge.missing.add((bundle, "jp-2"))
+    world.c.on_judge_versions(VERSIONS.model_copy(
+        update={"judge_profile_id": "jp-2"}))
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.resume_point.kind is TargetKind.RUNNING
+    assert job.resume_point.rerun and job.resume_point.external
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.counters.runtime_retry == 0
+
+
+def test_issue_resolved_before_the_hcap_notice_checks_the_plan(world):
+    """09 오라클 2: a promotion under the same identity closes the gap and
+    its issue event comes before the HCAP change notice."""
+    j = world.to_running()
+    gap = GapRef(gap_class=GapClass.REMOTE_KCOV_ATTRIBUTION,
+                 missing_capability_id="remote_kcov.context.softirq")
+    world.run(j, Q1Status.INCONCLUSIVE, "unsupported_attribution", gap)
+    assert world.job(j).resume_point.kind is TargetKind.RUNNING
+    world.hcap.violations[(sha("plan-1"), "hcap-2")] = ("HCAP-02 removed",)
+    world.registry.put(binding(hcap="hcap-2"))      # no notice yet
+    started = list(world.runner.started)
+    world.c.on_issue(gap, "resolved")
+    job = world.job(j)
+    assert job.state is JobState.S1_PLANNING
+    assert job.state_reason == "hcap_changed"
+    assert job.binding == binding(hcap="hcap-2")
+    assert world.runner.started == started
+    n = len(world.store.transitions(j))
+    world.c.on_registry_changed()                   # the late notice
+    assert len(world.store.transitions(j)) == n
+    world.c.replay(j)

@@ -85,6 +85,8 @@ class Target(Record):
     findings: tuple[str, ...] = ()
     charged: bool = False                   # repair already counted (§6)
     rerun: bool = False                     # running: same Runner input
+    external: bool = False                  # rerun: asked by an outside
+                                            # event, no budget (§6)
     reason: BlockedReason | None = None     # blocked_operator
     gap: GapRef | None = None               # blocked_harness_gap
     inner: Target | None = None             # a waiting target's own resume

@@ -97,8 +97,13 @@ class JudgeVersionsChanged(Record):
 
 
 class PolicyChanged(Record):
+    """`binding` is the registry's binding for the new policy's sanitizer,
+    looked up by the service; the machine uses it only when the sanitizer
+    changes."""
+
     type: Literal["policy_changed"] = "policy_changed"
     job_policy_id: str
+    binding: HarnessBinding | None = None
 
 
 class OperatorAction(Record):

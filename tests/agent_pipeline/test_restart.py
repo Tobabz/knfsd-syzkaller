@@ -103,13 +103,26 @@ def test_next_runner_task_waits_for_the_cancelled_one(world):
     new = job.pending_task.task_id
     assert job.cancelling_tasks == (old,)
     assert world.runner.starts[new] == 0             # not sent yet
-    world.c.poll()
-    assert world.runner.starts[new] == 0
     world.restart()                                  # cancel sent again
     job = world.job(j)
     assert job.cancelling_tasks == ()
     assert world.runner.starts[new] == 1
     assert world.runner.started == [old, new]
+
+
+def test_poll_sends_the_cancel_again(world):
+    j = world.to_running()
+    old = world.job(j).pending_task.task_id
+    world.runner.slow_cancel.add(old)
+    world.registry.put(binding("build-2"))
+    world.c.on_registry_changed()
+    new = world.job(j).pending_task.task_id
+    assert world.runner.starts[new] == 0
+    world.c.poll()                                   # cancel sent again
+    assert world.job(j).cancelling_tasks == ()
+    assert world.runner.cancel_calls[old] == 2
+    assert world.runner.started == [old, new]
+    world.c.replay(j)
 
 
 def test_double_abandonment_waits_for_both(world):

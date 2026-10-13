@@ -76,6 +76,43 @@ def test_declarations_and_calls_are_not_definitions():
     assert find_function("#define foo(x) (x)\n", "foo") == []
 
 
+def test_function_ends_at_its_own_brace():
+    src = ("static int target(void) { return 0; }\n"
+           "\n"
+           "int other(void)\n"
+           "{\n"
+           "\treturn 1;\n"
+           "}\n")
+    assert find_function(src, "target") == [(1, 1)]
+    assert find_function(src, "other") == [(3, 6)]
+    nested = "int f(int x)\n{\n\tif (x) {\n\t\tx++;\n\t}\n\treturn x;\n}\n"
+    assert find_function(nested, "f") == [(1, 7)]
+
+
+def test_comments_and_literals_are_not_code():
+    assert find_function("/*\nint target(void)\n{\n\treturn 0;\n}\n*/\n",
+                         "target") == []
+    assert find_function("// int target(void) { return 0; }\n",
+                         "target") == []
+    # A brace in a literal or comment does not end the body.
+    src = ("int target(void)\n{\n\tputs(\"}\");\n\tc = '}';\n"
+           "/* } */\n\treturn 0;\n}\nint after(void)\n{\n}\n")
+    assert find_function(src, "target") == [(1, 7)]
+    assert find_function("int target(void)\n{\n\treturn 0;\n/* never "
+                         "closed }\n", "target") == []
+
+
+def test_unbalanced_body_is_not_found():
+    # Braces split by #ifdef: the first column-0 } is not this brace's.
+    src = ("int target(int x)\n{\n#ifdef A\n\tif (x) {\n#else\n"
+           "\tif (!x) {\n#endif\n\t\tx++;\n\t}\n\treturn x;\n}\n"
+           "int other(void)\n{\n}\n")
+    assert find_function(src, "target") == []
+    # Inside another body is not a definition at file level.
+    assert find_function("void outer(void)\n{\nint target(void)\n{\n}\n}\n",
+                         "target") == []
+
+
 def test_normalized_paths():
     assert normalized("fs/nfsd/nfs4state.c")
     for bad in ("", "/fs/x.c", "fs//x.c", "fs/./x.c", "fs/../x.c",

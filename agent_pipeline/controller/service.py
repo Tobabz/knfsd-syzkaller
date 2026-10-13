@@ -175,21 +175,45 @@ class Controller:
                     judge_versions=versions))
 
     def set_policy(self, job_id: str, policy_id: str) -> None:
-        self.store.policy(policy_id)
-        self._apply(job_id, ev.PolicyChanged(job_policy_id=policy_id))
+        policy = self.store.policy(policy_id)
+        job = self.store.job(job_id)
+        binding = None if job.candidate is None else self.registry.lookup(
+            job.candidate.kernel_commit, policy.sanitizer)
+        self._apply(job_id, ev.PolicyChanged(job_policy_id=policy_id,
+                                             binding=binding))
 
     def operator(self, job_id: str, action: str) -> Outcome | None:
         return self._apply(job_id, ev.OperatorAction(
             action=action, action_id=f"op-{self.new_id()}"))
 
     def poll(self) -> None:
-        """Ask the Runner about every job's pending Runner task."""
-        for job in self.store.jobs():
-            p = job.pending_task
-            if p is not None and p.kind is TaskKind.RUNNER and \
-                    not job.cancelling_tasks:
-                self._take_status(job.job_id, p.task_id,
-                                  self.runner.status(p.task_id))
+        """Ask the Runner about every job's Runner tasks and finish what a
+        lost answer left undone (09 §8): a cancel not yet confirmed is sent
+        again, a pending task the Runner does not know is submitted again
+        with its task_id, and a gap job not linked to its issue is
+        linked."""
+        for job in list(self.store.jobs()):
+            self._settle(job.job_id)
+
+    def _settle(self, job_id: str) -> None:
+        job = self.store.job(job_id)
+        for task_id in job.cancelling_tasks:
+            st = self.runner.status(task_id)
+            if st.state in FINAL:
+                self._apply(job_id, ev.CancelConfirmed(task_id=task_id))
+            else:
+                self._cancel(job_id, task_id)
+        job = self.store.job(job_id)
+        self._link_gap(job)
+        p = job.pending_task
+        if p is None or p.kind is not TaskKind.RUNNER or \
+                job.cancelling_tasks:
+            return
+        st = self.runner.status(p.task_id)
+        if st.state == "unknown":
+            self._dispatch(job_id)
+        else:
+            self._take_status(job_id, p.task_id, st)
 
     # ------------------------------------------------------------ restart
 
@@ -201,6 +225,7 @@ class Controller:
             for task_id in job.cancelling_tasks:
                 self._cancel(job.job_id, task_id)
             job = self.store.job(job.job_id)
+            self._link_gap(job)
             p = job.pending_task
             if p is None:
                 if job.state is JobState.SUBMITTED:
@@ -257,15 +282,20 @@ class Controller:
             if a is not None and a.status == "running":
                 self.store.save_attempt(a.model_copy(
                     update={"status": "abandoned"}))
-        if new.state is JobState.BLOCKED_HARNESS_GAP and \
-                (old.state is not new.state or old.gap != new.gap):
-            # 07 §2: the Controller creates or links the issue.
-            self.store.link_issue(new.gap, self.issues.open_or_link(
-                new.gap, new.job_id))
         for task_id in new.cancelling_tasks:
             if task_id not in old.cancelling_tasks:
                 self._cancel(new.job_id, task_id)
         self._dispatch(new.job_id)
+        self._link_gap(self.store.job(new.job_id))
+
+    def _link_gap(self, job: Job) -> None:
+        """07 §2: the Controller creates or links the issue.  Idempotent,
+        so poll() and recover() send it again until it is recorded."""
+        if job.state in (JobState.BLOCKED_HARNESS_GAP, JobState.PARKED) \
+                and job.gap is not None and \
+                not self.store.is_linked(job.job_id, job.gap):
+            self.store.link_issue(job.gap, self.issues.open_or_link(
+                job.gap, job.job_id), job.job_id)
 
     def _dispatch(self, job_id: str) -> None:
         job = self.store.job(job_id)

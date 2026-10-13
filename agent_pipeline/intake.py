@@ -121,34 +121,87 @@ def line_count(text: str) -> int:
 _ANNOTATION = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*(\([^(){};]*\))?")
 
 
+def code_only(text: str) -> str:
+    """`text` with comments, string and character literals and
+    preprocessor lines (with their continuations) blanked to spaces.
+    Newlines stay, so offsets and line numbers are those of `text`.  An
+    unterminated comment or literal blanks the rest of the file."""
+    out = list(text)
+    i, n, bol = 0, len(text), True
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            bol = True
+            i += 1
+            continue
+        if bol and ch in " \t":
+            i += 1
+            continue
+        if bol and ch == "#":
+            j = i
+            while j < n and not (text[j] == "\n" and text[j - 1] != "\\"):
+                j += 1
+            end = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            end = n if j < 0 else j + 2
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            end = n if j < 0 else j
+        elif ch in "\"'":
+            j = i + 1
+            while j < n and text[j] != ch and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            end = min(j + 1, n)
+        else:
+            bol = False
+            i += 1
+            continue
+        for k in range(i, end):
+            if out[k] != "\n":
+                out[k] = " "
+        bol = False
+        i = end
+    return "".join(out)
+
+
 def find_function(text: str, symbol: str) -> list[tuple[int, int]]:
     """Every definition of `symbol` in kernel C style, as 1-based
     (start_line, end_line).
 
-    A definition starts at column 0 with `symbol(` in it, its parameter list
-    is followed (after optional annotations such as `__releases(x)`) by `{`,
-    and its body ends at the first later line starting with `}`.  A
-    return-type line just above the name is included.  Declarations,
-    macros, calls and indented text do not match.  Anything this cannot
-    parse is not found, which intake reports, rather than guessed.
+    Comments, literals and preprocessor lines are blanked first, so text in
+    them never matches.  A definition starts at column 0 outside any brace
+    with `symbol(` in it, its parameter list is followed (after optional
+    annotations such as `__releases(x)`) by `{`, and it ends at the brace
+    that closes that one.  A body in which a line starting with `}` comes
+    before that brace (braces split by #ifdef) is not found.  A return-type
+    line just above the name is included.  Declarations, macros, calls and
+    indented text do not match.  Anything this cannot parse is not found,
+    which intake reports, rather than guessed.
     """
-    lines = text.split("\n")
+    code = code_only(text)
+    lines = code.split("\n")
     offsets, pos = [], 0
     for ln in lines:
         offsets.append(pos)
         pos += len(ln) + 1
+    # Brace depth at the start of each line.
+    depth_at, d = [], 0
+    for ln in lines:
+        depth_at.append(d)
+        d += ln.count("{") - ln.count("}")
     name = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(symbol) + r"\s*\(")
     found = []
     for i, ln in enumerate(lines):
-        if not ln or ln[0] in " \t#/*{}":
+        if not ln or ln[0] in " \t{}" or depth_at[i] != 0:
             continue
         m = name.search(ln)
         if not m:
             continue
         at = offsets[i] + m.end() - 1          # the "("
         depth = 0
-        while at < len(text):
-            ch = text[at]
+        while at < len(code):
+            ch = code[at]
             if ch == "(":
                 depth += 1
             elif ch == ")":
@@ -162,26 +215,41 @@ def find_function(text: str, symbol: str) -> list[tuple[int, int]]:
             continue
         at += 1
         while True:
-            while at < len(text) and text[at] in " \t\n":
+            while at < len(code) and code[at] in " \t\n":
                 at += 1
-            if text.startswith("{", at):
+            if code.startswith("{", at):
                 break
-            a = _ANNOTATION.match(text, at)
+            a = _ANNOTATION.match(code, at)
             if not a or a.end() == at:
                 at = -1
                 break
             at = a.end()
         if at < 0:
             continue
-        brace_line = text.count("\n", 0, at)
-        end = next((k for k in range(brace_line + 1, len(lines))
-                    if lines[k].startswith("}")), None)
-        if end is None:
+        close = _closing_brace(code, at)
+        if close is None:
+            continue
+        open_line = code.count("\n", 0, at)
+        end = code.count("\n", 0, close)
+        if any(lines[k].startswith("}") for k in range(open_line + 1, end)):
             continue
         start = i
         prev = lines[i - 1] if i > 0 else ""
-        if prev and prev[0] not in " \t#/*{}" and "(" not in prev and \
-                not prev.rstrip().endswith((";", ",", "{", "}", ")", "*/")):
+        if prev and prev[0] not in " \t{}" and "(" not in prev and \
+                not prev.rstrip().endswith((";", ",", "{", "}", ")")):
             start = i - 1
         found.append((start + 1, end + 1))
     return found
+
+
+def _closing_brace(code: str, at: int) -> int | None:
+    """Offset of the `}` that closes the `{` at `at`."""
+    depth = 0
+    for k in range(at, len(code)):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return k
+    return None

@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS candidates (
 CREATE TABLE IF NOT EXISTS gap_issues (
     gap_class TEXT NOT NULL, missing_capability_id TEXT NOT NULL,
     issue_ref TEXT NOT NULL, PRIMARY KEY (gap_class, missing_capability_id));
+CREATE TABLE IF NOT EXISTS gap_links (
+    job_id TEXT NOT NULL, gap_class TEXT NOT NULL,
+    missing_capability_id TEXT NOT NULL,
+    PRIMARY KEY (job_id, gap_class, missing_capability_id));
 """
 
 
@@ -181,12 +185,25 @@ class Store:
 
     # ---------------------------------------------------------- gap issues
 
-    def link_issue(self, gap: GapRef, issue_ref: str) -> None:
+    def link_issue(self, gap: GapRef, issue_ref: str,
+                   job_id: str | None = None) -> None:
+        """The gap's issue, and that `job_id` is linked to it."""
         with self._tx():
             self.db.execute("INSERT OR IGNORE INTO gap_issues VALUES "
                             "(?, ?, ?)", (gap.gap_class.value,
                                           gap.missing_capability_id,
                                           issue_ref))
+            if job_id is not None:
+                self.db.execute("INSERT OR IGNORE INTO gap_links VALUES "
+                                "(?, ?, ?)", (job_id, gap.gap_class.value,
+                                              gap.missing_capability_id))
+
+    def is_linked(self, job_id: str, gap: GapRef) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM gap_links WHERE job_id = ? AND gap_class = ? AND "
+            "missing_capability_id = ?", (job_id, gap.gap_class.value,
+                                          gap.missing_capability_id)
+        ).fetchone() is not None
 
     def issue_ref(self, gap: GapRef) -> str | None:
         row = self.db.execute("SELECT issue_ref FROM gap_issues WHERE "
