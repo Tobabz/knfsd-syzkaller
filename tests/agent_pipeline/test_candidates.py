@@ -57,8 +57,9 @@ def test_submit_registers_and_reuses_the_candidate(world):
 
 
 def test_policy_defaults():
-    p = JobPolicy(policy_id="d", sanitizer=Sanitizer.KASAN,
-                  agent_retry_limit=2, runtime_retry_limit=2)
+    p = JobPolicy(policy_id="d", sanitizer=Sanitizer.KASAN)
     assert p.stage1_repair_budget == 3
+    assert p.agent_retry_limit == 3
+    assert p.runtime_retry_limit == 3
     assert p.approval_required is False
     assert p.run_stage2 is False

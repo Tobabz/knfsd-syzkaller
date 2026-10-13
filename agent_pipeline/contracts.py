@@ -84,8 +84,8 @@ class JobPolicy(Record):
     thing may happen after the first try.  With a limit of 1 one repair runs
     and the next blocks.
 
-    Defaults (owner decision, 2026-10-13): three Stage 1 repairs, no human
-    approval before a run.  run_stage2 becomes true by default once Stage 2
+    Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
+    Agent retries, three Runner reruns, no human approval before a run.  run_stage2 becomes true by default once Stage 2
     is implemented; until then it only accepts false."""
 
     policy_id: str
@@ -95,8 +95,8 @@ class JobPolicy(Record):
     # REACHED job waits in s1_reached (09 rationale 11).
     run_stage2: Literal[False] = False
     stage1_repair_budget: int = Field(default=3, ge=1)
-    agent_retry_limit: int = Field(ge=1)
-    runtime_retry_limit: int = Field(ge=1)
+    agent_retry_limit: int = Field(default=3, ge=1)
+    runtime_retry_limit: int = Field(default=3, ge=1)
 
 
 # ---------------------------------------------------------------- binding
