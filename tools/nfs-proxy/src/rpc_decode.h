@@ -18,9 +18,11 @@
  *            MSG_DENIED    reject_stat, mismatch_info | auth_stat, body
  *
  *   `body` is every byte after the envelope.  For a CALL and for an accepted
- *   SUCCESS reply that is the procedure's arguments or results.  For the other
- *   reply arms the RFC defines no body, and a non-empty `body` there is a fact
- *   the decoder reports rather than a judgement it makes.
+ *   SUCCESS reply that is the procedure's arguments or results, except under
+ *   RPCSEC_GSS: its integrity and privacy services wrap them (RFC 2203
+ *   §5.3.2.2-§5.3.2.3), so nfs_decode.c does not decode an RPCSEC_GSS body.
+ *   For the other reply arms the RFC defines no body, and a non-empty `body`
+ *   there is a fact the decoder reports rather than a judgement it makes.
  *
  *   A REPLY carries no procedure.  The decoder does not guess one; the
  *   Transaction Context (M3) supplies it from the matching CALL.
@@ -43,6 +45,11 @@
 #define NFSP_RPC_REPLY		1u
 #define NFSP_RPC_VERSION	2u
 #define NFSP_RPC_MAX_AUTH_BYTES	400u
+
+/* auth_flavor (RFC 5531 §8.2), the ones this repository names. */
+#define NFSP_RPC_AUTH_NONE	0u
+#define NFSP_RPC_AUTH_SYS	1u
+#define NFSP_RPC_RPCSEC_GSS	6u
 
 enum nfsp_rpc_reply_stat {
 	NFSP_RPC_MSG_ACCEPTED = 0,

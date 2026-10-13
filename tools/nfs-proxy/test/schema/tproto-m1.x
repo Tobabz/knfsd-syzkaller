@@ -6,8 +6,10 @@
  * test/test_nfs_decode.c, independently of any RFC.  Minor version 1:
  * adds OP_STAT, so the same opcode is malformed in minor 0 and decoded in 1.
  * STAT_res starts with a union on tp_status and ends with another
- * tp_status, so the operation status must stay the first leaf even after a
- * nested union has been decoded.
+ * tp_status, so the operation status must stay the value the result starts
+ * with even after a nested union has been decoded.  TAGS_res and NOTES_res
+ * start with a count and a list link instead, so OP_TAGS and OP_NOTES have
+ * no status, however many elements they carry.
  */
 %/* rpcgen pass-through lines are ignored by the normalizer */
 
@@ -35,6 +37,8 @@ enum tp_opnum {
 	OP_WRITE   = 2,
 	OP_LOOKUP  = 3,
 	OP_STAT    = 4,
+	OP_TAGS    = 5,
+	OP_NOTES   = 6,
 	OP_ILLEGAL = 0x271c
 };
 
@@ -122,6 +126,21 @@ struct STAT_res {
 	tp_status	later;
 };
 
+struct TAGS_res {
+	uint32_t	tags<TP_MASKS>;
+	tp_status	status;
+};
+
+struct note {
+	uint32_t	n;
+	note		*next;
+};
+
+struct NOTES_res {
+	note		*notes;
+	tp_status	status;
+};
+
 struct PING_res {
 	tp_status	status;
 };
@@ -135,6 +154,8 @@ case OP_PING:		void;
 case OP_WRITE:		WRITE_args opwrite;
 case OP_LOOKUP:		LOOKUP_args oplookup;
 case OP_STAT:		STAT_args opstat;
+case OP_TAGS:		void;
+case OP_NOTES:		void;
 case OP_ILLEGAL:	void;
 };
 
@@ -143,6 +164,8 @@ case OP_PING:		PING_res opping;
 case OP_WRITE:		WRITE_res opwrite;
 case OP_LOOKUP:		LOOKUP_res oplookup;
 case OP_STAT:		STAT_res opstat;
+case OP_TAGS:		TAGS_res optags;
+case OP_NOTES:		NOTES_res opnotes;
 case OP_ILLEGAL:	ILLEGAL_res opillegal;
 };
 

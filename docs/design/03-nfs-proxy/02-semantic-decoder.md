@@ -321,6 +321,7 @@ reply_dispatch
     procedure
     minor_version?      # NFSv4 COMPOUND / CB_COMPOUND
     source              # transaction_entry | test_fixture
+    cred_flavor         # CALL의 credential flavor
 ```
 
 - live traffic에서 `reply_dispatch`의 출처는 lookup 결과가 `found`인 TransactionEntry 하나다
@@ -328,6 +329,7 @@ reply_dispatch
   (`03-transaction-context.md` §6). NFSv4 `minor_version`은 CALL의 COMPOUND header를 decode했을 때만 있다.
 - `test_fixture`는 M2 host test에서 fixture CALL이 dispatch를 공급할 때만 쓴다. production runtime은 이
   source를 받지 않는다.
+- `cred_flavor`도 같은 CALL envelope에서 온다. RPCSEC_GSS CALL의 REPLY는 decode하지 않는다(§15).
 - request semantic context(operation sequence, request field)의 유무와 dispatch identity의 유무는 다른
   조건이다. dispatch만 있고 request context가 없으면 result schema는 고를 수 있지만 request-dependent
   predicate는 쓸 수 없다.
@@ -700,6 +702,13 @@ failure
     reason
 ```
 
+RPCSEC_GSS credential을 가진 CALL, 그런 CALL의 REPLY(`reply_dispatch.cred_flavor`), verifier가 RPCSEC_GSS인
+accepted REPLY는 service와 관계없이 `unsupported_schema`다. integrity와 privacy service에서 body는 procedure
+argument/result가 아니라 RFC 2203 wrapper(`rpc_gss_integ_data`, `rpc_gss_priv_data`)다
+([RFC 2203 §5.3.2.2](https://www.rfc-editor.org/rfc/rfc2203.html#section-5.3.2.2)). wrapper bytes가 procedure
+schema에 맞아도 boundary 증명이 아니다(§11). fuzzer는 RPCSEC_GSS credential 뒤에 평문 NFS body를 붙여
+보낸다(syzkaller patch 0006의 `rpc_auth_gss`).
+
 Decoder가 failure 이전에 일부 prefix field boundary를 증명했더라도,
 decode_status가 decoded가 아니면 Semantic Rule Resolver의 mutation input으로
 사용하지 않는다.
@@ -976,6 +985,14 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
   offset, width를 다시 적지 않는다.
 - **결정됨(M2):** resource limit은 nesting depth 64(normalizer가 build 때 거부하고 runtime도 다시 확인)와
   message당 field 기본 65536개(호출자가 낮출 수 있음)다. 실패한 decode는 field를 하나도 남기지 않는다.
+- **결정됨(M2):** semantic path 하나는 schema 안의 위치 하나를 가리킨다. 같은 path를 가진 field는 그 위치의
+  반복(array/list element, 반복된 operation)뿐이다. 이것을 깨는 XDR과 annotation은 normalizer가 build 때
+  거부한다. 목록은 `tools/nfs-proxy/schema/README.md`가 소유한다.
+- **결정됨(M2):** response operation의 status는 그 결과가 시작하는 위치에 있는 `status-type` 값이다. 결과가
+  count나 list link로 시작하면 element 수와 관계없이 status가 없다. 모든 NFSv4 resop arm은 `nfsstat4`로
+  시작한다.
+- **결정됨(M2):** RPCSEC_GSS body는 decode하지 않는다(§15). GSS context를 쓰는 traffic의 mutation은 범위
+  밖이다.
 - **결정됨(M2):** NFSv4 NULL procedure는 COMPOUND가 없어 minor version이 없다. 그래서 하나의
   ProtocolSchema를 고를 수 없고 `unsupported_schema`다. 그 REPLY는 §14 표대로 `dispatch_incomplete`다.
 - **미결:** NFS XDR snapshot 반입. NFSv4.0/4.1/4.2는 RFC 7531/5662/7863의 XDR을 추출해 pin한다. NFSv3는

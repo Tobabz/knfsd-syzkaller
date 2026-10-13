@@ -16,6 +16,10 @@
  *                 field: no sibling, span or path moves
  *   F4            a REPLY is decoded only from reply_dispatch, never from a
  *                 shape its bytes happen to fit
+ *   status        an operation's status is the status-typed value its result
+ *                 starts with
+ *   RPCSEC_GSS    a GSS-protected body is never decoded, even when its bytes
+ *                 fit the procedure
  */
 #include "nfs_decode.h"
 #include "rpc_decode.h"
@@ -378,7 +382,7 @@ static void test_call_golden(void)
 }
 
 static const struct nfsp_reply_dispatch tproto_dispatch = {
-	TPROTO_PROG, 1, 1, 1, 0, NFSP_DISPATCH_TEST_FIXTURE
+	TPROTO_PROG, 1, 1, 1, 0, NFSP_DISPATCH_TEST_FIXTURE, NFSP_RPC_AUTH_NONE
 };
 
 static void test_reply_golden(void)
@@ -532,7 +536,8 @@ static void test_reply_dispatch(void)
 	      !m.schema, "no dispatch: %s", nfsp_decode_strstatus(m.status));
 
 	rd = (struct nfsp_reply_dispatch){ TFLAT_PROG, 2, 6, 0, 0,
-					   NFSP_DISPATCH_TEST_FIXTURE };
+					   NFSP_DISPATCH_TEST_FIXTURE,
+					   NFSP_RPC_AUTH_NONE };
 	CHECK(run(r.b, r.n, &rd, 0, 0, &m) ==
 	      NFSP_DECODE_TRANSACTION_CONTEXT_MISSING,
 	      "fixture dispatch outside tests: %s",
@@ -579,7 +584,8 @@ static void test_reply_dispatch(void)
 
 	/* No result exists on a non-SUCCESS arm. */
 	rd = (struct nfsp_reply_dispatch){ TFLAT_PROG, 2, 6, 0, 0,
-					   NFSP_DISPATCH_TRANSACTION_ENTRY };
+					   NFSP_DISPATCH_TRANSACTION_ENTRY,
+					   NFSP_RPC_AUTH_NONE };
 	reply_header(&r, 3);	/* PROC_UNAVAIL */
 	CHECK(run(r.b, r.n, &rd, 0, 0, &m) == NFSP_DECODE_DECODED &&
 	      m.nfields == 0 && !strcmp(m.procedure_name, "READ"),
@@ -608,17 +614,18 @@ static void test_reply_dispatch(void)
 	nfsp_decoded_msg_free(&m);
 }
 
-/* PR #25 review P2: an operation's status is its first leaf.  STAT_res in
- * minor 1 is { union on tp_status first; tp_status later; }, so decoding the
- * nested union must not let `later` overwrite the status. */
+/* PR #25 review P2: an operation's status is the value its result starts
+ * with.  STAT_res in minor 1 is { union on tp_status first; tp_status later;
+ * }, so decoding the nested union must not let `later` overwrite the status.
+ */
 static void test_status_after_nested_union(void)
 {
 	struct nfsp_decoded_msg m = {0};
 	struct nfsp_reply_dispatch rd = tproto_dispatch;
 	struct msg r;
 
-	printf("REPLY: operation status stays the first leaf past a nested "
-	       "union\n");
+	printf("REPLY: operation status stays the result's first value past a "
+	       "nested union\n");
 	rd.minor_version = 1;
 	reply_header(&r, 0);
 	w32(&r, 0);		/* 24 COMPOUND status TP_OK */
@@ -631,13 +638,139 @@ static void test_status_after_nested_union(void)
 	CHECK(run(r.b, r.n, &rd, 1, 0, &m) == NFSP_DECODE_DECODED,
 	      "STAT reply: %s", nfsp_decode_strstatus(m.status));
 	CHECK(m.nops == 1 && m.ops[0].has_status && m.ops[0].status == 0,
-	      "op status %u/%u, want the first leaf 0",
+	      "op status %u/%u, want the value at the start, 0",
 	      m.nops ? m.ops[0].has_status : 0, m.nops ? m.ops[0].status : 0);
 	EXPECT(&m, "tproto.response.STAT.result.first.status", 0, 40, 4, 40, 4,
 	       0);
 	EXPECT(&m, "tproto.response.STAT.result.first.ok.value", 0, 44, 4, 44,
 	       4, 7);
 	EXPECT(&m, "tproto.response.STAT.result.later", 0, 48, 4, 48, 4, 5);
+	nfsp_decoded_msg_free(&m);
+}
+
+/* PR #25 re-review: TAGS_res and NOTES_res (minor 1) start with a count and
+ * a list link, not a tp_status.  So neither operation has a status, empty or
+ * not; before, an empty array or list made the later member the status and a
+ * non-empty one did not.  The status member still decodes at its own path. */
+static void test_status_at_result_start(void)
+{
+	struct nfsp_decoded_msg m = {0};
+	struct nfsp_reply_dispatch rd = tproto_dispatch;
+	struct msg r;
+
+	printf("REPLY: a result that starts with a count or a link has no "
+	       "status\n");
+	rd.minor_version = 1;
+	reply_header(&r, 0);
+	w32(&r, 0);		/* 24 COMPOUND status TP_OK */
+	wopaque(&r, "");	/* 28 tag */
+	w32(&r, 4);		/* 32 resarray count */
+	w32(&r, 5);		/* 36 OP_TAGS */
+	w32(&r, 0);		/* 40 tags count 0 */
+	w32(&r, 5);		/* 44 status TP_ERR_IO */
+	w32(&r, 5);		/* 48 OP_TAGS */
+	w32(&r, 1);		/* 52 tags count 1 */
+	w32(&r, 7);		/* 56 tags[0] */
+	w32(&r, 5);		/* 60 status TP_ERR_IO */
+	w32(&r, 6);		/* 64 OP_NOTES */
+	w32(&r, 0);		/* 68 notes: none */
+	w32(&r, 13);		/* 72 status TP_ERR_DENIED */
+	w32(&r, 6);		/* 76 OP_NOTES */
+	w32(&r, 1);		/* 80 notes present */
+	w32(&r, 9);		/* 84 notes[0].n */
+	w32(&r, 0);		/* 88 notes[0] link: end */
+	w32(&r, 13);		/* 92 status TP_ERR_DENIED */
+	CHECK(run(r.b, r.n, &rd, 1, 0, &m) == NFSP_DECODE_DECODED &&
+	      m.nops == 4, "TAGS/NOTES reply: %s, %u ops",
+	      nfsp_decode_strstatus(m.status), m.nops);
+	for (uint32_t i = 0; i < m.nops; i++)
+		CHECK(!m.ops[i].has_status, "op %u (%s) has status %u", i,
+		      m.ops[i].name, m.ops[i].status);
+	EXPECT(&m, "tproto.response.TAGS.result.status", 0, 44, 4, 44, 4, 5);
+	EXPECT(&m, "tproto.response.TAGS.result.status", 1, 60, 4, 60, 4, 5);
+	EXPECT(&m, "tproto.response.NOTES.result.status", 0, 72, 4, 72, 4, 13);
+	EXPECT(&m, "tproto.response.NOTES.result.status", 1, 92, 4, 92, 4, 13);
+	check_invariants(&m, r.n, "tags/notes reply");
+	nfsp_decoded_msg_free(&m);
+}
+
+/* A CALL with an RPCSEC_GSS credential (rpc_gss_cred_vers_1_t, RFC 2203
+ * §5) and verifier; the body starts at 72. */
+static void gss_call_header(struct msg *m, uint32_t prog, uint32_t vers,
+			    uint32_t proc, uint32_t service)
+{
+	m->n = 0;
+	w32(m, 0xc0ffee01);		/*  0 xid */
+	w32(m, 0);			/*  4 CALL */
+	w32(m, 2);			/*  8 rpcvers */
+	w32(m, prog);			/* 12 */
+	w32(m, vers);			/* 16 */
+	w32(m, proc);			/* 20 */
+	w32(m, NFSP_RPC_RPCSEC_GSS);	/* 24 cred flavor */
+	w32(m, 24);			/* 28 cred length */
+	w32(m, 1);			/* 32 version */
+	w32(m, 0);			/* 36 gss_proc RPCSEC_GSS_DATA */
+	w32(m, 1);			/* 40 seq_num */
+	w32(m, service);		/* 44 none 1, integrity 2, privacy 3 */
+	wopaque(m, "hndl");		/* 48 handle */
+	w32(m, NFSP_RPC_RPCSEC_GSS);	/* 56 verf flavor */
+	wopaque(m, "MIC-MIC!");		/* 60 checksum */
+}					/* 72 body */
+
+/* PR #25 re-review P2: under RPCSEC_GSS integrity or privacy the body is an
+ * RFC 2203 wrapper.  Here rpc_gss_priv_data {opaque databody_priv<>} also
+ * fits GETSIZE's tf_handle (opaque<8>), which used to decode as the file
+ * handle.  Nothing GSS is decoded, whatever the service. */
+static void test_rpcsec_gss(void)
+{
+	struct nfsp_decoded_msg m = {0};
+	struct nfsp_reply_dispatch rd;
+	struct msg c, body, r;
+
+	printf("RPCSEC_GSS: a protected body is not decoded\n");
+	for (uint32_t service = 1; service <= 3; service++) {
+		gss_call_header(&c, TFLAT_PROG, 2, 7, service);
+		wopaque(&c, "ciphertx");	/* 72 len, 76..83 */
+		CHECK(run(c.b, c.n, NULL, 0, 0, &m) ==
+		      NFSP_DECODE_UNSUPPORTED_SCHEMA && m.nfields == 0,
+		      "GSS service %u CALL: %s", service,
+		      nfsp_decode_strstatus(m.status));
+	}
+	call_header(&c, TFLAT_PROG, 2, 7);	/* the same body, AUTH_NONE */
+	wopaque(&c, "ciphertx");
+	CHECK(run(c.b, c.n, NULL, 0, 0, &m) == NFSP_DECODE_DECODED,
+	      "AUTH_NONE control: %s", nfsp_decode_strstatus(m.status));
+	EXPECT(&m, "tflat.request.GETSIZE.args", 0, 40, 12, 44, 8, 0);
+
+	/* A minor-versioned family refuses before reading the minor. */
+	build_compound_call(&body, 0);
+	gss_call_header(&c, TPROTO_PROG, 1, 1, 2);
+	memcpy(c.b + c.n, body.b + 40, body.n - 40);
+	c.n += body.n - 40;
+	CHECK(run(c.b, c.n, NULL, 0, 0, &m) ==
+	      NFSP_DECODE_UNSUPPORTED_SCHEMA && m.nfields == 0 &&
+	      !m.has_minor, "GSS COMPOUND CALL: %s",
+	      nfsp_decode_strstatus(m.status));
+
+	/* REPLY: GETSIZE_res {status, unsigned hyper size}. */
+	rd = (struct nfsp_reply_dispatch){ TFLAT_PROG, 2, 7, 0, 0,
+					   NFSP_DISPATCH_TEST_FIXTURE,
+					   NFSP_RPC_RPCSEC_GSS };
+	reply_header(&r, 0);
+	w32(&r, 0);		/* 24 status TF_OK */
+	w64(&r, 4096);		/* 28 size */
+	CHECK(run(r.b, r.n, &rd, 1, 0, &m) == NFSP_DECODE_UNSUPPORTED_SCHEMA &&
+	      m.nfields == 0, "REPLY to a GSS CALL: %s",
+	      nfsp_decode_strstatus(m.status));
+	rd.cred_flavor = NFSP_RPC_AUTH_SYS;
+	CHECK(run(r.b, r.n, &rd, 1, 0, &m) == NFSP_DECODE_DECODED,
+	      "AUTH_SYS control: %s", nfsp_decode_strstatus(m.status));
+	EXPECT(&m, "tflat.response.GETSIZE.result.size", 0, 28, 8, 28, 8,
+	       4096);
+	r.b[15] = (uint8_t)NFSP_RPC_RPCSEC_GSS;	/* 12 the REPLY's own verifier */
+	CHECK(run(r.b, r.n, &rd, 1, 0, &m) == NFSP_DECODE_UNSUPPORTED_SCHEMA &&
+	      m.nfields == 0, "GSS verifier on the REPLY: %s",
+	      nfsp_decode_strstatus(m.status));
 	nfsp_decoded_msg_free(&m);
 }
 
@@ -988,6 +1121,8 @@ int main(void)
 	test_minor_selection();
 	test_reply_dispatch();
 	test_status_after_nested_union();
+	test_status_at_result_start();
+	test_rpcsec_gss();
 	test_long_paths();
 	test_truncation();
 	test_malformed();
