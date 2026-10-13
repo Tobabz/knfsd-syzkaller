@@ -24,6 +24,8 @@ struct queue {
 };
 
 struct conn {
+	/* ConnectionRef identity.  Zero only while the slot is free. */
+	uint64_t connection_id;
 	int client_fd, backend_fd;
 	unsigned client, backend;
 	int connecting, connected;
@@ -40,6 +42,12 @@ struct state {
 	int listeners[NFSP_BACKENDS];
 	struct in_addr clients[NFSP_CLIENTS];
 	size_t limit;
+	/* Monotonic over the whole run, never derived from a slot or an fd,
+	 * so a reused slot cannot hand a new connection an old identity. */
+	uint64_t next_connection_id;
+	/* Canonical payload of a multi-fragment record.  One is enough: the
+	 * event loop handles one record at a time on one thread. */
+	struct nfsp_record_buf payload;
 };
 
 static uint64_t now_ms(void)
@@ -115,9 +123,23 @@ static int start_backend(const struct nfsp_route *r, int *connecting)
 	return fd;
 }
 
+static struct nfsp_connection_ref conn_ref(const struct conn *c)
+{
+	struct nfsp_connection_ref ref;
+	ref.connection_id = c->connection_id;
+	ref.client = c->client;
+	ref.backend = c->backend;
+	return ref;
+}
+
 static void conn_close(struct state *s, struct conn *c)
 {
 	if (c->client_fd < 0) return;
+	if (s->cfg->on_connection != NULL) {
+		struct nfsp_connection_ref ref = conn_ref(c);
+		s->cfg->on_connection(&ref, NFSP_CONN_CLOSED, s->cfg->on_connection_arg);
+	}
+	c->connection_id = 0;
 	close(c->client_fd);
 	if (c->backend_fd >= 0) close(c->backend_fd);
 	nfsp_framing_free(&c->c2s);
@@ -171,6 +193,23 @@ static int flush(struct state *s, struct conn *c, int dir)
 	return 0;
 }
 
+/* Hand the target path its canonical view of a record framing already
+ * accepted.  A canonicalisation failure here can only be NOMEM, or framing.c
+ * and rpc_record.c disagreeing about a record; either way the record is not
+ * forwarded, because the observer would otherwise miss a record the peer
+ * received. */
+static int observe(struct state *s, struct conn *c, int dir,
+		   const uint8_t *framed, size_t len)
+{
+	struct nfsp_rpc_record rec;
+	if (nfsp_rpc_payload(framed, len, &s->payload, &rec.rpc_payload,
+			     &rec.rpc_payload_len, &rec.nfrags) != NFSP_RECORD_OK)
+		return -1;
+	rec.conn = conn_ref(c);
+	rec.direction = dir;
+	return s->cfg->on_rpc_record(&rec, s->cfg->on_rpc_record_arg);
+}
+
 /* Feed at most the framing budget at a time.  A TCP read may contain several
  * complete records, and a previous read may have left an almost-full record.
  * Drain after EACH bounded append instead of treating coalescing as corruption. */
@@ -194,6 +233,11 @@ static int feed(struct state *s, struct conn *c, int dir,
 			if (rc == 0) break;
 			const uint8_t *fwd = f->buf;
 			size_t fwd_len = len;
+			if (s->cfg->on_rpc_record != NULL &&
+			    observe(s, c, dir, f->buf, len) != 0) {
+				s->stats->record_refused++;
+				return -1;
+			}
 			/* Default: forward the record exactly as received.  The callback
 			 * may redirect to a rebuilt record of a different length; framing
 			 * is consumed by the ORIGINAL length either way, since that is
@@ -283,9 +327,14 @@ static void accept_route(struct state *s, unsigned backend)
 	c->backend_fd = -1;
 	c->client = client;
 	c->backend = backend;
+	c->connection_id = s->next_connection_id++;
 	nfsp_framing_init(&c->c2s, s->limit);
 	nfsp_framing_init(&c->s2c, s->limit);
 	s->stats->accepted[client][backend]++;
+	if (s->cfg->on_connection != NULL) {
+		struct nfsp_connection_ref ref = conn_ref(c);
+		s->cfg->on_connection(&ref, NFSP_CONN_OPENED, s->cfg->on_connection_arg);
+	}
 	c->backend_fd = start_backend(&s->cfg->route[backend], &c->connecting);
 	if (c->backend_fd < 0) {
 		s->stats->connect_failed[client][backend]++;
@@ -337,11 +386,15 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 	s->cfg = cfg;
 	s->stats = stats;
 	s->limit = cfg->msg_limit ? cfg->msg_limit : NFSP_MSG_LIMIT_DEFAULT;
+	s->next_connection_id = 1;
+	/* Sentinels before the first goto out: calloc's zeros are valid fds
+	 * and would make `out` close fd 0 and report never-opened slots as
+	 * closed connections. */
+	for (b = 0; b < NFSP_BACKENDS; b++) s->listeners[b] = -1;
+	for (i = 0; i < NFSP_MAX_CONNS; i++) s->conns[i].client_fd = -1;
 	if (s->limit > SIZE_MAX - NFSP_FRAG_HEADER_LEN - NFSP_READ_CHUNK ||
 	    s->limit < NFSP_FRAG_HEADER_LEN) goto out;
 	memset(stats, 0, sizeof(*stats));
-	for (b = 0; b < NFSP_BACKENDS; b++) s->listeners[b] = -1;
-	for (i = 0; i < NFSP_MAX_CONNS; i++) s->conns[i].client_fd = -1;
 	for (b = 0; b < NFSP_CLIENTS; b++)
 		if (cfg->client_ip[b] == NULL ||
 		    inet_pton(AF_INET, cfg->client_ip[b], &s->clients[b]) != 1) goto out;
@@ -441,6 +494,7 @@ out:
 		if (s->conns[i].client_fd >= 0) conn_close(s, &s->conns[i]);
 	for (b = 0; b < NFSP_BACKENDS; b++)
 		if (s->listeners[b] >= 0) close(s->listeners[b]);
+	nfsp_record_buf_free(&s->payload);
 	free(s);
 	return rc;
 }
