@@ -611,6 +611,7 @@ class Normalizer:
         self.p = spec
         self.ann = ann
         self.minor = minor
+        self.prefix_layout = None
         self.nodes = []          # list of dict, index = type id
         self.by_name = {}        # named type -> index (also in-progress)
         self.by_key = {}         # structural key -> index (anonymous)
@@ -1116,9 +1117,13 @@ class Normalizer:
         sel = [p["number"] for p in procs if p["arg"] == sidx]
         if len(sel) != 1:
             raise SchemaError(f"exactly one procedure must take {sname}")
+        prefix = [t for _, t in self.nodes[sidx]["fields"][:fi + 1]]
+        # Compared across minors by layout; kept out of the schema so the
+        # schema_id does not depend on it.
+        memo = {}
+        self.prefix_layout = [self.layout(t, memo) for t in prefix]
         return {"procedure": sel[0], "field": fi,
-                "prefix": [self.canon(t) for _, t in
-                           self.nodes[sidx]["fields"][:fi + 1]]}
+                "prefix": [self.canon(t) for t in prefix]}
 
     def canon(self, i):
         """Structural form of a type, independent of table indices.
@@ -1153,6 +1158,38 @@ class Normalizer:
 
         return visit(i)
 
+    def layout(self, i, memo):
+        """Digest of the wire layout of type `i`: kind, bound, enum values,
+        union cases, and the layouts of its parts in order.  Names and
+        which declaration a part uses do not count, so two types with the
+        same layout have the same digest, shared or not.  Memoized per
+        type, so linear in the number of types."""
+        if i in memo:
+            if memo[i] is None:
+                raise SchemaError(f"type {self.nodes[i]['name']} contains "
+                                  f"itself")
+            return memo[i]
+        memo[i] = None
+        n = self.nodes[i]
+        k = n["kind"]
+        form = [k, n.get("bound")]
+        if k == "enum":
+            form.append([v for _, v in n["values"]])
+        elif k == "struct":
+            form.append([self.layout(t, memo) for _, t in n["fields"]])
+            form.append(bool(n.get("listed")))
+        elif k == "union":
+            form.append(self.layout(n["disc"][1], memo))
+            arms = list(n["arms"]) + ([dict(n["default"], value="default")]
+                                      if n["default"] else [])
+            form.append([[a["value"], None if a["type"] is None
+                          else self.layout(a["type"], memo)] for a in arms])
+        else:
+            form.extend(self.layout(c, memo) for c in self.children(n))
+        memo[i] = hashlib.sha256(json.dumps(
+            form, separators=(",", ":")).encode()).hexdigest()
+        return memo[i]
+
 
 def normalize(ann_path):
     ann = parse_annotations(ann_path)
@@ -1166,6 +1203,7 @@ def normalize(ann_path):
         if m not in dict(sources):
             raise SchemaError(f"extension {f}: no minor {m}")
     schemas = []
+    layouts = []
     used = set()
     used_aliases = set()
     for minor, src in sources:
@@ -1184,6 +1222,7 @@ def normalize(ann_path):
             sch = norm.run()
         except SchemaError as e:
             raise SchemaError(f"{src}: {e}") from None
+        layouts.append(norm.prefix_layout)
         used |= norm.used_branches
         used_aliases |= norm.used_aliases
         canon = json.dumps(sch, sort_keys=True, separators=(",", ":"))
@@ -1209,9 +1248,8 @@ def normalize(ann_path):
         raise SchemaError(f"branch annotation for {', '.join(sorted(unused))}"
                           f" matches no reachable union case")
     if len(schemas) > 1:
-        first = schemas[0]["selector"]["prefix"]
-        for s in schemas[1:]:
-            if s["selector"]["prefix"] != first or \
+        for s, lay in zip(schemas[1:], layouts[1:]):
+            if lay != layouts[0] or \
                     s["selector"]["procedure"] != \
                     schemas[0]["selector"]["procedure"]:
                 raise SchemaError("minor versions disagree on the layout "
