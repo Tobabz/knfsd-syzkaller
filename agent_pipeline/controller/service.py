@@ -28,6 +28,8 @@ from .store import Store
 from .tasks import AgentExecutor, AgentRequest, Runner, RunnerInput
 
 FINAL = ("sealed", "ended_unsealed")
+#: Agent attempt states that can still give a result.
+LIVE = ("sending", "running")
 
 
 class ReplayMismatch(Exception):
@@ -129,7 +131,7 @@ class Controller:
         ref = self.artifacts.put(output.model_dump_json().encode())
         job_id = job_of(task_id)
         a = self.store.attempt(task_id, attempt)
-        if a is not None and a.status == "running":
+        if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
                 "status": "succeeded", "model_id": model_id,
                 "output_ref": ref}))
@@ -140,7 +142,7 @@ class Controller:
     def on_agent_failure(self, task_id: str, attempt: int,
                          failure: str) -> None:
         a = self.store.attempt(task_id, attempt)
-        if a is not None and a.status == "running":
+        if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
                 "status": "failed", "failure": failure}))
         self._apply(job_of(task_id), ev.AgentFailed(
@@ -216,7 +218,7 @@ class Controller:
                         lambda t=task_id: self._recancel(job_id, t))
         self._guard(job_id, "link_issue",
                     lambda: self._link_gap(self.store.job(job_id)))
-        self._guard(job_id, "runner_status",
+        self._guard(job_id, "pending_task",
                     lambda: self._poll_pending(job_id))
 
     def _recancel(self, job_id: str, task_id: str) -> None:
@@ -228,6 +230,15 @@ class Controller:
     def _poll_pending(self, job_id: str) -> None:
         job = self.store.job(job_id)
         p = job.pending_task
+        if p is not None and p.kind is TaskKind.AGENT:
+            a = self.store.attempt(p.task_id, p.attempt)
+            if a is None or a.status == "sending":
+                # start() failed or never ran: whether the executor took it
+                # is unknown, so send a new attempt, as recover() does; a
+                # late result of this one makes no transition (09 §8).
+                self._apply(job_id, ev.AgentAttemptRestarted(
+                    task_id=p.task_id, attempt=p.attempt + 1))
+            return
         if p is None or p.kind is not TaskKind.RUNNER or \
                 job.cancelling_tasks:
             return
@@ -310,7 +321,7 @@ class Controller:
         new = out.job
         if out.abandoned_attempt:
             a = self.store.attempt(*out.abandoned_attempt)
-            if a is not None and a.status == "running":
+            if a is not None and a.status in LIVE:
                 self.store.save_attempt(a.model_copy(
                     update={"status": "abandoned"}))
         # Committed already: a failing call is recorded and sent again by
@@ -357,13 +368,17 @@ class Controller:
                 agent_task=p.agent_task, input_digest=p.input_digest,
                 repair_input_digest=None if p.repair is None else
                 self.artifacts.put(p.repair.model_dump_json().encode()),
-                status="running"))
+                status="sending"))
             self.agents.start(AgentRequest(
                 job_id=job_id, task_id=p.task_id, attempt=p.attempt,
                 agent_task=p.agent_task, candidate=job.candidate,
                 hcap_revision=job.binding.hcap_revision,
                 analysis_ref=job.analysis_ref, plan_ref=job.plan_ref,
                 repair=p.repair))
+            a = self.store.attempt(p.task_id, p.attempt)
+            if a.status == "sending":
+                self.store.save_attempt(a.model_copy(
+                    update={"status": "running"}))
         elif p.kind is TaskKind.RUNNER and not job.cancelling_tasks:
             # Idempotent by task_id: sending it again never starts a second
             # run (09 §8).

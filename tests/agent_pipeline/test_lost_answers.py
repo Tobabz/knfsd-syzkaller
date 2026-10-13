@@ -2,10 +2,11 @@
 failed, is recorded for its job and sent again by poll() or recover()
 until it is done.  One job's failing call never stops the others."""
 
-from agent_pipeline.contracts import GapClass, GapRef, Q1Status
+from agent_pipeline.contracts import (AnalysisOutput, GapClass, GapRef,
+                                      Q1Status)
 from agent_pipeline.controller.records import JobState
 
-from .fakes import OTHER_COMMIT, binding, function_submission
+from .fakes import OTHER_COMMIT, binding, function_submission, sha
 
 
 class Down(ConnectionError):
@@ -154,4 +155,59 @@ def test_lost_cancel_answer_is_settled_by_poll(world):
     assert job.cancelling_tasks == ()
     assert world.runner.started == [old, new]
     world.c.replay(j)
+    world.expected_failures = 1
+
+
+def test_failed_agent_start_is_sent_again_as_a_new_attempt(world):
+    fail(world.agents, "start")
+    j = world.submit()
+    p = world.job(j).pending_task
+    assert world.agents.requests == []
+    assert world.store.attempt(p.task_id, 1).status == "sending"
+    assert effects(world, j) == ["dispatch"]
+    assert world.c.poll() == []
+    job = world.job(j)
+    assert job.state is JobState.S1_ANALYSIS
+    assert job.pending_task.attempt == 2
+    assert [r.attempt for r in world.agents.requests] == [2]
+    assert world.store.attempt(p.task_id, 1).status == "abandoned"
+    assert world.store.attempt(p.task_id, 2).status == "running"
+    world.c.poll()                                     # started: no resend
+    assert len(world.agents.requests) == 1
+    # A late answer to the unsent attempt makes no transition.
+    world.c.on_agent_result(p.task_id, 1,
+                            AnalysisOutput(analysis_ref=sha("late")), "m")
+    assert world.job(j).analysis_ref is None
+    world.analysis(j)
+    assert world.job(j).state is JobState.S1_PLANNING
+    world.c.replay(j)
+    world.expected_failures = 1
+
+
+def test_failed_agent_restart_on_an_hcap_change_is_sent_again(world):
+    j = world.submit()
+    world.analysis(j)
+    fail(world.agents, "start")
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    n = len(world.agents.requests)
+    world.c.poll()
+    assert len(world.agents.requests) == n + 1
+    assert world.agents.requests[-1].hcap_revision == "hcap-2"
+    world.plan(j)
+    assert world.job(j).state is JobState.S1_RUNNING
+    world.expected_failures = 1
+
+
+def test_failed_agent_start_on_recover_is_sent_again(world):
+    j = world.submit()
+    fail(world.agents, "start")
+    world.restart()                    # new attempt 2, its start fails
+    assert world.job(j).pending_task.attempt == 2
+    world.c.poll()
+    p = world.job(j).pending_task
+    assert p.attempt == 3
+    assert world.agents.requests[-1].attempt == 3
+    world.analysis(j)
+    assert world.job(j).state is JobState.S1_PLANNING
     world.expected_failures = 1

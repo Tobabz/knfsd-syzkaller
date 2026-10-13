@@ -207,7 +207,9 @@ class AgentAttempt(Record):
     agent_task: AgentTask
     input_digest: str
     repair_input_digest: str | None = None
-    status: Literal["running", "succeeded", "failed", "abandoned"]
+    # sending: recorded, start() not yet returned; running: start() took it
+    status: Literal["sending", "running", "succeeded", "failed",
+                    "abandoned"]
     model_id: str | None = None
     output_ref: str | None = None
     failure: str | None = None
