@@ -1,0 +1,23 @@
+# Semantic annotations for NFSv4.0, NFSv4.1 and NFSv4.2.
+#
+# The XDR is RFC 7531, RFC 5662 and RFC 7863, extracted and pinned by
+# SOURCES.  This file names things; it never states a field, offset or width.
+notice Derived from the IETF Code Components of RFC 7531, RFC 5662 and
+notice RFC 7863 (Copyright IETF Trust and the persons identified as authors
+notice of the code) under the Simplified BSD License, whose text heads
+notice tools/nfs-proxy/schema/nfs4/rfc7531.x, rfc5662.x and rfc7863.x, and
+notice from two RFC 5531 definitions; see THIRD-PARTY-LICENSES.md.
+family nfs4
+program NFS4_PROGRAM NFS_V4
+procedure-prefix NFSPROC4_
+leaf args result
+operation request nfs_argop4 args OP_
+operation response nfs_resop4 result OP_
+status-type nfsstat4
+minor-field COMPOUND4args minorversion
+prelude prelude.x
+minor 0 rfc7531.x
+minor 1 rfc5662.x
+minor 2 rfc7863.x
+# Every other case label keeps its lowercased XDR name (nfs4err_denied, ...).
+branch NFS4_OK ok

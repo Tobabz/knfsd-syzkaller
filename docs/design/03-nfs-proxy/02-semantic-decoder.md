@@ -978,8 +978,17 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
   message당 field 기본 65536개(호출자가 낮출 수 있음)다. 실패한 decode는 field를 하나도 남기지 않는다.
 - **결정됨(M2):** NFSv4 NULL procedure는 COMPOUND가 없어 minor version이 없다. 그래서 하나의
   ProtocolSchema를 고를 수 없고 `unsupported_schema`다. 그 REPLY는 §14 표대로 `dispatch_incomplete`다.
-- **미결:** NFS XDR snapshot 반입. NFSv4.0/4.1/4.2는 RFC 7531/5662/7863의 XDR을 추출해 pin한다. NFSv3는
-  RFC 1813에 추출 가능한 XDR 파일이 없어 source 형태를 따로 정해야 한다.
+- **결정됨(M2):** NFSv4.0/4.1/4.2 XDR snapshot은 RFC 7531/5662/7863이다. 각 RFC 본문(.txt)의 SHA-256을
+  pin하고, 그 RFC에 적힌 `///` 추출 script를 그대로 실행한 출력만 `tools/nfs-proxy/schema/nfs4/`에 commit한다
+  (`SOURCES`, `schema/rfc_xdr.py`). 추출 파일의 SHA-256도 pin하고 `build.sh`가 확인한다. errata는 적용하지
+  않았다(2026-10-13 기준 세 RFC에 verified erratum 없음). XDR이 선언하지 않고 rpcgen의 C 환경에서 가져오는
+  이름(주석으로만 적힌 basic typedef, RFC 5531의 `auth_flavor`와 `authsys_parms`)은 같은 pinned text에서
+  규칙으로 만든 `prelude.x`가 공급한다. 손으로 쓴 XDR은 없다.
+- **미결:** NFSv3 XDR source. RFC 1813에는 추출 가능한 XDR 파일이 없어 source 형태를 따로 정해야 한다.
+- **미결:** RFC 7863 이후의 NFSv4.2 확장. kernel v7.3-rc5 knfsd는 RFC 8276 xattr operation(72-75)과
+  RFC 9754 delegation type(4, 5)을 decode/encode한다. pinned schema에는 없으므로 이런 message는 `malformed`이고,
+  추측한 layout으로 decode하지 않는다. 두 RFC의 XDR은 기존 enum과 union을 확장하는 조각이라 합치는 규칙을
+  따로 정해야 한다.
 - **미결:** NFS callback/backchannel program의 initial schema coverage.
 - **미결:** request/response consistency 검증(§14)은 request context가 있어야 한다. M3 TransactionEntry가
   생기기 전까지 M2 decoder의 `request_context`는 항상 0이다.

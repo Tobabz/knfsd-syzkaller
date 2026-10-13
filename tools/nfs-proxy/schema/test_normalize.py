@@ -243,17 +243,113 @@ class Minors(unittest.TestCase):
         self.assertNotEqual(schemas[0]["schema_id"], schemas[1]["schema_id"])
 
 
-class Committed(unittest.TestCase):
-    """The committed test tables match their XDR (build.sh checks this
-    too, through --check; this keeps the unit tests self-contained)."""
+class Preludes(unittest.TestCase):
+    """`prelude FILE`: XDR the sources use but take from their environment
+    (the NFSv4 basic typedefs and authsys_parms)."""
 
-    def test_test_tables_are_fresh(self):
-        for ann, out in (("tproto.ann", "schema_tproto.c"),
-                         ("tflat.ann", "schema_tflat.c")):
-            path = TEST_SCHEMA / ann
-            text = nz.emit_c(path, *nz.normalize(path))
-            self.assertEqual(text, (TEST_SCHEMA.parent / out).read_text(),
-                             f"{out} is stale")
+    XDR = "struct ARGS { uint32_t x; }; struct RES { st s; };"
+    PRE = "typedef unsigned int uint32_t;\nenum st { S_OK = 0 };\n"
+
+    def run_with(self, prelude, xdr):
+        ann = ANN + "prelude p.x\n"
+        with Tmp(xdr + PROGRAM, ann, {"p.x": prelude}) as a:
+            return nz.normalize(a)
+
+    def test_prelude_supplies_names(self):
+        _, (sch,) = self.run_with(self.PRE, self.XDR)
+        self.assertEqual(sch["preludes"][0]["file"], "p.x")
+        self.assertIn("st", types_by_name(sch))
+
+    def test_missing_name_is_refused_with_its_source(self):
+        with Tmp(self.XDR + PROGRAM) as a:
+            with self.assertRaises(nz.SchemaError) as cm:
+                nz.normalize(a)
+        self.assertIn("t.x: undefined type uint32_t", str(cm.exception))
+
+    def test_prelude_cannot_be_redefined(self):
+        with self.assertRaises(nz.SchemaError) as cm:
+            self.run_with(self.PRE, "typedef int uint32_t;" + self.XDR)
+        self.assertIn("t.x:1: redefinition of uint32_t", str(cm.exception))
+
+    def test_prelude_comment_keeps_schema_id(self):
+        _, (a,) = self.run_with(self.PRE, self.XDR)
+        _, (b,) = self.run_with("/* c */\n" + self.PRE, self.XDR)
+        self.assertEqual(a["schema_id"], b["schema_id"])
+        self.assertNotEqual(a["preludes"][0]["sha256"],
+                            b["preludes"][0]["sha256"])
+
+    def test_notice_is_in_the_header_not_the_schema_id(self):
+        _, (a,) = self.run_with(self.PRE, self.XDR)
+        ann = ANN + "prelude p.x\nnotice Some  license, see X.\n"
+        with Tmp(self.XDR + PROGRAM, ann, {"p.x": self.PRE}) as path:
+            ann_d, (b,) = nz.normalize(path)
+            text = nz.emit_c(path, ann_d, [b])
+        self.assertIn(" * Some license, see X.\n", text)
+        self.assertEqual(a["schema_id"], b["schema_id"])
+
+    def test_prelude_is_in_the_header(self):
+        ann = ANN + "prelude p.x\n"
+        with Tmp(self.XDR + PROGRAM, ann, {"p.x": self.PRE}) as a:
+            text = nz.emit_c(a, *nz.normalize(a))
+        self.assertIn(" * prelude:     p.x sha256:", text)
+
+
+NFS4_ANN = HERE / "nfs4" / "nfs4.ann"
+
+
+class Nfs4(unittest.TestCase):
+    """Properties of the real NFSv4 schemas that the decoder relies on."""
+
+    @classmethod
+    def setUpClass(cls):
+        _, cls.schemas = nz.normalize(NFS4_ANN)
+
+    def test_minors_and_program(self):
+        self.assertEqual([s["minor"] for s in self.schemas], [0, 1, 2])
+        for s in self.schemas:
+            self.assertEqual((s["program"], s["version"]), (100003, 4))
+            self.assertEqual([p["name"] for p in s["procedures"]],
+                             ["NULL", "COMPOUND"])
+            self.assertEqual((s["selector"]["procedure"],
+                              s["selector"]["field"]), (1, 1))
+
+    def test_every_result_starts_with_its_status(self):
+        # nfs_decode.c reads an operation's status from the first leaf of
+        # its result; this holds for every nfs_resop4 arm of every minor.
+        for s in self.schemas:
+            types = s["types"]
+            ops = [t for t in types if t.get("operations") == "response"]
+            self.assertEqual(len(ops), 1)
+            for arm in ops[0]["arms"]:
+                i = arm["type"]
+                while types[i]["kind"] in ("struct", "union"):
+                    t = types[i]
+                    i = t["fields"][0][1] if t["kind"] == "struct" \
+                        else t["disc"][1]
+                self.assertEqual(i, s["status_type"],
+                                 f"{s['schema_id']} {arm['label']}")
+
+    def test_operations_per_minor(self):
+        # RFC 7531 has 38 arms (OP_ACCESS..OP_RELEASE_LOCKOWNER and
+        # OP_ILLEGAL), RFC 5662 adds 19, RFC 7863 adds 13.
+        counts = [len(next(t for t in s["types"]
+                           if t.get("operations") == "request")["arms"])
+                  for s in self.schemas]
+        self.assertEqual(counts, [38, 57, 70])
+
+
+class Committed(unittest.TestCase):
+    """The committed tables match their XDR (build.sh checks this too,
+    through --check; this keeps the unit tests self-contained)."""
+
+    def test_tables_are_fresh(self):
+        for ann, out in ((TEST_SCHEMA / "tproto.ann",
+                          TEST_SCHEMA.parent / "schema_tproto.c"),
+                         (TEST_SCHEMA / "tflat.ann",
+                          TEST_SCHEMA.parent / "schema_tflat.c"),
+                         (NFS4_ANN, HERE.parent / "src" / "schema_nfs4.c")):
+            text = nz.emit_c(ann, *nz.normalize(ann))
+            self.assertEqual(text, out.read_text(), f"{out.name} is stale")
 
 
 if __name__ == "__main__":

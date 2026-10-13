@@ -4,8 +4,8 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/relay/control tests under clang
-and GCC ASan+UBSan, after the ProtocolSchema normalizer's tests and a freshness check of every generated schema table. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
+`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/nfs4_decode/relay/control tests under clang
+and GCC ASan+UBSan, after the ProtocolSchema normalizer's tests, a pin check of the RFC XDR files and a freshness check of every generated schema table. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
 delta files independently of their writer and reader. `build.sh` also compiles
 the guest delta-replay probe as a build-only regression gate. The host tests
 run on Linux only: `test_control` uses `AF_UNIX/SOCK_SEQPACKET`, the real legacy
@@ -131,8 +131,11 @@ contract in [02](../../docs/design/03-nfs-proxy/02-semantic-decoder.md).
 - A REPLY is decoded only from `reply_dispatch`. Without it the status is
   `transaction_context_missing`; for NFSv4 without a minor version it is `dispatch_incomplete`.
   `test_fixture` dispatch is refused outside host tests.
-- Only synthetic test schemas exist so far (`test/schema/`). NFS XDR is not yet in the
-  repository, so every NFS message is `unsupported_schema`. Nothing in `main.c` calls the decoder.
+- `src/schema_nfs4.c` holds NFSv4.0, 4.1 and 4.2, generated from the XDR of RFC 7531, RFC 5662
+  and RFC 7863. `schema/rfc_xdr.py` extracts that XDR with each RFC's own rule and pins every RFC
+  text and extracted file by SHA-256 (`schema/nfs4/SOURCES`); `build.sh` checks the pins offline.
+  NFSv3 has no schema yet, so its messages are `unsupported_schema`. Nothing in `main.c` calls the
+  decoder.
 
 ## Building
 
