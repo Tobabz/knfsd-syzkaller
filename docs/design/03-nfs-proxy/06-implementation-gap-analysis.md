@@ -627,15 +627,16 @@ CLI/file magic dispatch가 semantic delta를 별도 target path로 선택하게 
 #### Required change
 
 새 comparator가 window 위치별로 production/replay의 record-level semantic batch signature
-multiset과 delivery evidence를 비교해:
+multiset, hard refusal과 그 evidence 완전성, delivery evidence를 비교해:
 
 ```text
 REPLAY_EQUIVALENT
 REPLAY_DIVERGED
+REPLAY_INCONCLUSIVE
 REPLAY_INVALID
 ```
 
-를 생성해야 한다.
+를 생성해야 한다. refusal 분류와 판정 순서는 `05-mutation-delta-replay.md` §29가 소유한다.
 
 Comparator는 crash/sanitizer Q2를 판단하지 않는다. Comparator는 Proxy가 아니라 Controller 측
 validation layer에서 봉인된 production/replay evidence를 비교한다(`../02-llm-agent/01` §11.1,
@@ -906,6 +907,7 @@ Required:
 - EXPOSURE_INTENT host ACK before enqueue/exposure.
 - every event carries `program_generation_correlation`.
 - `GENERATION_OPEN` host ACK before activation ACK; host sink keeps per-generation open/closed binding.
+- first hard refusal per (generation, rule) as a write-ahead `APPLY_REFUSAL` before the refused record is relayed; `evidence_path_degraded` marking on ACK failure (`05` §21).
 - GENERATION_COMPLETE as the generation's last event, with per-rule resolver summary, `outside_activation_window`, evidence-path failure counters and closure (`05` §21).
 - sink rejects and records G events after G's summary; Runner seals G only after the summary or session/channel/VM end.
 - queue record/token metadata.
@@ -928,7 +930,8 @@ Required:
 - separate replay execution journal (host sink).
 - ordered `CrashContextWindow` program sequence execution (S1c).
 - per-position batch-signature multiset comparator.
-- REPLAY_EQUIVALENT / DIVERGED / INVALID result.
+- refusal classification, per-position refusal evidence completeness and the verdict order (`05` §29).
+- REPLAY_EQUIVALENT / DIVERGED / INCONCLUSIVE / INVALID result.
 
 Legacy NFSPDLT1/2 replay는 compatibility path로 계속 regression test한다.
 
@@ -1205,7 +1208,8 @@ Expected:
 ### 11. Semantic replay
 
 Production/replay dynamic field bytes를 다르게 만들고 05 contract의
-REPLAY_EQUIVALENT/DIVERGED/INVALID oracle을 통과한다.
+REPLAY_EQUIVALENT/DIVERGED/INCONCLUSIVE/INVALID oracle을 통과한다. 05 검증 오라클 §20의
+crash-cut hard refusal case를 포함한다.
 
 ### 12. Guest/runtime promotion
 

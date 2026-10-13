@@ -759,7 +759,10 @@ structure_constraint_failed
 semantic refusal은 mutation이 실행되지 않은 이유로 별도 evidence에 남긴다.
 
 이 결과는 record마다 journal event로 쓰지 않는다. rule별로 집계해 program generation마다
-`GENERATION_COMPLETE` summary에 남긴다(`05-mutation-delta-replay.md` §21, issue #4).
+`GENERATION_COMPLETE` summary에 남긴다(`05-mutation-delta-replay.md` §21, issue #4). 예외로, replay 판정이
+hard refusal로 분류하는 값(`05-mutation-delta-replay.md` §29)은 (generation, rule)마다 첫 번째를 relay 전에
+`APPLY_REFUSAL`로 write-ahead한다(issue #18 F2). 어떤 값이 normal non-match이고 어떤 값이 hard refusal인지는
+이 절이 아니라 JudgeProfile(Replay)이 정한다.
 activation 창 밖의 record는 Resolver에 들어가지 않으며 `outside_activation_window`로 센다
 (`01-architecture.md` §16).
 

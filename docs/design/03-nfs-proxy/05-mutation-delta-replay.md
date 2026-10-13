@@ -271,6 +271,7 @@ Core event:
 RULESET
 GENERATION_OPEN
 EXPOSURE_INTENT
+APPLY_REFUSAL
 FORWARD_COMPLETE
 FORWARD_FAILED
 GENERATION_COMPLETE
@@ -628,7 +629,7 @@ EXPOSURE_INTENT + FORWARD_FAILED
 
 이 distinction을 in-place counter 하나로 압축하지 않는다.
 
-### 21. GENERATION_OPEN / GENERATION_COMPLETE / RUN_COMPLETE
+### 21. GENERATION_OPEN / APPLY_REFUSAL / GENERATION_COMPLETE / RUN_COMPLETE
 
 generation G의 lifecycle(admitting, draining, closed)은 `01-architecture.md` §16이 소유한다. journal에는
 G의 처음과 끝이 남는다.
@@ -687,6 +688,25 @@ durable `GENERATION_COMPLETE`가 있으며, 그 rule의 `EXPOSURE_INTENT`가 없
 event를 거부하며 거부 사실을 host 기록으로 남긴다. 봉인된 G journal에 summary 뒤의 G event나 그 거부
 기록이 있으면 내부 불일치다. Judge는 그 generation에 확정 verdict를 내리지 않는다
 (`../02-llm-agent/01-two-stage-agent-architecture.md` §11.1).
+
+summary는 crash-cut에서 사라질 수 있다. 그래서 replay 비교에 필요한 hard refusal 사실은 summary와 별도로
+write-ahead한다(issue #18 F2). hard refusal인지는 JudgeProfile(Replay)의 분류(§29)가 정한다.
+
+```text
+APPLY_REFUSAL
+    program_generation_correlation
+    rule_id
+    refusal            # 04 §31 taxonomy 값 또는 apply_precondition_failed
+    record_context     # direction / rpc message type / program / version / procedure
+```
+
+- Proxy는 (generation, rule_id)마다 첫 hard refusal의 `APPLY_REFUSAL`을 append하고 host ACK `(D)`를 받은
+  뒤에 거부된 record를 relay한다. 두 번째부터는 summary의 count에만 남긴다. 비교에는 위치마다 hard
+  refusal의 존재만 필요하기 때문이다.
+- normal non-match는 이 event를 만들지 않는다. 지금처럼 summary에만 집계한다.
+- ACK가 없거나 sink가 거부하면 record는 변조 없이 relay한다(§11과 같다). Proxy는 그 session을
+  `evidence_path_degraded`로 표시하고, 이후 event와 summary의 `evidence_path_failures`에 그 사실을 남긴다.
+- summary가 있으면 rule별 hard refusal count가 0보다 큰데 `APPLY_REFUSAL`이 없는 것은 내부 불일치다.
 
 Proxy session이 clean하게 끝나면 optional `RUN_COMPLETE` event를 append할 수 있다.
 
@@ -853,9 +873,13 @@ ReplayResult
         production
             batch_signature_multiset
             forward_complete_multiset
+            hard_refusals[]          # rule_id, refusal
+            refusal_evidence         # complete | prefix_complete | unknown
         replay
             batch_signature_multiset
             forward_complete_multiset
+            hard_refusals[]
+            refusal_evidence
         differences[]
 
     runtime_errors[]
@@ -874,15 +898,21 @@ Semantic replay는 successful exposure-intent batch semantics를 stream position
 ```text
 REPLAY_EQUIVALENT
 REPLAY_DIVERGED
+REPLAY_INCONCLUSIVE
 REPLAY_INVALID
 ```
 
 `REPLAY_EQUIVALENT`는 delta/runtime/schema가 compatible하고, window의 모든 위치에서
-production/replay의 `EXPOSURE_INTENT` semantic batch signature multiset이 동일하며, hard
-semantic/apply refusal이 없음을 뜻한다.
+production/replay의 `EXPOSURE_INTENT` semantic batch signature multiset이 동일하며, 양쪽 모두 hard
+semantic/apply refusal이 없음이 증명됨을 뜻한다.
 
 `REPLAY_DIVERGED`는 실행은 valid하지만 missing/extra batch, batch composition 또는
-cardinality가 production과 다름을 뜻한다.
+cardinality가 production과 다르거나, 어느 쪽에 hard refusal이 있음을 뜻한다. 양쪽에 같은 hard refusal이
+있어도 equivalent로 올리지 않는다. hard refusal은 그 위치에서 rule set이 의도대로 적용되지 않았다는
+사실이기 때문이다.
+
+`REPLAY_INCONCLUSIVE`는 비교 전제는 성립하고 divergence도 관측되지 않았지만, 어느 위치에서 hard refusal이
+없었다는 사실을 증명할 수 없음을 뜻한다(issue #18 F2).
 
 `REPLAY_INVALID`는 delta corruption, schema/runtime incompatibility, unsupported
 transform, invalid fixture/resource failure 등으로 의미 있는 비교 자체가 불가능한 경우다.
@@ -890,6 +920,38 @@ transform, invalid fixture/resource failure 등으로 의미 있는 비교 자�
 `REPLAY_INVALID`는 manifest와 correlation 검증을 통과한 봉인 evidence에서만 나온다. 검증에 실패한
 bundle로는 비교 verdict를 내지 않는다. comparator는 그 replay 시도를 invalid evidence로 기록하며,
 evidence를 고친 뒤 replay를 다시 실행한다(`../02-llm-agent/01` §11.1, issue #11).
+
+**refusal 분류.** JudgeProfile(Replay)은 resolver taxonomy(`04-semantic-mutation-runtime.md` §31)와 Edit
+Applier refusal을 다음처럼 분류한다. 아래는 첫 profile의 내용이다. 분류를 바꾸면 새 profile version이다.
+
+| 분류 | 값 | 비교에서의 의미 |
+|---|---|---|
+| normal non-match | `scope_miss`, `rpc_selector_miss`, `target_not_found`, `predicate_false` | 영향 없음. record마다 기록하지 않는다 |
+| hard refusal | `schema_mismatch`, `decode_unavailable`, `transaction_context_missing`, `transaction_context_unusable`, `target_ambiguous`, `predicate_reference_ambiguous`, `transform_failed`, `conflict`, `structure_constraint_failed`, `apply_precondition_failed` | 그 위치를 `REPLAY_EQUIVALENT`에서 제외한다 |
+| incompatibility | `transform_unsupported` | `REPLAY_INVALID`(§39) |
+
+**refusal evidence 완전성.** comparator는 위치와 쪽마다 hard refusal 사실의 완전성을 봉인 bundle에서
+정한다.
+
+| 값 | 조건 |
+|---|---|
+| `complete` | durable `GENERATION_COMPLETE`가 있고 `evidence_path_failures`가 0이다. hard refusal 존재는 summary count와 `APPLY_REFUSAL`이 함께 정한다 |
+| `prefix_complete` | summary가 없다(crash-cut). journal prefix가 integrity 검증을 통과하고(torn final tail은 허용, §24), `evidence_path_degraded` 표시와 sink의 append 실패·거부 기록이 없으며, Runner가 기록한 종료 원인이 guest crash 또는 VM teardown이다. write-ahead 규칙 때문에 relay된 hard refusal은 모두 prefix에 있다 |
+| `unknown` | 그 밖의 경우 |
+
+crash-cut prefix라는 사실만으로는 `unknown`이 아니다. `delivery_unknown`도 이 완전성과 무관하며 semantic
+divergence로 바꾸지 않는다(§37).
+
+**판정 순서.** 위에서부터 처음 맞는 행을 적용한다.
+
+| 순서 | 조건 | 결과 |
+|---|---|---|
+| 1 | manifest / correlation 검증 실패 | verdict 없음. invalid evidence 기록 |
+| 2 | format / runtime / schema / transform 비호환, fixture·resource 실패, incompatibility 분류 refusal | `REPLAY_INVALID` |
+| 3 | 어느 위치든 batch signature multiset이 다름 | `REPLAY_DIVERGED` |
+| 4 | 어느 위치든 어느 쪽에 hard refusal이 있음 | `REPLAY_DIVERGED` |
+| 5 | 어느 위치든 어느 쪽의 `refusal_evidence`가 `unknown` | `REPLAY_INCONCLUSIVE` |
+| 6 | 그 밖 | `REPLAY_EQUIVALENT` |
 
 이 verdict는 Q2 crash reproduced/not reproduced와 별개다.
 
@@ -1002,7 +1064,9 @@ replay execution
     -> ReplayResult
 ```
 
-Crash가 replay 중 발생해도 마지막 replay mutation candidate가 durable해야 한다.
+Crash가 replay 중 발생해도 마지막 replay mutation candidate가 durable해야 한다. replay journal도
+`APPLY_REFUSAL` write-ahead 규칙(§21)을 따른다. 그래서 replay 쪽 refusal evidence 완전성도 production과
+같은 규칙(§29)으로 정한다.
 
 ### 37. delivery evidence
 
@@ -1352,6 +1416,18 @@ Expected:
 - drain bound 만료로 닫힌 G에서 `reply` rule의 M1은 `NOT_APPLIED`가 아니다;
 - 봉인된 clean `NOT_APPLIED` 뒤에 G의 application이 추가되면 FAIL이다.
 
+### 20. crash-cut hard refusal
+
+성공 batch multiset은 같고 한쪽에만 hard refusal이 있는 두 실행을 만든다. 각각 summary 전에 종료시킨다.
+
+Expected:
+- refusal이 있는 쪽의 `APPLY_REFUSAL`이 거부된 record의 relay 전에 host journal에 있다;
+- comparator가 둘을 `REPLAY_DIVERGED`로 구분한다;
+- 한쪽의 `APPLY_REFUSAL` append를 실패시키면 `refusal_evidence = unknown`이고 `REPLAY_INCONCLUSIVE`다;
+- refusal이 없는 정당한 crash-cut prefix 두 개는 `REPLAY_EQUIVALENT`가 될 수 있다. crash-cut이라는 이유만으로
+  비교를 막으면 FAIL이다;
+- `delivery_unknown`만 다른 두 실행을 `REPLAY_DIVERGED`로 판정하면 FAIL이다.
+
 ## 실패 양상과 진단
 
 | 증상 | 가능한 원인 | 구분하는 관측 | 조치 |
@@ -1392,6 +1468,12 @@ Expected:
   `GENERATION_COMPLETE`로 끝난다. clean 여부는 closure reason과 rule의 message type으로 정한다
   (§21, issue #4, issue #18 F1).
 - **미결:** drain bound의 숫자.
+- **결정됨:** (generation, rule)마다 첫 hard refusal은 relay 전에 `APPLY_REFUSAL`로 write-ahead한다.
+  replay 판정은 refusal 분류, refusal evidence 완전성, 판정 순서(§29)를 따른다(issue #18 F2).
+- **미결:** `APPLY_REFUSAL`의 ACK가 실패한 직후 다음 event가 host에 닿기 전에 guest가 종료되고, host가 그
+  요청을 전혀 받지 못한 경우는 host가 알 수 없다. 이 경우 refusal evidence가 `prefix_complete`로 잘못 남을
+  수 있다. sink 장애와 crash가 겹쳐야 생기며, S1b transport가 guest 쪽 ACK timeout을 host에 드러낼 수
+  있는지 구현에서 확인한다.
 - **결정됨:** production journal은 append-only lifecycle events를 사용한다.
 - **결정됨:** socket delivery와 disk commit의 atomicity gap은 `delivery_unknown`으로 표현한다.
 - **결정됨:** production MutationDelta는 replay 중 immutable이다.

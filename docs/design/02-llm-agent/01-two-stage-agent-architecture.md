@@ -843,7 +843,9 @@ JudgeProfile                     # 버전이 있는 Repository Design Data
     Q1    Q1AdmissibilityProfile: generation integrity, context별 loss 규칙 (`06` §6.1)
     M1    §7 판정 의미, journal / evidence 유효성 규칙
     Q2    sanitizer / crash report 분류 규칙
-    Replay  batch-signature / delivery 비교 의미, schema·runtime 호환 확인, evidence 유효성 규칙
+    Replay  batch-signature / delivery 비교 의미, schema·runtime 호환 확인, evidence 유효성 규칙,
+            refusal 분류(normal non-match / hard refusal / incompatibility), refusal evidence
+            완전성, 판정 순서 (`03-nfs-proxy/05` §29, issue #18 F2)
 
 JobPolicy                        # trusted control-plane policy (§4.1)
     baseline 반복 횟수
