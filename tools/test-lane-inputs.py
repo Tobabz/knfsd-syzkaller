@@ -165,6 +165,87 @@ with tempfile.TemporaryDirectory() as directory:
             raise AssertionError(f"{tree}: incomplete checkout was accepted")
         assert marker.read_text() == "existing data"
 
+# --skip-build reuses a build only when its recorded series is the checked-in one.
+with tempfile.TemporaryDirectory() as directory:
+    work = Path(directory)
+    bundle = work / "bundle"
+    # run_path returns a copy; the functions read their own module globals.
+    module = bootstrap["series_fingerprint"].__globals__
+    real_bundle = module["BUNDLE"]
+    module["BUNDLE"] = bundle
+    try:
+        def git(tree, *command):
+            return subprocess.run(["git", "-C", str(tree), *command], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        def make_tree(tree, sentinel, text):
+            sentinel = tree / sentinel
+            sentinel.parent.mkdir(parents=True)
+            git(work, "init", "-q", str(tree))
+            for key, value in (("user.email", "t@localhost"), ("user.name", "t")):
+                git(tree, "config", key, value)
+            (tree / "base").write_text("base")
+            git(tree, "add", "base")
+            git(tree, "commit", "-qm", "base")
+            base = git(tree, "rev-parse", "HEAD")
+            sentinel.write_text(text)
+            git(tree, "add", ".")
+            git(tree, "commit", "-qm", "series")
+            return base
+
+        target = work / "env"
+        linux, syz = target / "linux", target / "syzkaller"
+        kernel_base = make_tree(linux, "include/linux/sunrpc/fuzz.h",
+                                "sunrpc_fuzz_svc_remote_grant")
+        syz_base = make_tree(syz, "sys/linux/socket_inet_nfs.txt", "syz_send_nfs_fuzz")
+        for kind in ("kernel", "syzkaller"):
+            (bundle / kind).mkdir(parents=True)
+            (bundle / kind / "0001-a.patch").write_text(kind + " v1")
+        images = target / "images" / "kasan"
+        images.mkdir(parents=True)
+        for name in ("bzImage", ".config"):
+            (images / name).write_text(name)
+        for relative in ("bin/syz-manager", "bin/linux_amd64/syz-executor",
+                         "bin/linux_amd64/syz-execprog", "bin/syz-db"):
+            (syz / relative).parent.mkdir(parents=True, exist_ok=True)
+            (syz / relative).write_text("binary")
+        args = argparse.Namespace(target=target, kernel_ref=bootstrap["KERNEL_TAG"],
+                                  variants=["kasan"], skip_build=True)
+        stages = (("kernel", bootstrap["stage_kernel"], images / "build.json", kernel_base),
+                  ("syzkaller", bootstrap["stage_syzkaller"], syz / "bin/build.json",
+                   syz_base))
+
+        def refused(stage, needle):
+            try:
+                stage(args, {}, True)
+            except RuntimeError as error:
+                assert "--skip-build" in str(error) and needle in str(error), error
+            else:
+                raise AssertionError("stale build reused")
+
+        # An env from before series tracking carries no record: never reuse it.
+        for kind, stage, record_path, base in stages:
+            refused(stage, "no build record")
+
+        # A record from the current series is reused, and the manifest reports it.
+        for kind, stage, record_path, base in stages:
+            tree = linux if kind == "kernel" else syz
+            record = bootstrap["build_record"](kind, tree, base)
+            assert record["commits"] == 1
+            record_path.write_text(json.dumps(record))
+            manifest = {}
+            stage(args, manifest, True)
+            assert manifest[kind]["series_sha256"] == record["series_sha256"]
+            assert manifest[kind]["head"] == record["head"]
+            assert manifest[kind]["commits"] == 1
+
+        # Changing one patch of the series makes the old build stale.
+        for kind, stage, record_path, base in stages:
+            (bundle / kind / "0001-a.patch").write_text(kind + " v2")
+            refused(stage, "series changed")
+    finally:
+        module["BUNDLE"] = real_bundle
+
 manifest = json.loads((ROOT / "bundle/corpus/nfs-normal/manifest.json").read_text())
 assert manifest["schema"] == 3
 assert manifest["purpose"] == "mutation_seed"
