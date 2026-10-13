@@ -905,7 +905,8 @@ REPLY는 변조하지 않는다. closure reason과 `reply_unresolved_count`를 �
 Required:
 - semantic RULESET durable registration (host sink `(D)`).
 - EXPOSURE_INTENT host ACK before enqueue/exposure.
-- every event carries `program_generation_correlation`.
+- every event carries the host-stamped `session_binding`; generation-scoped events also carry `program_generation_correlation`, session-scoped `RULESET`/`RUN_COMPLETE` do not.
+- sink admission per `05` §6: event scope table, per-session `event_seq`/`batch_id` ranges, idempotent re-ACK of identical retransmissions, rejection and host record of conflicts, stale sessions and wrong lanes, Proxy/Runner restart rules.
 - `GENERATION_OPEN` host ACK before activation ACK; host sink keeps per-generation open/closed binding.
 - first hard refusal per (generation, rule) as a write-ahead `APPLY_REFUSAL` before the refused record is relayed; `evidence_path_degraded` marking on ACK failure (`05` §21).
 - GENERATION_COMPLETE as the generation's last event, with per-rule resolver summary, `outside_activation_window`, evidence-path failure counters and closure (`05` §21).

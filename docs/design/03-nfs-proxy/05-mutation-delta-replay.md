@@ -173,7 +173,8 @@ resolve된 batch 관계를 잃는다.
 implementation detail이며 replay identity가 아니다. Logical artifact는 한 generation의 rule set과
 application journal이다.
 
-각 event는 다음 correlation을 가진다.
+generation-scoped event는 다음 correlation을 가진다. session-scoped event(`RULESET`, `RUN_COMPLETE`)는
+generation이 생기기 전이나 뒤에 오므로 이 correlation을 갖지 않는다(§6).
 
 ```text
 program_generation_correlation
@@ -184,8 +185,8 @@ program_generation_correlation
     program_digest      # cross-check
 ```
 
-host sink는 guest가 보낸 값을 Runner가 설치한 rule set과 현재 activation 상태에 대조한다
-(`01-architecture.md` §16).
+host sink는 guest가 보낸 값을 Runner가 설치한 rule set과 host가 bind한 generation 상태에 대조한다
+(§6, `01-architecture.md` §16).
 
 ### 3. MutationDelta
 
@@ -260,6 +261,7 @@ Target journal은 append-only event stream이다.
 
 ```text
 JournalEvent
+    session_binding         # host-stamped (아래)
     event_seq
     event_type
     payload
@@ -280,6 +282,47 @@ RUN_COMPLETE
 
 `event_seq`는 journal integrity/order용 local sequence다.
 Semantic replay selector나 mutation identity가 아니다.
+
+**event scope와 admission (issue #18 F3).** 물리 journal은 여러 generation을 multiplex할 수 있으므로(§2)
+host sink는 event마다 scope를 확인한다.
+
+```text
+session_binding                 # host가 channel과 session 설치에서 기록
+    vm_instance_id
+    channel_id
+    proxy_session_id            # Runner가 rule set을 설치할 때 정한다
+    rule_set_id
+```
+
+| event | scope | 필수 identity | 금지 / 선행 조건 |
+|---|---|---|---|
+| `RULESET` | session | `session_binding` | `program_generation_correlation` 없음. session의 첫 event이며 첫 `GENERATION_OPEN`보다 먼저 `(D)`에 도달한다 |
+| `GENERATION_OPEN` | generation | `session_binding`, `program_generation_correlation` | 같은 session과 lane에 open generation이 이미 있으면 거부한다. 앞 generation이 draining이어도 그 lane의 admitting generation은 하나다(`01-architecture.md` §16) |
+| `EXPOSURE_INTENT`, `APPLY_REFUSAL` | generation | 위와 같음 | correlation이 이 session의 open generation binding(lane, `kcov_generation`, `rule_set_id`)과 맞아야 한다 |
+| `FORWARD_COMPLETE`, `FORWARD_FAILED` | generation | 위와 같음, `batch_id` | 같은 session과 generation에서 받아들인 `EXPOSURE_INTENT`의 `batch_id`여야 하며 batch마다 하나다 |
+| `GENERATION_COMPLETE` | generation | 위와 같음 | open generation의 마지막 event. 받은 뒤 그 binding은 closed다(§21) |
+| `RUN_COMPLETE` | session | `session_binding` | `program_generation_correlation` 없음. 그 session의 마지막 event |
+
+identifier 범위:
+
+- `event_seq`는 Proxy session마다 0부터 빈틈없이 증가한다. 여러 session이 한 물리 journal을 공유해도 범위는
+  session이다.
+- `batch_id`는 Proxy session 안에서 유일하다.
+- `proxy_session_id`는 Runner가 정하고 host가 기록한다. guest가 보낸 값은 대조만 한다.
+
+재수신과 충돌:
+
+| 상황 | sink 동작 |
+|---|---|
+| 같은 session, 같은 `event_seq`, byte-identical payload (ACK 유실 뒤 재전송) | 다시 append하지 않고 같은 ACK를 다시 보낸다. 새 application으로 세지 않는다 |
+| 같은 `event_seq` 또는 같은 `batch_id`에 다른 payload | 거부하고 session journal conflict를 host 기록으로 남긴다. 그 session의 open generation은 summary가 와도 내부 불일치다 |
+| `event_seq` 빈틈 또는 역행 | 거부하고 sequence violation을 기록한다. 그 session의 open generation은 내부 불일치다 |
+| 알 수 없는 또는 이미 끝난 `proxy_session_id` (stale session) | 거부하고 기록한다. 다른 session이나 새 generation에 편입하지 않는다 |
+| 다른 lane, 없는 generation, closed generation의 correlation | 거부하고 기록한다. host 값으로 고쳐 받아들이지 않는다 |
+| Proxy process 재시작 | 새 Proxy session이다. Runner가 rule set을 다시 설치하고 새 `proxy_session_id`를 정한다. 이전 session의 open generation은 summary 없이 끝난다 |
+| Runner process 재시작 | sink는 durable journal에서 session별 다음 `event_seq`, batch, generation binding을 복원한 뒤 수신을 재개한다. 복원할 수 없는 session의 event는 거부한다 |
+
+어느 경우에도 guest가 보낸 값을 host 값으로 바꿔 성공시키지 않는다(`../02-llm-agent/01` §11.1).
 
 ### 7. RULESET event
 
@@ -1428,6 +1471,17 @@ Expected:
   비교를 막으면 FAIL이다;
 - `delivery_unknown`만 다른 두 실행을 `REPLAY_DIVERGED`로 판정하면 FAIL이다.
 
+### 21. event scope와 재수신
+
+ACK를 유실시켜 같은 event를 다시 보내고, 같은 `event_seq`에 다른 payload, stale `proxy_session_id`, 다른 lane의
+correlation을 보낸다. 활성 generation이 없을 때 `RULESET`을 보낸다.
+
+Expected:
+- generation이 없을 때의 `RULESET`은 받아들인다;
+- generation-scoped event는 open generation binding 없이는 거부한다;
+- 재전송은 다시 ACK되고 application이 한 번만 세어진다;
+- 충돌, stale session, wrong lane은 새 generation에 편입되지 않고 거부와 함께 host에 기록된다.
+
 ## 실패 양상과 진단
 
 | 증상 | 가능한 원인 | 구분하는 관측 | 조치 |
@@ -1485,6 +1539,8 @@ Expected:
 - **미결:** concrete output snapshot 전체를 inline할지 여부.
 - **미결:** ReplayResult on-disk representation.
 - **미결:** guest-to-host journal transport와 host sink framing 세부.
+- **결정됨:** event는 session-scoped와 generation-scoped로 나뉜다. sink admission, identifier 범위, 재수신과
+  충돌 처리는 §6의 표를 따른다(issue #18 F3).
 - **미결:** ACK timeout으로 노출을 포기한 batch에 sink 복구 뒤
   `FORWARD_FAILED(reason=not_exposed_after_ack_timeout)`를 남길지. issue #3에 비차단 제안으로 올렸고
   아직 합의되지 않았다. 남기지 않아도 그 batch는 `delivery_unknown`으로 안전하게 남는다.
