@@ -520,6 +520,7 @@ MutationDelta
     append-only journal[]
         GENERATION_OPEN
         EXPOSURE_INTENT
+        APPLY_REFUSAL
         FORWARD_COMPLETE / FORWARD_FAILED
         GENERATION_COMPLETE
 ```

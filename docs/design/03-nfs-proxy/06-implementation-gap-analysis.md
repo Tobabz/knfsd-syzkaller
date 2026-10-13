@@ -123,7 +123,7 @@ Target Agent-facing path와 current compatibility path는 병존할 수 있다.
 | Edit Applier | `delta.c`, `edit.c` | reuse_with_adapter | verify-before-patch, original-coordinate rebuild, overlap refusal, one-pass output rebuild | consume conflict-free concrete edit batches instead of matching raw rules; remove semantic dependence on rule order | current tests + batch adapter tests |
 | Structure derivation | `edit.c` op-count + record-marker rebuild | extend | COMPOUND op-count bump, final marker rebuild | schema-derived length/count/padding/discriminant fixups from final structure | preserve/raw semantic tests |
 | Rule-set same-snapshot preflight | v1 then v2 sequential in `control.c` | replace | v2 multi-rule batch aggregation idea | all semantic rules resolve on original record; global conflict preflight; one final apply | registration-order permutation tests |
-| Delta Recorder | NFSPDLT1/2 writer (guest `O_SYNC` file) | replace | bounded binary IO, corruption refusal; guest `O_SYNC` stays legacy only | per-generation semantic journal events (RULESET/EXPOSURE_INTENT/FORWARD_*/GENERATION_COMPLETE) with generation correlation, sent to the host sink | 05 crash-cut oracle incl. guest crash after host ACK |
+| Delta Recorder | NFSPDLT1/2 writer (guest `O_SYNC` file) | replace | bounded binary IO, corruption refusal; guest `O_SYNC` stays legacy only | per-generation semantic journal events (RULESET/GENERATION_OPEN/EXPOSURE_INTENT/APPLY_REFUSAL/FORWARD_*/GENERATION_COMPLETE) with generation correlation, sent to the host sink | 05 crash-cut oracle incl. guest crash after host ACK |
 | Forward completion lifecycle | `queue.pending_records`, aggregate delivered stats | missing | nonblocking queue/flush loop | per-record/batch token boundaries and full-write completion/failure callback | partial-write/full-write tests |
 | Semantic Replay loader/runtime | concrete NFSPDLT1/2 loader in `control.c` | replace | CLI replay mode, shared process path, legacy replay tests | load recorded CompiledMutationRule set, run the ordered `CrashContextWindow` programs, same semantic runtime path, separate replay log on the host sink | dynamic replay + multi-generation + compatibility tests |
 | ReplayResult comparator | none | missing | current applied-count diagnostics | per-position batch-signature multiset + delivery comparison and verdict, in the Controller-side validation layer over sealed production/replay evidence (issue #11) | equivalent/diverged/invalid tests |
@@ -532,7 +532,7 @@ write가 성공해야 mutated output을 relay에 반환한다.
 #### Gap
 
 Target MutationDelta는 one `ProgramGenerationExecution`, recorded CompiledMutationRule[],
-append-only RULESET/EXPOSURE_INTENT/FORWARD_*/GENERATION_COMPLETE journal, generation
+append-only RULESET/GENERATION_OPEN/EXPOSURE_INTENT/APPLY_REFUSAL/FORWARD_*/GENERATION_COMPLETE journal, generation
 correlation, batch signatures와 concrete evidence를 요구한다.
 
 Current one-arm file + in-place count model은 이 lifecycle을 표현하지 못한다.
