@@ -301,6 +301,8 @@ SemanticDecodeInput
         procedure?
 
     transaction?
+
+    reply_dispatch?             # REPLY만. 아래
 ```
 
 RpcRecord.rpc_payload[0]이 모든 WireRef coordinate의 기준이다.
@@ -308,7 +310,29 @@ RpcRecord.rpc_payload[0]이 모든 WireRef coordinate의 기준이다.
 RPC record marker나 TCP fragment header는 Decoder coordinate space에 포함하지 않는다.
 
 CALL의 program/version/procedure는 RPC Decoder가 직접 제공한다.
-REPLY는 wire 자체에 procedure가 없으므로 TransactionEntry가 필요할 수 있다.
+REPLY는 wire 자체에 program/version/procedure가 없다([RFC 5531 §9](https://www.rfc-editor.org/rfc/rfc5531.html#section-9)).
+NFSv4 `COMPOUND4res`에는 request의 `minorversion`도 없다([RFC 8881 §16.2.2](https://www.rfc-editor.org/rfc/rfc8881.html#section-16.2.2)).
+그래서 REPLY의 schema는 검증된 dispatch identity로만 고른다(issue #18 F4).
+
+```text
+reply_dispatch
+    program
+    version
+    procedure
+    minor_version?      # NFSv4 COMPOUND / CB_COMPOUND
+    source              # transaction_entry | test_fixture
+```
+
+- live traffic에서 `reply_dispatch`의 출처는 lookup 결과가 `found`인 TransactionEntry 하나다
+  (`03-transaction-context.md` §7). program/version/procedure는 그 entry의 valid CALL envelope에서 온다
+  (`03-transaction-context.md` §6). NFSv4 `minor_version`은 CALL의 COMPOUND header를 decode했을 때만 있다.
+- `test_fixture`는 M2 host test에서 fixture CALL이 dispatch를 공급할 때만 쓴다. production runtime은 이
+  source를 받지 않는다.
+- request semantic context(operation sequence, request field)의 유무와 dispatch identity의 유무는 다른
+  조건이다. dispatch만 있고 request context가 없으면 result schema는 고를 수 있지만 request-dependent
+  predicate는 쓸 수 없다.
+- dispatch가 없거나 schema 선택에 필요한 값이 빠졌으면(NFSv4에서 `minor_version` 없음 포함) REPLY를
+  `decoded`로 만들지 않는다. payload가 어떤 result shape로 그럴듯하게 parse된다는 사실은 dispatch가 아니다.
 
 ### 7. DecodedRpcMessage
 
@@ -604,6 +628,9 @@ TransactionEntry가 없으면 procedure-specific response field를 추측하지 
 decode_status = transaction_context_missing
 ```
 
+entry는 있지만 request body semantic decode가 실패한 경우에도 procedure는 CALL envelope에서 오므로
+`reply_dispatch`가 있다(§6). 이때 result schema decode는 가능하고 request-dependent predicate는 쓸 수 없다.
+
 #### NFSv4 response
 
 NFSv4 COMPOUND result에는 operation result discriminant가 있으므로 wire schema로
@@ -620,9 +647,19 @@ early failure / shortened result array
 minor-version expectations
 ```
 
-TransactionEntry가 없다는 이유만으로 모든 self-describing NFSv4 result field를
-무조건 버리지는 않는다. 다만 request context가 필요한 semantic predicate/alias는
-unavailable로 남긴다.
+operation result discriminant는 operation을 식별할 뿐, 이 payload에 적용할 program/version과
+minorversion을 증명하지 않는다. 그래서 NFSv4 REPLY도 §6의 `reply_dispatch`가 있어야 `decoded`가 된다
+(issue #18 F4).
+
+| 조건 | decode_status | 출력 |
+|---|---|---|
+| `reply_dispatch` 있음, request context 있음 | `decoded` | 위 consistency를 검증한 field와 WireRef. request-dependent predicate 사용 가능 |
+| `reply_dispatch` 있음(`minor_version` 포함), request context 없음 또는 `forwarded` undecodable | `decoded` | result schema field와 WireRef. request-dependent predicate/alias는 unavailable |
+| entry 없음(missing, expired, ambiguous) | `transaction_context_missing` | mutation-safe field와 WireRef 없음. 진단용 prefix만 |
+| entry는 있지만 `minor_version` 없음 | `dispatch_incomplete` | 위와 같다 |
+
+dispatch가 없을 때 result discriminant를 읽어 만든 값은 §15의 partial diagnostics이며 Resolver input이
+아니다.
 
 Transaction Context의 key/lifecycle 정책은
 [`03-transaction-context.md`](03-transaction-context.md)가 소유한다.
@@ -639,6 +676,7 @@ unsupported_schema
 malformed
 truncated
 transaction_context_missing
+dispatch_incomplete
 resource_limit
 ```
 
@@ -916,6 +954,8 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
 - **결정됨:** WireRef는 RpcRecord.rpc_payload 기준이다.
 - **결정됨:** unknown/malformed layout에 heuristic WireRef를 만들지 않는다.
 - **결정됨:** decode_status가 decoded가 아니면 mutation-safe input으로 쓰지 않는다.
+- **결정됨:** REPLY schema는 검증된 `reply_dispatch`로만 고른다. NFSv4도 dispatch 없이 result shape만으로
+  `decoded`를 만들지 않는다(§6, §14, issue #18 F4).
 - **미결:** pinned XDR source snapshot을 repository 어디에 보관할지.
 - **미결:** Protocol Schema Normalizer 구현 언어/빌드 target.
 - **미결:** normalized ProtocolSchema의 on-disk serialization.

@@ -509,8 +509,9 @@ unsupported callback path
 late/duplicate reply
 ```
 
-NFSv4처럼 wire 자체로 일부 semantic decode가 가능한 경우 Decoder가 context-free
-field를 읽을 수는 있다. 하지만 request-context-dependent selector에는 사용할 수 없다.
+REPLY schema 선택에는 이 entry가 공급하는 dispatch identity가 필요하다(`02-semantic-decoder.md` §6). NFSv4
+result discriminant를 wire에서 읽을 수 있어도 entry가 없으면 Decoder는 `decoded` field나 WireRef를 만들지
+않고 진단만 남긴다(issue #18 F4).
 
 ### 14. connection close
 
@@ -828,6 +829,15 @@ bounded capacity를 채운 뒤:
 
 NFSv3 WRITE CALL context로 WRITE reply를 decode할 수 있어야 한다.
 동일 XID의 READ context를 잘못 붙이면 oracle 실패다.
+
+### 11a. reply dispatch 없음
+
+NFSv4 COMPOUND REPLY를 matching CALL 없이, 또는 COMPOUND header decode에 실패한 CALL 뒤에 보낸다.
+
+Expected:
+- entry가 없으면 `transaction_context_missing`, `minor_version`이 없으면 `dispatch_incomplete`다;
+- result shape가 그럴듯하게 parse돼도 `decoded`나 mutation-safe WireRef가 없다;
+- matching CALL이 있으면 그 dispatch의 schema로 decode한다.
 
 ### 12. NFSv4 early COMPOUND failure
 

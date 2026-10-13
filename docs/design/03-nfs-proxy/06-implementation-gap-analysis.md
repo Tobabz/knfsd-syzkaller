@@ -847,6 +847,10 @@ Initial coverage는 current scenarios에 필요한 protocol subset부터 구현�
 unsupported schema/op는 fail closed해야 한다. Partial support를 full HCAP support라고
 표시하지 않는다.
 
+reply decode를 포함하는 subset은 `reply_dispatch` 입력으로만 REPLY schema를 고른다(`02-semantic-decoder.md`
+§6, §14, issue #18 F4). M2 test는 fixture CALL로 dispatch를 공급하고, live dispatch는 M3의 TransactionEntry가
+공급한다. request-only subset은 이 조건과 무관하다.
+
 ### 26. M3 — Transaction Context
 
 M1의 ConnectionRef/RPC metadata와 M2의 request semantic summary 위에 구현한다.
