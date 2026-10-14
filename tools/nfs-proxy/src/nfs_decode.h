@@ -18,10 +18,21 @@
  *
  * FAIL CLOSED
  *
- *   status != NFSP_DECODE_DECODED means the message is not a mutation input
- *   (design 02 §15).  To make that impossible to get wrong, a failed decode
- *   leaves nfields == nops == 0: the proven prefix is not kept.  `failure`
- *   says where and why, for diagnosis.
+ *   A status other than decoded or partial means the message is not a
+ *   mutation input (design 02 §15).  To make that impossible to get wrong,
+ *   such a decode leaves nfields == nops == 0: the proven prefix is not
+ *   kept.  `failure` says where and why, for diagnosis.
+ *
+ *   partial    CALL only: an operation of the operation array failed to
+ *              decode (malformed or truncated) and its opcode word is in
+ *              the record.  knfsd runs the operations before it and answers
+ *              that one with an error (nfsd4_decode_compound), so the
+ *              operations before it are kept as fields and ops; the failed
+ *              operation and every byte after it are not described.
+ *              `failure` says why, and op_index/opcode/op_offset which
+ *              operation.  The nodes that contain the array end at
+ *              op_offset.  A record that ends exactly before an opcode word
+ *              is truncated, not partial: knfsd refuses that request whole.
  *
  *   truncated  the record ends before a fixed-size item (a word, a hyper, a
  *              fixed opaque) can be read.
@@ -85,7 +96,8 @@ enum nfsp_decode_status {
 	NFSP_DECODE_TRUNCATED,
 	NFSP_DECODE_TRANSACTION_CONTEXT_MISSING,
 	NFSP_DECODE_DISPATCH_INCOMPLETE,
-	NFSP_DECODE_RESOURCE_LIMIT
+	NFSP_DECODE_RESOURCE_LIMIT,
+	NFSP_DECODE_PARTIAL
 };
 
 /* Where a reply_dispatch came from.  Production code may only pass
@@ -171,6 +183,10 @@ struct nfsp_decode_failure {
 	uint32_t offset;		/* payload offset of the refused item */
 	const char *schema_node;	/* XDR type name or kind */
 	const char *reason;
+	/* partial only: the operation that failed, by its position in the
+	 * operation array, its opcode word as read, and the payload offset
+	 * where it starts (and where the decoded prefix ends). */
+	uint32_t op_index, opcode, op_offset;
 };
 
 /* Zero-initialise once and reuse across messages; the arrays are kept and

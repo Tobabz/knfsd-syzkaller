@@ -704,6 +704,7 @@ truncated
 transaction_context_missing
 dispatch_incomplete
 resource_limit
+partial
 ```
 
 필요하면 failure에 다음 진단을 남긴다.
@@ -713,7 +714,18 @@ failure
     offset
     schema_node
     reason
+    op_index, opcode, op_offset   (partial만)
 ```
+
+`partial`(2026-10-14, 저장소 소유자 결정)은 CALL의 operation 배열에서 한 operation이 decode되지 않을 때
+(`malformed`, `truncated`) 그 operation의 opcode word가 record 안에 있으면 쓴다. knfsd
+(`nfsd4_decode_compound`)는 operation을 하나씩 decode하다가 처음 실패한 operation에서 멈추고, 그 앞의
+operation은 실행한 뒤 실패한 operation에 오류를 돌려준다. minor version에 없는 opcode도 같다(`OP_ILLEGAL`).
+그래서 decoder는 실패한 operation 앞의 operation을 field와 operation으로 남기고, 실패한 operation과 그 뒤의
+bytes는 기술하지 않는다. operation 배열과 그것을 담는 node의 span은 실패한 operation의 시작(`op_offset`)에서
+끝난다. opcode word를 읽기 전에 record가 끝나면 knfsd가 요청 전체를 거부하므로 `partial`이 아니라
+`truncated`다. operation 밖의 실패(tag, minor version, operation 수)는 지금처럼 메시지 전체 실패다. REPLY에는
+`partial`이 없다. 읽는 쪽이 client이고, §14의 엄격한 result decode가 잘못된 dispatch를 드러내기 때문이다.
 
 RPCSEC_GSS credential을 가진 CALL, 그런 CALL의 REPLY(`reply_dispatch.cred_flavor`), verifier가 RPCSEC_GSS인
 accepted REPLY는 service와 관계없이 `unsupported_schema`다. integrity와 privacy service에서 body는 procedure
@@ -722,19 +734,25 @@ argument/result가 아니라 RFC 2203 wrapper(`rpc_gss_integ_data`, `rpc_gss_pri
 schema에 맞아도 boundary 증명이 아니다(§11). fuzzer는 RPCSEC_GSS credential 뒤에 평문 NFS body를 붙여
 보낸다(syzkaller patch 0006의 `rpc_auth_gss`).
 
-Decoder가 failure 이전에 일부 prefix field boundary를 증명했더라도,
-decode_status가 decoded가 아니면 Semantic Rule Resolver의 mutation input으로
-사용하지 않는다.
+Decoder가 failure 이전에 일부 prefix field boundary를 증명했더라도, decode_status가 `decoded`나 `partial`이
+아니면 Semantic Rule Resolver의 mutation input으로 사용하지 않는다. 그런 decode는 field를 남기지 않는다.
 
-Proven prefix는 diagnostics로 보존할 수 있다.
+`partial`은 예외다. 남은 field는 실패한 operation 앞까지 증명된 WireRef이고, 서버도 그 operation들을 같은
+경계로 읽고 실행한다. 그래서 Resolver는 그 field만 target으로 삼을 수 있고, `op_offset`부터 끝까지의 bytes는
+기술되지 않은 채 그대로 옮긴다(04 §21).
 
 ```text
-partial diagnostics
+partial (op_offset 앞의 operation)
+    ==
+mutation-safe prefix
+
+실패한 operation과 그 뒤
     !=
-mutation-safe decoded message
+target
 ```
 
-이 규칙은 malformed traffic의 앞부분을 잘못 mutation-safe라고 오인하는 것을 막는다.
+이 규칙은 malformed operation의 bytes를 target으로 오인하는 것을 막으면서, 서버가 실제로 실행하는 앞
+operation을 mutation 대상에서 빠뜨리지 않는다.
 
 ### 16. intentionally malformed mutation과의 관계
 

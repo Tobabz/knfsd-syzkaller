@@ -552,6 +552,45 @@ static void expect_meta(const struct nfsp_decoded_msg *m, const char *path,
 	expect_meta(m, path, nth, role, o, l, __LINE__)
 
 static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
+			     const char *what);
+
+/* A partial CALL: fields and ops end where the failed operation starts,
+ * and the ops are exactly the operations before it. */
+static void check_partial(const struct nfsp_decoded_msg *m, size_t len,
+			  const char *what)
+{
+	const struct nfsp_decode_failure *f = &m->failure;
+
+	CHECK(m->status == NFSP_DECODE_PARTIAL && m->msg_type == 0 &&
+	      (uint64_t)f->op_offset + 4 <= len && f->offset >= f->op_offset &&
+	      m->nops == f->op_index && m->nfields > 0,
+	      "%s: partial op %u at %u, %u ops, failure at %u", what,
+	      f->op_index, f->op_offset, m->nops, f->offset);
+	check_invariants(m, f->op_offset, what);
+	for (uint32_t i = 0; i < m->nops; i++)
+		CHECK(m->ops[i].sequence_index == i &&
+		      m->ops[i].field < m->nfields, "%s: op %u", what, i);
+}
+
+/* run() is partial at operation op_index starting at op_offset. */
+static void expect_partial_at(const struct msg *v, uint32_t op_index,
+			      uint32_t op_offset, uint32_t opcode,
+			      const char *what)
+{
+	struct nfsp_decoded_msg m = {0};
+
+	CHECK(run(v, v->n, NULL, &m) == NFSP_DECODE_PARTIAL &&
+	      m.failure.op_index == op_index &&
+	      m.failure.op_offset == op_offset && m.failure.opcode == opcode,
+	      "%s: %s, op %u at %u opcode %u; want partial op %u at %u",
+	      what, nfsp_decode_strstatus(m.status), m.failure.op_index,
+	      m.failure.op_offset, m.failure.opcode, op_index, op_offset);
+	if (m.status == NFSP_DECODE_PARTIAL)
+		check_partial(&m, v->n, what);
+	nfsp_decoded_msg_free(&m);
+}
+
+static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
 			     const char *what)
 {
 	char buf[256];
@@ -992,15 +1031,15 @@ static void test_minor_selection(void)
 		       1);
 	}
 
+	/* An operation of another minor is where knfsd stops (OP_ILLEGAL):
+	 * the operations before it stay. */
 	build_seek_call(&v, 1, OP_SEEK);
-	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 132 && m.nfields == 0 && m.nops == 0,
-	      "SEEK in 4.1: %s at %u", nfsp_decode_strstatus(m.status),
-	      m.failure.offset);
+	expect_partial_at(&v, 2, 132, OP_SEEK, "SEEK in 4.1");
 
 	build_open_call(&v);
 	put32(&v, 68, 0);
-	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_MALFORMED &&
+	expect_partial_at(&v, 0, 76, OP_SEQUENCE, "SEQUENCE in 4.0");
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_PARTIAL &&
 	      m.failure.offset == 76 && m.failure.reason &&
 	      !strcmp(m.failure.reason, "enum value not declared"),
 	      "SEQUENCE in 4.0: %s at %u", nfsp_decode_strstatus(m.status),
@@ -1088,9 +1127,7 @@ static void test_extensions(void)
 		     NFSP_META_PADDING, 149, 3);
 	}
 	put32(&v, 68, 1);
-	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 132, "GETXATTR in 4.1: %s at %u",
-	      nfsp_decode_strstatus(m.status), m.failure.offset);
+	expect_partial_at(&v, 2, 132, OP_GETXATTR, "GETXATTR in 4.1");
 
 	build_getxattr_reply(&v);
 	CHECK(v.n == 104, "getxattr reply length %zu", v.n);
@@ -1226,7 +1263,8 @@ static const struct golden goldens[] = {
 };
 #define NGOLDEN (sizeof(goldens) / sizeof(goldens[0]))
 
-/* Every proper prefix fails and leaves nothing behind. */
+/* Every proper prefix fails.  It leaves nothing behind, except a CALL cut
+ * inside an operation whose opcode word is present: partial. */
 static void test_truncation(void)
 {
 	struct nfsp_decoded_msg m = {0};
@@ -1242,6 +1280,10 @@ static void test_truncation(void)
 			enum nfsp_decode_status st =
 				run(&v, n, goldens[g].reply ? &rd : NULL, &m);
 
+			if (st == NFSP_DECODE_PARTIAL && !goldens[g].reply) {
+				check_partial(&m, n, goldens[g].what);
+				continue;
+			}
 			if (st == NFSP_DECODE_DECODED || m.nfields || m.nops)
 				bad++;
 		}
@@ -1273,26 +1315,55 @@ static void refused(builder build, const struct nfsp_reply_dispatch *rd,
 #define REFUSED(b, rd, at, w, st, off, why) \
 	refused(b, rd, at, w, st, off, why, __LINE__)
 
+/* Word `at` of the OPEN call set to w fails operation op_index. */
+static void partial_open(size_t at, uint32_t w, uint32_t fail_off,
+			 const char *reason, uint32_t op_index,
+			 uint32_t op_offset, int line)
+{
+	struct nfsp_decoded_msg m = {0};
+	struct msg v;
+	char what[48];
+
+	snprintf(what, sizeof(what), "line %d", line);
+	build_open_call(&v);
+	put32(&v, at, w);
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_PARTIAL &&
+	      m.failure.offset == fail_off && m.failure.reason &&
+	      !strcmp(m.failure.reason, reason) &&
+	      m.failure.op_index == op_index &&
+	      m.failure.op_offset == op_offset,
+	      "%s: word %zu = %#x: %s at %u (%s) op %u at %u", what, at, w,
+	      nfsp_decode_strstatus(m.status), m.failure.offset,
+	      m.failure.reason ? m.failure.reason : "", m.failure.op_index,
+	      m.failure.op_offset);
+	if (m.status == NFSP_DECODE_PARTIAL)
+		check_partial(&m, v.n, what);
+	nfsp_decoded_msg_free(&m);
+}
+
+#define PARTIAL(at, w, off, why, idx, opoff) \
+	partial_open(at, w, off, why, idx, opoff, __LINE__)
+
 static void test_malformed(void)
 {
 	struct nfsp_reply_dispatch rd = dispatch(1);
 	const enum nfsp_decode_status bad = NFSP_DECODE_MALFORMED;
 
 	printf("malformed: located refusals on the NFSv4 bounds\n");
-	REFUSED(build_open_call, NULL, 116, 129, bad, 116,
-		"length exceeds bound");		/* NFS4_FHSIZE */
-	REFUSED(build_open_call, NULL, 156, 1025, bad, 156,
-		"length exceeds bound");		/* NFS4_OPAQUE_LIMIT */
-	REFUSED(build_open_call, NULL, 156, 200, bad, 156,
-		"length exceeds remaining record");
-	REFUSED(build_open_call, NULL, 192, 4, bad, 192,
-		"enum value not declared");		/* createmode4 */
-	REFUSED(build_open_call, NULL, 216, 7, bad, 216,
-		"enum value not declared");		/* open_claim_type4 */
-	REFUSED(build_open_call, NULL, 196, 1000, bad, 196,
-		"count exceeds remaining record");
+	/* Inside an operation of a CALL: partial at that operation (PUTFH
+	 * at 112, OPEN at 132), the operations before it kept. */
+	PARTIAL(116, 129, 116, "length exceeds bound", 1, 112);
+	PARTIAL(156, 1025, 156, "length exceeds bound", 2, 132);
+	PARTIAL(156, 200, 156, "length exceeds remaining record", 2, 132);
+	PARTIAL(192, 4, 192, "enum value not declared", 2, 132);
+	PARTIAL(216, 7, 216, "enum value not declared", 2, 132);
+	PARTIAL(196, 1000, 196, "count exceeds remaining record", 2, 132);
+	/* No opcode word for the fifth operation: knfsd refuses the whole
+	 * request (its opcode read fails), so this is no partial. */
 	REFUSED(build_open_call, NULL, 72, 5, NFSP_DECODE_TRUNCATED, 236,
 		"record ends here");			/* count 5, four ops */
+	REFUSED(build_open_call, NULL, 72, 1000, bad, 72,
+		"count exceeds remaining record");
 	REFUSED(build_readdir_reply, &rd, 160, 2, bad, 160,
 		"list link is not 0 or 1");
 	REFUSED(build_readdir_reply, &rd, 216, 2, bad, 216,
@@ -1421,7 +1492,8 @@ static void test_random_edits(void)
 {
 	struct nfsp_decoded_msg m = {0};
 	uint64_t x = 0x243f6a8885a308d3ull;
-	unsigned ok = 0, refused_n = 0;
+	unsigned ok = 0, partial_n = 0, refused_n = 0;
+	enum nfsp_decode_status st;
 
 	printf("random edits: 20000 mutated messages, invariants hold\n");
 	for (unsigned it = 0; it < 20000; it++) {
@@ -1439,17 +1511,22 @@ static void test_random_edits(void)
 			v.b[hdr + (size_t)(x % (v.n - hdr))] =
 				(uint8_t)(x >> 32);
 		}
-		if (run(&v, v.n, g->reply ? &rd : NULL, &m) ==
-		    NFSP_DECODE_DECODED) {
+		st = run(&v, v.n, g->reply ? &rd : NULL, &m);
+		if (st == NFSP_DECODE_DECODED) {
 			ok++;
 			check_invariants(&m, v.n, "random edit");
+		} else if (st == NFSP_DECODE_PARTIAL) {
+			partial_n++;
+			CHECK(!g->reply, "partial REPLY");
+			check_partial(&m, v.n, "random edit");
 		} else {
 			refused_n++;
 			CHECK(m.nfields == 0 && m.nops == 0,
 			      "refused message kept fields");
 		}
 	}
-	printf("  %u decoded, %u refused\n", ok, refused_n);
+	printf("  %u decoded, %u partial, %u refused\n", ok, partial_n,
+	       refused_n);
 	CHECK(ok > 0 && refused_n > 0, "edits did not exercise both paths");
 	nfsp_decoded_msg_free(&m);
 }

@@ -37,6 +37,7 @@ struct dec {
 	uint32_t op;		/* current operation, or NFSP_FIELD_NONE */
 	uint32_t op_start;	/* payload offset where its result begins */
 	enum nfsp_decode_status st;
+	uint32_t stop_field;	/* partial: the operation array node */
 };
 
 static const char *kind_name(uint8_t kind)
@@ -272,6 +273,45 @@ static int dec_bytes(struct dec *d, uint16_t t, uint32_t me)
 	return 0;
 }
 
+/* A CALL's operation array: knfsd decodes its operations one by one and
+ * stops at the first that fails (nfsd4_decode_compound). */
+static int ops_array(const struct dec *d, const struct nfsp_schema_type *ty)
+{
+	return !d->response && d->len >= 4u &&
+	       (d->s->types[ty->sub].flags & NFSP_STF_OPS_REQUEST);
+}
+
+/* Keep the operations before element i of array `arr` and drop the rest:
+ * the fields and ops the failed element added go, and `failure` keeps why
+ * it failed.  The containing nodes are cut at `at` by the caller of
+ * decode() once the walk has unwound (finish_partial). */
+static void stop_at_op(struct dec *d, uint32_t arr, uint32_t i, uint32_t at,
+		       uint32_t nf, uint32_t no)
+{
+	d->m->nfields = nf;
+	d->m->nops = no;
+	d->m->failure.op_index = i;
+	d->m->failure.opcode = rd32(d, at);
+	d->m->failure.op_offset = at;
+	d->stop_field = arr;
+	d->st = NFSP_DECODE_PARTIAL;
+}
+
+/* After a partial walk: the operation array and every node containing it
+ * end where the failed operation starts. */
+static void finish_partial(struct dec *d)
+{
+	uint32_t stop = d->m->failure.op_offset;
+
+	for (uint32_t i = d->stop_field; i != NFSP_FIELD_NONE;
+	     i = F(d, i)->parent) {
+		struct nfsp_wire_ref *w = &F(d, i)->wire;
+
+		w->encoded.len = stop - w->encoded.off;
+		w->value.len = w->value.off <= stop ? stop - w->value.off : 0;
+	}
+}
+
 static int dec_array(struct dec *d, uint16_t t, uint32_t me)
 {
 	const struct nfsp_schema_type *ty = &d->s->types[t];
@@ -296,9 +336,17 @@ static int dec_array(struct dec *d, uint16_t t, uint32_t me)
 		d->off += 4;
 		F(d, me)->wire.value.off = d->off;
 	}
-	for (uint32_t i = 0; i < count; i++)
-		if (decode(d, ty->sub, me, NULL, "[]", i))
-			return -1;
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t nf = d->m->nfields, no = d->m->nops, at = d->off;
+
+		if (!decode(d, ty->sub, me, NULL, "[]", i))
+			continue;
+		if (ops_array(d, ty) && at <= d->len - 4u &&
+		    (d->st == NFSP_DECODE_MALFORMED ||
+		     d->st == NFSP_DECODE_TRUNCATED))
+			stop_at_op(d, me, i, at, nf, no);
+		return -1;
+	}
 	F(d, me)->wire.value.len = d->off - F(d, me)->wire.value.off;
 	return 0;
 }
@@ -771,8 +819,11 @@ nfsp_nfs_decode(const struct nfsp_schema_family *const *families,
 	out->procedure_name = pr->name;
 	if (root_type != NFSP_SCHEMA_NONE &&
 	    decode(&d, root_type, NFSP_FIELD_NONE, pr->name, leaf,
-		   NFSP_FIELD_NONE))
+		   NFSP_FIELD_NONE)) {
+		if (d.st == NFSP_DECODE_PARTIAL)
+			finish_partial(&d);
 		goto done;
+	}
 	if (d.off != d.len) {
 		if (d.response) {
 			fail(&d, NFSP_DECODE_MALFORMED, root_type,
@@ -784,7 +835,8 @@ nfsp_nfs_decode(const struct nfsp_schema_family *const *families,
 	}
 done:
 	out->status = d.st;
-	if (out->status != NFSP_DECODE_DECODED) {
+	if (out->status != NFSP_DECODE_DECODED &&
+	    out->status != NFSP_DECODE_PARTIAL) {
 		out->nfields = 0;
 		out->nops = 0;
 	}
@@ -900,6 +952,7 @@ const char *nfsp_decode_strstatus(enum nfsp_decode_status status)
 		return "transaction_context_missing";
 	case NFSP_DECODE_DISPATCH_INCOMPLETE: return "dispatch_incomplete";
 	case NFSP_DECODE_RESOURCE_LIMIT: return "resource_limit";
+	case NFSP_DECODE_PARTIAL: return "partial";
 	}
 	return "unknown";
 }

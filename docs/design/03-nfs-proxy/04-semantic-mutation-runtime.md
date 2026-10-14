@@ -592,6 +592,9 @@ Implicit best-effort path remapping은 없다.
 
 앞 단계가 실패하면 뒤 단계로 추측해서 진행하지 않는다.
 
+3단계는 decode_status가 `decoded`나 `partial`인 record만 통과시킨다(02 §15). `partial` CALL에서는 남은
+field만 target이 될 수 있고, `failure.op_offset`부터 record 끝까지의 bytes는 기술되지 않은 채 그대로 옮긴다.
+
 ### 22. target occurrence enumeration
 
 Decoder output에서 target path에 해당하는 occurrence를 모두 찾는다.
