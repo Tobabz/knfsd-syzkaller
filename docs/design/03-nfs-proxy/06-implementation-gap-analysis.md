@@ -870,6 +870,11 @@ bounded lifecycle/expiry
 
 초기에는 existing single-thread event loop를 활용해 ordering/concurrency complexity를 줄인다.
 
+구현 상태: `src/txn.*`(table), `src/semantic.*`(observer), `main.c --semantic`. NFSv4
+request/result context와 bounded lifecycle/expiry가 구현됐다. NFSv3 reply procedure context는
+entry가 procedure를 보존하므로 준비됐지만 NFSv3 schema가 없어 decode는 `unsupported_schema`다.
+`request.forwarded`는 M4 Resolver 전까지 original 또는 unknown이다(`03` 한계와 미결 사항).
+
 ### 27. M4 — Semantic rule ABI / Resolver / concrete edit adapter
 
 ```text

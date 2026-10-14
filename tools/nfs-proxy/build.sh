@@ -74,6 +74,8 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_rpc_decode:$TEST/test_rpc_decode.c:$SRC/rpc_decode.c:$SRC/rpc_record.c:$SRC/walk.c\
        test_nfs_decode:$TEST/test_nfs_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$TEST/schema_tproto.c:$TEST/schema_tflat.c\
        test_nfs4_decode:$TEST/test_nfs4_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c\
+       test_txn:$TEST/test_txn.c:$SRC/txn.c\
+       test_semantic:$TEST/test_semantic.c:$SRC/semantic.c:$SRC/txn.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c:$SRC/rpc_record.c:$SRC/rpc_decode.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
 
@@ -254,7 +256,9 @@ if [ "$MODE" != "--test" ]; then
 	# shellcheck disable=SC2086
 	$CC $CFLAGS -I"$SRC" -o "$BUILD/nfs-proxy" \
 		"$SRC/main.c" "$SRC/proxy.c" "$SRC/framing.c" "$SRC/rpc_record.c" \
-		"$SRC/control.c" "$SRC/delta.c" "$SRC/walk.c" "$SRC/edit.c"
+		"$SRC/control.c" "$SRC/delta.c" "$SRC/walk.c" "$SRC/edit.c" \
+		"$SRC/semantic.c" "$SRC/txn.c" "$SRC/nfs_decode.c" \
+		"$SRC/schema.c" "$SRC/schema_nfs4.c" "$SRC/rpc_decode.c"
 fi
 
 echo "=== host test suite: PASS ==="

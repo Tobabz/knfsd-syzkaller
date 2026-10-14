@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "proxy.h"
 #include "control.h"
+#include "semantic.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -11,6 +12,18 @@
 
 static _Atomic int stop_requested;
 static _Atomic int snapshot_requested;
+
+extern const struct nfsp_schema_family nfsp_schema_family_nfs4;
+
+static const struct nfsp_schema_family *const families[] = {
+	&nfsp_schema_family_nfs4,
+};
+
+/* What the event loop's hooks share: either part may be absent. */
+struct app {
+	struct nfsp_control *control;
+	struct nfsp_semantic *semantic;
+};
 
 static void stop_signal(int sig)
 {
@@ -45,12 +58,31 @@ static void print_stats(const struct nfsp_proxy_stats *stats, const char *phase)
 	fflush(stdout);
 }
 
+static void report(const struct nfsp_proxy_stats *stats, const char *phase,
+		   const struct app *app)
+{
+	print_stats(stats, phase);
+	nfsp_control_report(app->control);
+	if (app->semantic != NULL) {
+		nfsp_semantic_report(app->semantic, stdout);
+		fflush(stdout);
+	}
+}
+
 static void maybe_snapshot(const struct nfsp_proxy_stats *stats, void *arg)
 {
-	if (atomic_exchange(&snapshot_requested, 0)) {
-		print_stats(stats, "snapshot");
-		nfsp_control_report((struct nfsp_control *)arg);
-	}
+	if (atomic_exchange(&snapshot_requested, 0))
+		report(stats, "snapshot", arg);
+}
+
+static void tick(void *arg)
+{
+	struct app *app = arg;
+
+	if (app->control != NULL)
+		nfsp_control_tick(app->control);
+	if (app->semantic != NULL)
+		nfsp_semantic_tick(app->semantic);
 }
 
 static int endpoint(const char *arg, char ip[INET_ADDRSTRLEN], uint16_t *port)
@@ -86,9 +118,13 @@ static void usage(const char *program)
 	fprintf(stderr,
 		"Usage: %s CLIENT0_IP CLIENT1_IP K_LISTEN_IP:PORT "
 		"G_LISTEN_IP:PORT K_BACKEND_IP:PORT G_BACKEND_IP:PORT "
-		"[--control PATH --delta-dir DIR | --replay DELTA_FILE]\n"
+		"[--control PATH --delta-dir DIR | --replay DELTA_FILE] "
+		"[--semantic]\n"
 		"One listener per backend; client identity is the TCP source IP. "
-		"An arm rule is active only while its control FD remains open.\n", program);
+		"An arm rule is active only while its control FD remains open.\n"
+		"--semantic decodes every record and correlates each REPLY with "
+		"its CALL (observe only; never changes or refuses a record).\n",
+		program);
 }
 
 int main(int argc, char **argv)
@@ -96,14 +132,22 @@ int main(int argc, char **argv)
 	struct nfsp_proxy_cfg cfg = {0};
 	struct nfsp_proxy_stats stats;
 	struct nfsp_control *control = NULL;
+	struct nfsp_semantic semantic;
+	struct app app = {0};
+	int semantic_on = 0;
 	const char *control_path = NULL, *delta_dir = NULL, *replay = NULL;
 	char ips[4][INET_ADDRSTRLEN];
 	struct in_addr src[2];
 	int rc;
-	if (argc != 7 && argc != 9 && argc != 11) {
+	if (argc < 7) {
 		usage(argv[0]); return 2;
 	}
 	for (int i = 7; i < argc; i += 2) {
+		if (strcmp(argv[i], "--semantic") == 0 && !semantic_on) {
+			semantic_on = 1;
+			i--;
+			continue;
+		}
 		if (i + 1 >= argc) { usage(argv[0]); return 2; }
 		if (strcmp(argv[i], "--control") == 0 && control_path == NULL)
 			control_path = argv[i + 1];
@@ -137,12 +181,35 @@ int main(int argc, char **argv)
 		if (nfsp_control_open(&control, control_path, delta_dir, replay) != 0) {
 			perror("open control or replay"); return 1;
 		}
-		cfg.on_tick = nfsp_control_tick;
-		cfg.on_tick_arg = control;
 		cfg.on_record = nfsp_control_record;
 		cfg.on_record_arg = control;
 	}
-	cfg.on_stats_arg = control;
+	app.control = control;
+	if (semantic_on) {
+		memset(&semantic, 0, sizeof(semantic));
+		semantic.families = families;
+		semantic.nfamilies = sizeof(families) / sizeof(families[0]);
+		/* The observer runs before on_record: once a rewrite hook is
+		 * installed, what the peer was given is not known here, so
+		 * REPLYs get no dispatch (semantic.h). */
+		semantic.forwarded = cfg.on_record != NULL ?
+				     NFSP_TXN_FWD_UNKNOWN : NFSP_TXN_FWD_ORIGINAL;
+		if (nfsp_semantic_init(&semantic, NULL) != 0) {
+			fprintf(stderr, "semantic observer: no memory\n");
+			nfsp_control_close(control);
+			return 1;
+		}
+		app.semantic = &semantic;
+		cfg.on_rpc_record = nfsp_semantic_record;
+		cfg.on_rpc_record_arg = &semantic;
+		cfg.on_connection = nfsp_semantic_connection;
+		cfg.on_connection_arg = &semantic;
+	}
+	if (app.control != NULL || app.semantic != NULL) {
+		cfg.on_tick = tick;
+		cfg.on_tick_arg = &app;
+	}
+	cfg.on_stats_arg = &app;
 	if (!atomic_is_lock_free(&stop_requested) ||
 	    !atomic_is_lock_free(&snapshot_requested)) {
 		fprintf(stderr, "signal stop flag must be lock-free on this host\n");
@@ -152,8 +219,9 @@ int main(int argc, char **argv)
 	signal(SIGTERM, stop_signal);
 	signal(SIGUSR1, snapshot_signal);
 	rc = nfsp_proxy_run(&cfg, &stats, ready, NULL);
-	print_stats(&stats, "final");
-	nfsp_control_report(control);
+	report(&stats, "final", &app);
+	if (app.semantic != NULL)
+		nfsp_semantic_free(app.semantic);
 	if (nfsp_control_close(control) != 0) rc = -1;
 	if (rc != 0) { fprintf(stderr, "proxy setup, poll or replay failed\n"); return 1; }
 	return 0;

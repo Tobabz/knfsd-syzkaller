@@ -4,7 +4,7 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/nfs4_decode/relay/control tests under clang
+`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/nfs4_decode/txn/semantic/relay/control tests under clang
 and GCC ASan+UBSan, after the ProtocolSchema normalizer's tests, a pin check of the RFC XDR files and a freshness check of every generated schema table. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
 delta files independently of their writer and reader. `build.sh` also compiles
 the guest delta-replay probe as a build-only regression gate. The host tests
@@ -112,8 +112,8 @@ beside the legacy arm path and change none of its bytes or coordinates.
   monotonic over the run and never derived from a slot or fd. `on_connection` reports
   opened and closed events; `on_rpc_record` observes each record as an
   `nfsp_rpc_record` before the legacy `on_record` and may refuse it, which closes the
-  connection without forwarding (`record_refused`). With both callbacks NULL, as in
-  `main.c` today, the relay behaves exactly as before.
+  connection without forwarding (`record_refused`). With both callbacks NULL (`main.c`
+  without `--semantic`), the relay behaves exactly as before.
 
 ## Target semantic path: ProtocolSchema and NFS Semantic Decoder (M2)
 
@@ -134,8 +134,32 @@ contract in [02](../../docs/design/03-nfs-proxy/02-semantic-decoder.md).
 - `src/schema_nfs4.c` holds NFSv4.0, 4.1 and 4.2, generated from the XDR of RFC 7531, RFC 5662
   and RFC 7863. `schema/rfc_xdr.py` extracts that XDR with each RFC's own rule and pins every RFC
   text and extracted file by SHA-256 (`schema/nfs4/SOURCES`); `build.sh` checks the pins offline.
-  NFSv3 has no schema yet, so its messages are `unsupported_schema`. Nothing in `main.c` calls the
-  decoder.
+  NFSv3 has no schema yet, so its messages are `unsupported_schema`.
+
+## Target semantic path: Transaction Context (M3)
+
+[06 §26](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+contract in [03](../../docs/design/03-nfs-proxy/03-transaction-context.md).
+
+- `src/txn.*` keeps one entry per live CALL, keyed by `connection_id + call_direction + xid`.
+  A REPLY looks up the opposite of its own direction, so a backchannel CALL (S2C) and a
+  forechannel CALL (C2S) with the same XID on one connection stay apart. Results are
+  `found`, `missing`, `ambiguous` and `expired`; only `found` gives a `reply_dispatch`.
+  A different CALL on a live key makes it ambiguous (never overwritten); a retransmission
+  (the same bytes, by a two-hash fingerprint) is counted, not re-inserted. A key may take
+  a new CALL once its last CALL was answered; while an expired or ambiguous key is still
+  retained, a new CALL on it only keeps it ambiguous, since the old reply may yet come.
+- Memory is a fixed pool allocated once. Bounds: 4096 outstanding entries, 1024 per
+  connection, 1024 ended entries kept for diagnosis, 300 s timeout without traffic, 10 s
+  retention. A full table refuses a new CALL (`capacity_exhausted`) and never reclaims a
+  live entry; a closed connection drops all its entries.
+- `src/semantic.*` is the `on_rpc_record`/`on_connection` observer that ties M1–M3 together:
+  envelope, then a CALL entry, then the body decode and its request summary (opcodes and
+  minor version); a REPLY decodes only with a `found` entry's dispatch. It never changes or
+  refuses a record. `nfs-proxy ... --semantic` turns it on and prints `semantic ...` and
+  `txn ...` counter lines with the stats. With `--control`/`--replay` the CALL the peer gets
+  may be rewritten after the observer (even its minor version), so a REPLY then gets neither
+  a dispatch nor a request summary: it is `transaction_context_missing`.
 
 ## Building
 
