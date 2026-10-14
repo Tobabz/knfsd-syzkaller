@@ -158,6 +158,22 @@ static int optional_word(struct rd *r, int *has, uint32_t *v)
 	return *has ? u32(r, v) : 0;
 }
 
+/* An array count: within its bound and within `room`, what the input can
+ * hold.  Either refusal names the count word. */
+static int count_in(struct rd *r, uint32_t max, size_t room, uint32_t *n,
+		    const char *too_many, const char *exceeds)
+{
+	size_t at = r->off;
+
+	if (word_in(r, max, n, too_many))
+		return -1;
+	if (*n > room) {
+		r->off = at;
+		return bad(r, exceeds);
+	}
+	return 0;
+}
+
 static int literal(struct rd *r, struct nfsp_rule_literal *l)
 {
 	uint32_t k, w;
@@ -256,11 +272,11 @@ static int transform(struct rd *r, struct nfsp_rule_transform *t)
 		return value_ref(r, &t->source);
 	case NFSP_XF_BUILTIN:
 		if (name(r, NFSP_RULE_ID_MAX, 0, &t->transform_id) ||
-		    word_in(r, NFSP_RULE_BUILTIN_ARGS_MAX, &t->nargs,
-			    "too many builtin arguments"))
+		    count_in(r, NFSP_RULE_BUILTIN_ARGS_MAX,
+			     r->args_cap - r->nargs, &t->nargs,
+			     "too many builtin arguments",
+			     "builtin arguments exceed the input"))
 			return -1;
-		if (t->nargs > r->args_cap - r->nargs)
-			return bad(r, "builtin arguments exceed the input");
 		t->args = &r->rs->arg_pool[r->nargs];
 		r->nargs += t->nargs;
 		for (uint32_t i = 0; i < t->nargs; i++)
@@ -276,11 +292,11 @@ static int view_deps(struct rd *r, struct nfsp_rule_view_deps *d)
 	memset(d, 0, sizeof(*d));
 	if (boolean(r, &d->rpc_procedure) ||
 	    boolean(r, &d->request_operation_sequence) ||
-	    word_in(r, NFSP_RULE_REQUEST_FIELDS_MAX, &d->nfields,
-		    "too many request fields"))
+	    count_in(r, NFSP_RULE_REQUEST_FIELDS_MAX,
+		     r->fields_cap - r->nfields, &d->nfields,
+		     "too many request fields",
+		     "request fields exceed the input"))
 		return -1;
-	if (d->nfields > r->fields_cap - r->nfields)
-		return bad(r, "request fields exceed the input");
 	d->request_fields = &r->rs->field_pool[r->nfields];
 	r->nfields += d->nfields;
 	for (uint32_t i = 0; i < d->nfields; i++) {
@@ -330,11 +346,10 @@ static int rule(struct rd *r, struct nfsp_rule *ru)
 		return -1;
 	ru->part = (enum nfsp_rule_part)w;
 
-	if (word_in(r, NFSP_RULE_PREDICATES_MAX, &ru->npredicates,
-		    "too many predicates"))
+	if (count_in(r, NFSP_RULE_PREDICATES_MAX, r->preds_cap - r->npreds,
+		     &ru->npredicates, "too many predicates",
+		     "predicates exceed the input"))
 		return -1;
-	if (ru->npredicates > r->preds_cap - r->npreds)
-		return bad(r, "predicates exceed the input");
 	ru->predicates = &r->rs->pred_pool[r->npreds];
 	r->npreds += ru->npredicates;
 	for (uint32_t i = 0; i < ru->npredicates; i++) {
@@ -400,7 +415,7 @@ enum nfsp_rule_status nfsp_ruleset_parse(const uint8_t *buf, size_t len,
 	r.rs = rs;
 	r.err = err;
 	if (!buf || len > NFSP_RULESET_MAX_LEN) {
-		bad(&r, "larger than NFSP_RULESET_MAX_LEN");
+		bad(&r, buf ? "larger than NFSP_RULESET_MAX_LEN" : "no buffer");
 		return fail_free(rs, err);
 	}
 	if (len < 8 || memcmp(buf, NFSP_RULESET_MAGIC, 8)) {
@@ -439,14 +454,12 @@ enum nfsp_rule_status nfsp_ruleset_parse(const uint8_t *buf, size_t len,
 	}
 
 	if (name(&r, NFSP_RULE_SCHEMA_ID_MAX, 0, &rs->schema_id) ||
-	    name(&r, NFSP_RULE_ID_MAX, 0, &rs->candidate_id) ||
-	    word_in(&r, NFSP_RULES_MAX, &n, "too many rules"))
+	    name(&r, NFSP_RULE_ID_MAX, 0, &rs->candidate_id))
 		return fail_free(rs, err);
 	/* A rule takes far more than 4 bytes; this only bounds the array. */
-	if (n > (len - r.off) / 4) {
-		bad(&r, "rules exceed the input");
+	if (count_in(&r, NFSP_RULES_MAX, (len - r.off) / 4, &n,
+		     "too many rules", "rules exceed the input"))
 		return fail_free(rs, err);
-	}
 	if (n) {
 		rs->rules = calloc(n, sizeof(*rs->rules));
 		if (!rs->rules) {
@@ -641,6 +654,9 @@ static enum nfsp_rule_status resolve_ref(struct val *v,
 		if (!reply)
 			return refuse(v, NFSP_RULE_MESSAGE_TYPE_INCONSISTENT,
 				      "a request view in a call rule");
+		if (in_message(v->s, ref->path, 1))
+			return refuse(v, NFSP_RULE_MESSAGE_TYPE_INCONSISTENT,
+				      "a response path in a request view");
 		return resolve(v, 0, ref->path, &ref->node);
 	}
 	return refuse(v, NFSP_RULE_MALFORMED, "value source");

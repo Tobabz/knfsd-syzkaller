@@ -769,6 +769,8 @@ static void test_canonical(void)
 		       "a rule count the input does not hold");
 	malformed_word(32, 0, NFSP_RULE_MALFORMED, 36,
 		       "a rule the count does not cover");
+	malformed_word(32, 100, NFSP_RULE_MALFORMED, 32,
+		       "more rules than the input can hold");
 	malformed_word(52, 2, NFSP_RULE_MALFORMED, 52, "direction 2");
 	malformed_word(64, 2, NFSP_RULE_MALFORMED, 64, "message type 2");
 	malformed_word(76, 2, NFSP_RULE_MALFORMED, 76, "optional flag 2");
@@ -779,6 +781,8 @@ static void test_canonical(void)
 	malformed_word(168, 6, NFSP_RULE_MALFORMED, 168, "part 6");
 	malformed_word(172, NFSP_RULE_PREDICATES_MAX + 1u, NFSP_RULE_MALFORMED,
 		       172, "17 predicates");
+	malformed_word(172, NFSP_RULE_PREDICATES_MAX, NFSP_RULE_MALFORMED,
+		       172, "more predicates than the input can hold");
 	malformed_word(204, 2, NFSP_RULE_MALFORMED, 204, "transform flag 2");
 	malformed_word(220, 2, NFSP_RULE_MALFORMED, 220, "policy 2");
 	malformed_word(224, 2, NFSP_RULE_MALFORMED, 224,
@@ -798,8 +802,8 @@ static void test_canonical(void)
 	CHECK(nfsp_ruleset_parse(golden, NFSP_RULESET_MAX_LEN + 1u, &rs,
 				 &err) == NFSP_RULE_MALFORMED,
 	      "a set beyond the size bound");
-	CHECK(nfsp_ruleset_parse(NULL, 0, &rs, &err) == NFSP_RULE_MALFORMED,
-	      "no buffer");
+	CHECK(nfsp_ruleset_parse(NULL, 0, &rs, &err) == NFSP_RULE_MALFORMED &&
+	      !strcmp(err.detail, "no buffer"), "no buffer: %s", err.detail);
 
 	/* Rules in rule_id order, each id once: one encoding per set. */
 	two[0] = golden_spec();
@@ -1251,6 +1255,15 @@ static void test_refusals(void)
 	REFUSED_AT(sp, NFSP_RULE_MESSAGE_TYPE_INCONSISTENT, 0);
 	sp = open_spec(); sp.preds[1].lhs.path = OPEN_OTHER;
 	REFUSED_AT(sp, NFSP_RULE_MESSAGE_TYPE_INCONSISTENT, 1);
+	load(&sp, 1, &err);
+	CHECK(!strcmp(err.detail, "a response path in a request view"),
+	      "request view detail: %s", err.detail);
+	sp = open_spec(); sp.has_xf = 1; sp.xkind = NFSP_XF_COPY;
+	sp.xsrc.source = NFSP_SRC_REQUEST_FORWARDED; sp.xsrc.path = OPEN_OTHER;
+	REFUSED(sp, NFSP_RULE_MESSAGE_TYPE_INCONSISTENT);
+	load(&sp, 1, &err);
+	CHECK(!strcmp(err.detail, "a response path in a request view"),
+	      "copy from a request view detail: %s", err.detail);
 	sp = open_spec();
 	sp.preds[0].lhs.path = "nfs4.request.OPEN.args.seqid";
 	REFUSED_AT(sp, NFSP_RULE_MESSAGE_TYPE_INCONSISTENT, 0);
