@@ -22,6 +22,7 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `hcap.py` | versioned HCAP/ReachabilityPlan schemas, capability/status/scope checks and pinned dependency verification |
 | `admission.py` | exact syzkaller build/call-table identity, closed-world call admission and repository-owned neutral-control authority |
 | `materializer.py` | deterministic Harness Materializer core; validates pinned parser output, admission, runtime/fixture selection, seeds and neutral controls before publishing a review manifest |
+| `syzkaller/` | pinned Linux/amd64 `prog.Strict` parser and generated call-table exporter over a verified executable snapshot |
 | `registry.py` | immutable catalog reader for host-approved harness bindings, HCAP revisions and approval evidence |
 | `evidence.py` | seals supplied bytes into a manifest; verifies byte integrity, limits, types and host correlation |
 | `q1.py` | pure Q1 decision kernel over verified normalized inputs, a trusted profile/boundary and an external target-PC mapping |
@@ -34,6 +35,7 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `agent_tasks/tools.py` | the complete Agent tool allowlist: pinned kernel read/search, caller/callee index lookup and pinned HCAP lookup; paths and outputs are bounded |
 | `agent_tasks/source_index.py` | immutable Git-object implementation of the source-index protocol; full commit OIDs, trusted roots and process/output/time bounds are enforced |
 | `agent_tasks/runtime.py` | injectable structured-output runtime protocol; task policy selects provider/model and output-repair allowance |
+| `agent_tasks/pydantic_ai_runtime.py` | optional PydanticAI driver with typed output, the pinned toolbox, bounded requests and output repairs, and response-derived model identity |
 | `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis and Reachability Planning; records the runtime's actual `provider:model` id through existing Controller callbacks |
 | `runner/` | restart-safe SQLite task leases/cancellation/completion plus an injected capture backend that seals evidence and records host provenance receipts |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |
@@ -60,9 +62,21 @@ not parse syz programs or decide call admission.
 `ArtifactHarnessMaterializer` repeats that declarative HCAP check at its own
 trust boundary, then requires exact build, call-table, admission and neutral
 catalog identities. Both proposed programs and repository seeds pass the same
-strict parser and call-admission path. The parser is injected: production must
-supply one tied to the exact `SyzkallerTargetIdentity`; the synthetic parser in
-tests is not an implementation of that boundary.
+strict parser and call-admission path. The injected
+`syzkaller.PinnedSyzParser` verifies the exact `SyzkallerTargetIdentity`, build
+artifacts and generated target call table before parsing through syzkaller's
+`prog.Strict`. Build its bundle with the procedure in
+[`tools/syzkaller/README.md`](../tools/syzkaller/README.md). The host must approve
+the expected identity independently; a bundle's own identity file is not
+approval evidence.
+
+The parser derives profile acquisitions from exact typed
+`syz_open_nfs_lane_profile` variants and fd origins from unmodified direct
+references to those results. Closing or potentially rebinding descriptors
+invalidates the corresponding provenance. Legacy lane calls, derived fd/path
+provenance and runtime availability are outside this extraction scope.
+Unverified constraints remain refusals; parsing or building does not promote
+an experimental HCAP capability to validated status.
 
 The Runner-facing `EvidenceStore.seal` accepts already collected bytes and
 host-derived correlation/collection metadata. It publishes the manifest last.
@@ -137,15 +151,29 @@ policies. Controller integration tests use the real HCAP checker and sealed Q1
 adapter, including event replay; they still use fake Agent, Materializer and
 Runner execution. All coverage and mappings in those tests are synthetic.
 
-Candidate Analysis and Reachability Planning are implemented against an
-injectable runtime because `pydantic-ai-slim` was unavailable in the offline
-implementation environment. `agent_tasks/pydantic_ai_dependency.py` requires
-the reviewed `2.55.0` version and fails explicitly; it does not provide a
-home-grown provider loop. Dependency locking and the concrete PydanticAI driver
-remain before provider execution can be enabled.
+Candidate Analysis and Reachability Planning can use the concrete
+`PydanticAIRuntime`. The lock pins `pydantic-ai-slim==2.55.0`; the dev group
+includes the runtime and OpenAI transport so the default test command checks
+them. For a deployment without dev dependencies, install `agent-runtime` for
+an injected PydanticAI model, or `agent-openai` for the default OpenAI Responses
+driver:
 
-Also not here yet: the production pinned syz parser, concrete VM/KCOV execution
-engine and external-process fencing, raw KCOV/counter collection and
+```sh
+uv sync --locked --no-dev --extra agent-openai
+```
+
+Construct `PydanticAIRuntime()` and pass it to `Stage1AgentExecutor`. The host
+supplies credentials through the OpenAI SDK's configuration. The default
+driver disables SDK retries and server-side response storage; output repairs
+are bounded by the task policy, while Controller task retries remain separate.
+Each run has its own Agent and tool bindings. Tests use PydanticAI models and
+an HTTP mock without sending live provider requests. Importing the base
+`agent_tasks` package does not require this optional driver. See
+[`PYDANTIC_AI_RUNTIME.md`](agent_tasks/PYDANTIC_AI_RUNTIME.md) for factory,
+deadline and response-identity requirements.
+
+Also not here yet: broader NFS resource-provenance extraction, a concrete
+VM/KCOV execution engine and external-process fencing, raw KCOV/counter collection and
 normalization, automatic DWARF/runtime-PC mapping, Runner-receipt adapters for
 the Judges, approved production HCAP/judge data, and Stage 2 Controller/Runner
 integration. The standalone M1 and Q2 gates use synthetic fixtures only; no

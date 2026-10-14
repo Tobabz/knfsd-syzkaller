@@ -231,7 +231,7 @@ class ByteLengthFact(AuthorityRecord):
 
 
 class CallResourceFacts(AuthorityRecord):
-    """Facts extracted by a future pinned syz parser for one concrete call."""
+    """Facts extracted by a pinned syz parser for one concrete call."""
 
     origins: tuple[ResourceOriginFact, ...] = ()
     integers: tuple[IntegerFact, ...] = ()
