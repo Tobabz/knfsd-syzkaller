@@ -167,7 +167,7 @@ static int enum_has(const struct nfsp_protocol_schema *s,
 	return 0;
 }
 
-/* Validate a 4-byte scalar against its type.  0 when allowed. */
+/* Validate a discriminant word against its type.  0 when allowed. */
 static int check_word(struct dec *d, uint16_t t, uint32_t w)
 {
 	const struct nfsp_schema_type *ty = &d->s->types[t];
@@ -177,6 +177,23 @@ static int check_word(struct dec *d, uint16_t t, uint32_t w)
 	if (ty->kind == NFSP_XK_ENUM && !enum_has(d->s, ty, w))
 		return fail(d, NFSP_DECODE_MALFORMED, t,
 			    "enum value not declared");
+	return 0;
+}
+
+/* A 4-byte value of a field that is not a discriminant.  In a CALL the
+ * server reads it as a plain word, so an out-of-domain value is decoded and
+ * flagged.  A REPLY stays strict: its reader is the client, and a strict
+ * result is what keeps a wrong reply_dispatch from decoding (§14). */
+static int check_leaf(struct dec *d, uint16_t t, uint32_t me, uint32_t w)
+{
+	const struct nfsp_schema_type *ty = &d->s->types[t];
+
+	if ((ty->kind == NFSP_XK_BOOL && w > 1) ||
+	    (ty->kind == NFSP_XK_ENUM && !enum_has(d->s, ty, w))) {
+		if (d->response)
+			return check_word(d, t, w);
+		F(d, me)->flags |= NFSP_FF_UNDECLARED;
+	}
 	return 0;
 }
 
@@ -198,7 +215,7 @@ static int dec_scalar(struct dec *d, uint16_t t, uint32_t me)
 	} else {
 		uint32_t w = rd32(d, d->off);
 
-		if (check_word(d, t, w))
+		if (check_leaf(d, t, me, w))
 			return -1;
 		v = ty->kind == NFSP_XK_INT ?
 			(uint64_t)(int64_t)(int32_t)w : w;
@@ -240,9 +257,12 @@ static int dec_bytes(struct dec *d, uint16_t t, uint32_t me)
 	at = d->off + n;
 	for (uint32_t i = 0; i < pad; i++)
 		if (d->p[at + i]) {
-			d->off = at;
-			return fail(d, NFSP_DECODE_MALFORMED, t,
-				    "non-zero padding");
+			if (d->response) {
+				d->off = at;
+				return fail(d, NFSP_DECODE_MALFORMED, t,
+					    "non-zero padding");
+			}
+			F(d, me)->flags |= NFSP_FF_PAD_NONZERO;
 		}
 	F(d, me)->wire.value.off = d->off;
 	F(d, me)->wire.value.len = n;
@@ -753,9 +773,15 @@ nfsp_nfs_decode(const struct nfsp_schema_family *const *families,
 	    decode(&d, root_type, NFSP_FIELD_NONE, pr->name, leaf,
 		   NFSP_FIELD_NONE))
 		goto done;
-	if (d.off != d.len)
-		fail(&d, NFSP_DECODE_MALFORMED, root_type,
-		     "bytes after the procedure body");
+	if (d.off != d.len) {
+		if (d.response) {
+			fail(&d, NFSP_DECODE_MALFORMED, root_type,
+			     "bytes after the procedure body");
+		} else {
+			out->trailing.off = d.off;
+			out->trailing.len = d.len - d.off;
+		}
+	}
 done:
 	out->status = d.st;
 	if (out->status != NFSP_DECODE_DECODED) {

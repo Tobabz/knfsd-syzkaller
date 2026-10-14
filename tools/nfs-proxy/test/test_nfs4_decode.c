@@ -1279,7 +1279,6 @@ static void test_malformed(void)
 	const enum nfsp_decode_status bad = NFSP_DECODE_MALFORMED;
 
 	printf("malformed: located refusals on the NFSv4 bounds\n");
-	REFUSED(build_open_call, NULL, 108, 2, bad, 108, "bool is not 0 or 1");
 	REFUSED(build_open_call, NULL, 116, 129, bad, 116,
 		"length exceeds bound");		/* NFS4_FHSIZE */
 	REFUSED(build_open_call, NULL, 156, 1025, bad, 156,
@@ -1292,8 +1291,6 @@ static void test_malformed(void)
 		"enum value not declared");		/* open_claim_type4 */
 	REFUSED(build_open_call, NULL, 196, 1000, bad, 196,
 		"count exceeds remaining record");
-	REFUSED(build_open_call, NULL, 228, 0x696c6501u, bad, 231,
-		"non-zero padding");			/* "ile" + pad */
 	REFUSED(build_open_call, NULL, 72, 5, NFSP_DECODE_TRUNCATED, 236,
 		"record ends here");			/* count 5, four ops */
 	REFUSED(build_readdir_reply, &rd, 160, 2, bad, 160,
@@ -1302,6 +1299,35 @@ static void test_malformed(void)
 		"bool is not 0 or 1");
 	REFUSED(build_readdir_reply, &rd, 92, 99999, bad, 92,
 		"enum value not declared");		/* nfsstat4 */
+}
+
+/* In a CALL, knfsd reads sa_cachethis as a plain word and skips padding
+ * unread (nfsd4_decode_sequence, __xdr_inline_decode), so these decode and
+ * are flagged; the same oddities in a REPLY stay malformed. */
+static void test_lenient_call(void)
+{
+	struct nfsp_reply_dispatch rd = dispatch(1);
+	struct nfsp_decoded_msg m = {0};
+	const struct nfsp_semantic_field *f;
+	struct msg v;
+
+	printf("lenient CALL, strict REPLY\n");
+	build_open_call(&v);
+	put32(&v, 108, 2);			/* sa_cachethis */
+	put32(&v, 228, 0x696c6501u);		/* "ile" + pad */
+	if (decoded(&v, NULL, &m, "odd cachethis and padding")) {
+		f = field(&m, "nfs4.request.SEQUENCE.args.sa_cachethis", 0);
+		CHECK(f && f->flags == NFSP_FF_UNDECLARED && f->value == 2,
+		      "sa_cachethis not flagged");
+		f = field(&m, "nfs4.request.OPEN.args.claim.claim_null.file", 0);
+		CHECK(f && f->flags == NFSP_FF_PAD_NONZERO &&
+		      f->wire.value.off == 224 && f->wire.value.len == 7,
+		      "claim.file padding not flagged");
+		CHECK(m.nops == 4, "%u ops", m.nops);
+	}
+	REFUSED(build_readdir_reply, &rd, 216, 2, NFSP_DECODE_MALFORMED, 216,
+		"bool is not 0 or 1");
+	nfsp_decoded_msg_free(&m);
 }
 
 static int is_mutable_leaf(const struct nfsp_decoded_msg *m, uint32_t i)
@@ -1441,6 +1467,7 @@ int main(void)
 	test_layout_types();
 	test_truncation();
 	test_malformed();
+	test_lenient_call();
 	test_address_oracle();
 	test_random_edits();
 	printf("%d checks, %d failures\n", checks, failures);

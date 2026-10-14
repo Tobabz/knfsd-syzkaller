@@ -677,9 +677,22 @@ Transaction Context의 key/lifecycle 정책은
 Decoder는 fail closed 한다.
 
 M2 구현은 `truncated`와 `malformed`를 다음처럼 나눈다. record가 고정 크기 item(word, hyper, fixed
-opaque) 중간에서 끝나면 `truncated`다. XDR이 허용하지 않는 값이면 `malformed`다. 선언되지 않은 enum 값,
-0/1이 아닌 bool, arm이 없는 discriminant, bound를 넘거나 record 끝을 넘는 length/count, 0이 아닌
-padding, procedure body 뒤의 남은 bytes가 여기에 든다.
+opaque) 중간에서 끝나면 `truncated`다. XDR이 허용하지 않는 값이면 `malformed`다. 선언되지 않았거나 arm이
+없는 union discriminant, 0/1이 아닌 list link, bound를 넘거나 record 끝을 넘는 length/count가 여기에 든다.
+
+CALL에서는 서버가 읽는 만큼만 엄격하다(2026-10-14, 저장소 소유자 결정; knfsd v7.3-rc5 `fs/nfsd/nfs4xdr.c`
+대조). layout을 정하지 않는 field의 선언되지 않은 enum 값과 0/1이 아닌 bool, 0이 아닌 padding은 decode하고
+field의 `flags`에 표시한다(`NFSP_FF_UNDECLARED`, `NFSP_FF_PAD_NONZERO`). knfsd는 이런 word를 범위 검사 없이
+정수로 읽고(`xdr_stream_decode_bool`은 0이 아니면 true다) padding은 읽지 않고 건너뛴다(`__xdr_inline_decode`).
+procedure body 뒤의 남은 bytes는 `trailing` span으로 남기고 decode를 실패시키지 않는다. knfsd
+(`nfsd4_decode_compound`)도 무시한다. WireRef는 이 표시와 관계없이 같다.
+
+layout을 고르는 값은 이 완화에서 빠진다. union discriminant와 list link는 서버마다 arm 선택이 다를 수 있으므로
+(knfsd는 0이 아닌 bool discriminant를 TRUE arm으로 읽는다) 한 서버의 해석을 decode 결과에 넣지 않는다.
+
+REPLY는 완화하지 않는다. REPLY를 읽는 쪽은 client이고, result schema를 `reply_dispatch`로만 고르는 §14
+규칙에서 엄격한 decode가 잘못된 dispatch를 드러낸다(예: READ bytes를 GETSIZE dispatch로 읽으면 남은 bytes
+때문에 `malformed`). REPLY에서는 위 경우가 모두 `malformed`다.
 
 decode_status:
 

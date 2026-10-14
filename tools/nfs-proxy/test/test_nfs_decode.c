@@ -10,8 +10,10 @@
  *   1 golden      expected paths, values and every WireRef span
  *   2 truncation  every prefix of every golden message: not decoded, and no
  *                 field or operation survives
- *   3 malformed   oversized length, count beyond record, undeclared enum,
- *                 bad bool, non-zero padding, trailing bytes, bad list link
+ *   3 malformed   oversized length, count beyond record, undeclared
+ *                 discriminant, bad list link; lenient: undeclared enum and
+ *                 bad bool outside a discriminant, non-zero padding and
+ *                 trailing bytes decode and are flagged
  *   7 address     changing only one field's value bytes changes only that
  *                 field: no sibling, span or path moves
  *   F4            a REPLY is decoded only from reply_dispatch, never from a
@@ -906,17 +908,8 @@ static void test_malformed(void)
 		       "enum value not declared");	/* tp_kind */
 	expect_refusal(60, 99, NFSP_DECODE_MALFORMED, 60,
 		       "enum value not declared");	/* opcode */
-	expect_refusal(100, 2, NFSP_DECODE_MALFORMED, 100,
-		       "bool is not 0 or 1");
-	expect_refusal(112, 0x6f000100u, NFSP_DECODE_MALFORMED, 113,
-		       "non-zero padding");
-
-	build_compound_call(&c, 0);
-	w32(&c, 0);
-	CHECK(run(c.b, c.n, NULL, 0, 0, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 184 && m.nfields == 0,
-	      "trailing bytes: %s at %u", nfsp_decode_strstatus(m.status),
-	      m.failure.offset);
+	expect_refusal(160, 0xffffffffu, NFSP_DECODE_MALFORMED, 160,
+		       "enum value not declared");	/* tp_kind, too */
 
 	build_compound_reply(&c);
 	c.b[107] = 2;		/* entry[0] link = 2 */
@@ -929,11 +922,80 @@ static void test_malformed(void)
 	CHECK(run(c.b, c.n, &tproto_dispatch, 1, 0, &m) ==
 	      NFSP_DECODE_MALFORMED && m.failure.offset == 84,
 	      "list head 3: %s", nfsp_decode_strstatus(m.status));
+	nfsp_decoded_msg_free(&m);
+}
+
+/* Where knfsd reads a word as a plain integer, skips padding unread or
+ * ignores what follows the body, the decoder decodes and flags instead of
+ * refusing (design 02 §15).  Spans are the same as without the oddity. */
+static void expect_lenient(size_t at, uint32_t v, const char *path,
+			   uint8_t flag, uint64_t value)
+{
+	struct nfsp_decoded_msg m = {0};
+	const struct nfsp_semantic_field *f;
+
+	if (mutate_call(at, v, &m) != NFSP_DECODE_DECODED) {
+		CHECK(0, "word %zu = %#x: %s at %u (%s)", at, v,
+		      nfsp_decode_strstatus(m.status), m.failure.offset,
+		      m.failure.reason ? m.failure.reason : "");
+		nfsp_decoded_msg_free(&m);
+		return;
+	}
+	f = field(&m, path, 0);
+	CHECK(f && f->flags == flag && f->value == value,
+	      "%s: flags %#x value %llu", path, f ? f->flags : 0xffu,
+	      f ? (unsigned long long)f->value : 0ull);
+	for (uint32_t i = 0; i < m.nfields; i++)
+		CHECK(&m.fields[i] == f || !m.fields[i].flags,
+		      "field %u flagged too", i);
+	CHECK(m.nops == 3 && m.trailing.len == 0, "ops %u trailing %u",
+	      m.nops, m.trailing.len);
+	nfsp_decoded_msg_free(&m);
+}
+
+static void test_lenient(void)
+{
+	struct nfsp_decoded_msg m = {0};
+	const struct nfsp_semantic_field *f;
+	struct msg c;
+
+	printf("lenient CALL: out-of-domain words, padding, trailing bytes\n");
+	expect_lenient(100, 2, "tproto.request.WRITE.args.sync",
+		       NFSP_FF_UNDECLARED, 2);
+	expect_lenient(100, 0xffffffffu, "tproto.request.WRITE.args.sync",
+		       NFSP_FF_UNDECLARED, 0xffffffffu);
+	expect_lenient(112, 0x6f000100u, "tproto.request.WRITE.args.data",
+		       NFSP_FF_PAD_NONZERO, 0);
+	expect_lenient(44, 0x61620001u, "tproto.request.COMPOUND.args.tag",
+		       NFSP_FF_PAD_NONZERO, 0);
+
+	build_compound_call(&c, 0);
+	w32(&c, 0);
+	w32(&c, 0xdeadbeef);
+	if (run(c.b, c.n, NULL, 0, 0, &m) == NFSP_DECODE_DECODED) {
+		CHECK(m.trailing.off == 184 && m.trailing.len == 8 &&
+		      m.nops == 3, "trailing %u+%u, %u ops", m.trailing.off,
+		      m.trailing.len, m.nops);
+		f = field(&m, "tproto.request.COMPOUND.args", 0);
+		CHECK(f && f->wire.encoded.off + f->wire.encoded.len == 184,
+		      "the body still ends at 184");
+	} else {
+		CHECK(0, "trailing bytes: %s", nfsp_decode_strstatus(m.status));
+	}
+
+	/* A REPLY is never lenient (§14: a strict result keeps a wrong
+	 * dispatch from decoding). */
 	build_compound_reply(&c);
 	c.b[27] = 1;		/* COMPOUND status 1: not a tp_status */
 	CHECK(run(c.b, c.n, &tproto_dispatch, 1, 0, &m) ==
 	      NFSP_DECODE_MALFORMED && m.failure.offset == 24,
-	      "undeclared status: %s", nfsp_decode_strstatus(m.status));
+	      "undeclared reply status: %s", nfsp_decode_strstatus(m.status));
+	build_compound_reply(&c);
+	w32(&c, 0);
+	CHECK(run(c.b, c.n, &tproto_dispatch, 1, 0, &m) ==
+	      NFSP_DECODE_MALFORMED && m.failure.offset == 156 &&
+	      m.trailing.len == 0, "reply trailing bytes: %s",
+	      nfsp_decode_strstatus(m.status));
 	nfsp_decoded_msg_free(&m);
 }
 
@@ -1174,6 +1236,7 @@ int main(void)
 	test_long_paths();
 	test_truncation();
 	test_malformed();
+	test_lenient();
 	test_resource_limit();
 	test_address_oracle();
 	test_random_edits();

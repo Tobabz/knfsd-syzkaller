@@ -25,10 +25,21 @@
  *
  *   truncated  the record ends before a fixed-size item (a word, a hyper, a
  *              fixed opaque) can be read.
- *   malformed  a value the XDR does not allow: an undeclared enum value, a
- *              bool other than 0/1, a union discriminant with no arm, a
- *              length or count above its bound or beyond the record, non-zero
- *              padding, or bytes after the procedure body.
+ *   malformed  a value the XDR does not allow where it decides the layout:
+ *              an undeclared or arm-less union discriminant, a list link
+ *              other than 0/1, or a length or count above its bound or
+ *              beyond the record.
+ *
+ * LENIENT WHERE THE SERVER IS (design 02 §15)
+ *
+ *   In a CALL, an undeclared enum value or a bool other than 0/1 in a field
+ *   that is not a discriminant, and non-zero padding, are decoded and
+ *   flagged in the field (NFSP_FF_*): knfsd reads such words as plain
+ *   integers and skips padding unread.  Bytes after a CALL's procedure body
+ *   are `trailing`, not a failure: knfsd ignores them.  Nothing that
+ *   chooses a layout is ever lenient, and a REPLY is never lenient: its
+ *   reader is the client, and a strict result is what keeps a wrong
+ *   reply_dispatch from decoding.  In a REPLY all of these stay malformed.
  *
  * REPLIES (design 02 §6, §14, issue #18 F4)
  *
@@ -110,6 +121,15 @@ struct nfsp_decode_input {
 #define NFSP_META_DISCRIMINANT	0x4u	/* union discriminant, list link */
 #define NFSP_META_PADDING	0x8u	/* XDR padding after opaque bytes */
 
+/* What a field's bytes say that the XDR does not allow, where the decoder
+ * still decodes them because the server does (design 02 §15).  A
+ * discriminant or a list link is never lenient: it picks the layout. */
+#define NFSP_FF_UNDECLARED	0x1u	/* enum value not declared, or bool
+					 * other than 0/1 (knfsd reads both as
+					 * plain words) */
+#define NFSP_FF_PAD_NONZERO	0x2u	/* non-zero XDR padding (knfsd skips
+					 * padding unread) */
+
 struct nfsp_wire_ref {
 	struct nfsp_span encoded;	/* the node's whole XDR encoding */
 	struct nfsp_span value;		/* the value without metadata */
@@ -130,6 +150,7 @@ struct nfsp_semantic_field {
 	const char *component;
 	uint16_t type;		/* index into schema->types */
 	uint8_t kind;		/* enum nfsp_xdr_kind */
+	uint8_t flags;		/* NFSP_FF_* */
 	uint64_t value;		/* INT/HYPER sign-extended; UINT/UHYPER/BOOL/
 				 * ENUM as read; others 0 */
 	struct nfsp_wire_ref wire;
@@ -170,6 +191,9 @@ struct nfsp_decoded_msg {
 	struct nfsp_decoded_op *ops;
 	uint32_t nops;
 	struct nfsp_decode_failure failure;
+	/* CALL only: bytes after the procedure body (len 0: none).  The
+	 * server ignores them; no field covers them. */
+	struct nfsp_span trailing;
 
 	uint32_t fields_cap, ops_cap;
 };
