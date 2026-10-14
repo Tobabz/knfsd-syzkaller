@@ -33,6 +33,11 @@
  *              operation.  The nodes that contain the array end at
  *              op_offset.  A record that ends exactly before an opcode word
  *              is truncated, not partial: knfsd refuses that request whole.
+ *              The array's count is not checked against the record as a
+ *              whole, since knfsd never reads past the failing operation.
+ *              Only the procedure body decode is partial: a failure while
+ *              reading the minor-version prefix, before a schema is chosen,
+ *              refuses the message.
  *
  *   truncated  the record ends before a fixed-size item (a word, a hyper, a
  *              fixed opaque) can be read.

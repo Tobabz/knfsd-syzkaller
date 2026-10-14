@@ -974,8 +974,10 @@ static void test_malformed(void)
 	/* Outside any operation: the whole CALL is refused. */
 	expect_refusal(40, 0x7fffffff, NFSP_DECODE_MALFORMED, 40,
 		       "length exceeds remaining record");	/* tag */
-	expect_refusal(52, 1000, NFSP_DECODE_MALFORMED, 52,
-		       "count exceeds remaining record");
+	/* The operation count is not checked as a whole: three operations
+	 * decode and the fourth opcode word is missing (knfsd refuses). */
+	expect_refusal(52, 1000, NFSP_DECODE_TRUNCATED, 184,
+		       "record ends here");
 	/* Inside an operation: the operations before it stay (partial). */
 	expect_partial(176, 17, 176, "length exceeds bound", 2, 172);
 	expect_partial(176, 8, 176, "length exceeds remaining record", 2,
@@ -1236,6 +1238,92 @@ static void test_random_edits(void)
 /* A table whose CALL reaches a response operation union is refused, not
  * read as a second request operation list.  The normalizer never emits
  * one (test_normalize: test_operation_union_of_the_other_direction). */
+/* Copy of tproto minor `k` whose COMPOUND arguments are {tag, argarray,
+ * minorversion}: an operation array before the minor-version selector, a
+ * layout the normalizer accepts.  Returns 0 on a table it cannot copy. */
+static int reorder_selector(int k, struct nfsp_protocol_schema *sch,
+			    struct nfsp_schema_field *fields, size_t cap)
+{
+	const struct nfsp_protocol_schema *o =
+		nfsp_schema_family_tproto.schemas[k];
+	const struct nfsp_schema_proc *pr = nfsp_schema_proc(o, 1);
+	const struct nfsp_schema_type *args;
+	size_t n = 0;
+	struct nfsp_schema_field t;
+
+	if (!pr || o->selector_field != 1)
+		return 0;
+	for (uint32_t i = 0; i < o->ntypes; i++)
+		if (o->types[i].kind == NFSP_XK_STRUCT &&
+		    o->types[i].first + o->types[i].count > n)
+			n = o->types[i].first + o->types[i].count;
+	if (n > cap)
+		return 0;
+	memcpy(fields, o->fields, n * sizeof(fields[0]));
+	args = &o->types[pr->arg];
+	t = fields[args->first + 1];
+	fields[args->first + 1] = fields[args->first + 2];
+	fields[args->first + 2] = t;
+	*sch = *o;
+	sch->fields = fields;
+	sch->selector_field = 2;
+	return 1;
+}
+
+/* A failure while reading the minor-version prefix is no partial: no
+ * schema is chosen yet (PR #29 review).  The body decode, once a schema is
+ * chosen, still is. */
+static void test_ops_before_selector(void)
+{
+	static struct nfsp_schema_field f0[256], f1[256];
+	static struct nfsp_protocol_schema s0, s1;
+	const struct nfsp_protocol_schema *schs[2] = { &s0, &s1 };
+	struct nfsp_schema_family fam = nfsp_schema_family_tproto;
+	const struct nfsp_schema_family *f[1] = { &fam };
+	struct nfsp_rpc_envelope env;
+	struct nfsp_decode_input in;
+	struct nfsp_decoded_msg m = {0};
+	struct msg c;
+
+	printf("tables: an operation array before the minor selector\n");
+	CHECK(reorder_selector(0, &s0, f0, 256) &&
+	      reorder_selector(1, &s1, f1, 256), "cannot copy tproto");
+	fam.schemas = schs;
+	fam.nschemas = 2;
+	memset(&in, 0, sizeof(in));
+	in.rpc = &env;
+
+	call_header(&c, TPROTO_PROG, 1, 1);
+	w32(&c, 0);		/* 40 tag */
+	w32(&c, 1);		/* 44 argarray count */
+	w32(&c, 1);		/* 48 OP_PING */
+	w32(&c, 0);		/* 52 minorversion */
+	in.payload = c.b, in.len = c.n;
+	nfsp_rpc_decode(c.b, c.n, &env);
+	CHECK(nfsp_nfs_decode(f, 1, &in, &m) == NFSP_DECODE_DECODED &&
+	      m.schema == &s0 && m.nops == 1, "reordered PING: %s",
+	      nfsp_decode_strstatus(m.status));
+
+	call_header(&c, TPROTO_PROG, 1, 1);
+	w32(&c, 0);		/* 40 tag */
+	w32(&c, 2);		/* 44 argarray count */
+	w32(&c, 1);		/* 48 OP_PING */
+	w32(&c, 2);		/* 52 OP_WRITE, arguments missing */
+	in.payload = c.b, in.len = c.n;
+	nfsp_rpc_decode(c.b, c.n, &env);
+	CHECK(nfsp_nfs_decode(f, 1, &in, &m) == NFSP_DECODE_TRUNCATED &&
+	      !m.schema && m.nfields == 0 && m.nops == 0,
+	      "probe cut in WRITE: %s, %u fields",
+	      nfsp_decode_strstatus(m.status), m.nfields);
+	c.b[55] = 99;		/* 52: undeclared opcode */
+	nfsp_rpc_decode(c.b, c.n, &env);
+	CHECK(nfsp_nfs_decode(f, 1, &in, &m) == NFSP_DECODE_MALFORMED &&
+	      !m.schema && m.nfields == 0 && m.nops == 0,
+	      "probe at opcode 99: %s, %u fields",
+	      nfsp_decode_strstatus(m.status), m.nfields);
+	nfsp_decoded_msg_free(&m);
+}
+
 static void test_other_direction_op_union(void)
 {
 	const struct nfsp_protocol_schema *orig =
@@ -1326,6 +1414,7 @@ int main(void)
 	test_address_oracle();
 	test_random_edits();
 	test_other_direction_op_union();
+	test_ops_before_selector();
 	test_bad_input();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

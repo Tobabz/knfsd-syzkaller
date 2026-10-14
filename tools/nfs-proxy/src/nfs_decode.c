@@ -38,6 +38,8 @@ struct dec {
 	uint32_t op_start;	/* payload offset where its result begins */
 	enum nfsp_decode_status st;
 	uint32_t stop_field;	/* partial: the operation array node */
+	int probing;		/* reading the minor-version prefix: no schema
+				 * is chosen yet, so nothing is partial */
 };
 
 static const char *kind_name(uint8_t kind)
@@ -277,7 +279,7 @@ static int dec_bytes(struct dec *d, uint16_t t, uint32_t me)
  * stops at the first that fails (nfsd4_decode_compound). */
 static int ops_array(const struct dec *d, const struct nfsp_schema_type *ty)
 {
-	return !d->response && d->len >= 4u &&
+	return !d->response && !d->probing && d->len >= 4u &&
 	       (d->s->types[ty->sub].flags & NFSP_STF_OPS_REQUEST);
 }
 
@@ -328,8 +330,14 @@ static int dec_array(struct dec *d, uint16_t t, uint32_t me)
 			return fail(d, NFSP_DECODE_MALFORMED, t,
 				    "count exceeds bound");
 		/* min_size > 0 is a normalizer guarantee; this check bounds
-		 * the loop below by the bytes actually present. */
-		if ((uint64_t)count * min > remaining(d) - 4u)
+		 * the loop below by the bytes actually present.  A CALL's
+		 * operation array is not checked as a whole: knfsd reads
+		 * operations until one fails and never looks at the count of
+		 * those after it, and each element is checked as it is read
+		 * (an element needs at least its opcode word, so the loop
+		 * still ends with the record). */
+		if (!ops_array(d, ty) &&
+		    (uint64_t)count * min > remaining(d) - 4u)
 			return fail(d, NFSP_DECODE_MALFORMED, t,
 				    "count exceeds remaining record");
 		meta(d, me, NFSP_META_COUNT, d->off, 4);
@@ -640,14 +648,18 @@ static int probe_minor(struct dec *d, const struct nfsp_schema_family *fam,
 			      "minor-version selector has no argument"), -1;
 	ty = &s0->types[pr->arg];
 	d->s = s0;
+	d->probing = 1;
 	for (uint32_t k = 0; k <= s0->selector_field && k < ty->count; k++) {
 		const struct nfsp_schema_field *f = &s0->fields[ty->first + k];
 
 		idx = d->m->nfields;
 		if (decode(d, f->type, NFSP_FIELD_NONE, pr->name, f->name,
-			   NFSP_FIELD_NONE))
+			   NFSP_FIELD_NONE)) {
+			d->probing = 0;
 			return -1;
+		}
 	}
+	d->probing = 0;
 	*minor = (uint32_t)d->m->fields[idx].value;
 	return 0;
 }

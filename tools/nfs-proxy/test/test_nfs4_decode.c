@@ -1362,14 +1362,60 @@ static void test_malformed(void)
 	 * request (its opcode read fails), so this is no partial. */
 	REFUSED(build_open_call, NULL, 72, 5, NFSP_DECODE_TRUNCATED, 236,
 		"record ends here");			/* count 5, four ops */
-	REFUSED(build_open_call, NULL, 72, 1000, bad, 72,
-		"count exceeds remaining record");
+	/* The operation count is not checked as a whole: the four operations
+	 * decode and the fifth opcode word is missing. */
+	REFUSED(build_open_call, NULL, 72, 1000, NFSP_DECODE_TRUNCATED, 236,
+		"record ends here");
 	REFUSED(build_readdir_reply, &rd, 160, 2, bad, 160,
 		"list link is not 0 or 1");
 	REFUSED(build_readdir_reply, &rd, 216, 2, bad, 216,
 		"bool is not 0 or 1");
 	REFUSED(build_readdir_reply, &rd, 92, 99999, bad, 92,
 		"enum value not declared");		/* nfsstat4 */
+}
+
+/* A short COMPOUND: AUTH_SYS header, empty tag, minor 0, then `n` words
+ * from `ops`.  knfsd reads operations until one fails and never looks at
+ * the count of those after it (nfsd4_decode_compound). */
+static void short_compound(struct msg *m, uint32_t count,
+			   const uint32_t *ops, size_t n)
+{
+	call_header(m, 1);
+	w32(m, 0);			/* 64 tag */
+	w32(m, 0);			/* 68 minorversion */
+	w32(m, count);			/* 72 argarray count */
+	for (size_t i = 0; i < n; i++)
+		w32(m, ops[i]);		/* 76, 80, ... */
+}
+
+static void test_short_compound(void)
+{
+	static const uint32_t putroot_read[] = { 24, 25 };
+	static const uint32_t putroot_bad[] = { 24, 99999 };
+	static const uint32_t putroot2[] = { 24, 24 };
+	struct nfsp_decoded_msg m = {0};
+	struct msg v;
+
+	printf("short COMPOUND: partial where knfsd stops\n");
+	/* PUTROOTFH, then READ with no arguments: knfsd stops at READ. */
+	short_compound(&v, 3, putroot_read, 2);
+	expect_partial_at(&v, 1, 80, 25, "count 3, READ without args");
+	short_compound(&v, 2, putroot_read, 2);
+	expect_partial_at(&v, 1, 80, 25, "count 2, READ without args");
+	short_compound(&v, 3, putroot_bad, 2);
+	expect_partial_at(&v, 1, 80, 99999, "count 3, opcode 99999");
+	/* The third opcode word is missing: knfsd refuses the request. */
+	short_compound(&v, 3, putroot2, 2);
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_TRUNCATED &&
+	      m.failure.offset == 84 && m.nfields == 0 && m.nops == 0,
+	      "missing third opcode: %s at %u",
+	      nfsp_decode_strstatus(m.status), m.failure.offset);
+	short_compound(&v, 0xffffffffu, putroot2, 2);
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_TRUNCATED &&
+	      m.failure.offset == 84 && m.nfields == 0,
+	      "huge count: %s at %u", nfsp_decode_strstatus(m.status),
+	      m.failure.offset);
+	nfsp_decoded_msg_free(&m);
 }
 
 /* In a CALL, knfsd reads sa_cachethis as a plain word and skips padding
@@ -1545,6 +1591,7 @@ int main(void)
 	test_truncation();
 	test_malformed();
 	test_lenient_call();
+	test_short_compound();
 	test_address_oracle();
 	test_random_edits();
 	printf("%d checks, %d failures\n", checks, failures);

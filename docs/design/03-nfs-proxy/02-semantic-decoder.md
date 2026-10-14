@@ -724,7 +724,10 @@ operation은 실행한 뒤 실패한 operation에 오류를 돌려준다. minor 
 그래서 decoder는 실패한 operation 앞의 operation을 field와 operation으로 남기고, 실패한 operation과 그 뒤의
 bytes는 기술하지 않는다. operation 배열과 그것을 담는 node의 span은 실패한 operation의 시작(`op_offset`)에서
 끝난다. opcode word를 읽기 전에 record가 끝나면 knfsd가 요청 전체를 거부하므로 `partial`이 아니라
-`truncated`다. operation 밖의 실패(tag, minor version, operation 수)는 지금처럼 메시지 전체 실패다. REPLY에는
+`truncated`다. operation 배열의 count는 record 길이와 한꺼번에 비교하지 않는다. knfsd는 실패한 operation 뒤를
+읽지 않으므로 각 operation을 읽을 때 검사한다. operation 밖의 실패(tag, minor version, operation 수의 bound)는
+지금처럼 메시지 전체 실패다. `partial`은 schema를 고른 뒤의 procedure body decode에서만 생긴다. minor version
+앞부분을 읽는 동안(schema 선택 전)의 실패는 메시지 전체 실패다. REPLY에는
 `partial`이 없다. 읽는 쪽이 client이고, §14의 엄격한 result decode가 잘못된 dispatch를 드러내기 때문이다.
 
 RPCSEC_GSS credential을 가진 CALL, 그런 CALL의 REPLY(`reply_dispatch.cred_flavor`), verifier가 RPCSEC_GSS인
