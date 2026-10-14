@@ -995,8 +995,23 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
   밖이다.
 - **결정됨(M2):** NFSv4 NULL procedure는 COMPOUND가 없어 minor version이 없다. 그래서 하나의
   ProtocolSchema를 고를 수 없고 `unsupported_schema`다. 그 REPLY는 §14 표대로 `dispatch_incomplete`다.
-- **미결:** NFS XDR snapshot 반입. NFSv4.0/4.1/4.2는 RFC 7531/5662/7863의 XDR을 추출해 pin한다. NFSv3는
-  RFC 1813에 추출 가능한 XDR 파일이 없어 source 형태를 따로 정해야 한다.
+- **결정됨(M2):** NFSv4.0/4.1/4.2 XDR snapshot은 RFC 7531/5662/7863이다. 각 RFC 본문(.txt)의 SHA-256을
+  pin하고, 그 RFC에 적힌 `///` 추출 script를 그대로 실행한 출력만 `tools/nfs-proxy/schema/nfs4/`에 commit한다
+  (`SOURCES`, `schema/rfc_xdr.py`). 추출 파일의 SHA-256도 pin하고 `build.sh`가 확인한다. errata는 적용하지
+  않았다(2026-10-13 기준 XDR을 바꾸는 verified erratum 없음). XDR이 선언하지 않고 rpcgen의 C 환경에서 가져오는
+  이름(주석으로만 적힌 basic typedef, RFC 5531의 `auth_flavor`와 `authsys_parms`)은 같은 pinned text에서
+  규칙으로 만든 `prelude.x`가 공급한다. 손으로 쓴 XDR은 없다.
+- **미결:** NFSv3 XDR source. RFC 1813에는 추출 가능한 XDR 파일이 없어 source 형태를 따로 정해야 한다.
+- **결정됨(2026-10-13, 저장소 소유자):** knfsd가 구현하는 NFSv4.2 확장을 지원한다. RFC 8276 xattr operation
+  (72-75)과 RFC 9754 delegation type(4, 5)의 XDR을 RFC에서 추출해 pin하고(`SOURCES`), normalizer의 `extension`
+  규칙이 RFC 7863 위에 합친다. 합치는 규칙은 새 정의 추가, 값이 늘어난 enum 재정의, RFC의 "Following lines are
+  to be added to" 블록뿐이고 그 밖의 재정의는 build error다(`tools/nfs-proxy/schema/README.md`).
+- **결정됨(2026-10-13, 저장소 소유자):** RFC 9754는 delegation type 4, 5를 선언하지만 `open_delegation4`에 그
+  arm을 두지 않는다. 이것만 annotation `alias-arm`으로 READ, WRITE arm과 같은 layout으로 decode한다. 근거는 knfsd
+  `fs/nfsd/nfs4xdr.c`의 `nfsd4_encode_open_delegation4`와 Linux client decoder다. XDR 밖의 layout 사실은 이
+  annotation 하나로만 허용한다.
+- **결정됨(2026-10-13, 저장소 소유자):** errata는 Verified이면서 XDR을 바꾸는 것만 적용한다. pin한 RFC마다
+  errata와 결정을 `SOURCES`에 적는다.
 - **미결:** NFS callback/backchannel program의 initial schema coverage.
 - **미결:** request/response consistency 검증(§14)은 request context가 있어야 한다. M3 TransactionEntry가
   생기기 전까지 M2 decoder의 `request_context`는 항상 0이다.

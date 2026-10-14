@@ -5,8 +5,8 @@
 # it is the constraint this repository operates under (see
 # tools/build-ganesha-deps.sh for the same reasoning applied to the guest side).
 # python3 (standard library only) runs the ProtocolSchema normalizer's tests
-# and proves the committed schema tables are fresh; the C build never needs it,
-# so the guest build container does not either.
+# and proves the pinned XDR files and committed schema tables are fresh; the C
+# build never needs it, so the guest build container does not either.
 #
 # Linux only.  test_control needs AF_UNIX/SOCK_SEQPACKET, the legacy arm
 # transport, and test_proxy binds 127.0.0.2/.3 and 127.0.0.10/.11, which Linux
@@ -73,6 +73,7 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_rpc_record:$TEST/test_rpc_record.c:$SRC/rpc_record.c:$SRC/framing.c\
        test_rpc_decode:$TEST/test_rpc_decode.c:$SRC/rpc_decode.c:$SRC/rpc_record.c:$SRC/walk.c\
        test_nfs_decode:$TEST/test_nfs_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$TEST/schema_tproto.c:$TEST/schema_tflat.c\
+       test_nfs4_decode:$TEST/test_nfs4_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c:$SRC/rpc_record.c:$SRC/rpc_decode.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
 
@@ -80,7 +81,13 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
 # A table is committed so the C build (and the guest build container) needs
 # no Python; this list is how a stale one is caught.
 SCHEMAS="$TEST/schema/tproto.ann:$TEST/schema_tproto.c\
-	 $TEST/schema/tflat.ann:$TEST/schema_tflat.c"
+	 $TEST/schema/tflat.ann:$TEST/schema_tflat.c\
+	 $HERE/schema/nfs4/nfs4.ann:$SRC/schema_nfs4.c"
+
+# Pinned RFC XDR: every file here must still hash to its SOURCES pin.  The
+# offline check only; `schema/rfc_xdr.py SOURCES --verify` re-extracts from
+# the RFCs themselves and needs the network.
+XDR_SOURCES="$HERE/schema/nfs4/SOURCES"
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
 for c in "$CC" "$SANCC" python3; do
@@ -94,18 +101,26 @@ done
 # types, non-empty array elements, bounded depth), so its tests run first, and
 # every committed table must be exactly what the normalizer produces today.
 echo "=== schema normalizer tests (python3) ==="
-if ! out=$(python3 "$HERE/schema/test_normalize.py" -q 2>&1); then
-	printf '%s\n' "$out" >&2
-	echo "FATAL: schema normalizer tests failed" >&2
-	exit 1
-fi
+for t in test_normalize.py test_rfc_xdr.py; do
+	if ! out=$(python3 "$HERE/schema/$t" -q 2>&1); then
+		printf '%s\n' "$out" >&2
+		echo "FATAL: schema/$t failed" >&2
+		exit 1
+	fi
+done
+for m in $XDR_SOURCES; do
+	python3 "$HERE/schema/rfc_xdr.py" "$m" --check || {
+		echo "FATAL: XDR source differs from its pin in $m" >&2
+		exit 1
+	}
+done
 for pair in $SCHEMAS; do
 	python3 "$HERE/schema/normalize.py" "${pair%%:*}" --check "${pair#*:}" || {
 		echo "FATAL: stale schema table ${pair#*:}" >&2
 		exit 1
 	}
 done
-echo "  OK: normalizer tests, $(echo $SCHEMAS | wc -w) schema tables fresh"
+echo "  OK: normalizer tests, XDR pins, $(echo $SCHEMAS | wc -w) schema tables fresh"
 
 # Prove the sanitizer toolchain works BEFORE relying on it, with the error
 # visible.  A sanitizer pass that silently does not happen is worse than no
