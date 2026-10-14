@@ -1302,12 +1302,13 @@ Host tests 뒤 실제 lane/guest에서 semantic request/response mutation과 rep
 - **부분 해결:** NFSv4 ProtocolSchema source/artifact path는 고정됐다. NFSv3 source는 남았다.
 - **부분 해결:** M1-M4 source/API 이름은 고정됐다. M5-M6 source/API는 남았다.
 - **해결:** semantic rule serialization은 canonical binary `NFSPRUL1`로 고정됐다.
-- **미결:** semantic journal binary format/magic.
+- **부분 해결:** host framing `NFSPJNL1`과 ACK envelope은 `05` §45에 고정했다.
+  bounded codec/prefix reader는 구현됐으며 event payload encoding/admission, durable sink와 transport는 남았다.
 - **미결:** legacy/semantic CLI mode exact flags/config format.
 - **부분 해결:** initial NFSv4.0/4.1/4.2 component subset은 고정됐다. NFSv3와 promotion
   subset은 남았다.
-- **부분 해결:** context/rules/resolved-edit/activation component limits는 고정됐다.
-  M5-M6 journal/replay limits는 남았다.
+- **부분 해결:** context/rules/resolved-edit/activation 및 journal frame/segment limits는 고정됐다.
+  M5 session 전체 저장량·회전과 M6 replay limits는 남았다.
 - **미결:** v4.0 separate callback routing을 initial implementation에 포함할지 별도 milestone로 둘지.
 - **미결:** guest-to-host journal transport, rule set 설치 경로, activation 메시지 형식.
 - **미검증:** current source refactor 후 syz-manager workload performance.
