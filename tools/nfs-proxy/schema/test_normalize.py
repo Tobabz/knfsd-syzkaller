@@ -625,6 +625,32 @@ class Extensions(unittest.TestCase):
                      "redefinition of D_READ")
         self.refused("enum dtype { D_NONE = 0 };", "changes or drops")
 
+    def two_ext(self, e, f):
+        ann = EXT_ANN + "extension 2 f.x\n"
+        with Tmp(EXT_BASE, ann, {"u.x": EXT_BASE, "e.x": e, "f.x": f}) as a:
+            return nz.normalize(a)[1]
+
+    def test_restatements_of_one_enum_add_up(self):
+        # RFC 8435 and RFC 8154 each restate layouttype4 as RFC 5662 has
+        # it plus their own value.
+        flex = "enum dtype { D_NONE = 0, D_READ = 1, D_FLEX = 4 };"
+        scsi = "enum dtype { D_NONE = 0, D_READ = 1, D_SCSI = 5 };"
+        for e, f in ((flex, scsi), (scsi, flex)):
+            (_, m2) = self.two_ext(e, f)
+            self.assertEqual(sorted(v for _, v in
+                                    types_by_name(m2)["dtype"]["values"]),
+                             [0, 1, 4, 5])
+
+    def test_restatements_must_agree(self):
+        with self.assertRaises(nz.SchemaError) as cm:
+            self.two_ext("enum dtype { D_NONE = 0, D_READ = 1, D_X = 4 };",
+                         "enum dtype { D_NONE = 0, D_READ = 1, D_Y = 4 };")
+        self.assertIn("one value two names", str(cm.exception))
+        with self.assertRaises(nz.SchemaError) as cm:
+            self.two_ext("enum dtype { D_NONE = 0, D_READ = 1, D_X = 4 };",
+                         "enum dtype { D_NONE = 0, D_READ = 1, D_X = 5 };")
+        self.assertIn("redefinition of D_X", str(cm.exception))
+
     def test_other_redefinitions_stay_errors(self):
         self.refused("struct rdeleg { hyper sid; };", "redefinition")
 

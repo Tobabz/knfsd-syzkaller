@@ -3,8 +3,9 @@
 # The XDR is RFC 7531, RFC 5662 and RFC 7863, extracted and pinned by
 # SOURCES.  This file names things; it never states a field, offset or width.
 notice Derived from the IETF Code Components of RFC 7531, RFC 5662, RFC 7863,
-notice RFC 8276 and RFC 9754 (Copyright IETF Trust and the persons identified
-notice as authors of the code) under the Simplified (Revised) BSD License,
+notice RFC 8276, RFC 9754, RFC 8435 and RFC 8154 (Copyright IETF Trust and the
+notice persons identified as authors of the code) under the Simplified
+notice (Revised) BSD License,
 notice whose text heads tools/nfs-proxy/schema/nfs4/rfc7531.x, rfc5662.x,
 notice rfc7863.x and rfc8276.x, and from two RFC 5531 definitions; see
 notice THIRD-PARTY-LICENSES.md.
@@ -30,5 +31,12 @@ extension 2 rfc9754.x
 # Linux client's decoder.
 alias-arm open_delegation4 OPEN_DELEGATE_READ_ATTRS_DELEG OPEN_DELEGATE_READ
 alias-arm open_delegation4 OPEN_DELEGATE_WRITE_ATTRS_DELEG OPEN_DELEGATE_WRITE
+# pNFS layout types knfsd implements: flex files (RFC 8435) and SCSI
+# (RFC 8154) add values to RFC 5662's layouttype4.  Layout bodies stay
+# opaque, so nothing else changes.
+extension 1 rfc8435-layouttype4.x
+extension 1 rfc8154-layouttype4.x
+extension 2 rfc8435-layouttype4.x
+extension 2 rfc8154-layouttype4.x
 # Every other case label keeps its lowercased XDR name (nfs4err_denied, ...).
 branch NFS4_OK ok

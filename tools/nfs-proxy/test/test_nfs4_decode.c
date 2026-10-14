@@ -57,6 +57,7 @@ static const struct nfsp_schema_family *const fams[] = {
 #define OP_SEQUENCE	53u
 #define OP_SEEK		69u	/* NFSv4.2 */
 #define OP_GETXATTR	72u	/* RFC 8276, an NFSv4.2 extension */
+#define OP_LAYOUTGET	50u
 
 #define SESSIONID	"sess-0123456789a"	/* sessionid4[16] */
 #define DIRFH		"dir-fh-00001"		/* nfs_fh4, 12 bytes */
@@ -355,6 +356,52 @@ static void build_getxattr_call(struct msg *m)
 	wopaque(m, FILEFH);		/* 116 object: len, 120..131 */
 	w32(m, OP_GETXATTR);		/* 132 */
 	wopaque(m, "user.test");	/* 136 gxa_name: len, 140..148, pad */
+}					/* 152 */
+
+/* NFSv4.1 LAYOUTGET for a flex files layout (RFC 8435), as the Linux
+ * client's nfs4_xdr_enc_layoutget sends it.  192 bytes. */
+static void build_layoutget_call(struct msg *m)
+{
+	call_header(m, 1);
+	w32(m, 0);			/*  64 tag */
+	w32(m, 1);			/*  68 minorversion */
+	w32(m, 3);			/*  72 argarray count */
+	sequence_args(m, 0x15, 0);	/*  76 SEQUENCE, 80..111 */
+	w32(m, OP_PUTFH);		/* 112 */
+	wopaque(m, FILEFH);		/* 116 object: len, 120..131 */
+	w32(m, OP_LAYOUTGET);		/* 132 */
+	w32(m, 0);			/* 136 loga_signal_layout_avail */
+	w32(m, 4);			/* 140 loga_layout_type FLEX_FILES */
+	w32(m, 1);			/* 144 loga_iomode LAYOUTIOMODE4_READ */
+	w64(m, 0);			/* 148 loga_offset */
+	w64(m, ~0ull);			/* 156 loga_length */
+	w64(m, 0);			/* 164 loga_minlength */
+	w32(m, 1);			/* 172 loga_stateid.seqid */
+	wraw(m, OTHER, 12);		/* 176 loga_stateid.other */
+	w32(m, 4096);			/* 188 loga_maxcount */
+}					/* 192 */
+
+/* knfsd's reply for a SCSI layout (RFC 8154), body abridged.  152 bytes. */
+static void build_layoutget_reply(struct msg *m)
+{
+	reply_header(m);
+	w32(m, 0);			/*  24 status */
+	w32(m, 0);			/*  28 tag */
+	w32(m, 3);			/*  32 resarray count */
+	sequence_res(m, 0x15);		/*  36 SEQUENCE, 40..79 */
+	w32(m, OP_PUTFH);		/*  80 */
+	w32(m, 0);			/*  84 status */
+	w32(m, OP_LAYOUTGET);		/*  88 */
+	w32(m, 0);			/*  92 logr_status */
+	w32(m, 1);			/*  96 logr_return_on_close */
+	w32(m, 2);			/* 100 logr_stateid.seqid */
+	wraw(m, OTHER, 12);		/* 104 logr_stateid.other */
+	w32(m, 1);			/* 116 logr_layout count */
+	w64(m, 0);			/* 120 lo_offset */
+	w64(m, ~0ull);			/* 128 lo_length */
+	w32(m, 1);			/* 136 lo_iomode */
+	w32(m, 5);			/* 140 loc_type SCSI */
+	wopaque(m, "abcd");		/* 144 loc_body: len, 148..151 */
 }					/* 152 */
 
 /* knfsd's reply: the value "abc".  104 bytes. */
@@ -1101,6 +1148,52 @@ static void test_extensions(void)
 	nfsp_decoded_msg_free(&m);
 }
 
+/* RFC 8435 flex files (4) and RFC 8154 SCSI (5) layout types, which knfsd
+ * implements, in 4.1 and 4.2.  The layout body stays opaque. */
+static void test_layout_types(void)
+{
+	struct nfsp_reply_dispatch rd = dispatch(1), rd42 = dispatch(2);
+	struct nfsp_decoded_msg m = {0};
+	static const char *const names[] = { "SEQUENCE", "PUTFH",
+					     "LAYOUTGET" };
+	static const uint32_t ok3[] = { 0, 0, 0 };
+	struct msg v;
+
+	printf("pNFS layout types: RFC 8435 flex files, RFC 8154 SCSI\n");
+	build_layoutget_call(&v);
+	CHECK(v.n == 192, "layoutget call length %zu", v.n);
+	if (decoded(&v, NULL, &m, "LAYOUTGET flex files call")) {
+		expect_ops(&m, 3, names, 0, NULL);
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_layout_type", 0,
+		       140, 4, 140, 4, 4);
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_maxcount", 0,
+		       188, 4, 188, 4, 4096);
+	}
+	put32(&v, 140, 5);
+	if (decoded(&v, NULL, &m, "LAYOUTGET SCSI call"))
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_layout_type", 0,
+		       140, 4, 140, 4, 5);
+	put32(&v, 68, 2);
+	if (decoded(&v, NULL, &m, "LAYOUTGET SCSI call in 4.2"))
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_layout_type", 0,
+		       140, 4, 140, 4, 5);
+
+	build_layoutget_reply(&v);
+	CHECK(v.n == 152, "layoutget reply length %zu", v.n);
+	if (decoded(&v, &rd, &m, "LAYOUTGET SCSI reply")) {
+		expect_ops(&m, 3, names, 1, ok3);
+		EXPECT(&m, "nfs4.response.LAYOUTGET.result.ok.logr_layout[]."
+		       "lo_content.loc_type", 0, 140, 4, 140, 4, 5);
+		EXPECT(&m, "nfs4.response.LAYOUTGET.result.ok.logr_layout[]."
+		       "lo_content.loc_body", 0, 144, 8, 148, 4, 0);
+	}
+	put32(&v, 140, 4);
+	if (decoded(&v, &rd42, &m, "LAYOUTGET flex files reply in 4.2"))
+		EXPECT(&m, "nfs4.response.LAYOUTGET.result.ok.logr_layout[]."
+		       "lo_content.loc_type", 0, 140, 4, 140, 4, 4);
+	nfsp_decoded_msg_free(&m);
+}
+
 typedef void (*builder)(struct msg *);
 
 struct golden {
@@ -1128,6 +1221,8 @@ static const struct golden goldens[] = {
 	{ "4.2 getxattr reply", build_getxattr_reply, 1, 2, 7 },
 	{ "4.2 read attrs deleg", build_open_reply_rdeleg, 1, 2, 20 },
 	{ "4.2 write attrs deleg", build_open_reply_wdeleg, 1, 2, 21 },
+	{ "4.1 layoutget call", build_layoutget_call, 0, 1, 11 },
+	{ "4.1 layoutget reply", build_layoutget_reply, 1, 1, 11 },
 };
 #define NGOLDEN (sizeof(goldens) / sizeof(goldens[0]))
 
@@ -1343,6 +1438,7 @@ int main(void)
 	test_minor_selection();
 	test_cross_check();
 	test_extensions();
+	test_layout_types();
 	test_truncation();
 	test_malformed();
 	test_address_oracle();

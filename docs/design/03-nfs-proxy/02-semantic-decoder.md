@@ -1012,6 +1012,14 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
   annotation 하나로만 허용한다.
 - **결정됨(2026-10-13, 저장소 소유자):** errata는 Verified이면서 XDR을 바꾸는 것만 적용한다. pin한 RFC마다
   errata와 결정을 `SOURCES`에 적는다.
+- **결정됨(2026-10-14, 저장소 소유자):** knfsd가 구현하는 pNFS layout type을 지원한다. 고정 커널 설정
+  (`bundle/patches/kernel.config`)은 `CONFIG_NFSD_FLEXFILELAYOUT`, `CONFIG_NFSD_SCSILAYOUT`을 켜고, knfsd
+  (`nfsd4_decode_layoutupdate4`)는 `layouttype4`를 `LAYOUT_TYPE_MAX`(6) 미만까지 받는다. RFC 8435(flex files,
+  4)와 RFC 8154(SCSI, 5)는 RFC 5662의 `layouttype4`를 `///` XDR이 아니라 본문에서만 다시 적으므로,
+  `rfc_xdr.py`의 `fragment`가 그 정의를 pin한 RFC text에서 규칙(`copy`)으로 옮기고 minor 1, 2의 `extension`으로
+  합친다. 두 RFC가 각각 자기 값만 더해 다시 적으므로, 값이 늘어난 enum 재정의는 source가 선언한 값을 모두 지키는
+  한 합집합으로 합친다(순서 무관, 한 값에 두 이름은 build error). layout body는 원래 `opaque`라 그 밖의 schema는
+  바뀌지 않는다.
 - **미결:** NFS callback/backchannel program의 initial schema coverage.
 - **미결:** request/response consistency 검증(§14)은 request context가 있어야 한다. M3 TransactionEntry가
   생기기 전까지 M2 decoder의 `request_context`는 항상 0이다.
