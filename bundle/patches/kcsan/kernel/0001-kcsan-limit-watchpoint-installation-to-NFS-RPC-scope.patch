@@ -1,0 +1,357 @@
+From cd6c0f23b4cf08c0f8f07b920a9fc88c698d4f30 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Tue, 13 Oct 2026 15:52:55 +0900
+Subject: [PATCH] kcsan: limit watchpoint installation to NFS/RPC scope
+
+Restrict KCSAN watchpoint installation to built-in NFS client, NFS common,
+lockd, SUNRPC, and NFSD code. Link-order markers bracket each scope without
+requiring policy registration or changes to syzkaller. Preserve the normal
+KCSAN sampling behavior inside the allowed scope and expose admitted and
+rejected candidate counters for validation.
+
+---
+ fs/lockd/Makefile                     |  2 ++
+ fs/lockd/kcsan-nfs-scope-end.S        |  4 +++
+ fs/lockd/kcsan-nfs-scope-start.S      |  4 +++
+ fs/nfs/Makefile                       |  2 ++
+ fs/nfs/kcsan-nfs-scope-end.S          |  4 +++
+ fs/nfs/kcsan-nfs-scope-start.S        |  4 +++
+ fs/nfs_common/Makefile                |  2 ++
+ fs/nfs_common/kcsan-nfs-scope-end.S   |  4 +++
+ fs/nfs_common/kcsan-nfs-scope-start.S |  4 +++
+ fs/nfsd/Makefile                      |  2 ++
+ fs/nfsd/kcsan-nfs-scope-end.S         |  4 +++
+ fs/nfsd/kcsan-nfs-scope-start.S       |  4 +++
+ include/linux/kcsan_nfs_scope.h       | 23 +++++++++++++
+ kernel/kcsan/core.c                   | 47 +++++++++++++++++++++++++++
+ kernel/kcsan/debugfs.c                |  2 ++
+ kernel/kcsan/kcsan.h                  |  4 +++
+ net/sunrpc/Makefile                   |  2 ++
+ net/sunrpc/kcsan-nfs-scope-end.S      |  4 +++
+ net/sunrpc/kcsan-nfs-scope-start.S    |  4 +++
+ 19 files changed, 126 insertions(+)
+ create mode 100644 fs/lockd/kcsan-nfs-scope-end.S
+ create mode 100644 fs/lockd/kcsan-nfs-scope-start.S
+ create mode 100644 fs/nfs/kcsan-nfs-scope-end.S
+ create mode 100644 fs/nfs/kcsan-nfs-scope-start.S
+ create mode 100644 fs/nfs_common/kcsan-nfs-scope-end.S
+ create mode 100644 fs/nfs_common/kcsan-nfs-scope-start.S
+ create mode 100644 fs/nfsd/kcsan-nfs-scope-end.S
+ create mode 100644 fs/nfsd/kcsan-nfs-scope-start.S
+ create mode 100644 include/linux/kcsan_nfs_scope.h
+ create mode 100644 net/sunrpc/kcsan-nfs-scope-end.S
+ create mode 100644 net/sunrpc/kcsan-nfs-scope-start.S
+
+diff --git a/fs/lockd/Makefile b/fs/lockd/Makefile
+index 3f9569d3b..955b6cd33 100644
+--- a/fs/lockd/Makefile
++++ b/fs/lockd/Makefile
+@@ -5,6 +5,7 @@
+ 
+ ccflags-y += -I$(src)			# needed for trace events
+ 
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-start.o
+ obj-$(CONFIG_LOCKD) += lockd.o
+ 
+ lockd-y := clntlock.o clntproc.o clntxdr.o host.o svc.o svclock.o \
+@@ -12,6 +13,7 @@ lockd-y := clntlock.o clntproc.o clntxdr.o host.o svc.o svclock.o \
+ 	   nlm3xdr_gen.o
+ lockd-$(CONFIG_LOCKD_V4) += clnt4xdr.o svc4proc.o nlm4xdr_gen.o
+ lockd-$(CONFIG_PROC_FS) += procfs.o
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-end.o
+ 
+ #
+ # XDR code generation (requires Python and additional packages)
+diff --git a/fs/lockd/kcsan-nfs-scope-end.S b/fs/lockd/kcsan-nfs-scope-end.S
+new file mode 100644
+index 000000000..614be952d
+--- /dev/null
++++ b/fs/lockd/kcsan-nfs-scope-end.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE lockd
++#define KCSAN_NFS_SCOPE_EDGE end
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/fs/lockd/kcsan-nfs-scope-start.S b/fs/lockd/kcsan-nfs-scope-start.S
+new file mode 100644
+index 000000000..345e0109c
+--- /dev/null
++++ b/fs/lockd/kcsan-nfs-scope-start.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE lockd
++#define KCSAN_NFS_SCOPE_EDGE start
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/fs/nfs/Makefile b/fs/nfs/Makefile
+index c895521f2..650a14fc7 100644
+--- a/fs/nfs/Makefile
++++ b/fs/nfs/Makefile
+@@ -3,6 +3,7 @@
+ # Makefile for the Linux nfs filesystem routines.
+ #
+ 
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-start.o
+ obj-$(CONFIG_NFS_FS) += nfs.o
+ 
+ CFLAGS_nfstrace.o += -I$(src)
+@@ -36,3 +37,4 @@ nfsv4-$(CONFIG_NFS_V4_2)	+= nfs42proc.o nfs42xattr.o
+ obj-$(CONFIG_PNFS_FILE_LAYOUT) += filelayout/
+ obj-$(CONFIG_PNFS_BLOCK) += blocklayout/
+ obj-$(CONFIG_PNFS_FLEXFILE_LAYOUT) += flexfilelayout/
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-end.o
+diff --git a/fs/nfs/kcsan-nfs-scope-end.S b/fs/nfs/kcsan-nfs-scope-end.S
+new file mode 100644
+index 000000000..de47de9d0
+--- /dev/null
++++ b/fs/nfs/kcsan-nfs-scope-end.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE nfs
++#define KCSAN_NFS_SCOPE_EDGE end
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/fs/nfs/kcsan-nfs-scope-start.S b/fs/nfs/kcsan-nfs-scope-start.S
+new file mode 100644
+index 000000000..0d3c206d0
+--- /dev/null
++++ b/fs/nfs/kcsan-nfs-scope-start.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE nfs
++#define KCSAN_NFS_SCOPE_EDGE start
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/fs/nfs_common/Makefile b/fs/nfs_common/Makefile
+index c10ead273..93f7b1326 100644
+--- a/fs/nfs_common/Makefile
++++ b/fs/nfs_common/Makefile
+@@ -3,6 +3,7 @@
+ # Makefile for Linux filesystem routines that are shared by client and server.
+ #
+ 
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-start.o
+ obj-$(CONFIG_NFS_ACL_SUPPORT) += nfs_acl.o
+ nfs_acl-objs := nfsacl.o
+ 
+@@ -14,3 +15,4 @@ obj-$(CONFIG_GRACE_PERIOD) += grace.o
+ obj-$(CONFIG_NFS_V4_2_SSC_HELPER) += nfs_ssc.o
+ 
+ obj-$(CONFIG_NFS_COMMON) += common.o
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-end.o
+diff --git a/fs/nfs_common/kcsan-nfs-scope-end.S b/fs/nfs_common/kcsan-nfs-scope-end.S
+new file mode 100644
+index 000000000..d20ec1761
+--- /dev/null
++++ b/fs/nfs_common/kcsan-nfs-scope-end.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE nfs_common
++#define KCSAN_NFS_SCOPE_EDGE end
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/fs/nfs_common/kcsan-nfs-scope-start.S b/fs/nfs_common/kcsan-nfs-scope-start.S
+new file mode 100644
+index 000000000..46cb89f08
+--- /dev/null
++++ b/fs/nfs_common/kcsan-nfs-scope-start.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE nfs_common
++#define KCSAN_NFS_SCOPE_EDGE start
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/fs/nfsd/Makefile b/fs/nfsd/Makefile
+index f0da4d69d..5b1f0520b 100644
+--- a/fs/nfsd/Makefile
++++ b/fs/nfsd/Makefile
+@@ -5,6 +5,7 @@
+ 
+ ccflags-y += -I$(src)			# needed for trace events
+ 
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-start.o
+ obj-$(CONFIG_NFSD)	+= nfsd.o
+ 
+ # this one should be compiled first, as the tracing macros can easily blow up
+@@ -25,6 +26,7 @@ nfsd-$(CONFIG_NFSD_SCSILAYOUT) += blocklayout.o blocklayoutxdr.o
+ nfsd-$(CONFIG_NFSD_FLEXFILELAYOUT) += flexfilelayout.o flexfilelayoutxdr.o
+ nfsd-$(CONFIG_NFS_LOCALIO) += localio.o
+ nfsd-$(CONFIG_DEBUG_FS) += debugfs.o
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-end.o
+ 
+ #
+ # XDR code generation (requires Python and additional packages)
+diff --git a/fs/nfsd/kcsan-nfs-scope-end.S b/fs/nfsd/kcsan-nfs-scope-end.S
+new file mode 100644
+index 000000000..d567b4d9f
+--- /dev/null
++++ b/fs/nfsd/kcsan-nfs-scope-end.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE nfsd
++#define KCSAN_NFS_SCOPE_EDGE end
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/fs/nfsd/kcsan-nfs-scope-start.S b/fs/nfsd/kcsan-nfs-scope-start.S
+new file mode 100644
+index 000000000..4b5784990
+--- /dev/null
++++ b/fs/nfsd/kcsan-nfs-scope-start.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE nfsd
++#define KCSAN_NFS_SCOPE_EDGE start
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/include/linux/kcsan_nfs_scope.h b/include/linux/kcsan_nfs_scope.h
+new file mode 100644
+index 000000000..bcadd5b2c
+--- /dev/null
++++ b/include/linux/kcsan_nfs_scope.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Assembly markers for built-in NFS/RPC watchpoint-installation scope. */
++#ifndef KCSAN_NFS_SCOPE
++#error "KCSAN_NFS_SCOPE must name the source directory"
++#endif
++#ifndef KCSAN_NFS_SCOPE_EDGE
++#error "KCSAN_NFS_SCOPE_EDGE must be start or end"
++#endif
++
++#define __KCSAN_NFS_SCOPE_SYMBOL(scope, section, edge) __kcsan_nfs_scope_##scope##_##section##_##edge
++#define KCSAN_NFS_SCOPE_SYMBOL(scope, section, edge) __KCSAN_NFS_SCOPE_SYMBOL(scope, section, edge)
++#define KCSAN_NFS_SCOPE_MARK(section, kind) \
++	.pushsection section, "ax"; \
++	.globl KCSAN_NFS_SCOPE_SYMBOL(KCSAN_NFS_SCOPE, kind, KCSAN_NFS_SCOPE_EDGE); \
++	KCSAN_NFS_SCOPE_SYMBOL(KCSAN_NFS_SCOPE, kind, KCSAN_NFS_SCOPE_EDGE):; \
++	.popsection
++
++KCSAN_NFS_SCOPE_MARK(.text, text)
++KCSAN_NFS_SCOPE_MARK(.text.hot, hot)
++KCSAN_NFS_SCOPE_MARK(.text.unlikely, unlikely)
++KCSAN_NFS_SCOPE_MARK(.text.split, split)
++
++.section .note.GNU-stack, "", @progbits
+diff --git a/kernel/kcsan/core.c b/kernel/kcsan/core.c
+index 2db82661c..338a177d4 100644
+--- a/kernel/kcsan/core.c
++++ b/kernel/kcsan/core.c
+@@ -26,6 +26,48 @@
+ #include "kcsan.h"
+ #include "permissive.h"
+ 
++/*
++ * The NFS/RPC scope brackets built-in NFS client, shared NFS, lockd, SUNRPC
++ * and NFSD text.
++ * Weak references keep KCSAN linkable if a directory is absent or modular.
++ */
++#define KCSAN_NFS_SCOPE_DECLARE(scope, section) \
++	extern char __kcsan_nfs_scope_##scope##_##section##_start[] __weak; \
++	extern char __kcsan_nfs_scope_##scope##_##section##_end[] __weak
++
++#define KCSAN_NFS_SCOPE_DECLARE_ALL(scope) \
++	KCSAN_NFS_SCOPE_DECLARE(scope, text); \
++	KCSAN_NFS_SCOPE_DECLARE(scope, hot); \
++	KCSAN_NFS_SCOPE_DECLARE(scope, unlikely); \
++	KCSAN_NFS_SCOPE_DECLARE(scope, split)
++
++KCSAN_NFS_SCOPE_DECLARE_ALL(nfs);
++KCSAN_NFS_SCOPE_DECLARE_ALL(nfs_common);
++KCSAN_NFS_SCOPE_DECLARE_ALL(lockd);
++KCSAN_NFS_SCOPE_DECLARE_ALL(sunrpc);
++KCSAN_NFS_SCOPE_DECLARE_ALL(nfsd);
++
++#define KCSAN_NFS_SCOPE_IN_RANGE(scope, section, ip) \
++	(__kcsan_nfs_scope_##scope##_##section##_start && \
++	 __kcsan_nfs_scope_##scope##_##section##_end && \
++	 (ip) >= (unsigned long)__kcsan_nfs_scope_##scope##_##section##_start && \
++	 (ip) < (unsigned long)__kcsan_nfs_scope_##scope##_##section##_end)
++
++#define KCSAN_NFS_SCOPE_CONTAINS(scope, ip) \
++	(KCSAN_NFS_SCOPE_IN_RANGE(scope, text, ip) || \
++	 KCSAN_NFS_SCOPE_IN_RANGE(scope, hot, ip) || \
++	 KCSAN_NFS_SCOPE_IN_RANGE(scope, unlikely, ip) || \
++	 KCSAN_NFS_SCOPE_IN_RANGE(scope, split, ip))
++
++static __always_inline bool kcsan_nfs_scope_contains(unsigned long ip)
++{
++	return KCSAN_NFS_SCOPE_CONTAINS(nfs, ip) ||
++	       KCSAN_NFS_SCOPE_CONTAINS(nfs_common, ip) ||
++	       KCSAN_NFS_SCOPE_CONTAINS(lockd, ip) ||
++	       KCSAN_NFS_SCOPE_CONTAINS(sunrpc, ip) ||
++	       KCSAN_NFS_SCOPE_CONTAINS(nfsd, ip);
++}
++
+ static bool kcsan_early_enable = IS_ENABLED(CONFIG_KCSAN_EARLY_ENABLE);
+ unsigned int kcsan_udelay_task = CONFIG_KCSAN_UDELAY_TASK;
+ unsigned int kcsan_udelay_interrupt = CONFIG_KCSAN_UDELAY_INTERRUPT;
+@@ -543,6 +585,11 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type, unsigned
+ 	 * should_watch().
+ 	 */
+ 	reset_kcsan_skip();
++	if (!kcsan_nfs_scope_contains(ip)) {
++		atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_NFS_SCOPE_REJECTED]);
++		goto out;
++	}
++	atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_NFS_SCOPE_ALLOWED]);
+ 
+ 	if (!kcsan_is_enabled(ctx))
+ 		goto out;
+diff --git a/kernel/kcsan/debugfs.c b/kernel/kcsan/debugfs.c
+index 2af39ba5b..139583e27 100644
+--- a/kernel/kcsan/debugfs.c
++++ b/kernel/kcsan/debugfs.c
+@@ -33,6 +33,8 @@ static const char *const counter_names[] = {
+ 	[KCSAN_COUNTER_RACES_UNKNOWN_ORIGIN]		= "races_unknown_origin",
+ 	[KCSAN_COUNTER_UNENCODABLE_ACCESSES]		= "unencodable_accesses",
+ 	[KCSAN_COUNTER_ENCODING_FALSE_POSITIVES]	= "encoding_false_positives",
++	[KCSAN_COUNTER_NFS_SCOPE_ALLOWED]		= "nfs_scope_allowed",
++	[KCSAN_COUNTER_NFS_SCOPE_REJECTED]	= "nfs_scope_rejected",
+ };
+ static_assert(ARRAY_SIZE(counter_names) == KCSAN_COUNTER_COUNT);
+ 
+diff --git a/kernel/kcsan/kcsan.h b/kernel/kcsan/kcsan.h
+index ae33c2a7f..a5feca526 100644
+--- a/kernel/kcsan/kcsan.h
++++ b/kernel/kcsan/kcsan.h
+@@ -85,6 +85,10 @@ enum kcsan_counter_id {
+ 	 */
+ 	KCSAN_COUNTER_ENCODING_FALSE_POSITIVES,
+ 
++	/* Watchpoint candidates admitted or rejected by the NFS/RPC scope. */
++	KCSAN_COUNTER_NFS_SCOPE_ALLOWED,
++	KCSAN_COUNTER_NFS_SCOPE_REJECTED,
++
+ 	KCSAN_COUNTER_COUNT, /* number of counters */
+ };
+ extern atomic_long_t kcsan_counters[KCSAN_COUNTER_COUNT];
+diff --git a/net/sunrpc/Makefile b/net/sunrpc/Makefile
+index 543bd86f2..458df1a3b 100644
+--- a/net/sunrpc/Makefile
++++ b/net/sunrpc/Makefile
+@@ -4,6 +4,7 @@
+ #
+ 
+ 
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-start.o
+ obj-$(CONFIG_SUNRPC) += sunrpc.o
+ obj-$(CONFIG_SUNRPC_GSS) += auth_gss/
+ obj-$(CONFIG_SUNRPC_XPRT_RDMA) += xprtrdma/
+@@ -19,3 +20,4 @@ sunrpc-$(CONFIG_SUNRPC_DEBUG) += debugfs.o
+ sunrpc-$(CONFIG_SUNRPC_BACKCHANNEL) += backchannel_rqst.o
+ sunrpc-$(CONFIG_PROC_FS) += stats.o
+ sunrpc-$(CONFIG_SYSCTL) += sysctl.o
++obj-$(CONFIG_KCSAN) += kcsan-nfs-scope-end.o
+diff --git a/net/sunrpc/kcsan-nfs-scope-end.S b/net/sunrpc/kcsan-nfs-scope-end.S
+new file mode 100644
+index 000000000..f7a18564d
+--- /dev/null
++++ b/net/sunrpc/kcsan-nfs-scope-end.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE sunrpc
++#define KCSAN_NFS_SCOPE_EDGE end
++#include <linux/kcsan_nfs_scope.h>
+diff --git a/net/sunrpc/kcsan-nfs-scope-start.S b/net/sunrpc/kcsan-nfs-scope-start.S
+new file mode 100644
+index 000000000..125c95848
+--- /dev/null
++++ b/net/sunrpc/kcsan-nfs-scope-start.S
+@@ -0,0 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define KCSAN_NFS_SCOPE sunrpc
++#define KCSAN_NFS_SCOPE_EDGE start
++#include <linux/kcsan_nfs_scope.h>
