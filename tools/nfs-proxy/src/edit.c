@@ -105,6 +105,159 @@ static void sort_resolved(struct resolved *res, size_t n)
 	}
 }
 
+/* All validation happens before this helper.  Keeping the byte-moving loop in
+ * one place is the reusable part of the legacy rebuild substrate: both paths
+ * copy untouched original spans and insert replacements in offset order. */
+static size_t rebuild_resolved(const struct resolved *res, size_t nres,
+			       const uint8_t *in, size_t in_len, uint8_t *out)
+{
+	size_t cursor = 0, o = 0;
+
+	for (size_t i = 0; i < nres; i++) {
+		size_t span = (size_t)res[i].offset - cursor;
+
+		memcpy(out + o, in + cursor, span);
+		o += span;
+		if (res[i].ins_len > 0u) {
+			memcpy(out + o, res[i].ins, res[i].ins_len);
+			o += res[i].ins_len;
+		}
+		cursor = (size_t)res[i].offset + res[i].remove;
+	}
+	memcpy(out + o, in + cursor, in_len - cursor);
+	o += in_len - cursor;
+	return o;
+}
+
+static enum nfsp_concrete_status
+concrete_prepare(const struct nfsp_concrete_edit_batch *batch,
+		 const uint8_t *in, size_t in_len, size_t max_output,
+		 struct resolved res[NFSP_CONCRETE_EDIT_MAX], size_t *final_len)
+{
+	size_t inserted = 0, removed = 0;
+	size_t covered_end = 0;
+	int have_covered = 0;
+
+	if (final_len != NULL)
+		*final_len = 0;
+	if (batch == NULL || batch->edits == NULL || batch->nedits == 0u ||
+	    batch->nedits > NFSP_CONCRETE_EDIT_MAX || in == NULL ||
+	    final_len == NULL)
+		return NFSP_CONCRETE_INVALID;
+
+	/* Fixed refusal priority makes the result independent of input order:
+	 * shape, bounds, conflicts, originals, then output size. */
+	for (size_t i = 0; i < batch->nedits; i++) {
+		const struct nfsp_concrete_edit *e = &batch->edits[i];
+
+		if ((e->remove_len == 0u && e->data_len == 0u) ||
+		    (e->remove_len != 0u && e->original == NULL) ||
+		    (e->data_len != 0u && e->data == NULL))
+			return NFSP_CONCRETE_INVALID;
+		res[i].offset = e->offset;
+		res[i].remove = e->remove_len;
+		res[i].ins = e->data;
+		res[i].ins_len = e->data_len;
+		res[i].order = 0;
+	}
+	for (size_t i = 0; i < batch->nedits; i++) {
+		const struct nfsp_concrete_edit *e = &batch->edits[i];
+
+		if ((size_t)e->offset > in_len ||
+		    (size_t)e->remove_len > in_len - (size_t)e->offset)
+			return NFSP_CONCRETE_BOUNDS;
+	}
+
+	sort_resolved(res, batch->nedits);
+	for (size_t i = 0; i < batch->nedits; i++) {
+		size_t end = (size_t)res[i].offset + res[i].remove;
+
+		if (i != 0u && res[i - 1u].offset == res[i].offset)
+			return NFSP_CONCRETE_CONFLICT;
+		if (have_covered && (size_t)res[i].offset < covered_end)
+			return NFSP_CONCRETE_CONFLICT;
+		if (res[i].remove != 0u) {
+			covered_end = end;
+			have_covered = 1;
+		}
+	}
+	for (size_t i = 0; i < batch->nedits; i++) {
+		const struct nfsp_concrete_edit *found = NULL;
+
+		/* Find the source edit after sorting.  Equal offsets have already
+		 * been refused, so the offset identifies it uniquely. */
+		for (size_t j = 0; j < batch->nedits; j++)
+			if (batch->edits[j].offset == res[i].offset) {
+				found = &batch->edits[j];
+				break;
+			}
+		if (found == NULL)
+			return NFSP_CONCRETE_INVALID;
+		if (res[i].remove != 0u &&
+		    memcmp(in + res[i].offset, found->original,
+			   res[i].remove) != 0)
+			return NFSP_CONCRETE_ORIGINAL_MISMATCH;
+		if (removed > (size_t)-1 - res[i].remove ||
+		    inserted > (size_t)-1 - res[i].ins_len)
+			return NFSP_CONCRETE_TOO_LARGE;
+		removed += res[i].remove;
+		inserted += res[i].ins_len;
+	}
+	if (removed > in_len || inserted > (size_t)-1 - (in_len - removed))
+		return NFSP_CONCRETE_TOO_LARGE;
+	*final_len = in_len - removed + inserted;
+	if (*final_len > max_output)
+		return NFSP_CONCRETE_TOO_LARGE;
+	return NFSP_CONCRETE_OK;
+}
+
+enum nfsp_concrete_status
+nfsp_concrete_preflight(const struct nfsp_concrete_edit_batch *batch,
+			const uint8_t *in, size_t in_len, size_t max_output,
+			size_t *final_len)
+{
+	struct resolved res[NFSP_CONCRETE_EDIT_MAX];
+
+	return concrete_prepare(batch, in, in_len, max_output, res, final_len);
+}
+
+enum nfsp_concrete_status
+nfsp_apply_concrete_batch(const struct nfsp_concrete_edit_batch *batch,
+			  const uint8_t *in, size_t in_len,
+			  uint8_t *out, size_t out_cap, size_t *out_len)
+{
+	struct resolved res[NFSP_CONCRETE_EDIT_MAX];
+	size_t final_len;
+	enum nfsp_concrete_status status;
+
+	if (out_len != NULL)
+		*out_len = 0;
+	if (out == NULL || out_len == NULL)
+		return NFSP_CONCRETE_INVALID;
+	status = concrete_prepare(batch, in, in_len, out_cap, res, &final_len);
+	if (status != NFSP_CONCRETE_OK)
+		return status;
+	*out_len = rebuild_resolved(res, batch->nedits, in, in_len, out);
+	if (*out_len != final_len) {
+		*out_len = 0;
+		return NFSP_CONCRETE_INVALID;
+	}
+	return NFSP_CONCRETE_OK;
+}
+
+const char *nfsp_concrete_strstatus(enum nfsp_concrete_status status)
+{
+	switch (status) {
+	case NFSP_CONCRETE_OK: return "ok";
+	case NFSP_CONCRETE_INVALID: return "invalid";
+	case NFSP_CONCRETE_BOUNDS: return "bounds";
+	case NFSP_CONCRETE_CONFLICT: return "conflict";
+	case NFSP_CONCRETE_ORIGINAL_MISMATCH: return "original_mismatch";
+	case NFSP_CONCRETE_TOO_LARGE: return "too_large";
+	}
+	return "unknown";
+}
+
 int nfsp_apply_edit_rules(const struct nfsp_edit_rule *const *rules,
 			  struct nfsp_edit_stats *const *stats, size_t nrules,
 			  const struct nfsp_msg_ctx *ctx,
@@ -116,7 +269,7 @@ int nfsp_apply_edit_rules(const struct nfsp_edit_rule *const *rules,
 	struct resolved res[NFSP_EDIT_RESOLVED_MAX + 1u];
 	uint8_t participating[64];
 	uint8_t opcount_buf[4];
-	size_t nres = 0, body_off = 0, body_end = 0, grown, cursor, o;
+	size_t nres = 0, body_off = 0, body_end = 0, grown, o;
 	size_t i, j, ntaking = 0;
 	const struct nfsp_slot *opcount_slot = NULL;
 	uint32_t op_bump = 0;
@@ -309,21 +462,7 @@ int nfsp_apply_edit_rules(const struct nfsp_edit_rule *const *rules,
 	}
 
 	/* --- rebuild the record once, in offset order --- */
-	cursor = 0;
-	o = 0;
-	for (i = 0; i < nres; i++) {
-		size_t span = (size_t)res[i].offset - cursor;
-
-		memcpy(out + o, in + cursor, span);
-		o += span;
-		if (res[i].ins_len > 0u) {
-			memcpy(out + o, res[i].ins, res[i].ins_len);
-			o += res[i].ins_len;
-		}
-		cursor = (size_t)res[i].offset + res[i].remove;
-	}
-	memcpy(out + o, in + cursor, in_len - cursor);
-	o += in_len - cursor;
+	o = rebuild_resolved(res, nres, in, in_len, out);
 
 	/* Rebuild the record marker from the final length: one last fragment. */
 	put32(out, (uint32_t)(o - NFSP_FRAG_HEADER_LEN) | NFSP_LAST_FRAGMENT);
