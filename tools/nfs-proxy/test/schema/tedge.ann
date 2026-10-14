@@ -1,0 +1,9 @@
+# Semantic annotations for the tedge host-test protocol.
+family tedge
+program TEDGE_PROGRAM TEDGE_V1
+procedure-prefix TEPROC_
+leaf args result
+operation request te_argop args OP_
+operation response te_resop result OP_
+status-type te_status
+source tedge.x

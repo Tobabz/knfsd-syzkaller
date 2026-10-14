@@ -22,6 +22,7 @@
 extern const struct nfsp_schema_family nfsp_schema_family_nfs4;
 extern const struct nfsp_schema_family nfsp_schema_family_tproto;
 extern const struct nfsp_schema_family nfsp_schema_family_tflat;
+extern const struct nfsp_schema_family nfsp_schema_family_tedge;
 
 static const struct nfsp_schema_family *const fams[] = {
 	&nfsp_schema_family_nfs4,
@@ -87,12 +88,15 @@ static void expect_node(struct gen *g, uint16_t t)
 }
 
 /* The naming rules of schema.h, written out a second time: a node's path
- * is its parent's plus ".<component>", or "[]" for an element. */
+ * is its parent's plus ".<component>", or "[]" for an element.  An
+ * operation union has no path under its container: it is a root. */
 static void gen_node(struct gen *g, size_t len, uint16_t t, unsigned depth)
 {
 	const struct nfsp_schema_type *ty = &g->s->types[t];
 	int n;
 
+	if (ops_union(g->s, t))
+		return;
 	expect_node(g, t);
 	if (depth > 40 || len > 600)
 		return;
@@ -109,8 +113,6 @@ static void gen_node(struct gen *g, size_t len, uint16_t t, unsigned depth)
 		}
 		break;
 	case NFSP_XK_UNION:
-		if (ops_union(g->s, t))
-			break;
 		n = snprintf(g->path + len, sizeof(g->path) - len, ".%s",
 			     ty->disc_name);
 		gen_node(g, len + (size_t)n, ty->sub, depth + 1);
@@ -129,9 +131,6 @@ static void gen_node(struct gen *g, size_t len, uint16_t t, unsigned depth)
 		break;
 	case NFSP_XK_ARRAY_FIXED:
 	case NFSP_XK_ARRAY_VAR:
-		if (ops_union(g->s, ty->sub))
-			break;
-		/* fall through */
 	case NFSP_XK_LIST:
 		memcpy(g->path + len, "[]", 3);
 		gen_node(g, len + 2, ty->sub, depth + 1);
@@ -203,7 +202,7 @@ static void test_every_path(void)
 {
 	const struct nfsp_schema_family *all[] = {
 		&nfsp_schema_family_nfs4, &nfsp_schema_family_tproto,
-		&nfsp_schema_family_tflat,
+		&nfsp_schema_family_tflat, &nfsp_schema_family_tedge,
 	};
 	unsigned paths = 0;
 
@@ -839,6 +838,53 @@ static void test_canonical(void)
 	for (uint32_t i = 1; i < 4; i++)
 		sp.preds[i] = sp.preds[0];
 	CHECK(parse_spec(&sp, 1, &err) == NFSP_RULE_OK, "four predicates");
+
+	/* A malformed predicate names itself, as a type error does (PR #33
+	 * review); a fault after the predicates names none. */
+	sp = golden_spec();
+	sp.npreds = 2;
+	sp.preds[1] = sp.preds[0];
+	sp.preds[1].op = NFSP_CMP_GE + 1u;
+	CHECK(parse_spec(&sp, 1, &err) == NFSP_RULE_MALFORMED &&
+	      err.rule == 0 && err.predicate == 1,
+	      "second comparison out of range: %s rule %u predicate %u",
+	      nfsp_rule_strstatus(err.status), err.rule, err.predicate);
+	sp.preds[1] = sp.preds[0];
+	sp.preds[1].lit.kind = NFSP_LIT_BOOL;
+	sp.preds[1].lit.num = 2;
+	CHECK(parse_spec(&sp, 1, &err) == NFSP_RULE_MALFORMED &&
+	      err.rule == 0 && err.predicate == 1,
+	      "second predicate bool 2: predicate %u", err.predicate);
+	sp.preds[1] = sp.preds[0];
+	sp.preds[1].lhs.path = SEQ_SLOTID;
+	CHECK(parse_spec(&sp, 1, &err) == NFSP_RULE_MALFORMED &&
+	      err.rule == 0 && err.predicate == 1,
+	      "second predicate target with a path: predicate %u",
+	      err.predicate);
+	sp.preds[0].op = NFSP_CMP_GE + 1u;
+	CHECK(parse_spec(&sp, 1, &err) == NFSP_RULE_MALFORMED &&
+	      err.predicate == 0, "first predicate: predicate %u",
+	      err.predicate);
+	sp = golden_spec();
+	sp.npreds = 2;
+	sp.preds[1] = sp.preds[0];
+	sp.mkind = NFSP_MUT_OP_PREPEND + 1u;
+	CHECK(parse_spec(&sp, 1, &err) == NFSP_RULE_MALFORMED &&
+	      err.rule == 0 && err.predicate == NFSP_RULE_NONE,
+	      "mutation kind after two predicates: predicate %u",
+	      err.predicate);
+	two[0] = golden_spec();
+	two[1] = golden_spec();
+	two[1].rule_id = "r2";
+	two[1].preds[0].op = NFSP_CMP_GE + 1u;
+	CHECK(parse_spec(two, 2, &err) == NFSP_RULE_MALFORMED &&
+	      err.rule == 1 && err.predicate == 0,
+	      "second rule's predicate: rule %u predicate %u", err.rule,
+	      err.predicate);
+	CHECK(nfsp_ruleset_parse(golden, sizeof(golden) - 1u, &rs, &err) ==
+	      NFSP_RULE_MALFORMED && err.rule == 0 &&
+	      err.predicate == NFSP_RULE_NONE,
+	      "a cut after the predicates: predicate %u", err.predicate);
 	sp = golden_spec();
 	sp.preds[0].lit.kind = NFSP_LIT_BOOL;
 	sp.preds[0].lit.num = 2;
@@ -875,6 +921,99 @@ static void test_canonical(void)
 		sp.xlit.len = NFSP_RULE_LITERAL_MAX + 1u;
 		CHECK(parse_spec(&sp, 1, &err) == NFSP_RULE_MALFORMED,
 		      "a literal beyond the bound");
+	}
+}
+
+/* Operation unions outside an operation array (PR #33 review): tedge has
+ * one as the whole argument of DIRECT and one as a member of EMBEDDED's.
+ * The decoder emits each operation only as its own root, so the container
+ * paths name nothing, and a rule on one is refused (test_nfs_decode checks
+ * the decoder side). */
+static void test_resolve_op_containers(void)
+{
+	const struct nfsp_protocol_schema *s = nfsp_schema_family_tedge.schemas[0];
+	static const char *const none[][2] = {
+		{ "0", "tedge.request.DIRECT.args" },
+		{ "0", "tedge.request.DIRECT.args.argop" },
+		{ "0", "tedge.request.DIRECT.args.args.value" },
+		{ "0", "tedge.request.EMBEDDED.args.operation" },
+		{ "0", "tedge.request.EMBEDDED.args.operation.argop" },
+		{ "1", "tedge.response.DIRECT.result" },
+		{ "1", "tedge.response.EMBEDDED.result.operation" },
+		{ "1", "tedge.response.EMBEDDED.result.operation.result" },
+	};
+	struct nfsp_schema_node n;
+	struct nfsp_ruleset rs;
+	struct nfsp_rule_error err;
+	const struct nfsp_schema_family *const tf[] = {
+		&nfsp_schema_family_tedge,
+	};
+	struct spec sp;
+	struct w w;
+
+	printf("resolve: operation unions outside an operation array\n");
+	for (size_t i = 0; i < sizeof(none) / sizeof(none[0]); i++)
+		CHECK(nfsp_schema_resolve(s, none[i][0][0] == '1', none[i][1],
+					  &n) == NFSP_SCHEMA_NOT_FOUND,
+		      "%s resolved", none[i][1]);
+	CHECK(nfsp_schema_resolve(s, 0, "tedge.request.EMBEDDED.args", &n) ==
+	      NFSP_SCHEMA_FOUND && n.flags == NFSP_SN_ROOT,
+	      "EMBEDDED args");
+	CHECK(nfsp_schema_resolve(s, 0, "tedge.request.EMBEDDED.args.tag",
+				  &n) == NFSP_SCHEMA_FOUND && n.flags == 0,
+	      "EMBEDDED args.tag");
+	CHECK(nfsp_schema_resolve(s, 0, "tedge.request.ECHO", &n) ==
+	      NFSP_SCHEMA_FOUND &&
+	      n.flags == (NFSP_SN_ROOT | NFSP_SN_OPERATION) && !n.proc,
+	      "ECHO root");
+	CHECK(nfsp_schema_resolve(s, 1, "tedge.response.ECHO.result.value",
+				  &n) == NFSP_SCHEMA_FOUND &&
+	      n.flags == NFSP_SN_OPERATION, "ECHO result value");
+
+	/* The reviewer's rule: a raw edit of the discriminant word at the
+	 * DIRECT argument path loaded; it names no node the decoder emits. */
+	memset(&sp, 0, sizeof(sp));
+	sp.rule_id = "r1";
+	sp.intent_id = "i1";
+	sp.msg = NFSP_RULE_CALL;
+	sp.prog = 0x2000009bu;
+	sp.vers = 1;
+	sp.has_proc = 1;
+	sp.proc = 1;
+	sp.family = "tedge";
+	sp.tkind = NFSP_RULE_FIELD;
+	sp.path = "tedge.request.DIRECT.args";
+	sp.part = NFSP_PART_DISCRIMINANT;
+	sp.mkind = NFSP_MUT_REPLACE;
+	sp.has_xf = 1;
+	sp.xkind = NFSP_XF_LITERAL;
+	sp.xlit.kind = NFSP_LIT_UINT;
+	sp.xlit.num = 2;
+	sp.policy = NFSP_POLICY_RAW;
+	wset(&w, s->schema_id, &sp, 1);
+	CHECK(nfsp_ruleset_load(w.b, w.n, tf, 1, &rs, &err) ==
+	      NFSP_RULE_UNKNOWN_PATH && err.rule == 0,
+	      "DIRECT args discriminant: %s", nfsp_rule_strstatus(err.status));
+	nfsp_ruleset_free(&rs);
+	sp.path = "tedge.request.EMBEDDED.args.operation";
+	sp.proc = 2;
+	wset(&w, s->schema_id, &sp, 1);
+	CHECK(nfsp_ruleset_load(w.b, w.n, tf, 1, &rs, &err) ==
+	      NFSP_RULE_UNKNOWN_PATH && err.rule == 0,
+	      "EMBEDDED operation discriminant: %s",
+	      nfsp_rule_strstatus(err.status));
+	nfsp_ruleset_free(&rs);
+
+	/* The same edit named by the operation's own root loads, in both
+	 * procedures. */
+	sp.path = "tedge.request.ECHO";
+	sp.operation = "ECHO";
+	for (sp.proc = 1; sp.proc <= 2; sp.proc++) {
+		wset(&w, s->schema_id, &sp, 1);
+		CHECK(nfsp_ruleset_load(w.b, w.n, tf, 1, &rs, &err) ==
+		      NFSP_RULE_OK, "ECHO discriminant in procedure %u: %s",
+		      sp.proc, nfsp_rule_strstatus(err.status));
+		nfsp_ruleset_free(&rs);
 	}
 }
 
@@ -1263,6 +1402,7 @@ int main(void)
 	test_resolve_nodes();
 	test_resolve_ambiguous();
 	test_reaches();
+	test_resolve_op_containers();
 	test_golden();
 	test_prefixes();
 	test_canonical();

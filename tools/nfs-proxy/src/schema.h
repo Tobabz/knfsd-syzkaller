@@ -170,9 +170,11 @@ int nfsp_schema_enum_has(const struct nfsp_protocol_schema *s, uint16_t type,
  *
  *   A path is FOUND when exactly one node answers to it.  Two arms of one
  *   union may share a component; when they lead to different nodes the path
- *   is AMBIGUOUS, since a rule could not say which it meant.  A path to an
- *   element of the COMPOUND operation array (`argarray[]`) is never found:
- *   each operation is a root of its own (`<family>.request.<OP>`).
+ *   is AMBIGUOUS, since a rule could not say which it meant.  A path that
+ *   reaches an operation union from its container is never found, whether
+ *   the container is the operation array (`argarray[]`), a struct member or
+ *   the procedure argument itself: each operation is a root of its own
+ *   (`<family>.request.<OP>`), as the decoder emits it.
  */
 #define NFSP_SN_OPERATION	0x01u	/* under an operation root */
 #define NFSP_SN_ROOT		0x02u	/* the procedure's argument or result,

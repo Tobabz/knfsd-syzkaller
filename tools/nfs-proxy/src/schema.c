@@ -122,6 +122,12 @@ static void walk(struct walk *w, const struct nfsp_schema_node *at,
 	if (at->type >= s->ntypes || depth > WALK_MAX)
 		return;
 	ty = &s->types[at->type];
+	/* The decoder emits an operation as a root of its own, never as a
+	 * node of the procedure argument, struct or array that holds it, and
+	 * decodes no operation union of the other direction: no path below a
+	 * procedure root names one, or anything under it. */
+	if (is_ops_union(ty))
+		return;
 	if (!*p) {
 		child.flags = at->flags;
 		if ((ty->kind == NFSP_XK_ARRAY_FIXED ||
@@ -146,10 +152,6 @@ static void walk(struct walk *w, const struct nfsp_schema_node *at,
 		}
 		break;
 	case NFSP_XK_UNION:
-		/* An operation is reached only as a root; an operation union
-		 * of the other direction is never decoded. */
-		if (is_ops_union(ty))
-			break;
 		if (component_at(p, ty->disc_name, &rest)) {
 			child.type = ty->sub;
 			child.flags = inherit | NFSP_SN_DISCRIMINANT;
@@ -168,8 +170,7 @@ static void walk(struct walk *w, const struct nfsp_schema_node *at,
 		break;
 	case NFSP_XK_ARRAY_FIXED:
 	case NFSP_XK_ARRAY_VAR:
-		if (ty->sub >= s->ntypes || is_ops_union(&s->types[ty->sub]) ||
-		    !component_at(p, "[]", &rest))
+		if (ty->sub >= s->ntypes || !component_at(p, "[]", &rest))
 			break;
 		child.type = ty->sub;
 		child.flags = inherit | NFSP_SN_REPEATED;

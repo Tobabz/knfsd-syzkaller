@@ -690,6 +690,8 @@ class Committed(unittest.TestCase):
                           TEST_SCHEMA.parent / "schema_tproto.c"),
                          (TEST_SCHEMA / "tflat.ann",
                           TEST_SCHEMA.parent / "schema_tflat.c"),
+                         (TEST_SCHEMA / "tedge.ann",
+                          TEST_SCHEMA.parent / "schema_tedge.c"),
                          (NFS4_ANN, HERE.parent / "src" / "schema_nfs4.c")):
             text = nz.emit_c(ann, *nz.normalize(ann))
             self.assertEqual(text, out.read_text(), f"{out.name} is stale")

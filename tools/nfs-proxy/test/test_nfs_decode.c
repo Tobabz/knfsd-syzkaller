@@ -33,15 +33,18 @@
 
 extern const struct nfsp_schema_family nfsp_schema_family_tproto;
 extern const struct nfsp_schema_family nfsp_schema_family_tflat;
+extern const struct nfsp_schema_family nfsp_schema_family_tedge;
 
 static const struct nfsp_schema_family *const fams[] = {
 	&nfsp_schema_family_tproto,
 	&nfsp_schema_family_tflat,
+	&nfsp_schema_family_tedge,
 };
 #define NFAMS (sizeof(fams) / sizeof(fams[0]))
 
 #define TPROTO_PROG	0x20000099u
 #define TFLAT_PROG	0x2000009au
+#define TEDGE_PROG	0x2000009bu
 
 static int failures;
 static int checks;
@@ -1384,6 +1387,92 @@ static void test_other_direction_op_union(void)
 	nfsp_decoded_msg_free(&m);
 }
 
+/* tedge: an operation union as a procedure's whole argument (DIRECT) and
+ * as a struct member (EMBEDDED).  Each operation is emitted as a root of
+ * its own and its container has no node; check_invariants() resolves every
+ * emitted path statically, and the container paths must resolve to nothing
+ * (PR #33 review). */
+static void expect_op_only_root(const struct msg *v,
+				const struct nfsp_reply_dispatch *rd,
+				const char *const *present, size_t np,
+				const char *container, const char *what)
+{
+	struct nfsp_decoded_msg m = {0};
+	struct nfsp_schema_node n;
+
+	CHECK(run(v->b, v->n, rd, 0, 0, &m) == NFSP_DECODE_DECODED &&
+	      m.nops == 1, "%s: %s, %u ops", what,
+	      nfsp_decode_strstatus(m.status), m.nops);
+	if (m.status == NFSP_DECODE_DECODED) {
+		check_invariants(&m, v->n, what);
+		for (size_t i = 0; i < np; i++)
+			CHECK(field(&m, present[i], 0), "%s: no %s", what,
+			      present[i]);
+		CHECK(!field(&m, container, 0) &&
+		      nfsp_schema_resolve(m.schema, rd != NULL, container,
+					  &n) == NFSP_SCHEMA_NOT_FOUND,
+		      "%s: %s is a path", what, container);
+	}
+	nfsp_decoded_msg_free(&m);
+}
+
+static void test_ops_outside_array(void)
+{
+	static const char *const direct_call[] = {
+		"tedge.request.ECHO", "tedge.request.ECHO.argop",
+		"tedge.request.ECHO.args.value",
+	};
+	static const char *const embedded_call[] = {
+		"tedge.request.EMBEDDED.args",
+		"tedge.request.EMBEDDED.args.tag", "tedge.request.PING",
+		"tedge.request.PING.argop",
+	};
+	static const char *const direct_reply[] = {
+		"tedge.response.ECHO", "tedge.response.ECHO.result.status",
+		"tedge.response.ECHO.result.value",
+	};
+	static const char *const embedded_reply[] = {
+		"tedge.response.EMBEDDED.result",
+		"tedge.response.EMBEDDED.result.tag",
+		"tedge.response.PING", "tedge.response.PING.result.status",
+	};
+	struct nfsp_reply_dispatch rd = {
+		TEDGE_PROG, 1, 1, 0, 0, NFSP_DISPATCH_TRANSACTION_ENTRY,
+		NFSP_RPC_AUTH_NONE
+	};
+	struct msg v;
+
+	printf("tables: operation unions outside an operation array\n");
+	call_header(&v, TEDGE_PROG, 1, 1);
+	w32(&v, 2);		/* 40 OP_ECHO */
+	w32(&v, 42);		/* 44 value */
+	expect_op_only_root(&v, NULL, direct_call, 3,
+			    "tedge.request.DIRECT.args", "DIRECT CALL");
+
+	call_header(&v, TEDGE_PROG, 1, 2);
+	w32(&v, 7);		/* 40 tag */
+	w32(&v, 1);		/* 44 OP_PING, void */
+	expect_op_only_root(&v, NULL, embedded_call, 4,
+			    "tedge.request.EMBEDDED.args.operation",
+			    "EMBEDDED CALL");
+
+	reply_header(&v, 0);
+	w32(&v, 2);		/* 24 OP_ECHO */
+	w32(&v, 0);		/* 28 status TE_OK */
+	w32(&v, 42);		/* 32 value */
+	expect_op_only_root(&v, &rd, direct_reply, 3,
+			    "tedge.response.DIRECT.result", "DIRECT REPLY");
+
+	rd.procedure = 2;
+	reply_header(&v, 0);
+	w32(&v, 7);		/* 24 tag */
+	w32(&v, 1);		/* 28 OP_PING */
+	w32(&v, 0);		/* 32 status TE_OK */
+	expect_op_only_root(&v, &rd, embedded_reply, 4,
+			    "tedge.response.EMBEDDED.result.operation",
+			    "EMBEDDED REPLY");
+}
+
 static void test_bad_input(void)
 {
 	struct nfsp_decoded_msg m = {0};
@@ -1430,6 +1519,7 @@ int main(void)
 	test_random_edits();
 	test_other_direction_op_union();
 	test_ops_before_selector();
+	test_ops_outside_array();
 	test_bad_input();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

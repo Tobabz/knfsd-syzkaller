@@ -337,9 +337,12 @@ static int rule(struct rd *r, struct nfsp_rule *ru)
 		return bad(r, "predicates exceed the input");
 	ru->predicates = &r->rs->pred_pool[r->npreds];
 	r->npreds += ru->npredicates;
-	for (uint32_t i = 0; i < ru->npredicates; i++)
+	for (uint32_t i = 0; i < ru->npredicates; i++) {
+		r->err->predicate = i;
 		if (predicate(r, &ru->predicates[i]))
 			return -1;
+	}
+	r->err->predicate = NFSP_RULE_NONE;
 
 	if (word_in(r, NFSP_MUT_OP_PREPEND, &w, "mutation kind out of range"))
 		return -1;
