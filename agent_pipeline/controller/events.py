@@ -1,0 +1,130 @@
+"""Events the machine handles.  Each is stored with its transition, so a
+job can be replayed from its first record (09 §8, oracle 4).
+
+Facts the machine cannot compute from its inputs alone (an intake result,
+a registry lookup) arrive inside the event; the deterministic components
+(HCAP check, Materializer, Q1 Judge) the machine calls itself.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Literal, Union
+
+from pydantic import Field, TypeAdapter
+
+from ..contracts import (AgentOutput, GapRef, HarnessBinding, JudgeVersions,
+                         Record, VulnerabilityCandidate)
+
+
+class IntakeChecked(Record):
+    """02 §3 intake and 01 §11.2 binding, done by the service."""
+
+    type: Literal["intake_checked"] = "intake_checked"
+    candidate: VulnerabilityCandidate | None = None
+    rejection: str | None = None
+    binding: HarnessBinding | None = None
+    judge_versions: JudgeVersions
+
+
+class AgentSucceeded(Record):
+    type: Literal["agent_succeeded"] = "agent_succeeded"
+    task_id: str
+    attempt: int
+    output: AgentOutput
+    model_id: str
+
+
+class AgentFailed(Record):
+    type: Literal["agent_failed"] = "agent_failed"
+    task_id: str
+    attempt: int
+    failure: str
+
+
+class AgentAttemptRestarted(Record):
+    """A restarted Controller sent the pending Agent task again (09 §8)."""
+
+    type: Literal["agent_attempt_restarted"] = "agent_attempt_restarted"
+    task_id: str
+    attempt: int
+
+
+class RunnerFinished(Record):
+    """status(task_id) reached `sealed` or `ended_unsealed` (09 §8).  A
+    Stage 1 run seals at most one bundle."""
+
+    type: Literal["runner_finished"] = "runner_finished"
+    task_id: str
+    state: Literal["sealed", "ended_unsealed"]
+    bundle_ref: str | None = None
+    reason: str | None = None
+
+
+class ApprovalGiven(Record):
+    type: Literal["approval_given"] = "approval_given"
+    task_id: str
+    review_manifest_sha256: str
+    decision_id: str
+
+
+class ApprovalDenied(Record):
+    type: Literal["approval_denied"] = "approval_denied"
+    task_id: str
+    note: str
+
+
+class IssueChanged(Record):
+    """A HarnessGapIssue changed status (07 §7)."""
+
+    type: Literal["issue_changed"] = "issue_changed"
+    gap: GapRef
+    status: Literal["resolved", "deferred", "reopened", "wont_fix"]
+    resolution: str = ""
+
+
+class BindingChanged(Record):
+    """The registry's binding for the job's commit and sanitizer, looked up
+    again: after an issue is resolved (retry_pending), or because a harness
+    build or HCAP revision changed (09 §5).  None: no validated build."""
+
+    type: Literal["binding_changed"] = "binding_changed"
+    binding: HarnessBinding | None
+
+
+class JudgeVersionsChanged(Record):
+    type: Literal["judge_versions_changed"] = "judge_versions_changed"
+    judge_versions: JudgeVersions
+
+
+class PolicyChanged(Record):
+    """`binding` is the registry's binding for the new policy's sanitizer,
+    looked up by the service; the machine uses it only when the sanitizer
+    changes."""
+
+    type: Literal["policy_changed"] = "policy_changed"
+    job_policy_id: str
+    binding: HarnessBinding | None = None
+
+
+class OperatorAction(Record):
+    type: Literal["operator"] = "operator"
+    action: Literal["resume", "close", "cancel"]
+    action_id: str
+
+
+class CancelConfirmed(Record):
+    """cancel(task_id) answered with a final status (09 §8)."""
+
+    type: Literal["cancel_confirmed"] = "cancel_confirmed"
+    task_id: str
+
+
+Event = Annotated[
+    Union[IntakeChecked, AgentSucceeded, AgentFailed, AgentAttemptRestarted,
+          RunnerFinished, ApprovalGiven, ApprovalDenied, IssueChanged,
+          BindingChanged, JudgeVersionsChanged, PolicyChanged, OperatorAction,
+          CancelConfirmed],
+    Field(discriminator="type"),
+]
+
+EVENT = TypeAdapter(Event)

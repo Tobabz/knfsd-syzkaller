@@ -3,7 +3,8 @@
 > 상태: draft · 최종 확인: 2026-10-13
 > 상위 설계: `01-two-stage-agent-architecture.md` §12, §14 12번
 > 선행 계약: `02`–`08`, `../03-nfs-proxy/05-mutation-delta-replay.md` §27–§29
-> 관련 구현: 없음 (Controller 미구현). 구현 스택은 `../decisions/2026-10-13-agent-implementation-stack.md`
+> 관련 구현: `agent_pipeline/` (Stage 1: §3, §5, §6, §8. Stage 2 미구현). 구현 스택은
+> `../decisions/2026-10-13-agent-implementation-stack.md`
 > 관련 게이트: Q1 / Stage 2 baseline-with-rules gate / Q2 / Replay
 
 ## 요약
@@ -214,6 +215,7 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | `s1_running` | Q1 `INCONCLUSIVE(infra)`, `INCONCLUSIVE(loss)`, 봉인 bundle 없는 Runner 종료 | `s1_running` (같은 harness 재실행) | runtime_retry | `06` §13, `01` §12 |
 | `s1_running` | Q1 `INCONCLUSIVE(evidence)`, `INCONCLUSIVE(mapping)` | `blocked_operator(q1_evidence)`, `blocked_operator(q1_mapping)` | — | `06` §13, `01` §11.1 |
 | `s1_running` | Q1 `INCONCLUSIVE(unsupported_attribution)` | `blocked_harness_gap(remote_kcov_attribution, remote_kcov.context.<expected_context>)` | — | `06` §7, §13 |
+| `s1_running` | verdict의 `candidate_id`나 `execution_harness_id`가 job과 다름 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
 
 - ambient control의 결과(`06` §11)는 기록만 하고 전이를 바꾸지 않는다.
 - `s1_running`에 들어가는 모든 전이(재실행과 `resume` 포함)는 그때의 approval policy를 적용한다. 승인이 필요한데
@@ -293,7 +295,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 | 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 crash evidence의 harness identity로 계속한다(`../03-nfs-proxy/05` §25). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2, §12 |
 | `hcap_revision`만 변경 | 비종료 상태(`s2_replaying` 제외. 대기 상태는 표 위 규칙) | `s1_analysis`, `s1_planning`은 진행 중인 task의 결과를 받지 않고 같은 Agent Task를 새 `hcap_revision`으로 다시 시작한다. 그 밖의 상태는 plan과 evidence를 새 HCAP으로 결정적으로 다시 검증해, 실패하면 `s1_planning`(repair, `hcap_changed`)으로 간다. 통과하면 MutationRuleSet을 입력으로 쓰는 지점(`s2_gate`, `s2_campaign`, §4의 Compiler 거부 행이 정한 `resume_point`)은 그 rule set을 다시 compile해 `s2_gate`로 가고(거부는 §4의 Compiler 행), Mutation Strategy를 기다리는 `s2_strategy`는 진행 중인 task의 결과를 받지 않고 그 Agent Task를 새 `hcap_revision`으로 다시 시작한다. 나머지 상태는 그대로 둔다 | `01` §11.2, `07` §7 |
 | 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 기록된 rule set을 쓰고 Compiler를 다시 부르지 않는다(`../03-nfs-proxy/05` §26). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2 |
-| JudgeProfile 또는 RemoteKcovSupportBoundary 새 버전 채택 | 비종료 상태(대기 상태는 표 위 규칙) | job이 마지막으로 소비한 verdict의 봉인 bundle에 새 verdict를 만들어 기록한다. status와 reason이 같거나, 그 verdict를 소비할 때의 binding(identity, `hcap_revision`)이 job의 지금 binding과 다르면 전이를 만들지 않는다. binding이 다르면 binding 변경이 정한 경로(identity 재수립 지점, `hcap_revision` 행)가 그대로 남는다. 그 밖에는 그 verdict를 소비한 전이의 출발 상태에서 §3–§4 표를 다시 적용하고(binding이 같으므로 `Stage2Input`도 유효하다, `01` §5.1), 진행 중인 task는 결과를 받지 않는다. 새 규칙이 요구하는 evidence가 bundle에 없으면 그 Runner 단계를 다시 실행한다 | `01` §11.2 |
+| JudgeProfile 또는 RemoteKcovSupportBoundary 새 버전 채택 | 비종료 상태(대기 상태는 표 위 규칙) | job이 마지막으로 소비한 verdict의 봉인 bundle에 새 verdict를 만들어 기록한다. status와 reason이 같거나, 그 verdict를 소비할 때의 binding(identity, `hcap_revision`)이 job의 지금 binding과 다르거나, job이 그 verdict 뒤에 plan이나 harness를 바꿨으면 전이를 만들지 않는다. binding이 다르면 binding 변경이 정한 경로(identity 재수립 지점, `hcap_revision` 행)가 그대로 남는다. 그 밖에는 그 verdict를 소비한 전이의 출발 상태에서 §3–§4 표를 다시 적용하고(binding이 같으므로 `Stage2Input`도 유효하다, `01` §5.1), 진행 중인 task는 결과를 받지 않는다. 새 규칙이 요구하는 evidence가 bundle에 없으면 그 Runner 단계를 다시 실행한다 | `01` §11.2 |
 | JobPolicy 변경 | 비종료 상태 | 이후 전이에만 적용한다. 기존 verdict와 전이 기록은 바꾸지 않는다 | `01` §11.1 |
 | operator `resume` | `blocked_operator` | `resume_point`로 간다. 소진된 counter를 0으로 되돌리고 그 사실을 기록한다 | |
 | operator `route(to)` | `blocked_operator(gate_regression)` | `s2_gate` 또는 `s2_strategy`. `resume_point`가 이 상태에 들어올 때와 다르면(재평가 이벤트가 binding을 바꿨거나 gate verdict를 다르게 판정했다) 받지 않고 기록만 한다. 그때는 `resume`이 지금 `resume_point`로 보낸다 | `01` §5.1, §11.2 |
@@ -315,10 +317,12 @@ remote_kcov.kernel_revision.<commit>)`이다. 대기 상태에서는 이 검증�
 |---|---|---|---|
 | `agent_repair[stage1]` | Stage 1에서 `(repair)` 전이의 수(cause `hcap_changed` 제외). 전이마다 Agent Task 하나를 부른다 | operator `resume` | `blocked_operator(stage1_repair_budget)` |
 | `agent_repair[stage2]` | Stage 2에서 `(repair)` 전이의 수(cause `hcap_changed` 제외) | operator `resume` | `blocked_operator(stage2_repair_budget)` |
-| `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공 | `blocked_operator(agent_failure)` |
+| `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공, 새 요청 시작 | `blocked_operator(agent_failure)` |
 | `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s2_gate`, `s2_campaign`, `s2_replaying`) | 그 단계가 재실행이 아닌 행으로 끝날 때, Runner 입력이 바뀔 때. `s2_campaign`은 이어 간 campaign이 bundle을 봉인할 때도(campaign evidence는 §4의 campaign 임계값이 따로 센다). 재실행 행으로 가는 결과는 판정된 verdict여도(`INCONCLUSIVE(loss)`, gate의 M1 `INCONCLUSIVE`) 되돌리지 않는다 | `blocked_operator(runtime_retry_exhausted)` |
 | campaign 임계값, fuzz budget | `01` §11.1, §12 | — | §4 표 |
 
+- 한도 N은 재시도 횟수다. 처음 한 번 뒤에 센 일이 N번까지 일어날 수 있다. counter가 N인 상태에서 한 번 더 일어나면 그 일 대신
+  `blocked_operator`로 간다.
 - 한도 값은 JobPolicy가 소유한다(`01` §11.1의 retry / repair budget, campaign repair 임계값). Stage 2 시작 여부
   `run_stage2`와 approval policy도 JobPolicy 값이다.
 - 외부 이벤트(§5)가 부른 재실행과 Controller 재시작은 budget을 쓰지 않는다. 재시작 뒤 Runner task는 새 실행 없이
@@ -608,7 +612,13 @@ bundle fixture로 대신한다.
   뒤 어떤 실행을 이어 갈 수 있는지는 `01` §14 14번에서 정한다.
 - **미결:** 정지 중인 campaign에서 늦게 온 bundle의 crash 중 window에 `APPLIED` rule이 있는 것을 `01` §12의 replay와
   검토 경로로 보내는 방법. 지금은 표시한 triage 항목으로만 남는다(§4). Stage 2 구현 전에 정한다.
-- **미결:** JobPolicy의 한도 값, `run_stage2` 기본값, approval policy 기본값. 첫 Stage 1 구현에서 정한다.
+- **결정됨(2026-10-13, 저장소 소유자):** JobPolicy 기본값은 Stage 1 repair 한도 3회, `agent_retry` 한도 3회, `runtime_retry` 한도
+  3회, 실행 전 사람 승인 불필요다.
+  `run_stage2`는 Stage 2 구현 전까지 거짓만 받고, 구현 뒤 기본값을 참으로 바꾼다
+  (`agent_pipeline/contracts.py`의 `JobPolicy`).
+- **결정됨(2026-10-13, 저장소 소유자):** `agent_retry`는 요청 단위로 센다. 새 요청이 시작되면 0에서 센다.
+- **결정됨(2026-10-13, 저장소 소유자):** candidate 하나에 job 여러 개(예: sanitizer별)를 둘 수 있다. 같은
+  target(commit, location)은 같은 `candidate_id`다(`02` §7).
 - **미결:** gate를 여러 번 반복할 때 반복 결과를 합치는 규칙. `01` §3은 반복 횟수만 JobPolicy에 맡겼다. 제안: 각
   반복에 gate 표를 적용하고 가장 위의 행을 gate 결과로 한다. Stage 2 구현 전에 `01` §3에서 고정한다.
 - **미결:** gate Q1 `NOT_REACHED`의 자동 진단. 지금은 사람 결정(`blocked_operator(gate_regression)`)이다. 후보는 같은
@@ -620,7 +630,9 @@ bundle fixture로 대신한다.
   구현에서 정한다.
 - **미결:** triage 목록의 형식과 처리 주체.
 - **미결:** Stage 2 실행 전 사람 승인. 기존 계약의 approval binding은 Stage 1 review manifest뿐이다(`05` §11).
-- **미검증:** 이 문서는 구현과 대조하지 않았다. 검증 오라클이 구현 테스트로 통과할 때까지 `상태: draft`다.
+- **미검증:** Stage 2 행(§4와 §5의 Stage 2 부분)은 구현과 대조하지 않았다. Stage 1 행과 검증 오라클 1–5의 Stage 1
+  부분은 `tests/agent_pipeline/`이 확인한다(가짜 component, LLM과 VM 없음). 실제 Runner와 Agent provider로는
+  확인하지 않았다.
 
 ## Agent 사용 지침
 
