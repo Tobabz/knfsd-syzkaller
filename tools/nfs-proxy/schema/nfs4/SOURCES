@@ -1,0 +1,48 @@
+# Pinned sources of the NFSv4 XDR in this directory.
+#
+# Every .x file here is written by ../rfc_xdr.py from the RFC texts pinned
+# below, never by hand.  ../README.md describes the rules; the directives are
+# documented at the top of ../rfc_xdr.py.
+#
+#   rfc_xdr.py SOURCES --check     committed files match the pins (build.sh)
+#   rfc_xdr.py SOURCES --verify    fetch the RFCs and rebuild every file
+#
+# Errata policy (owner decision, 2026-10-13): apply an erratum only when it
+# is Verified and changes the XDR, and record each decision here.  Reported
+# errata are not applied.
+#
+# Errata as of 2026-10-13, none applied: RFC 7531 and RFC 7863 have none.
+# RFC 5662 has two, both Reported, not Verified: 7667 changes a comment, 7669
+# renames rpc_gss_svc_t and its values (same numbers, so no wire change).
+# RFC 5531's errata, 4849 (Verified, Appendix C) and 6255 (Reported, Section
+# 9), are outside the two definitions copied below.  RFC 8276 has 7050
+# (Verified, editorial: a section number in Section 1) and 5195, 7004, 7007
+# (Reported, Sections 3 and 8.4.5 prose and error lists), none in the XDR.
+# RFC 9754 has 8595 (Reported, Section 2 prose).
+
+rfc 7531 cc37bc438258c16febef4813bb82c810ce458aa38954f7513e56736e034ddd2c
+rfc 5662 4aad9353b73e3904875aa2f7834c0a294cdb505609daebd92b7f5b441e32f7c7
+rfc 7863 585a39637d442fd3ea92ff74f105076b173ec6b9d7175b8addb0dd25c9c23fa9
+rfc 5531 c1e2e05640c66c504871f3591311355a1bc432f75bd481b4ead8332a4fe351ae
+rfc 8276 3a138e1bd4b75aa18d06b21ba8f5358fb190f55453d6a73a2e5097fb364cdea2
+rfc 9754 fa76efbae83607fdda69af4607907dc1134a9ea76a54b41ce59c68f0d74f503e
+
+# NFSv4.0, NFSv4.1, NFSv4.2: each RFC's own extraction script, verbatim.
+extract rfc7531.x 7531 6d47206f35461db9e311f19a0cc5fd4f68a8ccd77186dd04d0c37f202cb214ce grep "^  *///" | sed 's?^  */// ??' | sed 's?^  *///$??'
+extract rfc5662.x 5662 a733627a032de34856e7c1b1e5b1e8dfb1f5438547beaaf474e5e6b3df4f1840 grep '^ *///' | sed 's?^ */// ??' | sed 's?^ *///$??'
+extract rfc7863.x 7863 01639d81f433999c45b31861b6f8fab7aa218b31396f20d39318d7a338051404 grep "^  *///" | sed 's?^  */// ??' | sed 's?^  *///$??'
+
+# NFSv4.2 extensions (RFC 8178): xattr operations and the attribute
+# delegation types.  normalize.py applies them on top of rfc7863.x (the
+# `extension` annotation).
+extract rfc8276.x 8276 846fb7e5258d22c37a6f9ec9edc1220893cd5f070dcfed425d41d03f057d3abb grep '^ *///' $* | sed 's?^ */// ??' | sed 's?^ *///$??'
+extract rfc9754.x 9754 9a40c4364ea0e0ece309ef96f9260b9c301a76907dd40fefd149b5fb8d7de236 grep '^ *///' $* | sed 's?^ */// ??' | sed 's?^ *///$??'
+
+# What the sources take from rpcgen's C environment instead of declaring:
+# the basic typedefs (each source states them only in a comment), and from
+# RFC 5531 the auth flavor constants (case labels of secinfo4 and
+# callback_sec_parms4) and authsys_parms (`%#include <rpc/auth_sys.h>`).
+prelude prelude.x 61255fece314daaf1fb2b4ccf0793e39a7cc0637c9b4bf23b75680f07ed54287
+typedefs rfc7531.x rfc5662.x rfc7863.x
+copy 5531 enum auth_flavor
+copy 5531 struct authsys_parms

@@ -1,9 +1,9 @@
 # NFS Semantic Decoder Contract
 
-> 상태: draft · 최종 확인: 2026-10-12
+> 상태: draft · 최종 확인: 2026-10-13
 > 기준: kernel v7.3-rc5 / syzkaller 801f0966669a37e048adabf9e5f38ce52825ea82
 > 상위 설계: 01-architecture.md
-> 관련 구현: tools/nfs-proxy/src/walk.h, tools/nfs-proxy/src/walk.c
+> 관련 구현: tools/nfs-proxy/schema/normalize.py, tools/nfs-proxy/src/schema.h, tools/nfs-proxy/src/nfs_decode.h (M2), legacy tools/nfs-proxy/src/walk.h
 > 관련 입력 shape: syzkaller 0006/0015
 > 관련 게이트: Stage 2 M1 target resolution
 
@@ -321,6 +321,7 @@ reply_dispatch
     procedure
     minor_version?      # NFSv4 COMPOUND / CB_COMPOUND
     source              # transaction_entry | test_fixture
+    cred_flavor         # CALL의 credential flavor
 ```
 
 - live traffic에서 `reply_dispatch`의 출처는 lookup 결과가 `found`인 TransactionEntry 하나다
@@ -328,6 +329,7 @@ reply_dispatch
   (`03-transaction-context.md` §6). NFSv4 `minor_version`은 CALL의 COMPOUND header를 decode했을 때만 있다.
 - `test_fixture`는 M2 host test에서 fixture CALL이 dispatch를 공급할 때만 쓴다. production runtime은 이
   source를 받지 않는다.
+- `cred_flavor`도 같은 CALL envelope에서 온다. RPCSEC_GSS CALL의 REPLY는 decode하지 않는다(§15).
 - request semantic context(operation sequence, request field)의 유무와 dispatch identity의 유무는 다른
   조건이다. dispatch만 있고 request context가 없으면 result schema는 고를 수 있지만 request-dependent
   predicate는 쓸 수 없다.
@@ -441,20 +443,26 @@ nfs4.request.OPEN.args.owner.clientid
 nfs4.response.OPEN.result.ok.stateid
 ```
 
-Union은 discriminant가 선택한 arm을 path에 반영한다.
+Union은 discriminant가 선택한 arm을 path에 반영한다. 규칙은 다음 하나다(M2 구현,
+`tools/nfs-proxy/schema/README.md`).
 
 ```text
-result.status
-result.ok.stateid
-claim.null.filename
-claim.previous.delegate_type
+<union>.<discriminant 이름>       result.status
+arm type이 struct                 result.ok.stateid          (struct member를 바로 이어 붙임)
+arm type이 struct가 아님          claim.<branch>.<arm 이름>
 ```
+
+branch는 case label에 annotation이 준 이름이고, 없으면 label을 소문자로 바꾼 것이다(`default:` arm은
+`default`). arm 이름과 member 이름은 XDR identifier를 그대로 쓴다. 그래서 NFSv4 예시의 정확한 path는
+pinned XDR이 들어온 뒤 그 identifier로 정해진다.
 
 NFSv4 COMPOUND 자체는 procedure node로 쓴다. operation array target의 path는
 `nfs4.request.COMPOUND.args.argarray`와 `nfs4.response.COMPOUND.result.resarray`다(`04` §5, issue #5).
 
 Array의 element index는 decoder output 안에서 structural metadata로 사용할 수 있지만
-Agent selector의 기본 identity로 사용하지 않는다.
+Agent selector의 기본 identity로 사용하지 않는다. element path는 `<array>[]`이고 index는 별도 값이다.
+XDR linked list(`struct T { ...; T *next; }`)도 같은 모양으로 펼친다. `entries[]`의 각 element가
+자기 뒤의 link word를 `discriminant` metadata로 가진다.
 
 Schema annotation이 제공하지 않는 arbitrary alias를 Agent가 생성할 수 없다.
 
@@ -668,6 +676,11 @@ Transaction Context의 key/lifecycle 정책은
 
 Decoder는 fail closed 한다.
 
+M2 구현은 `truncated`와 `malformed`를 다음처럼 나눈다. record가 고정 크기 item(word, hyper, fixed
+opaque) 중간에서 끝나면 `truncated`다. XDR이 허용하지 않는 값이면 `malformed`다. 선언되지 않은 enum 값,
+0/1이 아닌 bool, arm이 없는 discriminant, bound를 넘거나 record 끝을 넘는 length/count, 0이 아닌
+padding, procedure body 뒤의 남은 bytes가 여기에 든다.
+
 decode_status:
 
 ```text
@@ -688,6 +701,13 @@ failure
     schema_node
     reason
 ```
+
+RPCSEC_GSS credential을 가진 CALL, 그런 CALL의 REPLY(`reply_dispatch.cred_flavor`), verifier가 RPCSEC_GSS인
+accepted REPLY는 service와 관계없이 `unsupported_schema`다. integrity와 privacy service에서 body는 procedure
+argument/result가 아니라 RFC 2203 wrapper(`rpc_gss_integ_data`, `rpc_gss_priv_data`)다
+([RFC 2203 §5.3.2.2](https://www.rfc-editor.org/rfc/rfc2203.html#section-5.3.2.2)). wrapper bytes가 procedure
+schema에 맞아도 boundary 증명이 아니다(§11). fuzzer는 RPCSEC_GSS credential 뒤에 평문 NFS body를 붙여
+보낸다(syzkaller patch 0006의 `rpc_auth_gss`).
 
 Decoder가 failure 이전에 일부 prefix field boundary를 증명했더라도,
 decode_status가 decoded가 아니면 Semantic Rule Resolver의 mutation input으로
@@ -774,11 +794,9 @@ runtime guest validation
 Harness Capability Specification update
 ```
 
-현재 repository에는 target ProtocolSchema source/artifact 위치가 아직 구현되어 있지 않다.
-따라서 실제 파일/빌드 target은 implementation gap analysis에서 고정한다.
-
-구현 경로가 정해지기 전에는 존재하지 않는 source path를 문서에서 지원 절차로
-가정하지 않는다.
+M2에서 normalizer와 decoder가 들어왔다(`tools/nfs-proxy/schema/README.md`). NFS XDR source는 아직
+repository에 없다. 그래서 NFS 메시지는 지금 모두 `unsupported_schema`다. 테스트는 합성 protocol
+(`tools/nfs-proxy/test/schema/`)로 한다.
 
 ## 설계 근거
 
@@ -956,13 +974,49 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
 - **결정됨:** decode_status가 decoded가 아니면 mutation-safe input으로 쓰지 않는다.
 - **결정됨:** REPLY schema는 검증된 `reply_dispatch`로만 고른다. NFSv4도 dispatch 없이 result shape만으로
   `decoded`를 만들지 않는다(§6, §14, issue #18 F4).
-- **미결:** pinned XDR source snapshot을 repository 어디에 보관할지.
-- **미결:** Protocol Schema Normalizer 구현 언어/빌드 target.
-- **미결:** normalized ProtocolSchema의 on-disk serialization.
-- **미결:** generic runtime interpreter vs generated native decoder.
-- **미결:** exact semantic annotation file syntax.
+- **결정됨(M2):** Normalizer는 build/development time에 도는 Python 표준 라이브러리 script다
+  (`tools/nfs-proxy/schema/normalize.py`). C build와 guest build container는 Python이 필요 없다.
+- **결정됨(M2):** normalized ProtocolSchema의 artifact는 생성된 C 상수 table이며 commit한다. `build.sh`가
+  매번 다시 생성해 다르면 실패한다. `schema_id`는 normalized schema의 canonical JSON SHA-256이다
+  (`<family>[.<minor>]/sha256:<hex>`). XDR comment만 바뀌면 바뀌지 않는다.
+- **결정됨(M2):** runtime은 generic interpreter(`src/nfs_decode.c`)다. bounds check가 한 곳에만 있고,
+  schema 변경이 unchecked read를 만들 수 없다.
+- **결정됨(M2):** annotation은 줄 단위 directive 파일이다(`tools/nfs-proxy/schema/README.md`). field나
+  offset, width를 다시 적지 않는다.
+- **결정됨(M2):** resource limit은 nesting depth 64(normalizer가 build 때 거부하고 runtime도 다시 확인)와
+  message당 field 기본 65536개(호출자가 낮출 수 있음)다. 실패한 decode는 field를 하나도 남기지 않는다.
+- **결정됨(M2):** semantic path 하나는 schema 안의 위치 하나를 가리킨다. 같은 path를 가진 field는 그 위치의
+  반복(array/list element, 반복된 operation)뿐이다. 이것을 깨는 XDR과 annotation은 normalizer가 build 때
+  거부한다. 목록은 `tools/nfs-proxy/schema/README.md`가 소유한다.
+- **결정됨(M2):** response operation의 status는 그 결과가 시작하는 위치에 있는 `status-type` 값이다. 결과가
+  count나 list link로 시작하면 element 수와 관계없이 status가 없다. 모든 NFSv4 resop arm은 `nfsstat4`로
+  시작한다.
+- **결정됨(M2):** RPCSEC_GSS body는 decode하지 않는다(§15). GSS context를 쓰는 traffic의 mutation은 범위
+  밖이다.
+- **결정됨(M2):** NFSv4 NULL procedure는 COMPOUND가 없어 minor version이 없다. 그래서 하나의
+  ProtocolSchema를 고를 수 없고 `unsupported_schema`다. 그 REPLY는 §14 표대로 `dispatch_incomplete`다.
+- **결정됨(M2):** NFSv4.0/4.1/4.2 XDR snapshot은 RFC 7531/5662/7863이다. 각 RFC 본문(.txt)의 SHA-256을
+  pin하고, 그 RFC에 적힌 `///` 추출 script를 그대로 실행한 출력만 `tools/nfs-proxy/schema/nfs4/`에 commit한다
+  (`SOURCES`, `schema/rfc_xdr.py`). 추출 파일의 SHA-256도 pin하고 `build.sh`가 확인한다. errata는 적용하지
+  않았다(2026-10-13 기준 XDR을 바꾸는 verified erratum 없음). XDR이 선언하지 않고 rpcgen의 C 환경에서 가져오는
+  이름(주석으로만 적힌 basic typedef, RFC 5531의 `auth_flavor`와 `authsys_parms`)은 같은 pinned text에서
+  규칙으로 만든 `prelude.x`가 공급한다. 손으로 쓴 XDR은 없다.
+- **미결:** NFSv3 XDR source. RFC 1813에는 추출 가능한 XDR 파일이 없어 source 형태를 따로 정해야 한다.
+- **결정됨(2026-10-13, 저장소 소유자):** knfsd가 구현하는 NFSv4.2 확장을 지원한다. RFC 8276 xattr operation
+  (72-75)과 RFC 9754 delegation type(4, 5)의 XDR을 RFC에서 추출해 pin하고(`SOURCES`), normalizer의 `extension`
+  규칙이 RFC 7863 위에 합친다. 합치는 규칙은 새 정의 추가, 값이 늘어난 enum 재정의, RFC의 "Following lines are
+  to be added to" 블록뿐이고 그 밖의 재정의는 build error다(`tools/nfs-proxy/schema/README.md`).
+- **결정됨(2026-10-13, 저장소 소유자):** RFC 9754는 delegation type 4, 5를 선언하지만 `open_delegation4`에 그
+  arm을 두지 않는다. 이것만 annotation `alias-arm`으로 READ, WRITE arm과 같은 layout으로 decode한다. 근거는 knfsd
+  `fs/nfsd/nfs4xdr.c`의 `nfsd4_encode_open_delegation4`와 Linux client decoder다. XDR 밖의 layout 사실은 이
+  annotation 하나로만 허용한다.
+- **결정됨(2026-10-13, 저장소 소유자):** errata는 Verified이면서 XDR을 바꾸는 것만 적용한다. pin한 RFC마다
+  errata와 결정을 `SOURCES`에 적는다.
 - **미결:** NFS callback/backchannel program의 initial schema coverage.
-- **미결:** implementation-specific resource limits.
+- **미결:** request/response consistency 검증(§14)은 request context가 있어야 한다. M3 TransactionEntry가
+  생기기 전까지 M2 decoder의 `request_context`는 항상 0이다.
+- **한계:** `fattr4`의 attribute 값처럼 XDR에서 `opaque`로 선언되고 내용이 bitmap에 따라 정해지는 data는
+  opaque 하나로만 decode된다. XDR로 표현되지 않는 layout이라 schema walk로 증명할 수 없다.
 - **미검증:** RFC/XDR-derived normalized schema와 current syzkaller request shape 전체의 차이.
 
 ## 참조
@@ -1017,9 +1071,10 @@ unsupported_by_current_harness
 
 ### 확장 절차
 
-구현 전까지 concrete ProtocolSchema source path/build target은 미결이다.
+Normalizer와 annotation 문법은 `tools/nfs-proxy/schema/README.md`에 있다. 새 schema는 XDR source와
+annotation 파일을 추가하고, `build.sh`의 `SCHEMAS` 목록에 생성 table을 등록해 넣는다.
 
-따라서 현재 실제 repository에서 확인 가능한 extension workflow는 다음까지만 고정한다.
+현재 repository에서 확인 가능한 extension workflow는 다음과 같다.
 
 ```text
 02-semantic-decoder.md design update
@@ -1034,7 +1089,7 @@ guest/runtime validation
 04-harness-capability-spec.md update
 ```
 
-ProtocolSchema source/artifact path가 구현되면 이 절을 실제 path/symbol 기준으로 갱신한다.
+NFS XDR source가 들어오면 이 절에 그 path를 적는다.
 
 ### 제약
 
