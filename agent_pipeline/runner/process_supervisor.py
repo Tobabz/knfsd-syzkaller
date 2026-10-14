@@ -18,6 +18,7 @@ import selectors
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Mapping
 
@@ -364,4 +365,7 @@ class ProcessSupervisor:
                 except subprocess.TimeoutExpired:
                     # Do not kill the lock holder: it may own an unkillable
                     # descendant. Its watchdog keeps enforcing quarantine.
-                    pass
+                    # Retain/reap the child even if this supervisor is never
+                    # called again. One daemon waiter owns each live guardian.
+                    threading.Thread(target=process.wait, daemon=True,
+                                     name="runner-guardian-reaper").start()

@@ -108,6 +108,10 @@ If a caller callback hangs after launch, the independent guardian watchdog still
 terminates the payload and protects resource cleanup, but `run()` cannot return
 until that callback returns. Filesystem and OS operations likewise require a
 responsive host. An unkillable kernel task is quarantined, not declared stopped.
+A quarantined guardian retains its resource lock; one daemon waiter in the
+parent retains the process handle and reaps it when cleanup eventually finishes.
+Returning `CleanupIncomplete` does not leave an eventual zombie waiting for
+another supervisor invocation. The waiter neither signals nor unlocks the guardian.
 
 `ProcessResult` is returned only after durable cleanup acknowledgement and
 guardian reap. Its `reason` includes `completed`, `stop_requested`, `lease_lost`,

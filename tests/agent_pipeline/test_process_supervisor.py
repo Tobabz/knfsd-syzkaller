@@ -419,7 +419,8 @@ g.run(socket.socket(fileno=int(sys.argv[1])),int(sys.argv[2]),Path(sys.argv[3]))
     finally:
         release.touch()
     eventually(lambda: record(supervisor).get("state") == "clean")
-    reap(current["guardian"]["pid"])
+    # The supervisor's background waiter must reap it without another run.
+    eventually(lambda: not Path(f"/proc/{current['guardian']['pid']}").exists())
     assert not Path(f"/proc/{(tmp_path / 'pid').read_text()}").exists()
 
 
@@ -495,3 +496,26 @@ def test_world_writable_or_symlink_state_is_refused(tmp_path):
     link.symlink_to(unsafe, target_is_directory=True)
     with pytest.raises(OSError):
         ProcessSupervisor(link)
+
+
+def test_record_reader_accepts_committed_inode_replaced_after_open(tmp_path, monkeypatch):
+    path = tmp_path / "current.json"
+    replacement = tmp_path / "replacement.json"
+    guardian.write_record(path, {"state": "active"})
+    guardian.write_record(replacement, {"state": "clean"})
+    inode = path.stat().st_ino
+    original = os.fstat
+    replaced = False
+
+    def replace_before_stat(fd):
+        nonlocal replaced
+        if not replaced and original(fd).st_ino == inode:
+            replaced = True
+            os.replace(replacement, path)
+        return original(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fstat", replace_before_stat)
+        assert guardian.read_record(path) == {"state": "active"}
+    assert replaced
+    assert guardian.read_record(path) == {"state": "clean"}

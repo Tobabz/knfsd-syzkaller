@@ -39,8 +39,12 @@ def private_directory(path: Path) -> None:
 def checked_open(path: Path, flags: int) -> int:
     fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     info = os.fstat(fd)
+    # A reader can open the previous committed inode just before an atomic
+    # record replacement unlinks it. That remains a valid immutable snapshot.
+    # Writers and the lock must always refer to a linked, exclusive inode.
+    allowed_links = (0, 1) if (flags & os.O_ACCMODE) == os.O_RDONLY else (1,)
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-            or info.st_mode & 0o077 or info.st_nlink != 1):
+            or info.st_mode & 0o077 or info.st_nlink not in allowed_links):
         os.close(fd)
         raise ValueError("unsafe supervisor state file")
     return fd
