@@ -5,13 +5,46 @@ after the Controller process died; recover() then runs.
 """
 
 import hashlib
+import json
 
-from agent_pipeline.contracts import AnalysisOutput, PlanOutput, Q1Status
+import pytest
+
+from agent_pipeline.contracts import (AnalysisOutput, GapClass, GapRef,
+                                      PlanOutput, Q1Status)
 from agent_pipeline.controller import events as ev
-from agent_pipeline.controller.records import JobState, TaskKind, Transition
-from agent_pipeline.controller.tasks import RunnerInput, SubmitRefused
+from agent_pipeline.controller.records import (JobState, TargetKind, TaskKind,
+                                               Transition)
+from agent_pipeline.controller.service import ReplayMismatch
+from agent_pipeline.controller.tasks import (RunnerInput, SubmitRefused,
+                                             legacy_runner_input_digest,
+                                             runner_input_digest)
 
-from .fakes import binding, sha
+from .fakes import VERSIONS, binding, sha
+
+
+def remove_materialized_hcap_provenance(w, job_id):
+    """Rewrite one database as records emitted before the field existed."""
+
+    row = w.store.db.execute(
+        "SELECT body FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    body = json.loads(row[0])
+    body["harness"].pop("hcap_revision")
+    w.store.db.execute(
+        "UPDATE jobs SET body = ? WHERE job_id = ?",
+        (json.dumps(body, sort_keys=True), job_id))
+
+    rows = w.store.db.execute(
+        "SELECT seq, body FROM transitions WHERE job_id = ? ORDER BY seq",
+        (job_id,)).fetchall()
+    for seq, raw in rows:
+        transition = json.loads(raw)
+        harness = transition["job"].get("harness")
+        if harness is None:
+            continue
+        harness.pop("hcap_revision", None)
+        w.store.db.execute(
+            "UPDATE transitions SET body = ? WHERE job_id = ? AND seq = ?",
+            (json.dumps(transition, sort_keys=True), job_id, seq))
 
 
 def same_after_restart(w, j):
@@ -24,6 +57,119 @@ def same_after_restart(w, j):
         assert after.pending_task == before.pending_task
     w.c.replay(j)
     return after
+
+
+def rewrite_runner_digest(world, job_id, digest=None):
+    """Rewrite one pending Runner task as a persisted historical snapshot."""
+
+    job = world.job(job_id)
+    pending = job.pending_task
+    assert pending is not None and pending.kind is TaskKind.RUNNER
+    task_input = RunnerInput(
+        job_id=job_id, harness_ref=job.harness.harness_ref,
+        execution_harness_id=job.harness.execution_harness_id)
+    digest = digest or legacy_runner_input_digest(task_input)
+
+    def historical(snapshot):
+        task = snapshot.pending_task
+        if task is None or task.task_id != pending.task_id:
+            return snapshot
+        return snapshot.model_copy(update={
+            "pending_task": task.model_copy(update={"input_digest": digest}),
+        })
+
+    current = historical(job)
+    world.store.db.execute(
+        "UPDATE jobs SET body = ? WHERE job_id = ?",
+        (current.model_dump_json(), job_id))
+    for transition in world.store.transitions(job_id):
+        changed = historical(transition.job)
+        if changed == transition.job:
+            continue
+        replacement = transition.model_copy(update={"job": changed})
+        world.store.db.execute(
+            "UPDATE transitions SET body = ? WHERE job_id = ? AND seq = ?",
+            (replacement.model_dump_json(), job_id, transition.seq))
+    return pending, task_input, digest
+
+
+def migration_events(world, job_id):
+    return [transition for transition in world.store.transitions(job_id)
+            if transition.event["type"] ==
+            "runner_input_digest_migrated"]
+
+
+def test_replay_authenticates_historical_runner_digest(world):
+    job_id = world.to_running()
+    pending, _, legacy = rewrite_runner_digest(world, job_id)
+
+    replayed = world.c.replay(job_id)
+
+    assert replayed.pending_task.task_id == pending.task_id
+    assert replayed.pending_task.input_digest == legacy
+    assert migration_events(world, job_id) == []
+
+
+@pytest.mark.parametrize("operation", ["poll", "recover"])
+def test_pending_legacy_runner_digest_is_migrated_before_dispatch(
+        world, operation):
+    job_id = world.to_running()
+    pending, task_input, legacy = rewrite_runner_digest(world, job_id)
+    before_submits = world.runner.submits[pending.task_id]
+
+    assert getattr(world.c, operation)() == []
+
+    job = world.job(job_id)
+    assert job.pending_task.input_digest == runner_input_digest(task_input)
+    assert job.pending_task.input_digest != legacy
+    assert world.runner.submits[pending.task_id] == before_submits + 1
+    events = migration_events(world, job_id)
+    assert len(events) == 1
+    assert events[0].event == {
+        "type": "runner_input_digest_migrated",
+        "task_id": pending.task_id,
+        "legacy_digest": legacy,
+        "canonical_digest": runner_input_digest(task_input),
+    }
+    assert world.c.replay(job_id) == job
+
+
+def test_runner_digest_migration_is_idempotent(world):
+    job_id = world.to_running()
+    pending, _, _ = rewrite_runner_digest(world, job_id)
+
+    assert world.c.poll() == []
+    migrated = world.job(job_id)
+    transition_count = len(world.store.transitions(job_id))
+    submit_count = world.runner.submits[pending.task_id]
+    assert world.c.poll() == []
+
+    assert world.job(job_id) == migrated
+    assert len(world.store.transitions(job_id)) == transition_count
+    assert len(migration_events(world, job_id)) == 1
+    # A running task is polled by status and is not submitted again.
+    assert world.runner.submits[pending.task_id] == submit_count
+
+
+def test_forged_runner_digest_is_refused_before_runner_call(world):
+    job_id = world.to_running()
+    pending, _, forged = rewrite_runner_digest(
+        world, job_id, digest="0" * 64)
+    before_submits = world.runner.submits[pending.task_id]
+    before_seq = world.job(job_id).seq
+
+    failures = world.c.poll()
+
+    assert len(failures) == 1
+    assert failures[0].effect == "pending_task"
+    assert "unauthenticated input digest" in failures[0].error
+    assert world.runner.submits[pending.task_id] == before_submits
+    assert world.job(job_id).seq == before_seq
+    assert world.job(job_id).pending_task.input_digest == forged
+    assert migration_events(world, job_id) == []
+    with pytest.raises(ReplayMismatch):
+        world.c.replay(job_id)
+    world.expected_failures += 1
 
 
 def test_restart_at_each_state_keeps_state_and_replays(world):
@@ -71,6 +217,130 @@ def test_restart_during_a_run_starts_it_once(world):
     world.run(j, Q1Status.REACHED)
     assert world.job(j).state is JobState.S1_REACHED
     assert world.runner.started == [task]
+
+
+def test_recover_migrates_legacy_materialized_without_hcap_provenance(world):
+    job_id = world.to_running()
+    before = world.job(job_id)
+    old_task = before.pending_task.task_id
+    remove_materialized_hcap_provenance(world, job_id)
+    legacy = world.job(job_id)
+    assert legacy.harness.hcap_revision is None
+    assert "hcap_revision" not in legacy.harness.model_fields_set
+
+    world.restart()
+
+    current = world.job(job_id)
+    assert current.state is JobState.S1_RUNNING
+    assert current.harness.hcap_revision == current.binding.hcap_revision
+    assert current.pending_task.task_id != old_task
+    assert world.runner.cancel_calls[old_task] == 1
+    assert world.c.replay(job_id) == current
+
+
+def test_recover_finishes_same_binding_hcap_mismatch_migration(world):
+    job_id = world.to_running()
+    before = world.job(job_id)
+    old_task = before.pending_task.task_id
+    replacement = binding(hcap="hcap-2")
+    world.registry.put(replacement)
+
+    # Reproduce a crash after the historical HCAP-only transition committed
+    # but before a flagged authority-rematerialization event was available.
+    world.c._apply(job_id, ev.BindingChanged(
+        binding=replacement, judge_versions=before.judge_versions))
+    stale = world.job(job_id)
+    assert stale.binding == replacement
+    assert stale.harness.hcap_revision == before.binding.hcap_revision
+    assert stale.pending_task.task_id == old_task
+
+    # Stored events from the affected implementation predate the flag.
+    transition = world.store.transitions(job_id)[-1]
+    raw = json.loads(transition.model_dump_json())
+    assert raw["event"].pop("rematerialize_authority") is False
+    world.store.db.execute(
+        "UPDATE transitions SET body = ? WHERE job_id = ? AND seq = ?",
+        (json.dumps(raw, sort_keys=True), job_id, transition.seq))
+
+    world.restart()
+
+    current = world.job(job_id)
+    assert current.state is JobState.S1_RUNNING
+    assert current.harness.hcap_revision == replacement.hcap_revision
+    assert current.harness.harness_ref != before.harness.harness_ref
+    assert current.pending_task.task_id != old_task
+    assert world.runner.cancel_calls[old_task] == 1
+    assert world.c.replay(job_id) == current
+
+
+def test_flagless_replay_combines_legacy_hcap_and_runner_digest(world):
+    job_id = world.to_running()
+    gap = GapRef(
+        gap_class=GapClass.REMOTE_KCOV_ATTRIBUTION,
+        missing_capability_id="remote_kcov.context.softirq")
+    bundle = world.run(
+        job_id, Q1Status.INCONCLUSIVE, "unsupported_attribution", gap)
+    blocked = world.job(job_id)
+    world.c._apply(job_id, ev.IssueChanged(
+        gap=gap, status="resolved", resolution="historical"))
+    versions = VERSIONS.model_copy(update={"judge_profile_id": "jp-2"})
+    world.judge.add(
+        bundle, blocked.binding.execution_harness_id,
+        blocked.candidate.candidate_id, Q1Status.REACHED, profile="jp-2")
+    historical = ev.BindingChanged(
+        binding=blocked.binding, judge_versions=versions)
+    world.c._apply(job_id, historical)
+    old_task = world.job(job_id).pending_task.task_id
+
+    transition = world.store.transitions(job_id)[-1]
+    raw = json.loads(transition.model_dump_json())
+    assert raw["event"].pop("rematerialize_authority") is False
+    world.store.db.execute(
+        "UPDATE transitions SET body = ? WHERE job_id = ? AND seq = ?",
+        (json.dumps(raw, sort_keys=True), job_id, transition.seq))
+    remove_materialized_hcap_provenance(world, job_id)
+    rewrite_runner_digest(world, job_id)
+    legacy = world.job(job_id)
+
+    assert world.c.replay(job_id) == legacy
+
+    world.restart()
+    current = world.job(job_id)
+    assert current.harness.hcap_revision == current.binding.hcap_revision
+    assert current.pending_task.task_id != old_task
+    assert world.runner.cancel_calls[old_task] == 1
+    assert world.c.replay(job_id) == current
+
+
+def test_flagless_failed_revalidation_preserves_waiting_snapshot(world):
+    """A pre-migration HCAP event keeps its inert harness on replay."""
+
+    job_id = world.to_running()
+    world.run(job_id, Q1Status.INCONCLUSIVE, "evidence")
+    before = world.job(job_id)
+    assert before.state is JobState.BLOCKED_OPERATOR
+
+    replacement = binding(hcap="hcap-2")
+    world.hcap.violations[(sha("plan-1"), "hcap-2")] = \
+        ("HCAP-02 removed",)
+    historical = ev.BindingChanged(
+        binding=replacement, judge_versions=before.judge_versions)
+    assert "rematerialize_authority" not in historical.model_fields_set
+    world.c._apply(job_id, historical)
+
+    stored = world.job(job_id)
+    assert stored.state is before.state
+    assert stored.harness == before.harness
+    assert stored.resume_point.kind is TargetKind.PLANNING
+
+    transition = world.store.transitions(job_id)[-1]
+    raw = json.loads(transition.model_dump_json())
+    assert raw["event"].pop("rematerialize_authority") is False
+    world.store.db.execute(
+        "UPDATE transitions SET body = ? WHERE job_id = ? AND seq = ?",
+        (json.dumps(raw, sort_keys=True), job_id, transition.seq))
+
+    assert world.c.replay(job_id) == stored
 
 
 def test_crash_after_commit_before_send_starts_once(world):

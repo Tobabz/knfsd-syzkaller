@@ -20,7 +20,7 @@ from typing import Annotated, Literal
 from pydantic import ConfigDict, Field, JsonValue, model_validator
 
 from .artifacts import ArtifactStore
-from .contracts import CandidateLocation, HcapCheck, Record, Sha256
+from .contracts import CandidateLocation, HcapCheck, JudgeVersions, Record, Sha256
 from .data import load_record
 
 Text = Annotated[str, Field(min_length=1, pattern=r"\S")]
@@ -327,7 +327,30 @@ class ArtifactHcapChecker:
             return False
         return missing_capability_id in catalog.missing_capability_ids
 
-    def check_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+    def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
+        """Select the Q1 authorities approved with a harness's HCAP.
+
+        Catalogs predating these authority references use the Controller's
+        configured default. A partial Q1 authority pair is ambiguous and is
+        therefore rejected instead of being combined with an unrelated
+        default.
+        """
+        catalog = self.load_catalog(hcap_revision)
+        refs = (*catalog.authority_refs,
+                *(ref for capability in catalog.capabilities
+                  for ref in capability.authority_refs))
+        by_kind = {ref.kind: ref.artifact_ref for ref in refs}
+        profile = by_kind.get("Q1AdmissibilityProfile")
+        boundary = by_kind.get("RemoteKcovSupportBoundary")
+        if profile is None and boundary is None:
+            return None
+        if profile is None or boundary is None:
+            raise ValueError("HCAP must pin both Q1 authority artifacts")
+        return JudgeVersions(judge_profile_id=profile,
+                             support_boundary_id=boundary)
+
+    def _check_plan(self, plan_ref: str, hcap_revision: str, *,
+                    require_revision: bool) -> HcapCheck:
         try:
             catalog = self.load_catalog(hcap_revision)
         except _ARTIFACT_ERRORS:
@@ -342,7 +365,7 @@ class ArtifactHcapChecker:
             return HcapCheck(violations=("invalid_plan_artifact",))
 
         violations: list[str] = []
-        if plan.hcap_revision != hcap_revision:
+        if require_revision and plan.hcap_revision != hcap_revision:
             violations.append("hcap_revision_mismatch")
         by_id = {cap.id: cap for cap in catalog.capabilities}
         interfaces: set[str] = set()
@@ -375,3 +398,13 @@ class ArtifactHcapChecker:
             if interface not in interfaces:
                 violations.append(f"interface_not_declared:{interface}")
         return HcapCheck(violations=tuple(violations))
+
+    def check_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        """Validate a newly submitted Agent plan, including its revision."""
+        return self._check_plan(plan_ref, hcap_revision,
+                                require_revision=True)
+
+    def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        """Validate stored plan semantics against a replacement catalog."""
+        return self._check_plan(plan_ref, hcap_revision,
+                                require_revision=False)

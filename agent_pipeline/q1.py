@@ -379,37 +379,67 @@ def evaluate(inputs: Q1Input) -> Q1Decision:
     if (obs.correlation != data.expected_correlation
             or data.expected_correlation.execution_harness_id != identity.execution_harness_id):
         return unknown("evidence", "generation_correlation_mismatch")
+    counts = generation.model_dump()
+    counters_complete = all(value is not None for value in counts.values())
+    if ((generation.generation_begin is not None and generation.generation_begin > 1)
+            or (generation.aggregate_published is not None
+                and generation.aggregate_published > 1)):
+        return unknown("evidence",
+                       "multiple_generations_in_single_generation_evidence")
+    if generation.aggregate_published:
+        unsafe_known_publish = (
+            (generation.generation_begin is not None
+             and generation.generation_begin != 1)
+            or (generation.remote_start_ok is not None
+                and generation.remote_start_ok < profile.minimum_remote_start_ok)
+            or (generation.generation_aborted is not None
+                and generation.generation_aborted != 0)
+            or (generation.scratch_overflow is not None
+                and generation.scratch_overflow != 0)
+            or (generation.merge_truncation is not None
+                and generation.merge_truncation != 0)
+            or (generation.outstanding_tokens is not None
+                and generation.outstanding_tokens != 0)
+            or (generation.remote_refs is not None and generation.remote_refs != 0)
+        )
+        if unsafe_known_publish:
+            return unknown(
+                "evidence", "published_aggregate_contradicts_generation_counters")
+
+    # An early execution failure can legitimately precede attribution, trace
+    # setup and generation-counter collection. Trust bindings and any
+    # checkable publication contradictions above still take precedence.
+    if not all((obs.boot_ok, obs.fixture_ok, obs.lane_ok, obs.runner_completed)) or obs.runtime_errors:
+        return unknown("infra", "execution_incomplete_or_failed")
     if obs.channel != "remote_kcov" or not obs.generation_attributed:
         return unknown("evidence", "coverage_not_generation_attributed_remote_kcov")
     if obs.lane_trace_mode not in profile.allowed_trace_modes:
         return unknown("evidence", "trace_mode_missing_or_disallowed")
-
-    counts = generation.model_dump()
-    if any(value is None for value in counts.values()):
+    if generation.aggregate_published is None:
         return unknown("evidence", "missing_generation_counter")
-    if generation.generation_begin > 1 or generation.aggregate_published > 1:
-        return unknown("evidence", "multiple_generations_in_single_generation_evidence")
-    unsafe_publish = (
-        generation.generation_begin != 1
-        or generation.remote_start_ok < profile.minimum_remote_start_ok
-        or generation.generation_aborted != 0
-        or generation.scratch_overflow != 0
-        or generation.merge_truncation != 0
-        or generation.outstanding_tokens != 0
-        or generation.remote_refs != 0
-    )
-    if generation.aggregate_published and unsafe_publish:
-        return unknown("evidence", "published_aggregate_contradicts_generation_counters")
-    if not all((obs.boot_ok, obs.fixture_ok, obs.lane_ok, obs.runner_completed)) or obs.runtime_errors:
-        return unknown("infra", "execution_incomplete_or_failed")
     if not generation.aggregate_published:
-        if generation.scratch_overflow or generation.merge_truncation:
+        loss_counters = (generation.scratch_overflow, generation.merge_truncation)
+        if any(value is not None and value != 0 for value in loss_counters):
             return unknown("loss", "aggregate_unpublished_after_coverage_loss")
-        if (generation.generation_aborted or generation.outstanding_tokens or generation.remote_refs
-                or generation.generation_begin != 1
-                or generation.remote_start_ok < profile.minimum_remote_start_ok):
+        if any(value is None for value in loss_counters):
+            return unknown("evidence", "missing_generation_counter")
+        generation_failure = (
+            None if generation.generation_aborted is None
+            else generation.generation_aborted != 0,
+            None if generation.outstanding_tokens is None
+            else generation.outstanding_tokens != 0,
+            None if generation.remote_refs is None else generation.remote_refs != 0,
+            None if generation.generation_begin is None else generation.generation_begin != 1,
+            None if generation.remote_start_ok is None
+            else generation.remote_start_ok < profile.minimum_remote_start_ok,
+        )
+        if any(failed is True for failed in generation_failure):
             return unknown("infra", "aggregate_unpublished_after_generation_failure")
+        if any(failed is None for failed in generation_failure):
+            return unknown("evidence", "missing_generation_counter")
         return unknown("evidence", "current_generation_aggregate_absent")
+    if not counters_complete:
+        return unknown("evidence", "missing_generation_counter")
     if not obs.collection_started or not obs.collection_completed:
         return unknown("evidence", "coverage_collection_incomplete")
     if obs.published_pcs is None or not obs.coverage_artifacts:

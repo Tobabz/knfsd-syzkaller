@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..contracts import (AgentTask, CandidateSubmission, GapRef,
+from ..contracts import (AgentModelPolicy, AgentTask, CandidateSubmission, GapRef,
                          HarnessBinding, JudgeVersions, Materialized,
                          Q1Result, Record, VulnerabilityCandidate)
 
@@ -121,6 +121,10 @@ class PendingTask(Record):
     kind: TaskKind
     input_digest: str
     agent_task: AgentTask | None = None
+    # Pinned when the task is minted so a policy change or Controller restart
+    # cannot silently run the same task identity with another model policy.
+    # None preserves replay of tasks stored before model policy was explicit.
+    model_policy: AgentModelPolicy | None = None
     attempt: int = 1                        # agent only
     repair: RepairInput | None = None
 

@@ -239,6 +239,58 @@ def test_published_contradiction_forbids_both_definite_verdicts(sample, field, v
     expect_unknown(count(sample if hit else miss(sample), **{field: value}), "evidence")
 
 
+@pytest.mark.parametrize("changes,missing", [
+    ({"generation_begin": 2}, "remote_refs"),
+    ({"aggregate_published": 2}, "remote_refs"),
+    ({"generation_begin": 0}, "remote_refs"),
+    ({"remote_start_ok": 0}, "remote_refs"),
+    ({"generation_aborted": 1}, "remote_refs"),
+    ({"scratch_overflow": 1}, "remote_refs"),
+    ({"merge_truncation": 1}, "remote_refs"),
+    ({"outstanding_tokens": 1}, "remote_refs"),
+    ({"remote_refs": 1}, "merge_truncation"),
+])
+def test_known_published_contradiction_precedes_unrelated_missing_counter(
+        sample, changes, missing):
+    data = count(observe(sample, runner_completed=False), **changes, **{missing: None})
+    diagnostic = ("multiple_generations_in_single_generation_evidence"
+                  if "generation_begin" in changes and changes["generation_begin"] > 1
+                  or "aggregate_published" in changes and changes["aggregate_published"] > 1
+                  else "published_aggregate_contradicts_generation_counters")
+    expect_unknown(data, "evidence", diagnostic)
+
+
+@pytest.mark.parametrize("early_failure", [False, True])
+def test_truly_undecidable_partial_counter_preserves_early_infra_precedence(
+        sample, early_failure):
+    data = count(observe(sample, runner_completed=not early_failure), remote_refs=None)
+    if early_failure:
+        expect_unknown(data, "infra", "execution_incomplete_or_failed")
+    else:
+        expect_unknown(data, "evidence", "missing_generation_counter")
+
+
+@pytest.mark.parametrize("changes,missing,reason,diagnostic", [
+    ({"scratch_overflow": 1}, "remote_refs", "loss",
+     "aggregate_unpublished_after_coverage_loss"),
+    ({"merge_truncation": 1}, "remote_refs", "loss",
+     "aggregate_unpublished_after_coverage_loss"),
+    ({"generation_aborted": 1}, "remote_refs", "infra",
+     "aggregate_unpublished_after_generation_failure"),
+    ({"remote_refs": 1}, "outstanding_tokens", "infra",
+     "aggregate_unpublished_after_generation_failure"),
+])
+def test_known_unpublished_failure_precedes_unrelated_missing_counter(
+        sample, changes, missing, reason, diagnostic):
+    data = count(sample, aggregate_published=0, **changes, **{missing: None})
+    expect_unknown(data, reason, diagnostic)
+
+
+def test_unpublished_failure_waits_for_undecidable_higher_precedence_loss(sample):
+    data = count(sample, aggregate_published=0, generation_aborted=1, scratch_overflow=None)
+    expect_unknown(data, "evidence", "missing_generation_counter")
+
+
 @pytest.mark.parametrize("changes,reason", [
     ({}, "evidence"), ({"scratch_overflow": 1}, "loss"),
     ({"merge_truncation": 1}, "loss"), ({"generation_aborted": 1}, "infra"),

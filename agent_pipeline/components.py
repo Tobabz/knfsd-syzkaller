@@ -1,6 +1,7 @@
 """Interfaces of the deterministic components and outside systems the
-Controller calls. Artifact-backed HCAP and Q1 implementations live in hcap
-and sealed_q1; the real Materializer and execution services remain separate.
+Controller calls. Artifact-backed HCAP, Q1 and Materializer implementations
+live in hcap, sealed_q1 and materializer. Durable execution services remain a
+separate Runner boundary.
 
 The machine calls HcapChecker, Materializer and Q1Judge inside a transition,
 so each must be a pure function of its arguments (09 rationale 1): replaying
@@ -12,7 +13,8 @@ from __future__ import annotations
 from typing import Protocol
 
 from .contracts import (HarnessBinding, HcapCheck, JudgeVersions, GapRef,
-                        MaterializeRejected, Materialized, Q1Result, Sanitizer)
+                        MaterializationHcapAuthority, MaterializeRejected,
+                        Materialized, Q1Result, Sanitizer)
 
 
 class HcapChecker(Protocol):
@@ -20,15 +22,27 @@ class HcapChecker(Protocol):
         """04 §1.1: capabilities exist, usable_by has agent_stage1, the plan
         names this hcap_revision."""
 
+    def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        """Check a stored plan against a newly selected HCAP catalog.
+
+        The plan keeps the revision under which the Agent produced it; all
+        capability, status, scope and interface declarations are checked
+        against ``hcap_revision``.
+        """
+
+    def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
+        """Return the Q1 authorities pinned by this HCAP, when present."""
+
     def knows_capability(self, hcap_revision: str,
                          missing_capability_id: str) -> bool:
         """Is the id in this revision's controlled vocabulary (07 §3)?"""
 
 
 class Materializer(Protocol):
-    def materialize(self, plan_ref: str, binding: HarnessBinding
+    def materialize(self, plan_ref: str, binding: HarnessBinding, *,
+                    hcap_authority: MaterializationHcapAuthority | None = None
                     ) -> Materialized | MaterializeRejected:
-        """05 §11."""
+        """05 §11.  Omitted authority requires an exact plan revision."""
 
 
 class Q1Judge(Protocol):

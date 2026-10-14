@@ -79,6 +79,36 @@ class Sanitizer(str, enum.Enum):
     KCSAN = "kcsan"
 
 
+class AgentModelPolicy(Record):
+    """Trusted model selection for one Agent Task execution.
+
+    The provider and requested model are policy, not Candidate or Agent
+    output.  ``output_retries`` is the structured-output repair allowance
+    inside one execution; exhausting it is one Agent failure for the
+    Controller's separate ``agent_retry_limit`` accounting (09 §6).
+    """
+
+    provider: str = Field(min_length=1, max_length=64,
+                          pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    model: str = Field(min_length=1, max_length=160,
+                       pattern=r"^[^\s:]+$")
+    output_retries: int = Field(default=2, ge=0, le=8)
+    max_output_tokens: int = Field(default=8192, ge=256, le=65536)
+
+    @property
+    def requested_model_id(self) -> str:
+        return f"{self.provider}:{self.model}"
+
+
+class Stage1AgentPolicy(Record):
+    """Task-specific model policy selected by the trusted Controller."""
+
+    candidate_analysis: AgentModelPolicy = Field(default_factory=lambda:
+        AgentModelPolicy(provider="openai", model="gpt-5"))
+    reachability_planning: AgentModelPolicy = Field(default_factory=lambda:
+        AgentModelPolicy(provider="openai", model="gpt-5"))
+
+
 class JobPolicy(Record):
     """01 §11.1, 09 §6.  Limits count retries: how many times the counted
     thing may happen after the first try.  With a limit of 1 one repair runs
@@ -95,6 +125,7 @@ class JobPolicy(Record):
     # Stage 2 is not implemented yet (decision record, decision 1); a
     # REACHED job waits in s1_reached (09 rationale 11).
     run_stage2: Literal[False] = False
+    stage1_agents: Stage1AgentPolicy = Field(default_factory=Stage1AgentPolicy)
     stage1_repair_budget: int = Field(default=3, ge=1)
     agent_retry_limit: int = Field(default=3, ge=1)
     runtime_retry_limit: int = Field(default=3, ge=1)
@@ -242,6 +273,24 @@ class Materialized(Record):
     harness_ref: Sha256
     review_manifest_sha256: Sha256
     execution_harness_id: Sha256
+    # None loads records written before materialization authority provenance
+    # was persisted.  The Controller treats those records as stale and
+    # rematerializes them before another Runner dispatch.
+    hcap_revision: str | None = None
+
+
+class MaterializationHcapAuthority(Record):
+    """HCAP authority selected for one materialization.
+
+    A new Agent plan must name the effective revision exactly.  A stored plan
+    may instead be materialized under a compatible replacement revision after
+    the Controller has revalidated it.  The Materializer still repeats the
+    complete plan/catalog validation under that effective revision; this flag
+    only makes the otherwise deliberate revision mismatch explicit.
+    """
+
+    effective_hcap_revision: str
+    validation: Literal["exact_plan_revision", "compatible_replacement"]
 
 
 NEUTRAL_CONTROL_UNAVAILABLE = "neutral_control_unavailable"

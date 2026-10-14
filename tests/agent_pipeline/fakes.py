@@ -86,6 +86,13 @@ class FakeHcap:
         return HcapCheck(violations=self.violations.get(
             (plan_ref, hcap_revision), ()))
 
+    def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        return HcapCheck(violations=self.violations.get(
+            (plan_ref, hcap_revision), ()))
+
+    def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
+        return None
+
     def knows_capability(self, hcap_revision: str, cap: str) -> bool:
         return cap in self.vocabulary
 
@@ -94,16 +101,20 @@ class FakeMaterializer:
     def __init__(self) -> None:
         self.refusals: dict[tuple[str, str], MaterializeRejected] = {}
 
-    def materialize(self, plan_ref: str, binding: HarnessBinding):
+    def materialize(self, plan_ref: str, binding: HarnessBinding, *,
+                    hcap_authority=None):
         r = self.refusals.get((plan_ref, binding.execution_harness_id))
         if r is not None:
             return r
         return Materialized(
             harness_ref=sha("harness", plan_ref,
-                            binding.execution_harness_id),
+                            binding.execution_harness_id,
+                            binding.hcap_revision),
             review_manifest_sha256=sha("manifest", plan_ref,
-                                       binding.execution_harness_id),
-            execution_harness_id=binding.execution_harness_id)
+                                       binding.execution_harness_id,
+                                       binding.hcap_revision),
+            execution_harness_id=binding.execution_harness_id,
+            hcap_revision=binding.hcap_revision)
 
 
 class FakeJudge:

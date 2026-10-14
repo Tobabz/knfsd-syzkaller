@@ -137,7 +137,8 @@ class ArtifactQ1Judge:
             raise ValueError("plan trace mode differs from the executed configuration")
         observation = _payload(bundle.get(OBSERVATION_ID, expected_type=OBSERVATION_TYPE),
                                RemoteKcovObservation)
-        if observation.lane_trace_mode != receipt.trace_mode:
+        if observation.lane_trace_mode is not None and \
+                observation.lane_trace_mode != receipt.trace_mode:
             raise ValueError("observation trace mode differs from trusted execution")
         # Bind the normalized PC claim to actual separately sealed bytes.
         # A guest's boolean 'observed' flag is never an oracle.
@@ -188,6 +189,8 @@ class ArtifactQ1Judge:
         receipt = self._receipt(bundle_ref)  # Never fabricate a missing host identity.
         try:
             return self.assess(bundle_ref, plan_ref, candidate_id, versions).as_result()
+        except OSError:
+            raise
         except _INVALID:
             fields = dict(
                 candidate_id=receipt.candidate.candidate_id,
@@ -216,5 +219,7 @@ class ArtifactQ1Judge:
             return not any(d.startswith("required_counter_window_absent:")
                            or d == "context_loss_policy_absent"
                            for d in decision.observations)
+        except OSError:
+            raise
         except _INVALID:
             return False

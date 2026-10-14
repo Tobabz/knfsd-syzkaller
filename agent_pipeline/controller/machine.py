@@ -13,20 +13,20 @@ blocked_operator(unexpected_event); nothing is mapped to the nearest row.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Callable
 
 from ..components import HcapChecker, Materializer, Q1Judge
 from ..contracts import (NEUTRAL_CONTROL_UNAVAILABLE, TASK_VARIANTS, AgentTask,
                          GapClass, GapRef, HarnessBinding, JobPolicy,
-                         MaterializeRejected, Q1Result, Q1Status,
-                         kernel_revision_gap)
+                         MaterializationHcapAuthority, MaterializeRejected,
+                         Q1Result, Q1Status, kernel_revision_gap)
 from . import events as ev
 from .records import (TERMINAL, WAITING, BlockedReason, ConsumedVerdict,
                       Job, JobState, PendingTask, RepairCause, RepairInput,
                       Stage2Input, Target, TargetKind, TaskKind)
+from .tasks import (RunnerInput, agent_input_digest,
+                    legacy_runner_input_digest, runner_input_digest)
 
 AGENT_STATES = {JobState.S1_ANALYSIS: AgentTask.CANDIDATE_ANALYSIS,
                 JobState.S1_PLANNING: AgentTask.REACHABILITY_PLANNING}
@@ -65,11 +65,6 @@ class _Call:
     consumed: list[str] = field(default_factory=list)
     verdicts: list[Q1Result] = field(default_factory=list)
     abandoned: tuple[str, int] | None = None
-
-
-def digest(obj) -> str:
-    text = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(text.encode()).hexdigest()
 
 
 class Machine:
@@ -133,7 +128,7 @@ class Machine:
             j.plan_ref = out.plan_ref
             j.harness = None
             c.consumed.append(out.plan_ref)
-            self._goto(c, self._materialize(c))
+            self._goto(c, self._materialize(c, require_revision=True))
         elif out.variant == "unsupported":
             gap = GapRef(gap_class=out.gap_class,
                          missing_capability_id=out.missing_capability_id)
@@ -150,6 +145,28 @@ class Machine:
             self._goto(c, Target(kind=TargetKind.ANALYSIS,
                                  cause=RepairCause.REANALYSIS_REQUESTED,
                                  findings=(out.reason,)))
+        return True
+
+    def _on_runner_input_digest_migrated(
+            self, c: _Call, e: ev.RunnerInputDigestMigrated) -> bool:
+        """Migrate exactly one authenticated legacy pending Runner task."""
+
+        j = c.job
+        p = j.pending_task
+        if not self._is_pending(p, TaskKind.RUNNER, e.task_id) or \
+                j.harness is None:
+            return False
+        task_input = RunnerInput(
+            job_id=j.job_id, harness_ref=j.harness.harness_ref,
+            execution_harness_id=j.harness.execution_harness_id)
+        legacy = legacy_runner_input_digest(task_input)
+        canonical = runner_input_digest(task_input)
+        if legacy == canonical or p.input_digest != legacy or \
+                e.legacy_digest != legacy or \
+                e.canonical_digest != canonical:
+            return False
+        j.pending_task = p.model_copy(update={"input_digest": canonical})
+        c.reason = "runner_input_digest_migrated"
         return True
 
     def _on_agent_failed(self, c: _Call, e: ev.AgentFailed) -> bool:
@@ -267,54 +284,87 @@ class Machine:
     def _on_binding_changed(self, c: _Call, e: ev.BindingChanged) -> bool:
         if c.job.state is JobState.SUBMITTED:
             return False
-        return self._binding_change(c, e.binding)
+        # Events written before the authority-migration flag existed used the
+        # old reduction order: assign judge versions, then rebind, without
+        # re-judging an already consumed bundle. Preserve that exact behavior
+        # for replay; all current producers explicitly set the flag.
+        if "rematerialize_authority" not in e.model_fields_set:
+            if e.judge_versions is not None:
+                c.job.judge_versions = e.judge_versions
+            return self._binding_change(c, e.binding)
+        binding_changed = self._binding_change(
+            c, e.binding,
+            rematerialize_authority=e.rematerialize_authority)
+        versions_changed = e.judge_versions is not None and \
+            e.judge_versions != c.job.judge_versions
+        if versions_changed:
+            self._change_judge_versions(
+                c, e.judge_versions,
+                set_reason=not binding_changed)
+        return binding_changed or versions_changed
 
-    def _binding_change(self, c: _Call, binding: HarnessBinding | None
-                        ) -> bool:
+    def _binding_change(self, c: _Call, binding: HarnessBinding | None, *,
+                        rematerialize_authority: bool = False) -> bool:
         j = c.job
         new = self._usable(c, binding)
         if j.state is JobState.RETRY_PENDING:
             base = j.resume_point
-            t = self._rebind(c, new, base)
+            t = self._rebind(
+                c, new, base,
+                rematerialize_authority=rematerialize_authority)
             j.gap = None
             j.resume_point = None
             c.reason = "rebind"
             self._goto(c, t)
             return True
-        if new == j.binding:
+        if new == j.binding and (not rematerialize_authority or
+                                 not self._materialization_stale(j, new)):
             return False
         if j.state in WAITING:
             base = self._waiting_base(j)
-            self._set_resume(c, self._rebind(c, new, base), base)
+            self._set_resume(c, self._rebind(
+                c, new, base,
+                rematerialize_authority=rematerialize_authority), base)
             c.reason = "binding_changed"
             return True
         old = j.binding
         here = self._here(j)
         c.reason = "binding_changed"
         if new is not None and old is not None and \
-                new.execution_harness_id == old.execution_harness_id:
-            # hcap_revision only (09 §5).
+                new.execution_harness_id == old.execution_harness_id and \
+                new.hcap_revision != old.hcap_revision and \
+                not rematerialize_authority:
+            # Preserve historical HCAP-only events exactly. A current
+            # recovery detects their stale harness and emits a flagged,
+            # same-binding BindingChanged migration.
             j.binding = new
             if j.state in AGENT_STATES:
-                # The same Agent Task again, on the new hcap_revision.
                 self._goto(c, self._agent_target(j.pending_task,
                                                  charged=True))
                 return True
             if j.plan_ref:
-                chk = self.env.hcap.check_plan(j.plan_ref, new.hcap_revision)
+                chk = self.env.hcap.revalidate_plan(j.plan_ref,
+                                                    new.hcap_revision)
                 if not chk.ok:
                     self._goto(c, Target(kind=TargetKind.PLANNING,
                                          cause=RepairCause.HCAP_CHANGED,
                                          findings=chk.violations))
             return True
-        self._goto(c, self._rebind(c, new, here))
+        self._goto(c, self._rebind(
+            c, new, here,
+            rematerialize_authority=rematerialize_authority))
         return True
 
     def _on_judge_versions_changed(self, c: _Call,
                                    e: ev.JudgeVersionsChanged) -> bool:
+        return self._change_judge_versions(c, e.judge_versions)
+
+    def _change_judge_versions(self, c: _Call, versions, *,
+                               set_reason: bool = True) -> bool:
         j = c.job
-        j.judge_versions = e.judge_versions
-        c.reason = "judge_versions_changed"
+        j.judge_versions = versions
+        if set_reason:
+            c.reason = "judge_versions_changed"
         lv = j.last_verdict
         if lv is None or j.state is JobState.SUBMITTED:
             return True
@@ -323,23 +373,43 @@ class Machine:
         same_binding = lv.binding == j.binding and \
             lv.plan_ref == j.plan_ref and j.harness is not None and \
             lv.harness_ref == j.harness.harness_ref
-        if not self.env.judge.has_required_evidence(lv.bundle_ref,
-                                                    e.judge_versions):
+        if not self.env.judge.has_required_evidence(lv.bundle_ref, versions):
             if not same_binding:
                 return True
             t = Target(kind=TargetKind.RUNNING, rerun=True)
         else:
             r = self.env.judge.judge(lv.bundle_ref, lv.plan_ref,
                                      j.candidate.candidate_id,
-                                     e.judge_versions)
+                                     versions)
             c.verdicts.append(r)
-            # Recorded always; routes only when the verdict changed.
-            if not same_binding or (r.status, r.reason) == \
-                    (lv.result.status, lv.result.reason):
+            if not same_binding:
                 return True
+            previous_reason = c.reason
+            old_target = self._q1_target(c, lv.result)
+            c.reason = previous_reason
+            new_target = self._q1_target(c, r)
             c.consumed.append(r.verdict_id)
             j.last_verdict = lv.model_copy(update={"result": r})
-            t = self._q1_target(c, r)
+            # Consume the new authority's verdict even when its route is the
+            # same.  A reached job must then expose the new verdict in its
+            # Stage2Input instead of retaining the old authority's identity.
+            same_decision = (r.status, r.reason, r.gap_signal) == \
+                (lv.result.status, lv.result.reason, lv.result.gap_signal)
+            if same_decision and old_target == new_target:
+                if j.state is JobState.S1_REACHED:
+                    self._goto(c, Target(kind=TargetKind.REACHED))
+                return True
+            t = new_target
+            # A NOT_REACHED re-judge replaces the evidence embedded in the
+            # current repair task.  Reissue that logical input without
+            # charging the Stage 1 repair budget a second time.
+            pending = j.pending_task
+            if t.kind is TargetKind.PLANNING and \
+                    j.state is JobState.S1_PLANNING and \
+                    pending is not None and pending.kind is TaskKind.AGENT and \
+                    pending.repair is not None and pending.repair.cause is \
+                    RepairCause.Q1_NOT_REACHED:
+                t = t.model_copy(update={"charged": True})
         # 09 §5, §6: a rerun this event asks for spends no budget, also
         # when it waits in a resume point first.
         t = self._external(t)
@@ -369,7 +439,18 @@ class Machine:
         c.policy = self.env.policy(e.job_policy_id)
         if c.policy.sanitizer is not old.sanitizer and \
                 j.state is not JobState.SUBMITTED:
-            self._binding_change(c, e.binding)
+            if "rematerialize_authority" not in e.model_fields_set:
+                if e.judge_versions is not None:
+                    j.judge_versions = e.judge_versions
+                self._binding_change(c, e.binding)
+            else:
+                self._binding_change(
+                    c, e.binding,
+                    rematerialize_authority=e.rematerialize_authority)
+                if e.judge_versions is not None and \
+                        e.judge_versions != j.judge_versions:
+                    self._change_judge_versions(c, e.judge_versions,
+                                                set_reason=False)
         c.reason = "policy_changed"
         return True
 
@@ -474,16 +555,29 @@ class Machine:
         return True
 
     def _materialize(self, c: _Call,
-                     failure_cause: RepairCause | None = None) -> Target:
+                     failure_cause: RepairCause | None = None, *,
+                     require_revision: bool = False) -> Target:
         """HCAP check, then the Materializer, on the stored plan (09 §3).
-        Stores the harness on success."""
+        Stores the harness on success. Only a newly returned Agent plan must
+        name the selected revision; later catalog revalidation checks its
+        declarations against the replacement catalog."""
         j = c.job
-        chk = self.env.hcap.check_plan(j.plan_ref, j.binding.hcap_revision)
+        # A failed authority check or materialization must never leave an old
+        # harness available to a later Runner dispatch.
+        j.harness = None
+        check = self.env.hcap.check_plan if require_revision else \
+            self.env.hcap.revalidate_plan
+        chk = check(j.plan_ref, j.binding.hcap_revision)
         if not chk.ok:
             return Target(kind=TargetKind.PLANNING,
                           cause=failure_cause or RepairCause.HCAP_INVALID,
                           findings=chk.violations)
-        m = self.env.materializer.materialize(j.plan_ref, j.binding)
+        authority = MaterializationHcapAuthority(
+            effective_hcap_revision=j.binding.hcap_revision,
+            validation="exact_plan_revision" if require_revision else
+            "compatible_replacement")
+        m = self.env.materializer.materialize(
+            j.plan_ref, j.binding, hcap_authority=authority)
         if isinstance(m, MaterializeRejected):
             if m.reason == NEUTRAL_CONTROL_UNAVAILABLE:
                 if not m.profile:
@@ -498,7 +592,8 @@ class Machine:
                           cause=failure_cause or
                           RepairCause.MATERIALIZER_REJECTED,
                           findings=(m.reason, m.detail))
-        if m.execution_harness_id != j.binding.execution_harness_id:
+        if m.execution_harness_id != j.binding.execution_harness_id or \
+                m.hcap_revision != j.binding.hcap_revision:
             return self._unexpected_target(TargetKind.MATERIALIZE)
         j.harness = m
         return Target(kind=TargetKind.RUNNING)
@@ -540,11 +635,13 @@ class Machine:
                       inner=Target(kind=kind))
 
     def _rebind(self, c: _Call, new: HarnessBinding | None,
-                base: Target) -> Target:
+                base: Target, *,
+                rematerialize_authority: bool = False) -> Target:
         """Where a binding change sends a job whose base point is `base`
         (09 §5, the identity re-establishment point)."""
         j = c.job
         old = j.binding
+        stale = self._materialization_stale(j, new)
         if new is None:
             j.binding = None
             return Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
@@ -561,12 +658,43 @@ class Machine:
             return Target(kind=TargetKind.ANALYSIS)
         if new.hcap_revision != old.hcap_revision and j.plan_ref and \
                 base.kind not in (TargetKind.ANALYSIS, TargetKind.PLANNING):
-            chk = self.env.hcap.check_plan(j.plan_ref, new.hcap_revision)
+            chk = self.env.hcap.revalidate_plan(j.plan_ref,
+                                                new.hcap_revision)
             if not chk.ok:
+                if rematerialize_authority:
+                    j.harness = None
                 return Target(kind=TargetKind.PLANNING,
                               cause=RepairCause.HCAP_CHANGED,
                               findings=chk.violations)
+            if rematerialize_authority:
+                j.harness = None
+                return self._materialize(c, RepairCause.HCAP_CHANGED)
+            return base
+        if rematerialize_authority and stale and base.kind in (
+                TargetKind.ANALYSIS, TargetKind.PLANNING):
+            # The active Agent task will replace this inert harness.
+            j.harness = None
+            return base
+        if rematerialize_authority and stale and j.plan_ref:
+            chk = self.env.hcap.revalidate_plan(j.plan_ref,
+                                                new.hcap_revision)
+            if not chk.ok:
+                j.harness = None
+                return Target(kind=TargetKind.PLANNING,
+                              cause=RepairCause.HCAP_CHANGED,
+                              findings=chk.violations)
+            j.harness = None
+            return self._materialize(c, RepairCause.HCAP_CHANGED)
+        if rematerialize_authority and stale:
+            j.harness = None
+            return self._unexpected_target(TargetKind.MATERIALIZE)
         return base
+
+    @staticmethod
+    def _materialization_stale(
+            j: Job, binding: HarnessBinding | None) -> bool:
+        return binding is not None and j.harness is not None and \
+            j.harness.hcap_revision != binding.hcap_revision
 
     @staticmethod
     def _waiting_base(j: Job) -> Target:
@@ -604,19 +732,26 @@ class Machine:
         self._drop_task(c)
         if not retry:
             j.counters = j.counters.model_copy(update={"agent_retry": 0})
-        task_input = {
-            "agent_task": task.value,
-            "candidate": j.candidate.model_dump(mode="json"),
-            "hcap_revision": j.binding.hcap_revision,
-            "analysis_ref": j.analysis_ref,
-            "plan_ref": j.plan_ref if task is
-            AgentTask.REACHABILITY_PLANNING else None,
-            "repair": repair.model_dump(mode="json") if repair else None,
-        }
+        if task is AgentTask.CANDIDATE_ANALYSIS:
+            model_policy = c.policy.stage1_agents.candidate_analysis
+        elif task is AgentTask.REACHABILITY_PLANNING:
+            model_policy = c.policy.stage1_agents.reachability_planning
+        else:
+            raise ValueError(f"no model policy for {task}")
         j.pending_task = PendingTask(task_id=self._mint(j),
                                      kind=TaskKind.AGENT,
-                                     input_digest=digest(task_input),
-                                     agent_task=task, repair=repair)
+                                     input_digest=agent_input_digest(
+                                         agent_task=task,
+                                         model_policy=model_policy,
+                                         candidate=j.candidate,
+                                         hcap_revision=
+                                         j.binding.hcap_revision,
+                                         analysis_ref=j.analysis_ref,
+                                         plan_ref=j.plan_ref,
+                                         repair=repair),
+                                     agent_task=task,
+                                     model_policy=model_policy,
+                                     repair=repair)
         j.state = JobState.S1_ANALYSIS if \
             task is AgentTask.CANDIDATE_ANALYSIS else JobState.S1_PLANNING
         j.state_reason = repair.cause.value if repair else None
@@ -644,11 +779,12 @@ class Machine:
                 input_digest=h.review_manifest_sha256)
             j.state = JobState.S1_APPROVAL
         else:
+            task_input = RunnerInput(
+                job_id=j.job_id, harness_ref=h.harness_ref,
+                execution_harness_id=h.execution_harness_id)
             j.pending_task = PendingTask(
                 task_id=self._mint(j), kind=TaskKind.RUNNER,
-                input_digest=digest({"harness_ref": h.harness_ref,
-                                     "execution_harness_id":
-                                     h.execution_harness_id}))
+                input_digest=runner_input_digest(task_input))
             j.state = JobState.S1_RUNNING
         j.state_reason = "rerun" if rerun else None
         j.resume_point = None

@@ -13,7 +13,7 @@ from typing import Annotated, Literal, Union
 from pydantic import Field, TypeAdapter
 
 from ..contracts import (AgentOutput, GapRef, HarnessBinding, JudgeVersions,
-                         Record, VulnerabilityCandidate)
+                         Record, Sha256, VulnerabilityCandidate)
 
 
 class IntakeChecked(Record):
@@ -60,6 +60,16 @@ class RunnerFinished(Record):
     reason: str | None = None
 
 
+class RunnerInputDigestMigrated(Record):
+    """Replace one authenticated pre-``job_id`` Runner input digest."""
+
+    type: Literal["runner_input_digest_migrated"] = \
+        "runner_input_digest_migrated"
+    task_id: str
+    legacy_digest: Sha256
+    canonical_digest: Sha256
+
+
 class ApprovalGiven(Record):
     type: Literal["approval_given"] = "approval_given"
     task_id: str
@@ -89,6 +99,11 @@ class BindingChanged(Record):
 
     type: Literal["binding_changed"] = "binding_changed"
     binding: HarnessBinding | None
+    judge_versions: JudgeVersions | None = None
+    # Absent in historical events. New registry/recovery events set this so
+    # binding, materialization and judge authority change atomically while old
+    # transition logs retain their original reduction.
+    rematerialize_authority: bool = False
 
 
 class JudgeVersionsChanged(Record):
@@ -104,6 +119,8 @@ class PolicyChanged(Record):
     type: Literal["policy_changed"] = "policy_changed"
     job_policy_id: str
     binding: HarnessBinding | None = None
+    judge_versions: JudgeVersions | None = None
+    rematerialize_authority: bool = False
 
 
 class OperatorAction(Record):
@@ -121,9 +138,9 @@ class CancelConfirmed(Record):
 
 Event = Annotated[
     Union[IntakeChecked, AgentSucceeded, AgentFailed, AgentAttemptRestarted,
-          RunnerFinished, ApprovalGiven, ApprovalDenied, IssueChanged,
-          BindingChanged, JudgeVersionsChanged, PolicyChanged, OperatorAction,
-          CancelConfirmed],
+          RunnerFinished, RunnerInputDigestMigrated, ApprovalGiven,
+          ApprovalDenied, IssueChanged, BindingChanged, JudgeVersionsChanged,
+          PolicyChanged, OperatorAction, CancelConfirmed],
     Field(discriminator="type"),
 ]
 

@@ -132,6 +132,10 @@ class EvidenceVerificationError(EvidenceError):
     """Fail closed: no VerifiedBundle is produced for this reference."""
 
 
+class EvidenceUnavailableError(EvidenceVerificationError, OSError):
+    """Artifact bytes could not be read due to a retryable I/O failure."""
+
+
 @dataclass(frozen=True)
 class VerifiedArtifact:
     descriptor: EvidenceArtifact
@@ -248,5 +252,11 @@ class EvidenceStore:
                     raise ValueError(f"artifact hash mismatch: {artifact.identity}")
                 verified.append(VerifiedArtifact(artifact, data))
             return VerifiedBundle(bundle_ref, manifest, tuple(verified))
-        except (ArtifactError, ValueError, TypeError, OSError, RecursionError) as exc:
+        except OSError as exc:
+            # Keep storage availability distinct from stable malformed,
+            # schema, limit and digest-integrity failures. The Judge lets this
+            # escape so the Controller does not commit a replay-unstable
+            # semantic verdict.
+            raise EvidenceUnavailableError(str(exc)) from exc
+        except (ArtifactError, ValueError, TypeError, RecursionError) as exc:
             raise EvidenceVerificationError(str(exc)) from exc

@@ -6,6 +6,8 @@ from agent_pipeline.contracts import (GapClass, GapRef, MaterializeRejected,
                                       UnsupportedOutput)
 from agent_pipeline.controller.records import (BlockedReason, JobState,
                                                RepairCause, TaskKind)
+from agent_pipeline.controller.tasks import (RunnerInput,
+                                             runner_input_digest)
 
 from .fakes import (OTHER_COMMIT, binding, function_submission, policy,
                     sha)
@@ -123,6 +125,16 @@ def test_approval_of_the_current_manifest_runs(make_world):
     job = w.job(j)
     assert job.state is JobState.S1_RUNNING
     assert w.runner.started == [job.pending_task.task_id]
+
+
+def test_runner_pending_digest_is_canonical_submitted_input(world):
+    j = world.to_running()
+    job = world.job(j)
+    submitted = world.runner.tasks[job.pending_task.task_id]["input"]
+    assert submitted == RunnerInput(
+        job_id=j, harness_ref=job.harness.harness_ref,
+        execution_harness_id=job.harness.execution_harness_id)
+    assert job.pending_task.input_digest == runner_input_digest(submitted)
 
 
 def test_approval_of_another_manifest_is_not_an_approval(make_world):
