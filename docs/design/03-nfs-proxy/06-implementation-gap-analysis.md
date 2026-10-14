@@ -929,6 +929,12 @@ M4는 generation의 admitting/draining/closed 단계와 closure 판정도 구현
 issue #18 F1). deactivation은 CALL admission만 닫고, draining G의 REPLY는 G로 처리하며, closure 뒤 G
 REPLY는 변조하지 않는다. closure reason과 `reply_unresolved_count`를 만든다.
 
+구현 상태: M4는 M4a(rule set serialization/validation), M4b(Resolver), M4c(preflight와 concrete edit
+adapter), M4d(activation 창과 generation 단계, sink는 test double)로 나눠 진행한다. M4a가 구현됐다.
+`src/rule.*`는 `NFSPRUL1`(`04-semantic-mutation-runtime.md` §35)을 읽고 schema에 대해 all-or-nothing으로
+검증하며, `src/schema.*`의 `nfsp_schema_resolve()`가 semantic path를 type graph에서 찾는다. 설치 경로와
+`RULESET` 기록은 아직 없다(§9, S1a).
+
 ### 28. M5 — Semantic Delta journal / relay completion
 
 Required:
