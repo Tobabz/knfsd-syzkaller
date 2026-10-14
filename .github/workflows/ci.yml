@@ -1,0 +1,45 @@
+# Host checks that need no VM, kernel build or site-generated image.  The
+# fuzzing lane itself (kernel, syzkaller, guest images) is run by hand.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nfs-proxy:
+    # Normalizer and rfc_xdr tests, RFC pins and table freshness (offline),
+    # clang build plus gcc ASan/UBSan build, every host unit test.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/nfs-proxy/build.sh
+
+  agent-pipeline:
+    # Stage 1 Controller (agent_pipeline/), against uv.lock.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run pytest -q
+
+  lane-inputs:
+    # Lane dependency assembly and bake inputs, and the lane script's
+    # quoted sh -c region, without booting a guest.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/test-lane-inputs.py
+      - run: sh tools/lane-quote-lint.sh
