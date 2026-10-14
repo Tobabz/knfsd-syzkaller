@@ -702,9 +702,11 @@ static int has_meta(const struct nfsp_protocol_schema *s,
 		return ty->kind == NFSP_XK_UNION || ty->kind == NFSP_XK_LIST ||
 		       (n->flags & NFSP_SN_LIST_ELEMENT);
 	case NFSP_PART_PADDING:
+		/* A value of length 0 has no padding, and <0> allows only
+		 * that. */
 		return (ty->kind == NFSP_XK_OPAQUE_FIXED && (ty->bound & 3u)) ||
-		       ty->kind == NFSP_XK_OPAQUE_VAR ||
-		       ty->kind == NFSP_XK_STRING;
+		       ((ty->kind == NFSP_XK_OPAQUE_VAR ||
+			 ty->kind == NFSP_XK_STRING) && ty->bound > 0);
 	}
 	return 0;
 }

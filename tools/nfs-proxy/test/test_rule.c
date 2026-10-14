@@ -1213,6 +1213,66 @@ static void test_valid(void)
 	OK(sp);
 }
 
+/* Padding of a variable opaque or string with bound 0: its length is
+ * always 0, so it never has padding (the decoder refuses any other
+ * length).  The real tables have no such field, so one is made from a
+ * copy of NFSv4.1 with the owner opaque's bound set to 0. */
+static void test_padding_of_bound_zero(void)
+{
+	const struct nfsp_protocol_schema *s = v41();
+	struct nfsp_schema_type *types;
+	struct nfsp_protocol_schema sch;
+	const struct nfsp_protocol_schema *schs[1] = { &sch };
+	struct nfsp_schema_family fam = nfsp_schema_family_nfs4;
+	const struct nfsp_schema_family *f[1] = { &fam };
+	struct nfsp_schema_node n;
+	struct nfsp_ruleset rs;
+	struct nfsp_rule_error err;
+	struct spec sp;
+	struct w w;
+
+	printf("validate: no padding under a bound of 0\n");
+	CHECK(nfsp_schema_resolve(s, 0, "nfs4.request.OPEN.args.owner.owner",
+				  &n) == NFSP_SCHEMA_FOUND &&
+	      s->types[n.type].kind == NFSP_XK_OPAQUE_VAR, "owner opaque");
+	types = malloc(s->ntypes * sizeof(*types));
+	if (!types || s->types[n.type].kind != NFSP_XK_OPAQUE_VAR) {
+		free(types);
+		return;
+	}
+	memcpy(types, s->types, s->ntypes * sizeof(*types));
+	sch = *s;
+	sch.types = types;
+	fam.schemas = schs;
+	fam.nschemas = 1;
+
+	sp = golden_spec();
+	sp.npreds = 0;
+	sp.operation = "OPEN";
+	sp.path = "nfs4.request.OPEN.args.owner.owner";
+	sp.part = NFSP_PART_PADDING;
+	sp.policy = NFSP_POLICY_RAW;
+	sp.xlit.kind = NFSP_LIT_OPAQUE;
+	sp.xlit.bytes = "\1";
+	sp.xlit.len = 1;
+	wset(&w, s->schema_id, &sp, 1);
+	for (int k = 0; k < 2; k++) {
+		types[n.type].kind = k ? NFSP_XK_STRING : NFSP_XK_OPAQUE_VAR;
+		types[n.type].bound = 1;
+		CHECK(nfsp_ruleset_load(w.b, w.n, f, 1, &rs, &err) ==
+		      NFSP_RULE_OK, "%s<1> padding: %s",
+		      k ? "string" : "opaque", nfsp_rule_strstatus(err.status));
+		nfsp_ruleset_free(&rs);
+		types[n.type].bound = 0;
+		CHECK(nfsp_ruleset_load(w.b, w.n, f, 1, &rs, &err) ==
+		      NFSP_RULE_PART_UNAVAILABLE && err.rule == 0,
+		      "%s<0> padding: %s", k ? "string" : "opaque",
+		      nfsp_rule_strstatus(err.status));
+		nfsp_ruleset_free(&rs);
+	}
+	free(types);
+}
+
 static void test_refusals(void)
 {
 	struct nfsp_rule_error err;
@@ -1420,6 +1480,7 @@ int main(void)
 	test_prefixes();
 	test_canonical();
 	test_valid();
+	test_padding_of_bound_zero();
 	test_refusals();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
