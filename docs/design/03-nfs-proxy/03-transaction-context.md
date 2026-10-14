@@ -901,8 +901,15 @@ Transaction Context가 correct request/reply semantic context를 공급함만 �
 - **결정됨:** context memory/lifetime은 bounded여야 한다.
 - **결정됨:** full raw request 장기 보존은 기본 계약이 아니다.
 - **결정됨:** `connection_id`는 Proxy 실행마다 1부터 시작하는 64-bit 단조 증가 카운터다(§2, M1).
-- **미결:** timeout / completed-retention / capacity의 numeric values.
-- **미결:** request equivalence fingerprint 구현 방식.
+- **결정됨(M3 초기값):** outstanding 4096(global) / 1024(per connection), completed retention
+  1024 entries · 10 s, timeout 300 s(마지막 CALL 관측 기준, monotonic clock). 고정 pool을 한 번
+  할당하고 retained entry만 회수한다(`tools/nfs-proxy/src/txn.h`). 실제 workload peak로 재검토한다.
+- **결정됨:** request equivalence는 `rpc_payload` 전체 bytes의 독립 64-bit hash 두 개와 길이로
+  판정한다. 같으면 retransmission, 다르면 ambiguous다(§11). Runtime 판정용이며 identity가 아니다.
+- **결정됨:** request summary는 `minor_version`과 operation opcode 배열(최대 256)이다. request
+  decode가 `decoded`/`partial`일 때만 저장·제공한다.
+- **결정됨(M4 전):** legacy `on_record` rewrite hook이 있으면 `request.forwarded`는 unknown이고
+  request-dependent 검증에 쓰지 않는다. 없으면 `forwarded = original`이다.
 - **미결:** rule dependency에 따른 `semantic_context[]` exact typed representation.
 - **미결:** callback/backchannel routing의 initial current-implementation coverage.
 - **미검증:** real manager workload의 outstanding transaction peak와 retention 요구량.
@@ -959,9 +966,21 @@ unsupported_by_current_harness
 
 ### 확장 절차
 
-Current implementation에는 Transaction Context가 아직 없다.
+M3 구현 위치:
 
-구현 시 최소 다음을 함께 변경/검증한다.
+```text
+tools/nfs-proxy/src/txn.{h,c}        Transaction Context table (key, state, bounds, lifecycle)
+tools/nfs-proxy/src/semantic.{h,c}   on_rpc_record / on_connection observer:
+                                     RPC Decoder -> txn -> NFS Semantic Decoder -> enrichment
+tools/nfs-proxy/src/main.c           --semantic (observe only, counters in stats output)
+tools/nfs-proxy/test/test_txn.c      oracle 1-10 (+ supersede, random model check)
+tools/nfs-proxy/test/test_semantic.c oracle 11a, 12, 13 (NFSv4), forwarded unknown, lifecycle
+```
+
+NFSv3 schema가 없으므로 oracle 11은 NFSv3 schema 추가 시 검증한다. Oracle 14는 Resolver(M4)가
+`request.forwarded`를 채울 때 검증한다. `activation_generation`은 M4 전까지 0이다.
+
+변경 시 최소 다음을 함께 변경/검증한다.
 
 ```text
 Proxy connection lifecycle
@@ -974,7 +993,7 @@ guest/runtime validation
 Harness Capability Specification
 ```
 
-실제 구현 파일/심볼이 추가되면 이 절을 concrete path 기준으로 갱신한다.
+파일/심볼이 바뀌면 위 경로 목록을 갱신한다.
 
 ### 제약
 

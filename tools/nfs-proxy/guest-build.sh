@@ -18,7 +18,9 @@ gcc -std=c11 -O2 -g -pthread -Wall -Wextra -Werror -Wshadow \
     -Wwrite-strings -Wmissing-prototypes -Wstrict-prototypes -Wformat=2 \
     -I/src -o /work/nfs-proxy /src/main.c /src/proxy.c /src/framing.c \
     /src/rpc_record.c \
-    /src/control.c /src/delta.c /src/walk.c /src/edit.c
+    /src/control.c /src/delta.c /src/walk.c /src/edit.c \
+    /src/semantic.c /src/txn.c /src/nfs_decode.c /src/schema.c \
+    /src/schema_nfs4.c /src/rpc_decode.c
 gcc -std=c11 -O2 -g -Wall -Wextra -Werror -Wshadow -Wconversion \
     -Wsign-conversion -Wpointer-arith -Wcast-qual -Wwrite-strings \
     -Wmissing-prototypes -Wstrict-prototypes -Wformat=2 \
@@ -66,6 +68,9 @@ validate_binary /work/guest-delta-replay replay-probe
         /src/rpc_record.c /src/rpc_record.h \
         /src/control.c /src/control.h /src/delta.c /src/delta.h \
         /src/walk.c /src/walk.h /src/edit.c /src/edit.h \
+        /src/semantic.c /src/semantic.h /src/txn.c /src/txn.h \
+        /src/nfs_decode.c /src/nfs_decode.h /src/schema.c /src/schema.h \
+        /src/schema_nfs4.c /src/rpc_decode.c /src/rpc_decode.h \
         /test/guest-delta-replay.c
     sha256sum /work/nfs-proxy /work/guest-delta-replay
 } > /work/provenance.txt

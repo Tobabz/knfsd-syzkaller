@@ -68,7 +68,8 @@
  *
  *   Request context (the CALL's decoded operations, for request-dependent
  *   predicates and request/result consistency) comes from the Transaction
- *   Context in M3.  M2 never has it, so `request_context` is always 0.
+ *   Context (txn.h), next to this decode (semantic.h), not through it, so
+ *   `request_context` is always 0 here.
  *
  * RPCSEC_GSS
  *
@@ -205,7 +206,7 @@ struct nfsp_decoded_msg {
 	int has_minor;
 	uint32_t minor_version;
 	enum nfsp_dispatch_source dispatch_source;	/* REPLY */
-	int request_context;		/* always 0 in M2, see above */
+	int request_context;		/* always 0, see above */
 
 	struct nfsp_semantic_field *fields;
 	uint32_t nfields;
