@@ -122,6 +122,11 @@ class FakeJudge:
         entry["by_profile"][profile] = (status, reason, gap)
         return bundle
 
+    def matches_execution(self, bundle_ref, *, job_id, task_id) -> bool:
+        # Routing fixtures pre-register bundles. Real provenance/cross-task
+        # rejection is covered with ArtifactQ1Judge in test_sealed_q1.
+        return bundle_ref in self.bundles
+
     def judge(self, bundle_ref, plan_ref, candidate_id,
               versions: JudgeVersions) -> Q1Result:
         e = self.bundles[bundle_ref]
