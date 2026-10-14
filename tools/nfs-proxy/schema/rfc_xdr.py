@@ -23,8 +23,13 @@ MANIFEST (one directive per line, `#` starts a comment line)
                             of RFC N exactly (its own `///` script).
   prelude FILE SHA256       FILE is built from the `typedefs` and `copy`
                             lines that follow, in order
+  fragment FILE SHA256      FILE is built from the `copy` lines that follow:
+                            a definition an RFC states only in its prose,
+                            not in its `///` XDR (RFC 8435 and RFC 8154
+                            restate layouttype4 that way)
   typedefs FILE...          every `typedef` line each FILE states inside a
                             comment; the files must all state the same ones
+                            (prelude only)
   copy N KEYWORD NAME       the definition `KEYWORD NAME {` ... `};` in RFC N,
                             which must occur exactly once and not span a page
 
@@ -60,7 +65,7 @@ def sha256(data):
 
 
 def parse_manifest(path):
-    m = {"rfc": {}, "extract": [], "prelude": None}
+    m = {"rfc": {}, "extract": [], "prelude": None, "built": []}
     hexpin = re.compile(r"[0-9a-f]{64}")
     for no, raw in enumerate(Path(path).read_text().split("\n"), 1):
         line = raw.strip()
@@ -80,30 +85,45 @@ def parse_manifest(path):
                 raise SourceError(f"{where}: extract FILE N SHA256 CMD")
             m["extract"].append({"file": args[0], "rfc": args[1],
                                  "sha256": args[2], "cmd": args[3]})
-        elif kw == "prelude":
+        elif kw in ("prelude", "fragment"):
             args = rest.split()
             if len(args) != 2 or not hexpin.fullmatch(args[1]) or \
-                    m["prelude"]:
-                raise SourceError(f"{where}: one prelude FILE SHA256")
-            m["prelude"] = {"file": args[0], "sha256": args[1], "parts": []}
+                    (kw == "prelude" and m["prelude"]):
+                raise SourceError(f"{where}: one prelude FILE SHA256"
+                                  if kw == "prelude" else
+                                  f"{where}: fragment FILE SHA256")
+            if any(b["file"] == args[0] for b in m["built"]) or \
+                    any(e["file"] == args[0] for e in m["extract"]):
+                raise SourceError(f"{where}: {args[0]} is built twice")
+            b = {"kind": kw, "file": args[0], "sha256": args[1],
+                 "parts": []}
+            m["built"].append(b)
+            if kw == "prelude":
+                m["prelude"] = b
         elif kw in ("typedefs", "copy"):
             args = rest.split()
-            if not m["prelude"]:
-                raise SourceError(f"{where}: {kw} before prelude")
+            if not m["built"]:
+                raise SourceError(f"{where}: {kw} before prelude or "
+                                  f"fragment")
             if kw == "copy" and len(args) != 3:
                 raise SourceError(f"{where}: copy N KEYWORD NAME")
-            if kw == "typedefs" and not args:
-                raise SourceError(f"{where}: typedefs FILE...")
-            m["prelude"]["parts"].append((kw, args))
+            if kw == "typedefs" and (not args or
+                                     m["built"][-1]["kind"] != "prelude"):
+                raise SourceError(f"{where}: typedefs FILE... in a prelude")
+            m["built"][-1]["parts"].append((kw, args))
         else:
             raise SourceError(f"{where}: unknown directive {kw}")
     for e in m["extract"]:
         if e["rfc"] not in m["rfc"]:
             raise SourceError(f"{path}: extract {e['file']}: RFC "
                               f"{e['rfc']} is not pinned")
-    for kw, args in (m["prelude"] or {"parts": []})["parts"]:
-        if kw == "copy" and args[0] not in m["rfc"]:
-            raise SourceError(f"{path}: copy: RFC {args[0]} is not pinned")
+    for b in m["built"]:
+        if not b["parts"]:
+            raise SourceError(f"{path}: {b['kind']} {b['file']} is empty")
+        for kw, args in b["parts"]:
+            if kw == "copy" and args[0] not in m["rfc"]:
+                raise SourceError(f"{path}: copy: RFC {args[0]} is not "
+                                  f"pinned")
     return m
 
 
@@ -172,19 +192,31 @@ def copy_definition(n, rfc_text, keyword, name):
     return first + 1, last + 1, body
 
 
-def build_prelude(m, files, rfcs):
+PRELUDE_HEAD = [
+    " * XDR that the NFSv4 sources use but do not declare, because rpcgen",
+    " * takes it from the C environment.  normalize.py reads this file",
+    " * before each source (the `prelude` annotation).  Every definition",
+    " * is copied by rule from pinned RFC text; see SOURCES.",
+]
+FRAGMENT_HEAD = [
+    " * XDR that an RFC states in its prose but not in its `///` XDR,",
+    " * copied by rule from the pinned RFC text; see SOURCES.  normalize.py",
+    " * applies it as an `extension` of the minor versions that name it.",
+    " * Code Components of the RFC: Simplified (Revised) BSD License, whose",
+    " * text heads rfc8276.x; see THIRD-PARTY-LICENSES.md.",
+]
+
+
+def build_file(b, files, rfcs):
     out = [
         "/*",
         " * GENERATED by tools/nfs-proxy/schema/rfc_xdr.py from SOURCES -- "
         "DO NOT EDIT.",
         " *",
-        " * XDR that the NFSv4 sources use but do not declare, because rpcgen",
-        " * takes it from the C environment.  normalize.py reads this file",
-        " * before each source (the `prelude` annotation).  Every definition",
-        " * is copied by rule from pinned RFC text; see SOURCES.",
+    ] + (PRELUDE_HEAD if b["kind"] == "prelude" else FRAGMENT_HEAD) + [
         " */",
     ]
-    for kw, args in m["prelude"]["parts"]:
+    for kw, args in b["parts"]:
         out.append("")
         if kw == "typedefs":
             stated = [commented_typedefs(f, files[f]) for f in args]
@@ -210,19 +242,19 @@ def rebuild(manifest, rfc_dir):
     files = {}
     for e in m["extract"]:
         files[e["file"]] = run_extract(e, rfcs[e["rfc"]])
-    if m["prelude"]:
-        for kw, args in m["prelude"]["parts"]:
+    for b in m["built"]:
+        for kw, args in b["parts"]:
             for f in args if kw == "typedefs" else ():
                 if f not in files:
                     raise SourceError(f"typedefs: {f} is not extracted")
-        files[m["prelude"]["file"]] = build_prelude(m, files, rfcs)
+        files[b["file"]] = build_file(b, files, rfcs)
     return m, files
 
 
 def pins(m):
     out = {e["file"]: e["sha256"] for e in m["extract"]}
-    if m["prelude"]:
-        out[m["prelude"]["file"]] = m["prelude"]["sha256"]
+    for b in m["built"]:
+        out[b["file"]] = b["sha256"]
     return out
 
 

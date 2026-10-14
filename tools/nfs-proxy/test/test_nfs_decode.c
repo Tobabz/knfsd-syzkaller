@@ -10,8 +10,10 @@
  *   1 golden      expected paths, values and every WireRef span
  *   2 truncation  every prefix of every golden message: not decoded, and no
  *                 field or operation survives
- *   3 malformed   oversized length, count beyond record, undeclared enum,
- *                 bad bool, non-zero padding, trailing bytes, bad list link
+ *   3 malformed   oversized length, count beyond record, undeclared
+ *                 discriminant, bad list link; lenient: undeclared enum and
+ *                 bad bool outside a discriminant, non-zero padding and
+ *                 trailing bytes decode and are flagged
  *   7 address     changing only one field's value bytes changes only that
  *                 field: no sibling, span or path moves
  *   F4            a REPLY is decoded only from reply_dispatch, never from a
@@ -237,6 +239,27 @@ static void expect(const struct nfsp_decoded_msg *m, const char *path,
 	expect(m, path, nth, eo, el, vo, vl, v, __LINE__)
 
 /* Structural invariants every decoded message must satisfy. */
+static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
+			     const char *what);
+
+/* What a partial message must be: a CALL whose fields and ops all end where
+ * the failed operation starts, with exactly the operations before it. */
+static void check_partial(const struct nfsp_decoded_msg *m, size_t len,
+			  const char *what)
+{
+	const struct nfsp_decode_failure *f = &m->failure;
+
+	CHECK(m->status == NFSP_DECODE_PARTIAL && m->msg_type == 0 &&
+	      (uint64_t)f->op_offset + 4 <= len && f->offset >= f->op_offset &&
+	      m->nops == f->op_index && m->nfields > 0,
+	      "%s: partial op %u at %u, %u ops, failure at %u", what,
+	      f->op_index, f->op_offset, m->nops, f->offset);
+	check_invariants(m, f->op_offset, what);
+	for (uint32_t i = 0; i < m->nops; i++)
+		CHECK(m->ops[i].sequence_index == i &&
+		      m->ops[i].field < m->nfields, "%s: op %u", what, i);
+}
+
 static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
 			     const char *what)
 {
@@ -482,14 +505,18 @@ static void test_minor_selection(void)
 	EXPECT(&m, "tproto.request.STAT.args.which", 0, 56, 4, 56, 4, 42);
 
 	c.b[47] = 0;		/* minorversion = 0 */
-	CHECK(run(c.b, c.n, NULL, 0, 0, &m) == NFSP_DECODE_MALFORMED &&
-	      m.nfields == 0 && m.nops == 0,
-	      "minor 0 OP_STAT must be malformed, got %s",
+	/* Not an operation of minor 0: knfsd answers it OP_ILLEGAL and stops
+	 * there, so it is the failed operation of a partial CALL. */
+	CHECK(run(c.b, c.n, NULL, 0, 0, &m) == NFSP_DECODE_PARTIAL &&
+	      m.nops == 0 && m.failure.op_index == 0 &&
+	      m.failure.opcode == 4 && m.failure.op_offset == 52,
+	      "minor 0 OP_STAT must be partial at op 0, got %s",
 	      nfsp_decode_strstatus(m.status));
 	CHECK(m.failure.offset == 52 && m.failure.reason &&
 	      !strcmp(m.failure.reason, "enum value not declared"),
 	      "failure %u %s", m.failure.offset,
 	      m.failure.reason ? m.failure.reason : "");
+	check_partial(&m, c.n, "minor 0 OP_STAT");
 
 	c.b[47] = 7;		/* minorversion = 7 */
 	CHECK(run(c.b, c.n, NULL, 0, 0, &m) ==
@@ -825,7 +852,9 @@ static void test_long_paths(void)
 	free(full);
 }
 
-/* Oracle 2: every proper prefix fails, and leaves nothing behind. */
+/* Oracle 2: every proper prefix fails.  It leaves nothing behind, except a
+ * CALL cut inside an operation whose opcode word is present: that is
+ * partial, with the operations before it (knfsd runs them). */
 static void truncate_all(const struct msg *full,
 			 const struct nfsp_reply_dispatch *rd, uint32_t body,
 			 const char *what)
@@ -837,6 +866,10 @@ static void truncate_all(const struct msg *full,
 		enum nfsp_decode_status st =
 			run(full->b, n, rd, 1, 0, &m);
 
+		if (st == NFSP_DECODE_PARTIAL && !rd) {
+			check_partial(&m, n, what);
+			continue;
+		}
 		if (st == NFSP_DECODE_DECODED || m.nfields || m.nops) {
 			if (!bad++)
 				printf("  first bad prefix %zu: %s\n", n,
@@ -886,37 +919,77 @@ static void expect_refusal(size_t at, uint32_t v, enum nfsp_decode_status st,
 	nfsp_decoded_msg_free(&m);
 }
 
+/* Word `at` of the golden CALL set to v fails operation op_index, which
+ * starts at op_offset: partial, with the operations before it intact. */
+static void expect_partial(size_t at, uint32_t v, uint32_t fail_off,
+			   const char *reason, uint32_t op_index,
+			   uint32_t op_offset)
+{
+	struct nfsp_decoded_msg m = {0}, full = {0};
+	struct msg c;
+	char what[64];
+
+	snprintf(what, sizeof(what), "word %zu = %#x", at, v);
+	CHECK(mutate_call(at, v, &m) == NFSP_DECODE_PARTIAL &&
+	      m.failure.offset == fail_off && m.failure.reason &&
+	      !strcmp(m.failure.reason, reason) &&
+	      m.failure.op_index == op_index &&
+	      m.failure.op_offset == op_offset,
+	      "%s: %s at %u (%s), op %u at %u; want partial at %u (%s), "
+	      "op %u at %u", what, nfsp_decode_strstatus(m.status),
+	      m.failure.offset, m.failure.reason ? m.failure.reason : "",
+	      m.failure.op_index, m.failure.op_offset, fail_off, reason,
+	      op_index, op_offset);
+	if (m.status != NFSP_DECODE_PARTIAL) {
+		nfsp_decoded_msg_free(&m);
+		return;
+	}
+	check_partial(&m, 184, what);
+	/* The kept prefix is the golden decode's prefix, span for span. */
+	build_compound_call(&c, 0);
+	run(c.b, c.n, NULL, 0, 0, &full);
+	for (uint32_t i = 0; i < m.nfields; i++) {
+		const struct nfsp_semantic_field *a = &m.fields[i],
+						 *b = &full.fields[i];
+
+		if (a->wire.encoded.off + a->wire.encoded.len > op_offset ||
+		    b->wire.encoded.off + b->wire.encoded.len <= op_offset)
+			CHECK(!memcmp(&a->wire, &b->wire, sizeof(a->wire)) &&
+			      a->value == b->value, "%s: field %u differs",
+			      what, i);
+	}
+	CHECK(m.failure.opcode == (op_offset == at ? v :
+				   full.ops[op_index].opcode),
+	      "%s: opcode %u", what, m.failure.opcode);
+	nfsp_decoded_msg_free(&full);
+	nfsp_decoded_msg_free(&m);
+}
+
 static void test_malformed(void)
 {
 	struct nfsp_decoded_msg m = {0};
 	struct msg c;
 
 	printf("malformed: deterministic refusals with location\n");
-	expect_refusal(176, 17, NFSP_DECODE_MALFORMED, 176,
-		       "length exceeds bound");		/* tp_name<16> */
-	expect_refusal(176, 8, NFSP_DECODE_MALFORMED, 176,
-		       "length exceeds remaining record");
-	expect_refusal(104, 0x7fffffff, NFSP_DECODE_MALFORMED, 104,
-		       "length exceeds remaining record");
-	expect_refusal(116, 5, NFSP_DECODE_MALFORMED, 116,
-		       "count exceeds bound");		/* mask<4> */
-	expect_refusal(52, 1000, NFSP_DECODE_MALFORMED, 52,
-		       "count exceeds remaining record");
-	expect_refusal(160, 9, NFSP_DECODE_MALFORMED, 160,
-		       "enum value not declared");	/* tp_kind */
-	expect_refusal(60, 99, NFSP_DECODE_MALFORMED, 60,
-		       "enum value not declared");	/* opcode */
-	expect_refusal(100, 2, NFSP_DECODE_MALFORMED, 100,
-		       "bool is not 0 or 1");
-	expect_refusal(112, 0x6f000100u, NFSP_DECODE_MALFORMED, 113,
-		       "non-zero padding");
-
-	build_compound_call(&c, 0);
-	w32(&c, 0);
-	CHECK(run(c.b, c.n, NULL, 0, 0, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 184 && m.nfields == 0,
-	      "trailing bytes: %s at %u", nfsp_decode_strstatus(m.status),
-	      m.failure.offset);
+	/* Outside any operation: the whole CALL is refused. */
+	expect_refusal(40, 0x7fffffff, NFSP_DECODE_MALFORMED, 40,
+		       "length exceeds remaining record");	/* tag */
+	/* The operation count is not checked as a whole: three operations
+	 * decode and the fourth opcode word is missing (knfsd refuses). */
+	expect_refusal(52, 1000, NFSP_DECODE_TRUNCATED, 184,
+		       "record ends here");
+	/* Inside an operation: the operations before it stay (partial). */
+	expect_partial(176, 17, 176, "length exceeds bound", 2, 172);
+	expect_partial(176, 8, 176, "length exceeds remaining record", 2,
+		       172);					/* tp_name<16> */
+	expect_partial(104, 0x7fffffff, 104,
+		       "length exceeds remaining record", 1, 60);
+	expect_partial(116, 5, 116, "count exceeds bound", 1, 60);
+	expect_partial(160, 9, 160, "enum value not declared", 1, 60);
+	expect_partial(160, 0xffffffffu, 160, "enum value not declared", 1,
+		       60);					/* tp_kind */
+	expect_partial(60, 99, 60, "enum value not declared", 1, 60);
+	expect_partial(56, 0, 56, "enum value not declared", 0, 56);
 
 	build_compound_reply(&c);
 	c.b[107] = 2;		/* entry[0] link = 2 */
@@ -929,11 +1002,80 @@ static void test_malformed(void)
 	CHECK(run(c.b, c.n, &tproto_dispatch, 1, 0, &m) ==
 	      NFSP_DECODE_MALFORMED && m.failure.offset == 84,
 	      "list head 3: %s", nfsp_decode_strstatus(m.status));
+	nfsp_decoded_msg_free(&m);
+}
+
+/* Where knfsd reads a word as a plain integer, skips padding unread or
+ * ignores what follows the body, the decoder decodes and flags instead of
+ * refusing (design 02 §15).  Spans are the same as without the oddity. */
+static void expect_lenient(size_t at, uint32_t v, const char *path,
+			   uint8_t flag, uint64_t value)
+{
+	struct nfsp_decoded_msg m = {0};
+	const struct nfsp_semantic_field *f;
+
+	if (mutate_call(at, v, &m) != NFSP_DECODE_DECODED) {
+		CHECK(0, "word %zu = %#x: %s at %u (%s)", at, v,
+		      nfsp_decode_strstatus(m.status), m.failure.offset,
+		      m.failure.reason ? m.failure.reason : "");
+		nfsp_decoded_msg_free(&m);
+		return;
+	}
+	f = field(&m, path, 0);
+	CHECK(f && f->flags == flag && f->value == value,
+	      "%s: flags %#x value %llu", path, f ? f->flags : 0xffu,
+	      f ? (unsigned long long)f->value : 0ull);
+	for (uint32_t i = 0; i < m.nfields; i++)
+		CHECK(&m.fields[i] == f || !m.fields[i].flags,
+		      "field %u flagged too", i);
+	CHECK(m.nops == 3 && m.trailing.len == 0, "ops %u trailing %u",
+	      m.nops, m.trailing.len);
+	nfsp_decoded_msg_free(&m);
+}
+
+static void test_lenient(void)
+{
+	struct nfsp_decoded_msg m = {0};
+	const struct nfsp_semantic_field *f;
+	struct msg c;
+
+	printf("lenient CALL: out-of-domain words, padding, trailing bytes\n");
+	expect_lenient(100, 2, "tproto.request.WRITE.args.sync",
+		       NFSP_FF_UNDECLARED, 2);
+	expect_lenient(100, 0xffffffffu, "tproto.request.WRITE.args.sync",
+		       NFSP_FF_UNDECLARED, 0xffffffffu);
+	expect_lenient(112, 0x6f000100u, "tproto.request.WRITE.args.data",
+		       NFSP_FF_PAD_NONZERO, 0);
+	expect_lenient(44, 0x61620001u, "tproto.request.COMPOUND.args.tag",
+		       NFSP_FF_PAD_NONZERO, 0);
+
+	build_compound_call(&c, 0);
+	w32(&c, 0);
+	w32(&c, 0xdeadbeef);
+	if (run(c.b, c.n, NULL, 0, 0, &m) == NFSP_DECODE_DECODED) {
+		CHECK(m.trailing.off == 184 && m.trailing.len == 8 &&
+		      m.nops == 3, "trailing %u+%u, %u ops", m.trailing.off,
+		      m.trailing.len, m.nops);
+		f = field(&m, "tproto.request.COMPOUND.args", 0);
+		CHECK(f && f->wire.encoded.off + f->wire.encoded.len == 184,
+		      "the body still ends at 184");
+	} else {
+		CHECK(0, "trailing bytes: %s", nfsp_decode_strstatus(m.status));
+	}
+
+	/* A REPLY is never lenient (§14: a strict result keeps a wrong
+	 * dispatch from decoding). */
 	build_compound_reply(&c);
 	c.b[27] = 1;		/* COMPOUND status 1: not a tp_status */
 	CHECK(run(c.b, c.n, &tproto_dispatch, 1, 0, &m) ==
 	      NFSP_DECODE_MALFORMED && m.failure.offset == 24,
-	      "undeclared status: %s", nfsp_decode_strstatus(m.status));
+	      "undeclared reply status: %s", nfsp_decode_strstatus(m.status));
+	build_compound_reply(&c);
+	w32(&c, 0);
+	CHECK(run(c.b, c.n, &tproto_dispatch, 1, 0, &m) ==
+	      NFSP_DECODE_MALFORMED && m.failure.offset == 156 &&
+	      m.trailing.len == 0, "reply trailing bytes: %s",
+	      nfsp_decode_strstatus(m.status));
 	nfsp_decoded_msg_free(&m);
 }
 
@@ -1047,7 +1189,8 @@ static void test_random_edits(void)
 {
 	struct nfsp_decoded_msg m = {0};
 	uint64_t x = 0x9e3779b97f4a7c15ull;
-	unsigned decoded = 0, refused = 0;
+	unsigned decoded = 0, partial = 0, refused = 0;
+	enum nfsp_decode_status st;
 
 	printf("random edits: 20000 mutated messages, invariants hold\n");
 	for (unsigned it = 0; it < 20000; it++) {
@@ -1072,16 +1215,22 @@ static void test_random_edits(void)
 			at = 24 + (size_t)(x % (v.n - 24));
 			v.b[at] = (uint8_t)(x >> 32);
 		}
-		if (run(v.b, v.n, rd, 1, 0, &m) == NFSP_DECODE_DECODED) {
+		st = run(v.b, v.n, rd, 1, 0, &m);
+		if (st == NFSP_DECODE_DECODED) {
 			decoded++;
 			check_invariants(&m, v.n, "random edit");
+		} else if (st == NFSP_DECODE_PARTIAL) {
+			partial++;
+			CHECK(!rd, "partial REPLY");
+			check_partial(&m, v.n, "random edit");
 		} else {
 			refused++;
 			CHECK(m.nfields == 0 && m.nops == 0,
 			      "refused message kept fields");
 		}
 	}
-	printf("  %u decoded, %u refused\n", decoded, refused);
+	printf("  %u decoded, %u partial, %u refused\n", decoded, partial,
+	       refused);
 	CHECK(decoded > 0 && refused > 0, "edits did not exercise both paths");
 	nfsp_decoded_msg_free(&m);
 }
@@ -1089,6 +1238,92 @@ static void test_random_edits(void)
 /* A table whose CALL reaches a response operation union is refused, not
  * read as a second request operation list.  The normalizer never emits
  * one (test_normalize: test_operation_union_of_the_other_direction). */
+/* Copy of tproto minor `k` whose COMPOUND arguments are {tag, argarray,
+ * minorversion}: an operation array before the minor-version selector, a
+ * layout the normalizer accepts.  Returns 0 on a table it cannot copy. */
+static int reorder_selector(int k, struct nfsp_protocol_schema *sch,
+			    struct nfsp_schema_field *fields, size_t cap)
+{
+	const struct nfsp_protocol_schema *o =
+		nfsp_schema_family_tproto.schemas[k];
+	const struct nfsp_schema_proc *pr = nfsp_schema_proc(o, 1);
+	const struct nfsp_schema_type *args;
+	size_t n = 0;
+	struct nfsp_schema_field t;
+
+	if (!pr || o->selector_field != 1)
+		return 0;
+	for (uint32_t i = 0; i < o->ntypes; i++)
+		if (o->types[i].kind == NFSP_XK_STRUCT &&
+		    o->types[i].first + o->types[i].count > n)
+			n = o->types[i].first + o->types[i].count;
+	if (n > cap)
+		return 0;
+	memcpy(fields, o->fields, n * sizeof(fields[0]));
+	args = &o->types[pr->arg];
+	t = fields[args->first + 1];
+	fields[args->first + 1] = fields[args->first + 2];
+	fields[args->first + 2] = t;
+	*sch = *o;
+	sch->fields = fields;
+	sch->selector_field = 2;
+	return 1;
+}
+
+/* A failure while reading the minor-version prefix is no partial: no
+ * schema is chosen yet (PR #29 review).  The body decode, once a schema is
+ * chosen, still is. */
+static void test_ops_before_selector(void)
+{
+	static struct nfsp_schema_field f0[256], f1[256];
+	static struct nfsp_protocol_schema s0, s1;
+	const struct nfsp_protocol_schema *schs[2] = { &s0, &s1 };
+	struct nfsp_schema_family fam = nfsp_schema_family_tproto;
+	const struct nfsp_schema_family *f[1] = { &fam };
+	struct nfsp_rpc_envelope env;
+	struct nfsp_decode_input in;
+	struct nfsp_decoded_msg m = {0};
+	struct msg c;
+
+	printf("tables: an operation array before the minor selector\n");
+	CHECK(reorder_selector(0, &s0, f0, 256) &&
+	      reorder_selector(1, &s1, f1, 256), "cannot copy tproto");
+	fam.schemas = schs;
+	fam.nschemas = 2;
+	memset(&in, 0, sizeof(in));
+	in.rpc = &env;
+
+	call_header(&c, TPROTO_PROG, 1, 1);
+	w32(&c, 0);		/* 40 tag */
+	w32(&c, 1);		/* 44 argarray count */
+	w32(&c, 1);		/* 48 OP_PING */
+	w32(&c, 0);		/* 52 minorversion */
+	in.payload = c.b, in.len = c.n;
+	nfsp_rpc_decode(c.b, c.n, &env);
+	CHECK(nfsp_nfs_decode(f, 1, &in, &m) == NFSP_DECODE_DECODED &&
+	      m.schema == &s0 && m.nops == 1, "reordered PING: %s",
+	      nfsp_decode_strstatus(m.status));
+
+	call_header(&c, TPROTO_PROG, 1, 1);
+	w32(&c, 0);		/* 40 tag */
+	w32(&c, 2);		/* 44 argarray count */
+	w32(&c, 1);		/* 48 OP_PING */
+	w32(&c, 2);		/* 52 OP_WRITE, arguments missing */
+	in.payload = c.b, in.len = c.n;
+	nfsp_rpc_decode(c.b, c.n, &env);
+	CHECK(nfsp_nfs_decode(f, 1, &in, &m) == NFSP_DECODE_TRUNCATED &&
+	      !m.schema && m.nfields == 0 && m.nops == 0,
+	      "probe cut in WRITE: %s, %u fields",
+	      nfsp_decode_strstatus(m.status), m.nfields);
+	c.b[55] = 99;		/* 52: undeclared opcode */
+	nfsp_rpc_decode(c.b, c.n, &env);
+	CHECK(nfsp_nfs_decode(f, 1, &in, &m) == NFSP_DECODE_MALFORMED &&
+	      !m.schema && m.nfields == 0 && m.nops == 0,
+	      "probe at opcode 99: %s, %u fields",
+	      nfsp_decode_strstatus(m.status), m.nfields);
+	nfsp_decoded_msg_free(&m);
+}
+
 static void test_other_direction_op_union(void)
 {
 	const struct nfsp_protocol_schema *orig =
@@ -1174,10 +1409,12 @@ int main(void)
 	test_long_paths();
 	test_truncation();
 	test_malformed();
+	test_lenient();
 	test_resource_limit();
 	test_address_oracle();
 	test_random_edits();
 	test_other_direction_op_union();
+	test_ops_before_selector();
 	test_bad_input();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

@@ -18,7 +18,8 @@
 # 9), are outside the two definitions copied below.  RFC 8276 has 7050
 # (Verified, editorial: a section number in Section 1) and 5195, 7004, 7007
 # (Reported, Sections 3 and 8.4.5 prose and error lists), none in the XDR.
-# RFC 9754 has 8595 (Reported, Section 2 prose).
+# RFC 9754 has 8595 (Reported, Section 2 prose).  RFC 8435 and RFC 8154
+# have none (errata.rfc-editor.org, 2026-10-14).
 
 rfc 7531 cc37bc438258c16febef4813bb82c810ce458aa38954f7513e56736e034ddd2c
 rfc 5662 4aad9353b73e3904875aa2f7834c0a294cdb505609daebd92b7f5b441e32f7c7
@@ -26,6 +27,8 @@ rfc 7863 585a39637d442fd3ea92ff74f105076b173ec6b9d7175b8addb0dd25c9c23fa9
 rfc 5531 c1e2e05640c66c504871f3591311355a1bc432f75bd481b4ead8332a4fe351ae
 rfc 8276 3a138e1bd4b75aa18d06b21ba8f5358fb190f55453d6a73a2e5097fb364cdea2
 rfc 9754 fa76efbae83607fdda69af4607907dc1134a9ea76a54b41ce59c68f0d74f503e
+rfc 8435 a2a6893700639b3ab1e25e4e2d9c5d1cc404a8d3f7ead7e4df83bc055fa331ec
+rfc 8154 760fba4c84cb21bf567c2a367574cb98392dfb67ed486341cfd71681a374b629
 
 # NFSv4.0, NFSv4.1, NFSv4.2: each RFC's own extraction script, verbatim.
 extract rfc7531.x 7531 6d47206f35461db9e311f19a0cc5fd4f68a8ccd77186dd04d0c37f202cb214ce grep "^  *///" | sed 's?^  */// ??' | sed 's?^  *///$??'
@@ -46,3 +49,13 @@ prelude prelude.x 61255fece314daaf1fb2b4ccf0793e39a7cc0637c9b4bf23b75680f07ed542
 typedefs rfc7531.x rfc5662.x rfc7863.x
 copy 5531 enum auth_flavor
 copy 5531 struct authsys_parms
+
+# pNFS layout types that knfsd implements (CONFIG_NFSD_FLEXFILELAYOUT and
+# CONFIG_NFSD_SCSILAYOUT, both on in bundle/patches/kernel.config): RFC 8435
+# adds LAYOUT4_FLEX_FILES and RFC 8154 adds LAYOUT4_SCSI to RFC 5662's
+# layouttype4.  Each restates the enum in its prose only, so the definition
+# is copied by rule; normalize.py applies both to minors 1 and 2.
+fragment rfc8435-layouttype4.x 1ca511d9036a0c9ba13e039d2f8edd31a4fc4fc3038d409ff38e3a8ed20e455b
+copy 8435 enum layouttype4
+fragment rfc8154-layouttype4.x 881f4b6f934e7bc1eee80032fd5249f0fcacc0c003359d1e368d996040ac50bd
+copy 8154 enum layouttype4

@@ -677,9 +677,22 @@ Transaction Context의 key/lifecycle 정책은
 Decoder는 fail closed 한다.
 
 M2 구현은 `truncated`와 `malformed`를 다음처럼 나눈다. record가 고정 크기 item(word, hyper, fixed
-opaque) 중간에서 끝나면 `truncated`다. XDR이 허용하지 않는 값이면 `malformed`다. 선언되지 않은 enum 값,
-0/1이 아닌 bool, arm이 없는 discriminant, bound를 넘거나 record 끝을 넘는 length/count, 0이 아닌
-padding, procedure body 뒤의 남은 bytes가 여기에 든다.
+opaque) 중간에서 끝나면 `truncated`다. XDR이 허용하지 않는 값이면 `malformed`다. 선언되지 않았거나 arm이
+없는 union discriminant, 0/1이 아닌 list link, bound를 넘거나 record 끝을 넘는 length/count가 여기에 든다.
+
+CALL에서는 서버가 읽는 만큼만 엄격하다(2026-10-14, 저장소 소유자 결정; knfsd v7.3-rc5 `fs/nfsd/nfs4xdr.c`
+대조). layout을 정하지 않는 field의 선언되지 않은 enum 값과 0/1이 아닌 bool, 0이 아닌 padding은 decode하고
+field의 `flags`에 표시한다(`NFSP_FF_UNDECLARED`, `NFSP_FF_PAD_NONZERO`). knfsd는 이런 word를 범위 검사 없이
+정수로 읽고(`xdr_stream_decode_bool`은 0이 아니면 true다) padding은 읽지 않고 건너뛴다(`__xdr_inline_decode`).
+procedure body 뒤의 남은 bytes는 `trailing` span으로 남기고 decode를 실패시키지 않는다. knfsd
+(`nfsd4_decode_compound`)도 무시한다. WireRef는 이 표시와 관계없이 같다.
+
+layout을 고르는 값은 이 완화에서 빠진다. union discriminant와 list link는 서버마다 arm 선택이 다를 수 있으므로
+(knfsd는 0이 아닌 bool discriminant를 TRUE arm으로 읽는다) 한 서버의 해석을 decode 결과에 넣지 않는다.
+
+REPLY는 완화하지 않는다. REPLY를 읽는 쪽은 client이고, result schema를 `reply_dispatch`로만 고르는 §14
+규칙에서 엄격한 decode가 잘못된 dispatch를 드러낸다(예: READ bytes를 GETSIZE dispatch로 읽으면 남은 bytes
+때문에 `malformed`). REPLY에서는 위 경우가 모두 `malformed`다.
 
 decode_status:
 
@@ -691,6 +704,7 @@ truncated
 transaction_context_missing
 dispatch_incomplete
 resource_limit
+partial
 ```
 
 필요하면 failure에 다음 진단을 남긴다.
@@ -700,7 +714,21 @@ failure
     offset
     schema_node
     reason
+    op_index, opcode, op_offset   (partial만)
 ```
+
+`partial`(2026-10-14, 저장소 소유자 결정)은 CALL의 operation 배열에서 한 operation이 decode되지 않을 때
+(`malformed`, `truncated`) 그 operation의 opcode word가 record 안에 있으면 쓴다. knfsd
+(`nfsd4_decode_compound`)는 operation을 하나씩 decode하다가 처음 실패한 operation에서 멈추고, 그 앞의
+operation은 실행한 뒤 실패한 operation에 오류를 돌려준다. minor version에 없는 opcode도 같다(`OP_ILLEGAL`).
+그래서 decoder는 실패한 operation 앞의 operation을 field와 operation으로 남기고, 실패한 operation과 그 뒤의
+bytes는 기술하지 않는다. operation 배열과 그것을 담는 node의 span은 실패한 operation의 시작(`op_offset`)에서
+끝난다. opcode word를 읽기 전에 record가 끝나면 knfsd가 요청 전체를 거부하므로 `partial`이 아니라
+`truncated`다. operation 배열의 count는 record 길이와 한꺼번에 비교하지 않는다. knfsd는 실패한 operation 뒤를
+읽지 않으므로 각 operation을 읽을 때 검사한다. operation 밖의 실패(tag, minor version, operation 수의 bound)는
+지금처럼 메시지 전체 실패다. `partial`은 schema를 고른 뒤의 procedure body decode에서만 생긴다. minor version
+앞부분을 읽는 동안(schema 선택 전)의 실패는 메시지 전체 실패다. REPLY에는
+`partial`이 없다. 읽는 쪽이 client이고, §14의 엄격한 result decode가 잘못된 dispatch를 드러내기 때문이다.
 
 RPCSEC_GSS credential을 가진 CALL, 그런 CALL의 REPLY(`reply_dispatch.cred_flavor`), verifier가 RPCSEC_GSS인
 accepted REPLY는 service와 관계없이 `unsupported_schema`다. integrity와 privacy service에서 body는 procedure
@@ -709,19 +737,25 @@ argument/result가 아니라 RFC 2203 wrapper(`rpc_gss_integ_data`, `rpc_gss_pri
 schema에 맞아도 boundary 증명이 아니다(§11). fuzzer는 RPCSEC_GSS credential 뒤에 평문 NFS body를 붙여
 보낸다(syzkaller patch 0006의 `rpc_auth_gss`).
 
-Decoder가 failure 이전에 일부 prefix field boundary를 증명했더라도,
-decode_status가 decoded가 아니면 Semantic Rule Resolver의 mutation input으로
-사용하지 않는다.
+Decoder가 failure 이전에 일부 prefix field boundary를 증명했더라도, decode_status가 `decoded`나 `partial`이
+아니면 Semantic Rule Resolver의 mutation input으로 사용하지 않는다. 그런 decode는 field를 남기지 않는다.
 
-Proven prefix는 diagnostics로 보존할 수 있다.
+`partial`은 예외다. 남은 field는 실패한 operation 앞까지 증명된 WireRef이고, 서버도 그 operation들을 같은
+경계로 읽고 실행한다. 그래서 Resolver는 그 field만 target으로 삼을 수 있고, `op_offset`부터 끝까지의 bytes는
+기술되지 않은 채 그대로 옮긴다(04 §21).
 
 ```text
-partial diagnostics
+partial (op_offset 앞의 operation)
+    ==
+mutation-safe prefix
+
+실패한 operation과 그 뒤
     !=
-mutation-safe decoded message
+target
 ```
 
-이 규칙은 malformed traffic의 앞부분을 잘못 mutation-safe라고 오인하는 것을 막는다.
+이 규칙은 malformed operation의 bytes를 target으로 오인하는 것을 막으면서, 서버가 실제로 실행하는 앞
+operation을 mutation 대상에서 빠뜨리지 않는다.
 
 ### 16. intentionally malformed mutation과의 관계
 
@@ -1012,6 +1046,14 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
   annotation 하나로만 허용한다.
 - **결정됨(2026-10-13, 저장소 소유자):** errata는 Verified이면서 XDR을 바꾸는 것만 적용한다. pin한 RFC마다
   errata와 결정을 `SOURCES`에 적는다.
+- **결정됨(2026-10-14, 저장소 소유자):** knfsd가 구현하는 pNFS layout type을 지원한다. 고정 커널 설정
+  (`bundle/patches/kernel.config`)은 `CONFIG_NFSD_FLEXFILELAYOUT`, `CONFIG_NFSD_SCSILAYOUT`을 켜고, knfsd
+  (`nfsd4_decode_layoutupdate4`)는 `layouttype4`를 `LAYOUT_TYPE_MAX`(6) 미만까지 받는다. RFC 8435(flex files,
+  4)와 RFC 8154(SCSI, 5)는 RFC 5662의 `layouttype4`를 `///` XDR이 아니라 본문에서만 다시 적으므로,
+  `rfc_xdr.py`의 `fragment`가 그 정의를 pin한 RFC text에서 규칙(`copy`)으로 옮기고 minor 1, 2의 `extension`으로
+  합친다. 두 RFC가 각각 자기 값만 더해 다시 적으므로, 값이 늘어난 enum 재정의는 source가 선언한 값을 모두 지키는
+  한 합집합으로 합친다(순서 무관, 한 값에 두 이름은 build error). layout body는 원래 `opaque`라 그 밖의 schema는
+  바뀌지 않는다.
 - **미결:** NFS callback/backchannel program의 initial schema coverage.
 - **미결:** request/response consistency 검증(§14)은 request context가 있어야 한다. M3 TransactionEntry가
   생기기 전까지 M2 decoder의 `request_context`는 항상 0이다.

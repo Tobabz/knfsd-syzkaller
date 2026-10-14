@@ -43,7 +43,7 @@ One directive per line, `#` starts a comment.
 | `status-type ENUM` | the enum whose value at the start of a response operation is its status |
 | `source FILE` | the single XDR file, for a family without minor versions |
 | `prelude FILE` | XDR read before every source file, into the same namespace; a name defined in both is an error |
-| `extension N FILE` | an NFSv4 extension (RFC 8178) applied after minor `N`'s source: new definitions join the namespace, an enum restated with more values replaces the old one (every old value must stay), and the RFC's own `/* Following lines are to be added to [enum\|union] NAME */` blocks add their lines to `NAME`; nothing else may change an existing definition |
+| `extension N FILE` | an NFSv4 extension (RFC 8178) applied after minor `N`'s source: new definitions join the namespace, an enum restated with more values widens it (every value the source declared must stay; several restatements add up, whatever their order, and one value with two names is an error), and the RFC's own `/* Following lines are to be added to [enum\|union] NAME */` blocks add their lines to `NAME`; nothing else may change an existing definition |
 | `alias-arm UNION LABEL LIKE` | a case value the XDR declares with no arm in `UNION` is decoded with `LIKE`'s arm. The only layout fact an annotation may state; each use names the implementation it follows. A `LABEL` that already has an arm, a `LIKE` with none, or an alias used in no minor version is an error |
 | `notice TEXT` | one line copied into the generated file's header, for a license notice the sources require |
 | `minor N FILE` | one XDR file per minor version |
@@ -124,6 +124,10 @@ python3 schema/test_rfc_xdr.py                   # its tests (build.sh runs them
   `KEYWORD NAME { ... };` definition from an RFC, which must occur once and not
   cross a page break. For NFSv4 that is RFC 5531's `auth_flavor` (the
   `AUTH_NONE`, `AUTH_SYS`, `RPCSEC_GSS` case labels) and `authsys_parms`.
+- `fragment`: a file of `copy` lines, for a definition an RFC states in its
+  prose but not in its `///` XDR. RFC 8435 (flex files) and RFC 8154 (SCSI)
+  restate `layouttype4` that way, each with its own new value; each fragment
+  is an `extension` of minors 1 and 2.
 - No errata are applied. `SOURCES` records which errata existed when the pins
   were taken and why none was applied.
 
@@ -134,7 +138,7 @@ The RFC texts are not committed; their pins are enough to fetch and check them.
 
 | Annotation | Table | Source | Status |
 |---|---|---|---|
-| `nfs4/nfs4.ann` | `../src/schema_nfs4.c` | RFC 7531 (4.0), RFC 5662 (4.1), RFC 7863 + RFC 8276 + RFC 9754 (4.2) | NFSv4 COMPOUND, CALL and REPLY |
+| `nfs4/nfs4.ann` | `../src/schema_nfs4.c` | RFC 7531 (4.0), RFC 5662 + RFC 8435 + RFC 8154 (4.1), RFC 7863 + RFC 8276 + RFC 9754 + RFC 8435 + RFC 8154 (4.2) | NFSv4 COMPOUND, CALL and REPLY |
 | `../test/schema/tproto.ann` | `../test/schema_tproto.c` | written for the tests | synthetic, host tests only |
 | `../test/schema/tflat.ann` | `../test/schema_tflat.c` | written for the tests | synthetic, host tests only |
 
@@ -143,8 +147,10 @@ message is `unsupported_schema`. NFSv4.2 is RFC 7863 plus the extensions knfsd
 implements: the RFC 8276 xattr operations and the RFC 9754 attribute
 delegation types. RFC 9754 declares delegation types 4 and 5 but no
 `open_delegation4` arm for them; `nfs4.ann` aliases them to the READ and WRITE
-arms, as knfsd encodes them (`nfsd4_encode_open_delegation4`). Any other
-extension is undeclared, so a message that uses it is `malformed`.
+arms, as knfsd encodes them (`nfsd4_encode_open_delegation4`). NFSv4.1 and
+NFSv4.2 also have the pNFS layout types knfsd implements beyond RFC 5662:
+flex files (4, RFC 8435) and SCSI (5, RFC 8154); the layout bodies stay
+opaque. Any other extension is undeclared.
 
 Errata: an erratum is applied only when it is Verified and changes the XDR;
 `SOURCES` records the errata of every pinned RFC and the decision.

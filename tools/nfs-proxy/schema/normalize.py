@@ -161,6 +161,7 @@ class Parser:
         self.programs = {}       # name -> {"number", "versions"}
         self.extending = False   # inside extend()
         self.widening = None     # the enum an extension is restating
+        self.base_enums = {}     # enum -> values as the source declared them
         self.order = []          # declaration order of type names
 
     def err(self, msg):
@@ -202,19 +203,49 @@ class Parser:
     def define(self, name, entry):
         if self.widening == name:
             # An extension restates an enum with more values (RFC 9754
-            # open_delegation_type4): every old value must stay as it was.
-            old = dict(self.types[name][1][1])
+            # open_delegation_type4; RFC 8435 and RFC 8154 layouttype4).
+            # Each restates the enum as the source declared it plus its own
+            # values, so every value of the source must stay as it was, and
+            # the enum becomes the union of all restatements, whatever their
+            # order.  One name with two values, or one value with two
+            # names, is an error.
+            cur = list(self.types[name][1][1])
+            base = self.base_enums.setdefault(name, list(cur))
             new = dict(entry[1][1])
-            if any(new.get(n) != v for n, v in old.items()):
+            if any(new.get(n) != v for n, v in base):
                 self.err(f"extension of enum {name} changes or drops a "
-                         f"value")
-            self.types[name] = entry
+                         f"value of the source")
+            have = dict(cur)
+            for n, v in entry[1][1]:
+                if n in have:
+                    if have[n] != v:
+                        self.err(f"extension of enum {name} gives {n} "
+                                 f"another value")
+                    continue
+                cur.append((n, v))
+                have[n] = v
+            values = [self.resolve_lit(v) for _, v in cur]
+            if len(set(values)) != len(values):
+                self.err(f"extension of enum {name} gives one value two "
+                         f"names")
+            self.types[name] = ("spec", ("enum", cur))
             return
         if name in self.types or name in self.consts or \
                 name in self.enumconsts:
             self.err(f"redefinition of {name}")
         self.types[name] = entry
         self.order.append(name)
+
+    def resolve_lit(self, v, seen=()):
+        """An enum value as a number where the namespace already has it,
+        for comparing values; an unknown name stays as it is."""
+        while v[0] == "id" and v[1] not in seen:
+            seen = seen + (v[1],)
+            nxt = self.consts.get(v[1], self.enumconsts.get(v[1]))
+            if nxt is None:
+                return v
+            v = nxt
+        return v[1] if v[0] == "lit" else v
 
     def include(self, toks, origin):
         """Parse another file into the same namespace (a prelude, then the

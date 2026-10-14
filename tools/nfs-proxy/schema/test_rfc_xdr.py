@@ -93,8 +93,8 @@ class Tree:
 
     @staticmethod
     def build_prelude():
-        head = rfc_xdr.build_prelude(
-            {"prelude": {"parts": []}}, {}, {}).decode()
+        head = rfc_xdr.build_file(
+            {"kind": "prelude", "parts": []}, {}, {}).decode()
         return head + """
 /* a.x: stated only inside a comment */
 typedef unsigned int uint32_t;
@@ -162,10 +162,48 @@ class Extraction(unittest.TestCase):
         with Tree() as t:
             files = {"a.x": XDR1.encode(),
                      "b.x": XDR1.replace("unsigned int", "int").encode()}
-            m = {"prelude": {"parts": [("typedefs", ["a.x", "b.x"])]}}
+            b = {"kind": "prelude",
+                 "parts": [("typedefs", ["a.x", "b.x"])]}
             with self.assertRaises(rfc_xdr.SourceError) as cm:
-                rfc_xdr.build_prelude(m, files, {})
+                rfc_xdr.build_file(b, files, {})
         self.assertIn("b.x states other typedefs", str(cm.exception))
+
+
+class Fragment(unittest.TestCase):
+    """A definition an RFC states only in its prose (RFC 8435, RFC 8154)."""
+
+    def fragment(self, t):
+        return rfc_xdr.build_file(
+            {"kind": "fragment", "parts": [("copy", ["9992", "enum",
+                                                     "flavor"])]},
+            {}, {"9992": (t.rfcs / "rfc9992.txt").read_bytes()})
+
+    def test_fragment_is_built_and_pinned(self):
+        with Tree() as t:
+            frag = self.fragment(t)
+            (t.dir / "f.x").write_bytes(frag)
+            with open(t.manifest, "a") as f:
+                f.write(f"fragment f.x {rfc_xdr.sha256(frag)}\n"
+                        f"copy 9992 enum flavor\n")
+            m, files = rfc_xdr.rebuild(t.manifest, t.rfcs)
+            self.assertEqual(files["f.x"], frag)
+            self.assertIn("f.x", rfc_xdr.pins(m))
+            self.assertEqual(rfc_xdr.main([str(t.manifest), "--check"]), 0)
+        text = frag.decode()
+        self.assertIn("enum flavor {", text)
+        self.assertIn("not in its `///` XDR", text)
+        self.assertNotIn("typedef", text)
+
+    def test_fragment_refusals(self):
+        for extra, needle in (
+                ("fragment f.x {}\ntypedefs a.x\n", "in a prelude"),
+                ("fragment f.x {}\n", "is empty"),
+                ("fragment a.x {}\ncopy 9992 enum flavor\n",
+                 "built twice")):
+            with Tree(extra=extra.format("0" * 64)) as t:
+                with self.assertRaises(rfc_xdr.SourceError) as cm:
+                    rfc_xdr.parse_manifest(t.manifest)
+            self.assertIn(needle, str(cm.exception))
 
 
 class Copy(unittest.TestCase):

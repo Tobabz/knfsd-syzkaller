@@ -37,6 +37,9 @@ struct dec {
 	uint32_t op;		/* current operation, or NFSP_FIELD_NONE */
 	uint32_t op_start;	/* payload offset where its result begins */
 	enum nfsp_decode_status st;
+	uint32_t stop_field;	/* partial: the operation array node */
+	int probing;		/* reading the minor-version prefix: no schema
+				 * is chosen yet, so nothing is partial */
 };
 
 static const char *kind_name(uint8_t kind)
@@ -167,7 +170,7 @@ static int enum_has(const struct nfsp_protocol_schema *s,
 	return 0;
 }
 
-/* Validate a 4-byte scalar against its type.  0 when allowed. */
+/* Validate a discriminant word against its type.  0 when allowed. */
 static int check_word(struct dec *d, uint16_t t, uint32_t w)
 {
 	const struct nfsp_schema_type *ty = &d->s->types[t];
@@ -177,6 +180,23 @@ static int check_word(struct dec *d, uint16_t t, uint32_t w)
 	if (ty->kind == NFSP_XK_ENUM && !enum_has(d->s, ty, w))
 		return fail(d, NFSP_DECODE_MALFORMED, t,
 			    "enum value not declared");
+	return 0;
+}
+
+/* A 4-byte value of a field that is not a discriminant.  In a CALL the
+ * server reads it as a plain word, so an out-of-domain value is decoded and
+ * flagged.  A REPLY stays strict: its reader is the client, and a strict
+ * result is what keeps a wrong reply_dispatch from decoding (§14). */
+static int check_leaf(struct dec *d, uint16_t t, uint32_t me, uint32_t w)
+{
+	const struct nfsp_schema_type *ty = &d->s->types[t];
+
+	if ((ty->kind == NFSP_XK_BOOL && w > 1) ||
+	    (ty->kind == NFSP_XK_ENUM && !enum_has(d->s, ty, w))) {
+		if (d->response)
+			return check_word(d, t, w);
+		F(d, me)->flags |= NFSP_FF_UNDECLARED;
+	}
 	return 0;
 }
 
@@ -198,7 +218,7 @@ static int dec_scalar(struct dec *d, uint16_t t, uint32_t me)
 	} else {
 		uint32_t w = rd32(d, d->off);
 
-		if (check_word(d, t, w))
+		if (check_leaf(d, t, me, w))
 			return -1;
 		v = ty->kind == NFSP_XK_INT ?
 			(uint64_t)(int64_t)(int32_t)w : w;
@@ -240,9 +260,12 @@ static int dec_bytes(struct dec *d, uint16_t t, uint32_t me)
 	at = d->off + n;
 	for (uint32_t i = 0; i < pad; i++)
 		if (d->p[at + i]) {
-			d->off = at;
-			return fail(d, NFSP_DECODE_MALFORMED, t,
-				    "non-zero padding");
+			if (d->response) {
+				d->off = at;
+				return fail(d, NFSP_DECODE_MALFORMED, t,
+					    "non-zero padding");
+			}
+			F(d, me)->flags |= NFSP_FF_PAD_NONZERO;
 		}
 	F(d, me)->wire.value.off = d->off;
 	F(d, me)->wire.value.len = n;
@@ -250,6 +273,45 @@ static int dec_bytes(struct dec *d, uint16_t t, uint32_t me)
 		meta(d, me, NFSP_META_PADDING, at, pad);
 	d->off = at + pad;
 	return 0;
+}
+
+/* A CALL's operation array: knfsd decodes its operations one by one and
+ * stops at the first that fails (nfsd4_decode_compound). */
+static int ops_array(const struct dec *d, const struct nfsp_schema_type *ty)
+{
+	return !d->response && !d->probing && d->len >= 4u &&
+	       (d->s->types[ty->sub].flags & NFSP_STF_OPS_REQUEST);
+}
+
+/* Keep the operations before element i of array `arr` and drop the rest:
+ * the fields and ops the failed element added go, and `failure` keeps why
+ * it failed.  The containing nodes are cut at `at` by the caller of
+ * decode() once the walk has unwound (finish_partial). */
+static void stop_at_op(struct dec *d, uint32_t arr, uint32_t i, uint32_t at,
+		       uint32_t nf, uint32_t no)
+{
+	d->m->nfields = nf;
+	d->m->nops = no;
+	d->m->failure.op_index = i;
+	d->m->failure.opcode = rd32(d, at);
+	d->m->failure.op_offset = at;
+	d->stop_field = arr;
+	d->st = NFSP_DECODE_PARTIAL;
+}
+
+/* After a partial walk: the operation array and every node containing it
+ * end where the failed operation starts. */
+static void finish_partial(struct dec *d)
+{
+	uint32_t stop = d->m->failure.op_offset;
+
+	for (uint32_t i = d->stop_field; i != NFSP_FIELD_NONE;
+	     i = F(d, i)->parent) {
+		struct nfsp_wire_ref *w = &F(d, i)->wire;
+
+		w->encoded.len = stop - w->encoded.off;
+		w->value.len = w->value.off <= stop ? stop - w->value.off : 0;
+	}
 }
 
 static int dec_array(struct dec *d, uint16_t t, uint32_t me)
@@ -268,17 +330,31 @@ static int dec_array(struct dec *d, uint16_t t, uint32_t me)
 			return fail(d, NFSP_DECODE_MALFORMED, t,
 				    "count exceeds bound");
 		/* min_size > 0 is a normalizer guarantee; this check bounds
-		 * the loop below by the bytes actually present. */
-		if ((uint64_t)count * min > remaining(d) - 4u)
+		 * the loop below by the bytes actually present.  A CALL's
+		 * operation array is not checked as a whole: knfsd reads
+		 * operations until one fails and never looks at the count of
+		 * those after it, and each element is checked as it is read
+		 * (an element needs at least its opcode word, so the loop
+		 * still ends with the record). */
+		if (!ops_array(d, ty) &&
+		    (uint64_t)count * min > remaining(d) - 4u)
 			return fail(d, NFSP_DECODE_MALFORMED, t,
 				    "count exceeds remaining record");
 		meta(d, me, NFSP_META_COUNT, d->off, 4);
 		d->off += 4;
 		F(d, me)->wire.value.off = d->off;
 	}
-	for (uint32_t i = 0; i < count; i++)
-		if (decode(d, ty->sub, me, NULL, "[]", i))
-			return -1;
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t nf = d->m->nfields, no = d->m->nops, at = d->off;
+
+		if (!decode(d, ty->sub, me, NULL, "[]", i))
+			continue;
+		if (ops_array(d, ty) && at <= d->len - 4u &&
+		    (d->st == NFSP_DECODE_MALFORMED ||
+		     d->st == NFSP_DECODE_TRUNCATED))
+			stop_at_op(d, me, i, at, nf, no);
+		return -1;
+	}
 	F(d, me)->wire.value.len = d->off - F(d, me)->wire.value.off;
 	return 0;
 }
@@ -572,14 +648,18 @@ static int probe_minor(struct dec *d, const struct nfsp_schema_family *fam,
 			      "minor-version selector has no argument"), -1;
 	ty = &s0->types[pr->arg];
 	d->s = s0;
+	d->probing = 1;
 	for (uint32_t k = 0; k <= s0->selector_field && k < ty->count; k++) {
 		const struct nfsp_schema_field *f = &s0->fields[ty->first + k];
 
 		idx = d->m->nfields;
 		if (decode(d, f->type, NFSP_FIELD_NONE, pr->name, f->name,
-			   NFSP_FIELD_NONE))
+			   NFSP_FIELD_NONE)) {
+			d->probing = 0;
 			return -1;
+		}
 	}
+	d->probing = 0;
 	*minor = (uint32_t)d->m->fields[idx].value;
 	return 0;
 }
@@ -751,14 +831,24 @@ nfsp_nfs_decode(const struct nfsp_schema_family *const *families,
 	out->procedure_name = pr->name;
 	if (root_type != NFSP_SCHEMA_NONE &&
 	    decode(&d, root_type, NFSP_FIELD_NONE, pr->name, leaf,
-		   NFSP_FIELD_NONE))
+		   NFSP_FIELD_NONE)) {
+		if (d.st == NFSP_DECODE_PARTIAL)
+			finish_partial(&d);
 		goto done;
-	if (d.off != d.len)
-		fail(&d, NFSP_DECODE_MALFORMED, root_type,
-		     "bytes after the procedure body");
+	}
+	if (d.off != d.len) {
+		if (d.response) {
+			fail(&d, NFSP_DECODE_MALFORMED, root_type,
+			     "bytes after the procedure body");
+		} else {
+			out->trailing.off = d.off;
+			out->trailing.len = d.len - d.off;
+		}
+	}
 done:
 	out->status = d.st;
-	if (out->status != NFSP_DECODE_DECODED) {
+	if (out->status != NFSP_DECODE_DECODED &&
+	    out->status != NFSP_DECODE_PARTIAL) {
 		out->nfields = 0;
 		out->nops = 0;
 	}
@@ -874,6 +964,7 @@ const char *nfsp_decode_strstatus(enum nfsp_decode_status status)
 		return "transaction_context_missing";
 	case NFSP_DECODE_DISPATCH_INCOMPLETE: return "dispatch_incomplete";
 	case NFSP_DECODE_RESOURCE_LIMIT: return "resource_limit";
+	case NFSP_DECODE_PARTIAL: return "partial";
 	}
 	return "unknown";
 }

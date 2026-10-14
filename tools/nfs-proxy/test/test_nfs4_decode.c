@@ -57,6 +57,7 @@ static const struct nfsp_schema_family *const fams[] = {
 #define OP_SEQUENCE	53u
 #define OP_SEEK		69u	/* NFSv4.2 */
 #define OP_GETXATTR	72u	/* RFC 8276, an NFSv4.2 extension */
+#define OP_LAYOUTGET	50u
 
 #define SESSIONID	"sess-0123456789a"	/* sessionid4[16] */
 #define DIRFH		"dir-fh-00001"		/* nfs_fh4, 12 bytes */
@@ -357,6 +358,52 @@ static void build_getxattr_call(struct msg *m)
 	wopaque(m, "user.test");	/* 136 gxa_name: len, 140..148, pad */
 }					/* 152 */
 
+/* NFSv4.1 LAYOUTGET for a flex files layout (RFC 8435), as the Linux
+ * client's nfs4_xdr_enc_layoutget sends it.  192 bytes. */
+static void build_layoutget_call(struct msg *m)
+{
+	call_header(m, 1);
+	w32(m, 0);			/*  64 tag */
+	w32(m, 1);			/*  68 minorversion */
+	w32(m, 3);			/*  72 argarray count */
+	sequence_args(m, 0x15, 0);	/*  76 SEQUENCE, 80..111 */
+	w32(m, OP_PUTFH);		/* 112 */
+	wopaque(m, FILEFH);		/* 116 object: len, 120..131 */
+	w32(m, OP_LAYOUTGET);		/* 132 */
+	w32(m, 0);			/* 136 loga_signal_layout_avail */
+	w32(m, 4);			/* 140 loga_layout_type FLEX_FILES */
+	w32(m, 1);			/* 144 loga_iomode LAYOUTIOMODE4_READ */
+	w64(m, 0);			/* 148 loga_offset */
+	w64(m, ~0ull);			/* 156 loga_length */
+	w64(m, 0);			/* 164 loga_minlength */
+	w32(m, 1);			/* 172 loga_stateid.seqid */
+	wraw(m, OTHER, 12);		/* 176 loga_stateid.other */
+	w32(m, 4096);			/* 188 loga_maxcount */
+}					/* 192 */
+
+/* knfsd's reply for a SCSI layout (RFC 8154), body abridged.  152 bytes. */
+static void build_layoutget_reply(struct msg *m)
+{
+	reply_header(m);
+	w32(m, 0);			/*  24 status */
+	w32(m, 0);			/*  28 tag */
+	w32(m, 3);			/*  32 resarray count */
+	sequence_res(m, 0x15);		/*  36 SEQUENCE, 40..79 */
+	w32(m, OP_PUTFH);		/*  80 */
+	w32(m, 0);			/*  84 status */
+	w32(m, OP_LAYOUTGET);		/*  88 */
+	w32(m, 0);			/*  92 logr_status */
+	w32(m, 1);			/*  96 logr_return_on_close */
+	w32(m, 2);			/* 100 logr_stateid.seqid */
+	wraw(m, OTHER, 12);		/* 104 logr_stateid.other */
+	w32(m, 1);			/* 116 logr_layout count */
+	w64(m, 0);			/* 120 lo_offset */
+	w64(m, ~0ull);			/* 128 lo_length */
+	w32(m, 1);			/* 136 lo_iomode */
+	w32(m, 5);			/* 140 loc_type SCSI */
+	wopaque(m, "abcd");		/* 144 loc_body: len, 148..151 */
+}					/* 152 */
+
 /* knfsd's reply: the value "abc".  104 bytes. */
 static void build_getxattr_reply(struct msg *m)
 {
@@ -503,6 +550,45 @@ static void expect_meta(const struct nfsp_decoded_msg *m, const char *path,
 
 #define META(m, path, nth, role, o, l) \
 	expect_meta(m, path, nth, role, o, l, __LINE__)
+
+static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
+			     const char *what);
+
+/* A partial CALL: fields and ops end where the failed operation starts,
+ * and the ops are exactly the operations before it. */
+static void check_partial(const struct nfsp_decoded_msg *m, size_t len,
+			  const char *what)
+{
+	const struct nfsp_decode_failure *f = &m->failure;
+
+	CHECK(m->status == NFSP_DECODE_PARTIAL && m->msg_type == 0 &&
+	      (uint64_t)f->op_offset + 4 <= len && f->offset >= f->op_offset &&
+	      m->nops == f->op_index && m->nfields > 0,
+	      "%s: partial op %u at %u, %u ops, failure at %u", what,
+	      f->op_index, f->op_offset, m->nops, f->offset);
+	check_invariants(m, f->op_offset, what);
+	for (uint32_t i = 0; i < m->nops; i++)
+		CHECK(m->ops[i].sequence_index == i &&
+		      m->ops[i].field < m->nfields, "%s: op %u", what, i);
+}
+
+/* run() is partial at operation op_index starting at op_offset. */
+static void expect_partial_at(const struct msg *v, uint32_t op_index,
+			      uint32_t op_offset, uint32_t opcode,
+			      const char *what)
+{
+	struct nfsp_decoded_msg m = {0};
+
+	CHECK(run(v, v->n, NULL, &m) == NFSP_DECODE_PARTIAL &&
+	      m.failure.op_index == op_index &&
+	      m.failure.op_offset == op_offset && m.failure.opcode == opcode,
+	      "%s: %s, op %u at %u opcode %u; want partial op %u at %u",
+	      what, nfsp_decode_strstatus(m.status), m.failure.op_index,
+	      m.failure.op_offset, m.failure.opcode, op_index, op_offset);
+	if (m.status == NFSP_DECODE_PARTIAL)
+		check_partial(&m, v->n, what);
+	nfsp_decoded_msg_free(&m);
+}
 
 static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
 			     const char *what)
@@ -945,15 +1031,15 @@ static void test_minor_selection(void)
 		       1);
 	}
 
+	/* An operation of another minor is where knfsd stops (OP_ILLEGAL):
+	 * the operations before it stay. */
 	build_seek_call(&v, 1, OP_SEEK);
-	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 132 && m.nfields == 0 && m.nops == 0,
-	      "SEEK in 4.1: %s at %u", nfsp_decode_strstatus(m.status),
-	      m.failure.offset);
+	expect_partial_at(&v, 2, 132, OP_SEEK, "SEEK in 4.1");
 
 	build_open_call(&v);
 	put32(&v, 68, 0);
-	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_MALFORMED &&
+	expect_partial_at(&v, 0, 76, OP_SEQUENCE, "SEQUENCE in 4.0");
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_PARTIAL &&
 	      m.failure.offset == 76 && m.failure.reason &&
 	      !strcmp(m.failure.reason, "enum value not declared"),
 	      "SEQUENCE in 4.0: %s at %u", nfsp_decode_strstatus(m.status),
@@ -1041,9 +1127,7 @@ static void test_extensions(void)
 		     NFSP_META_PADDING, 149, 3);
 	}
 	put32(&v, 68, 1);
-	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_MALFORMED &&
-	      m.failure.offset == 132, "GETXATTR in 4.1: %s at %u",
-	      nfsp_decode_strstatus(m.status), m.failure.offset);
+	expect_partial_at(&v, 2, 132, OP_GETXATTR, "GETXATTR in 4.1");
 
 	build_getxattr_reply(&v);
 	CHECK(v.n == 104, "getxattr reply length %zu", v.n);
@@ -1101,6 +1185,52 @@ static void test_extensions(void)
 	nfsp_decoded_msg_free(&m);
 }
 
+/* RFC 8435 flex files (4) and RFC 8154 SCSI (5) layout types, which knfsd
+ * implements, in 4.1 and 4.2.  The layout body stays opaque. */
+static void test_layout_types(void)
+{
+	struct nfsp_reply_dispatch rd = dispatch(1), rd42 = dispatch(2);
+	struct nfsp_decoded_msg m = {0};
+	static const char *const names[] = { "SEQUENCE", "PUTFH",
+					     "LAYOUTGET" };
+	static const uint32_t ok3[] = { 0, 0, 0 };
+	struct msg v;
+
+	printf("pNFS layout types: RFC 8435 flex files, RFC 8154 SCSI\n");
+	build_layoutget_call(&v);
+	CHECK(v.n == 192, "layoutget call length %zu", v.n);
+	if (decoded(&v, NULL, &m, "LAYOUTGET flex files call")) {
+		expect_ops(&m, 3, names, 0, NULL);
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_layout_type", 0,
+		       140, 4, 140, 4, 4);
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_maxcount", 0,
+		       188, 4, 188, 4, 4096);
+	}
+	put32(&v, 140, 5);
+	if (decoded(&v, NULL, &m, "LAYOUTGET SCSI call"))
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_layout_type", 0,
+		       140, 4, 140, 4, 5);
+	put32(&v, 68, 2);
+	if (decoded(&v, NULL, &m, "LAYOUTGET SCSI call in 4.2"))
+		EXPECT(&m, "nfs4.request.LAYOUTGET.args.loga_layout_type", 0,
+		       140, 4, 140, 4, 5);
+
+	build_layoutget_reply(&v);
+	CHECK(v.n == 152, "layoutget reply length %zu", v.n);
+	if (decoded(&v, &rd, &m, "LAYOUTGET SCSI reply")) {
+		expect_ops(&m, 3, names, 1, ok3);
+		EXPECT(&m, "nfs4.response.LAYOUTGET.result.ok.logr_layout[]."
+		       "lo_content.loc_type", 0, 140, 4, 140, 4, 5);
+		EXPECT(&m, "nfs4.response.LAYOUTGET.result.ok.logr_layout[]."
+		       "lo_content.loc_body", 0, 144, 8, 148, 4, 0);
+	}
+	put32(&v, 140, 4);
+	if (decoded(&v, &rd42, &m, "LAYOUTGET flex files reply in 4.2"))
+		EXPECT(&m, "nfs4.response.LAYOUTGET.result.ok.logr_layout[]."
+		       "lo_content.loc_type", 0, 140, 4, 140, 4, 4);
+	nfsp_decoded_msg_free(&m);
+}
+
 typedef void (*builder)(struct msg *);
 
 struct golden {
@@ -1128,10 +1258,13 @@ static const struct golden goldens[] = {
 	{ "4.2 getxattr reply", build_getxattr_reply, 1, 2, 7 },
 	{ "4.2 read attrs deleg", build_open_reply_rdeleg, 1, 2, 20 },
 	{ "4.2 write attrs deleg", build_open_reply_wdeleg, 1, 2, 21 },
+	{ "4.1 layoutget call", build_layoutget_call, 0, 1, 11 },
+	{ "4.1 layoutget reply", build_layoutget_reply, 1, 1, 11 },
 };
 #define NGOLDEN (sizeof(goldens) / sizeof(goldens[0]))
 
-/* Every proper prefix fails and leaves nothing behind. */
+/* Every proper prefix fails.  It leaves nothing behind, except a CALL cut
+ * inside an operation whose opcode word is present: partial. */
 static void test_truncation(void)
 {
 	struct nfsp_decoded_msg m = {0};
@@ -1147,6 +1280,10 @@ static void test_truncation(void)
 			enum nfsp_decode_status st =
 				run(&v, n, goldens[g].reply ? &rd : NULL, &m);
 
+			if (st == NFSP_DECODE_PARTIAL && !goldens[g].reply) {
+				check_partial(&m, n, goldens[g].what);
+				continue;
+			}
 			if (st == NFSP_DECODE_DECODED || m.nfields || m.nops)
 				bad++;
 		}
@@ -1178,35 +1315,136 @@ static void refused(builder build, const struct nfsp_reply_dispatch *rd,
 #define REFUSED(b, rd, at, w, st, off, why) \
 	refused(b, rd, at, w, st, off, why, __LINE__)
 
+/* Word `at` of the OPEN call set to w fails operation op_index. */
+static void partial_open(size_t at, uint32_t w, uint32_t fail_off,
+			 const char *reason, uint32_t op_index,
+			 uint32_t op_offset, int line)
+{
+	struct nfsp_decoded_msg m = {0};
+	struct msg v;
+	char what[48];
+
+	snprintf(what, sizeof(what), "line %d", line);
+	build_open_call(&v);
+	put32(&v, at, w);
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_PARTIAL &&
+	      m.failure.offset == fail_off && m.failure.reason &&
+	      !strcmp(m.failure.reason, reason) &&
+	      m.failure.op_index == op_index &&
+	      m.failure.op_offset == op_offset,
+	      "%s: word %zu = %#x: %s at %u (%s) op %u at %u", what, at, w,
+	      nfsp_decode_strstatus(m.status), m.failure.offset,
+	      m.failure.reason ? m.failure.reason : "", m.failure.op_index,
+	      m.failure.op_offset);
+	if (m.status == NFSP_DECODE_PARTIAL)
+		check_partial(&m, v.n, what);
+	nfsp_decoded_msg_free(&m);
+}
+
+#define PARTIAL(at, w, off, why, idx, opoff) \
+	partial_open(at, w, off, why, idx, opoff, __LINE__)
+
 static void test_malformed(void)
 {
 	struct nfsp_reply_dispatch rd = dispatch(1);
 	const enum nfsp_decode_status bad = NFSP_DECODE_MALFORMED;
 
 	printf("malformed: located refusals on the NFSv4 bounds\n");
-	REFUSED(build_open_call, NULL, 108, 2, bad, 108, "bool is not 0 or 1");
-	REFUSED(build_open_call, NULL, 116, 129, bad, 116,
-		"length exceeds bound");		/* NFS4_FHSIZE */
-	REFUSED(build_open_call, NULL, 156, 1025, bad, 156,
-		"length exceeds bound");		/* NFS4_OPAQUE_LIMIT */
-	REFUSED(build_open_call, NULL, 156, 200, bad, 156,
-		"length exceeds remaining record");
-	REFUSED(build_open_call, NULL, 192, 4, bad, 192,
-		"enum value not declared");		/* createmode4 */
-	REFUSED(build_open_call, NULL, 216, 7, bad, 216,
-		"enum value not declared");		/* open_claim_type4 */
-	REFUSED(build_open_call, NULL, 196, 1000, bad, 196,
-		"count exceeds remaining record");
-	REFUSED(build_open_call, NULL, 228, 0x696c6501u, bad, 231,
-		"non-zero padding");			/* "ile" + pad */
+	/* Inside an operation of a CALL: partial at that operation (PUTFH
+	 * at 112, OPEN at 132), the operations before it kept. */
+	PARTIAL(116, 129, 116, "length exceeds bound", 1, 112);
+	PARTIAL(156, 1025, 156, "length exceeds bound", 2, 132);
+	PARTIAL(156, 200, 156, "length exceeds remaining record", 2, 132);
+	PARTIAL(192, 4, 192, "enum value not declared", 2, 132);
+	PARTIAL(216, 7, 216, "enum value not declared", 2, 132);
+	PARTIAL(196, 1000, 196, "count exceeds remaining record", 2, 132);
+	/* No opcode word for the fifth operation: knfsd refuses the whole
+	 * request (its opcode read fails), so this is no partial. */
 	REFUSED(build_open_call, NULL, 72, 5, NFSP_DECODE_TRUNCATED, 236,
 		"record ends here");			/* count 5, four ops */
+	/* The operation count is not checked as a whole: the four operations
+	 * decode and the fifth opcode word is missing. */
+	REFUSED(build_open_call, NULL, 72, 1000, NFSP_DECODE_TRUNCATED, 236,
+		"record ends here");
 	REFUSED(build_readdir_reply, &rd, 160, 2, bad, 160,
 		"list link is not 0 or 1");
 	REFUSED(build_readdir_reply, &rd, 216, 2, bad, 216,
 		"bool is not 0 or 1");
 	REFUSED(build_readdir_reply, &rd, 92, 99999, bad, 92,
 		"enum value not declared");		/* nfsstat4 */
+}
+
+/* A short COMPOUND: AUTH_SYS header, empty tag, minor 0, then `n` words
+ * from `ops`.  knfsd reads operations until one fails and never looks at
+ * the count of those after it (nfsd4_decode_compound). */
+static void short_compound(struct msg *m, uint32_t count,
+			   const uint32_t *ops, size_t n)
+{
+	call_header(m, 1);
+	w32(m, 0);			/* 64 tag */
+	w32(m, 0);			/* 68 minorversion */
+	w32(m, count);			/* 72 argarray count */
+	for (size_t i = 0; i < n; i++)
+		w32(m, ops[i]);		/* 76, 80, ... */
+}
+
+static void test_short_compound(void)
+{
+	static const uint32_t putroot_read[] = { 24, 25 };
+	static const uint32_t putroot_bad[] = { 24, 99999 };
+	static const uint32_t putroot2[] = { 24, 24 };
+	struct nfsp_decoded_msg m = {0};
+	struct msg v;
+
+	printf("short COMPOUND: partial where knfsd stops\n");
+	/* PUTROOTFH, then READ with no arguments: knfsd stops at READ. */
+	short_compound(&v, 3, putroot_read, 2);
+	expect_partial_at(&v, 1, 80, 25, "count 3, READ without args");
+	short_compound(&v, 2, putroot_read, 2);
+	expect_partial_at(&v, 1, 80, 25, "count 2, READ without args");
+	short_compound(&v, 3, putroot_bad, 2);
+	expect_partial_at(&v, 1, 80, 99999, "count 3, opcode 99999");
+	/* The third opcode word is missing: knfsd refuses the request. */
+	short_compound(&v, 3, putroot2, 2);
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_TRUNCATED &&
+	      m.failure.offset == 84 && m.nfields == 0 && m.nops == 0,
+	      "missing third opcode: %s at %u",
+	      nfsp_decode_strstatus(m.status), m.failure.offset);
+	short_compound(&v, 0xffffffffu, putroot2, 2);
+	CHECK(run(&v, v.n, NULL, &m) == NFSP_DECODE_TRUNCATED &&
+	      m.failure.offset == 84 && m.nfields == 0,
+	      "huge count: %s at %u", nfsp_decode_strstatus(m.status),
+	      m.failure.offset);
+	nfsp_decoded_msg_free(&m);
+}
+
+/* In a CALL, knfsd reads sa_cachethis as a plain word and skips padding
+ * unread (nfsd4_decode_sequence, __xdr_inline_decode), so these decode and
+ * are flagged; the same oddities in a REPLY stay malformed. */
+static void test_lenient_call(void)
+{
+	struct nfsp_reply_dispatch rd = dispatch(1);
+	struct nfsp_decoded_msg m = {0};
+	const struct nfsp_semantic_field *f;
+	struct msg v;
+
+	printf("lenient CALL, strict REPLY\n");
+	build_open_call(&v);
+	put32(&v, 108, 2);			/* sa_cachethis */
+	put32(&v, 228, 0x696c6501u);		/* "ile" + pad */
+	if (decoded(&v, NULL, &m, "odd cachethis and padding")) {
+		f = field(&m, "nfs4.request.SEQUENCE.args.sa_cachethis", 0);
+		CHECK(f && f->flags == NFSP_FF_UNDECLARED && f->value == 2,
+		      "sa_cachethis not flagged");
+		f = field(&m, "nfs4.request.OPEN.args.claim.claim_null.file", 0);
+		CHECK(f && f->flags == NFSP_FF_PAD_NONZERO &&
+		      f->wire.value.off == 224 && f->wire.value.len == 7,
+		      "claim.file padding not flagged");
+		CHECK(m.nops == 4, "%u ops", m.nops);
+	}
+	REFUSED(build_readdir_reply, &rd, 216, 2, NFSP_DECODE_MALFORMED, 216,
+		"bool is not 0 or 1");
+	nfsp_decoded_msg_free(&m);
 }
 
 static int is_mutable_leaf(const struct nfsp_decoded_msg *m, uint32_t i)
@@ -1300,7 +1538,8 @@ static void test_random_edits(void)
 {
 	struct nfsp_decoded_msg m = {0};
 	uint64_t x = 0x243f6a8885a308d3ull;
-	unsigned ok = 0, refused_n = 0;
+	unsigned ok = 0, partial_n = 0, refused_n = 0;
+	enum nfsp_decode_status st;
 
 	printf("random edits: 20000 mutated messages, invariants hold\n");
 	for (unsigned it = 0; it < 20000; it++) {
@@ -1318,17 +1557,22 @@ static void test_random_edits(void)
 			v.b[hdr + (size_t)(x % (v.n - hdr))] =
 				(uint8_t)(x >> 32);
 		}
-		if (run(&v, v.n, g->reply ? &rd : NULL, &m) ==
-		    NFSP_DECODE_DECODED) {
+		st = run(&v, v.n, g->reply ? &rd : NULL, &m);
+		if (st == NFSP_DECODE_DECODED) {
 			ok++;
 			check_invariants(&m, v.n, "random edit");
+		} else if (st == NFSP_DECODE_PARTIAL) {
+			partial_n++;
+			CHECK(!g->reply, "partial REPLY");
+			check_partial(&m, v.n, "random edit");
 		} else {
 			refused_n++;
 			CHECK(m.nfields == 0 && m.nops == 0,
 			      "refused message kept fields");
 		}
 	}
-	printf("  %u decoded, %u refused\n", ok, refused_n);
+	printf("  %u decoded, %u partial, %u refused\n", ok, partial_n,
+	       refused_n);
 	CHECK(ok > 0 && refused_n > 0, "edits did not exercise both paths");
 	nfsp_decoded_msg_free(&m);
 }
@@ -1343,8 +1587,11 @@ int main(void)
 	test_minor_selection();
 	test_cross_check();
 	test_extensions();
+	test_layout_types();
 	test_truncation();
 	test_malformed();
+	test_lenient_call();
+	test_short_compound();
 	test_address_oracle();
 	test_random_edits();
 	printf("%d checks, %d failures\n", checks, failures);
