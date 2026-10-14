@@ -197,6 +197,12 @@ class Machine:
             c.reason = f"runner_ended_unsealed:{e.reason or ''}"
             self._goto(c, Target(kind=TargetKind.RUNNING, rerun=True))
             return True
+        if not self.env.judge.matches_execution(e.bundle_ref, job_id=j.job_id,
+                                                task_id=e.task_id):
+            c.reason = "q1_execution_mismatch"
+            self._block(c, BlockedReason.Q1_EVIDENCE,
+                        Target(kind=TargetKind.RUNNING))
+            return True
         r = self.env.judge.judge(e.bundle_ref, j.plan_ref,
                                  j.candidate.candidate_id, j.judge_versions)
         c.verdicts.append(r)

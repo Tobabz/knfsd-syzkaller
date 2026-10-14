@@ -1,6 +1,6 @@
 """Interfaces of the deterministic components and outside systems the
-Controller calls.  The real HCAP checker, Harness Materializer and Q1 Judge
-come with their own PRs; tests use fakes.
+Controller calls. Artifact-backed HCAP and Q1 implementations live in hcap
+and sealed_q1; the real Materializer and execution services remain separate.
 
 The machine calls HcapChecker, Materializer and Q1Judge inside a transition,
 so each must be a pure function of its arguments (09 rationale 1): replaying
@@ -32,6 +32,17 @@ class Materializer(Protocol):
 
 
 class Q1Judge(Protocol):
+    def matches_execution(self, bundle_ref: str, *, job_id: str,
+                          task_id: str) -> bool:
+        """Does trusted host provenance bind the bundle to this Runner task?
+
+        The Controller calls this before first consuming a bundle. Checking
+        only a bundle against its own receipt cannot prevent cross-task reuse.
+        This lookup, like judge(), must remain reproducible during replay.
+        Raise if host provenance is not available yet, so the Controller can
+        retry without committing a mismatch that would later change meaning.
+        """
+
     def judge(self, bundle_ref: str, plan_ref: str, candidate_id: str,
               versions: JudgeVersions) -> Q1Result:
         """06 §8-§10 over one sealed bundle (01 §11.1)."""
