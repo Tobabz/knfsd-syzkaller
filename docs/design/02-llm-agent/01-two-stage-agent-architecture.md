@@ -784,7 +784,9 @@ legacy NFSPDLT replay는 legacy/manual campaign의 재현 계약으로만 남는
 
 ## 10. Agent SDK와 deterministic boundary
 
-Agent SDK는 reasoning runtime으로 사용한다.
+Agent SDK는 reasoning runtime으로 사용한다. 이 문서의 "Agent SDK"는 특정 제품이 아니라 그 runtime을 가리킨다.
+구체 선택(여러 provider를 쓰는 PydanticAI)과 근거는 `../decisions/2026-10-13-agent-implementation-stack.md`가
+기록한다.
 
 ```text
 Agent SDK owns
@@ -856,6 +858,7 @@ bounded syz-manager fuzz
 sanitizer/crash collection
 evidence 수집과 봉인 (EvidenceManifest, §11.1)
 operational health check (verdict 아님)
+Controller와의 task 계약 (task_id당 실행 하나, status, cancel. 09 §8)
 ```
 
 ### 11.1 Judge 위치와 evidence 신뢰 경계
@@ -1092,6 +1095,8 @@ Q2 observed
 ```
 
 gap으로 막힌 job의 상태 전이(`retry_pending`, `parked`, `closed_unsupported`)는 `07` §7이 정한다(issue #13).
+위 경로를 job 상태, 전이, repair budget, 재시작 규칙으로 옮긴 상태 기계는 [`09-job-state-graph.md`](09-job-state-graph.md)가
+소유한다. 경로의 의미는 이 절과 각 계약 문서가 소유한다.
 
 build dependency, broken fixture, image/config mismatch는 LLM source repair로 보내지 않는다.
 
@@ -1151,5 +1156,9 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
     - log를 자르거나 지운 bundle은 `NOT_OBSERVED`가 아니라 `INCONCLUSIVE`다.
     - complete log, 닫힌 collection window, `runner_stopped`이고 report가 없을 때만 `NOT_OBSERVED`다.
     - profile을 바꾼 재판정은 기존 verdict를 고치지 않고 새 verdict를 만든다.
-12. repair/state graph
-13. Agent SDK concrete selection and agent/tool definitions
+12. [`repair/state graph`](09-job-state-graph.md) — draft (2026-10-13). job 상태, 전이, budget, 재시작 규칙
+13. Agent SDK concrete selection and agent/tool definitions — 선택은
+    [`decisions/2026-10-13-agent-implementation-stack.md`](../decisions/2026-10-13-agent-implementation-stack.md)에
+    기록했다(PydanticAI). agent/tool definitions는 첫 Stage 1 구현에서 정한다
+14. Runner task 실행 — Controller task 계약([`09`](09-job-state-graph.md) §8)의 Runner 쪽 구현. task·cancel 기록의
+    durable 저장, Runner 재시작 뒤 실행 복원, campaign evidence의 봉인 단위
