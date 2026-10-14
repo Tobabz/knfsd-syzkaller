@@ -261,8 +261,24 @@ enum nfsp_txn_result nfsp_txn_call(struct nfsp_txn *t,
 		t->stats.ambiguous_calls++;
 		return NFSP_TXN_AMBIGUOUS_CALL;
 	}
+	if (i != NONE && E(t, i)->state != NFSP_TXN_REPLIED) {
+		/* Ended without its one reply (expired, or ambiguous): a late
+		 * reply may still come for the old CALL, so a new CALL on the
+		 * key cannot own it.  The key stays ambiguous, and stays
+		 * retained a full retention from now (§11, §13). */
+		e = E(t, i);
+		e->state = NFSP_TXN_AMBIGUOUS;
+		e->duplicate_calls++;
+		e->last_seen_ms = now;
+		list_unlink(t, i);
+		e->ended_ms = now;
+		list_append(t, i);
+		*entry = e;
+		t->stats.ambiguous_calls++;
+		return NFSP_TXN_AMBIGUOUS_CALL;
+	}
 	if (i != NONE) {
-		/* An ended transaction: the key may be used again (§12). */
+		/* Completed with its reply: the key may be used again (§12). */
 		free_slot(t, i);
 		t->stats.superseded++;
 	}

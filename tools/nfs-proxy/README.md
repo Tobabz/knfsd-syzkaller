@@ -146,7 +146,9 @@ contract in [03](../../docs/design/03-nfs-proxy/03-transaction-context.md).
   forechannel CALL (C2S) with the same XID on one connection stay apart. Results are
   `found`, `missing`, `ambiguous` and `expired`; only `found` gives a `reply_dispatch`.
   A different CALL on a live key makes it ambiguous (never overwritten); a retransmission
-  (the same bytes, by a two-hash fingerprint) is counted, not re-inserted.
+  (the same bytes, by a two-hash fingerprint) is counted, not re-inserted. A key may take
+  a new CALL once its last CALL was answered; while an expired or ambiguous key is still
+  retained, a new CALL on it only keeps it ambiguous, since the old reply may yet come.
 - Memory is a fixed pool allocated once. Bounds: 4096 outstanding entries, 1024 per
   connection, 1024 ended entries kept for diagnosis, 300 s timeout without traffic, 10 s
   retention. A full table refuses a new CALL (`capacity_exhausted`) and never reclaims a
@@ -156,7 +158,8 @@ contract in [03](../../docs/design/03-nfs-proxy/03-transaction-context.md).
   minor version); a REPLY decodes only with a `found` entry's dispatch. It never changes or
   refuses a record. `nfs-proxy ... --semantic` turns it on and prints `semantic ...` and
   `txn ...` counter lines with the stats. With `--control`/`--replay` the CALL the peer gets
-  may be rewritten after the observer, so no request summary is offered then.
+  may be rewritten after the observer (even its minor version), so a REPLY then gets neither
+  a dispatch nor a request summary: it is `transaction_context_missing`.
 
 ## Building
 

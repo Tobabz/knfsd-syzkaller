@@ -92,18 +92,21 @@ int nfsp_semantic_record(const struct nfsp_rpc_record *r, void *arg)
 				     NFSP_DIR_S2C : NFSP_DIR_C2S;
 		ev.txn = nfsp_txn_reply(&s->txn, &key, now, &e);
 		ev.entry = e;
-		if (ev.txn == NFSP_TXN_FOUND) {
+		if (ev.txn == NFSP_TXN_FOUND &&
+		    e->forwarded == NFSP_TXN_FWD_ORIGINAL) {
 			nfsp_txn_dispatch(e, &rd);
 			/* Only a request that decoded may feed a
 			 * request-dependent check (design 03 §6). */
-			if (e->forwarded == NFSP_TXN_FWD_ORIGINAL &&
-			    e->original.decoded &&
+			if (e->original.decoded &&
 			    (e->original.status == NFSP_DECODE_DECODED ||
 			     e->original.status == NFSP_DECODE_PARTIAL))
 				ev.request = &e->original;
 			decode(s, r, &rpc, &rd);
 		} else {
-			/* Never another entry's dispatch (design 03 §7). */
+			/* Never another entry's dispatch (design 03 §7).  A
+			 * rewrite after this observer may have changed the
+			 * CALL's minor version or procedure, so an unknown
+			 * forwarded CALL gives no dispatch either. */
 			decode(s, r, &rpc, NULL);
 		}
 		s->stats.replies++;

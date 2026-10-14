@@ -289,6 +289,45 @@ static void test_supersede(void)
 	nfsp_txn_free(&t);
 }
 
+/* An expired or ambiguous key is not handed to a new CALL while it is
+ * retained, whichever way it ended; after the retention it is free. */
+static void test_no_reuse_while_unresolved(void)
+{
+	struct nfsp_txn t;
+	const struct nfsp_txn_entry *r;
+	struct nfsp_txn_key k = key(1, C2S, 8);
+
+	init(&t, 0, 0, 0, 100, 50);
+	CHECK(call(&t, 1, C2S, 8, call_a, 0) == NFSP_TXN_INSERTED, "A");
+	nfsp_txn_tick(&t, 100);
+	CHECK(t.stats.expired_timeout == 1, "A expired at 100");
+	CHECK(call(&t, 1, C2S, 8, call_b, 101) == NFSP_TXN_AMBIGUOUS_CALL,
+	      "B on the expired key");
+	CHECK(t.stats.outstanding == 0 && t.stats.retained == 1 &&
+	      t.stats.inserted == 1, "B was not inserted");
+	CHECK(nfsp_txn_reply(&t, &k, 140, &r) == NFSP_TXN_AMBIGUOUS_REPLY &&
+	      r->expiry == NFSP_TXN_EXPIRED_TIMEOUT,
+	      "late reply is ambiguous, never found");
+	/* The new CALL restarted the retention: 101 + 50. */
+	CHECK(reply(&t, 1, C2S, 8, 150) == NFSP_TXN_AMBIGUOUS_REPLY,
+	      "kept a full retention after B");
+	CHECK(reply(&t, 1, C2S, 8, 151) == NFSP_TXN_MISSING, "then freed");
+	CHECK(call(&t, 1, C2S, 8, call_b, 152) == NFSP_TXN_INSERTED,
+	      "a free key takes a new CALL");
+
+	k.xid = 9;
+	CHECK(call(&t, 1, C2S, 9, call_a, 200) == NFSP_TXN_INSERTED, "A");
+	CHECK(call(&t, 1, C2S, 9, call_b, 201) == NFSP_TXN_AMBIGUOUS_CALL,
+	      "B conflicts");
+	CHECK(reply(&t, 1, C2S, 9, 202) == NFSP_TXN_AMBIGUOUS_REPLY,
+	      "a reply retires it");
+	CHECK(call(&t, 1, C2S, 9, call_b, 203) == NFSP_TXN_AMBIGUOUS_CALL,
+	      "B retransmitted on the retained ambiguous key");
+	CHECK(reply(&t, 1, C2S, 9, 204) == NFSP_TXN_AMBIGUOUS_REPLY,
+	      "late reply still ambiguous");
+	nfsp_txn_free(&t);
+}
+
 /* The CALL's decode feeds the REPLY's dispatch: the minor version, and the
  * operations only when the decode kept them. */
 static void test_enrich(void)
@@ -400,6 +439,7 @@ int main(void)
 	test_timeout();
 	test_capacity();
 	test_supersede();
+	test_no_reuse_while_unresolved();
 	test_enrich();
 	test_model();
 	printf("%d checks, %d failures\n", checks, failures);

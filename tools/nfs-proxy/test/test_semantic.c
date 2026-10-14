@@ -392,20 +392,70 @@ static void test_backchannel(void)
 }
 
 /* When a legacy rewrite may change the CALL, the forwarded request is
- * unknown: the reply still decodes, but no request summary is offered. */
+ * unknown, and so is the dispatch: a rewrite of the minor version from 0 to
+ * 1 would otherwise decode a 4.1 reply under the 4.0 schema.  The reply is
+ * found, but gets no dispatch and no request summary. */
 static void test_forwarded_unknown(void)
 {
 	struct nfsp_semantic s;
 	struct msg m;
 
 	setup(&s, NFSP_TXN_FWD_UNKNOWN);
-	v41_call(&m, 3);
+	v40_call(&m, 3);
 	feed(&s, 1, NFSP_DIR_C2S, &m);
 	v41_reply(&m, 3);
 	feed(&s, 1, NFSP_DIR_S2C, &m);
-	CHECK(seen.txn == NFSP_TXN_FOUND &&
-	      seen.status == NFSP_DECODE_DECODED && !seen.has_request,
-	      "no request summary");
+	CHECK(seen.txn == NFSP_TXN_FOUND && seen.has_entry &&
+	      seen.status == NFSP_DECODE_TRANSACTION_CONTEXT_MISSING &&
+	      seen.nops == 0 && !seen.has_request,
+	      "no dispatch: %s", nfsp_decode_strstatus(seen.status));
+	nfsp_semantic_free(&s);
+}
+
+/* A late reply to an expired, or ambiguous, CALL must not take the
+ * request of a new CALL that reused the key while the old one is still
+ * retained. */
+static void test_reuse_after_unresolved(void)
+{
+	struct nfsp_semantic s;
+	struct msg m;
+
+	setup(&s, NFSP_TXN_FWD_ORIGINAL);
+	v40_call(&m, 6);				/* A: PUTFH, READDIR */
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	clock_now = 1000;				/* A expires */
+	v41_call(&m, 6);				/* B: SEQUENCE ... */
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	CHECK(seen.txn == NFSP_TXN_AMBIGUOUS_CALL,
+	      "B on an expired, retained key: %s",
+	      nfsp_txn_strresult(seen.txn));
+	v40_reply_stale(&m, 6);				/* late reply to A */
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_AMBIGUOUS_REPLY && !seen.has_request &&
+	      seen.status == NFSP_DECODE_TRANSACTION_CONTEXT_MISSING,
+	      "late A reply: %s/%s", nfsp_txn_strresult(seen.txn),
+	      nfsp_decode_strstatus(seen.status));
+	nfsp_semantic_free(&s);
+
+	setup(&s, NFSP_TXN_FWD_ORIGINAL);
+	v40_call(&m, 6);				/* A */
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	v41_call(&m, 6);				/* B, conflicting */
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	v41_reply(&m, 6);				/* B's reply */
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_AMBIGUOUS_REPLY, "ambiguous reply");
+	v41_call(&m, 6);				/* B retransmitted */
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	CHECK(seen.txn == NFSP_TXN_AMBIGUOUS_CALL,
+	      "retransmission on a retained ambiguous key: %s",
+	      nfsp_txn_strresult(seen.txn));
+	v40_reply_stale(&m, 6);				/* late reply to A */
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_AMBIGUOUS_REPLY && !seen.has_request &&
+	      seen.status == NFSP_DECODE_TRANSACTION_CONTEXT_MISSING,
+	      "late A reply: %s/%s", nfsp_txn_strresult(seen.txn),
+	      nfsp_decode_strstatus(seen.status));
 	nfsp_semantic_free(&s);
 }
 
@@ -502,6 +552,7 @@ int main(void)
 	test_no_dispatch();
 	test_backchannel();
 	test_forwarded_unknown();
+	test_reuse_after_unresolved();
 	test_ambiguous();
 	test_lifecycle();
 	test_report();

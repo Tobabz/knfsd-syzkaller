@@ -17,8 +17,12 @@
  *          fails, so a REPLY still finds its procedure.
  *   REPLY  envelope -> nfsp_txn_reply(call_direction = opposite of the
  *          REPLY's) -> body decode with the entry's dispatch only when the
- *          lookup is `found`; otherwise no dispatch, which the decoder
- *          reports as transaction_context_missing.
+ *          lookup is `found` and the CALL the peer got is the one recorded
+ *          (forwarded ORIGINAL); otherwise no dispatch, which the decoder
+ *          reports as transaction_context_missing.  A legacy rewrite after
+ *          this observer can change the CALL's minor version or procedure,
+ *          so with one installed (forwarded UNKNOWN) no REPLY is decoded
+ *          against a schema.
  *
  *   A record whose envelope is invalid touches no entry.
  *
@@ -50,8 +54,8 @@ struct nfsp_semantic_event {
 	enum nfsp_txn_result txn;
 	/* CALL: the live entry (INSERTED, DUPLICATE_EQUIVALENT,
 	 * AMBIGUOUS_CALL).  REPLY: the entry looked up (FOUND,
-	 * AMBIGUOUS_REPLY, EXPIRED_ENTRY), for diagnosis; only FOUND gave the
-	 * dispatch.  NULL otherwise. */
+	 * AMBIGUOUS_REPLY, EXPIRED_ENTRY), for diagnosis; only FOUND with a
+	 * forwarded ORIGINAL CALL gave the dispatch.  NULL otherwise. */
 	const struct nfsp_txn_entry *entry;
 	/* REPLY, FOUND, the forwarded CALL is the one decoded, and its decode
 	 * was decoded or partial (design 03 §6, §9): the request summary a

@@ -908,8 +908,12 @@ Transaction Context가 correct request/reply semantic context를 공급함만 �
   판정한다. 같으면 retransmission, 다르면 ambiguous다(§11). Runtime 판정용이며 identity가 아니다.
 - **결정됨:** request summary는 `minor_version`과 operation opcode 배열(최대 256)이다. request
   decode가 `decoded`/`partial`일 때만 저장·제공한다.
-- **결정됨(M4 전):** legacy `on_record` rewrite hook이 있으면 `request.forwarded`는 unknown이고
-  request-dependent 검증에 쓰지 않는다. 없으면 `forwarded = original`이다.
+- **결정됨(M4 전):** legacy `on_record` rewrite hook이 있으면 `request.forwarded`는 unknown이다.
+  그 rewrite는 minor version이나 procedure도 바꿀 수 있으므로, REPLY에 dispatch도 request summary도
+  주지 않는다(`transaction_context_missing`). 없으면 `forwarded = original`이다.
+- **결정됨:** §12의 재사용은 정상 응답(`replied`)으로 끝난 key에만 허용한다. `expired`나
+  `ambiguous`로 끝난 key가 retained 상태인 동안 들어온 새 CALL은 key를 ambiguous로 유지하고
+  retention을 다시 시작한다. 옛 CALL의 늦은 REPLY가 새 CALL의 context를 얻지 않게 하기 위해서다.
 - **미결:** rule dependency에 따른 `semantic_context[]` exact typed representation.
 - **미결:** callback/backchannel routing의 initial current-implementation coverage.
 - **미검증:** real manager workload의 outstanding transaction peak와 retention 요구량.

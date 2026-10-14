@@ -190,7 +190,8 @@ int main(int argc, char **argv)
 		semantic.families = families;
 		semantic.nfamilies = sizeof(families) / sizeof(families[0]);
 		/* The observer runs before on_record: once a rewrite hook is
-		 * installed, what the peer was given is not known here. */
+		 * installed, what the peer was given is not known here, so
+		 * REPLYs get no dispatch (semantic.h). */
 		semantic.forwarded = cfg.on_record != NULL ?
 				     NFSP_TXN_FWD_UNKNOWN : NFSP_TXN_FWD_ORIGINAL;
 		if (nfsp_semantic_init(&semantic, NULL) != 0) {

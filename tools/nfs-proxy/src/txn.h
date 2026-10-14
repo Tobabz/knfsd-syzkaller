@@ -24,7 +24,9 @@
  *   - a REPLY with no live entry is missing, never matched to a recent one
  *     (§13);
  *   - a full table refuses a new CALL (capacity_exhausted) and never
- *     reclaims a live one (§16).
+ *     reclaims a live one (§16);
+ *   - a key that expired or became ambiguous is not given to a new CALL
+ *     while it is retained: the old CALL's reply may still come (§13).
  *   Only `found` may feed a reply decode or a request-dependent check.
  *
  * BOUNDS (design 03 §15-§17)
@@ -161,8 +163,11 @@ void nfsp_txn_free(struct nfsp_txn *t);
 
 /* A CALL with a valid envelope.  `payload` is its whole rpc_payload; its
  * fingerprint decides whether a CALL on a live key is a retransmission (the
- * same bytes) or a different CALL (ambiguous).  *entry is set for INSERTED,
- * DUPLICATE_EQUIVALENT and AMBIGUOUS_CALL (the one live entry), else NULL.
+ * same bytes) or a different CALL (ambiguous).  A key whose last CALL was
+ * answered may carry a new CALL; a key still retained after it expired or
+ * became ambiguous may not, since the old CALL's reply may still come: the
+ * new CALL makes it ambiguous.  *entry is set for INSERTED,
+ * DUPLICATE_EQUIVALENT and AMBIGUOUS_CALL (the key's entry), else NULL.
  * Expires timed-out entries first. */
 enum nfsp_txn_result nfsp_txn_call(struct nfsp_txn *t,
 				   const struct nfsp_txn_key *key,
