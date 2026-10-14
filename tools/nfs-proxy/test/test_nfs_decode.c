@@ -263,7 +263,10 @@ static void check_partial(const struct nfsp_decoded_msg *m, size_t len,
 static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
 			     const char *what)
 {
-	char buf[256];
+	char buf[1024];
+	struct nfsp_schema_node node;
+	enum nfsp_schema_resolve res;
+	size_t n;
 
 	for (uint32_t i = 0; i < m->nfields; i++) {
 		const struct nfsp_semantic_field *f = &m->fields[i];
@@ -296,8 +299,20 @@ static void check_invariants(const struct nfsp_decoded_msg *m, size_t len,
 			      eend <= (uint64_t)p->off + p->len,
 			      "%s field %u: outside parent", what, i);
 		}
-		CHECK(nfsp_field_path(m, i, buf, sizeof(buf)) > 0,
-		      "%s field %u: no path", what, i);
+		n = nfsp_field_path(m, i, buf, sizeof(buf));
+		CHECK(n > 0 && n < sizeof(buf), "%s field %u: path length %zu",
+		      what, i, n);
+		/* A rule names this field by the same path before any
+		 * message exists (schema.h): it must resolve to this node. */
+		res = nfsp_schema_resolve(m->schema,
+					  m->msg_type == NFSP_RPC_REPLY, buf,
+					  &node);
+		CHECK(res == NFSP_SCHEMA_FOUND && node.type == f->type &&
+		      !(node.flags & NFSP_SN_OPERATION) ==
+		      (f->op == NFSP_FIELD_NONE),
+		      "%s field %u: %s resolves %d, type %u flags %#x; want "
+		      "type %u", what, i, buf, res, res ? 0u : node.type,
+		      res ? 0u : node.flags, f->type);
 	}
 }
 

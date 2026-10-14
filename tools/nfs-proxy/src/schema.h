@@ -155,4 +155,61 @@ nfsp_schema_minor(const struct nfsp_schema_family *f, uint32_t minor);
 const char *nfsp_schema_enum_name(const struct nfsp_protocol_schema *s,
 				  uint16_t type, uint32_t value);
 
+/* Whether enum type `type` declares `value`. */
+int nfsp_schema_enum_has(const struct nfsp_protocol_schema *s, uint16_t type,
+			 uint32_t value);
+
+/* STATIC PATH RESOLUTION
+ *
+ *   A rule names its target by semantic path before any message exists
+ *   (design 04 §5, §19).  nfsp_schema_resolve() answers which node the
+ *   decoder would emit at that path, by walking the type graph with the
+ *   naming rules above instead of the bytes.  It is the same naming as
+ *   nfsp_field_path(), not a second one: the decode tests resolve every path
+ *   the decoder emits and require the same type back.
+ *
+ *   A path is FOUND when exactly one node answers to it.  Two arms of one
+ *   union may share a component; when they lead to different nodes the path
+ *   is AMBIGUOUS, since a rule could not say which it meant.  A path to an
+ *   element of the COMPOUND operation array (`argarray[]`) is never found:
+ *   each operation is a root of its own (`<family>.request.<OP>`).
+ */
+#define NFSP_SN_OPERATION	0x01u	/* under an operation root */
+#define NFSP_SN_ROOT		0x02u	/* the procedure's argument or result,
+					 * or the operation itself */
+#define NFSP_SN_DISCRIMINANT	0x04u	/* a union's discriminant: its value
+					 * picks the layout after it */
+#define NFSP_SN_REPEATED	0x08u	/* inside an array or list element */
+#define NFSP_SN_OPS_ARRAY	0x10u	/* the operation array of this
+					 * direction */
+#define NFSP_SN_LIST_ELEMENT	0x20u	/* a list element; its link word is
+					 * its discriminant metadata */
+
+struct nfsp_schema_node {
+	uint16_t type;		/* into types */
+	uint8_t flags;		/* NFSP_SN_* */
+	const char *root;	/* procedure or operation name */
+	uint16_t root_type;	/* the procedure's argument or result type, or
+				 * the operation union */
+	/* Procedure roots only: the procedure; NULL under an operation. */
+	const struct nfsp_schema_proc *proc;
+};
+
+enum nfsp_schema_resolve {
+	NFSP_SCHEMA_FOUND = 0,
+	NFSP_SCHEMA_NOT_FOUND,
+	NFSP_SCHEMA_AMBIGUOUS
+};
+
+/* Resolve a request path (response 0, a CALL's) or a response path
+ * (response 1, a REPLY's).  *out is set only when FOUND. */
+enum nfsp_schema_resolve
+nfsp_schema_resolve(const struct nfsp_protocol_schema *s, int response,
+		    const char *path, struct nfsp_schema_node *out);
+
+/* Whether a value of type `from` contains a node of type `to` (or is one).
+ * -1 when out of memory. */
+int nfsp_schema_reaches(const struct nfsp_protocol_schema *s, uint16_t from,
+			uint16_t to);
+
 #endif /* NFSP_SCHEMA_H */
