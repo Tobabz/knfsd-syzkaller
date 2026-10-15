@@ -171,10 +171,12 @@ format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.
   the bytes left before anything is copied, and any second encoding of the same set (trailing
   bytes, non-zero padding, unsorted or repeated ids) is `malformed`.
 - Validation then checks each rule against the ProtocolSchema its `schema_id` names: selector,
-  target path and part, that every value the rule reads is in the target's procedure (a READ
-  rule cannot read a WRITE field), predicate and transform types, mutation shape, and that the
-  declared context dependencies are exactly those its ValueRefs need. Loading is all or nothing; the
-  first failing rule refuses the set with a typed status and its rule and predicate index.
+  target path and part, that every value the rule reads is in the target's procedure (in a
+  family dispatched by procedure, such as NFSv3, a READ rule cannot read a WRITE argument; every
+  NFSv4 operation is in COMPOUND, so no NFSv4 rule is refused for what it reads), predicate and
+  transform types, mutation shape, and that the declared context dependencies are exactly those
+  its ValueRefs need. Loading is all or nothing; the first failing rule refuses the set with a
+  typed status and its rule and predicate index.
   What this runtime cannot apply yet (insert, delete, operation edits, builtin transforms, the
   `encoded` part) is `unsupported_capability`.
 - `nfsp_schema_resolve()` (`src/schema.*`) finds the node a semantic path names from the type

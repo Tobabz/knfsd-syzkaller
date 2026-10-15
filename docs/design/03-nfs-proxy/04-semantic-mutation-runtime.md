@@ -559,11 +559,15 @@ promoted registry scope 안 (runtime 광고만으로는 부족, issue #14)
 
 Compiler는 live record가 아직 없으므로 actual selector match, current field value,
 current WireRef offset, current TransactionEntry presence, runtime rule conflict를
-검증하지 않는다. 다만 어떤 message에도 함께 있을 수 없는 값은 schema만으로 알 수 있으므로 거부한다.
-message 하나는 procedure 하나의 값만 담는다(CALL은 그 argument, REPLY는 그 result, REPLY의 request
-view는 그 REPLY가 답하는 CALL의 argument). 그래서 target과 rule이 읽는 모든 ValueRef는 한 procedure
-안에 있어야 하고, rule이 procedure를 지정하면 그 procedure여야 한다. operation은 그 operation에 닿는
-모든 procedure 안에 있다. 예를 들어 NFSv3 READ rule이 WRITE argument를 읽으면 `selector_mismatch`다.
+검증하지 않는다. 다만 target과 다른 procedure에만 있는 값은 target을 담는 message에 있을 수 없음을
+schema만으로 알 수 있으므로 거부한다. message 하나는 procedure 하나의 값만 담는다(CALL은 그 argument,
+REPLY는 그 result, REPLY의 request view는 그 REPLY가 답하는 CALL의 argument). 그래서 target과 rule이
+읽는 모든 ValueRef는 한 procedure 안에 있어야 하고, rule이 procedure를 지정하면 그 procedure여야 한다.
+operation은 그 operation에 닿는 모든 procedure 안에 있다. 예를 들어 NFSv3 READ rule이 WRITE argument를
+읽으면 `selector_mismatch`다. NFSv4 operation은 모두 COMPOUND 안에 있으므로 NFSv4 rule은 읽는 값
+때문에 거부되지 않는다. 같은 procedure 안에서 서로 배타적인 값(고르지 않은 union arm, operation을
+하나만 담는 message의 다른 operation, 같은 COMPOUND에 없는 operation)도 거부하지 않고 값이 없는
+ValueRef로 남긴다(미결(M4b)).
 
 ### 20. schema_id compatibility
 
@@ -1209,8 +1213,8 @@ Expected:
 - **미결:** existing NFSPARM engine 재사용 범위.
 - **미결(M4b):** 값이 없는 ValueRef. predicate나 copy source가 이 record에서 값을 찾지 못하는 경우(같은
   COMPOUND에 없는 operation, 고르지 않은 union arm)의 taxonomy 값이다. §8과 §23은 view를 decode할 수
-  없거나, 값이 여럿이거나, request 대응을 증명할 수 없는 경우만 정한다. §19 검사는 어떤 message에도
-  없을 값만 거부한다.
+  없거나, 값이 여럿이거나, request 대응을 증명할 수 없는 경우만 정한다. §19 검사는 target과 같은
+  procedure에 없는 값만 거부한다.
 - **미결(M4b):** 3단계(§21)에서 decode되지 않은 record의 분류. procedure selector가 없는 NFSv4 rule은
   NULL CALL과 그 REPLY(`unsupported_schema`, `dispatch_incomplete`, `02` 결정됨(M2))에도 RPC selector가
   맞는다. target이 있을 수 없는 procedure의 record를 hard refusal로 셀지 selector miss로 셀지 정한다.

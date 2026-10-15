@@ -245,7 +245,8 @@ enum nfsp_rule_status {
 	NFSP_RULE_UNKNOWN_SCHEMA,
 	/* Input errors: the rule does not say something this schema has. */
 	NFSP_RULE_SELECTOR_MISMATCH,	/* program, version, family, minor,
-					 * procedure or operation */
+					 * procedure or operation; or a value
+					 * read outside the target's procedure */
 	NFSP_RULE_MESSAGE_TYPE_INCONSISTENT,
 	NFSP_RULE_UNKNOWN_PATH,
 	NFSP_RULE_AMBIGUOUS_PATH,
