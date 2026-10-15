@@ -9,6 +9,7 @@ exact :class:`SyzkallerTargetIdentity` selected by that authority.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Annotated, Literal, Protocol
 
@@ -63,6 +64,15 @@ CALL_NOT_ADMITTED = "call_not_admitted"
 DISALLOWED_OR_UNAVAILABLE_CALL = "disallowed_or_unavailable_call"
 PROFILE_FIXTURE_ROUTE_MISMATCH = "profile_fixture_route_mismatch"
 INVALID_RUNTIME_SELECTION = "invalid_runtime_selection"
+
+# Typed parser refusal -> (Materialization reason, detail suffix).
+PARSER_REFUSALS = {
+    "call_unresolved": (CALL_UNRESOLVED, None),
+    "call_disabled": (DISALLOWED_OR_UNAVAILABLE_CALL, "disabled"),
+    "nfs_acquisition_unverified": (PROFILE_FIXTURE_ROUTE_MISMATCH,
+                                   "nfs_acquisition_unverified"),
+}
+PARSER_CALL_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.$]{0,127}$")
 
 MAX_PARSED_CALLS = 1_000_000
 MAX_FACTS_PER_CALL = 64
@@ -223,7 +233,20 @@ class ParsedProgram(MaterializerRecord):
 
 
 class SyzParseFailure(ValueError):
-    """A deterministic strict-parse refusal from the injected parser."""
+    """A deterministic strict-parse refusal from the injected parser.
+
+    ``reason`` is set only for a typed refusal that names the offending call
+    (one of ``PARSER_REFUSALS``); the Materializer routes it to that typed
+    reason instead of a bare ``parse_failure``.
+    """
+
+    def __init__(self, message: str = "", *, reason: str | None = None,
+                 call: str | None = None,
+                 call_index: int | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.call = call
+        self.call_index = call_index
 
 
 class PinnedSyzParser(Protocol):
@@ -539,7 +562,10 @@ class ArtifactHarnessMaterializer:
             parsed = self.parser.parse(program, identity=identity)
         except OSError:
             raise
-        except (SyzParseFailure, ValueError, TypeError, RecursionError):
+        except SyzParseFailure as error:
+            self._parser_refusal(error, role)
+            self._fail(PARSE_FAILURE, f"{role}_strict_parse_failed")
+        except (ValueError, TypeError, RecursionError):
             self._fail(PARSE_FAILURE, f"{role}_strict_parse_failed")
         if type(parsed) is not ParsedProgram:
             self._fail(PARSE_FAILURE, f"{role}_parser_contract_invalid")
@@ -565,6 +591,17 @@ class ArtifactHarnessMaterializer:
             self._fail(PARSE_FAILURE,
                        f"{role}_parser_resource_count_underreported")
         return parsed
+
+    def _parser_refusal(self, error: SyzParseFailure, role: str) -> None:
+        """Keep a typed refusal's reason and call; ignore a malformed one."""
+        route = PARSER_REFUSALS.get(getattr(error, "reason", None))
+        call, index = getattr(error, "call", None), getattr(error, "call_index", None)
+        if (route is None or type(call) is not str or not PARSER_CALL_NAME.fullmatch(call)
+                or type(index) is not int or not 0 <= index < MAX_PARSED_CALLS):
+            return
+        reason, suffix = route
+        detail = f"{role}:{index}:{call}"
+        self._fail(reason, f"{detail}:{suffix}" if suffix else detail)
 
     def _admit(self, parsed: ParsedProgram, *, role: str,
                selection: RuntimeSelection,

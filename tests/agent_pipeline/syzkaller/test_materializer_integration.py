@@ -16,7 +16,8 @@ from agent_pipeline.contracts import Materialized, MaterializeRejected
 from agent_pipeline.data import load_record, put_record
 from agent_pipeline.hcap import AuthorityRef, CapabilityInterface, ProgramProposal
 from agent_pipeline.materializer import (
-    ArtifactHarnessMaterializer, CALL_NOT_ADMITTED, ExecutionHarnessApproval,
+    ArtifactHarnessMaterializer, CALL_NOT_ADMITTED, CALL_UNRESOLVED,
+    DISALLOWED_OR_UNAVAILABLE_CALL, ExecutionHarnessApproval,
     MaterializationReviewManifest, ParsedProgram, PROFILE_FIXTURE_ROUTE_MISMATCH,
     StaticExecutionHarnessAuthority, descriptor_id,
 )
@@ -33,6 +34,10 @@ LANE = f"r0 = {LANE_CALL}(0x2, 0x0)\n".encode()
     (LANE + b"fsync(r0+1)\n", CALL_NOT_ADMITTED),
     (b"r0 = syz_open_nfs_lane_profile$client0_knfsd_v42(0x3, 0x0)\n"
      b"fsync(r0)\n", PROFILE_FIXTURE_ROUTE_MISMATCH),
+    # Bridge refusals keep their typed reason and offending call.
+    (LANE + b"clone3(0x0, 0x0)\n", DISALLOWED_OR_UNAVAILABLE_CALL),
+    (LANE + b"syz_not_in_build()\n", CALL_UNRESOLVED),
+    (LANE + b"syz_socket_connect_nfs$client0(0x0)\n", PROFILE_FIXTURE_ROUTE_MISMATCH),
 ])
 def test_real_parser_materializer_handoff(tmp_path, program, reason):
     value = os.environ.get("KNFSD_SYZ_BUNDLE")
@@ -110,6 +115,13 @@ def test_real_parser_materializer_handoff(tmp_path, program, reason):
         assert result.reason == reason
         if reason == CALL_NOT_ADMITTED:
             assert "resource_constraint_unverified" in result.detail
+        if b"clone3" in program:
+            assert result.detail == "scenario:1:clone3:disabled"
+        if b"syz_not_in_build" in program:
+            assert result.detail == "scenario:1:syz_not_in_build"
+        if b"syz_socket_connect_nfs" in program:
+            assert result.detail == ("scenario:1:syz_socket_connect_nfs$client0:"
+                                     "nfs_acquisition_unverified")
         return
     assert isinstance(result, Materialized), result
     review = load_record(store, result.review_manifest_sha256, MaterializationReviewManifest)

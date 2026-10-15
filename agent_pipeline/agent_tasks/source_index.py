@@ -20,6 +20,7 @@ import subprocess
 import time
 from typing import Mapping, Sequence
 
+from ..intake import source_lines
 from .tools import (MAX_SOURCE_BYTES, MAX_SOURCE_LINES, SOURCE_PREFIXES,
                     IndexedMatch, IndexedSource)
 
@@ -408,7 +409,7 @@ class GitKernelSourceIndex:
         if entry is None:
             return None
         text = self._load_texts((entry,), deadline)[0]
-        lines = text.splitlines(keepends=True)
+        lines = source_lines(text)
         selected = "".join(lines[start_line - 1:end_line])
         return IndexedSource(
             self._utf8_prefix(selected, max_bytes),
