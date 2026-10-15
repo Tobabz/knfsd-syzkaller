@@ -36,8 +36,10 @@ derives authoritative fields from guest observations or manifest claims.
 It then loads the corresponding `RunnerEvidenceReceiptStore` entry, checks every
 task/input/job/harness/lease/bundle binding, verifies the sealed manifest and all
 artifact bytes, and compares the complete inventory and collection/sealing
-metadata. An orphaned backend receipt is insufficient. A reclaimed lease cannot
-reuse the old generation's sealed result. Completion must not predate sealing.
+metadata. An orphaned backend receipt is insufficient. An expired lease ends the
+task unsealed, so its sealed result is never published. Runner and sealer
+timestamps come from different clocks and are not compared; ordering comes from
+Runner acceptance under the lease generation.
 
 Publication uses a SQLite FULL/WAL transaction and stores the validated context,
 `TrustedQ1Execution`, and digests of both source receipts. Publication is

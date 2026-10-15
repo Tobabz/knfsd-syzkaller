@@ -26,7 +26,7 @@ from agent_pipeline.q1 import (CandidateTarget, ContextLossPolicy, CounterDelta,
     CounterLimit, ExecutionCorrelation, GenerationCounters, KernelIdentity,
     Q1AdmissibilityProfile, RemoteKcovObservation, RemoteKcovSupportBoundary,
     TargetPcMapping)
-from agent_pipeline.runner import (BackendResult, DurableRunner, LeaseControl,
+from agent_pipeline.runner import (RUNNER_RESTART, BackendResult, DurableRunner, LeaseControl,
                                   LeaseLost, RunnerDataError)
 from agent_pipeline.runner.evidence_backend import (EvidenceSealingBackend,
     ExecutionCapture, HostExecutionFacts, RunnerEvidenceReceipt,
@@ -250,16 +250,28 @@ def test_stale_sealed_generation_cannot_be_adopted_by_new_lease(pipeline):
     p.start()
     p.seal()
     p.clock.value = p.lease.expires_at_ns + 1
-    new_lease = p.runner.claim("replacement-worker")
-    assert new_lease.generation == 2
+    # An expired lease is never reclaimed; the task ends runner_restart.
+    assert p.runner.claim("replacement-worker") is None
     with pytest.raises(LeaseLost):
         p.runner.complete(p.lease, p.result)
-    p.runner.complete(new_lease, p.result)  # Runner is bundle-opaque; bridge must reject.
-    with pytest.raises(Q1ReceiptRejected, match="generation"):
+    assert p.runner.status(p.lease.binding.task_id).reason == RUNNER_RESTART
+    with pytest.raises(Q1ReceiptRejected, match="unsealed"):
         p.bridge.publish(p.context)
-    with pytest.raises(Q1ReceiptRejected, match="accepted completion"):
+    with pytest.raises(Q1ReceiptRejected, match="unsealed"):
         p.bridge.publish(p.context.model_copy(update={"lease_generation": 2}))
     assert dict(p.bridge.snapshot().receipts) == {}
+
+
+def test_runner_clock_behind_sealer_still_publishes(pipeline):
+    # Runner and sealer clocks are independent; a step back between sealing
+    # and completion must not make an accepted execution unpublishable.
+    p = pipeline
+    p.start()
+    p.seal()                     # sealed_at_ns = 130
+    p.clock.value = 125
+    p.runner.complete(p.control.lease, p.result)
+    p.bridge.publish(p.context)
+    assert len(p.bridge.snapshot().receipts) == 1
 
 
 def test_unsealed_completion_never_publishes(pipeline):

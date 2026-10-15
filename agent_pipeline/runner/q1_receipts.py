@@ -261,8 +261,6 @@ class RunnerQ1ReceiptBridge:
                  "sealing receipt input digest mismatch")
         correlation = BundleCorrelation.model_validate(context.correlation.model_dump())
         _require(receipt.correlation == correlation, "host execution position mismatch")
-        _require(completion.completed_at_ns >= receipt.sealing.sealed_at_ns,
-                 "completion predates evidence sealing")
         self._check_materialization(context)
         bundle = self.evidence.verify(receipt.bundle_ref, expected_correlation=correlation)
         manifest = bundle.manifest

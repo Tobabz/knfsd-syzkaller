@@ -146,20 +146,53 @@ def _receive(channel: socket.socket) -> dict | None:
     return value
 
 
+def _prepare(channel: socket.socket) -> dict | None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "subreaper unavailable")
+    # Verify the required kernel interfaces before creating any payload
+    # process: pidfds, and the children list (CONFIG_PROC_CHILDREN) that
+    # tree cleanup polls.
+    probe = os.pidfd_open(os.getpid())
+    os.close(probe)
+    _children()
+    channel.settimeout(2.0)
+    return _receive(channel)
+
+
+def _refuse(channel: socket.socket, resource: Path) -> None:
+    """Record clean(guardian_failed) for a failure before `active`.
+
+    The payload is spawned only after `active` is durable, and this guardian
+    holds the resource lock the parent reserved under, so a `reserved` record
+    proves no payload ever ran. Any other record is left untouched.
+    """
+    try:
+        record = read_record(resource / "current.json")
+        if record.get("state") != "reserved":
+            return
+        now = time.time_ns()
+        result = dict(type="result", reason="guardian_failed", returncode=None,
+                      started_at_ns=now, completed_at_ns=now)
+        record.update(state="clean", result=result)
+        write_record(resource / "current.json", record)
+    except Exception:
+        return  # Fail closed: the record stays reserved.
+    channel.setblocking(False)
+    _finish(channel, result)
+
+
 def run(channel: socket.socket, lock_fd: int, resource: Path) -> None:
     # The caller already holds this inherited open-file-description lock.
     # Do not unlock it: closing the last copy releases ownership on exit.
     os.fstat(lock_fd)
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
-        raise OSError(ctypes.get_errno(), "subreaper unavailable")
-    # Verify the required syscall before creating any payload process.
-    probe = os.pidfd_open(os.getpid())
-    os.close(probe)
-    channel.settimeout(2.0)
-    config = _receive(channel)
+    try:
+        config = _prepare(channel)
+    except Exception:
+        config = None
     if config is None:
-        return  # Reserved state stays fail-closed: no evidence of execution.
+        _refuse(channel, resource)
+        return
     channel.setblocking(False)
     record = read_record(resource / "current.json")
     if (record["state"] != "reserved"
@@ -292,6 +325,10 @@ def run(channel: socket.socket, lock_fd: int, resource: Path) -> None:
                   started_at_ns=started_ns, completed_at_ns=time.time_ns())
     record.update(state="clean", result=result)
     write_record(resource / "current.json", record)
+    _finish(channel, result)
+
+
+def _finish(channel: socket.socket, result: dict) -> None:
     _send(channel, result)
     # Closing a sequenced-packet socket with unread heartbeats can reset the
     # peer and discard its final acknowledgement. Half-close and drain until
@@ -305,7 +342,7 @@ def run(channel: socket.socket, lock_fd: int, resource: Path) -> None:
                     break
             except BlockingIOError:
                 time.sleep(POLL)
-    except OSError:
+    except (OSError, ValueError):
         pass
 
 

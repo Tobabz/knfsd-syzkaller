@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -16,8 +17,9 @@ import time
 
 import pytest
 
-from agent_pipeline.controller.tasks import RunnerInput
-from agent_pipeline.runner import DurableRunner
+from agent_pipeline.runner import process_supervisor as ps
+from agent_pipeline.controller.tasks import RunnerInput, RunnerStatus
+from agent_pipeline.runner import RUNNER_RESTART, DurableRunner
 from agent_pipeline.runner.worker import LeaseControl
 from agent_pipeline.runner import _process_guardian as guardian
 from agent_pipeline.runner.process_supervisor import (
@@ -209,8 +211,11 @@ def test_expiry_and_reclaim_do_not_overlap_same_resource(tmp_path):
                                  resource_key="lane", limits=limits(term_grace_s=1.2))
             eventually(lambda: (tmp_path / "old-pid").exists())
             eventually(lambda: time.time_ns() >= old.expires_at_ns)
-            new = runner.claim("replacement")
-            assert new.generation == old.generation + 1
+            # An expired lease is never reclaimed: the task ends
+            # runner_restart and the Controller's retry is a new task.
+            new, _ = claim(runner, "retry")
+            assert runner.status(old.binding.task_id) == RunnerStatus(
+                state="ended_unsealed", reason=RUNNER_RESTART)
             replacement = command(tmp_path, 'print("replacement")')
             with pytest.raises(ResourceBusy):
                 supervisor.run(replacement, new, LeaseControl(runner, new),
@@ -219,7 +224,7 @@ def test_expiry_and_reclaim_do_not_overlap_same_resource(tmp_path):
             assert result.reason in ("lease_lost", "stop_requested")
         assert not Path(f"/proc/{(tmp_path / 'old-pid').read_text()}").exists()
         # Waiting for old cleanup may outlast the replacement's short lease.
-        newest = runner.claim("replacement-2") or new
+        newest, _ = claim(runner, "retry-2")
         result = supervisor.run(replacement, newest, LeaseControl(runner, newest),
                                 resource_key="lane", limits=limits())
         assert result.stdout == b"replacement\n"
@@ -422,6 +427,67 @@ g.run(socket.socket(fileno=int(sys.argv[1])),int(sys.argv[2]),Path(sys.argv[3]))
     # The supervisor's background waiter must reap it without another run.
     eventually(lambda: not Path(f"/proc/{current['guardian']['pid']}").exists())
     assert not Path(f"/proc/{(tmp_path / 'pid').read_text()}").exists()
+
+
+@pytest.mark.parametrize("where", ["socketpair", "selector"])
+def test_fd_failure_before_guardian_spawn_leaves_resource_clean(host, tmp_path, monkeypatch, where):
+    runner, supervisor = host
+    module, name = (ps.socket, "socketpair") if where == "socketpair" else (ps.selectors, "DefaultSelector")
+    real = getattr(module, name)
+    failed = []
+
+    def once(*args, **kwargs):
+        if not failed:
+            failed.append(1)
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, once)
+    lease, control = claim(runner, "first")
+    with pytest.raises(ProcessSupervisorError, match="could not start"):
+        supervisor.run(command(tmp_path, 'open("ran","w")'), lease, control,
+                       resource_key="lane", limits=limits())
+    assert not (tmp_path / "ran").exists()
+    assert record(supervisor)["result"]["reason"] == "spawn_failed"
+    lease, control = claim(runner, "second")
+    result = supervisor.run(command(tmp_path, 'print("next")'), lease, control,
+                            resource_key="lane", limits=limits())
+    assert result.stdout == b"next\n"
+
+
+def fault_guardian(tmp_path, body):
+    wrapper = tmp_path / "fault_guardian.py"
+    wrapper.write_text(f'''
+import importlib.util,os,sys,socket
+from pathlib import Path
+s=importlib.util.spec_from_file_location('guardian',{guardian.__file__!r})
+g=importlib.util.module_from_spec(s); s.loader.exec_module(g)
+{body}
+g.run(socket.socket(fileno=int(sys.argv[1])),int(sys.argv[2]),Path(sys.argv[3]))
+''')
+    return str(wrapper)
+
+
+@pytest.mark.parametrize("body", [
+    # No pidfds (ENOSYS or seccomp).
+    "def enosys(*_): raise OSError(38, 'Function not implemented')\nos.pidfd_open = enosys",
+    # CONFIG_PROC_CHILDREN=n: tree cleanup could never list the payload.
+    "def missing(): raise FileNotFoundError(2, 'No such file or directory')\ng._children = missing",
+])
+def test_guardian_precondition_failure_refuses_before_spawn(host, tmp_path, monkeypatch, body):
+    runner, supervisor = host
+    with monkeypatch.context() as patch:
+        patch.setattr(guardian, "__file__", fault_guardian(tmp_path, body))
+        lease, control = claim(runner, "first")
+        result = supervisor.run(command(tmp_path, 'open("ran","w")'), lease, control,
+                                resource_key="lane", limits=limits())
+    assert result.reason == "guardian_failed"
+    assert not (tmp_path / "ran").exists()
+    assert record(supervisor)["state"] == "clean"
+    lease, control = claim(runner, "second")
+    result = supervisor.run(command(tmp_path, 'print("next")'), lease, control,
+                            resource_key="lane", limits=limits())
+    assert result.stdout == b"next\n"
 
 
 @pytest.mark.parametrize("state", ["reserved", "active", "quarantined"])

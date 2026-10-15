@@ -50,6 +50,10 @@ The caller locks the resource before writing an admission tombstone and a
 guardian. The guardian records `active` durably **before** spawning the payload.
 Thus parent death between spawn and record cannot free a living guardian's lock;
 guardian death in that window leaves an unclean record that refuses replacement.
+A failure before `active` (socket or selector creation, guardian spawn, a missing
+kernel interface, a lost configuration) records `clean` with `spawn_failed` or
+`guardian_failed` instead: the payload starts only after `active`, so a
+`reserved` record under the held lock proves nothing ran.
 The payload does not inherit either the lock descriptor or control socket.
 
 The guardian uses Linux `PR_SET_CHILD_SUBREAPER`. It terminates and reaps its
@@ -130,8 +134,10 @@ their own artifact and secret policies.
 
 ## Deployment boundary and verification
 
-Require Linux `/proc`, pidfds, permission to signal owned children, subreaper
-support and local Unix `SOCK_SEQPACKET`. The workload is a trusted, cooperative
+Require Linux `/proc` with `/proc/<pid>/task/<tid>/children`
+(`CONFIG_PROC_CHILDREN`), pidfds, permission to signal owned children, subreaper
+support and local Unix `SOCK_SEQPACKET`. The guardian probes pidfds and the
+children file before spawning and otherwise refuses with `guardian_failed`. The workload is a trusted, cooperative
 local process. It must not tamper with the ownership namespace, signal the
 guardian, fork indefinitely, move work to another host/service, pass resource
 handles outside the supervised tree, or detach a separately managed VM/device.

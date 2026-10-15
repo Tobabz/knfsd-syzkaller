@@ -223,9 +223,8 @@ class ProcessSupervisor:
             os.close(fd)
 
     def _execute(self, resource, lock_fd, config, record, lease, control, limits):
-        parent, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        parent = child_channel = selector = None
         process = None
-        selector = selectors.DefaultSelector()
         output = {"stdout": bytearray(), "stderr": bytearray()}
         total = 0
         stopping = None
@@ -252,6 +251,8 @@ class ProcessSupervisor:
 
         try:
             try:
+                parent, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                selector = selectors.DefaultSelector()
                 process = subprocess.Popen(
                     [sys.executable, "-I", str(Path(guardian.__file__).resolve()),
                      str(child_channel.fileno()), str(lock_fd), str(resource)],
@@ -260,8 +261,9 @@ class ProcessSupervisor:
                     stderr=subprocess.PIPE, start_new_session=True, env={},
                 )
             except OSError:
-                # Popen's exec-error protocol has reaped the failed guardian;
-                # no guardian/payload can hold the resource after this failure.
+                # No guardian exists: socket/selector creation failed, or
+                # Popen's exec-error protocol has reaped the failed guardian.
+                # No guardian/payload can hold the resource after this failure.
                 record.update(state="clean", result=dict(type="result", reason="spawn_failed"))
                 guardian.write_record(resource / "current.json", record)
                 raise ProcessSupervisorError("could not start process guardian") from None
@@ -270,7 +272,9 @@ class ProcessSupervisor:
             payload = json.dumps(config, separators=(",", ":")).encode()
             if len(payload) > guardian.MAX_PACKET:
                 raise ProcessSupervisorError("guardian configuration exceeds bound")
-            parent.send(payload)
+            # A guardian that already failed has recorded clean itself;
+            # its result or EOF below reports that, not this send.
+            send(config)
             for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, name)
@@ -354,9 +358,9 @@ class ProcessSupervisor:
         finally:
             # EOF independently tells the guardian to clean up, including on
             # KeyboardInterrupt or failures in the calling application.
-            child_channel.close()
-            parent.close()
-            selector.close()
+            for resource_handle in (child_channel, parent, selector):
+                if resource_handle is not None:
+                    resource_handle.close()
             if process is not None:
                 for stream in (process.stdout, process.stderr):
                     stream.close()
