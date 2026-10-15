@@ -18,7 +18,7 @@ from agent_pipeline.evidence import (
     EvidenceStore,
     ExecutionCorrelation,
 )
-from agent_pipeline.runner import DurableRunner, LeaseControl
+from agent_pipeline.runner import DurableRunner, ExecutionNotStopped, LeaseControl
 from agent_pipeline.runner.evidence_backend import (
     CAPTURE_FAILED,
     DUPLICATE_ARTIFACT,
@@ -384,8 +384,9 @@ def test_cancel_during_capture_prevents_publication(world):
 def test_expired_lease_reclaimed_during_capture_prevents_publication(world):
     def reclaim(lease, control):
         world.runner_clock.value = lease.expires_at_ns
-        replacement = world.runner.claim("worker-2")
-        assert replacement.generation == lease.generation + 1
+        reclaimed.append(world.runner.claim("worker-2"))
+
+    reclaimed = []
 
     engine = FakeEngine(valid_capture(), hook=reclaim)
     result = world.backend(engine).execute(world.lease, world.control)
@@ -393,6 +394,14 @@ def test_expired_lease_reclaimed_during_capture_prevents_publication(world):
         None,
         LEASE_LOST_DURING_CAPTURE,
     )
+    assert reclaimed == [None]  # an expired lease is never run again
+    assert world.files() == ()
+
+
+def test_unconfirmed_stop_is_not_reported_as_an_ended_capture(world):
+    engine = FakeEngine(None, error=ExecutionNotStopped())
+    with pytest.raises(ExecutionNotStopped):
+        world.backend(engine).execute(world.lease, world.control)
     assert world.files() == ()
 
 

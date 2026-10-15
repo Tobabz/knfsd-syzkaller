@@ -14,6 +14,16 @@ from .service import (
 )
 
 
+class ExecutionNotStopped(Exception):
+    """The backend could not confirm that its execution stopped.
+
+    Raise it (or a subclass) instead of returning a result when the process,
+    VM or other side effect may still be running.  The worker then neither
+    completes the task nor renews its lease: the task ends when the lease
+    expires, after the backend's own lease deadline.
+    """
+
+
 class LeaseControl:
     """The backend's narrow heartbeat and stop-request interface."""
 
@@ -94,11 +104,27 @@ class RunnerWorker:
         beat.start()
         try:
             result = self.backend.execute(lease, control)
+        except ExecutionNotStopped:
+            # A completion would tell the Controller the execution ended (and
+            # settle a pending cancel).  Stop renewing instead; lease expiry
+            # ends the task once the backend's own deadline has passed.
+            result = None
+            not_stopped = True
         except Exception:
             result = BackendResult(reason=BACKEND_ERROR)
+            not_stopped = False
+        else:
+            not_stopped = False
         finally:
             stop.set()
             beat.join()
+        if not_stopped:
+            return WorkerRun(
+                task_id=lease.binding.task_id,
+                generation=lease.generation,
+                disposition="not_stopped",
+                status=self.runner.status(lease.binding.task_id),
+            )
         if result is None:
             result = BackendResult(reason=EXECUTOR_ENDED_UNSEALED)
         try:

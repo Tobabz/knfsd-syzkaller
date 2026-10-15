@@ -32,7 +32,7 @@ from ..evidence import (
     SealingMetadata,
 )
 from .models import BackendResult, Digest, HostRecord, Identifier, Timestamp, WorkLease
-from .worker import LeaseControl
+from .worker import ExecutionNotStopped, LeaseControl
 
 
 CAPTURE_FAILED = "capture_failed"
@@ -320,6 +320,8 @@ class EvidenceSealingBackend:
 
         try:
             raw_capture = self.engine.capture(lease, control)
+        except ExecutionNotStopped:
+            raise  # Not an ended execution; the worker must not complete it.
         except Exception:
             if self._stopped(control):
                 return self._unsealed(LEASE_LOST_DURING_CAPTURE)
