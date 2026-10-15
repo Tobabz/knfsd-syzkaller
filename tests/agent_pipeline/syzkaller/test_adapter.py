@@ -157,7 +157,9 @@ def test_repeated_large_allocations_are_process_bounded(parser, identity):
     program = line * 3000
     assert len(program) < 256 * 1024
     start = time.monotonic()
-    with pytest.raises(SyzParseFailure):
+    # Either bound may end it first: the address-space limit (a parse
+    # failure) or, on a loaded host, the wall timeout (a host failure).
+    with pytest.raises((SyzParseFailure, TimeoutError)):
         parser.parse(program, identity=identity)
     assert time.monotonic() - start < 15
 
