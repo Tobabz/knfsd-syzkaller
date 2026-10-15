@@ -23,7 +23,9 @@ from ..admission import (
     SyzkallerBuildManifest, SyzkallerCallTable, SyzkallerTargetIdentity,
 )
 from ..data import canonical_json, parse_json
-from ..materializer import ParsedProgram, SyzParseFailure
+from ..materializer import (
+    PARSER_CALL_NAME, PARSER_REFUSALS, ParsedProgram, SyzParseFailure,
+)
 
 MAX_BINARY_BYTES = 128 * 1024 * 1024
 MAX_METADATA_BYTES = 16 * 1024 * 1024
@@ -197,7 +199,16 @@ class PinnedSyzParser:
             raise SyzParseFailure("requested parser identity mismatch")
         if type(program) is not bytes or not 0 < len(program) <= self.limits.max_program_bytes:
             raise SyzParseFailure("program byte limit exceeded")
-        value = self._invoke("parse", program)
+        try:
+            value = self._invoke("parse", program)
+        except SyzParseFailure as error:
+            # Only a call the pinned table resolves can be disabled or an
+            # unverified acquisition, and only an absent one is unresolved.
+            if error.reason is not None and (
+                    (error.call in self._call_names)
+                    != (error.reason != "call_unresolved")):
+                raise SyzParseFailure("bridge refused: inconsistent typed refusal") from error
+            raise
         try:
             if set(value) != {"bridge", "program"}:
                 raise ValueError("invalid parse response")
@@ -218,6 +229,25 @@ class PinnedSyzParser:
             return parsed
         except (ValueError, TypeError, KeyError, RecursionError) as error:
             raise SyzParseFailure("invalid parsed program") from error
+
+
+def _typed_refusal(stderr: bytes) -> SyzParseFailure:
+    """Decode the bridge's exit-3 refusal; anything malformed stays untyped."""
+    try:
+        value = parse_json(stderr)
+        if (not isinstance(value, dict)
+                or set(value) != {"reason", "call_index", "call"}
+                or value["reason"] not in PARSER_REFUSALS
+                or type(value["call_index"]) is not int
+                or not 0 <= value["call_index"] < 4096
+                or type(value["call"]) is not str
+                or not PARSER_CALL_NAME.fullmatch(value["call"])):
+            raise ValueError("invalid typed refusal")
+    except (ValueError, TypeError, RecursionError):
+        return SyzParseFailure("bridge refused: invalid typed refusal")
+    return SyzParseFailure(
+        f"bridge refused: {value['reason']}", reason=value["reason"],
+        call=value["call"], call_index=value["call_index"])
 
 
 def _run(fd: int, operation: str, data: bytes, limits: BridgeLimits) -> bytes:
@@ -266,6 +296,8 @@ def _run(fd: int, operation: str, data: bytes, limits: BridgeLimits) -> bytes:
                 # the program.
                 raise ChildProcessError(
                     f"bridge killed by signal {-process.returncode}")
+            if process.returncode == 3:
+                raise _typed_refusal(bytes(buffers["stderr"]))
             if process.returncode:
                 diagnostic = buffers["stderr"].decode("utf-8", errors="replace")[:1024]
                 raise SyzParseFailure(f"bridge refused ({process.returncode}): {diagnostic}")

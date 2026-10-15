@@ -13,7 +13,7 @@ from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.data import canonical_json
 from agent_pipeline.materializer import SyzParseFailure
 from agent_pipeline.syzkaller import BridgeLimits, PinnedSyzParser
-from agent_pipeline.syzkaller.adapter import _run
+from agent_pipeline.syzkaller.adapter import _run, _typed_refusal
 
 
 @pytest.fixture(scope="module")
@@ -71,6 +71,29 @@ def test_actual_parsed_arguments_and_nfs_provenance(parser, identity):
 def test_real_parser_refuses(program, parser, identity):
     with pytest.raises(SyzParseFailure):
         parser.parse(program, identity=identity)
+
+
+@pytest.mark.parametrize("program,reason,index,call", [
+    (LANE + b"r1 = syz_not_in_build(0x0)\n", "call_unresolved", 1, "syz_not_in_build"),
+    (LANE + b"clone3(0x0, 0x0)\n", "call_disabled", 1, "clone3"),
+    (LANE + b"syz_open_nfs_lane$client0(0x0)\n", "nfs_acquisition_unverified", 1,
+     "syz_open_nfs_lane$client0"),
+])
+def test_real_parser_typed_refusal(program, reason, index, call, parser, identity):
+    with pytest.raises(SyzParseFailure) as caught:
+        parser.parse(program, identity=identity)
+    error = caught.value
+    assert (error.reason, error.call_index, error.call) == (reason, index, call)
+
+
+@pytest.mark.parametrize("stderr", [
+    b"not json", b'{"reason":"call_disabled","call_index":0}',
+    b'{"reason":"other","call_index":0,"call":"clone3"}',
+    b'{"reason":"call_disabled","call_index":"0","call":"clone3"}',
+    b'{"reason":"call_disabled","call_index":0,"call":"a b"}',
+])
+def test_malformed_typed_refusal_stays_untyped(stderr):
+    assert _typed_refusal(stderr).reason is None
 
 
 @pytest.mark.parametrize("suffix", [

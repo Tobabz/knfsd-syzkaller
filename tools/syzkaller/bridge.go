@@ -116,6 +116,14 @@ func main() {
 	// The caller also imposes a wall timeout and bounded stdout/stderr. Avoid
 	// reflecting attacker-controlled source or huge parser diagnostics in errors.
 	if err := run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
+		// A typed refusal goes out as one bounded JSON object, exit 3.
+		var typed *refusal
+		if errors.As(err, &typed) {
+			if data, jerr := json.Marshal(typed); jerr == nil {
+				os.Stderr.Write(append(data, '\n'))
+				os.Exit(3)
+			}
+		}
 		message := err.Error()
 		if len(message) > 1024 {
 			message = message[:1024]

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -150,5 +151,32 @@ func TestLimits(t *testing.T) {
 	var output bytes.Buffer
 	if err := writeJSON(&output, strings.Repeat("x", 128), 64); err == nil || output.Len() != 0 {
 		t.Fatal("output limit not atomic")
+	}
+}
+
+func TestTypedRefusals(t *testing.T) {
+	for _, c := range []struct {
+		source string
+		want   refusal
+	}{
+		{"getpid()\n# c\n\nunknown_call()\n", refusal{"call_unresolved", 1, "unknown_call"}},
+		{lane + "r1 = syz_not_in_build(0x0)\n", refusal{"call_unresolved", 1, "syz_not_in_build"}},
+		{lane + "clone3(0x0, 0x0)\n", refusal{"call_disabled", 1, "clone3"}},
+		{lane + "r1 = syz_open_nfs_lane$client0(0x0)\n", refusal{"nfs_acquisition_unverified", 1, "syz_open_nfs_lane$client0"}},
+	} {
+		t.Run(c.source, func(t *testing.T) {
+			_, err := parseProgram(targetForTest(t), []byte(c.source))
+			var got *refusal
+			if !errors.As(err, &got) || *got != c.want {
+				t.Fatalf("got %v, want %+v", err, c.want)
+			}
+		})
+	}
+	// A malformed name or another strict error is not reported as typed.
+	for _, source := range []string{"getpid(1)\n", "bad-name()\n"} {
+		var got *refusal
+		if _, err := parseProgram(targetForTest(t), []byte(source)); err == nil || errors.As(err, &got) {
+			t.Fatalf("%q: %v", source, err)
+		}
 	}
 }

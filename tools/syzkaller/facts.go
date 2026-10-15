@@ -3,7 +3,9 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/google/syzkaller/prog"
 )
@@ -48,6 +50,51 @@ type programResult struct {
 	Acquisitions []acquisition `json:"nfs_acquisitions"`
 }
 
+// refusal is a typed rejection that names the offending call, so Planning
+// repair can tell what to change. Other rejections stay untyped.
+type refusal struct {
+	Reason string `json:"reason"`
+	Index  int    `json:"call_index"`
+	Call   string `json:"call"`
+}
+
+func (r *refusal) Error() string {
+	return fmt.Sprintf("%s: call %d %s", r.Reason, r.Index, r.Call)
+}
+
+var callName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.$]{0,127}$`)
+
+// strictRefusal names the first call line that is absent from the target
+// (reason call_unresolved) or disabled in it (call_disabled). It only
+// interprets the matching strict-parse error, so it mirrors the parser's
+// line rules rather than re-parsing the program.
+func strictRefusal(target *prog.Target, data []byte, reason string) *refusal {
+	index := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		if eq, paren := strings.IndexByte(line, '='), strings.IndexByte(line, '('); eq >= 0 && (paren < 0 || eq < paren) {
+			line = strings.TrimSpace(line[eq+1:])
+		}
+		name := line
+		if paren := strings.IndexByte(line, '('); paren >= 0 {
+			name = line[:paren]
+		}
+		meta := target.SyscallMap[name]
+		if (reason == "call_unresolved" && meta == nil) ||
+			(reason == "call_disabled" && meta != nil && meta.Attrs.Disabled) {
+			if !callName.MatchString(name) {
+				return nil
+			}
+			return &refusal{reason, index, name}
+		}
+		index++
+	}
+	return nil
+}
+
 func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 	result := programResult{Digest: fmt.Sprintf("%x", sha256.Sum256(data)),
 		Calls: []parsedCall{}, Acquisitions: []acquisition{}}
@@ -56,6 +103,16 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 	}
 	p, err := target.Deserialize(data, prog.Strict)
 	if err != nil {
+		message := err.Error()
+		reason := ""
+		if strings.HasPrefix(message, "unknown syscall ") {
+			reason = "call_unresolved"
+		} else if strings.Contains(message, ": use of a disabled call") {
+			reason = "call_disabled"
+		}
+		if r := strictRefusal(target, data, reason); reason != "" && r != nil {
+			return result, r
+		}
 		return result, fmt.Errorf("strict parse: %w", err)
 	}
 	if len(p.Calls) == 0 || len(p.Calls) > maxCalls {
@@ -66,7 +123,7 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 	acquired := map[acquisition]bool{}
 	for index, call := range p.Calls {
 		if call.Meta.Attrs.Disabled {
-			return result, fmt.Errorf("disabled call")
+			return result, &refusal{"call_disabled", index, call.Meta.Name}
 		}
 		if call.Props != (prog.CallProps{}) {
 			return result, fmt.Errorf("call properties are unsupported")
@@ -106,7 +163,7 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 		} else if isNfsAcquisition(call.Meta.CallName) {
 			// Silently omitting an acquisition could hide a second, conflicting
 			// profile beside a supported acquisition in the same program.
-			return result, fmt.Errorf("NFS acquisition profile is unverified")
+			return result, &refusal{"nfs_acquisition_unverified", index, call.Meta.Name}
 		} else if call.Meta.CallName == "close" && len(call.Args) == 1 {
 			ref, ok := call.Args[0].(*prog.ResultArg)
 			if ok && ref.Res != nil && ref.OpAdd == 0 && ref.OpDiv == 0 {

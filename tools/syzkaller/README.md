@@ -151,3 +151,22 @@ This first slice supports acquisition plus direct-root FD plans. It intentionall
 does not establish descendant-file provenance for the full normal-flow corpus.
 Generic parsable programs can have empty `nfs_acquisitions`; Materializer refuses
 them when it requires an NFS profile acquisition.
+
+## Typed refusals
+
+Three refusals name the offending call so Planning repair can see what to
+change. The bridge exits with status 3 and writes one JSON object
+`{"reason", "call_index", "call"}` to stderr; the adapter raises
+`SyzParseFailure` with those fields, and Materializer maps them:
+
+| Bridge reason | Materializer reason | Detail |
+|---|---|---|
+| `call_unresolved` (not in the pinned target) | `call_unresolved` | `scenario:<index>:<call>` |
+| `call_disabled` (in the target, disabled) | `disallowed_or_unavailable_call` | `scenario:<index>:<call>:disabled` |
+| `nfs_acquisition_unverified` | `profile_fixture_route_mismatch` | `scenario:<index>:<call>:nfs_acquisition_unverified` |
+
+(`neutral:` replaces `scenario:` for the neutral control.) The index counts
+call lines, skipping blank and comment lines. The adapter checks the reason, a
+bounded call name, and that only an unresolved call is absent from the call
+table; anything else stays an untyped `parse_failure`, as do all other strict
+parse errors.
