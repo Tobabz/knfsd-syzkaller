@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Protocol
 
 from .models import BackendResult, WorkLease, WorkerRun
@@ -58,20 +59,46 @@ class RunnerWorker:
         backend: RunnerBackend,
         *,
         worker_id: str,
+        heartbeat_interval_s: float | None = None,
     ) -> None:
         self.runner = runner
         self.backend = backend
         self.worker_id = worker_id
+        # None: a third of the lease, so two missed renewals still leave
+        # the lease valid.
+        self.heartbeat_interval_s = heartbeat_interval_s
+
+    def _heartbeat(self, control: LeaseControl,
+                   stop: threading.Event) -> None:
+        lease = control.lease
+        interval = self.heartbeat_interval_s
+        if interval is None:
+            interval = (lease.expires_at_ns - lease.claimed_at_ns) / 3e9
+        while not stop.wait(interval):
+            try:
+                control.renew()
+            except LeaseLost:
+                return                   # cancelled, expired or reclaimed
+            except Exception:
+                continue                 # transient; the next beat retries
 
     def run_once(self) -> WorkerRun | None:
         lease = self.runner.claim(self.worker_id)
         if lease is None:
             return None
         control = LeaseControl(self.runner, lease)
+        stop = threading.Event()
+        beat = threading.Thread(target=self._heartbeat, args=(control, stop),
+                                name=f"lease-heartbeat-{lease.generation}",
+                                daemon=True)
+        beat.start()
         try:
             result = self.backend.execute(lease, control)
         except Exception:
             result = BackendResult(reason=BACKEND_ERROR)
+        finally:
+            stop.set()
+            beat.join()
         if result is None:
             result = BackendResult(reason=EXECUTOR_ENDED_UNSEALED)
         try:

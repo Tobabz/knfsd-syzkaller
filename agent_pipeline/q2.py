@@ -187,6 +187,11 @@ def default_q2_profile() -> Q2JudgeProfile:
     rules = (
         Q2ParseRule(rule_id="kasan", signal_class="KASAN",
                     pattern=r"(?m)\bBUG:\s+KASAN:"),
+        # A KASAN-instrumented wild or NULL dereference is reported as a
+        # general protection fault followed by this KASAN line.
+        Q2ParseRule(rule_id="kasan_wild_access", signal_class="KASAN",
+                    pattern=(r"(?m)^KASAN:[ \t]+(?:null-ptr-deref|"
+                             r"maybe wild-memory-access)\b")),
         Q2ParseRule(rule_id="kmsan", signal_class="KMSAN",
                     pattern=r"(?m)\bBUG:\s+KMSAN:"),
         Q2ParseRule(rule_id="ubsan", signal_class="UBSAN",
@@ -202,6 +207,13 @@ def default_q2_profile() -> Q2JudgeProfile:
                      r"(?:self-)?detected[ \t]+(?:expedited[ \t]+)?stalls?\b|"
                      r"\bwatchdog:\s+BUG:\s+soft lockup)"),
         ),
+        # Oops headlines syzkaller's pkg/report also treats as crashes.
+        Q2ParseRule(
+            rule_id="oops", signal_class="BUG",
+            pattern=(r"(?m)(?:\bkernel BUG at\b|"
+                     r"\bgeneral protection fault\b|\bOops:|"
+                     r"\binvalid opcode:|\bUnable to handle kernel\b)"),
+        ),
         Q2ParseRule(rule_id="bug", signal_class="BUG",
                     pattern=r"(?m)\bBUG:"),
         Q2ParseRule(rule_id="panic", signal_class="panic",
@@ -209,7 +221,7 @@ def default_q2_profile() -> Q2JudgeProfile:
     )
     return Q2JudgeProfile(
         name="knfsd-q2-sanitizer-signals",
-        revision="2",
+        revision="3",
         signal_classes=classes,
         parse_rules=rules,
         termination_rules=(

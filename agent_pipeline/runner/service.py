@@ -31,6 +31,10 @@ from .models import (
 
 EXECUTOR_ENDED_UNSEALED = "executor_ended_without_bundle"
 BACKEND_ERROR = "backend_error"
+#: 09 §8: an execution whose worker stopped renewing its lease is not run
+#: again; the Controller charges the Runner retry budget for it.
+RUNNER_RESTART = "runner_restart"
+CANCELLED = "cancelled"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runner_tasks (
@@ -288,12 +292,19 @@ class DurableRunner:
     def status(self, task_id: str) -> RunnerStatus:
         task_id = self._task_id(task_id)
         with self._lock:
-            return self._status(self._row(task_id))
+            row = self._row(task_id)
+            if row is not None and row["lifecycle"] == "leased" and \
+                    row["lease_expires_at_ns"] <= self._now():
+                with self._transaction():
+                    self._end_expired_leases(self._now())
+                    row = self._row(task_id)
+            return self._status(row)
 
     def cancel(self, task_id: str) -> RunnerStatus:
         task_id = self._task_id(task_id)
         with self._transaction():
             now = self._now()
+            self._end_expired_leases(now)
             row = self._row(task_id)
             if row is None:
                 self._db.execute(
@@ -308,32 +319,20 @@ class DurableRunner:
                 row = self._row(task_id)
             elif row["cancel_requested_at_ns"] is None:
                 lifecycle = row["lifecycle"]
-                if lifecycle in ("queued", "leased"):
-                    if lifecycle == "leased":
-                        self._db.execute(
-                            """UPDATE runner_attempts
-                               SET finished_at_ns = ?, outcome = 'cancelled',
-                                   reason = 'cancelled'
-                               WHERE task_id = ? AND generation = ?
-                                   AND outcome = 'active'""",
-                            (now, task_id, row["lease_generation"]),
-                        )
-                    receipt, receipt_sha = self._completion_receipt(
-                        row, generation=row["lease_generation"],
-                        state="ended_unsealed", bundle_ref=None,
-                        reason="cancelled", completed_at_ns=now,
-                    )
+                if lifecycle == "leased":
+                    # 09 §8: cancel answers a final status only once the
+                    # execution stopped.  The worker sees the request through
+                    # stop_requested() and completes as cancelled.
                     self._db.execute(
-                        """UPDATE runner_tasks SET
-                            lifecycle = 'ended_unsealed', final_reason = 'cancelled',
-                            cancel_requested_at_ns = ?, cancel_completed_at_ns = ?,
-                            cancel_disposition = 'cancelled', lease_worker_id = NULL,
-                            lease_token = NULL, lease_claimed_at_ns = NULL,
-                            lease_expires_at_ns = NULL, receipt_json = ?,
-                            receipt_sha256 = ?, updated_at_ns = ?
-                           WHERE task_id = ?""",
-                        (now, now, receipt, receipt_sha, now, task_id),
+                        """UPDATE runner_tasks SET cancel_requested_at_ns = ?,
+                            updated_at_ns = ? WHERE task_id = ?""",
+                        (now, now, task_id),
                     )
+                elif lifecycle == "queued":
+                    self._db.execute(
+                        """UPDATE runner_tasks SET cancel_requested_at_ns = ?
+                           WHERE task_id = ?""", (now, task_id))
+                    self._end_unsealed(self._row(task_id), CANCELLED, now)
                 else:
                     disposition = (
                         "already_sealed"
@@ -356,16 +355,13 @@ class DurableRunner:
         """Return tasks claimable now in stable submission order."""
 
         with self._lock:
-            now = self._now()
             rows = self._db.execute(
                 """SELECT task_id, submission_order, lifecycle,
                           lease_generation
                    FROM runner_tasks
                    WHERE cancel_requested_at_ns IS NULL AND
-                       (lifecycle = 'queued' OR
-                        (lifecycle = 'leased' AND lease_expires_at_ns <= ?))
+                       lifecycle = 'queued'
                    ORDER BY submission_order""",
-                (now,),
             ).fetchall()
         return tuple(
             RecoverableTask(
@@ -386,25 +382,16 @@ class DurableRunner:
             expires = now + self._lease_duration_ns
             if expires > 2**63 - 1:
                 raise ValueError("lease expiry exceeds signed 64-bit range")
+            self._end_expired_leases(now)
             row = self._db.execute(
                 """SELECT * FROM runner_tasks
                    WHERE cancel_requested_at_ns IS NULL AND
-                       (lifecycle = 'queued' OR
-                        (lifecycle = 'leased' AND lease_expires_at_ns <= ?))
+                       lifecycle = 'queued'
                    ORDER BY submission_order LIMIT 1""",
-                (now,),
             ).fetchone()
             if row is None:
                 return None
             task_input = self._load_input(row)
-            if row["lifecycle"] == "leased":
-                self._db.execute(
-                    """UPDATE runner_attempts SET finished_at_ns = ?,
-                        outcome = 'lease_expired', reason = 'lease_expired'
-                       WHERE task_id = ? AND generation = ?
-                         AND outcome = 'active'""",
-                    (now, row["task_id"], row["lease_generation"]),
-                )
             generation = row["lease_generation"] + 1
             token = self._token_factory()
             # HostRecord performs the authoritative token validation before
@@ -492,7 +479,11 @@ class DurableRunner:
         with self._transaction():
             now = self._now()
             row = self._row(lease.binding.task_id)
-            self._require_current_lease(row, lease, now)
+            self._require_current_lease(row, lease, now, allow_cancel=True)
+            if row["cancel_requested_at_ns"] is not None:
+                # The execution stopped after cancel(): settle the cancel.
+                self._end_unsealed(row, CANCELLED, now)
+                return self._status(self._row(lease.binding.task_id))
             if result.bundle_ref is not None:
                 lifecycle = "sealed"
                 bundle_ref = result.bundle_ref
@@ -543,11 +534,12 @@ class DurableRunner:
         return status
 
     def _require_current_lease(
-        self, row: sqlite3.Row | None, lease: WorkLease, now: int
+        self, row: sqlite3.Row | None, lease: WorkLease, now: int, *,
+        allow_cancel: bool = False,
     ) -> None:
         if row is None or row["lifecycle"] != "leased":
             raise LeaseLost(lease.binding.task_id)
-        if row["cancel_requested_at_ns"] is not None:
+        if row["cancel_requested_at_ns"] is not None and not allow_cancel:
             raise LeaseLost(lease.binding.task_id)
         if (
             row["lease_generation"] != lease.generation
@@ -558,6 +550,54 @@ class DurableRunner:
             raise LeaseLost(lease.binding.task_id)
         if self._binding(row) != lease.binding or self._load_input(row) != lease.task_input:
             raise LeaseLost(lease.binding.task_id)
+
+    def _end_expired_leases(self, now: int) -> None:
+        """End every expired lease: ``cancelled`` if a cancel waits for it,
+        otherwise ``runner_restart``.  An expired execution is never claimed
+        again, so the Controller decides whether to retry (09 §8)."""
+
+        rows = self._db.execute(
+            """SELECT * FROM runner_tasks
+               WHERE lifecycle = 'leased' AND lease_expires_at_ns <= ?""",
+            (now,),
+        ).fetchall()
+        for row in rows:
+            cancelled = row["cancel_requested_at_ns"] is not None
+            self._end_unsealed(row, CANCELLED if cancelled else RUNNER_RESTART,
+                               now)
+
+    def _end_unsealed(self, row: sqlite3.Row, reason: str, now: int) -> None:
+        """Finish a queued or leased row without a bundle, inside the
+        caller's transaction."""
+
+        task_id = row["task_id"]
+        cancelled = row["cancel_requested_at_ns"] is not None
+        if row["lifecycle"] == "leased":
+            outcome = "cancelled" if cancelled else "lease_expired"
+            self._db.execute(
+                """UPDATE runner_attempts SET finished_at_ns = ?,
+                    outcome = ?, reason = ?
+                   WHERE task_id = ? AND generation = ?
+                     AND outcome = 'active'""",
+                (now, outcome, reason, task_id, row["lease_generation"]),
+            )
+        receipt, receipt_sha = self._completion_receipt(
+            row, generation=row["lease_generation"],
+            state="ended_unsealed", bundle_ref=None,
+            reason=reason, completed_at_ns=now,
+        )
+        self._db.execute(
+            """UPDATE runner_tasks SET
+                lifecycle = 'ended_unsealed', final_reason = ?,
+                cancel_completed_at_ns = CASE WHEN ? THEN ? END,
+                cancel_disposition = CASE WHEN ? THEN 'cancelled' END,
+                lease_worker_id = NULL, lease_token = NULL,
+                lease_claimed_at_ns = NULL, lease_expires_at_ns = NULL,
+                receipt_json = ?, receipt_sha256 = ?, updated_at_ns = ?
+               WHERE task_id = ?""",
+            (reason, cancelled, now, cancelled, receipt, receipt_sha, now,
+             task_id),
+        )
 
     def _completion_receipt(
         self,

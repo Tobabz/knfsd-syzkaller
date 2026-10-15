@@ -277,6 +277,11 @@ class Materialized(Record):
     # was persisted.  The Controller treats those records as stale and
     # rematerializes them before another Runner dispatch.
     hcap_revision: str | None = None
+    # A later HCAP revision under which the Controller re-validated the plan
+    # and found the HCAP-derived authority refs (call admission profile,
+    # neutral control catalog) unchanged (09 §5).  The harness itself stays
+    # the one built under `hcap_revision`.
+    authority_hcap_revision: str | None = None
 
 
 class MaterializationHcapAuthority(Record):
@@ -294,6 +299,9 @@ class MaterializationHcapAuthority(Record):
 
 
 NEUTRAL_CONTROL_UNAVAILABLE = "neutral_control_unavailable"
+#: Host-side authority (build approval, HCAP or admission records, parser
+#: identity) is unusable.  No plan change can fix it (09 §3).
+HOST_AUTHORITY_UNAVAILABLE = "host_authority_unavailable"
 
 
 class MaterializeRejected(Record):

@@ -22,19 +22,9 @@ from pydantic import Field
 
 from ..contracts import Record
 from ..hcap import ArtifactHcapChecker, HcapCatalog
+from ..intake import ANALYSIS_ROOTS, in_analysis_roots
 
-SOURCE_PREFIXES = (
-    "fs/nfsd/",
-    "fs/nfs/",
-    "fs/nfs_common/",
-    "fs/lockd/",
-    "net/sunrpc/",
-    "include/linux/nfs",
-    "include/linux/sunrpc/",
-    "include/linux/lockd/",
-    "include/uapi/linux/nfs",
-    "include/trace/events/sunrpc.h",
-)
+SOURCE_PREFIXES = ANALYSIS_ROOTS
 MAX_SOURCE_LINES = 400
 MAX_SOURCE_BYTES = 32 * 1024
 MAX_MATCHES = 32
@@ -206,11 +196,14 @@ class ToolDefinition:
 TOOL_DEFINITIONS = (
     ToolDefinition(
         "read_kernel_source",
-        "Read bounded lines from the pinned kernel source tree.",
+        f"Read at most {MAX_SOURCE_LINES} lines (1-based, inclusive) of one "
+        "file in the pinned kernel tree. Allowed roots: "
+        + ", ".join(SOURCE_PREFIXES) + ".",
         ReadSourceArgs),
     ToolDefinition(
         "search_kernel_source",
-        "Literal bounded search in the allowed NFS, lockd and SUNRPC roots.",
+        "Literal bounded search in the allowed roots (NFS, lockd, SUNRPC, "
+        "exportfs and VFS entry files); path_prefix narrows it to one.",
         SearchSourceArgs),
     ToolDefinition(
         "find_callers",
@@ -255,15 +248,20 @@ def _source_path(path: str) -> str:
     normalized = pure.as_posix()
     if normalized != path.rstrip("/"):
         raise ToolBoundaryError("source path must be normalized")
-    if not any(normalized.startswith(prefix) for prefix in SOURCE_PREFIXES):
-        raise ToolBoundaryError("source path is outside the Stage 1 roots")
+    if not in_analysis_roots(normalized):
+        raise ToolBoundaryError(
+            "source path is outside the Stage 1 roots: "
+            + ", ".join(SOURCE_PREFIXES))
     return normalized
 
 
 def _roots(path_prefix: str | None) -> tuple[str, ...]:
     if path_prefix is None:
         return SOURCE_PREFIXES
-    return (_source_path(path_prefix),)
+    root = _source_path(path_prefix)
+    if root + "/" in SOURCE_PREFIXES:
+        return (root + "/",)            # the directory, not a name prefix
+    return (root,)
 
 
 class Stage1Toolbox:

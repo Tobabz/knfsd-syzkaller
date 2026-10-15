@@ -244,6 +244,7 @@ def test_recover_finishes_same_binding_hcap_mismatch_migration(world):
     old_task = before.pending_task.task_id
     replacement = binding(hcap="hcap-2")
     world.registry.put(replacement)
+    world.materializer.authority_changed.add(replacement.hcap_revision)
 
     # Reproduce a crash after the historical HCAP-only transition committed
     # but before a flagged authority-rematerialization event was available.
@@ -270,6 +271,36 @@ def test_recover_finishes_same_binding_hcap_mismatch_migration(world):
     assert current.harness.harness_ref != before.harness.harness_ref
     assert current.pending_task.task_id != old_task
     assert world.runner.cancel_calls[old_task] == 1
+    assert world.c.replay(job_id) == current
+
+
+def test_recover_keeps_harness_whose_authority_is_unchanged(world):
+    job_id = world.to_running()
+    before = world.job(job_id)
+    old_task = before.pending_task.task_id
+    replacement = binding(hcap="hcap-2")
+    world.registry.put(replacement)
+    world.c._apply(job_id, ev.BindingChanged(
+        binding=replacement, judge_versions=before.judge_versions))
+    transition = world.store.transitions(job_id)[-1]
+    raw = json.loads(transition.model_dump_json())
+    for key in ("rematerialize_authority", "harness_authority_current"):
+        raw["event"].pop(key)
+    world.store.db.execute(
+        "UPDATE transitions SET body = ? WHERE job_id = ? AND seq = ?",
+        (json.dumps(raw, sort_keys=True), job_id, transition.seq))
+
+    world.restart()
+
+    current = world.job(job_id)
+    assert current.state is JobState.S1_RUNNING
+    assert current.harness.harness_ref == before.harness.harness_ref
+    assert current.harness.authority_hcap_revision == \
+        replacement.hcap_revision
+    assert current.pending_task.task_id == old_task
+    assert old_task not in world.runner.cancel_calls
+    world.restart()
+    assert world.job(job_id).seq == current.seq
     assert world.c.replay(job_id) == current
 
 
@@ -472,3 +503,57 @@ def test_late_outputs_are_kept_as_artifacts(world):
     ref = hashlib.sha256(late.model_dump_json().encode()).hexdigest()
     assert world.artifacts.has(ref)
     assert world.job(j).pending_task == p
+
+
+def test_adopted_judge_versions_survive_restart(world):
+    """09 §5: on_judge_versions() is stored, so a restart with the
+    configured default does not re-judge an adopted REACHED back."""
+    j = world.to_running()
+    gap = GapRef(gap_class=GapClass.REMOTE_KCOV_ATTRIBUTION,
+                 missing_capability_id="remote_kcov.context.softirq")
+    bundle = world.run(j, Q1Status.INCONCLUSIVE, "unsupported_attribution",
+                       gap)
+    job = world.job(j)
+    adopted = VERSIONS.model_copy(update={"judge_profile_id": "jp-2"})
+    world.judge.add(bundle, job.binding.execution_harness_id,
+                    job.candidate.candidate_id, Q1Status.REACHED,
+                    profile="jp-2")
+    world.c.on_judge_versions(adopted)
+    world.c._apply(j, ev.IssueChanged(gap=gap, status="resolved"))
+    assert world.job(j).state is JobState.RETRY_PENDING
+
+    world.restart()
+
+    assert world.c.judge_versions == adopted
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    assert job.judge_versions == adopted
+
+
+def test_historical_same_verdict_rejudge_replays(world):
+    """A JudgeVersionsChanged stored before `consume_same_verdict` existed
+    changed only the versions when the decision was the same."""
+    j = world.to_running()
+    bundle = world.run(j, Q1Status.REACHED)
+    job = world.job(j)
+    adopted = VERSIONS.model_copy(update={"judge_profile_id": "jp-2"})
+    world.judge.add(bundle, job.binding.execution_harness_id,
+                    job.candidate.candidate_id, Q1Status.REACHED,
+                    profile="jp-2")
+    event = ev.JudgeVersionsChanged(judge_versions=adopted)
+    raw = event.model_dump(mode="json")
+    raw.pop("consume_same_verdict")
+    historical = job.model_copy(update={"judge_versions": adopted,
+                                        "seq": job.seq + 1})
+    world.store.commit(job.seq, historical, Transition(
+        job_id=j, seq=historical.seq, from_state=job.state,
+        to_state=historical.state, reason="judge_versions_changed",
+        event=raw, job_policy_id=job.job_policy_id,
+        at="2026-10-01T00:00:00+00:00", job=historical))
+    assert world.c.replay(j) == historical
+
+    current = world.c.machine.handle(job, ev.JudgeVersionsChanged(
+        judge_versions=adopted, consume_same_verdict=True)).job
+    assert current.last_verdict.result.judge_profile_id == "jp-2"
+    assert current.stage2_input.q1_verdict_id != \
+        job.stage2_input.q1_verdict_id

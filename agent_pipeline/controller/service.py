@@ -23,7 +23,7 @@ from ..contracts import (AgentOutput, AgentTask, CandidateSubmission, GapRef,
                          VulnerabilityCandidate)
 from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
-from .machine import Env, Machine, Outcome
+from .machine import Env, Machine, Outcome, harness_authority_stale
 from .records import (TERMINAL, AgentAttempt, Job, JobState, TaskKind,
                       Transition)
 from .store import Store
@@ -73,13 +73,16 @@ class Controller:
         self.store = store
         self.machine = Machine(env)
         self.hcap = env.hcap
+        self.materializer = env.materializer
         self.runner = runner
         self.agents = agents
         self.issues = issues
         self.registry = registry
         self.tree = tree
         self.artifacts = artifacts
-        self.judge_versions = judge_versions
+        # An adopted fallback outlives the process; the constructor value is
+        # only the first default (09 §5).
+        self.judge_versions = store.judge_versions() or judge_versions
         self.clock = clock
         self.new_id = new_id
         self.failures: list[EffectFailure] = []
@@ -201,6 +204,7 @@ class Controller:
             self._reconcile_registry(job.job_id)
 
     def on_judge_versions(self, versions: JudgeVersions) -> None:
+        self.store.save_judge_versions(versions)
         self.judge_versions = versions
         for job in self.store.jobs():
             if job.state in TERMINAL:
@@ -208,18 +212,18 @@ class Controller:
             selected = self._versions_for(job.binding)
             if job.judge_versions != selected:
                 self._apply(job.job_id, ev.JudgeVersionsChanged(
-                    judge_versions=selected))
+                    judge_versions=selected, consume_same_verdict=True))
 
     def set_policy(self, job_id: str, policy_id: str) -> None:
         policy = self.store.policy(policy_id)
         job = self.store.job(job_id)
         binding = None if job.candidate is None else self.registry.lookup(
             job.candidate.kernel_commit, policy.sanitizer)
-        self._apply(job_id, ev.PolicyChanged(job_policy_id=policy_id,
-                                             binding=binding,
-                                             judge_versions=
-                                             self._versions_for(binding),
-                                             rematerialize_authority=True))
+        self._apply(job_id, ev.PolicyChanged(
+            job_policy_id=policy_id, binding=binding,
+            judge_versions=self._versions_for(binding),
+            rematerialize_authority=True,
+            harness_authority_current=self._authority_current(job, binding)))
 
     def operator(self, job_id: str, action: str) -> Outcome | None:
         return self._apply(job_id, ev.OperatorAction(
@@ -377,15 +381,15 @@ class Controller:
         policy = self.store.policy(job.job_policy_id)
         binding = self.registry.lookup(job.candidate.kernel_commit,
                                        policy.sanitizer)
-        harness = job.harness
-        stale = binding is not None and binding == job.binding and \
-            harness is not None and \
-            harness.hcap_revision != binding.hcap_revision
+        stale = binding == job.binding and \
+            harness_authority_stale(job, binding)
         if binding != job.binding or stale:
             out = self._apply(job_id, ev.BindingChanged(
                 binding=binding,
                 judge_versions=self._versions_for(binding),
-                rematerialize_authority=True))
+                rematerialize_authority=True,
+                harness_authority_current=self._authority_current(
+                    job, binding)))
             if out is None:
                 raise RuntimeError(
                     f"materialization authority migration refused for "
@@ -397,7 +401,22 @@ class Controller:
                                  policy.sanitizer)
         self._apply(job.job_id, ev.BindingChanged(
             binding=b, judge_versions=self._versions_for(b),
-            rematerialize_authority=True))
+            rematerialize_authority=True,
+            harness_authority_current=self._authority_current(job, b)))
+
+    def _authority_current(self, job: Job,
+                           binding: HarnessBinding | None) -> bool:
+        """Does the job's harness keep its HCAP-derived authority refs
+        under `binding`?  Only then may an HCAP-only change keep it
+        (09 §5).  Infrastructure errors propagate."""
+        h = job.harness
+        if binding is None or h is None or h.hcap_revision is None or \
+                h.execution_harness_id != binding.execution_harness_id:
+            return False
+        if not harness_authority_stale(job, binding):
+            return True
+        return self.materializer.harness_authority_current(
+            h.harness_ref, binding)
 
     def _apply(self, job_id: str, event) -> Outcome | None:
         job = self.store.job(job_id)

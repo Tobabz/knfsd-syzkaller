@@ -104,11 +104,19 @@ class BindingChanged(Record):
     # binding, materialization and judge authority change atomically while old
     # transition logs retain their original reduction.
     rematerialize_authority: bool = False
+    # Set by the service: the job's current harness has the same
+    # HCAP-derived authority refs under `binding` (09 §5).  The machine then
+    # re-validates the plan and keeps the harness instead of rebuilding it.
+    harness_authority_current: bool = False
 
 
 class JudgeVersionsChanged(Record):
     type: Literal["judge_versions_changed"] = "judge_versions_changed"
     judge_versions: JudgeVersions
+    # Absent in historical events, whose reduction kept the old verdict when
+    # the re-judge gave the same decision.  Current events consume the new
+    # authority's verdict in that case too (09 §5).
+    consume_same_verdict: bool = False
 
 
 class PolicyChanged(Record):
@@ -121,6 +129,10 @@ class PolicyChanged(Record):
     binding: HarnessBinding | None = None
     judge_versions: JudgeVersions | None = None
     rematerialize_authority: bool = False
+    # Set by the service: the job's current harness has the same
+    # HCAP-derived authority refs under `binding` (09 §5).  The machine then
+    # re-validates the plan and keeps the harness instead of rebuilding it.
+    harness_authority_current: bool = False
 
 
 class OperatorAction(Record):

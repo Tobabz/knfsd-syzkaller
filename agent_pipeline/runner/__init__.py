@@ -12,6 +12,8 @@ from .models import (
 )
 from .service import (
     BACKEND_ERROR,
+    CANCELLED,
+    RUNNER_RESTART,
     EXECUTOR_ENDED_UNSEALED,
     DurableRunner,
     LeaseLost,
@@ -30,6 +32,8 @@ from .evidence_backend import (
 __all__ = [
     "AttemptFact",
     "BACKEND_ERROR",
+    "CANCELLED",
+    "RUNNER_RESTART",
     "BackendResult",
     "CompletionReceipt",
     "DurableRunner",

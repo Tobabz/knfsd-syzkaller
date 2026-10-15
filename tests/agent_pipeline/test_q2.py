@@ -176,6 +176,16 @@ def test_non_stall_rcu_messages_are_unclassified(sample, text):
     ("BUG: KMSAN: uninit-value in worker\n", "KMSAN", True),
     ("BUG: KCSAN: data-race in worker\n", "KCSAN", False),
     ("UBSAN: array-index-out-of-bounds in worker\n", "UBSAN", False),
+    ("general protection fault, probably for non-canonical address "
+     "0xdffffc0000000000: 0000 [#1] PREEMPT SMP KASAN\n"
+     "KASAN: null-ptr-deref in range [0x0-0x7]\n", "KASAN", True),
+    ("general protection fault: 0000 [#1] PREEMPT SMP\n", "BUG", True),
+    ("kernel BUG at fs/nfsd/nfs4state.c:1234!\n"
+     "invalid opcode: 0000 [#1] PREEMPT SMP KASAN\n", "BUG", True),
+    ("invalid opcode: 0000 [#1] PREEMPT SMP\n", "BUG", True),
+    ("Oops: 0000 [#1] PREEMPT SMP\n", "BUG", True),
+    ("Unable to handle kernel NULL pointer dereference at virtual address "
+     "0000000000000008\n", "BUG", True),
 ])
 def test_specific_report_classification_precedes_generic_bug(sample, text, expected, fatal):
     decision = evaluate(with_evidence(
