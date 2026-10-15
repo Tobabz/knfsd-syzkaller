@@ -146,6 +146,9 @@ class CancelConfirmed(Record):
 
     type: Literal["cancel_confirmed"] = "cancel_confirmed"
     task_id: str
+    #: The final status was ``cleanup_unconfirmed``: the lease ended, but
+    #: the execution was not confirmed stopped.  Absent in earlier logs.
+    cleanup_unconfirmed: bool = False
 
 
 Event = Annotated[

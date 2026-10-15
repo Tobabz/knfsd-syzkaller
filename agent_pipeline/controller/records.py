@@ -49,6 +49,7 @@ class BlockedReason(str, enum.Enum):
     GAP_ID_UNKNOWN = "gap_id_unknown"
     UNEXPECTED_EVENT = "unexpected_event"
     HOST_AUTHORITY = "host_authority"
+    EXECUTION_CLEANUP = "execution_cleanup"
 
 
 class RepairCause(str, enum.Enum):
@@ -176,6 +177,8 @@ class Job(BaseModel):
     counters: Counters = Field(default_factory=Counters)
     pending_task: PendingTask | None = None
     cancelling_tasks: tuple[str, ...] = ()
+    #: Runner tasks whose lease ended without confirmed cleanup (09 §8).
+    uncleaned_tasks: tuple[str, ...] = ()
     resume_point: Target | None = None
     analysis_ref: str | None = None
     plan_ref: str | None = None

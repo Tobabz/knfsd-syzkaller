@@ -12,6 +12,11 @@ from ..contracts import (AgentModelPolicy, AgentTask, Record,
 from ..data import canonical_json
 from .records import RepairInput
 
+#: A Runner final reason: the lease ended while the backend could not
+#: confirm its execution stopped (09 §8).  Neither a confirmed cancel nor a
+#: runtime retry; the Controller tracks the task until an operator resumes.
+CLEANUP_UNCONFIRMED = "cleanup_unconfirmed"
+
 
 class RunnerStatus(Record):
     """status(task_id).  `bundles` are the sealed bundles, in order."""

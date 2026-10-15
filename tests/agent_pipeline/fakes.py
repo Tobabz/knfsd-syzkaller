@@ -82,13 +82,18 @@ class FakeHcap:
         self.vocabulary: set[str] = {"syzlang.nfs4.op_lock",
                                      "fixture.lease_expiry"}
 
+        #: HCAP revisions whose host catalog is corrupt.
+        self.corrupt: set[str] = set()
+
     def check_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        if hcap_revision in self.corrupt:
+            return HcapCheck(violations=("invalid_hcap_artifact",),
+                             host_authority=True)
         return HcapCheck(violations=self.violations.get(
             (plan_ref, hcap_revision), ()))
 
     def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
-        return HcapCheck(violations=self.violations.get(
-            (plan_ref, hcap_revision), ()))
+        return self.check_plan(plan_ref, hcap_revision)
 
     def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
         return None
@@ -176,6 +181,8 @@ class FakeRunner:
         self.cancelled: set[str] = set()
         self.cancel_calls: Counter = Counter()
         self.slow_cancel: set[str] = set()
+        #: Tasks whose cancel ends without confirmed cleanup.
+        self.unconfirmed: set[str] = set()
 
     def _status(self, task_id: str) -> RunnerStatus:
         t = self.tasks.get(task_id)
@@ -215,7 +222,9 @@ class FakeRunner:
             self.slow_cancel.discard(task_id)
             return self._status(task_id)
         if t["state"] == "running":
-            t["state"], t["reason"] = "ended_unsealed", "cancelled"
+            t["state"], t["reason"] = "ended_unsealed", (
+                "cleanup_unconfirmed" if task_id in self.unconfirmed
+                else "cancelled")
         return self._status(task_id)
 
     def finish(self, task_id: str, bundle: str | None = None,
