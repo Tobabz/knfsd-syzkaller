@@ -29,7 +29,8 @@ from pydantic_ai.usage import UsageLimits  # noqa: E402
 
 from ..contracts import AgentModelPolicy
 from .runtime import OutputRejected, RuntimeRequest, RuntimeResult
-from .tools import Stage1Toolbox, TOOL_DEFINITIONS
+from .tools import (TOOL_DEFINITIONS, BackendBoundaryError, Stage1Toolbox,
+                    ToolBoundaryError)
 
 OUTPUT_TOOL = "stage1_result"
 ModelFactory = Callable[[AgentModelPolicy], Model]
@@ -109,11 +110,23 @@ class _ResponseGuard(WrapperModel):
         return response
 
 
+#: Retries of one tool after a call mistake the model can correct.
+TOOL_RETRIES = 2
+
+
 def _tool_function(toolbox: Stage1Toolbox, name: str):
     def invoke(**arguments):
         # Tool.from_schema advertises JSON schema but skips argument validation.
         # The pinned dispatcher performs actual validation before any backend IO.
-        return toolbox.invoke(name, arguments)
+        try:
+            return toolbox.invoke(name, arguments)
+        except BackendBoundaryError:
+            raise
+        except (ToolBoundaryError, ValidationError) as exc:
+            # A call mistake (bad arguments, a path outside the roots, too
+            # many lines, a missing file) goes back to the model to correct.
+            # Backend and source-index failures still end the run.
+            raise ModelRetry(f"{name}: {exc}") from exc
     return invoke
 
 
@@ -172,7 +185,8 @@ class PydanticAIRuntime:
                 _ResponseGuard(model, request, self.limits),
                 output_type=ToolOutput(envelope, name=OUTPUT_TOOL),
                 instructions=request.instructions, tools=tools,
-                retries={"tools": 0, "output": request.model_policy.output_retries},
+                retries={"tools": TOOL_RETRIES,
+                         "output": request.model_policy.output_retries},
                 tool_timeout=self.limits.request_timeout_seconds,
                 # Explicitly disable global Agent.instrument_all() defaults.
             )

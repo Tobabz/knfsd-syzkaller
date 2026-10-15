@@ -466,6 +466,14 @@ def test_harness_authority_current_only_while_hcap_refs_are_unchanged(
         materializer.harness_authority_current("e" * 64, world.binding)
 
 
+@pytest.mark.parametrize("error", [TimeoutError("bridge timed out"),
+                                   ChildProcessError("bridge killed")])
+def test_parser_host_failure_is_raised_not_a_rejection(world, error):
+    world.parser.results[world.scenario_ref] = error
+    with pytest.raises(OSError):
+        world.materializer.materialize(world.plan_ref, world.binding)
+
+
 def test_seed_flow_has_no_admission_bypass(world):
     proposal = ProgramProposal(
         kind="seed", artifact_ref=world.scenario_ref,

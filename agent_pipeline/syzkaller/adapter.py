@@ -221,7 +221,12 @@ class PinnedSyzParser:
 
 
 def _run(fd: int, operation: str, data: bytes, limits: BridgeLimits) -> bytes:
-    """Drain both pipes incrementally; kill/reap on overflow or timeout."""
+    """Drain both pipes incrementally; kill/reap on overflow or timeout.
+
+    A timeout (``TimeoutError``) or a signal death (``ChildProcessError``)
+    is a host failure, an ``OSError`` the Materializer re-raises; only a
+    bridge refusal or an invalid answer is a ``SyzParseFailure``.
+    """
     with tempfile.TemporaryFile() as source:
         source.write(data)
         source.seek(0)
@@ -241,7 +246,7 @@ def _run(fd: int, operation: str, data: bytes, limits: BridgeLimits) -> bytes:
                 while selector.get_map():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise SyzParseFailure("bridge timed out")
+                        raise TimeoutError("bridge timed out")
                     for key, _ in selector.select(remaining):
                         chunk = os.read(key.fileobj.fileno(), 65536)
                         if not chunk:
@@ -254,14 +259,19 @@ def _run(fd: int, operation: str, data: bytes, limits: BridgeLimits) -> bytes:
                         buffer.extend(chunk)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise SyzParseFailure("bridge timed out")
+                raise TimeoutError("bridge timed out")
             process.wait(timeout=remaining)
+            if process.returncode < 0:
+                # Killed by a signal (OOM, host limits): not a verdict on
+                # the program.
+                raise ChildProcessError(
+                    f"bridge killed by signal {-process.returncode}")
             if process.returncode:
                 diagnostic = buffers["stderr"].decode("utf-8", errors="replace")[:1024]
                 raise SyzParseFailure(f"bridge refused ({process.returncode}): {diagnostic}")
             return bytes(buffers["stdout"])
         except subprocess.TimeoutExpired as error:
-            raise SyzParseFailure("bridge timed out") from error
+            raise TimeoutError("bridge timed out") from error
         finally:
             # Kill the process group even if the leader has exited: a failed
             # helper must not leave inherited pipe writers behind.

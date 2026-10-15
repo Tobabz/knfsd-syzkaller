@@ -28,9 +28,12 @@ from pydantic_ai.usage import RequestUsage
 from agent_pipeline.agent_tasks.analysis import CandidateAnalysis
 from agent_pipeline.agent_tasks.executor import Stage1AgentExecutor
 from agent_pipeline.agent_tasks.pydantic_ai_runtime import (
-    OUTPUT_TOOL, PydanticAIRuntime, PydanticAIRuntimeError, RuntimeLimits)
+    OUTPUT_TOOL, TOOL_RETRIES, PydanticAIRuntime, PydanticAIRuntimeError,
+    RuntimeLimits)
 from agent_pipeline.agent_tasks.runtime import OutputRejected, RuntimeRequest
-from agent_pipeline.agent_tasks.tools import Stage1Toolbox, ToolBoundaryError
+from agent_pipeline.agent_tasks.tools import (BackendBoundaryError,
+                                              IndexedMatch, Stage1Toolbox,
+                                              ToolBoundaryError)
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.contracts import AgentModelPolicy, AgentTask, PlanOutput
 from agent_pipeline.data import load_record, put_record
@@ -165,27 +168,73 @@ def test_unknown_tool_fails_even_beside_valid_output(with_output):
     assert len(script.calls) == 1
 
 
-@pytest.mark.parametrize("arguments,error", [
-    ({"path": "../../etc/passwd", "start_line": 1, "end_line": 2}, ToolBoundaryError),
-    ({"path": "fs/nfsd/nfs4proc.c", "start_line": 0, "end_line": 2}, UnexpectedModelBehavior),
-    ({"path": "fs/nfsd/nfs4proc.c", "start_line": 1, "end_line": 2,
-      "kernel_commit": "forged"}, UnexpectedModelBehavior),
+@pytest.mark.parametrize("arguments", [
+    {"path": "../../etc/passwd", "start_line": 1, "end_line": 2},
+    {"path": "fs/nfsd/nfs4proc.c", "start_line": 0, "end_line": 2},
+    {"path": "fs/nfsd/nfs4proc.c", "start_line": 1, "end_line": 2,
+     "kernel_commit": "forged"},
+    {"path": "fs/nfsd/nfs4proc.c", "start_line": 1, "end_line": 401},
 ])
-def test_invalid_tool_arguments_never_reach_source(arguments, error):
+def test_invalid_tool_arguments_never_reach_source(arguments):
     source = FakeSource()
     script = Script(response(parts=[ToolCallPart("read_kernel_source", arguments)]))
-    with pytest.raises(error):
+    with pytest.raises(UnexpectedModelBehavior, match="max retries"):
         script.runtime().run(runtime_request(tools=toolbox(source)))
     assert not source.calls
+    assert len(script.calls) == TOOL_RETRIES + 1
+
+
+@pytest.mark.parametrize("arguments,message", [
+    ({"path": "fs/nfsd/nfs4proc.c", "start_line": 1, "end_line": 401},
+     "400 lines"),
+    ({"path": "include/linux/fs.h", "start_line": 1, "end_line": 2},
+     "outside the Stage 1 roots"),
+    ({"path": "fs/nfsd/nfs4proc.c", "start_line": 0, "end_line": 2},
+     "start_line"),
+])
+def test_tool_call_mistake_is_returned_to_the_model(arguments, message):
+    script = Script(response(parts=[ToolCallPart("read_kernel_source", arguments)]),
+                    response())
+    result = script.runtime().run(runtime_request())
+    assert result.output == CandidateAnalysis.model_validate(analysis_data())
+    assert len(script.calls) == 2
+    retries = [part for part in script.calls[1][0][-1].parts
+               if isinstance(part, RetryPromptPart)]
+    assert len(retries) == 1 and message in str(retries[0].content)
+
+
+def test_missing_source_file_is_returned_to_the_model():
+    source = FakeSource()
+    source.read_text = None
+    script = Script(response(parts=[ToolCallPart("read_kernel_source", {
+        "path": "fs/nfsd/nfs4state.h", "start_line": 1, "end_line": 2})]),
+        response())
+    script.runtime().run(runtime_request(tools=toolbox(source)))
+    assert len(script.calls) == 2
+
+
+def test_source_index_boundary_violation_is_not_retried():
+    source = FakeSource()
+    source.matches = [IndexedMatch(path="drivers/block/x.c", line=1,
+                                   text="outside")]
+    script = Script(response(parts=[ToolCallPart(
+        "search_kernel_source", {"query": "target"})]))
+    with pytest.raises(BackendBoundaryError):
+        script.runtime().run(runtime_request(tools=toolbox(source)))
     assert len(script.calls) == 1
 
 
 def test_backend_tool_failure_is_not_retried():
     source = FakeSource()
-    source.read_text = None
+
+    def broken(*args):
+        source.calls.append(args)
+        raise OSError(5, "Input/output error")
+
+    source.read = broken
     script = Script(response(parts=[ToolCallPart("read_kernel_source", {
         "path": "fs/nfsd/nfs4proc.c", "start_line": 1, "end_line": 2})]))
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(OSError):
         script.runtime().run(runtime_request(tools=toolbox(source)))
     assert len(script.calls) == len(source.calls) == 1
 

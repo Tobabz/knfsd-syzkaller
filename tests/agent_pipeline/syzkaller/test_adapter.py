@@ -186,8 +186,14 @@ def test_live_stream_limits_kill_helper(tmp_path, stream):
     assert time.monotonic() - start < 5
 
 
+def test_helper_killed_by_signal_is_a_host_failure(tmp_path):
+    with pytest.raises(ChildProcessError, match="signal 9"):
+        run_helper(tmp_path, "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
+
+
 def test_silent_helper_timeout_and_minimal_environment(tmp_path):
-    with pytest.raises(SyzParseFailure, match="timed out"):
+    # A timeout is a host failure (OSError), never a plan parse failure.
+    with pytest.raises(TimeoutError, match="timed out"):
         run_helper(tmp_path, "import time\ntime.sleep(60)\n", BridgeLimits(timeout_seconds=.1))
     output = run_helper(tmp_path, "import os\nprint(','.join(sorted(os.environ)))\n")
     assert output.strip() in (b"GOMAXPROCS,GOTRACEBACK,LANG", b"GOMAXPROCS,GOTRACEBACK,LANG,LC_CTYPE")
