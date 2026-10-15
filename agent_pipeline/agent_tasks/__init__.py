@@ -9,6 +9,7 @@ runtime.
 from .analysis import CandidateAnalysis
 from .executor import Stage1AgentExecutor
 from .planning import ReachabilityPlanningOutput
+from .queued import QueuedAgentExecutor
 from .runtime import AgentRuntime, RuntimeResult
 from .source_index import GitKernelSourceIndex
 from .tools import Stage1Toolbox
@@ -17,6 +18,7 @@ __all__ = [
     "AgentRuntime",
     "CandidateAnalysis",
     "GitKernelSourceIndex",
+    "QueuedAgentExecutor",
     "ReachabilityPlanningOutput",
     "RuntimeResult",
     "Stage1AgentExecutor",

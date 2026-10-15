@@ -31,7 +31,7 @@ SDK too (OpenAI 3.31.0). No workflow change is required.
 from agent_pipeline.agent_tasks.pydantic_ai_runtime import (
     PydanticAIRuntime, RuntimeLimits,
 )
-from agent_pipeline.agent_tasks.executor import Stage1AgentExecutor
+from agent_pipeline.agent_tasks.queued import QueuedAgentExecutor
 
 runtime = PydanticAIRuntime(limits=RuntimeLimits(
     max_requests=16,
@@ -39,8 +39,23 @@ runtime = PydanticAIRuntime(limits=RuntimeLimits(
     request_timeout_seconds=60,
     run_timeout_seconds=300,
 ))
-executor = Stage1AgentExecutor(runtime, artifacts, pinned_toolbox_factory, sink)
+agents = QueuedAgentExecutor(runtime, artifacts, pinned_toolbox_factory, sink)
+controller = Controller(..., agents=agents, ...)
+agents.sink = controller
+
+while running:                       # the Controller thread
+    agents.deliver(block=True, timeout=1.0)
+    controller.poll()
 ```
+
+Give the Controller a `QueuedAgentExecutor`, not `Stage1AgentExecutor`.
+`Stage1AgentExecutor.start` runs the whole task inline: as the Controller's
+`agents` it would block `submit`/`poll` for up to the run timeout and nest
+each retry inside the previous failure's callback. Its sink also must not be
+called from a worker thread, because the Controller's SQLite Store belongs
+to the Controller thread. `QueuedAgentExecutor.start` hands the task to a
+worker pool and returns; `deliver()` passes finished results to the
+Controller on the thread that calls it.
 
 The default factory accepts only trusted `provider="openai"` policy and
 passes its model name to `OpenAIResponsesModel`. It uses the SDK's host
@@ -64,9 +79,12 @@ Each execution constructs a fresh Agent, message history and tool bindings.
 Its only function tools are the five registered `Stage1Toolbox` definitions;
 the pinned dispatcher validates all arguments before source/HCAP access.
 Tools execute sequentially. Unknown tool names fail before any tool runs,
-including unknown calls accompanying otherwise valid final output. Invalid
-arguments, scope violations and source/backend failures terminate the run;
-tool retries are zero.
+including unknown calls accompanying otherwise valid final output. Call
+mistakes the model can correct (invalid arguments, a path outside the
+allowed roots, a read over 400 lines, a file missing at the pinned commit)
+are returned to the model as `ModelRetry`, with at most `TOOL_RETRIES` (2)
+retries per tool. Source-index and backend failures terminate the run. The
+tool descriptions state the line limit and the allowed roots.
 
 The sole output tool is `stage1_result`. Its JSON object is
 `{"result": <requested typed output>}`. This envelope lets the Planning
@@ -126,6 +144,6 @@ The installed 2.55.0 package source was checked against the official
 [Agent API](https://pydantic.dev/docs/ai/api/pydantic-ai/agent/),
 [output validators](https://pydantic.dev/docs/ai/core-concepts/output/), and
 [function tools](https://pydantic.dev/docs/ai/tools-toolsets/tools/).
-In this version `Agent(retries={"tools": 0, "output": N})` selects separate
+In this version `Agent(retries={"tools": 2, "output": N})` selects separate
 budgets; `Tool.from_schema` advertises but does not validate arguments, hence
 the explicit pinned dispatcher validation above.
