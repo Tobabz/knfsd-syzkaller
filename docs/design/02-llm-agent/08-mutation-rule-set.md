@@ -358,6 +358,8 @@ ordinal을 쓰지 않는다.
 ```text
 Agent가 고칠 수 있는 입력
     unknown_path, type_mismatch, message_type_inconsistent,
+    selector_mismatch (예: NFSv3 READ rule이 WRITE argument를 읽음.
+                       NFSv4 operation은 모두 COMPOUND 안이라 이 예에 해당하지 않음),
     missing_required_field (예: targets_baseline_traffic)
         -> Mutation Strategy repair
 

@@ -1273,6 +1273,194 @@ static void test_padding_of_bound_zero(void)
 	free(types);
 }
 
+#define FOREIGN "a value the rule reads is not in the target's procedure"
+
+static void expect_in(const struct nfsp_schema_family *f,
+		      const struct spec *sp, enum nfsp_rule_status want,
+		      uint32_t pred, int line)
+{
+	const struct nfsp_schema_family *const fs[1] = { f };
+	struct nfsp_ruleset rs;
+	struct nfsp_rule_error err;
+	enum nfsp_rule_status st;
+	struct w w;
+
+	wset(&w, f->schemas[0]->schema_id, sp, 1);
+	st = nfsp_ruleset_load(w.b, w.n, fs, 1, &rs, &err);
+	nfsp_ruleset_free(&rs);
+	CHECK(st == want &&
+	      (want == NFSP_RULE_OK ||
+	       (err.rule == 0 && err.predicate == pred &&
+		(want != NFSP_RULE_SELECTOR_MISMATCH ||
+		 !strcmp(err.detail, FOREIGN)))),
+	      "line %d: %s (rule %u predicate %u: %s), want %s", line,
+	      nfsp_rule_strstatus(st), err.rule, err.predicate,
+	      err.detail ? err.detail : "", nfsp_rule_strstatus(want));
+}
+
+/* A rule of tflat (the NFSv3 shape): replace READ's count in a CALL. */
+static struct spec tflat_spec(void)
+{
+	struct spec sp;
+
+	memset(&sp, 0, sizeof(sp));
+	sp.rule_id = "r1";
+	sp.intent_id = "i1";
+	sp.dir = NFSP_RULE_C2S;
+	sp.msg = NFSP_RULE_CALL;
+	sp.prog = 0x2000009au;
+	sp.vers = 2;
+	sp.has_proc = 1;
+	sp.proc = 6;
+	sp.family = "tflat";
+	sp.tkind = NFSP_RULE_FIELD;
+	sp.path = "tflat.request.READ.args.count";
+	sp.part = NFSP_PART_VALUE;
+	sp.npreds = 1;
+	sp.preds[0].lhs.source = NFSP_SRC_CURRENT_MESSAGE;
+	sp.preds[0].lhs.path = "tflat.request.READ.args.fh";
+	sp.preds[0].op = NFSP_CMP_EQ;
+	sp.preds[0].lit.kind = NFSP_LIT_OPAQUE;
+	sp.preds[0].lit.bytes = "h";
+	sp.preds[0].lit.len = 1;
+	sp.mkind = NFSP_MUT_REPLACE;
+	sp.has_xf = 1;
+	sp.xkind = NFSP_XF_LITERAL;
+	sp.xlit.kind = NFSP_LIT_UINT;
+	sp.xlit.num = 0;
+	sp.policy = NFSP_POLICY_PRESERVE;
+	sp.app = NFSP_APPLY_ALL_MATCHES;
+	return sp;
+}
+
+/* A REPLY rule of tflat: replace GETSIZE's size when its status is TF_OK. */
+static struct spec tflat_reply_spec(void)
+{
+	struct spec sp = tflat_spec();
+
+	sp.dir = NFSP_RULE_S2C;
+	sp.msg = NFSP_RULE_REPLY;
+	sp.proc = 7;
+	sp.path = "tflat.response.GETSIZE.result.size";
+	sp.preds[0].lhs.path = "tflat.response.GETSIZE.result.status";
+	sp.preds[0].lit.kind = NFSP_LIT_ENUM;
+	sp.preds[0].lit.num = 0;
+	sp.xlit.kind = NFSP_LIT_UHYPER;
+	sp.fwd.proc = 1;
+	return sp;
+}
+
+/* One message holds one procedure's values, so a value the rule reads in
+ * another procedure is never there: the rule could never match. */
+static void test_one_procedure(void)
+{
+	const struct nfsp_schema_family *tf = &nfsp_schema_family_tflat;
+	const struct nfsp_schema_family *te = &nfsp_schema_family_tedge;
+	struct spec sp;
+
+	printf("validate: every value in the target's procedure\n");
+	sp = tflat_spec();
+	expect_in(tf, &sp, NFSP_RULE_OK, 0, __LINE__);
+	/* READ's count when GETSIZE's handle is "h". */
+	sp.preds[0].lhs.path = "tflat.request.GETSIZE.args";
+	expect_in(tf, &sp, NFSP_RULE_SELECTOR_MISMATCH, 0, __LINE__);
+	sp.has_proc = 0;
+	expect_in(tf, &sp, NFSP_RULE_SELECTOR_MISMATCH, 0, __LINE__);
+
+	/* A request view: the CALL a GETSIZE REPLY answers is GETSIZE's. The
+	 * first predicate is fine; the second is blamed. */
+	sp = tflat_reply_spec();
+	sp.npreds = 2;
+	sp.preds[1].lhs.source = NFSP_SRC_REQUEST_FORWARDED;
+	sp.preds[1].lhs.path = "tflat.request.GETSIZE.args";
+	sp.preds[1].op = NFSP_CMP_EQ;
+	sp.preds[1].lit.kind = NFSP_LIT_OPAQUE;
+	sp.preds[1].lit.bytes = "h";
+	sp.preds[1].lit.len = 1;
+	sp.fwd.n = 1;
+	sp.fwd.fields[0] = "tflat.request.GETSIZE.args";
+	expect_in(tf, &sp, NFSP_RULE_OK, 0, __LINE__);
+	sp.preds[1].lhs.path = "tflat.request.READ.args.fh";
+	sp.fwd.fields[0] = "tflat.request.READ.args.fh";
+	expect_in(tf, &sp, NFSP_RULE_SELECTOR_MISMATCH, 1, __LINE__);
+	sp.preds[1].lhs.source = NFSP_SRC_REQUEST_ORIGINAL;
+	sp.fwd.n = 0;
+	sp.orig.n = 1;
+	sp.orig.fields[0] = "tflat.request.READ.args.fh";
+	expect_in(tf, &sp, NFSP_RULE_SELECTOR_MISMATCH, 1, __LINE__);
+
+	/* The right side of a comparison, and a copy source. */
+	sp = tflat_reply_spec();
+	sp.path = "tflat.response.GETSIZE.result.status";
+	sp.preds[0].is_ref = 1;
+	sp.preds[0].ref.source = NFSP_SRC_CURRENT_MESSAGE;
+	sp.preds[0].ref.path = "tflat.response.READ.result.status";
+	sp.xlit.kind = NFSP_LIT_ENUM;
+	expect_in(tf, &sp, NFSP_RULE_SELECTOR_MISMATCH, 0, __LINE__);
+	sp.npreds = 0;
+	sp.xkind = NFSP_XF_COPY;
+	sp.xsrc.source = NFSP_SRC_CURRENT_MESSAGE;
+	sp.xsrc.path = "tflat.response.READ.result.status";
+	expect_in(tf, &sp, NFSP_RULE_SELECTOR_MISMATCH, NFSP_RULE_NONE,
+		  __LINE__);
+	sp.xsrc.source = NFSP_SRC_TARGET;
+	sp.xsrc.path = NULL;
+	expect_in(tf, &sp, NFSP_RULE_OK, 0, __LINE__);
+
+	/* An operation is in every procedure that reaches it: ECHO is in
+	 * DIRECT and EMBEDDED, EMBEDDED's tag only in EMBEDDED. */
+	memset(&sp, 0, sizeof(sp));
+	sp.rule_id = "r1";
+	sp.intent_id = "i1";
+	sp.msg = NFSP_RULE_CALL;
+	sp.prog = 0x2000009bu;
+	sp.vers = 1;
+	sp.family = "tedge";
+	sp.operation = "ECHO";
+	sp.tkind = NFSP_RULE_FIELD;
+	sp.path = "tedge.request.ECHO.args.value";
+	sp.part = NFSP_PART_VALUE;
+	sp.npreds = 1;
+	sp.preds[0].lhs.source = NFSP_SRC_CURRENT_MESSAGE;
+	sp.preds[0].lhs.path = "tedge.request.EMBEDDED.args.tag";
+	sp.preds[0].op = NFSP_CMP_EQ;
+	sp.preds[0].lit.kind = NFSP_LIT_UINT;
+	sp.preds[0].lit.num = 1;
+	sp.mkind = NFSP_MUT_REPLACE;
+	sp.has_xf = 1;
+	sp.xkind = NFSP_XF_LITERAL;
+	sp.xlit.kind = NFSP_LIT_UINT;
+	sp.policy = NFSP_POLICY_PRESERVE;
+	sp.app = NFSP_APPLY_ALL_MATCHES;
+	expect_in(te, &sp, NFSP_RULE_OK, 0, __LINE__);
+	sp.has_proc = 1;
+	sp.proc = 2;
+	expect_in(te, &sp, NFSP_RULE_OK, 0, __LINE__);
+	sp.proc = 1;
+	expect_in(te, &sp, NFSP_RULE_SELECTOR_MISMATCH, 0, __LINE__);
+	/* The reverse: a target in EMBEDDED reading the operation. */
+	sp.has_proc = 0;
+	sp.operation = NULL;
+	sp.path = "tedge.request.EMBEDDED.args.tag";
+	sp.preds[0].lhs.path = "tedge.request.ECHO.args.value";
+	expect_in(te, &sp, NFSP_RULE_OK, 0, __LINE__);
+
+	/* NFSv4: a COMPOUND field read with an operation field, with and
+	 * without the procedure; COMPOUND is NFSv4's only one with values. */
+	sp = golden_spec();
+	sp.operation = NULL;
+	sp.path = "nfs4.request.COMPOUND.args.minorversion";
+	sp.preds[0].lhs.source = NFSP_SRC_CURRENT_MESSAGE;
+	sp.preds[0].lhs.path = OPEN_FILE;
+	sp.preds[0].op = NFSP_CMP_EQ;
+	sp.preds[0].lit.kind = NFSP_LIT_OPAQUE;
+	sp.preds[0].lit.bytes = "scenario-file";
+	sp.preds[0].lit.len = 13;
+	OK(sp);
+	sp.has_proc = 0;
+	OK(sp);
+}
+
 static void test_refusals(void)
 {
 	struct nfsp_rule_error err;
@@ -1481,6 +1669,7 @@ int main(void)
 	test_canonical();
 	test_valid();
 	test_padding_of_bound_zero();
+	test_one_procedure();
 	test_refusals();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

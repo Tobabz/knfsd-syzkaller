@@ -21,7 +21,7 @@ import time
 from typing import Mapping, Sequence
 
 from .tools import (MAX_SOURCE_BYTES, MAX_SOURCE_LINES, SOURCE_PREFIXES,
-                    IndexedMatch)
+                    IndexedMatch, IndexedSource)
 
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -388,7 +388,7 @@ class GitKernelSourceIndex:
         start_line: int,
         end_line: int,
         max_bytes: int,
-    ) -> str | None:
+    ) -> IndexedSource | None:
         """Read an inclusive, byte-bounded line range from one commit blob."""
 
         deadline = self._new_deadline()
@@ -410,7 +410,9 @@ class GitKernelSourceIndex:
         text = self._load_texts((entry,), deadline)[0]
         lines = text.splitlines(keepends=True)
         selected = "".join(lines[start_line - 1:end_line])
-        return self._utf8_prefix(selected, max_bytes)
+        return IndexedSource(
+            self._utf8_prefix(selected, max_bytes),
+            truncated=len(selected.encode("utf-8")) > max_bytes)
 
     def search(
         self,

@@ -1,5 +1,7 @@
 """Real artifact/checker/judge plumbing; synthetic facts, no VM or mapper."""
 
+import errno
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -155,6 +157,54 @@ def test_real_sealed_bytes_yield_deterministic_hit(tmp_path):
 def test_empty_published_aggregate_is_a_judgeable_miss(tmp_path):
     f = setup(tmp_path, pcs=())
     assert result(f).status is Q1Status.NOT_REACHED
+
+
+@pytest.mark.parametrize("where", ["object", "shard"])
+@pytest.mark.parametrize("code", [errno.EIO, errno.EMFILE])
+@pytest.mark.parametrize("which", [
+    "bundle_ref", "coverage_ref", "plan_ref", "mapping_ref", "profile", "boundary",
+])
+def test_open_failure_never_becomes_a_q1_verdict(tmp_path, monkeypatch, where, code, which):
+    f = setup(tmp_path)
+    baseline = result(f)
+    assert baseline.status is Q1Status.REACHED
+    refs = {"profile": f.versions.judge_profile_id,
+            "boundary": f.versions.support_boundary_id}
+    ref = refs[which] if which in refs else getattr(f, which)
+    target = ref if where == "object" else ref[:2]
+    real_open = os.open
+
+    def unavailable(path, flags, mode=0o777, *, dir_fd=None):
+        if path == target and dir_fd is not None:
+            raise OSError(code, os.strerror(code), path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", unavailable)
+        with pytest.raises(OSError):
+            result(f)
+        with pytest.raises(OSError):
+            f.judge.has_required_evidence(f.bundle_ref, f.versions)
+
+    assert result(f) == baseline
+    assert f.judge.has_required_evidence(f.bundle_ref, f.versions)
+
+
+@pytest.mark.parametrize("where", ["object", "shard"])
+def test_symlink_is_invalid_q1_evidence(tmp_path, where):
+    f = setup(tmp_path)
+    assert result(f).status is Q1Status.REACHED
+    path = f.store._path(f.coverage_ref)
+    if where == "shard":
+        path = path.parent
+    saved = tmp_path / "original"
+    path.rename(saved)
+    path.symlink_to(saved, target_is_directory=where == "shard")
+
+    verdict = result(f)
+    assert verdict.status is Q1Status.INCONCLUSIVE
+    assert verdict.reason == "evidence"
+    assert not f.judge.has_required_evidence(f.bundle_ref, f.versions)
 
 
 @pytest.mark.parametrize("include_hit", [False, True])

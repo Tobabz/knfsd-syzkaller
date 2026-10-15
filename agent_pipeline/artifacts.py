@@ -6,6 +6,7 @@ objects are verified before reuse and are never overwritten by ``put``.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -77,10 +78,12 @@ class ArtifactStore:
                 os.fsync(root_fd)
             try:
                 shard_fd = os.open(sha[:2], flags, dir_fd=root_fd)
-            except FileNotFoundError:
-                raise
             except OSError as exc:
-                raise ArtifactIntegrityError("artifact shard is not a directory") from exc
+                # Only filesystem shape violations establish invalid evidence.
+                # Absence, I/O and resource failures must remain retryable.
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise ArtifactIntegrityError("artifact shard is not a directory") from exc
+                raise
             try:
                 yield shard_fd
             finally:
@@ -93,10 +96,17 @@ class ArtifactStore:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         try:
             fd = os.open(sha, flags, dir_fd=shard_fd)
-        except FileNotFoundError:
-            raise
         except OSError as exc:
-            raise ArtifactIntegrityError("artifact is not a readable regular file") from exc
+            invalid_object = exc.errno in (errno.ELOOP, errno.ENOTDIR)
+            if exc.errno in (errno.ENXIO, errno.ENODEV):
+                # Some special files (e.g. sockets) fail before fstat. Verify
+                # their type instead of treating these errnos as corruption
+                # when a regular file's backing storage is unavailable.
+                info = os.stat(sha, dir_fd=shard_fd, follow_symlinks=False)
+                invalid_object = not stat.S_ISREG(info.st_mode)
+            if invalid_object:
+                raise ArtifactIntegrityError("artifact is not a readable regular file") from exc
+            raise
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):

@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .artifacts import ArtifactStore
 from .data import canonical_json, load_record, parse_json
-from .evidence import (ArtifactType, EvidenceStore, EvidenceVerificationError,
+from .evidence import (ArtifactType, EvidenceStore,
                        ExecutionCorrelation, Identifier, VerifiedBundle)
 from .q2 import (CandidateAssociation, ConsoleLogCompleteness, Digest,
                  ManagerCrashReport, Q2CollectionWindow, Q2Decision, Q2Evidence,
@@ -122,17 +122,6 @@ def _payload(raw: bytes, model: type[Model]) -> Model:
     if canonical_json(result) != raw:
         raise ValueError("noncanonical typed Q2 evidence payload")
     return result
-
-
-def _caused_by_io(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, OSError):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 class ArtifactQ2Judge:
@@ -294,11 +283,10 @@ class ArtifactQ2Judge:
         profile = self._profile(judge_profile_id)
         try:
             inputs = self._prepare(receipt, profile)
-        except EvidenceVerificationError as exc:
-            if _caused_by_io(exc):
-                raise Q2EvidenceUnavailable("sealed Q2 artifacts are unavailable") from exc
-            inputs = self._invalid_input(receipt, profile)
         except OSError as exc:
+            # EvidenceUnavailableError is an OSError too. Preserve that typed
+            # boundary: an integrity error may have an OS cause (e.g. ELOOP)
+            # without being a retryable availability failure.
             raise Q2EvidenceUnavailable("sealed Q2 artifacts are unavailable") from exc
         except (ValueError, TypeError, RecursionError):
             inputs = self._invalid_input(receipt, profile)
