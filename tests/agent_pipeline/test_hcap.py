@@ -541,9 +541,16 @@ def test_artifacts_and_direct_dependencies_fail_closed_after_success(
     else:
         path.write_bytes(b"SYNTHETIC TAMPERING")
     catalog_fault = dependency not in ("plan_ref", "program")
-    expected = "invalid_hcap_artifact" if catalog_fault else "invalid_plan_artifact"
-    assert synthetic.checker.check_plan(
-        synthetic.plan_ref, synthetic.revision).violations == (expected,)
+    if fault == "missing":
+        # Host availability: propagates so the Controller keeps pending work.
+        with pytest.raises(FileNotFoundError):
+            synthetic.checker.check_plan(synthetic.plan_ref, synthetic.revision)
+    else:
+        expected = "invalid_hcap_artifact" if catalog_fault else "invalid_plan_artifact"
+        result = synthetic.checker.check_plan(synthetic.plan_ref, synthetic.revision)
+        assert result.violations == (expected,)
+        # Only a corrupt host catalog is a host failure, not a plan finding.
+        assert result.host_authority == catalog_fault
     if catalog_fault:
         assert not synthetic.checker.knows_capability(synthetic.revision, "state_lineage")
         with pytest.raises((OSError, ValueError)):
@@ -557,13 +564,13 @@ def test_public_loader_raises_for_invalid_or_absent_catalog(synthetic):
         synthetic.checker.load_catalog("f" * 64)
 
 
-def test_io_failure_is_a_closed_check(synthetic, monkeypatch):
+def test_io_failure_propagates_and_is_not_a_plan_finding(synthetic, monkeypatch):
     def unreadable(_):
         raise PermissionError("synthetic read failure")
 
     monkeypatch.setattr(synthetic.store, "get", unreadable)
-    assert synthetic.checker.check_plan(
-        synthetic.plan_ref, synthetic.revision).violations == ("invalid_hcap_artifact",)
+    with pytest.raises(PermissionError):
+        synthetic.checker.check_plan(synthetic.plan_ref, synthetic.revision)
     assert not synthetic.checker.knows_capability(synthetic.revision, "state_lineage")
 
 

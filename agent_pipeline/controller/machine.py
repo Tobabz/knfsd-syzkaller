@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from ..components import HcapChecker, Materializer, Q1Judge
-from ..contracts import (HOST_AUTHORITY_UNAVAILABLE,
+from ..contracts import (HOST_AUTHORITY_UNAVAILABLE, HcapCheck,
                          NEUTRAL_CONTROL_UNAVAILABLE, TASK_VARIANTS, AgentTask,
                          GapClass, GapRef, HarnessBinding, JobPolicy,
                          MaterializationHcapAuthority, MaterializeRejected,
@@ -26,7 +26,7 @@ from . import events as ev
 from .records import (TERMINAL, WAITING, BlockedReason, ConsumedVerdict,
                       Job, JobState, PendingTask, RepairCause, RepairInput,
                       Stage2Input, Target, TargetKind, TaskKind)
-from .tasks import (RunnerInput, agent_input_digest,
+from .tasks import (CLEANUP_UNCONFIRMED, RunnerInput, agent_input_digest,
                     legacy_runner_input_digest, runner_input_digest)
 
 AGENT_STATES = {JobState.S1_ANALYSIS: AgentTask.CANDIDATE_ANALYSIS,
@@ -39,6 +39,17 @@ RESET_ON_RESUME = {
     BlockedReason.AGENT_FAILURE: "agent_retry",
     BlockedReason.RUNTIME_RETRY_EXHAUSTED: "runtime_retry",
 }
+
+
+def _plan_check_target(chk: HcapCheck, cause: RepairCause) -> Target:
+    """A failed plan check: Agent repair, unless the host catalog itself is
+    corrupt, which no plan change can fix (no LLM repair, no charge)."""
+    if chk.host_authority:
+        return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                      reason=BlockedReason.HOST_AUTHORITY,
+                      inner=Target(kind=TargetKind.MATERIALIZE))
+    return Target(kind=TargetKind.PLANNING, cause=cause,
+                  findings=chk.violations)
 
 
 def harness_authority_stale(j: Job, binding: HarnessBinding | None) -> bool:
@@ -215,12 +226,18 @@ class Machine:
             j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
                                        if t != e.task_id)
             c.reason = "cancel_settled"
+            if e.reason == CLEANUP_UNCONFIRMED:
+                self._cleanup_unconfirmed(c, e.task_id)
             return True
         p = j.pending_task
         if not self._is_pending(p, TaskKind.RUNNER, e.task_id) or \
                 j.state is not JobState.S1_RUNNING:
             return False
         j.pending_task = None
+        if e.reason == CLEANUP_UNCONFIRMED:
+            # Not a runtime failure to retry: the execution may still run.
+            self._cleanup_unconfirmed(c, e.task_id)
+            return True
         if e.state == "ended_unsealed" or not e.bundle_ref:
             c.reason = f"runner_ended_unsealed:{e.reason or ''}"
             self._goto(c, Target(kind=TargetKind.RUNNING, rerun=True))
@@ -361,9 +378,8 @@ class Machine:
                 chk = self.env.hcap.revalidate_plan(j.plan_ref,
                                                     new.hcap_revision)
                 if not chk.ok:
-                    self._goto(c, Target(kind=TargetKind.PLANNING,
-                                         cause=RepairCause.HCAP_CHANGED,
-                                         findings=chk.violations))
+                    self._goto(c, _plan_check_target(
+                        chk, RepairCause.HCAP_CHANGED))
             return True
         t = self._rebind(
             c, new, here,
@@ -494,6 +510,9 @@ class Machine:
             counter = RESET_ON_RESUME.get(BlockedReason(j.state_reason))
             if counter:
                 j.counters = j.counters.model_copy(update={counter: 0})
+            if j.state_reason == BlockedReason.EXECUTION_CLEANUP.value:
+                # The operator confirmed the executions are gone.
+                j.uncleaned_tasks = ()
             t = j.resume_point
             if t is None:
                 return False
@@ -517,7 +536,20 @@ class Machine:
         j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
                                    if t != e.task_id)
         c.reason = "cancel_settled"
+        if e.cleanup_unconfirmed:
+            self._cleanup_unconfirmed(c, e.task_id)
         return True
+
+    def _cleanup_unconfirmed(self, c: _Call, task_id: str) -> None:
+        """A Runner task ended without confirmed cleanup (09 §8): keep it
+        tracked and hand a live job to the operator.  A terminal job stays
+        closed; its record still names the task."""
+        j = c.job
+        if task_id not in j.uncleaned_tasks:
+            j.uncleaned_tasks = j.uncleaned_tasks + (task_id,)
+        c.reason = "cleanup_unconfirmed"
+        if j.state not in TERMINAL and j.state not in WAITING:
+            self._block(c, BlockedReason.EXECUTION_CLEANUP, self._here(j))
 
     # ------------------------------------------------------------ targets
 
@@ -600,9 +632,8 @@ class Machine:
             self.env.hcap.revalidate_plan
         chk = check(j.plan_ref, j.binding.hcap_revision)
         if not chk.ok:
-            return Target(kind=TargetKind.PLANNING,
-                          cause=failure_cause or RepairCause.HCAP_INVALID,
-                          findings=chk.violations)
+            return _plan_check_target(
+                chk, failure_cause or RepairCause.HCAP_INVALID)
         authority = MaterializationHcapAuthority(
             effective_hcap_revision=j.binding.hcap_revision,
             validation="exact_plan_revision" if require_revision else
@@ -706,9 +737,7 @@ class Machine:
             if not chk.ok:
                 if rematerialize_authority:
                     j.harness = None
-                return Target(kind=TargetKind.PLANNING,
-                              cause=RepairCause.HCAP_CHANGED,
-                              findings=chk.violations)
+                return _plan_check_target(chk, RepairCause.HCAP_CHANGED)
             if rematerialize_authority and keep:
                 self._keep_harness(j, new)
                 return base
@@ -726,9 +755,7 @@ class Machine:
                                                 new.hcap_revision)
             if not chk.ok:
                 j.harness = None
-                return Target(kind=TargetKind.PLANNING,
-                              cause=RepairCause.HCAP_CHANGED,
-                              findings=chk.violations)
+                return _plan_check_target(chk, RepairCause.HCAP_CHANGED)
             if keep:
                 self._keep_harness(j, new)
                 return base

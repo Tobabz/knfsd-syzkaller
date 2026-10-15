@@ -694,3 +694,48 @@ def test_reached_is_entered_only_on_a_reached_verdict(world):
     assert job.last_verdict.result.status is Q1Status.REACHED
     assert job.stage2_input.q1_verdict_id == \
         job.last_verdict.result.verdict_id
+
+
+def test_corrupt_host_catalog_blocks_without_llm_repair(world):
+    """A corrupt host HCAP catalog fails the plan check before the
+    Materializer runs; it is still a host failure, not a plan finding."""
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    world.hcap.corrupt.add("hcap-2")
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "host_authority"
+    assert job.pending_task is None
+    assert job.counters.agent_repair_stage1 == \
+        before.counters.agent_repair_stage1
+    assert world.c.replay(j) == job
+
+
+def test_unreadable_host_catalog_keeps_the_job_and_retries(world, monkeypatch):
+    """A missing or unreadable catalog is a host availability failure: no
+    transition and no charge; a later poll applies the change."""
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    real = world.hcap.check_plan
+
+    def unreadable(plan_ref, hcap_revision):
+        if hcap_revision == "hcap-2":
+            raise FileNotFoundError("catalog")
+        return real(plan_ref, hcap_revision)
+
+    monkeypatch.setattr(world.hcap, "check_plan", unreadable)
+    world.materializer.authority_changed.add("hcap-2")
+    world.registry.put(binding(hcap="hcap-2"))
+    with pytest.raises(FileNotFoundError):     # as a Materializer OSError
+        world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is before.state
+    assert job.binding == before.binding
+    assert job.counters == before.counters
+    monkeypatch.setattr(world.hcap, "check_plan", real)
+    world.c.on_registry_changed()
+    assert world.job(j).binding.hcap_revision == "hcap-2"

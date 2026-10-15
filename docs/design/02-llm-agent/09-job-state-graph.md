@@ -202,7 +202,7 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | `s1_analysis` | `analysis` | `s1_planning` | — | `03` §13 |
 | `s1_planning` | `plan`, HCAP 검사 실패(없는 capability, `usable_by`에 `agent_stage1` 없음, 다른 `hcap_revision`) | `s1_planning` (repair, `hcap_invalid`) | agent_repair | `04` §1.1, `05` §8 |
 | `s1_planning` | `plan`, Materializer typed 거부(`neutral_control_unavailable`, `host_authority_unavailable` 제외) | `s1_planning` (repair, `materializer_rejected`) | agent_repair | `05` §11, §13 |
-| `s1_planning` | `plan`, Materializer `host_authority_unavailable`(build approval에 없는 `hcap_revision`, 깨진 build artifact·HCAP·admission 기록, parser identity 불일치). plan을 고쳐 해결할 수 없다 | `blocked_operator(host_authority)`. `resume_point`는 materialize다 | — | `05` §11, §13 |
+| `s1_planning` | `plan`, Materializer `host_authority_unavailable`(build approval에 없는 `hcap_revision`, 깨진 build artifact·HCAP·admission 기록, parser identity 불일치) 또는 HCAP 검사가 host catalog 자체를 읽을 수 없다(깨진 catalog). plan을 고쳐 해결할 수 없다. catalog나 dependency 파일이 없거나 읽기가 실패하면 전이 없이 다음 poll에서 다시 시도한다 | `blocked_operator(host_authority)`. `resume_point`는 materialize다 | — | `05` §11, §13 |
 | `s1_planning` | `plan`, Materializer `neutral_control_unavailable` | `blocked_harness_gap(fixture_or_tool, neutral_control.<profile>)` | — | `05` §11 |
 | `s1_planning` | `plan`, materialize 성공, approval policy가 승인을 요구 | `s1_approval` | — | `05` §11, `02` §8 |
 | `s1_planning` | `plan`, materialize 성공, 승인 불필요 | `s1_running` | — | |
@@ -370,6 +370,7 @@ Job
     pending_task?          # task_id, kind (agent | runner | human),
                            # 입력 digest, agent면 지금 attempt
     cancelling_tasks[]     # cancel을 보내고 종료 응답을 기다리는 Runner task
+    uncleaned_tasks[]      # lease는 끝났지만 실행 정리를 확인하지 못한 Runner task
     resume_point?          # 대기 상태(§1)와 retry_pending일 때. 대기 상태를
                            # 가리키면 그 상태의 resume_point도 둔다(§5)
 
@@ -404,6 +405,12 @@ cancel(task_id)           실행을 멈추고 끝난 뒤 최종 status를 돌려
                           모르는 task_id면 cancel된 것으로 기록하고
                           ended_unsealed(cancelled)를 돌려준다
 ```
+
+backend가 실행 종료를 확인하지 못하면(예: 프로세스 정리 실패) Runner는 완료를 기록하지 않고 lease 만료를 기다린다.
+만료되면 `ended_unsealed(cleanup_unconfirmed)`로 끝낸다. 이것은 확인된 cancel도, runtime 재시도 대상도 아니다.
+Controller는 그 task를 `uncleaned_tasks`에 남기고, 종료 상태가 아닌 job은 `blocked_operator(execution_cleanup)`로
+보낸다. operator가 실행이 사라졌음을 확인하고 `resume`하면 목록을 비우고 멈춘 곳에서 이어 간다. 종료된 job은
+그대로 두되 기록에 task가 남는다.
 
 `sealed`는 마지막 bundle까지 봉인하고 끝났다는 뜻이고, `ended_unsealed`는 마지막 bundle 없이 끝났다는 뜻이다.
 campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running` 동안에도 목록이 늘어난다.
@@ -601,6 +608,7 @@ bundle fixture로 대신한다.
 | `s1_planning`과 `s1_running`을 오간 끝에 `blocked_operator(stage1_repair_budget)` | 시나리오 선택 실패, 분석 오류, Q1 관측 범위 문제. 어느 쪽인지 모를 수 있다 | `AgentAttempt`의 `RepairInput`과 Q1Result 순서, `observations` | 사람이 검토해 budget을 늘려 `resume`하거나 close |
 | `blocked_operator(runtime_retry_exhausted)`. 여러 job에서 함께 나올 수 있다 | 인프라 문제(VM, fixture), 반복되는 관측 손실(`loss`), gate의 M1 evidence 경로 문제 | 재실행마다의 Q1 reason과 gate의 M1 verdict, 같은 harness build인지 | harness·infra·evidence 경로를 고친 뒤 `resume` |
 | `blocked_operator(unexpected_event)` | Controller 구현과 이 표의 불일치, 또는 상류 문서의 새 reason | `Transition`의 event와 상태 | 표나 구현을 고친다 |
+| `blocked_operator(execution_cleanup)` | Runner backend가 실행 정리를 확인하지 못한 채 lease가 끝났다(signal 실패, 죽지 않는 프로세스) | job의 `uncleaned_tasks`, Runner의 attempt 기록, backend 자원 상태(`ProcessSupervisor`면 `quarantined`) | 실행이 사라졌는지 확인한 뒤 `resume` |
 | `blocked_operator(host_authority)` | registry가 build approval보다 먼저 새 `hcap_revision`을 공개했다, build artifact·HCAP·admission 기록이 깨졌다, parser build가 harness identity와 다르다 | `Transition`의 Materializer 거부 detail | 호스트 쪽 기록을 고친 뒤 `resume`(다시 materialize한다) |
 | `blocked_operator(gap_id_unknown)` | HCAP vocabulary에 없는 capability가 필요하다 | `unsupported` 출력의 `reason`에 적힌 필요한 capability | vocabulary를 확장해 `resume`하거나 close |
 | issue가 해결됐는데 `blocked_harness_gap`에 남아 있다 | issue 상태 이벤트를 받지 못했다 | tracker 상태와 job의 issue 참조 | 원인 모름. tracker 연동을 확인한다 |

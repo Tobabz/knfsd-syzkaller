@@ -27,7 +27,8 @@ from .machine import Env, Machine, Outcome, harness_authority_stale
 from .records import (TERMINAL, AgentAttempt, Job, JobState, TaskKind,
                       Transition)
 from .store import Store
-from .tasks import (AgentExecutor, AgentRequest, Runner, RunnerInput,
+from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
+                    RunnerInput,
                     agent_input_digest, legacy_runner_input_digest,
                     runner_input_digest)
 
@@ -252,10 +253,16 @@ class Controller:
                     lambda: self._poll_pending(job_id))
 
     def _recancel(self, job_id: str, task_id: str) -> None:
-        if self.runner.status(task_id).state in FINAL:
-            self._apply(job_id, ev.CancelConfirmed(task_id=task_id))
+        st = self.runner.status(task_id)
+        if st.state in FINAL:
+            self._confirm_cancel(job_id, task_id, st)
         else:
             self._cancel(job_id, task_id)
+
+    def _confirm_cancel(self, job_id: str, task_id: str, st) -> None:
+        self._apply(job_id, ev.CancelConfirmed(
+            task_id=task_id,
+            cleanup_unconfirmed=st.reason == CLEANUP_UNCONFIRMED))
 
     def _poll_pending(self, job_id: str) -> None:
         job = self.store.job(job_id)
@@ -659,7 +666,7 @@ class Controller:
     def _cancel(self, job_id: str, task_id: str) -> None:
         st = self.runner.cancel(task_id)
         if st.state in FINAL:
-            self._apply(job_id, ev.CancelConfirmed(task_id=task_id))
+            self._confirm_cancel(job_id, task_id, st)
 
     def _take_status(self, job_id: str, task_id: str, st) -> None:
         if st.state in FINAL:

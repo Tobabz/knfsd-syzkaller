@@ -15,7 +15,7 @@ from agent_pipeline.controller.tasks import (RunnerInput, SubmitRefused,
 from agent_pipeline.data import canonical_json
 from agent_pipeline.runner import (
     BACKEND_ERROR,
-    CANCELLED,
+    CLEANUP_UNCONFIRMED,
     EXECUTOR_ENDED_UNSEALED,
     BackendResult,
     DurableRunner,
@@ -277,7 +277,9 @@ def test_unconfirmed_stop_keeps_a_cancel_pending_until_lease_expiry(tmp_path):
     assert runner.cancel("job-1.t1").state == "running"
     clock.set(110)
     ended = runner.status("job-1.t1")
-    assert (ended.state, ended.reason) == ("ended_unsealed", CANCELLED)
+    # Never a confirmed cancel: the execution may still be running.
+    assert (ended.state, ended.reason) == ("ended_unsealed", CLEANUP_UNCONFIRMED)
+    assert runner.receipt("job-1.t1").reason == CLEANUP_UNCONFIRMED
     runner.close()
 
 
