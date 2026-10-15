@@ -475,6 +475,215 @@ static int same_batch(const struct nfsp_mutation_batch *a,
 	return 1;
 }
 
+static void test_empty_value_adjacent_edit(void)
+{
+	static const char tag[] = "tproto.request.COMPOUND.args.tag";
+	struct nfsp_decoded_msg decoded = {0};
+	struct nfsp_mutation_verify verify = verify_context();
+	struct nfsp_mutation_batch baseline = {0};
+	struct nfsp_resolver_record record;
+	struct nfsp_rule canonical[2];
+	struct msg call, expected;
+
+	printf("mutation apply: empty preserve value and adjacent field ownership\n");
+	build_call(&call, 7, "", "hello");
+	build_call(&expected, 7, "old", "hello");
+	CHECK(decode_call(&call, &decoded) == 0, "decode adjacent fixture");
+	record = record_for(&call, &decoded);
+	base_rule(&canonical[0], "z-tag", NULL, tag);
+	literal_string(&canonical[0], "old");
+	base_rule(&canonical[1], "a-minor", NULL,
+		  "tproto.request.COMPOUND.args.minorversion");
+	literal_uint(&canonical[1], 0);
+	for (uint32_t p = 0; p < 2; p++) {
+		struct nfsp_mutation_batch batch = {0};
+		struct nfsp_mutation_output output = {0};
+		struct nfsp_resolution resolution;
+		struct nfsp_rule rules[2] = {canonical[p], canonical[1u - p]};
+		struct nfsp_ruleset set = rule_set(rules, 2);
+
+		CHECK(nfsp_resolve_rules(&set, &record, &resolution) == 0 &&
+		      resolution.preflight == NFSP_PREFLIGHT_READY,
+		      "adjacent footprints must resolve");
+		CHECK(nfsp_mutation_lower(&record, &resolution, &batch) ==
+		      NFSP_MUTATION_OK, "lower adjacent empty field");
+		CHECK(batch.concrete.nedits == 2u && batch.edits[0].offset == 40u &&
+		      batch.edits[0].remove_len == 4u && batch.edits[0].data_len == 8u &&
+		      g32(batch.edits[0].original) == 0u &&
+		      g32(batch.edits[0].data) == 3u &&
+		      !memcmp(batch.edits[0].data + 4, "old\0", 4) &&
+		      batch.edits[1].offset == 44u &&
+		      batch.edit_flags[0] == (NFSP_MUTATION_EDIT_TARGET |
+			NFSP_MUTATION_EDIT_DERIVED_LENGTH |
+			NFSP_MUTATION_EDIT_DERIVED_PADDING) &&
+		      batch.mutation_index[0] == 1u,
+		      "coalesced edit lost original bytes, derived flags or owner");
+		if (p == 0u)
+			CHECK(nfsp_mutation_lower(&record, &resolution, &baseline) ==
+			      NFSP_MUTATION_OK, "lower permutation baseline");
+		else
+			CHECK(same_batch(&baseline, &batch),
+			      "adjacent edit permutation changed signed batch inputs");
+		CHECK(nfsp_mutation_apply(&record, &resolution, &verify, &output) ==
+		      NFSP_MUTATION_OK, "apply adjacent edits");
+		CHECK(output.rpc_payload_len == expected.n &&
+		      !memcmp(output.rpc_payload, expected.b, expected.n),
+		      "adjacent edits changed unintended bytes");
+		if (output.framed_bytes != NULL) {
+			check_frame(&output);
+			check_value(&output, tag, (const uint8_t *)"old", 3);
+		}
+		nfsp_mutation_output_free(&output);
+		call.b[43] = 1; /* Stale original length, despite an empty value. */
+		CHECK(nfsp_mutation_apply(&record, &resolution, &verify, &output) ==
+		      NFSP_MUTATION_ORIGINAL_MISMATCH && output.framed_bytes == NULL,
+		      "coalescing must retain exact original length precondition");
+		call.b[43] = 0;
+		resolution.mutations[1].output.len = UINT32_MAX - 3u;
+		CHECK(nfsp_mutation_apply(&record, &resolution, &verify, &output) ==
+		      NFSP_MUTATION_STRUCTURE_CONSTRAINT_FAILED && output.framed_bytes == NULL,
+		      "coalesced encoding size must not wrap around");
+		resolution.mutations[1].output.len = 3;
+		nfsp_resolution_free(&resolution);
+		nfsp_mutation_batch_free(&batch);
+	}
+	nfsp_mutation_batch_free(&baseline);
+
+	/* Coalescing must not hide a real owner overlap, including an empty field. */
+	for (uint32_t p = 0; p < 2; p++) {
+		struct nfsp_mutation_output output = {0};
+		struct nfsp_resolution resolution;
+		struct nfsp_ruleset set = rule_set(canonical, 2);
+
+		base_rule(&canonical[1], "a-overlap", NULL, tag);
+		canonical[1].policy = NFSP_POLICY_RAW;
+		if (p == 0u) {
+			canonical[1].part = NFSP_PART_LENGTH;
+			literal_uint(&canonical[1], 3);
+		} else {
+			literal_string(&canonical[1], "other");
+		}
+		CHECK(nfsp_resolve_rules(&set, &record, &resolution) == 0 &&
+		      resolution.preflight == NFSP_PREFLIGHT_CONFLICT,
+		      "empty field overlap must conflict");
+		resolution.preflight = NFSP_PREFLIGHT_READY;
+		CHECK(nfsp_mutation_apply(&record, &resolution, &verify, &output) ==
+		      NFSP_MUTATION_CONFLICT && output.framed_bytes == NULL,
+		      "lowering must independently reject owner overlap");
+		nfsp_resolution_free(&resolution);
+	}
+	nfsp_decoded_msg_free(&decoded);
+}
+
+static void test_raw_schema_dispatch_and_safe_controls(void)
+{
+	static const char minor[] = "tproto.request.COMPOUND.args.minorversion";
+	static const uint32_t values[] = {1u, 99u};
+	struct nfsp_mutation_verify verify = verify_context();
+	struct nfsp_decoded_msg decoded = {0};
+	struct nfsp_resolver_record record;
+	struct nfsp_rule rule;
+	struct msg call;
+
+	printf("mutation apply: raw schema selector, discriminant and safe controls\n");
+	build_call(&call, 7, "ab", "hello");
+	/* PING's encoding is the same in both supported minor versions. */
+	call.n = 60;
+	call.b[55] = 1;
+	CHECK(decode_call(&call, &decoded) == 0, "decode schema-dispatch fixture");
+	record = record_for(&call, &decoded);
+	for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+		struct nfsp_mutation_output output = {0};
+		struct nfsp_resolution resolution;
+		struct nfsp_decoded_msg changed = {0};
+		struct nfsp_ruleset set;
+		struct msg expected = call;
+
+		base_rule(&rule, "minor", NULL, minor);
+		rule.policy = NFSP_POLICY_RAW;
+		literal_uint(&rule, values[i]);
+		set = rule_set(&rule, 1);
+		CHECK(nfsp_resolve_rules(&set, &record, &resolution) == 0 &&
+		      resolution.preflight == NFSP_PREFLIGHT_READY,
+		      "resolve raw schema selector");
+		CHECK(nfsp_mutation_apply(&record, &resolution, &verify, &output) ==
+		      NFSP_MUTATION_OK, "apply raw minor %u", values[i]);
+		expected.b[51] = (uint8_t)values[i];
+		CHECK(output.rpc_payload_len == expected.n &&
+		      !memcmp(output.rpc_payload, expected.b, expected.n),
+		      "raw minor output differs from exact intended bytes");
+		if (output.framed_bytes != NULL) {
+			check_frame(&output);
+			if (values[i] == 1u)
+				CHECK(decode_payload(output.rpc_payload, output.rpc_payload_len,
+						     &changed) == 0 && changed.minor_version == 1u &&
+				      strcmp(changed.schema->schema_id, decoded.schema->schema_id),
+				      "supported changed minor must independently decode");
+			else
+				CHECK(decode_payload(output.rpc_payload, output.rpc_payload_len,
+						     &changed) != 0 &&
+				      changed.status == NFSP_DECODE_UNSUPPORTED_SCHEMA,
+				      "unknown raw minor must retain raw semantics");
+		}
+		nfsp_decoded_msg_free(&changed);
+		nfsp_mutation_output_free(&output);
+		nfsp_resolution_free(&resolution);
+	}
+	nfsp_decoded_msg_free(&decoded);
+	build_call(&call, 7, "ab", "hello");
+	CHECK(decode_call(&call, &decoded) == 0, "decode safe controls");
+	record = record_for(&call, &decoded);
+	for (uint32_t i = 0; i < 4; i++) {
+		struct nfsp_mutation_output output = {0};
+		struct nfsp_resolution resolution;
+		struct nfsp_ruleset set;
+
+		base_rule(&rule, "control", i == 0u || i == 3u ? NULL : "WRITE",
+			  i == 0u || i == 3u ? minor : i == 1u ?
+			  "tproto.request.WRITE.args.id.seq" :
+			  "tproto.request.WRITE.args.target.kind");
+		rule.policy = i == 3u ? NFSP_POLICY_PRESERVE : NFSP_POLICY_RAW;
+		literal_uint(&rule, i == 0u ? 0u : i == 1u ? 9u : 1u);
+		if (i == 2u)
+			rule.transform.value.kind = NFSP_LIT_ENUM;
+		set = rule_set(&rule, 1);
+		CHECK(nfsp_resolve_rules(&set, &record, &resolution) == 0 &&
+		      resolution.preflight == NFSP_PREFLIGHT_READY, "resolve control %u", i);
+		/* A no-op selector and an ordinary raw scalar still need a decoder.
+		 * Raw discriminants may change layout; preserve selectors may not. */
+		CHECK(nfsp_mutation_apply(&record, &resolution, NULL, &output) ==
+		      (i == 2u ? NFSP_MUTATION_OK : NFSP_MUTATION_VERIFY_FAILED),
+		      "raw verification classification %u", i);
+		nfsp_mutation_output_free(&output);
+		CHECK(nfsp_mutation_apply(&record, &resolution, &verify, &output) ==
+		      (i == 3u ? NFSP_MUTATION_VERIFY_FAILED : NFSP_MUTATION_OK),
+		      "verified control %u", i);
+		if (i == 1u && output.framed_bytes != NULL) {
+			const uint8_t seq[4] = {0, 0, 0, 9};
+
+			check_value(&output, rule.target_path, seq, 4);
+		}
+		nfsp_mutation_output_free(&output);
+		if (i <= 1u) {
+			struct nfsp_mutation_batch batch = {0};
+
+			/* Break an unrelated operation after resolution.  Concrete
+			 * preconditions still match, so only a real semantic decode
+			 * can reject the output, using the normal verifier context. */
+			call.b[59] = 99;
+			CHECK(nfsp_mutation_lower(&record, &resolution, &batch) ==
+			      NFSP_MUTATION_OK, "negative decode control must lower");
+			CHECK(nfsp_mutation_apply(&record, &resolution, &verify, &output) ==
+			      NFSP_MUTATION_VERIFY_FAILED && output.framed_bytes == NULL,
+			      "safe raw field %u skipped independent semantic verification", i);
+			call.b[59] = 1;
+			nfsp_mutation_batch_free(&batch);
+		}
+		nfsp_resolution_free(&resolution);
+	}
+	nfsp_decoded_msg_free(&decoded);
+}
+
 static void test_permutation_final_bytes(void)
 {
 	static const uint32_t permutations[6][3] = {
@@ -699,6 +908,25 @@ static void test_concrete_preflight_order(void)
 	CHECK(nfsp_concrete_preflight(&batch, input, sizeof(input), 64,
 				      &final_len) == NFSP_CONCRETE_BOUNDS,
 	      "bounds must precede overlap/original checks");
+	edits[0].offset = edits[1].offset = 2;
+	edits[0].remove_len = 0;
+	edits[0].original = NULL;
+	edits[1].original = input + 2;
+	CHECK(nfsp_concrete_preflight(&batch, input, sizeof(input), 64,
+				      &final_len) == NFSP_CONCRETE_CONFLICT,
+	      "independent insert and replacement at one boundary still conflict");
+	reversed[0] = edits[1];
+	reversed[1] = edits[0];
+	batch.edits = reversed;
+	CHECK(nfsp_concrete_preflight(&batch, input, sizeof(input), 64,
+				      &final_len) == NFSP_CONCRETE_CONFLICT,
+	      "reordering must not permit a boundary collision");
+	edits[1].remove_len = 0;
+	edits[1].original = NULL;
+	batch.edits = edits;
+	CHECK(nfsp_concrete_preflight(&batch, input, sizeof(input), 64,
+				      &final_len) == NFSP_CONCRETE_CONFLICT,
+	      "independent inserts at one boundary still conflict");
 }
 
 int main(void)
@@ -706,6 +934,8 @@ int main(void)
 	test_preserve_variables_and_batch();
 	test_preserve_shrink_and_empty_input();
 	test_raw_scalar_and_metadata();
+	test_empty_value_adjacent_edit();
+	test_raw_schema_dispatch_and_safe_controls();
 	test_permutation_final_bytes();
 	test_overlap_and_structure_refusal();
 	test_dynamic_originals();

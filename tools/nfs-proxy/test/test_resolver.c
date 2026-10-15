@@ -360,6 +360,167 @@ static void test_reference_ambiguity(void)
 	nfsp_decoded_msg_free(&decoded_call);
 }
 
+static void test_cross_operation_references(void)
+{
+	static const char name[] = "tproto.request.LOOKUP.args.name";
+	const char *fields[] = { name };
+	const enum nfsp_rule_source sources[] = {
+		NFSP_SRC_CURRENT_MESSAGE, NFSP_SRC_REQUEST_FORWARDED,
+		NFSP_SRC_REQUEST_ORIGINAL,
+	};
+
+	printf("resolver: other operation references are message-wide and unique\n");
+	for (size_t s = 0; s < sizeof(sources) / sizeof(sources[0]); s++) {
+		for (uint32_t occurrences = 0; occurrences <= 2; occurrences++) {
+			struct nfsp_decoded_msg request = {0}, forwarded = {0};
+			struct nfsp_decoded_msg response = {0};
+			struct nfsp_resolver_transaction tx = {0};
+			struct nfsp_rule_predicate predicate = {0};
+			struct nfsp_resolver_record record;
+			struct nfsp_resolution result;
+			struct nfsp_ruleset rs;
+			struct nfsp_rule rule;
+			struct msg call, reply;
+			int is_reply = sources[s] != NFSP_SRC_CURRENT_MESSAGE;
+
+			build_call(&call, 7);
+			call.n -= 12u; /* Remove the final LOOKUP. */
+			call.b[55] = (uint8_t)(2u + occurrences);
+			for (uint32_t i = 0; i < occurrences; i++) {
+				w32(&call, 3); wopaque(&call, "file");
+			}
+			CHECK(decode_msg(&call, NULL, &request) == 0, "decode call");
+			CHECK(decode_msg(&call, NULL, &forwarded) == 0, "decode forwarded");
+			build_reply(&reply);
+			CHECK(decode_msg(&reply, &dispatch, &response) == 0,
+			      "decode reply");
+			base_rule(&rule, "cross-op", is_reply, "WRITE", is_reply ?
+				  "tproto.response.WRITE.result.ok.count" :
+				  "tproto.request.WRITE.args.id.seq");
+			literal_uint(&rule, 11);
+			request_ref(&predicate.lhs, sources[s], name);
+			predicate.op = NFSP_CMP_EQ;
+			predicate.rhs_kind = NFSP_OPND_LITERAL;
+			predicate.rhs_literal.kind = NFSP_LIT_OPAQUE;
+			predicate.rhs_literal.bytes = (const uint8_t *)"file";
+			predicate.rhs_literal.len = 4;
+			rule.predicates = &predicate;
+			rule.npredicates = 1;
+			if (is_reply) {
+				struct nfsp_rule_view_deps *deps =
+					sources[s] == NFSP_SRC_REQUEST_ORIGINAL ?
+					&rule.original : &rule.forwarded;
+
+				deps->request_fields = fields;
+				deps->nfields = 1;
+				deps->request_operation_sequence = 1;
+				rule.forwarded.rpc_procedure = 1;
+				rule.forwarded.request_operation_sequence = 1;
+			}
+			tx.state = NFSP_RESOLVER_TXN_FOUND;
+			tx.program = TPROTO_PROG;
+			tx.version = tx.procedure = 1;
+			tx.original.payload = tx.forwarded.payload = call.b;
+			tx.original.payload_len = tx.forwarded.payload_len = call.n;
+			tx.original.message = &request;
+			tx.forwarded.message = &forwarded;
+			record = is_reply ? call_record(&reply, &response) :
+				call_record(&call, &request);
+			record.direction = is_reply ? NFSP_RULE_S2C : NFSP_RULE_C2S;
+			record.transaction = &tx;
+			rs = rule_set(&rule, 1);
+			CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0,
+			      "resolve cross-op reference");
+			CHECK(result.nmutations == (occurrences == 1u ? 1u : 0u) &&
+			      result.rules[0].count[occurrences == 0u ?
+				NFSP_RESOLVE_PREDICATE_FALSE : occurrences == 1u ?
+				NFSP_RESOLVE_RESOLVED :
+				NFSP_RESOLVE_PREDICATE_REFERENCE_AMBIGUOUS] == 1u,
+			      "source %u occurrences %u classification", (unsigned)sources[s],
+			      occurrences);
+			nfsp_resolution_free(&result);
+
+			if (is_reply && occurrences == 1u) {
+				/* The LOOKUP is unique, but the response's WRITE must
+				 * still match the request occurrence at sequence 1. */
+				forwarded.ops[1].opcode = 3;
+				CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0 &&
+				      result.nmutations == 0u && result.rules[0].count[
+					NFSP_RESOLVE_PREDICATE_REFERENCE_AMBIGUOUS] == 1u,
+				      "cross-op reference bypassed forwarded correspondence");
+				nfsp_resolution_free(&result);
+				forwarded.ops[1].opcode = 2;
+				if (sources[s] == NFSP_SRC_REQUEST_ORIGINAL) {
+					/* Matching target opcode/sequence is insufficient if
+					 * another original operation was reordered. */
+					request.ops[2].sequence_index = 99;
+					CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0 &&
+					      result.nmutations == 0u && result.rules[0].count[
+						NFSP_RESOLVE_PREDICATE_REFERENCE_AMBIGUOUS] == 1u,
+					      "cross-op original bypassed sequence equality");
+					nfsp_resolution_free(&result);
+					request.ops[2].sequence_index = 2;
+				}
+			}
+
+			if (!is_reply) {
+				base_rule(&rule, "cross-copy", 0, "WRITE",
+					  "tproto.request.WRITE.args.data");
+				rule.transform.kind = NFSP_XF_COPY;
+				current_ref(&rule.transform.source, 0, name);
+				CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0,
+				      "resolve cross-op copy");
+				CHECK(result.nmutations == (occurrences == 1u ? 1u : 0u),
+				      "copy must require a unique source");
+				if (result.nmutations == 1u)
+					CHECK(result.mutations[0].output.len == 4u &&
+					      !memcmp(result.mutations[0].output.bytes, "file", 4),
+					      "copied other operation value");
+				nfsp_resolution_free(&result);
+			}
+			nfsp_decoded_msg_free(&request);
+			nfsp_decoded_msg_free(&forwarded);
+			nfsp_decoded_msg_free(&response);
+		}
+	}
+}
+
+static void test_same_operation_occurrence(void)
+{
+	static const char name[] = "tproto.request.LOOKUP.args.name";
+	struct nfsp_decoded_msg decoded = {0};
+	struct nfsp_rule_predicate predicate = {0};
+	struct nfsp_resolver_record record;
+	struct nfsp_resolution result;
+	struct nfsp_ruleset rs;
+	struct nfsp_rule rule;
+	struct msg call;
+
+	printf("resolver: repeated same operation binds its own occurrence\n");
+	build_call(&call, 7);
+	call.b[55] = 4;
+	w32(&call, 3); wopaque(&call, "other");
+	CHECK(decode_msg(&call, NULL, &decoded) == 0, "decode repeated LOOKUP");
+	base_rule(&rule, "local", 0, "LOOKUP", name);
+	literal_opaque(&rule, "changed", 7);
+	current_ref(&predicate.lhs, 0, name);
+	predicate.op = NFSP_CMP_EQ;
+	predicate.rhs_kind = NFSP_OPND_LITERAL;
+	predicate.rhs_literal.kind = NFSP_LIT_OPAQUE;
+	predicate.rhs_literal.bytes = (const uint8_t *)"file";
+	predicate.rhs_literal.len = 4;
+	rule.predicates = &predicate;
+	rule.npredicates = 1;
+	rs = rule_set(&rule, 1);
+	record = call_record(&call, &decoded);
+	CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0 &&
+	      result.nmutations == 1u && result.mutations[0].operation_index == 2u &&
+	      result.rules[0].count[NFSP_RESOLVE_PREDICATE_FALSE] == 1u,
+	      "same-type occurrences must not become message-wide ambiguous");
+	nfsp_resolution_free(&result);
+	nfsp_decoded_msg_free(&decoded);
+}
+
 static void test_request_original_and_forwarded(void)
 {
 	static const char count_path[] =
@@ -440,6 +601,32 @@ static void test_request_original_and_forwarded(void)
 	      result.nmutations ? (unsigned long long)
 		result.mutations[0].output.number : 0ull);
 	nfsp_resolution_free(&result);
+
+	/* Same-type request references still require proven correspondence. */
+	rule.transform.kind = NFSP_XF_LITERAL;
+	literal_uint(&rule, 11);
+	request_ref(&predicates[1].lhs, NFSP_SRC_REQUEST_ORIGINAL, request_seq);
+	predicates[1].rhs_literal.num = 7;
+	original_decoded.ops[1].sequence_index = 99;
+	CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0 &&
+	      result.nmutations == 0u && result.rules[0].count[
+		NFSP_RESOLVE_PREDICATE_REFERENCE_AMBIGUOUS] == 1u,
+	      "reordered original operations must not bind");
+	nfsp_resolution_free(&result);
+	original_decoded.ops[1].sequence_index = 1;
+	forwarded_decoded.ops[1].opcode = 3;
+	CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0 &&
+	      result.nmutations == 0u && result.rules[0].count[
+		NFSP_RESOLVE_PREDICATE_REFERENCE_AMBIGUOUS] == 1u,
+	      "original must correspond to forwarded operations");
+	nfsp_resolution_free(&result);
+	predicates[1].lhs.source = NFSP_SRC_REQUEST_FORWARDED;
+	CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0 &&
+	      result.nmutations == 0u && result.rules[0].count[
+		NFSP_RESOLVE_PREDICATE_REFERENCE_AMBIGUOUS] == 1u,
+	      "forwarded opcode must match the response occurrence");
+	nfsp_resolution_free(&result);
+	forwarded_decoded.ops[1].opcode = 2;
 
 	transaction.original.message = NULL;
 	CHECK(nfsp_resolve_rules(&rs, &record, &result) == 0,
@@ -637,6 +824,8 @@ int main(void)
 {
 	test_typed_current_and_all_matches();
 	test_reference_ambiguity();
+	test_cross_operation_references();
+	test_same_operation_occurrence();
 	test_request_original_and_forwarded();
 	test_structure_conflict_and_order();
 	test_ready_order_invariance();

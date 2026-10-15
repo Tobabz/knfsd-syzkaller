@@ -15,6 +15,7 @@ _Static_assert(NFSP_CONCRETE_EDIT_MAX >= NFSP_RESOLVED_MAX * 2u,
 enum plan_form {
 	PLAN_SIMPLE = 0,
 	PLAN_LENGTH,
+	PLAN_EMPTY_VALUE,
 	PLAN_VALUE_PADDING
 };
 
@@ -408,7 +409,22 @@ nfsp_mutation_lower(const struct nfsp_resolver_record *record,
 			put32(length->original_word, mutation->current.len);
 			put32(length->data_word, mutation->output.len);
 
-			if (mutation->current.len + old_padding[i] != 0u ||
+			if (mutation->current.len == 0u &&
+			    mutation->output.len != 0u) {
+				/* Own the empty field's length word together with its
+				 * new value.  A separate insertion at value.off would
+				 * collide with an edit of the adjacent field. */
+				if (mutation->output.len + new_padding[i] > UINT32_MAX - 4u)
+					return NFSP_MUTATION_STRUCTURE_CONSTRAINT_FAILED;
+				length->form = PLAN_EMPTY_VALUE;
+				length->data_len += mutation->output.len + new_padding[i];
+				length->flags |= NFSP_MUTATION_EDIT_TARGET;
+				if (new_padding[i] != 0u)
+					length->flags |= NFSP_MUTATION_EDIT_DERIVED_PADDING;
+				length->data = mutation->output.bytes;
+				length->new_value_len = mutation->output.len;
+				length->new_padding = new_padding[i];
+			} else if (mutation->current.len + old_padding[i] != 0u ||
 			    mutation->output.len + new_padding[i] != 0u) {
 				tail = &plans[nplans++];
 				tail->offset = mutation->wire.value.off;
@@ -479,7 +495,8 @@ nfsp_mutation_lower(const struct nfsp_resolver_record *record,
 					plan->old_value_len,
 				       plan->old_padding);
 			} else {
-				const uint8_t *source = plan->form == PLAN_LENGTH ?
+				const uint8_t *source = (plan->form == PLAN_LENGTH ||
+					plan->form == PLAN_EMPTY_VALUE) ?
 					plan->original_word : plan->original;
 
 				memcpy(out->storage + used, source,
@@ -490,9 +507,16 @@ nfsp_mutation_lower(const struct nfsp_resolver_record *record,
 		edit->data_len = plan->data_len;
 		if (plan->data_len != 0u) {
 			edit->data = out->storage + used;
-			if (plan->form == PLAN_VALUE_PADDING) {
-				memcpy(out->storage + used, plan->data,
+			if (plan->form == PLAN_EMPTY_VALUE) {
+				memcpy(out->storage + used, plan->data_word, 4u);
+				memcpy(out->storage + used + 4u, plan->data,
 				       plan->new_value_len);
+				memset(out->storage + used + 4u + plan->new_value_len,
+				       0, plan->new_padding);
+			} else if (plan->form == PLAN_VALUE_PADDING) {
+				if (plan->new_value_len != 0u)
+					memcpy(out->storage + used, plan->data,
+					       plan->new_value_len);
 				memset(out->storage + used + plan->new_value_len, 0,
 				       plan->new_padding);
 			} else {
@@ -570,6 +594,35 @@ static int layout_discriminant(const struct nfsp_decoded_msg *message,
 	       span_equal(field->wire.discriminant, mutation->selected);
 }
 
+static int schema_selector_changed(const struct nfsp_decoded_msg *message,
+				   const struct nfsp_resolved_mutation *mutation)
+{
+	const struct nfsp_protocol_schema *schema = message->schema;
+	const struct nfsp_semantic_field *field =
+		&message->fields[mutation->field_index];
+	const struct nfsp_schema_proc *proc;
+	const struct nfsp_schema_type *args;
+	const struct nfsp_schema_field *selector;
+	const struct nfsp_semantic_field *parent;
+
+	if (message->msg_type != NFSP_RPC_CALL || !schema->has_minor ||
+	    message->procedure != schema->selector_proc ||
+	    mutation->current.number == mutation->output.number ||
+	    field->parent >= message->nfields)
+		return 0;
+	proc = nfsp_schema_proc(schema, schema->selector_proc);
+	if (proc == NULL || proc->arg >= schema->ntypes)
+		return 0;
+	args = &schema->types[proc->arg];
+	if (args->kind != NFSP_XK_STRUCT || schema->selector_field >= args->count)
+		return 0;
+	selector = &schema->fields[args->first + schema->selector_field];
+	parent = &message->fields[field->parent];
+	return parent->parent == NFSP_FIELD_NONE && parent->type == proc->arg &&
+	       field->op == NFSP_FIELD_NONE && field->type == selector->type &&
+	       field->component != NULL && !strcmp(field->component, selector->name);
+}
+
 static int batch_is_semantically_decodable(
 		const struct nfsp_resolver_record *record,
 		const struct nfsp_resolution *resolution)
@@ -582,7 +635,8 @@ static int batch_is_semantically_decodable(
 			continue;
 		if (mutation->part != NFSP_PART_VALUE ||
 		    mutation->selected.len != mutation->output.len ||
-		    layout_discriminant(record->message, mutation))
+		    layout_discriminant(record->message, mutation) ||
+		    schema_selector_changed(record->message, mutation))
 			return 0;
 	}
 	return 1;
