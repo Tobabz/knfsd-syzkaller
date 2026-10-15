@@ -167,10 +167,10 @@ class Q2JudgeProfile(_Record):
 
 
 def default_q2_profile() -> Q2JudgeProfile:
-    """The initial reviewed signal taxonomy required by 01 §14 item 11.
+    """The default signal taxonomy required by 01 §14 item 11.
 
-    Rules are ordered from specific sanitizer headlines to generic BUG and
-    hang reports.  Fatality describes the class in this profile and remains
+    Specific sanitizer and hang headlines precede generic BUG reports.
+    Fatality describes the class in this profile and remains
     independent of the observed VM termination.
     """
 
@@ -195,20 +195,21 @@ def default_q2_profile() -> Q2JudgeProfile:
                     pattern=r"(?m)\bBUG:\s+KCSAN:"),
         Q2ParseRule(rule_id="warning", signal_class="WARNING",
                     pattern=r"(?m)\bWARNING:"),
+        Q2ParseRule(
+            rule_id="hang", signal_class="hang",
+            pattern=(r"(?mi)(?:\bINFO:\s+task\s+.+\s+blocked for more than|"
+                     r"\bINFO:[ \t]+rcu(?:_preempt|_sched|_bh|_tasks)?[ \t]+"
+                     r"(?:self-)?detected[ \t]+(?:expedited[ \t]+)?stalls?\b|"
+                     r"\bwatchdog:\s+BUG:\s+soft lockup)"),
+        ),
         Q2ParseRule(rule_id="bug", signal_class="BUG",
                     pattern=r"(?m)\bBUG:"),
         Q2ParseRule(rule_id="panic", signal_class="panic",
                     pattern=r"(?mi)\bKernel panic - not syncing:"),
-        Q2ParseRule(
-            rule_id="hang", signal_class="hang",
-            pattern=(r"(?mi)(?:\bINFO:\s+task\s+.+\s+blocked for more than|"
-                     r"\bINFO:\s+rcu\s+.+\s+stall|"
-                     r"\bwatchdog:\s+BUG:\s+soft lockup)"),
-        ),
     )
     return Q2JudgeProfile(
         name="knfsd-q2-sanitizer-signals",
-        revision="1",
+        revision="2",
         signal_classes=classes,
         parse_rules=rules,
         termination_rules=(

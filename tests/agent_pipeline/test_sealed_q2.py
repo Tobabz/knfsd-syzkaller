@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 from hashlib import sha256
 from types import SimpleNamespace
 
@@ -143,6 +145,26 @@ def test_sealed_complete_no_report_is_not_observed(tmp_path):
     assert result.signals == ()
 
 
+@pytest.mark.parametrize("report", [
+    b"rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:\n",
+    b"rcu: INFO: rcu_sched detected stalls on CPUs/tasks:\n",
+    b"rcu: INFO: rcu_preempt self-detected stall on CPU\n",
+    b"rcu: INFO: rcu_sched self-detected stall on CPU\n",
+    b"rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks: {\n",
+    b"rcu: INFO: rcu_sched detected expedited stalls on CPUs/tasks: {\n",
+    b"rcu: INFO: rcu_tasks detected stalls on tasks:\n",
+    b"watchdog: BUG: soft lockup - CPU#0 stuck for 26s! [syz-executor:1234]\n",
+    b"INFO: task syz-executor:1234 blocked for more than 143 seconds.\n",
+])
+def test_sealed_kernel_stall_reports_are_hangs(tmp_path, report):
+    f = setup(tmp_path, reports=(report,))
+    result = f.judge.judge(f.bundle_ref, f.profile_ref)
+    assert result.status is Q2Status.OBSERVED
+    assert [(signal.signal_class, signal.fatal, signal.report_ref)
+            for signal in result.signals] == [("hang", True, digest_bytes(report))]
+    assert result == f.judge.judge(f.bundle_ref, f.profile_ref)
+
+
 @pytest.mark.parametrize(("completeness", "window", "reason"), [
     ("truncated", Q2CollectionWindow(start_marker="start", end_marker="end"),
      "console_log_truncated"),
@@ -256,11 +278,64 @@ def test_missing_receipt_or_transient_io_produces_no_verdict(tmp_path, monkeypat
         f.judge.judge(f.bundle_ref, f.profile_ref)
 
 
-def test_missing_referenced_artifact_is_retryable(tmp_path):
+@pytest.mark.parametrize("target", ["manifest", "console", "report", "profile"])
+def test_missing_referenced_artifact_is_retryable(tmp_path, target):
     f = setup(tmp_path, reports=(b"WARNING: report\n",))
-    f.store._path(f.report_refs[0].sha256).unlink()
+    baseline = f.judge.judge(f.bundle_ref, f.profile_ref)
+    ref = {"manifest": f.bundle_ref, "console": f.console_ref,
+           "report": f.report_refs[0].sha256, "profile": f.profile_ref}[target]
+    data = f.store.get(ref)
+    f.store._path(ref).unlink()
     with pytest.raises(Q2EvidenceUnavailable):
         f.judge.judge(f.bundle_ref, f.profile_ref)
+    assert f.store.put(data) == ref
+    assert f.judge.judge(f.bundle_ref, f.profile_ref) == baseline
+
+
+@pytest.mark.parametrize("where", ["object", "shard"])
+@pytest.mark.parametrize("target", ["manifest", "console", "report"])
+def test_symlink_is_invalid_q2_evidence(tmp_path, where, target):
+    f = setup(tmp_path, reports=(b"WARNING: report\n",))
+    assert f.judge.judge(f.bundle_ref, f.profile_ref).status is Q2Status.OBSERVED
+    ref = {"manifest": f.bundle_ref, "console": f.console_ref,
+           "report": f.report_refs[0].sha256}[target]
+    path = f.store._path(ref)
+    if where == "shard":
+        path = path.parent
+    saved = tmp_path / "original"
+    path.rename(saved)
+    path.symlink_to(saved, target_is_directory=where == "shard")
+
+    result = f.judge.judge(f.bundle_ref, f.profile_ref)
+    assert result.status is Q2Status.INCONCLUSIVE
+    assert result.reason == "invalid_evidence"
+    assert result.signals == ()
+    assert result == f.judge.judge(f.bundle_ref, f.profile_ref)
+
+
+@pytest.mark.parametrize("where", ["object", "shard"])
+@pytest.mark.parametrize("code", [errno.EIO, errno.EMFILE])
+@pytest.mark.parametrize("target", ["manifest", "report", "profile"])
+def test_open_failure_is_retryable_for_q2(tmp_path, monkeypatch, where, code, target):
+    f = setup(tmp_path, reports=(b"WARNING: report\n",))
+    baseline = f.judge.judge(f.bundle_ref, f.profile_ref)
+    assert baseline.status is Q2Status.OBSERVED
+    ref = {"manifest": f.bundle_ref, "report": f.report_refs[0].sha256,
+           "profile": f.profile_ref}[target]
+    name = ref if where == "object" else ref[:2]
+    real_open = os.open
+
+    def unavailable(path, flags, mode=0o777, *, dir_fd=None):
+        if path == name and dir_fd is not None:
+            raise OSError(code, os.strerror(code), path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", unavailable)
+        with pytest.raises(Q2EvidenceUnavailable):
+            f.judge.judge(f.bundle_ref, f.profile_ref)
+
+    assert f.judge.judge(f.bundle_ref, f.profile_ref) == baseline
 
 
 def test_profile_change_rejudges_same_bundle_without_mutation(tmp_path):

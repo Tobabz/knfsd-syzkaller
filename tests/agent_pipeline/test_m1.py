@@ -94,7 +94,7 @@ def generation(
     index: int,
     *,
     applied: tuple[str, ...] = (),
-    outcome: ForwardOutcome | None = None,
+    outcome: ForwardOutcome | None = ForwardOutcome.COMPLETE,
     activation: BarrierStatus = BarrierStatus.ACKED,
     deactivation: BarrierStatus = BarrierStatus.ACKED,
     closure: ClosureReason = ClosureReason.DRAINED,
@@ -157,7 +157,7 @@ def generation(
         last_generation_event_seq=(
             summary_seq
             if summary
-            else max((event.event_seq for event in forwards), default=None)
+            else max((event.event_seq for event in (*exposures, *forwards)), default=None)
         ),
         issues=issues,
     )
@@ -209,6 +209,7 @@ def test_durable_exposure_is_applied_for_every_delivery_state(outcome, delivery)
             0,
             applied=("rule-call",),
             outcome=outcome,
+            summary=outcome is not None,
             deactivation=BarrierStatus.FAILED,
         )
     )
@@ -218,6 +219,70 @@ def test_durable_exposure_is_applied_for_every_delivery_state(outcome, delivery)
     assert result.exposure_batch_ids == ("batch-0-rule-call",)
     assert generation_result(inputs).delivery_results[0].state is delivery
     assert rule_result(inputs, "rule-reply").reason is M1Reason.DEACTIVATION_BARRIER_FAILED
+
+
+@pytest.mark.parametrize("applied", [("rule-call",), ("rule-call", "rule-reply")])
+@pytest.mark.parametrize("closure,unresolved", [
+    (ClosureReason.DRAINED, 0),
+    (ClosureReason.REPLY_UNRESOLVED, 1),
+    (ClosureReason.ABORTED, 0),
+])
+def test_terminal_summary_requires_forward_for_every_batch(applied, closure, unresolved):
+    base = generation(0, applied=applied, closure=closure,
+                      reply_unresolved_count=unresolved)
+    evidence = replace(base.mutation_evidence,
+                       forward_events=base.mutation_evidence.forward_events[:-1])
+    result = generation_result(judge_input(replace(base, mutation_evidence=evidence)))
+    assert all((item.status, item.reason)
+               == (M1Status.INCONCLUSIVE, M1Reason.GENERATION_COMPLETE_INVALID)
+               for item in result.rule_results)
+    assert result.delivery_results == ()
+
+
+@pytest.mark.parametrize("summary", [False, True])
+def test_forward_completeness_is_per_batch_even_for_the_same_rule(summary):
+    base = generation(0, applied=("rule-call",), summary=summary)
+    evidence = base.mutation_evidence
+    second = replace(evidence.exposure_intents[0], batch_id="second-batch", event_seq=20)
+    complete = (replace(evidence.generation_complete, exposure_batch_count=2)
+                if summary else None)
+    evidence = replace(evidence, exposure_intents=(*evidence.exposure_intents, second),
+                       generation_complete=complete,
+                       last_generation_event_seq=100 if summary else 20)
+    inputs = judge_input(replace(base, mutation_evidence=evidence))
+    if summary:
+        assert all((item.status, item.reason)
+                   == (M1Status.INCONCLUSIVE, M1Reason.GENERATION_COMPLETE_INVALID)
+                   for item in generation_result(inputs).rule_results)
+        assert generation_result(inputs).delivery_results == ()
+    else:
+        assert rule_result(inputs, "rule-call").status is M1Status.APPLIED
+        assert rule_result(inputs, "rule-reply").status is M1Status.INCONCLUSIVE
+        assert rule_result(inputs, "rule-reply").reason is M1Reason.GENERATION_COMPLETE_MISSING
+        assert tuple(item.state for item in generation_result(inputs).delivery_results) == (
+            DeliveryState.COMPLETE, DeliveryState.UNKNOWN,
+        )
+
+
+@pytest.mark.parametrize("outcome,delivery", [
+    (ForwardOutcome.COMPLETE, DeliveryState.COMPLETE),
+    (ForwardOutcome.FAILED, DeliveryState.FAILED),
+])
+def test_terminal_summary_accepts_completed_or_failed_forward(outcome, delivery):
+    inputs = judge_input(generation(0, applied=("rule-call",), outcome=outcome))
+    assert rule_result(inputs, "rule-call").status is M1Status.APPLIED
+    assert rule_result(inputs, "rule-reply").status is M1Status.NOT_APPLIED
+    assert generation_result(inputs).delivery_results[0].state is delivery
+
+
+def test_missing_forward_without_summary_preserves_valid_exposure():
+    inputs = judge_input(generation(0, applied=("rule-call",), outcome=None, summary=False))
+    assert rule_result(inputs, "rule-call").status is M1Status.APPLIED
+    assert rule_result(inputs, "rule-reply").status is M1Status.INCONCLUSIVE
+    assert rule_result(inputs, "rule-reply").reason is M1Reason.GENERATION_COMPLETE_MISSING
+    delivery = generation_result(inputs).delivery_results[0]
+    assert delivery.state is DeliveryState.UNKNOWN
+    assert delivery.forward_event_seq is None
 
 
 def test_clean_terminal_generation_is_the_only_not_applied_path():
@@ -360,7 +425,8 @@ def test_accepted_event_after_summary_is_detected_from_sequence():
     evidence = replace(
         evidence,
         exposure_intents=(late,),
-        last_generation_event_seq=101,
+        forward_events=(replace(evidence.forward_events[0], event_seq=102),),
+        last_generation_event_seq=102,
     )
     inputs = judge_input(replace(base, mutation_evidence=evidence))
     assert all(
