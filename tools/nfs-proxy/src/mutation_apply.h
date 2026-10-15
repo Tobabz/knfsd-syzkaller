@@ -35,7 +35,9 @@ enum nfsp_mutation_status {
 };
 
 /* Why a concrete edit exists.  VALUE_AND_PADDING is one contiguous edit so
- * an empty value and its padding never become ambiguous same-boundary inserts. */
+ * a value and its padding never become ambiguous same-boundary inserts.
+ * Growing an empty preserve value includes its length word in the same edit
+ * to avoid colliding with the next field; its flags combine applicable roles. */
 #define NFSP_MUTATION_EDIT_TARGET		0x1u
 #define NFSP_MUTATION_EDIT_DERIVED_LENGTH	0x2u
 #define NFSP_MUTATION_EDIT_DERIVED_PADDING	0x4u

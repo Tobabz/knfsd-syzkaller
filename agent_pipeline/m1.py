@@ -7,9 +7,10 @@ project every committed generation event, rejection, and integrity finding
 into these models.  In particular, ``evidence_verified`` is not a guest claim.
 
 M1 answers whether a mutation was applied.  Delivery is reconstructed for
-each durable exposure batch and remains a separate result.  Missing forwarding
-evidence therefore yields ``DeliveryState.UNKNOWN`` without weakening an
-otherwise valid ``M1Status.APPLIED`` verdict.
+each durable exposure batch and remains a separate result. Before a terminal
+summary, missing forwarding evidence yields ``DeliveryState.UNKNOWN`` without
+weakening an otherwise valid ``M1Status.APPLIED`` verdict. A terminal summary
+requires a forward outcome for every exposure batch.
 """
 
 from __future__ import annotations
@@ -785,6 +786,9 @@ def _inspect_generation(
             len(set(summarized)) != len(summarized)
             or set(summarized) != rule_ids
             or summary.exposure_batch_count != len(exposures_by_batch)
+            # GENERATION_COMPLETE follows a COMPLETE/FAILED for every batch.
+            # An open journal prefix may still have unknown delivery instead.
+            or forwards_by_batch.keys() != exposures_by_batch.keys()
             or not _closure_shape_valid(summary.closure)
             or (
                 JournalIssue.SINK_REJECTION in issue_set

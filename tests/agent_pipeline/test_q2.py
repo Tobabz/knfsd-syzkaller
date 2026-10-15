@@ -115,6 +115,86 @@ def test_nonfatal_report_is_observed_without_vm_crash(sample):
     assert decision.vm_termination == "runner_stopped"
 
 
+@pytest.mark.parametrize("flavor", ["rcu", "rcu_preempt", "rcu_sched", "rcu_bh"])
+@pytest.mark.parametrize("header", [
+    "detected stalls on CPUs/tasks:",
+    "self-detected stall on CPU",
+    "detected stall, but suppressed full report due to a stuck CSD-lock.",
+    "detected expedited stalls on CPUs/tasks: {",
+    "detected expedited stalls, but suppressed full report due to a stuck CSD-lock.",
+])
+def test_rcu_stall_headers_are_hangs(sample, flavor, header):
+    # kernel/rcu/tree_stall.h: print_other_cpu_stall(), print_cpu_stall(),
+    # and the suppressed-report branch of check_cpu_stall().
+    # kernel/rcu/tree_exp.h: synchronize_rcu_expedited_stall().
+    inputs = with_evidence(sample, manager_crash_reports=(report(
+        "rcu", f"[  123.456789] rcu: INFO: {flavor} {header}\n"),))
+    decision = evaluate(inputs)
+    assert decision.status is Q2Status.OBSERVED
+    assert [(signal.signal_class, signal.fatal) for signal in decision.signals] == [
+        ("hang", True),
+    ]
+
+
+def test_rcu_tasks_stall_header_is_a_hang(sample):
+    # kernel/rcu/tasks.h: check_holdout_task().
+    inputs = with_evidence(sample, manager_crash_reports=(report(
+        "rcu-tasks", "rcu: INFO: rcu_tasks detected stalls on tasks:\n"),))
+    decision = evaluate(inputs)
+    assert decision.status is Q2Status.OBSERVED
+    assert [(signal.signal_class, signal.fatal) for signal in decision.signals] == [
+        ("hang", True),
+    ]
+
+
+@pytest.mark.parametrize("text", [
+    "rcu: INFO: rcu_preempt detected\n",
+    "rcu: INFO: rcu_sched starting stall detector\n",
+    "rcu: INFO: rcu_preempt detected stallion\n",
+    "rcu: INFO: rcu_preempt\nother component detected stall\n",
+    "rcu: INFO: rcu_preempt detected\nstall from another component\n",
+    "rcu: INFO: rcu_preempt detected expedited\nstalls on CPUs/tasks:\n",
+    "rcu: INFO: rcu_preempt detected expedited stallion\n",
+    "rcu: INFO: rcu_tasks starting stall detector\n",
+    "rcu: INFO: rcu_taskstats detected stalls on tasks:\n",
+])
+def test_non_stall_rcu_messages_are_unclassified(sample, text):
+    decision = evaluate(with_evidence(
+        sample, manager_crash_reports=(report("rcu", text),)))
+    assert decision.status is Q2Status.INCONCLUSIVE
+    assert decision.reason == "unclassified_report"
+    assert decision.signals == ()
+
+
+@pytest.mark.parametrize("text,expected,fatal", [
+    ("watchdog: BUG: soft lockup - CPU#0 stuck for 26s! [syz-executor:1234]\n",
+     "hang", True),
+    ("INFO: task syz-executor:1234 blocked for more than 143 seconds.\n", "hang", True),
+    ("BUG: unable to handle kernel NULL pointer dereference\n", "BUG", True),
+    ("Kernel panic - not syncing: Fatal exception\n", "panic", True),
+    ("BUG: KASAN: use-after-free in worker\n", "KASAN", True),
+    ("BUG: KMSAN: uninit-value in worker\n", "KMSAN", True),
+    ("BUG: KCSAN: data-race in worker\n", "KCSAN", False),
+    ("UBSAN: array-index-out-of-bounds in worker\n", "UBSAN", False),
+])
+def test_specific_report_classification_precedes_generic_bug(sample, text, expected, fatal):
+    decision = evaluate(with_evidence(
+        sample, manager_crash_reports=(report("report", text),)))
+    assert decision.status is Q2Status.OBSERVED
+    assert [(signal.signal_class, signal.fatal) for signal in decision.signals] == [
+        (expected, fatal),
+    ]
+
+
+def test_sanitizer_still_precedes_a_secondary_lockup(sample):
+    text = ("BUG: KASAN: use-after-free in worker\n"
+            "watchdog: BUG: soft lockup - CPU#0 stuck for 26s! [worker:12]\n")
+    decision = evaluate(with_evidence(
+        sample, manager_crash_reports=(report("report", text),)))
+    assert decision.status is Q2Status.OBSERVED
+    assert [signal.signal_class for signal in decision.signals] == ["KASAN"]
+
+
 def test_classified_report_precedes_ordinary_collection_incompleteness(sample):
     inputs = with_evidence(
         sample,

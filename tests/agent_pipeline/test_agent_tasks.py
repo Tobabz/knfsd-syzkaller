@@ -15,6 +15,7 @@ from agent_pipeline.agent_tasks import pydantic_ai_dependency
 from agent_pipeline.agent_tasks.planning import ReachabilityPlanningOutput
 from agent_pipeline.agent_tasks.runtime import RuntimeResult
 from agent_pipeline.agent_tasks.tools import (MAX_SOURCE_BYTES, IndexedMatch,
+                                              IndexedSource,
                                               Stage1Toolbox,
                                               ToolBoundaryError)
 from agent_pipeline.artifacts import ArtifactStore
@@ -496,6 +497,21 @@ def test_tool_results_are_bounded_and_backend_paths_are_rechecked():
         path="drivers/block/secret.c", line=1, text="outside")]
     with pytest.raises(ToolBoundaryError, match="outside"):
         tools.invoke("search_kernel_source", {"query": "target"})
+
+
+@pytest.mark.parametrize("text,truncated", [
+    ("complete\n", False),
+    (IndexedSource("short prefix", truncated=True), True),
+    (IndexedSource("x" * (MAX_SOURCE_BYTES + 1)), True),
+], ids=["plain-string", "adapter-cut", "toolbox-cut"])
+def test_source_read_accepts_strings_and_preserves_adapter_cut(text, truncated):
+    source = FakeSource()
+    source.read_text = text
+    excerpt = toolbox(source).invoke("read_kernel_source", {
+        "path": "fs/nfsd/nfs4proc.c", "start_line": 10, "end_line": 11})
+    assert excerpt.text == text[:MAX_SOURCE_BYTES]
+    assert excerpt.truncated is truncated
+    assert excerpt.end_line == 10
 
 
 def test_toolbox_factory_binds_trusted_request_identity():

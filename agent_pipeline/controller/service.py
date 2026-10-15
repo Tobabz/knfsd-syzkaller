@@ -339,8 +339,8 @@ class Controller:
             if not self._replay_job_matches(replayed, t.job):
                 raise ReplayMismatch(f"{job_id} seq {t.seq}")
             # Continue from the exact historical snapshot.  Before the
-            # migration event exists, this may carry the authenticated old
-            # Runner digest into later transitions.
+            # migration event exists, this may carry an authenticated old
+            # Runner digest or an unpinned Agent task into later transitions.
             job = t.job
         if job != self.store.job(job_id):
             raise ReplayMismatch(f"{job_id}: stored job differs")
@@ -530,10 +530,12 @@ class Controller:
 
     @classmethod
     def _replay_job_matches(cls, actual: Job, stored: Job) -> bool:
-        """Compare a replay result, recognizing only the exact old digest.
+        """Compare a replay result, recognizing exact historical encodings.
 
-        Every other field still has to compare equal after substituting the
-        authenticated legacy digest into the newly computed snapshot.
+        A pre-pin Agent task omitted model_policy and hashed only its other
+        inputs. Authenticate both digests against the replayed inputs before
+        normalizing those two fields. Explicit null or a different policy is
+        not that historical encoding. Every other field must match exactly.
         """
 
         if actual == stored:
@@ -541,8 +543,33 @@ class Controller:
         actual_pending = actual.pending_task
         stored_pending = stored.pending_task
         if actual_pending is None or stored_pending is None or \
-                actual_pending.kind is not TaskKind.RUNNER or \
-                stored_pending.kind is not TaskKind.RUNNER:
+                actual_pending.kind is not stored_pending.kind:
+            return False
+        if actual_pending.kind is TaskKind.AGENT:
+            if "model_policy" in stored_pending.model_fields_set or \
+                    actual_pending.model_policy is None or \
+                    actual.candidate is None or actual.binding is None:
+                return False
+            inputs = dict(
+                agent_task=actual_pending.agent_task,
+                model_policy=actual_pending.model_policy,
+                candidate=actual.candidate,
+                hcap_revision=actual.binding.hcap_revision,
+                analysis_ref=actual.analysis_ref,
+                plan_ref=actual.plan_ref,
+                repair=actual_pending.repair)
+            if actual_pending.input_digest != agent_input_digest(**inputs) or \
+                    stored_pending.input_digest != agent_input_digest(
+                        **inputs, include_model_policy=False):
+                return False
+            reproduced = actual.model_copy(update={
+                "pending_task": actual_pending.model_copy(update={
+                    "input_digest": stored_pending.input_digest,
+                    "model_policy": None,
+                }),
+            })
+            return reproduced == stored
+        if actual_pending.kind is not TaskKind.RUNNER:
             return False
         task_input = cls._runner_input(actual)
         if actual_pending.input_digest != runner_input_digest(task_input) or \

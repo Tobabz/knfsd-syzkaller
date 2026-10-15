@@ -1,0 +1,254 @@
+{
+  "source_revision": "565b5c47715813df4e9fd760f747ff3dd39ba34d",
+  "description": "Untouched World.submit() database created by the historical Controller; base replay succeeded.",
+  "tables": {
+    "policies": [
+      {
+        "policy_id": "p1",
+        "sanitizer": "kasan",
+        "approval_required": false,
+        "run_stage2": false,
+        "stage1_repair_budget": 3,
+        "agent_retry_limit": 2,
+        "runtime_retry_limit": 2
+      }
+    ],
+    "jobs": [
+      {
+        "job_id": "job-0001",
+        "submission": {
+          "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "location": {
+            "kind": "function",
+            "path": "fs/nfsd/nfs4xdr.c",
+            "symbol": "nfsd4_target",
+            "start_line": null,
+            "end_line": null
+          }
+        },
+        "candidate": {
+          "candidate_id": "VC-0002",
+          "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "location": {
+            "kind": "function",
+            "path": "fs/nfsd/nfs4xdr.c",
+            "symbol": "nfsd4_target",
+            "start_line": 6,
+            "end_line": 12
+          }
+        },
+        "state": "s1_analysis",
+        "state_reason": null,
+        "gap": null,
+        "binding": {
+          "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sanitizer": "kasan",
+          "execution_harness_id": "e844adc60c72d254b27e713b88e72a8338fbb13944b1499c212495e376cd3d11",
+          "hcap_revision": "hcap-1"
+        },
+        "judge_versions": {
+          "judge_profile_id": "jp-1",
+          "support_boundary_id": "sb-1"
+        },
+        "job_policy_id": "p1",
+        "counters": {
+          "agent_repair_stage1": 0,
+          "agent_retry": 0,
+          "runtime_retry": 0
+        },
+        "pending_task": {
+          "task_id": "job-0001.t1",
+          "kind": "agent",
+          "input_digest": "c71ec42341549c6813d85eff0bb8996f52d8fc55833eec4c11fca6b7551a9259",
+          "agent_task": "candidate_analysis",
+          "attempt": 1,
+          "repair": null
+        },
+        "cancelling_tasks": [],
+        "resume_point": null,
+        "analysis_ref": null,
+        "plan_ref": null,
+        "harness": null,
+        "approved_manifests": [],
+        "last_verdict": null,
+        "stage2_input": null,
+        "seq": 1,
+        "task_seq": 1
+      }
+    ],
+    "transitions": [
+      {
+        "job_id": "job-0001",
+        "seq": 0,
+        "from_state": null,
+        "to_state": "submitted",
+        "reason": "submitted",
+        "event": {
+          "type": "submitted"
+        },
+        "consumed": [],
+        "job_policy_id": "p1",
+        "at": "2026-10-13T00:00:00+00:00",
+        "job": {
+          "job_id": "job-0001",
+          "submission": {
+            "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "location": {
+              "kind": "function",
+              "path": "fs/nfsd/nfs4xdr.c",
+              "symbol": "nfsd4_target",
+              "start_line": null,
+              "end_line": null
+            }
+          },
+          "candidate": null,
+          "state": "submitted",
+          "state_reason": null,
+          "gap": null,
+          "binding": null,
+          "judge_versions": null,
+          "job_policy_id": "p1",
+          "counters": {
+            "agent_repair_stage1": 0,
+            "agent_retry": 0,
+            "runtime_retry": 0
+          },
+          "pending_task": null,
+          "cancelling_tasks": [],
+          "resume_point": null,
+          "analysis_ref": null,
+          "plan_ref": null,
+          "harness": null,
+          "approved_manifests": [],
+          "last_verdict": null,
+          "stage2_input": null,
+          "seq": 0,
+          "task_seq": 0
+        }
+      },
+      {
+        "job_id": "job-0001",
+        "seq": 1,
+        "from_state": "submitted",
+        "to_state": "s1_analysis",
+        "reason": null,
+        "event": {
+          "type": "intake_checked",
+          "candidate": {
+            "candidate_id": "VC-0002",
+            "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "location": {
+              "kind": "function",
+              "path": "fs/nfsd/nfs4xdr.c",
+              "symbol": "nfsd4_target",
+              "start_line": 6,
+              "end_line": 12
+            }
+          },
+          "rejection": null,
+          "binding": {
+            "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sanitizer": "kasan",
+            "execution_harness_id": "e844adc60c72d254b27e713b88e72a8338fbb13944b1499c212495e376cd3d11",
+            "hcap_revision": "hcap-1"
+          },
+          "judge_versions": {
+            "judge_profile_id": "jp-1",
+            "support_boundary_id": "sb-1"
+          }
+        },
+        "consumed": [],
+        "job_policy_id": "p1",
+        "at": "2026-10-13T00:00:00+00:00",
+        "job": {
+          "job_id": "job-0001",
+          "submission": {
+            "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "location": {
+              "kind": "function",
+              "path": "fs/nfsd/nfs4xdr.c",
+              "symbol": "nfsd4_target",
+              "start_line": null,
+              "end_line": null
+            }
+          },
+          "candidate": {
+            "candidate_id": "VC-0002",
+            "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "location": {
+              "kind": "function",
+              "path": "fs/nfsd/nfs4xdr.c",
+              "symbol": "nfsd4_target",
+              "start_line": 6,
+              "end_line": 12
+            }
+          },
+          "state": "s1_analysis",
+          "state_reason": null,
+          "gap": null,
+          "binding": {
+            "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sanitizer": "kasan",
+            "execution_harness_id": "e844adc60c72d254b27e713b88e72a8338fbb13944b1499c212495e376cd3d11",
+            "hcap_revision": "hcap-1"
+          },
+          "judge_versions": {
+            "judge_profile_id": "jp-1",
+            "support_boundary_id": "sb-1"
+          },
+          "job_policy_id": "p1",
+          "counters": {
+            "agent_repair_stage1": 0,
+            "agent_retry": 0,
+            "runtime_retry": 0
+          },
+          "pending_task": {
+            "task_id": "job-0001.t1",
+            "kind": "agent",
+            "input_digest": "c71ec42341549c6813d85eff0bb8996f52d8fc55833eec4c11fca6b7551a9259",
+            "agent_task": "candidate_analysis",
+            "attempt": 1,
+            "repair": null
+          },
+          "cancelling_tasks": [],
+          "resume_point": null,
+          "analysis_ref": null,
+          "plan_ref": null,
+          "harness": null,
+          "approved_manifests": [],
+          "last_verdict": null,
+          "stage2_input": null,
+          "seq": 1,
+          "task_seq": 1
+        }
+      }
+    ],
+    "attempts": [
+      {
+        "task_id": "job-0001.t1",
+        "attempt": 1,
+        "job_id": "job-0001",
+        "agent_task": "candidate_analysis",
+        "input_digest": "c71ec42341549c6813d85eff0bb8996f52d8fc55833eec4c11fca6b7551a9259",
+        "repair_input_digest": null,
+        "status": "running",
+        "model_id": null,
+        "output_ref": null,
+        "failure": null
+      }
+    ],
+    "candidates": [
+      {
+        "candidate_id": "VC-0002",
+        "kernel_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "location": {
+          "kind": "function",
+          "path": "fs/nfsd/nfs4xdr.c",
+          "symbol": "nfsd4_target",
+          "start_line": 6,
+          "end_line": 12
+        }
+      }
+    ]
+  }
+}

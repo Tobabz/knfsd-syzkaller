@@ -205,6 +205,7 @@ resolve_ref(const struct nfsp_rule_value_ref *ref,
 	const struct nfsp_resolver_view *view;
 	uint32_t wanted_op = NFSP_FIELD_NONE;
 	int bind_op = 0;
+	int same_operation;
 
 	(void)rule;
 	if (ref->source == NFSP_SRC_TARGET) {
@@ -214,9 +215,13 @@ resolve_ref(const struct nfsp_rule_value_ref *ref,
 		*message = current;
 		return REF_OK;
 	}
+	/* Only references to this operation type share the target occurrence.
+	 * Other operation types must be unique across the selected message. */
+	same_operation = (ref->node.flags & NFSP_SN_OPERATION) &&
+		ref->node.root != NULL && tf->op < current->nops &&
+		!strcmp(ref->node.root, current->ops[tf->op].name);
 	if (ref->source == NFSP_SRC_CURRENT_MESSAGE) {
-		if ((ref->node.flags & NFSP_SN_OPERATION) &&
-		    tf->op != NFSP_FIELD_NONE) {
+		if (same_operation) {
 			bind_op = 1;
 			wanted_op = tf->op;
 		}
@@ -258,7 +263,10 @@ resolve_ref(const struct nfsp_rule_value_ref *ref,
 			    tx->forwarded.message->ops[fwd_op].opcode != cur_op)
 				return REF_AMBIGUOUS;
 		}
-		bind_op = 1;
+		/* Even a message-wide cross-operation reference must not bypass
+		 * the request/result correspondence checks above.  Only a
+		 * same-type reference is narrowed to that proven occurrence. */
+		bind_op = same_operation;
 		wanted_op = req_op;
 	}
 	*payload = view->payload;

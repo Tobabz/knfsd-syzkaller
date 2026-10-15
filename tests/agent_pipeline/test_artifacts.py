@@ -1,7 +1,9 @@
 """ArtifactStore checks use only isolated temporary files."""
 
+import errno
 import hashlib
 import os
+import socket
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -52,6 +54,36 @@ def test_missing_artifact_is_not_present(store):
     assert not store.has(digest)
     with pytest.raises(FileNotFoundError):
         store.get(digest)
+
+
+@pytest.mark.parametrize("where", ["object", "shard"])
+@pytest.mark.parametrize("code", [
+    errno.EIO, errno.EMFILE, errno.ENFILE, errno.EACCES, errno.ENXIO, errno.ENODEV,
+])
+def test_open_availability_errors_are_preserved(store, monkeypatch, where, code):
+    data = b"available again after retry"
+    ref = store.put(data)
+    target = ref if where == "object" else ref[:2]
+    real_open = os.open
+    failure = OSError(code, os.strerror(code), target)
+
+    def unavailable(path, flags, mode=0o777, *, dir_fd=None):
+        if path == target and dir_fd is not None:
+            raise failure
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", unavailable)
+        for operation in (lambda: store.get(ref), lambda: store.has(ref),
+                          lambda: store.put(data)):
+            with pytest.raises(OSError) as caught:
+                operation()
+            assert caught.value is failure
+
+    assert store.get(ref) == data
+    assert store.has(ref)
+    assert store.put(data) == ref
+    assert not list(store.root.rglob(".pending-*"))
 
 
 @pytest.mark.parametrize("replacement", [b"corrupt", b"trunc", b""])
@@ -142,13 +174,34 @@ def test_nonregular_objects_are_rejected_without_blocking(store, tmp_path, kind)
         assert outside.read_bytes() == data
 
 
-def test_shard_symlink_cannot_redirect_reads_or_writes(store, tmp_path):
+def test_socket_object_is_invalid_even_when_open_fails(store, tmp_path):
+    data = b"original"
+    ref = store.put(data)
+    path = store._path(ref)
+    path.unlink()
+    # Bind a short name first to stay within AF_UNIX's pathname limit.
+    socket_path = tmp_path / "socket"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as endpoint:
+        endpoint.bind(str(socket_path))
+        socket_path.rename(path)
+        for operation in (lambda: store.get(ref), lambda: store.has(ref),
+                          lambda: store.put(data)):
+            with pytest.raises(ArtifactIntegrityError):
+                operation()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "regular_file"])
+def test_invalid_shard_cannot_redirect_reads_or_writes(store, tmp_path, kind):
     data = b"original"
     ref = hashlib.sha256(data).hexdigest()
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / ref).write_bytes(data)
-    (store.root / ref[:2]).symlink_to(outside, target_is_directory=True)
+    shard = store.root / ref[:2]
+    if kind == "symlink":
+        shard.symlink_to(outside, target_is_directory=True)
+    else:
+        shard.write_bytes(b"not a directory")
     for operation in (lambda: store.get(ref), lambda: store.has(ref),
                       lambda: store.put(data)):
         with pytest.raises(ArtifactIntegrityError):
