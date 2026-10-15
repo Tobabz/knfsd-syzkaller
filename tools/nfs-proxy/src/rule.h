@@ -51,10 +51,12 @@
  *   must run exactly the set its RULESET names.  Beyond the format, every
  *   rule must agree with its schema (program, version, minor version,
  *   procedure, operation), every path must resolve to exactly one schema
- *   node (schema.h), predicates and transforms must be typed as design 04
- *   §9, §13, §14 say with no implicit reinterpretation, and the declared
- *   context dependencies must be exactly those the rule's ValueRefs need
- *   (design 04 §10, rules in §35).
+ *   node (schema.h), the target and every value the rule reads must be in
+ *   one procedure (a message holds only its own procedure's values),
+ *   predicates and transforms must be typed as design 04 §9, §13, §14 say
+ *   with no implicit reinterpretation, and the declared context
+ *   dependencies must be exactly those the rule's ValueRefs need (design 04
+ *   §10, rules in §35).
  *
  *   What this runtime cannot yet apply is unsupported_capability, kept apart
  *   from input errors because it is a harness gap and not the Agent's to fix
@@ -243,7 +245,8 @@ enum nfsp_rule_status {
 	NFSP_RULE_UNKNOWN_SCHEMA,
 	/* Input errors: the rule does not say something this schema has. */
 	NFSP_RULE_SELECTOR_MISMATCH,	/* program, version, family, minor,
-					 * procedure or operation */
+					 * procedure or operation; or a value
+					 * read outside the target's procedure */
 	NFSP_RULE_MESSAGE_TYPE_INCONSISTENT,
 	NFSP_RULE_UNKNOWN_PATH,
 	NFSP_RULE_AMBIGUOUS_PATH,
