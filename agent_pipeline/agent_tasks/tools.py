@@ -22,7 +22,7 @@ from pydantic import Field
 
 from ..contracts import Record
 from ..hcap import ArtifactHcapChecker, HcapCatalog
-from ..intake import ANALYSIS_ROOTS, in_analysis_roots
+from ..intake import ANALYSIS_ROOTS, in_analysis_roots, line_count
 
 SOURCE_PREFIXES = ANALYSIS_ROOTS
 MAX_SOURCE_LINES = 400
@@ -315,7 +315,7 @@ class Stage1Toolbox:
         truncated = isinstance(text, IndexedSource) and text.truncated
         text, cut = _bounded(text, MAX_SOURCE_BYTES)
         return SourceExcerpt(path=path, start_line=args.start_line,
-                             end_line=args.start_line + len(text.splitlines()) - 1,
+                             end_line=args.start_line + line_count(text) - 1,
                              text=text, truncated=truncated or cut)
 
     def _matches(self, values: Sequence[IndexedMatch], requested: int

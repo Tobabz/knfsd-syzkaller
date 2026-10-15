@@ -222,6 +222,28 @@ def test_git_read_reports_only_truncation_of_requested_range(synthetic_repo):
     assert direct.truncated is True
 
 
+def test_read_and_search_agree_on_lines_after_form_feed(synthetic_repo):
+    # git grep and search split on "\n" only; read must not also split on
+    # form feed or vertical tab, or every later line number shifts.
+    path = "fs/nfsd/formfeed.c"
+    for fixture in ("bad\nname.c", "binary.c"):  # keep search well-formed
+        (synthetic_repo.path / "fs/nfsd" / fixture).unlink()
+    (synthetic_repo.path / path).write_text(
+        "a\fb\vc\nFF_TARGET\nlast", encoding="utf-8")
+    commit = commit_all(synthetic_repo.path, "form feed")
+    index = GitKernelSourceIndex(synthetic_repo.path)
+    [match] = index.search(commit, "FF_TARGET", ("fs/nfsd/",), 10)
+    assert (match.path, match.line) == (path, 2)
+    toolbox = Stage1Toolbox(index, None, kernel_commit=commit,
+                            hcap_revision="a" * 64)
+    excerpt = toolbox.invoke("read_kernel_source", {
+        "path": path, "start_line": 2, "end_line": 3})
+    assert (excerpt.text, excerpt.end_line) == ("FF_TARGET\nlast", 3)
+    first = toolbox.invoke("read_kernel_source", {
+        "path": path, "start_line": 1, "end_line": 1})
+    assert (first.text, first.end_line) == ("a\fb\vc\n", 1)
+
+
 def test_literal_search_handles_metacharacters_and_stays_in_roots(
     synthetic_repo: SyntheticRepo,
 ) -> None:

@@ -157,8 +157,19 @@ def validate(sub: CandidateSubmission, tree: SourceTree,
                                    end_line=end))
 
 
+def source_lines(text: str) -> list[str]:
+    """Split on "\\n" only, keeping line ends, as search and Git do.
+
+    ``str.splitlines`` also breaks on form feed, vertical tab and other
+    separators, which would shift every later line number.
+    """
+    lines = text.split("\n")
+    kept = [line + "\n" for line in lines[:-1]]
+    return kept + [lines[-1]] if lines[-1] else kept
+
+
 def line_count(text: str) -> int:
-    return len(text.splitlines())
+    return len(source_lines(text))
 
 
 _ANNOTATION = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*(\([^(){};]*\))?")
