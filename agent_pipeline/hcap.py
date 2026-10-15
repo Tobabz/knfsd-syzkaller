@@ -351,16 +351,25 @@ class ArtifactHcapChecker:
 
     def _check_plan(self, plan_ref: str, hcap_revision: str, *,
                     require_revision: bool) -> HcapCheck:
+        # A missing or unreadable artifact is a host availability failure:
+        # OSError propagates, like the Materializer's, so the caller keeps
+        # the pending work and retries. Invalid catalog bytes are a host
+        # integrity failure, not an Agent repair finding.
         try:
             catalog = self.load_catalog(hcap_revision)
+        except OSError:
+            raise
         except _ARTIFACT_ERRORS:
-            return HcapCheck(violations=("invalid_hcap_artifact",))
+            return HcapCheck(violations=("invalid_hcap_artifact",),
+                             host_authority=True)
         try:
             _check_ref(plan_ref)
             plan = load_record(self.store, plan_ref, ReachabilityPlan)
             self._verify_artifact(plan.program_proposal.artifact_ref)
             if plan.program_proposal.seed_manifest_ref is not None:
                 self._verify_artifact(plan.program_proposal.seed_manifest_ref)
+        except OSError:
+            raise
         except _ARTIFACT_ERRORS:
             return HcapCheck(violations=("invalid_plan_artifact",))
 

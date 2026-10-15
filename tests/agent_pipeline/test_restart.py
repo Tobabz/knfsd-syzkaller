@@ -557,3 +557,53 @@ def test_historical_same_verdict_rejudge_replays(world):
     assert current.last_verdict.result.judge_profile_id == "jp-2"
     assert current.stage2_input.q1_verdict_id != \
         job.stage2_input.q1_verdict_id
+
+
+def test_cancel_without_confirmed_cleanup_is_tracked_for_the_operator(world):
+    """09 §8: a cancel whose execution was not confirmed stopped is not a
+    settled cancel. The task stays on the job and the operator decides."""
+    j = world.to_running()
+    old = world.job(j).pending_task.task_id
+    world.runner.unconfirmed.add(old)
+    world.registry.put(binding("build-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.cancelling_tasks == ()
+    assert job.uncleaned_tasks == (old,)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "execution_cleanup"
+    assert world.c.replay(j) == job
+    world.restart()
+    assert world.job(j).uncleaned_tasks == (old,)
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.uncleaned_tasks == ()
+    assert job.state is JobState.S1_RUNNING
+    assert world.runner.starts[job.pending_task.task_id] == 1
+    assert world.c.replay(j) == job
+
+
+def test_operator_cancel_without_confirmed_cleanup_keeps_the_task(world):
+    j = world.to_running()
+    running = world.job(j).pending_task.task_id
+    world.runner.unconfirmed.add(running)
+    world.c.operator(j, "cancel")
+    job = world.job(j)
+    assert job.state is JobState.CLOSED and job.state_reason == "cancelled"
+    assert job.cancelling_tasks == ()
+    assert job.uncleaned_tasks == (running,)
+    assert world.c.replay(j) == job
+
+
+def test_runner_end_without_confirmed_cleanup_is_not_a_retry(world):
+    j = world.to_running()
+    p = world.job(j).pending_task
+    before = world.job(j).counters
+    world.runner.finish(p.task_id, reason="cleanup_unconfirmed")
+    world.c.poll()
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "execution_cleanup"
+    assert job.uncleaned_tasks == (p.task_id,)
+    assert job.counters.runtime_retry == before.runtime_retry
+    assert world.c.replay(j) == job

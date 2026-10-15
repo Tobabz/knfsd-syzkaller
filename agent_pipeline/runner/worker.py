@@ -119,6 +119,10 @@ class RunnerWorker:
             stop.set()
             beat.join()
         if not_stopped:
+            try:
+                self.runner.stop_unconfirmed(lease)
+            except LeaseLost:
+                pass        # already ended; expiry recorded what it knew
             return WorkerRun(
                 task_id=lease.binding.task_id,
                 generation=lease.generation,

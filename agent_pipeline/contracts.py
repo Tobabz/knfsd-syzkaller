@@ -258,9 +258,14 @@ TASK_VARIANTS = {
 
 
 class HcapCheck(Record):
-    """The deterministic plan check against one HCAP revision (04 §1.1)."""
+    """The deterministic plan check against one HCAP revision (04 §1.1).
+
+    ``host_authority`` marks a host-side catalog integrity failure: no plan
+    change can fix it, so it is not an Agent repair finding.
+    """
 
     violations: tuple[str, ...] = ()
+    host_authority: bool = False
 
     @property
     def ok(self) -> bool:

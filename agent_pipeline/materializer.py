@@ -438,10 +438,7 @@ class ArtifactHarnessMaterializer:
         # Materializer is an independent trust boundary.  Repeat the complete
         # declarative plan/catalog check here instead of assuming that a
         # Controller called ArtifactHcapChecker.check_plan() first.  This is
-        # intentionally performed over the already loaded immutable records:
-        # load_catalog() preserves transient artifact I/O as exceptions,
-        # whereas check_plan() translates those exceptions into violations for
-        # its Controller-facing API.
+        # intentionally performed over the already loaded immutable records.
         by_id = {item.id: item for item in catalog.capabilities}
         interfaces: set[str] = set()
         violations: list[str] = []

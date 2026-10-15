@@ -24,16 +24,21 @@ it again under its `runtime_retry` budget.
 `cancel()` on a leased task only records the request and answers `running`.
 The worker sees it through `stop_requested()`, and its `complete()` settles
 the task as `ended_unsealed(cancelled)`. If the worker never completes, lease
-expiry settles it the same way. So a final cancel status means the execution
-stopped, and the Controller sends the job's next Runner task only then.
+expiry settles it the same way. So `cancelled` means the worker reported the
+execution stopped, or its lease ran out with no report either way; the
+Controller sends the job's next Runner task only then.
 
 A backend that cannot confirm its execution stopped (for example, process
 cleanup that could not be proven) raises `ExecutionNotStopped` instead of
-returning a result. `EvidenceSealingBackend` passes it through. The worker then
-neither completes nor renews: the task ends at lease expiry, after the
-backend's own lease deadline. Until cleanup is done, the backend's resource
-fence (for `ProcessSupervisor`, the resource lock) refuses the next execution;
-repeated refusals spend `runtime_retry` and reach `blocked_operator`.
+returning a result. `EvidenceSealingBackend` passes it through. The worker
+records the unconfirmed stop and neither completes nor renews. At lease
+expiry, after the backend's own lease deadline, the task ends
+`ended_unsealed(cleanup_unconfirmed)`: never a confirmed cancel or a
+`runner_restart`. The Controller keeps such a task in the job's
+`uncleaned_tasks` and hands a live job to the operator
+(`blocked_operator(execution_cleanup)`). Until cleanup is done, the backend's
+resource fence (for `ProcessSupervisor`, the resource lock) refuses the next
+execution.
 
 ## Backend fencing requirement
 

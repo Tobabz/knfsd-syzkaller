@@ -13,6 +13,7 @@ from .models import (
 from .service import (
     BACKEND_ERROR,
     CANCELLED,
+    CLEANUP_UNCONFIRMED,
     RUNNER_RESTART,
     EXECUTOR_ENDED_UNSEALED,
     DurableRunner,
@@ -33,6 +34,7 @@ __all__ = [
     "AttemptFact",
     "BACKEND_ERROR",
     "CANCELLED",
+    "CLEANUP_UNCONFIRMED",
     "RUNNER_RESTART",
     "BackendResult",
     "CompletionReceipt",

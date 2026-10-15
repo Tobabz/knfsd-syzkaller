@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator
 
-from ..controller.tasks import (RunnerInput, RunnerStatus, SubmitRefused,
+from ..controller.tasks import (CLEANUP_UNCONFIRMED, RunnerInput, RunnerStatus, SubmitRefused,
                                 runner_input_digest)
 from ..data import canonical_json, parse_json
 from .models import (
@@ -460,6 +460,23 @@ class DurableRunner:
             )
         return lease.model_copy(update={"expires_at_ns": expires})
 
+    def stop_unconfirmed(self, lease: WorkLease) -> None:
+        """Record that this lease's execution could not be confirmed
+        stopped.  The task then ends ``cleanup_unconfirmed`` at lease
+        expiry, not ``cancelled`` or ``runner_restart``."""
+
+        lease = WorkLease.model_validate(lease)
+        with self._transaction():
+            now = self._now()
+            row = self._row(lease.binding.task_id)
+            self._require_current_lease(row, lease, now, allow_cancel=True)
+            self._db.execute(
+                """UPDATE runner_attempts SET reason = ?
+                   WHERE task_id = ? AND generation = ?
+                     AND outcome = 'active'""",
+                (CLEANUP_UNCONFIRMED, lease.binding.task_id, lease.generation),
+            )
+
     def stop_requested(self, lease: WorkLease) -> bool:
         """True for cancellation, expiry, reclaim, or any lost ownership."""
 
@@ -552,19 +569,27 @@ class DurableRunner:
             raise LeaseLost(lease.binding.task_id)
 
     def _end_expired_leases(self, now: int) -> None:
-        """End every expired lease: ``cancelled`` if a cancel waits for it,
-        otherwise ``runner_restart``.  An expired execution is never claimed
-        again, so the Controller decides whether to retry (09 §8)."""
+        """End every expired lease: ``cleanup_unconfirmed`` if the worker
+        reported its execution not confirmed stopped, else ``cancelled`` if
+        a cancel waits for it, otherwise ``runner_restart``.  An expired
+        execution is never claimed again, so the Controller decides what
+        follows (09 §8)."""
 
         rows = self._db.execute(
-            """SELECT * FROM runner_tasks
-               WHERE lifecycle = 'leased' AND lease_expires_at_ns <= ?""",
+            """SELECT t.*, a.reason AS attempt_reason
+               FROM runner_tasks t LEFT JOIN runner_attempts a
+                 ON a.task_id = t.task_id AND a.generation = t.lease_generation
+               WHERE t.lifecycle = 'leased' AND t.lease_expires_at_ns <= ?""",
             (now,),
         ).fetchall()
         for row in rows:
-            cancelled = row["cancel_requested_at_ns"] is not None
-            self._end_unsealed(row, CANCELLED if cancelled else RUNNER_RESTART,
-                               now)
+            if row["attempt_reason"] == CLEANUP_UNCONFIRMED:
+                reason = CLEANUP_UNCONFIRMED
+            elif row["cancel_requested_at_ns"] is not None:
+                reason = CANCELLED
+            else:
+                reason = RUNNER_RESTART
+            self._end_unsealed(row, reason, now)
 
     def _end_unsealed(self, row: sqlite3.Row, reason: str, now: int) -> None:
         """Finish a queued or leased row without a bundle, inside the
