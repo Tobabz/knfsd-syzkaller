@@ -48,6 +48,7 @@ class BlockedReason(str, enum.Enum):
     RUNTIME_RETRY_EXHAUSTED = "runtime_retry_exhausted"
     GAP_ID_UNKNOWN = "gap_id_unknown"
     UNEXPECTED_EVENT = "unexpected_event"
+    HOST_AUTHORITY = "host_authority"
 
 
 class RepairCause(str, enum.Enum):

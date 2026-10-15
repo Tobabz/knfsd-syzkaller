@@ -30,6 +30,7 @@ from .artifacts import (
     ArtifactStore,
 )
 from .contracts import (
+    HOST_AUTHORITY_UNAVAILABLE,
     Commit,
     HarnessBinding,
     MaterializationHcapAuthority,
@@ -375,24 +376,24 @@ class ArtifactHarnessMaterializer:
     def _approval(self, binding: HarnessBinding) -> ExecutionHarnessApproval:
         approval = self.builds.resolve(binding)
         if type(approval) is not ExecutionHarnessApproval:
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        "execution_harness_unapproved")
         try:
             approval = ExecutionHarnessApproval.model_validate_json(
                 canonical_json(approval))
         except _INVALID_RECORD:
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        "malformed_execution_harness_approval")
         descriptor = approval.descriptor
         if descriptor_id(descriptor) != binding.execution_harness_id:
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        "execution_harness_identity_mismatch")
         if (descriptor.kernel_commit != binding.kernel_commit
                 or descriptor.sanitizer != binding.sanitizer):
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        "execution_harness_binding_mismatch")
         if binding.hcap_revision not in approval.approved_hcap_revisions:
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        "hcap_not_approved_for_execution_harness")
         for artifact in descriptor.build_artifacts:
             try:
@@ -400,7 +401,7 @@ class ArtifactHarnessMaterializer:
             except OSError:
                 raise
             except _INVALID_RECORD:
-                self._fail(INVALID_RUNTIME_SELECTION,
+                self._fail(HOST_AUTHORITY_UNAVAILABLE,
                            f"invalid_build_artifact:{artifact.name}")
         return approval
 
@@ -421,7 +422,7 @@ class ArtifactHarnessMaterializer:
     def _hcap(self, binding: HarnessBinding, plan: ReachabilityPlan,
               authority: MaterializationHcapAuthority) -> HcapCatalog:
         if authority.effective_hcap_revision != binding.hcap_revision:
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        "materialization_hcap_authority_mismatch")
         if authority.validation == "exact_plan_revision" and \
                 plan.hcap_revision != authority.effective_hcap_revision:
@@ -432,7 +433,7 @@ class ArtifactHarnessMaterializer:
         except OSError:
             raise
         except _INVALID_RECORD:
-            self._fail(INVALID_RUNTIME_SELECTION, "invalid_hcap_artifact")
+            self._fail(HOST_AUTHORITY_UNAVAILABLE, "invalid_hcap_artifact")
 
         # Materializer is an independent trust boundary.  Repeat the complete
         # declarative plan/catalog check here instead of assuming that a
@@ -550,7 +551,7 @@ class ArtifactHarnessMaterializer:
         except _INVALID_RECORD:
             self._fail(PARSE_FAILURE, f"{role}_parser_result_invalid")
         if parsed.identity != identity:
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        f"{role}_parser_identity_mismatch")
         if parsed.program_sha256 != program_ref:
             self._fail(PARSE_FAILURE, f"{role}_parser_digest_mismatch")
@@ -601,7 +602,7 @@ class ArtifactHarnessMaterializer:
                 resource_facts=call.resource_facts)
             if not decision.admitted:
                 if decision.reason == "identity_mismatch":
-                    self._fail(INVALID_RUNTIME_SELECTION,
+                    self._fail(HOST_AUTHORITY_UNAVAILABLE,
                                f"{role}_admission_identity_mismatch")
                 self._fail(CALL_NOT_ADMITTED,
                            f"{role}:{call.index}:{call.call}:"
@@ -620,7 +621,7 @@ class ArtifactHarnessMaterializer:
                  selected_capabilities: tuple[str, ...]) -> Materialized:
         descriptor_ref = put_record(self.artifacts, descriptor)
         if descriptor_ref != binding.execution_harness_id:
-            self._fail(INVALID_RUNTIME_SELECTION,
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
                        "execution_descriptor_digest_changed")
         scenario_ref = put_record(self.artifacts, scenario_parsed)
         neutral_parser_ref = put_record(self.artifacts, neutral_parsed)
@@ -680,6 +681,29 @@ class ArtifactHarnessMaterializer:
             execution_harness_id=binding.execution_harness_id,
             hcap_revision=binding.hcap_revision)
 
+    def harness_authority_current(self, harness_ref: str,
+                                  binding: HarnessBinding) -> bool:
+        """09 §5: an HCAP-only change keeps a harness whose HCAP-derived
+        authority refs are unchanged under the new revision."""
+        try:
+            harness = load_record(self.artifacts, harness_ref,
+                                  ReachabilityHarness)
+            if harness.execution_harness_id != binding.execution_harness_id:
+                return False
+            identity = self._approval(binding).descriptor.syzkaller_identity
+            admission = load_call_admission_authority(
+                self.artifacts, binding.hcap_revision,
+                expected_identity=identity)
+            neutral = load_neutral_control_authority(
+                self.artifacts, binding.hcap_revision,
+                expected_identity=identity)
+        except OSError:
+            raise
+        except (_Failure, *_INVALID_RECORD):
+            return False
+        return admission.profile_ref == harness.call_admission_profile_ref \
+            and neutral.catalog_ref == harness.neutral_control_catalog_ref
+
     def materialize(self, plan_ref: str, binding: HarnessBinding, *,
                     hcap_authority: MaterializationHcapAuthority | None = None
                     ) -> Materialized | MaterializeRejected:
@@ -709,7 +733,7 @@ class ArtifactHarnessMaterializer:
             except OSError:
                 raise
             except _INVALID_RECORD:
-                self._fail(INVALID_RUNTIME_SELECTION,
+                self._fail(HOST_AUTHORITY_UNAVAILABLE,
                            "invalid_materializer_authority")
 
             neutral_choice = neutral.select(
@@ -720,7 +744,7 @@ class ArtifactHarnessMaterializer:
                         NEUTRAL_CONTROL_UNAVAILABLE,
                         "no exact neutral control runtime selection",
                         profile=plan.runtime_selection.profile)
-                self._fail(INVALID_RUNTIME_SELECTION,
+                self._fail(HOST_AUTHORITY_UNAVAILABLE,
                            "neutral_control_identity_mismatch")
             neutral_required = neutral_choice.required_capability_ids
             if not set(neutral_required) <= set(plan.required_capabilities):

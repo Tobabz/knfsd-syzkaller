@@ -12,7 +12,8 @@ import sqlite3
 from pathlib import Path
 from typing import Iterator
 
-from ..contracts import GapRef, JobPolicy, Q1Result, VulnerabilityCandidate
+from ..contracts import (GapRef, JobPolicy, JudgeVersions, Q1Result,
+                         VulnerabilityCandidate)
 from .records import AgentAttempt, Job, JobState, Transition
 
 SCHEMA = """
@@ -39,6 +40,8 @@ CREATE TABLE IF NOT EXISTS gap_links (
     job_id TEXT NOT NULL, gap_class TEXT NOT NULL,
     missing_capability_id TEXT NOT NULL,
     PRIMARY KEY (job_id, gap_class, missing_capability_id));
+CREATE TABLE IF NOT EXISTS controller_settings (
+    key TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS effect_failures (
     job_id TEXT NOT NULL, effect TEXT NOT NULL, error TEXT NOT NULL,
     at TEXT NOT NULL);
@@ -83,6 +86,21 @@ class Store:
         if row is None:
             raise KeyError(policy_id)
         return JobPolicy.model_validate_json(row[0])
+
+    # ---------------------------------------------------------- judge
+
+    def save_judge_versions(self, versions: JudgeVersions) -> None:
+        """The fallback Q1 authorities the Controller adopted (09 §5)."""
+        with self._tx():
+            self.db.execute(
+                "INSERT OR REPLACE INTO controller_settings VALUES (?, ?)",
+                ("judge_versions", versions.model_dump_json()))
+
+    def judge_versions(self) -> JudgeVersions | None:
+        row = self.db.execute("SELECT body FROM controller_settings WHERE "
+                              "key = 'judge_versions'").fetchone()
+        return None if row is None else \
+            JudgeVersions.model_validate_json(row[0])
 
     # ---------------------------------------------------------- candidates
 

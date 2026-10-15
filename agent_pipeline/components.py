@@ -44,6 +44,12 @@ class Materializer(Protocol):
                     ) -> Materialized | MaterializeRejected:
         """05 §11.  Omitted authority requires an exact plan revision."""
 
+    def harness_authority_current(self, harness_ref: str,
+                                  binding: HarnessBinding) -> bool:
+        """Would `binding`'s HCAP revision give this harness the same
+        call admission profile and neutral control catalog refs?  False
+        for any record or approval problem; OSError propagates."""
+
 
 class Q1Judge(Protocol):
     def matches_execution(self, bundle_ref: str, *, job_id: str,

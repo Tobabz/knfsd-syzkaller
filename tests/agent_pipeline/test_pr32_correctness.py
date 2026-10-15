@@ -26,7 +26,9 @@ def install_judge(world, judge):
     world.c.machine.env.judge = judge
 
 
-def test_compatible_hcap_update_rematerializes_stored_plan(world):
+@pytest.mark.parametrize("authority_changed", [False, True])
+def test_compatible_hcap_update_rematerializes_only_changed_authority(
+        world, authority_changed):
     job_id, old_job, facts = start_real_judge_run(world)
     old_catalog = load_record(
         world.artifacts, old_job.binding.hcap_revision, HcapCatalog)
@@ -40,16 +42,26 @@ def test_compatible_hcap_update_rematerializes_stored_plan(world):
         "hcap_revision_mismatch",)
     assert checker.revalidate_plan(facts.plan_ref, new_ref).ok
 
+    if authority_changed:
+        world.materializer.authority_changed.add(new_ref)
     world.registry.put(old_job.binding.model_copy(
         update={"hcap_revision": new_ref}))
     world.c.on_registry_changed()
 
     current = world.job(job_id)
+    old_task = old_job.pending_task.task_id
     assert current.state.value == "s1_running"
     assert current.plan_ref == old_job.plan_ref
-    assert current.harness.harness_ref != old_job.harness.harness_ref
-    assert current.pending_task.task_id != old_job.pending_task.task_id
-    assert world.runner.cancel_calls[old_job.pending_task.task_id] == 1
+    assert current.binding.hcap_revision == new_ref
+    if authority_changed:
+        assert current.harness.harness_ref != old_job.harness.harness_ref
+        assert current.pending_task.task_id != old_task
+        assert world.runner.cancel_calls[old_task] == 1
+    else:
+        assert current.harness.harness_ref == old_job.harness.harness_ref
+        assert current.harness.authority_hcap_revision == new_ref
+        assert current.pending_task.task_id == old_task
+        assert old_task not in world.runner.cancel_calls
     assert current.counters.agent_repair_stage1 == 0
     assert world.c.replay(job_id) == current
 
