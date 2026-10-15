@@ -90,6 +90,15 @@ leaf that repeats the operation discriminant's name; an operation or procedure
 whose name is only its prefix, or an operation named like a procedure; a
 leaf, in `leaf` or `operation`, that is not an identifier.
 
+A semantic path must also name a position some message carries, so these are
+build errors as well: in a family with minor versions, a procedure other than
+the selector that is not void (the decoder finds the minor version only in the
+selector's argument, so it decodes no other procedure); a non-void `default:`
+arm of a union whose `bool` or `enum` discriminant has a case for every value
+(the decoder refuses a discriminant its type does not declare, so the default
+is never decoded); an array of bound 0 (`x<0>`, `x[0]`), which never has an
+element.
+
 The parser reads every declaration in a source file, so a syntax error,
 `float`/`double`/`quadruple`, a multi-argument procedure, or a duplicate
 member or procedure name fails the build wherever it appears. The other

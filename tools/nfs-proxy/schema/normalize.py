@@ -38,7 +38,10 @@ WHAT IT REFUSES
   two positions one path is refused too: duplicate struct members or
   procedure names, a union arm whose branch repeats the discriminant's name,
   two arm declarations sharing a branch, one union named as the operation
-  of both directions, and the rest that schema/README.md lists.
+  of both directions, and the rest that schema/README.md lists.  A path must
+  also name a position some message carries, so a non-void procedure beside
+  the minor-version selector, a non-void default arm that no discriminant
+  value selects, and an array of bound 0 are refused as well.
 
   The parser reads every declaration in a file, so its refusals (syntax,
   float/double/quadruple, multi-argument procedures, duplicate member or
@@ -765,6 +768,10 @@ class Normalizer:
                             None if name else ("optional", sub))
         kind = "array_fixed" if shape == "fixed" else "array_var"
         bound = size if size is not None else UNBOUNDED
+        if bound == 0:
+            # Its count is always 0, so `<array>[]` would name an element
+            # no message carries.
+            raise SchemaError(f"{where}: an array of bound 0 has no element")
         return self.add({"kind": kind, "name": name, "sub": sub,
                          "bound": bound},
                         None if name else (kind, sub, bound))
@@ -840,8 +847,24 @@ class Normalizer:
                 self.decl_type(default)
             node["default"] = {"label": "default", "decl": default["name"],
                                "type": t}
+            # The decoder refuses a discriminant its type does not declare,
+            # so when every value has a case the default is never decoded,
+            # and `<union>.default` would name a value no message carries.
+            # A void default names nothing.
+            if t is not None and self.covered(dt, seen):
+                raise SchemaError(f"union {name}: every {dk} value has a "
+                                  f"case, so the default arm is never "
+                                  f"decoded")
         else:
             node["default"] = None
+
+    def covered(self, dt, seen):
+        node = self.nodes[dt]
+        if node["kind"] == "bool":
+            return {0, 1} <= seen
+        if node["kind"] == "enum":
+            return {v for _, v in node["values"]} <= seen
+        return False
 
     def ref_target(self, spec):
         # Follow plain typedef aliases to the struct name they denote.
@@ -916,6 +939,15 @@ class Normalizer:
         sel = None
         if self.ann["minor_field"]:
             sel = self.selector(procs)
+            # Only the selector's argument carries the minor version that
+            # picks a schema, so the decoder decodes no other procedure's
+            # CALL or REPLY (src/nfs_decode.c): any value of one would have
+            # a path no message carries.
+            for p in procs:
+                if p["number"] != sel["procedure"] and \
+                        (p["arg"] is not None or p["res"] is not None):
+                    raise SchemaError(f"procedure {p['name']} carries no "
+                                      f"minor version, so it must be void")
         depth = max([self.depth(p["arg"]) for p in procs] +
                     [self.depth(p["res"]) for p in procs] + [0])
         if depth > MAX_DEPTH:
