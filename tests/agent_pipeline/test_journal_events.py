@@ -160,7 +160,7 @@ def test_all_nine_event_schemas_roundtrip_exact_bytes(kind):
 
 
 # Produced independently with the existing C test builder and accepted by
-# production nfsp_ruleset_load in the parent's cross-language check. Embedding
+# production nfsp_ruleset_load in an independent cross-language check. Embedding
 # bytes keeps these tests independent of /tmp artifacts and of our builder.
 C_CALL = bytes.fromhex(
     "4e46535052554c31000000010000004e6e6673342e312f7368613235363a653137623764"
