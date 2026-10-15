@@ -50,10 +50,13 @@ The caller locks the resource before writing an admission tombstone and a
 guardian. The guardian records `active` durably **before** spawning the payload.
 Thus parent death between spawn and record cannot free a living guardian's lock;
 guardian death in that window leaves an unclean record that refuses replacement.
-A failure before `active` (socket or selector creation, guardian spawn, a missing
-kernel interface, a lost configuration) records `clean` with `spawn_failed` or
-`guardian_failed` instead: the payload starts only after `active`, so a
-`reserved` record under the held lock proves nothing ran.
+The guardian channel (socketpair and selector) is allocated before the
+admission records are written, so descriptor exhaustion there changes no state.
+A later failure before `active` (guardian spawn, a missing kernel interface, a
+lost configuration) records `clean` with `spawn_failed` or `guardian_failed`
+instead; the supervisor closes its channel first so the record write has a
+descriptor. The payload starts only after `active`, so a `reserved` record
+under the held lock proves nothing ran.
 The payload does not inherit either the lock descriptor or control socket.
 
 The guardian uses Linux `PR_SET_CHILD_SUBREAPER`. It terminates and reaps its
@@ -75,7 +78,7 @@ restarted caller. The old lease remains admitted and cannot execute twice.
 | Durable `clean` state and a new current lease | Admit the new attempt |
 | Previously admitted lease, even after failure/restart | `DuplicateExecution` |
 | `reserved`, `active`, malformed or `quarantined` state after lock acquisition | `RecoveryRequired`; no signal to stored PIDs and no execution |
-| TERM/KILL cleanup cannot prove an empty tree within its deadlines | `CleanupIncomplete`; living guardian retains the lock and continues cleanup |
+| TERM/KILL cleanup cannot prove an empty tree within its deadlines | `CleanupIncomplete` (an `ExecutionNotStopped`: the Runner task ends only at lease expiry); living guardian retains the lock and continues cleanup |
 | Guardian is killed and its dirty state is retained | `RecoveryRequired` on the next admission |
 | Complete ownership namespace loss or rollback | Not automatically detectable; the operator must externally fence the resource before recovery |
 

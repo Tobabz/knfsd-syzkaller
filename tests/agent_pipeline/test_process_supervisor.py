@@ -444,11 +444,49 @@ def test_fd_failure_before_guardian_spawn_leaves_resource_clean(host, tmp_path, 
 
     monkeypatch.setattr(module, name, once)
     lease, control = claim(runner, "first")
-    with pytest.raises(ProcessSupervisorError, match="could not start"):
+    with pytest.raises(ProcessSupervisorError, match="could not allocate"):
         supervisor.run(command(tmp_path, 'open("ran","w")'), lease, control,
                        resource_key="lane", limits=limits())
     assert not (tmp_path / "ran").exists()
-    assert record(supervisor)["result"]["reason"] == "spawn_failed"
+    # Allocated before admission: nothing was recorded for this lease.
+    assert not (supervisor.state_dir / sha("lane") / "current.json").exists()
+    lease, control = claim(runner, "second")
+    result = supervisor.run(command(tmp_path, 'print("next")'), lease, control,
+                            resource_key="lane", limits=limits())
+    assert result.stdout == b"next\n"
+
+
+@pytest.mark.parametrize("spare", range(8))
+def test_real_descriptor_exhaustion_leaves_resource_usable(host, tmp_path, spare):
+    # Each spare count runs out of descriptors at a different step: state
+    # directories, the lock, the guardian channel, the admission records, or
+    # the guardian's pipes (where the supervisor must free its channel before
+    # recording clean(spawn_failed)). None may leave the resource reserved.
+    import resource
+    runner, supervisor = host
+    lease, control = claim(runner, "first")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    held = []
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(soft, 512), hard))
+    try:
+        try:
+            while True:
+                held.append(os.open(os.devnull, os.O_RDONLY))
+        except OSError as exc:
+            assert exc.errno == errno.EMFILE
+        for _ in range(spare):
+            os.close(held.pop())
+        with pytest.raises(OSError if spare < 2 else (OSError, ProcessSupervisorError)):
+            supervisor.run(command(tmp_path, 'open("ran","w")'), lease, control,
+                           resource_key="lane", limits=limits())
+    finally:
+        for fd in held:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert not (tmp_path / "ran").exists()
+    path = supervisor.state_dir / sha("lane") / "current.json"
+    if path.exists():
+        assert record(supervisor)["state"] == "clean"
     lease, control = claim(runner, "second")
     result = supervisor.run(command(tmp_path, 'print("next")'), lease, control,
                             resource_key="lane", limits=limits())
@@ -585,3 +623,58 @@ def test_record_reader_accepts_committed_inode_replaced_after_open(tmp_path, mon
         assert guardian.read_record(path) == {"state": "active"}
     assert replaced
     assert guardian.read_record(path) == {"state": "clean"}
+
+
+def test_unconfirmed_cleanup_does_not_settle_a_cancel_early(tmp_path, monkeypatch):
+    # ProcessSupervisor -> capture -> EvidenceSealingBackend -> RunnerWorker:
+    # CleanupIncomplete must not let the worker record the cancel while the
+    # payload may still run. The task ends only at lease expiry.
+    from agent_pipeline.artifacts import ArtifactStore
+    from agent_pipeline.evidence import EvidenceStore
+    from agent_pipeline.runner import RunnerWorker
+    from agent_pipeline.runner.evidence_backend import (
+        EvidenceSealingBackend, RunnerEvidenceReceiptStore)
+
+    runner = DurableRunner(tmp_path / "runner.sqlite", lease_duration_ns=30_000_000_000)
+    receipts = RunnerEvidenceReceiptStore(tmp_path / "receipts.sqlite")
+    supervisor = ProcessSupervisor(tmp_path / "state")
+    release = tmp_path / "allow-test-cleanup"
+    wrapper = tmp_path / "quarantine_guardian.py"
+    wrapper.write_text(f'''
+import importlib.util,sys,socket
+from pathlib import Path
+s=importlib.util.spec_from_file_location('guardian',{guardian.__file__!r})
+g=importlib.util.module_from_spec(s); s.loader.exec_module(g)
+original=g._signal_child
+def signal_child(pid,sig):
+    if not Path({str(release)!r}).exists(): raise PermissionError('test-only signal denial')
+    original(pid,sig)
+g._signal_child=signal_child
+g.run(socket.socket(fileno=int(sys.argv[1])),int(sys.argv[2]),Path(sys.argv[3]))
+''')
+    monkeypatch.setattr(guardian, "__file__", str(wrapper))
+
+    class Capture:
+        def capture(self, lease, control):
+            code = 'import os,time; open("pid","w").write(str(os.getpid())); time.sleep(60)'
+            threading.Timer(0.3, runner.cancel, (lease.binding.task_id,)).start()
+            supervisor.run(command(tmp_path, code), lease, control, resource_key="lane",
+                           limits=limits(term_grace_s=0.1, kill_grace_s=0.2))
+            raise AssertionError("cleanup cannot be confirmed in this test")
+
+    try:
+        runner.submit("task", RunnerInput(job_id="job", harness_ref=sha("h"),
+                                          execution_harness_id=sha("e")))
+        backend = EvidenceSealingBackend(Capture(), EvidenceStore(ArtifactStore(tmp_path / "cas")),
+                                         receipts, sealer_id="test")
+        run = RunnerWorker(runner, backend, worker_id="w").run_once()
+        assert run.disposition == "not_stopped"
+        assert Path(f"/proc/{(tmp_path / 'pid').read_text()}").exists()
+        assert runner.status("task").state == "running"   # cancel still pending
+        assert runner.receipt("task") is None
+    finally:
+        release.touch()
+        receipts.close()
+        runner.close()
+    eventually(lambda: record(supervisor).get("state") == "clean")
+    eventually(lambda: not Path(f"/proc/{(tmp_path / 'pid').read_text()}").exists())

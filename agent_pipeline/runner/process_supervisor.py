@@ -24,7 +24,7 @@ from typing import Mapping
 
 from . import _process_guardian as guardian
 from .models import WorkLease
-from .worker import LeaseControl
+from .worker import ExecutionNotStopped, LeaseControl
 
 
 class ProcessSupervisorError(RuntimeError):
@@ -43,8 +43,27 @@ class DuplicateExecution(ProcessSupervisorError):
     """This lease was already admitted on this resource, even if it failed."""
 
 
-class CleanupIncomplete(ProcessSupervisorError):
-    """Cleanup was not confirmed; a living guardian retains the resource lock."""
+class CleanupIncomplete(ProcessSupervisorError, ExecutionNotStopped):
+    """Cleanup was not confirmed; a living guardian retains the resource lock.
+
+    As an ``ExecutionNotStopped``, it keeps the Runner from reporting the
+    execution (or a pending cancel) as ended before lease expiry.
+    """
+
+
+def _open_channel():
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        return parent, child, selectors.DefaultSelector()
+    except BaseException:
+        _close(parent, child)
+        raise
+
+
+def _close(*handles) -> None:
+    for handle in handles:
+        if handle is not None:
+            handle.close()
 
 
 @dataclass(frozen=True)
@@ -209,21 +228,32 @@ class ProcessSupervisor:
                 token_sha256=_sha(lease.token), attempt_sha256=attempt_hash,
                 boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             )
-            # Keep durable admission tombstones even on spawn failure. Retrying
-            # an execution requires a fresh lease, not the same bearer again.
-            guardian.write_record(attempt_path, record)
-            guardian.write_record(record_path, record)
+            # Allocate the guardian channel before anything is recorded: under
+            # descriptor exhaustion this fails with no state change, and a
+            # later failure can free these descriptors to record clean.
+            try:
+                ipc = _open_channel()
+            except OSError:
+                raise ProcessSupervisorError("could not allocate guardian channel") from None
+            try:
+                # Keep durable admission tombstones even on spawn failure. Retrying
+                # an execution requires a fresh lease, not the same bearer again.
+                guardian.write_record(attempt_path, record)
+                guardian.write_record(record_path, record)
+            except BaseException:
+                _close(*ipc)
+                raise
             config = dict(command=wire, limits=asdict(limits),
                           expires_at_ns=renewed.expires_at_ns,
                           attempt_sha256=attempt_hash)
-            return self._execute(resource, fd, config, record, lease, control, limits)
+            return self._execute(resource, fd, config, record, lease, control, limits, ipc)
         finally:
             # Never LOCK_UN: the guardian holds the SAME open file description.
             # Closing our copy leaves its lock in force until tree cleanup.
             os.close(fd)
 
-    def _execute(self, resource, lock_fd, config, record, lease, control, limits):
-        parent = child_channel = selector = None
+    def _execute(self, resource, lock_fd, config, record, lease, control, limits, ipc):
+        parent, child_channel, selector = ipc
         process = None
         output = {"stdout": bytearray(), "stderr": bytearray()}
         total = 0
@@ -251,8 +281,6 @@ class ProcessSupervisor:
 
         try:
             try:
-                parent, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-                selector = selectors.DefaultSelector()
                 process = subprocess.Popen(
                     [sys.executable, "-I", str(Path(guardian.__file__).resolve()),
                      str(child_channel.fileno()), str(lock_fd), str(resource)],
@@ -261,9 +289,11 @@ class ProcessSupervisor:
                     stderr=subprocess.PIPE, start_new_session=True, env={},
                 )
             except OSError:
-                # No guardian exists: socket/selector creation failed, or
-                # Popen's exec-error protocol has reaped the failed guardian.
-                # No guardian/payload can hold the resource after this failure.
+                # Popen's exec-error protocol has reaped the failed guardian;
+                # no guardian/payload can hold the resource after this failure.
+                # Free the channel first: under descriptor exhaustion the
+                # record write needs a descriptor too.
+                _close(parent, child_channel, selector)
                 record.update(state="clean", result=dict(type="result", reason="spawn_failed"))
                 guardian.write_record(resource / "current.json", record)
                 raise ProcessSupervisorError("could not start process guardian") from None
@@ -358,9 +388,7 @@ class ProcessSupervisor:
         finally:
             # EOF independently tells the guardian to clean up, including on
             # KeyboardInterrupt or failures in the calling application.
-            for resource_handle in (child_channel, parent, selector):
-                if resource_handle is not None:
-                    resource_handle.close()
+            _close(child_channel, parent, selector)
             if process is not None:
                 for stream in (process.stdout, process.stderr):
                     stream.close()
