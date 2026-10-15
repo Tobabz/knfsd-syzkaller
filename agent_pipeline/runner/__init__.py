@@ -19,7 +19,7 @@ from .service import (
     LeaseLost,
     RunnerDataError,
 )
-from .worker import LeaseControl, RunnerBackend, RunnerWorker
+from .worker import ExecutionNotStopped, LeaseControl, RunnerBackend, RunnerWorker
 from .evidence_backend import (
     EvidenceSealingBackend,
     ExecutionCapture,
@@ -41,6 +41,7 @@ __all__ = [
     "EXECUTOR_ENDED_UNSEALED",
     "ExecutionCapture",
     "ExecutionEngine",
+    "ExecutionNotStopped",
     "HostExecutionFacts",
     "LeaseControl",
     "LeaseLost",

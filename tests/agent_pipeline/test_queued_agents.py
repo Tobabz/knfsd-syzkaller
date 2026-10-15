@@ -82,3 +82,32 @@ def test_failure_is_delivered_once_and_a_retry_does_not_nest(tmp_path):
         executor.close()
     assert [f[1] for f in sink.failures] == [1, 2, 3]
     assert all(f[2].startswith("RuntimeError") for f in sink.failures)
+
+
+def test_result_is_redelivered_after_the_sink_fails_to_store_it(tmp_path):
+    import pytest
+    import sqlite3
+
+    sink = Sink()
+    calls = []
+
+    def flaky(*args):
+        calls.append(args)
+        if len(calls) == 1:              # e.g. a transient SQLite write lock
+            raise sqlite3.OperationalError("database is locked")
+        Sink.on_agent_result(sink, *args)
+
+    sink.on_agent_result = flaky
+    executor = QueuedAgentExecutor(DeterministicFunctionRuntime([analysis_data()]),
+                                   ArtifactStore(tmp_path / "a"),
+                                   lambda req: toolbox(), sink)
+    try:
+        executor.start(request(AgentTask.CANDIDATE_ANALYSIS))
+        with pytest.raises(sqlite3.OperationalError):
+            executor.deliver(block=True, timeout=5)
+        assert executor.deliver() == 1
+        assert executor.deliver() == 0
+    finally:
+        executor.close()
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert len(sink.results) == 1
