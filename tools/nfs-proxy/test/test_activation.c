@@ -382,8 +382,8 @@ static void test_pending_timeout_and_stale_ack(void)
 	      "admission closes while draining ACK is pending");
 	CHECK(nfsp_activation_account_reply(&activation, 7,
 					    NFSP_ACTIVATION_REPLY_RESOLVED) ==
-	      NFSP_ACTIVATION_OUTSIDE_WINDOW,
-	      "unconfirmed draining barrier is fail-closed for REPLY");
+	      NFSP_ACTIVATION_OK,
+	      "REPLY to an admitted CALL is G's while the drain ACK waits");
 	CHECK(nfsp_activation_deactivate(&activation, "rules-A", 7, &drain2) ==
 	      NFSP_ACTIVATION_BARRIER_PENDING && drain2.id == drain1.id &&
 	      gate.calls == 2, "duplicate pending deactivation is idempotent");
@@ -408,15 +408,16 @@ static void test_pending_timeout_and_stale_ack(void)
 	      "quarantined snapshot");
 	CHECK(generations[0].state == NFSP_GENERATION_QUARANTINED &&
 	      generations[0].draining_barrier == NFSP_BARRIER_NO_ACK &&
-	      generations[0].unresolved_replies == 1,
-	      "timeout preserves unresolved generation facts");
+	      generations[0].resolved_replies == 1 &&
+	      generations[0].unresolved_replies == 0,
+	      "timeout preserves generation reply facts");
 	CHECK(nfsp_activation_force_close(&activation, 7,
 					  NFSP_FORCE_ABORTED) == NFSP_ACTIVATION_OK,
 	      "explicit abort can record closure after quarantine");
 	s = snapshot(&activation, generations, 4, &count);
 	CHECK(s.state == NFSP_ACTIVATION_QUARANTINED &&
 	      generations[0].closure_reason == NFSP_CLOSURE_ABORTED &&
-	      generations[0].reply_unresolved_count == 1,
+	      generations[0].reply_unresolved_count == 0,
 	      "forced closure does not clear lane quarantine");
 	nfsp_activation_free(&activation);
 }
@@ -953,6 +954,54 @@ static void test_typed_results(void)
 	      "unknown result string");
 }
 
+/* A REPLY to an admitted CALL that arrives while the draining ACK waits,
+ * or while G still accounts a CALL, settles G's reply debt (PR #34 X-P2-2). */
+static void test_reply_while_drain_barrier_or_call_accounting(void)
+{
+	struct nfsp_activation activation;
+	struct gate_script gate;
+	struct nfsp_activation_barrier open, drain;
+	struct nfsp_activation_generation_snapshot generations[4];
+	struct nfsp_activation_call_ticket pending;
+	uint64_t generation = 0;
+	size_t count = 0;
+
+	script_init(&gate, NFSP_ACTIVATION_GATE_ACCEPTED);
+	script_add(&gate, NFSP_ACTIVATION_GATE_ACCEPTED);
+	script_add(&gate, NFSP_ACTIVATION_GATE_PENDING);
+	init_activation(&activation, &gate, 4, 2);
+	install(&activation);
+	CHECK(nfsp_activation_activate(&activation, "rules-A", 7, &open) ==
+	      NFSP_ACTIVATION_OK, "G7 open");
+	admit_call(&activation, 7);
+	CHECK(nfsp_activation_call_generation(&activation, &generation,
+					      &pending) ==
+	      NFSP_ACTIVATION_OK && generation == 7, "second CALL ticket");
+	CHECK(nfsp_activation_deactivate(&activation, "rules-A", 7, NULL) ==
+	      NFSP_ACTIVATION_CALL_ACCOUNT_PENDING, "G7 accounts its CALLs");
+	CHECK(nfsp_activation_account_reply(&activation, 7,
+					    NFSP_ACTIVATION_REPLY_RESOLVED) ==
+	      NFSP_ACTIVATION_OK, "REPLY during CALL_ACCOUNTING is G7's");
+	CHECK(nfsp_activation_account_call(&activation, &pending,
+					   NFSP_ACTIVATION_CALL_INSERTED) ==
+	      NFSP_ACTIVATION_OK, "pending CALL accounted");
+	CHECK(nfsp_activation_deactivate(&activation, "rules-A", 7, &drain) ==
+	      NFSP_ACTIVATION_BARRIER_PENDING, "draining ACK pending");
+	CHECK(nfsp_activation_account_reply(&activation, 7,
+					    NFSP_ACTIVATION_REPLY_RESOLVED) ==
+	      NFSP_ACTIVATION_OK, "REPLY during DRAIN_BARRIER is G7's");
+	CHECK(nfsp_activation_barrier_complete(&activation, drain.id,
+					       NFSP_ACTIVATION_GATE_ACCEPTED) ==
+	      NFSP_ACTIVATION_OK, "draining ACK accepted");
+	(void)snapshot(&activation, generations, 4, &count);
+	CHECK(count == 1 && generations[0].state == NFSP_GENERATION_CLOSED &&
+	      generations[0].closure_reason == NFSP_CLOSURE_DRAINED &&
+	      generations[0].resolved_replies == 2 &&
+	      generations[0].reply_unresolved_count == 0,
+	      "both REPLYs settled: G7 closes drained");
+	nfsp_activation_free(&activation);
+}
+
 int main(void)
 {
 	test_init_ruleset_and_legacy();
@@ -967,6 +1016,7 @@ int main(void)
 	test_capacity_and_snapshot_preflight();
 	test_permutation_determinism();
 	test_typed_results();
+	test_reply_while_drain_barrier_or_call_accounting();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

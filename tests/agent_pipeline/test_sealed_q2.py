@@ -239,11 +239,20 @@ def test_malformed_q2_index_is_invalid_evidence(tmp_path, malformed):
     assert result.reason == "invalid_evidence"
 
 
-def test_non_utf8_manager_report_is_invalid_evidence(tmp_path):
+def test_non_utf8_manager_report_is_unclassified_not_dropped(tmp_path):
     f = setup(tmp_path, reports=(b"\xff\xfe\x00",))
     result = f.judge.judge(f.bundle_ref, f.profile_ref)
     assert result.status is Q2Status.INCONCLUSIVE
-    assert result.reason == "invalid_evidence"
+    assert result.reason == "unclassified_report"
+
+
+def test_one_non_utf8_byte_keeps_a_sealed_report_classifiable(tmp_path):
+    report = (b"BUG: KASAN: slab-use-after-free in nfsd4_process_open2\n"
+              b"Read of size 8 at addr ffff888012345678 by task syz\xff/5\n")
+    f = setup(tmp_path, reports=(report,))
+    result = f.judge.judge(f.bundle_ref, f.profile_ref)
+    assert result.status is Q2Status.OBSERVED
+    assert [s.signal_class for s in result.signals] == ["KASAN"]
 
 
 def test_unlisted_or_omitted_report_cannot_change_the_oracle(tmp_path):

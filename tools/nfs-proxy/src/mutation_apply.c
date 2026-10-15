@@ -448,9 +448,12 @@ nfsp_mutation_lower(const struct nfsp_resolver_record *record,
 		} else {
 			struct edit_plan *plan;
 
-			if (nplans == NFSP_CONCRETE_EDIT_MAX ||
-			    (mutation->selected.len == 0u &&
-			     mutation->output.len == 0u))
+			/* A raw no-op (nothing selected, nothing written) edits
+			 * no byte; it must not refuse the rest of the batch. */
+			if (mutation->selected.len == 0u &&
+			    mutation->output.len == 0u)
+				continue;
+			if (nplans == NFSP_CONCRETE_EDIT_MAX)
 				return NFSP_MUTATION_STRUCTURE_CONSTRAINT_FAILED;
 			plan = &plans[nplans++];
 			plan->offset = mutation->selected.off;
@@ -463,6 +466,8 @@ nfsp_mutation_lower(const struct nfsp_resolver_record *record,
 			plan->data = mutation->output.bytes;
 		}
 	}
+	if (nplans == 0u)
+		return NFSP_MUTATION_EMPTY;
 	for (size_t i = 0; i < nplans; i++) {
 		size_t bytes = (size_t)plans[i].remove_len + plans[i].data_len;
 

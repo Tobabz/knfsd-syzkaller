@@ -13,6 +13,20 @@ the current `RunnerInput` has no separate stage field. A completion receipt
 binds that task id to its job, harness artifact, execution harness, accepted
 lease generation, and final bundle or unsealed reason.
 
+## Lease expiry and cancellation (09 §8)
+
+`RunnerWorker` renews its lease from a heartbeat thread, every third of the
+lease duration by default, while the backend runs. A lease that still expires
+(the worker or host died) is never claimed again: the task ends
+`ended_unsealed(runner_restart)`, and the Controller decides whether to run
+it again under its `runtime_retry` budget.
+
+`cancel()` on a leased task only records the request and answers `running`.
+The worker sees it through `stop_requested()`, and its `complete()` settles
+the task as `ended_unsealed(cancelled)`. If the worker never completes, lease
+expiry settles it the same way. So a final cancel status means the execution
+stopped, and the Controller sends the job's next Runner task only then.
+
 ## Backend fencing requirement
 
 The generation and bearer token in `WorkLease` must also fence the concrete
@@ -21,11 +35,11 @@ process/VM ownership record, reject stale heartbeats and writes, and require
 the current generation/token before publishing a sealed bundle. It must poll
 `LeaseControl.stop_requested()` and stop on cancellation or lost ownership.
 
-SQLite expiry and reclaim prevent an old worker's result from being accepted
-by `DurableRunner`, but they cannot terminate a noncooperative process or undo
+SQLite lease expiry prevents an old worker's result from being accepted by
+`DurableRunner`, but it cannot terminate a noncooperative process or undo
 side effects it performs outside this database. A backend that does not apply
-the same fence can briefly overlap with a replacement after expiry and is not
-safe for production use.
+the same fence can briefly overlap with a retry the Controller starts after
+expiry and is not safe for production use.
 
 The raw token is a bearer credential. It is retained in SQLite and returned in
 `WorkLease`; audit views expose only its SHA-256 digest.

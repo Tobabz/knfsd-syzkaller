@@ -796,7 +796,12 @@ nfsp_activation_account_reply(struct nfsp_activation *a, uint64_t generation,
 		return account_outside_reply(a, 1, 0, 0);
 	if (a->quarantined)
 		return account_outside_reply(a, 0, 0, 0);
+	/* Deactivation closes CALL admission only: a REPLY to a CALL G
+	 * admitted is G's while G accounts its last CALLs, waits for the
+	 * draining ACK, or drains (01 §16, 06 §27). */
 	eligible = g->state == NFSP_GENERATION_ADMITTING ||
+		   g->state == NFSP_GENERATION_CALL_ACCOUNTING ||
+		   g->state == NFSP_GENERATION_DRAIN_BARRIER ||
 		   g->state == NFSP_GENERATION_DRAINING;
 	if (!eligible)
 		return account_outside_reply(a, 0, 0, 0);

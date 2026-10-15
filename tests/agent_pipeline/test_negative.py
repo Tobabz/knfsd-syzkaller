@@ -5,7 +5,9 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from agent_pipeline.contracts import (AnalysisOutput, GapClass, GapRef,
+from agent_pipeline.contracts import (HOST_AUTHORITY_UNAVAILABLE,
+                                      AnalysisOutput, GapClass, GapRef,
+                                      MaterializeRejected,
                                       HarnessBinding, PlanOutput, Q1Status,
                                       Sanitizer)
 from agent_pipeline.controller import events as ev
@@ -269,6 +271,7 @@ def test_registry_change_rebinds_reached_job_in_one_atomic_transition(world):
     replacement = binding(hcap="hcap-2")
     world.hcap.judge_versions = lambda revision: \
         versions if revision == replacement.hcap_revision else None
+    world.materializer.authority_changed.add(replacement.hcap_revision)
     world.registry.put(replacement)
 
     world.c.on_registry_changed()
@@ -440,9 +443,12 @@ def test_hcap_change_in_planning_restarts_the_task(world):
 
 
 def test_hcap_change_while_running_rematerializes_and_restarts(world):
+    """The new HCAP revision changes the call admission or neutral
+    control authority refs: the harness is rebuilt and the run restarted."""
     j = world.to_running()
     before = world.job(j)
     task = before.pending_task.task_id
+    world.materializer.authority_changed.add("hcap-2")
     world.registry.put(binding(hcap="hcap-2"))
     world.c.on_registry_changed()
     job = world.job(j)
@@ -450,6 +456,88 @@ def test_hcap_change_while_running_rematerializes_and_restarts(world):
     assert job.harness.harness_ref != before.harness.harness_ref
     assert job.pending_task.task_id != task
     assert world.runner.cancel_calls[task] == 1
+
+
+def test_hcap_change_while_running_keeps_harness_with_same_authority(world):
+    """09 §5 `hcap_revision`-only row: the plan re-validates and the
+    authority refs are unchanged, so the run goes on."""
+    j = world.to_running()
+    before = world.job(j)
+    task = before.pending_task.task_id
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.binding.hcap_revision == "hcap-2"
+    assert job.harness.harness_ref == before.harness.harness_ref
+    assert job.harness.hcap_revision == "hcap-1"
+    assert job.harness.authority_hcap_revision == "hcap-2"
+    assert job.pending_task.task_id == task
+    assert task not in world.runner.cancel_calls
+    assert job.counters == before.counters
+    seq = job.seq
+    world.c.on_registry_changed()               # no repeated migration
+    assert world.job(j).seq == seq
+    assert world.c.replay(j) == world.job(j)
+
+
+def test_hcap_change_keeps_reached_job_with_same_authority(world):
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    assert before.state is JobState.S1_REACHED
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    assert job.stage2_input == before.stage2_input
+    assert job.last_verdict == before.last_verdict
+    assert job.harness.harness_ref == before.harness.harness_ref
+    assert world.c.replay(j) == job
+
+
+def test_host_authority_refusal_blocks_without_llm_repair(world):
+    """09 §3: a host-side Materializer refusal (unapproved HCAP, corrupt
+    build artifact) is not an Agent mistake: no repair task, no charge."""
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    refusal = MaterializeRejected(
+        reason=HOST_AUTHORITY_UNAVAILABLE,
+        detail="hcap_not_approved_for_execution_harness")
+    world.materializer.refusals[(before.plan_ref,
+                                 before.binding.execution_harness_id)] = \
+        refusal
+    world.materializer.authority_changed.add("hcap-2")
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "host_authority"
+    assert job.pending_task is None
+    assert job.counters.agent_repair_stage1 == \
+        before.counters.agent_repair_stage1
+
+    del world.materializer.refusals[(before.plan_ref,
+                                     before.binding.execution_harness_id)]
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.harness.hcap_revision == "hcap-2"
+    assert job.counters.agent_repair_stage1 == \
+        before.counters.agent_repair_stage1
+
+
+def test_hcap_change_with_failing_plan_replans_despite_same_authority(world):
+    j = world.to_running()
+    before = world.job(j)
+    world.hcap.violations[(before.plan_ref, "hcap-2")] = ("cap_withdrawn",)
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.S1_PLANNING
+    assert job.harness is None
+    assert world.c.replay(j) == job
 
 
 def test_sanitizer_policy_change_rebinds(world):

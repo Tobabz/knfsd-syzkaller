@@ -18,6 +18,46 @@ from .contracts import (CandidateLocation, CandidateSubmission, LocationKind,
                         Record, VulnerabilityCandidate)
 
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+
+#: The source Stage 1 analysis can read (03 §5): the NFS server and client,
+#: lockd, SUNRPC, exportfs, and the VFS files a `client_vfs_operation` entry
+#: passes through.  A root ending in "/" is a directory; any other root is a
+#: path prefix.  Candidates outside these roots are refused at intake.
+ANALYSIS_ROOTS = (
+    "fs/nfsd/",
+    "fs/nfs/",
+    "fs/nfs_common/",
+    "fs/lockd/",
+    "fs/exportfs/",
+    "net/sunrpc/",
+    "include/linux/nfs",
+    "include/linux/sunrpc/",
+    "include/linux/lockd/",
+    "include/linux/exportfs.h",
+    "include/uapi/linux/nfs",
+    "include/trace/events/sunrpc.h",
+    "fs/attr.c",
+    "fs/fcntl.c",
+    "fs/file_table.c",
+    "fs/ioctl.c",
+    "fs/locks.c",
+    "fs/namei.c",
+    "fs/open.c",
+    "fs/read_write.c",
+    "fs/readdir.c",
+    "fs/remap_range.c",
+    "fs/splice.c",
+    "fs/stat.c",
+    "fs/sync.c",
+    "fs/xattr.c",
+)
+
+
+def in_analysis_roots(path: str) -> bool:
+    """`path` is normalized; a directory root also matches itself."""
+    return any(path == root[:-1] or path.startswith(root)
+               if root.endswith("/") else path.startswith(root)
+               for root in ANALYSIS_ROOTS)
 SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -76,6 +116,9 @@ def validate(sub: CandidateSubmission, tree: SourceTree,
                               detail=sub.kernel_commit)
     if not normalized(loc.path):
         return IntakeRejected(reason="path_not_normalized", detail=loc.path)
+    if not in_analysis_roots(loc.path):
+        return IntakeRejected(reason="path_outside_analysis_roots",
+                              detail=loc.path)
     text = tree.read_text(sub.kernel_commit, loc.path)
     if text is None:
         return IntakeRejected(reason="path_not_found", detail=loc.path)

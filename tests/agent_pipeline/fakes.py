@@ -100,6 +100,9 @@ class FakeHcap:
 class FakeMaterializer:
     def __init__(self) -> None:
         self.refusals: dict[tuple[str, str], MaterializeRejected] = {}
+        #: HCAP revisions whose call admission / neutral control refs differ
+        #: from every earlier revision's.
+        self.authority_changed: set[str] = set()
 
     def materialize(self, plan_ref: str, binding: HarnessBinding, *,
                     hcap_authority=None):
@@ -115,6 +118,10 @@ class FakeMaterializer:
                                        binding.hcap_revision),
             execution_harness_id=binding.execution_harness_id,
             hcap_revision=binding.hcap_revision)
+
+    def harness_authority_current(self, harness_ref: str,
+                                  binding: HarnessBinding) -> bool:
+        return binding.hcap_revision not in self.authority_changed
 
 
 class FakeJudge:
@@ -291,11 +298,11 @@ class World:
                           new_id=self._new_id)
 
     def restart(self) -> Controller:
-        versions = self.controller.judge_versions
+        # A fresh Controller with the configured default: adopted judge
+        # versions must come back from the Store, not from memory.
         self.store.close()
         self.store = Store(self.tmp / "jobs.sqlite")
         self.controller = self._controller()
-        self.controller.judge_versions = versions
         self.controller.recover()
         return self.controller
 

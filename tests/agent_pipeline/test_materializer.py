@@ -25,6 +25,7 @@ from agent_pipeline.admission import (
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.components import Materializer
 from agent_pipeline.contracts import (
+    HOST_AUTHORITY_UNAVAILABLE,
     HarnessBinding,
     MaterializationHcapAuthority,
     MaterializeRejected,
@@ -409,6 +410,70 @@ def test_compatible_replacement_uses_effective_hcap_with_new_build_identity(
     assert harness.execution_harness_id == binding.execution_harness_id
 
 
+def _approved_for(world, *hcap_refs):
+    approval = ExecutionHarnessApproval(
+        descriptor=world.descriptor,
+        approved_hcap_revisions=tuple(sorted({world.hcap_ref, *hcap_refs})))
+    return ArtifactHarnessMaterializer(
+        world.store, StaticExecutionHarnessAuthority((approval,)),
+        world.parser)
+
+
+def test_harness_authority_current_only_while_hcap_refs_are_unchanged(
+        world):
+    """09 §5: an HCAP-only change keeps a harness whose call admission
+    profile and neutral control catalog refs are unchanged."""
+    result = world.materializer.materialize(world.plan_ref, world.binding)
+    assert isinstance(result, Materialized)
+    same_refs = put_record(world.store, world.hcap.model_copy(update={
+        "missing_capability_ids": ("fixture.unrelated_future_capability",),
+    }))
+    profile = world.profile.model_copy(update={
+        "limits": world.profile.limits.model_copy(
+            update={"max_calls_per_program": 15})})
+    profile_ref = put_record(world.store, profile)
+    neutral_ref = put_record(world.store, world.neutral_catalog.model_copy(
+        update={"call_admission_profile_ref": profile_ref}))
+    new_refs = put_record(world.store, world.hcap.model_copy(update={
+        "authority_refs": (
+            AuthorityRef(kind="CallAdmissionProfile",
+                         artifact_ref=profile_ref),
+            AuthorityRef(kind="NeutralControlCatalog",
+                         artifact_ref=neutral_ref),
+            AuthorityRef(kind="NormalFlowSeedManifest",
+                         artifact_ref=world.seed_manifest_ref),
+        )}))
+    materializer = _approved_for(world, same_refs, new_refs)
+
+    def current(hcap_ref, **updates):
+        return materializer.harness_authority_current(
+            result.harness_ref, world.binding.model_copy(
+                update={"hcap_revision": hcap_ref, **updates}))
+
+    assert current(world.hcap_ref)
+    assert current(same_refs)
+    assert not current(new_refs)
+    # Not approved for this execution harness, or another harness.
+    assert not world.materializer.harness_authority_current(
+        result.harness_ref,
+        world.binding.model_copy(update={"hcap_revision": same_refs}))
+    assert not current(same_refs, execution_harness_id="f" * 64)
+    # A corrupt harness record is not current; a missing one is I/O.
+    corrupt = world.store.put(b"not a harness")
+    assert not materializer.harness_authority_current(
+        corrupt, world.binding)
+    with pytest.raises(OSError):
+        materializer.harness_authority_current("e" * 64, world.binding)
+
+
+@pytest.mark.parametrize("error", [TimeoutError("bridge timed out"),
+                                   ChildProcessError("bridge killed")])
+def test_parser_host_failure_is_raised_not_a_rejection(world, error):
+    world.parser.results[world.scenario_ref] = error
+    with pytest.raises(OSError):
+        world.materializer.materialize(world.plan_ref, world.binding)
+
+
 def test_seed_flow_has_no_admission_bypass(world):
     proposal = ProgramProposal(
         kind="seed", artifact_ref=world.scenario_ref,
@@ -606,7 +671,7 @@ def test_parser_and_build_identity_mismatch_are_refused(world):
         (("openat$lane", "available", lane_facts()),))
     parser_mismatch = world.materializer.materialize(
         world.plan_ref, world.binding)
-    assert parser_mismatch.reason == INVALID_RUNTIME_SELECTION
+    assert parser_mismatch.reason == HOST_AUTHORITY_UNAVAILABLE
     assert "parser_identity_mismatch" in parser_mismatch.detail
 
     changed = world.descriptor.model_copy(update={
@@ -616,7 +681,7 @@ def test_parser_and_build_identity_mismatch_are_refused(world):
     materializer = ArtifactHarnessMaterializer(
         world.store, FixedBuildAuthority(approval), world.parser)
     build_mismatch = materializer.materialize(world.plan_ref, world.binding)
-    assert build_mismatch.reason == INVALID_RUNTIME_SELECTION
+    assert build_mismatch.reason == HOST_AUTHORITY_UNAVAILABLE
     assert "identity_mismatch" in build_mismatch.detail
 
 
