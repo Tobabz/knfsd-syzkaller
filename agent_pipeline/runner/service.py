@@ -252,8 +252,8 @@ class DurableRunner:
             harness_ref=task_input.harness_ref,
             execution_harness_id=task_input.execution_harness_id,
         )
-        now = self._now()
         with self._transaction():
+            now = self._now()
             row = self._row(task_id)
             if row is None:
                 self._db.execute(
@@ -292,8 +292,8 @@ class DurableRunner:
 
     def cancel(self, task_id: str) -> RunnerStatus:
         task_id = self._task_id(task_id)
-        now = self._now()
         with self._transaction():
+            now = self._now()
             row = self._row(task_id)
             if row is None:
                 self._db.execute(
@@ -355,8 +355,8 @@ class DurableRunner:
     def recoverable(self) -> tuple[RecoverableTask, ...]:
         """Return tasks claimable now in stable submission order."""
 
-        now = self._now()
         with self._lock:
+            now = self._now()
             rows = self._db.execute(
                 """SELECT task_id, submission_order, lifecycle,
                           lease_generation
@@ -379,11 +379,13 @@ class DurableRunner:
 
     def claim(self, worker_id: str) -> WorkLease | None:
         worker_id = self._worker_id(worker_id)
-        now = self._now()
-        expires = now + self._lease_duration_ns
-        if expires > 2**63 - 1:
-            raise ValueError("lease expiry exceeds signed 64-bit range")
         with self._transaction():
+            # Lock contention can outlast a lease. Take all lease timestamps
+            # only once both the process lock and SQLite write lock are held.
+            now = self._now()
+            expires = now + self._lease_duration_ns
+            if expires > 2**63 - 1:
+                raise ValueError("lease expiry exceeds signed 64-bit range")
             row = self._db.execute(
                 """SELECT * FROM runner_tasks
                    WHERE cancel_requested_at_ns IS NULL AND
@@ -448,8 +450,8 @@ class DurableRunner:
 
     def renew(self, lease: WorkLease) -> WorkLease:
         lease = WorkLease.model_validate(lease)
-        now = self._now()
         with self._transaction():
+            now = self._now()
             row = self._row(lease.binding.task_id)
             self._require_current_lease(row, lease, now)
             # A heartbeat guarantees one lease window from "now" without
@@ -475,8 +477,8 @@ class DurableRunner:
         """True for cancellation, expiry, reclaim, or any lost ownership."""
 
         lease = WorkLease.model_validate(lease)
-        now = self._now()
         with self._lock:
+            now = self._now()
             row = self._row(lease.binding.task_id)
             try:
                 self._require_current_lease(row, lease, now)
@@ -487,8 +489,8 @@ class DurableRunner:
     def complete(self, lease: WorkLease, result: BackendResult) -> RunnerStatus:
         lease = WorkLease.model_validate(lease)
         result = BackendResult.model_validate(result)
-        now = self._now()
         with self._transaction():
+            now = self._now()
             row = self._row(lease.binding.task_id)
             self._require_current_lease(row, lease, now)
             if result.bundle_ref is not None:

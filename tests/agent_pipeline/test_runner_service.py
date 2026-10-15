@@ -270,6 +270,109 @@ def test_lease_can_be_renewed_without_changing_generation(tmp_path):
     runner.close()
 
 
+@pytest.mark.parametrize("operation", ["complete", "renew", "claim", "reclaim"])
+@pytest.mark.parametrize("after_wait", [199, 200, 400])
+def test_lease_time_is_sampled_after_sqlite_write_lock(
+        tmp_path, operation, after_wait):
+    path = tmp_path / "runner.sqlite"
+    clock = FakeClock(100)
+    runner = make_runner(path, clock)
+    runner.submit("job-1.t1", runner_input())
+    lease = None if operation == "claim" else runner.claim("worker")
+    clock.set(150)
+    entering = threading.Event()
+    # SQLite traces BEGIN before acquiring its write lock. This handshake
+    # also works after the fix, which must not read the clock before BEGIN.
+    runner._db.set_trace_callback(
+        lambda sql: entering.set() if sql == "BEGIN IMMEDIATE" else None)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+
+    def act():
+        if operation == "complete":
+            return runner.complete(lease, BackendResult(bundle_ref=sha("bundle")))
+        if operation == "renew":
+            return runner.renew(lease)
+        return runner.claim("worker-new")
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(act)
+            try:
+                assert entering.wait(timeout=5)
+                assert not future.done()
+                clock.set(after_wait)
+            finally:
+                blocker.execute("ROLLBACK")
+            if operation in ("complete", "renew") and after_wait >= 200:
+                with pytest.raises(LeaseLost):
+                    future.result(timeout=5)
+                assert runner.status("job-1.t1").state == "running"
+                assert runner.receipt("job-1.t1") is None
+                assert runner.attempts("job-1.t1")[0].expires_at_ns == 200
+            else:
+                result = future.result(timeout=5)
+                if operation == "complete":
+                    assert result.state == "sealed"
+                    assert runner.receipt("job-1.t1").completed_at_ns == after_wait
+                elif operation == "reclaim" and after_wait < 200:
+                    assert result is None
+                else:
+                    assert result.expires_at_ns == after_wait + 100
+                    assert not runner.stop_requested(result)
+                    if operation != "renew":
+                        assert result.claimed_at_ns == after_wait
+                    if operation == "reclaim":
+                        assert result.generation == 2
+                        assert runner.attempts("job-1.t1")[0].outcome == "lease_expired"
+    finally:
+        blocker.close()
+        runner.close()
+
+
+@pytest.mark.parametrize("operation", ["stop_requested", "recoverable"])
+@pytest.mark.parametrize("after_wait", [199, 200, 400])
+def test_lease_reads_sample_time_after_process_lock(
+        tmp_path, monkeypatch, operation, after_wait):
+    clock = FakeClock(100)
+    runner = make_runner(tmp_path / "runner.sqlite", clock)
+    runner.submit("job-1.t1", runner_input())
+    lease = runner.claim("worker")
+    clock.set(150)
+    lock = runner._lock
+    entering = threading.Event()
+
+    class ObservedLock:
+        def __enter__(self):
+            entering.set()
+            return lock.__enter__()
+
+        def __exit__(self, *args):
+            return lock.__exit__(*args)
+
+    monkeypatch.setattr(runner, "_lock", ObservedLock())
+
+    def act():
+        return (runner.stop_requested(lease) if operation == "stop_requested"
+                else runner.recoverable())
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with lock:
+                future = pool.submit(act)
+                assert entering.wait(timeout=5)
+                assert not future.done()
+                clock.set(after_wait)
+            result = future.result(timeout=5)
+        if operation == "stop_requested":
+            assert result is (after_wait >= 200)
+        else:
+            assert [task.task_id for task in result] == (
+                ["job-1.t1"] if after_wait >= 200 else [])
+    finally:
+        runner.close()
+
+
 def test_cancel_wins_over_a_late_backend_result(tmp_path):
     path = tmp_path / "runner.sqlite"
     clock = FakeClock()
