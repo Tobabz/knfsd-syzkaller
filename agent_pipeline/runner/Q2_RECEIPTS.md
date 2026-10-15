@@ -115,7 +115,7 @@ No failure path overwrites a publication or manufactures a successful Q2
 result. Fix stable conflicts at their source; retry unavailable storage without
 recording a semantic verdict.
 
-The owned tests use bounded synthetic captures with the actual Runner,
+The tests use bounded synthetic captures with the actual Runner,
 EvidenceSealingBackend, receipt store, EvidenceStore and Q2 Judge. They cover
 orphan/stale/wrong-task rejection, forged guest indexes, host inventory and
 metadata conflicts, window precedence, storage faults, actual SQLite lock
