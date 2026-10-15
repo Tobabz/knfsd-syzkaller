@@ -52,6 +52,8 @@ Thus parent death between spawn and record cannot free a living guardian's lock;
 guardian death in that window leaves an unclean record that refuses replacement.
 The guardian channel (socketpair and selector) is allocated before the
 admission records are written, so descriptor exhaustion there changes no state.
+If writing the records fails (including the directory sync after `reserved`
+is in place), the supervisor closes the channel and records `clean`.
 A later failure before `active` (guardian spawn, a missing kernel interface, a
 lost configuration) records `clean` with `spawn_failed` or `guardian_failed`
 instead; the supervisor closes its channel first so the record write has a
@@ -79,7 +81,7 @@ restarted caller. The old lease remains admitted and cannot execute twice.
 | Previously admitted lease, even after failure/restart | `DuplicateExecution` |
 | `reserved`, `active`, malformed or `quarantined` state after lock acquisition | `RecoveryRequired`; no signal to stored PIDs and no execution |
 | TERM/KILL cleanup cannot prove an empty tree within its deadlines | `CleanupIncomplete` (an `ExecutionNotStopped`: the Runner task ends only at lease expiry); living guardian retains the lock and continues cleanup |
-| Guardian is killed and its dirty state is retained | `RecoveryRequired` on the next admission |
+| Guardian is killed and its dirty state is retained | The running call raises `ExecutionUncertain` (a `RecoveryRequired` and an `ExecutionNotStopped`: the Runner task ends only at lease expiry); `RecoveryRequired` on the next admission |
 | Complete ownership namespace loss or rollback | Not automatically detectable; the operator must externally fence the resource before recovery |
 
 Boot id, guardian/child PID and process start ticks are audit data, not authority

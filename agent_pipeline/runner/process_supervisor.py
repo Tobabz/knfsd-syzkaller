@@ -51,6 +51,14 @@ class CleanupIncomplete(ProcessSupervisorError, ExecutionNotStopped):
     """
 
 
+class ExecutionUncertain(RecoveryRequired, ExecutionNotStopped):
+    """The guardian started but ended without confirmed tree cleanup.
+
+    Unlike a refused admission, an execution may have run and may still be
+    running: the Runner must not report it as ended before lease expiry.
+    """
+
+
 def _open_channel():
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
@@ -241,7 +249,15 @@ class ProcessSupervisor:
                 guardian.write_record(attempt_path, record)
                 guardian.write_record(record_path, record)
             except BaseException:
+                # Nothing was started: free the channel, then record clean
+                # (a failed directory sync can leave `reserved` in place).
                 _close(*ipc)
+                try:
+                    guardian.write_record(record_path, dict(
+                        record, state="clean",
+                        result=dict(type="result", reason="spawn_failed")))
+                except Exception:
+                    pass  # Fail closed: a reserved record needs recovery.
                 raise
             config = dict(command=wire, limits=asdict(limits),
                           expires_at_ns=renewed.expires_at_ns,
@@ -345,7 +361,7 @@ class ProcessSupervisor:
                             result = message
                             parent.shutdown(socket.SHUT_WR)
                         else:
-                            raise RecoveryRequired("invalid guardian response")
+                            raise ExecutionUncertain("invalid guardian response")
                     else:
                         chunk = os.read(key.fd, 65_536)
                         if not chunk:
@@ -361,7 +377,7 @@ class ProcessSupervisor:
                         break
                     # A broken guardian may leave a descendant holding pipes.
                     if result is None and control_eof:
-                        raise RecoveryRequired("guardian ended without confirmed tree cleanup")
+                        raise ExecutionUncertain("guardian ended without confirmed tree cleanup")
                 if stop_deadline is not None and time.monotonic() >= stop_deadline:
                     raise CleanupIncomplete("guardian cleanup deadline exceeded")
                 if time.monotonic() - started > (limits.timeout_s + limits.heartbeat_timeout_s
@@ -375,7 +391,7 @@ class ProcessSupervisor:
             if (process.returncode != 0 or result is None or clean.get("state") != "clean"
                     or clean.get("attempt_sha256") != record["attempt_sha256"]
                     or clean.get("result") != result):
-                raise RecoveryRequired("guardian lacks durable cleanup acknowledgement")
+                raise ExecutionUncertain("guardian lacks durable cleanup acknowledgement")
             token = lease.token.encode()
             return ProcessResult(
                 reason=stopping or result["reason"], returncode=result["returncode"],

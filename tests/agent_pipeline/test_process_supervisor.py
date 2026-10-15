@@ -19,7 +19,7 @@ import pytest
 
 from agent_pipeline.runner import process_supervisor as ps
 from agent_pipeline.controller.tasks import RunnerInput, RunnerStatus
-from agent_pipeline.runner import RUNNER_RESTART, DurableRunner
+from agent_pipeline.runner import RUNNER_RESTART, DurableRunner, ExecutionNotStopped
 from agent_pipeline.runner.worker import LeaseControl
 from agent_pipeline.runner import _process_guardian as guardian
 from agent_pipeline.runner.process_supervisor import (
@@ -379,8 +379,10 @@ g.run(socket.socket(fileno=int(sys.argv[1])),int(sys.argv[2]),Path(sys.argv[3]))
     monkeypatch.setattr(guardian, "__file__", str(wrapper))
     lease, control = claim(runner)
     code = 'import os,time; open("payload-pid","w").write(str(os.getpid())); time.sleep(60)'
-    with pytest.raises(RecoveryRequired):
+    with pytest.raises(RecoveryRequired) as lost:
         supervisor.run(command(tmp_path, code), lease, control, resource_key="lane", limits=limits())
+    # The payload may still run: the Runner must not record it as ended.
+    assert isinstance(lost.value, ExecutionNotStopped)
     eventually(lambda: (tmp_path / "payload-pid").exists())
     current = record(supervisor)
     assert current["state"] == "active"
@@ -487,6 +489,36 @@ def test_real_descriptor_exhaustion_leaves_resource_usable(host, tmp_path, spare
     path = supervisor.state_dir / sha("lane") / "current.json"
     if path.exists():
         assert record(supervisor)["state"] == "clean"
+    lease, control = claim(runner, "second")
+    result = supervisor.run(command(tmp_path, 'print("next")'), lease, control,
+                            resource_key="lane", limits=limits())
+    assert result.stdout == b"next\n"
+
+
+def test_failed_reservation_sync_records_clean(host, tmp_path, monkeypatch):
+    # current.json is already `reserved` when its directory sync fails
+    # (e.g. EMFILE): nothing started, so the resource must stay usable.
+    runner, supervisor = host
+    real = guardian.sync_directory
+    calls = []
+
+    def flaky(path):
+        calls.append(path)
+        if len(calls) == 2:          # after the tombstone, the reservation
+            raise OSError(errno.EMFILE, "Too many open files")
+        real(path)
+
+    monkeypatch.setattr(guardian, "sync_directory", flaky)
+    lease, control = claim(runner, "first")
+    with pytest.raises(OSError):
+        supervisor.run(command(tmp_path, 'open("ran","w")'), lease, control,
+                       resource_key="lane", limits=limits())
+    monkeypatch.setattr(guardian, "sync_directory", real)
+    assert not (tmp_path / "ran").exists()
+    assert record(supervisor)["state"] == "clean"
+    with pytest.raises(DuplicateExecution):      # the tombstone is kept
+        supervisor.run(command(tmp_path, 'print(1)'), lease, control,
+                       resource_key="lane", limits=limits())
     lease, control = claim(runner, "second")
     result = supervisor.run(command(tmp_path, 'print("next")'), lease, control,
                             resource_key="lane", limits=limits())
