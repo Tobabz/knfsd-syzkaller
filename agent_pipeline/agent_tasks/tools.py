@@ -58,12 +58,29 @@ class IndexedMatch:
     symbol: str | None = None
 
 
+class IndexedSource(str):
+    """String-compatible source text with the adapter's truncation signal.
+
+    A byte limit can drop part of a UTF-8 character, leaving fewer than the
+    requested bytes. Only the adapter knows whether it discarded content.
+    """
+
+    truncated: bool
+
+    def __new__(cls, text: str, *, truncated: bool = False):
+        result = super().__new__(cls, text)
+        result.truncated = truncated
+        return result
+
+
 class KernelSourceIndex(Protocol):
     """A commit-aware, read-only source index supplied by the host.
 
     Implementations must honor the passed roots and limits.  The toolbox
     validates and bounds responses again before exposing them to a model.
     ``search`` is a literal text search, not an arbitrary regular expression.
+    ``read`` may return a plain string for complete text; adapters that cap
+    it must return ``IndexedSource`` with an explicit truncation flag.
     """
 
     def read(self, commit: str, path: str, start_line: int, end_line: int,
@@ -130,6 +147,11 @@ class HcapLookupArgs(ToolArgs):
 
 
 class SourceExcerpt(Record):
+    """Returned line range; the last line may be partial when truncated.
+
+    Empty text has end_line == start_line - 1.
+    """
+
     path: str
     start_line: int
     end_line: int
@@ -292,10 +314,11 @@ class Stage1Toolbox:
             MAX_SOURCE_BYTES)
         if text is None:
             raise FileNotFoundError(path)
-        text, truncated = _bounded(text, MAX_SOURCE_BYTES)
+        truncated = isinstance(text, IndexedSource) and text.truncated
+        text, cut = _bounded(text, MAX_SOURCE_BYTES)
         return SourceExcerpt(path=path, start_line=args.start_line,
-                             end_line=args.end_line, text=text,
-                             truncated=truncated)
+                             end_line=args.start_line + len(text.splitlines()) - 1,
+                             text=text, truncated=truncated or cut)
 
     def _matches(self, values: Sequence[IndexedMatch], requested: int
                  ) -> SourceMatches:

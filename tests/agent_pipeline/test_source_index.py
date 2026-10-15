@@ -22,6 +22,7 @@ from agent_pipeline.agent_tasks.source_index import (
     SourceIndexLimitError,
     _BoundedProcess,
 )
+from agent_pipeline.agent_tasks.tools import MAX_SOURCE_BYTES, Stage1Toolbox
 
 
 SAMPLE_V1 = """\
@@ -163,6 +164,62 @@ def test_reads_only_exact_commit_blobs_and_ignores_worktree(
         synthetic_repo.second_commit, "fs/nfsd/sample.c", 1, 100, 32_768)
     assert replaced is not None and "SECOND_COMMIT" in replaced
     assert "FIRST_COMMIT" not in replaced
+
+
+@pytest.mark.parametrize("source,truncated", [
+    ("".join(f"/* line {i:03}: " + "x" * 84 + " */\n"
+             for i in range(1, 401)), True),
+    ("x" * MAX_SOURCE_BYTES, False),
+    ("x" * MAX_SOURCE_BYTES + "\n", True),
+    ("한" * (MAX_SOURCE_BYTES // 3 + 1), True),
+    ("x" * (MAX_SOURCE_BYTES - 1) + "한", True),
+    ("first\nlast", False),
+    ("", False),
+], ids=["400-lines", "exact-limit", "one-byte-over", "multibyte",
+        "split-codepoint", "short", "empty"])
+def test_git_read_truncation_survives_toolbox(
+        synthetic_repo, source, truncated):
+    path = "fs/nfsd/excerpt.c"
+    (synthetic_repo.path / path).write_text(source, encoding="utf-8")
+    commit = commit_all(synthetic_repo.path, "excerpt")
+    index = GitKernelSourceIndex(synthetic_repo.path)
+    toolbox = Stage1Toolbox(index, None, kernel_commit=commit,
+                            hcap_revision="a" * 64)
+    # Still serve the pinned Git object, including when the worktree differs.
+    (synthetic_repo.path / path).write_text("worktree only\n", encoding="utf-8")
+
+    excerpt = toolbox.invoke("read_kernel_source", {
+        "path": path, "start_line": 1, "end_line": 400})
+    expected = source.encode("utf-8")[:MAX_SOURCE_BYTES].decode(
+        "utf-8", errors="ignore")
+    assert excerpt.text == expected
+    assert excerpt.truncated is truncated
+    assert excerpt.end_line == len(expected.splitlines())
+    assert len(excerpt.text.encode("utf-8")) <= MAX_SOURCE_BYTES
+    # Direct callers retain the original str API and exact byte bound.
+    direct = index.read(commit, path, 1, 400, MAX_SOURCE_BYTES)
+    assert isinstance(direct, str)
+    assert direct == excerpt.text
+    assert direct.truncated is truncated
+
+
+def test_git_read_reports_only_truncation_of_requested_range(synthetic_repo):
+    path = "fs/nfsd/excerpt.c"
+    (synthetic_repo.path / path).write_text(
+        "prefix\n한\nsuffix\n" + "x" * MAX_SOURCE_BYTES, encoding="utf-8")
+    commit = commit_all(synthetic_repo.path, "range")
+    index = GitKernelSourceIndex(synthetic_repo.path)
+    toolbox = Stage1Toolbox(index, None, kernel_commit=commit,
+                            hcap_revision="a" * 64)
+    excerpt = toolbox.invoke("read_kernel_source", {
+        "path": path, "start_line": 2, "end_line": 3})
+    assert (excerpt.text, excerpt.start_line, excerpt.end_line,
+            excerpt.truncated) == ("한\nsuffix\n", 2, 3, False)
+    # A byte budget smaller than one code point produces an empty prefix,
+    # which must still be marked truncated.
+    direct = index.read(commit, path, 2, 2, 1)
+    assert direct == ""
+    assert direct.truncated is True
 
 
 def test_literal_search_handles_metacharacters_and_stays_in_roots(
