@@ -230,7 +230,10 @@ class ArtifactQ2Judge:
             reports.append(ManagerCrashReport(
                 artifact_identity=identity,
                 report_ref=artifact.descriptor.sha256,
-                text=artifact.data.decode("utf-8"),
+                # Report text echoes guest bytes (comm, file names).  The
+                # digest above covers the raw bytes; classification only
+                # needs the headline, so invalid UTF-8 is replaced.
+                text=artifact.data.decode("utf-8", errors="replace"),
             ))
 
         evidence = Q2Evidence(

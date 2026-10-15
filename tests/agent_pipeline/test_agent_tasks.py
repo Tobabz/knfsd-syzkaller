@@ -16,7 +16,7 @@ from agent_pipeline.agent_tasks.planning import ReachabilityPlanningOutput
 from agent_pipeline.agent_tasks.runtime import RuntimeResult
 from agent_pipeline.agent_tasks.tools import (MAX_SOURCE_BYTES, IndexedMatch,
                                               IndexedSource,
-                                              Stage1Toolbox,
+                                              TOOL_DEFINITIONS, Stage1Toolbox,
                                               ToolBoundaryError)
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.contracts import (AgentModelPolicy, AgentTask,
@@ -480,6 +480,27 @@ def test_tool_dispatch_rejects_unregistered_and_unconfined_access():
     # The revision is pinned in the toolbox and is not an accepted argument.
     with pytest.raises(ValidationError):
         tools.invoke("lookup_hcap", {"revision": "other"})
+
+
+@pytest.mark.parametrize("prefix", ["fs/nfsd", "fs/nfsd/", "fs/read_write.c",
+                                    "fs/exportfs"])
+def test_search_accepts_a_root_itself_and_vfs_entry_files(prefix):
+    source = FakeSource()
+    tools = toolbox(source)
+    tools.invoke("search_kernel_source", {"query": "nfsd",
+                                          "path_prefix": prefix})
+    tools.invoke("read_kernel_source", {
+        "path": "fs/read_write.c", "start_line": 1, "end_line": 2})
+    with pytest.raises(ToolBoundaryError, match="fs/nfsd/"):
+        tools.invoke("read_kernel_source", {
+            "path": "fs/super.c", "start_line": 1, "end_line": 2})
+
+
+def test_tool_descriptions_state_the_line_limit_and_roots():
+    read = next(item for item in TOOL_DEFINITIONS
+                if item.name == "read_kernel_source")
+    assert "400 lines" in read.description
+    assert "fs/read_write.c" in read.description
 
 
 def test_tool_results_are_bounded_and_backend_paths_are_rechecked():

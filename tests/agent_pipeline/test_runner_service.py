@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -17,6 +18,7 @@ from agent_pipeline.runner import (
     EXECUTOR_ENDED_UNSEALED,
     BackendResult,
     DurableRunner,
+    RUNNER_RESTART,
     LeaseLost,
     RunnerDataError,
     RunnerWorker,
@@ -196,7 +198,10 @@ def test_concurrent_duplicate_submit_creates_one_task(tmp_path):
     second.close()
 
 
-def test_restart_reclaims_only_after_expiry_and_rejects_old_worker(tmp_path):
+def test_expired_lease_ends_as_runner_restart_and_is_not_rerun(tmp_path):
+    """09 §8: an execution whose worker stopped renewing ends
+    ``ended_unsealed(runner_restart)`` so the Controller charges its retry
+    budget; the Runner never re-executes it on its own."""
     path = tmp_path / "runner.sqlite"
     clock = FakeClock(100)
     runner = make_runner(path, clock, duration=10)
@@ -210,33 +215,47 @@ def test_restart_reclaims_only_after_expiry_and_rejects_old_worker(tmp_path):
     clock.set(109)
     assert restarted.recoverable() == ()
     assert restarted.claim("worker-new") is None
+    assert restarted.status("job-1.t1").state == "running"
 
     clock.set(110)
-    pending = restarted.recoverable()
-    assert len(pending) == 1
-    assert pending[0].reclaiming_expired_lease
-    assert pending[0].next_generation == 2
-    new = restarted.claim("worker-new")
-    assert new.generation == 2
+    assert restarted.recoverable() == ()
+    assert restarted.claim("worker-new") is None
+    ended = restarted.status("job-1.t1")
+    assert (ended.state, ended.reason) == ("ended_unsealed", RUNNER_RESTART)
     attempts = restarted.attempts("job-1.t1")
-    assert [attempt.outcome for attempt in attempts] == ["lease_expired", "active"]
-
+    assert [attempt.outcome for attempt in attempts] == ["lease_expired"]
     with pytest.raises(LeaseLost):
         restarted.complete(old, BackendResult(bundle_ref=sha("stale")))
-    sealed = restarted.complete(new, BackendResult(bundle_ref=sha("accepted")))
-    assert sealed.bundles == (sha("accepted"),)
     receipt = restarted.receipt("job-1.t1")
     assert receipt.binding.task_id == "job-1.t1"
     assert receipt.binding.job_id == task_input.job_id
     assert receipt.binding.harness_ref == task_input.harness_ref
     assert receipt.binding.execution_harness_id == task_input.execution_harness_id
-    assert receipt.generation == 2
+    assert (receipt.generation, receipt.reason) == (1, RUNNER_RESTART)
     restarted.close()
 
     final = make_runner(path, clock, duration=10)
-    assert final.status("job-1.t1") == sealed
-    assert final.attempts("job-1.t1")[-1].outcome == "sealed"
+    assert final.status("job-1.t1") == ended
     final.close()
+
+
+def test_worker_heartbeat_keeps_a_long_run_leased(tmp_path):
+    runner = DurableRunner(tmp_path / "runner.sqlite",
+                           lease_duration_ns=300_000_000)
+    runner.submit("job-1.t1", runner_input())
+
+    class SlowBackend:
+        def execute(self, lease, control):
+            deadline = time.monotonic() + 1.0   # > 3 lease durations
+            while time.monotonic() < deadline:
+                assert not control.stop_requested()
+                time.sleep(0.05)
+            return BackendResult(bundle_ref=sha("long"))
+
+    run = RunnerWorker(runner, SlowBackend(), worker_id="w").run_once()
+    assert run.disposition == "completed"
+    assert run.status.state == "sealed"
+    runner.close()
 
 
 def test_attempt_audit_redacts_bearer_token(tmp_path):
@@ -307,30 +326,30 @@ def test_lease_time_is_sampled_after_sqlite_write_lock(
             if operation in ("complete", "renew") and after_wait >= 200:
                 with pytest.raises(LeaseLost):
                     future.result(timeout=5)
-                assert runner.status("job-1.t1").state == "running"
-                assert runner.receipt("job-1.t1") is None
                 assert runner.attempts("job-1.t1")[0].expires_at_ns == 200
+                assert runner.status("job-1.t1").reason == RUNNER_RESTART
             else:
                 result = future.result(timeout=5)
                 if operation == "complete":
                     assert result.state == "sealed"
                     assert runner.receipt("job-1.t1").completed_at_ns == after_wait
-                elif operation == "reclaim" and after_wait < 200:
+                elif operation == "reclaim":
+                    # An expired lease is never claimed again.
                     assert result is None
+                    if after_wait >= 200:
+                        assert runner.attempts("job-1.t1")[0].outcome == \
+                            "lease_expired"
                 else:
                     assert result.expires_at_ns == after_wait + 100
                     assert not runner.stop_requested(result)
                     if operation != "renew":
                         assert result.claimed_at_ns == after_wait
-                    if operation == "reclaim":
-                        assert result.generation == 2
-                        assert runner.attempts("job-1.t1")[0].outcome == "lease_expired"
     finally:
         blocker.close()
         runner.close()
 
 
-@pytest.mark.parametrize("operation", ["stop_requested", "recoverable"])
+@pytest.mark.parametrize("operation", ["stop_requested"])
 @pytest.mark.parametrize("after_wait", [199, 200, 400])
 def test_lease_reads_sample_time_after_process_lock(
         tmp_path, monkeypatch, operation, after_wait):
@@ -381,11 +400,15 @@ def test_cancel_wins_over_a_late_backend_result(tmp_path):
     runner.submit("job-1.t1", runner_input())
     lease = runner.claim("worker")
 
-    status = observer.cancel("job-1.t1")
-    assert (status.state, status.reason) == ("ended_unsealed", "cancelled")
+    # 09 §8: cancel answers a final status only after the run stopped.
+    assert observer.cancel("job-1.t1").state == "running"
+    assert runner.stop_requested(lease)
     with pytest.raises(LeaseLost):
-        runner.complete(lease, BackendResult(bundle_ref=sha("too-late")))
+        runner.renew(lease)
+    status = runner.complete(lease, BackendResult(bundle_ref=sha("too-late")))
+    assert (status.state, status.reason) == ("ended_unsealed", "cancelled")
     assert runner.status("job-1.t1") == status
+    assert observer.cancel("job-1.t1") == status
     facts = runner.facts("job-1.t1")
     assert facts.cancel_requested_at_ns is not None
     assert facts.cancel_completed_at_ns is not None
@@ -429,14 +452,14 @@ def test_complete_and_cancel_race_has_one_monotone_winner(tmp_path):
             cancel_result = cancelled.result()
 
         final = runner.status(task_id)
+        assert completed_result == final
         if final.state == "sealed":
-            assert completed_result.state == "sealed"
             assert cancel_result == final
             assert runner.facts(task_id).cancel_disposition == "already_sealed"
         else:
+            # Cancel came first: it waited for the run, which then settled it.
             assert (final.state, final.reason) == ("ended_unsealed", "cancelled")
-            assert completed_result == "lease_lost"
-            assert cancel_result == final
+            assert cancel_result.state == "running"
             assert runner.facts(task_id).cancel_disposition == "cancelled"
 
     runner.close()
@@ -499,10 +522,12 @@ def test_backend_in_flight_cancel_cannot_publish_late_success(tmp_path):
         release.set()
         run = future.result(timeout=5)
 
-    assert (cancelled.state, cancelled.reason) == ("ended_unsealed", "cancelled")
-    assert run.disposition == "lease_lost"
-    assert run.status == cancelled
-    assert runner.status("job-1.t1") == cancelled
+    assert cancelled.state == "running"
+    assert run.disposition == "completed"
+    assert (run.status.state, run.status.reason) == ("ended_unsealed",
+                                                     "cancelled")
+    assert runner.status("job-1.t1") == run.status
+    assert runner.attempts("job-1.t1")[0].outcome == "cancelled"
     runner.close()
     canceller.close()
 
@@ -537,4 +562,62 @@ def test_receipt_rejects_conflict_with_durable_task_row(tmp_path):
         )
     with pytest.raises(RunnerDataError, match="conflicts with task state"):
         runner.receipt("job-1.t1")
+    runner.close()
+
+
+def _controller_with(tmp_path, runner):
+    from .fakes import World
+
+    world = World(tmp_path)
+    world.runner = runner
+    world.controller = world._controller()
+    return world
+
+
+def test_expired_leases_spend_the_controller_runtime_retry_budget(tmp_path):
+    from agent_pipeline.controller.records import JobState
+
+    clock = FakeClock()
+    runner = make_runner(tmp_path / "runner.sqlite", clock, duration=10)
+    world = _controller_with(tmp_path, runner)
+    j = world.to_running()
+    limit = world.store.policy("p1").runtime_retry_limit
+    executions = 0
+    for _ in range(limit + 3):
+        if runner.claim("worker") is None:
+            break
+        executions += 1
+        clock.set(clock() + 11)                  # the worker died
+        world.c.poll()
+    job = world.job(j)
+    assert executions == limit + 1
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "runtime_retry_exhausted"
+    runner.close()
+
+
+def test_controller_waits_for_a_leased_run_to_stop_before_the_next(tmp_path):
+    from .fakes import binding
+
+    runner = make_runner(tmp_path / "runner.sqlite", FakeClock())
+    world = _controller_with(tmp_path, runner)
+    j = world.to_running()
+    old = world.job(j).pending_task.task_id
+    lease = runner.claim("worker")
+
+    world.registry.put(binding("build-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.cancelling_tasks == (old,)
+    new = job.pending_task.task_id
+    assert runner.status(new).state == "unknown"  # not sent yet
+    world.c.poll()
+    assert runner.status(new).state == "unknown"
+
+    assert runner.stop_requested(lease)
+    runner.complete(lease, BackendResult(reason="stopped"))
+    world.c.poll()
+    job = world.job(j)
+    assert job.cancelling_tasks == ()
+    assert runner.status(new).state == "running"
     runner.close()

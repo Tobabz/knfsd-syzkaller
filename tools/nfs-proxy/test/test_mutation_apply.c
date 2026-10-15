@@ -929,6 +929,60 @@ static void test_concrete_preflight_order(void)
 	      "independent inserts at one boundary still conflict");
 }
 
+/* A raw no-op (empty value replaced by empty bytes) edits nothing and must
+ * not refuse an independent edit in the same batch (PR #34 review). */
+static void test_raw_noop_keeps_batch(void)
+{
+	static const char tag[] = "tproto.request.COMPOUND.args.tag";
+	struct nfsp_decoded_msg decoded = {0};
+	struct nfsp_mutation_verify verify = verify_context();
+	struct nfsp_resolver_record record;
+	struct nfsp_rule rules[2];
+	struct msg call;
+
+	printf("mutation apply: raw no-op beside a real edit\n");
+	build_call(&call, 7, "", "hello");
+	CHECK(decode_call(&call, &decoded) == 0, "decode no-op fixture");
+	record = record_for(&call, &decoded);
+	base_rule(&rules[0], "a-noop", NULL, tag);
+	rules[0].policy = NFSP_POLICY_RAW;
+	literal_string(&rules[0], "");
+	base_rule(&rules[1], "b-seq", "WRITE",
+		  "tproto.request.WRITE.args.id.seq");
+	literal_uint(&rules[1], 11);
+	for (uint32_t n = 1; n <= 2; n++) {
+		struct nfsp_mutation_batch batch = {0};
+		struct nfsp_mutation_output output = {0};
+		struct nfsp_resolution resolution;
+		struct nfsp_ruleset set = rule_set(rules, n);
+		enum nfsp_mutation_status st;
+
+		CHECK(nfsp_resolve_rules(&set, &record, &resolution) == 0 &&
+		      resolution.preflight == NFSP_PREFLIGHT_READY,
+		      "no-op batch of %u resolves", n);
+		st = nfsp_mutation_lower(&record, &resolution, &batch);
+		if (n == 1u) {
+			CHECK(st == NFSP_MUTATION_EMPTY,
+			      "a lone raw no-op lowers to nothing (%s)",
+			      nfsp_mutation_strstatus(st));
+		} else {
+			const uint8_t seq[4] = {0, 0, 0, 11};
+
+			CHECK(st == NFSP_MUTATION_OK && batch.concrete.nedits == 1u,
+			      "raw no-op is skipped, the other edit stays");
+			CHECK(nfsp_mutation_apply(&record, &resolution, &verify,
+						  &output) == NFSP_MUTATION_OK,
+			      "batch with a raw no-op applies");
+			if (output.framed_bytes != NULL)
+				check_value(&output, rules[1].target_path, seq, 4);
+		}
+		nfsp_mutation_output_free(&output);
+		nfsp_mutation_batch_free(&batch);
+		nfsp_resolution_free(&resolution);
+	}
+	nfsp_decoded_msg_free(&decoded);
+}
+
 int main(void)
 {
 	test_preserve_variables_and_batch();
@@ -940,6 +994,7 @@ int main(void)
 	test_overlap_and_structure_refusal();
 	test_dynamic_originals();
 	test_concrete_preflight_order();
+	test_raw_noop_keeps_batch();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
