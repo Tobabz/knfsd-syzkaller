@@ -358,6 +358,7 @@ ordinal을 쓰지 않는다.
 ```text
 Agent가 고칠 수 있는 입력
     unknown_path, type_mismatch, message_type_inconsistent,
+    selector_mismatch (예: READ rule이 WRITE argument를 읽음),
     missing_required_field (예: targets_baseline_traffic)
         -> Mutation Strategy repair
 

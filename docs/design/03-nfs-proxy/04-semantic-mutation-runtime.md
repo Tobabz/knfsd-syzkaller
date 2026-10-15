@@ -541,6 +541,7 @@ nfs version/minor valid
 operation valid
 target semantic path exists
 target WireRef part exists
+predicate / copy ValueRefs in the target's procedure
 predicate types compatible
 transform types compatible
 structure_policy valid for mutation kind
@@ -552,13 +553,17 @@ promoted registry scope 안 (runtime 광고만으로는 부족, issue #14)
 ```
 
 실패는 typed reason으로 돌려준다. `unknown_path`, `type_mismatch`, `message_type_inconsistent`,
-`missing_required_field`는 Agent가 고칠 입력 오류이고, `unsupported_capability`와
+`selector_mismatch`, `missing_required_field`는 Agent가 고칠 입력 오류이고, `unsupported_capability`와
 `requires_state_lineage`는 `HarnessGapIssue(gap_class=mutation_engine)`로 간다
 (`../02-llm-agent/08-mutation-rule-set.md` §12, issue #5).
 
 Compiler는 live record가 아직 없으므로 actual selector match, current field value,
 current WireRef offset, current TransactionEntry presence, runtime rule conflict를
-검증하지 않는다.
+검증하지 않는다. 다만 어떤 message에도 함께 있을 수 없는 값은 schema만으로 알 수 있으므로 거부한다.
+message 하나는 procedure 하나의 값만 담는다(CALL은 그 argument, REPLY는 그 result, REPLY의 request
+view는 그 REPLY가 답하는 CALL의 argument). 그래서 target과 rule이 읽는 모든 ValueRef는 한 procedure
+안에 있어야 하고, rule이 procedure를 지정하면 그 procedure여야 한다. operation은 그 operation에 닿는
+모든 procedure 안에 있다. 예를 들어 NFSv3 READ rule이 WRITE argument를 읽으면 `selector_mismatch`다.
 
 ### 20. schema_id compatibility
 
@@ -907,7 +912,8 @@ Load는 all-or-nothing이다. 처음 실패한 rule이 set 전체를 거부하�
 
 ```text
 unknown_schema            schema_id를 가진 ProtocolSchema가 없다
-selector_mismatch         family/program/version/minor/procedure/operation이 schema·target과 다르다
+selector_mismatch         family/program/version/minor/procedure/operation이 schema·target과 다르다,
+                          또는 ValueRef가 target과 다른 procedure에 있다(§19)
 message_type_inconsistent CALL rule의 response path, REPLY rule의 request path,
                           CALL rule의 request view
 unknown_path              path가 schema node를 이름 붙이지 않는다
@@ -1201,6 +1207,13 @@ Expected:
 - **미결:** runtime numeric safety limits.
 - **미결:** same-container independent edit conflict granularity.
 - **미결:** existing NFSPARM engine 재사용 범위.
+- **미결(M4b):** 값이 없는 ValueRef. predicate나 copy source가 이 record에서 값을 찾지 못하는 경우(같은
+  COMPOUND에 없는 operation, 고르지 않은 union arm)의 taxonomy 값이다. §8과 §23은 view를 decode할 수
+  없거나, 값이 여럿이거나, request 대응을 증명할 수 없는 경우만 정한다. §19 검사는 어떤 message에도
+  없을 값만 거부한다.
+- **미결(M4b):** 3단계(§21)에서 decode되지 않은 record의 분류. procedure selector가 없는 NFSv4 rule은
+  NULL CALL과 그 REPLY(`unsupported_schema`, `dispatch_incomplete`, `02` 결정됨(M2))에도 RPC selector가
+  맞는다. target이 있을 수 없는 procedure의 record를 hard refusal로 셀지 selector miss로 셀지 정한다.
 - **미결:** state lineage 확장. 이미 정한 불변식은 새 versioned ValueRef source와 semantic runtime
   version, bounded·명시적 scope, capture/reference의 semantic identity(literal 값을 replay identity로 쓰지
   않음), 선언된 capture/match semantics(last observed 값이나 Nth temporal identity 금지), 같은 reference를

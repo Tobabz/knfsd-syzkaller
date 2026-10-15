@@ -711,6 +711,21 @@ static int has_meta(const struct nfsp_protocol_schema *s,
 	return 0;
 }
 
+/* Whether node `n`, resolved in the request (response 0) or the response,
+ * is in that message of procedure `pr`.  -1 when out of memory. */
+static int in_procedure(const struct nfsp_protocol_schema *s,
+			const struct nfsp_schema_proc *pr,
+			const struct nfsp_schema_node *n, int response)
+{
+	uint16_t rt = response ? pr->res : pr->arg;
+
+	if (n->proc)
+		return n->proc == pr;
+	if (rt == NFSP_SCHEMA_NONE)
+		return 0;
+	return nfsp_schema_reaches(s, rt, n->root_type);
+}
+
 static enum nfsp_rule_status check_target(struct val *v)
 {
 	const struct nfsp_protocol_schema *s = v->s;
@@ -733,18 +748,9 @@ static enum nfsp_rule_status check_target(struct val *v)
 			      "operation given for a target outside one");
 	}
 	if (ru->has_procedure) {
-		const struct nfsp_schema_proc *pr =
-			nfsp_schema_proc(s, ru->procedure);
-		uint16_t rt = ru->message_type == NFSP_RULE_REPLY ? pr->res :
-								    pr->arg;
-		int in;
+		int in = in_procedure(s, nfsp_schema_proc(s, ru->procedure), n,
+				      ru->message_type == NFSP_RULE_REPLY);
 
-		if (n->proc)
-			in = n->proc == pr;
-		else if (rt == NFSP_SCHEMA_NONE)
-			in = 0;
-		else
-			in = nfsp_schema_reaches(s, rt, n->root_type);
 		if (in < 0)
 			return refuse(v, NFSP_RULE_NO_MEMORY, "reachability");
 		if (!in)
@@ -800,6 +806,80 @@ static enum nfsp_rule_status check_predicates(struct val *v)
 	}
 	v->pred = NFSP_RULE_NONE;
 	return NFSP_RULE_OK;
+}
+
+/* ---- one procedure ---- */
+
+/* The values a rule reads besides its target, in predicate order and the
+ * copy source last (predicate NFSP_RULE_NONE). */
+struct reads {
+	const struct nfsp_rule_value_ref *ref[2u * NFSP_RULE_PREDICATES_MAX + 1u];
+	uint32_t pred[2u * NFSP_RULE_PREDICATES_MAX + 1u];
+	uint32_t n;
+};
+
+static void add_read(struct reads *r, const struct nfsp_rule_value_ref *ref,
+		     uint32_t pred)
+{
+	if (ref->source == NFSP_SRC_TARGET)
+		return;
+	r->ref[r->n] = ref;
+	r->pred[r->n++] = pred;
+}
+
+/* A message holds the values of one procedure: a CALL its argument, a REPLY
+ * its result, and a REPLY's request views the argument of the CALL it
+ * answers.  So the target and every value the rule reads must be in one
+ * procedure, the rule's own when it names one.  A path of another procedure
+ * resolves, but no message that holds the target holds it, and the rule
+ * could never match.  An operation is in every procedure whose message
+ * reaches it.  The value blamed is the first that no procedure shares with
+ * the target and the values before it. */
+static enum nfsp_rule_status check_procedure(struct val *v)
+{
+	const struct nfsp_protocol_schema *s = v->s;
+	const struct nfsp_rule *ru = v->ru;
+	int reply = ru->message_type == NFSP_RULE_REPLY;
+	struct reads r;
+	uint32_t best = 0;
+
+	r.n = 0;
+	for (uint32_t i = 0; i < ru->npredicates; i++) {
+		add_read(&r, &ru->predicates[i].lhs, i);
+		if (ru->predicates[i].rhs_kind == NFSP_OPND_REF)
+			add_read(&r, &ru->predicates[i].rhs_ref, i);
+	}
+	if (ru->has_transform && ru->transform.kind == NFSP_XF_COPY)
+		add_read(&r, &ru->transform.source, NFSP_RULE_NONE);
+	if (!r.n)
+		return NFSP_RULE_OK;
+	for (uint32_t k = 0; k < s->nprocs; k++) {
+		const struct nfsp_schema_proc *pr = &s->procs[k];
+		uint32_t j = 0;
+		int in;
+
+		if (ru->has_procedure && pr->number != ru->procedure)
+			continue;
+		in = in_procedure(s, pr, &ru->target, reply);
+		for (; in > 0 && j < r.n; j++) {
+			const struct nfsp_rule_value_ref *ref = r.ref[j];
+
+			in = in_procedure(s, pr, &ref->node,
+					  reply && ref->source ==
+						   NFSP_SRC_CURRENT_MESSAGE);
+			if (in <= 0)
+				break;
+		}
+		if (in < 0)
+			return refuse(v, NFSP_RULE_NO_MEMORY, "reachability");
+		if (in > 0)
+			return NFSP_RULE_OK;
+		if (j > best)
+			best = j;
+	}
+	v->pred = r.pred[best];
+	return refuse(v, NFSP_RULE_SELECTOR_MISMATCH,
+		      "a value the rule reads is not in the target's procedure");
 }
 
 /* ---- context dependencies (design 04 §10, rules in §35) ---- */
@@ -1007,7 +1087,7 @@ static enum nfsp_rule_status check_rule(struct val *v)
 	if (ru->has_transform && ru->transform.kind == NFSP_XF_COPY &&
 	    (st = resolve_ref(v, &ru->transform.source)))
 		return st;
-	if ((st = check_deps(v)))
+	if ((st = check_procedure(v)) || (st = check_deps(v)))
 		return st;
 	return check_mutation(v);
 }

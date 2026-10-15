@@ -233,7 +233,7 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s1_reached` | Stage 2 시작(JobPolicy 또는 operator). Q1 evidence의 ExecutionHarnessIdentity가 job의 bound identity와 같음 | `s2_strategy` | — | `01` §5.1 |
 | `s1_reached` | Stage 2 시작, identity 다름 | §5의 identity 변경 처리 | — | `01` §11.2 |
 | `s2_strategy` | `rule_set`, Compiler 성공 | `s2_gate` | — | `08` §12 |
-| `s2_strategy` | `rule_set`, Compiler 거부 `unknown_path`, `type_mismatch`, `message_type_inconsistent`, `missing_required_field` | `s2_strategy` (repair, `compiler_rejected`) | agent_repair | `08` §12 |
+| `s2_strategy` | `rule_set`, Compiler 거부 `unknown_path`, `type_mismatch`, `message_type_inconsistent`, `selector_mismatch`, `missing_required_field` | `s2_strategy` (repair, `compiler_rejected`) | agent_repair | `08` §12 |
 | `s2_strategy` | `rule_set`, Compiler 거부 `unsupported_capability`, `requires_state_lineage` | `blocked_harness_gap(mutation_engine, missing_capability_id)`. `resume_point`는 그 rule set을 다시 compile하는 지점이다 | — | `08` §12, §15, `07` §7 |
 | `s2_strategy` | `unsupported` | `blocked_harness_gap(mutation_engine, missing_capability_id)` | — | `08` §15 |
 | `s2_gate` | gate Q1 `NOT_REACHED` | `blocked_operator(gate_regression)` | — | `01` §3, `08` §16 |
