@@ -164,5 +164,5 @@ class WorkerRun(HostRecord):
 
     task_id: Identifier
     generation: int = Field(ge=1)
-    disposition: Literal["completed", "lease_lost"]
+    disposition: Literal["completed", "lease_lost", "not_stopped"]
     status: RunnerStatus

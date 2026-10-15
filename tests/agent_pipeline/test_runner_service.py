@@ -15,9 +15,11 @@ from agent_pipeline.controller.tasks import (RunnerInput, SubmitRefused,
 from agent_pipeline.data import canonical_json
 from agent_pipeline.runner import (
     BACKEND_ERROR,
+    CANCELLED,
     EXECUTOR_ENDED_UNSEALED,
     BackendResult,
     DurableRunner,
+    ExecutionNotStopped,
     RUNNER_RESTART,
     LeaseLost,
     RunnerDataError,
@@ -255,6 +257,27 @@ def test_worker_heartbeat_keeps_a_long_run_leased(tmp_path):
     run = RunnerWorker(runner, SlowBackend(), worker_id="w").run_once()
     assert run.disposition == "completed"
     assert run.status.state == "sealed"
+    runner.close()
+
+
+def test_unconfirmed_stop_keeps_a_cancel_pending_until_lease_expiry(tmp_path):
+    clock = FakeClock(100)
+    runner = make_runner(tmp_path / "runner.sqlite", clock, duration=10)
+    runner.submit("job-1.t1", runner_input())
+
+    class StuckBackend:
+        def execute(self, lease, control):
+            runner.cancel(lease.binding.task_id)
+            raise ExecutionNotStopped()
+
+    run = RunnerWorker(runner, StuckBackend(), worker_id="w",
+                       heartbeat_interval_s=60).run_once()
+    assert run.disposition == "not_stopped"
+    assert run.status.state == "running"
+    assert runner.cancel("job-1.t1").state == "running"
+    clock.set(110)
+    ended = runner.status("job-1.t1")
+    assert (ended.state, ended.reason) == ("ended_unsealed", CANCELLED)
     runner.close()
 
 

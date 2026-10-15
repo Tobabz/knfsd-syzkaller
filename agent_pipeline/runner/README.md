@@ -26,6 +26,14 @@ the task as `ended_unsealed(cancelled)`. If the worker never completes, lease
 expiry settles it the same way. So a final cancel status means the execution
 stopped, and the Controller sends the job's next Runner task only then.
 
+A backend that cannot confirm its execution stopped (for example, process
+cleanup that could not be proven) raises `ExecutionNotStopped` instead of
+returning a result. `EvidenceSealingBackend` passes it through. The worker then
+neither completes nor renews: the task ends at lease expiry, after the
+backend's own lease deadline. Until cleanup is done, the backend's resource
+fence (for `ProcessSupervisor`, the resource lock) refuses the next execution;
+repeated refusals spend `runtime_retry` and reach `blocked_operator`.
+
 ## Backend fencing requirement
 
 The generation and bearer token in `WorkLease` must also fence the concrete
