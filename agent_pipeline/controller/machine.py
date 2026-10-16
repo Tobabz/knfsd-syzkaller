@@ -98,7 +98,8 @@ class Machine:
     def handle(self, job: Job, event) -> Outcome | None:
         j = job.model_copy(deep=True)
         if j.state in TERMINAL and not isinstance(
-                event, (ev.RunnerFinished, ev.CancelConfirmed)):
+                event, (ev.RunnerFinished, ev.CancelConfirmed,
+                        ev.CleanupUnconfirmed)):
             return None
         c = _Call(j, self.env.policy(j.job_policy_id))
         if not getattr(self, "_on_" + event.type)(c, event):
@@ -540,6 +541,19 @@ class Machine:
             self._cleanup_unconfirmed(c, e.task_id)
         return True
 
+    def _on_cleanup_unconfirmed(self, c: _Call,
+                                e: ev.CleanupUnconfirmed) -> bool:
+        j = c.job
+        if not e.task_id.startswith(j.job_id + ".t") or \
+                e.task_id in j.uncleaned_tasks:
+            return False
+        j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
+                                   if t != e.task_id)
+        if self._is_pending(j.pending_task, TaskKind.RUNNER, e.task_id):
+            j.pending_task = None
+        self._cleanup_unconfirmed(c, e.task_id)
+        return True
+
     def _cleanup_unconfirmed(self, c: _Call, task_id: str) -> None:
         """A Runner task ended without confirmed cleanup (09 §8): keep it
         tracked and hand a live job to the operator.  A terminal job stays
@@ -838,6 +852,13 @@ class Machine:
         """Every entry into s1_running applies the approval policy of the
         moment (09 §3)."""
         j = c.job
+        if j.uncleaned_tasks:
+            # 09 §8: no Runner work while an earlier execution may still
+            # run, however the job got here (a wait ending, another resume).
+            self._block(c, BlockedReason.EXECUTION_CLEANUP,
+                        Target(kind=TargetKind.RUNNING, rerun=rerun,
+                               external=external))
+            return
         if rerun and not external:
             n = j.counters.runtime_retry
             if n >= c.policy.runtime_retry_limit:

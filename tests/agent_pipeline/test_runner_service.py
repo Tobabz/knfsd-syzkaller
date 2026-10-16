@@ -646,3 +646,72 @@ def test_controller_waits_for_a_leased_run_to_stop_before_the_next(tmp_path):
     assert job.cancelling_tasks == ()
     assert runner.status(new).state == "running"
     runner.close()
+
+
+def test_unconfirmed_stop_after_expiry_still_ends_cleanup_unconfirmed(tmp_path):
+    """Cleanup can outlast the lease: an expired attempt still active is
+    ended ``cleanup_unconfirmed`` by the late report itself."""
+    clock = FakeClock(100)
+    runner = make_runner(tmp_path / "runner.sqlite", clock, duration=10)
+    runner.submit("job-1.t1", runner_input())
+
+    class SlowCleanup:
+        def execute(self, lease, control):
+            runner.cancel(lease.binding.task_id)
+            clock.set(111)          # cleanup gives up after the lease
+            raise ExecutionNotStopped()
+
+    run = RunnerWorker(runner, SlowCleanup(), worker_id="w",
+                       heartbeat_interval_s=60).run_once()
+    assert run.disposition == "not_stopped"
+    assert (run.status.state, run.status.reason) == (
+        "ended_unsealed", CLEANUP_UNCONFIRMED)
+    assert runner.cleanup_reports() == ()
+    runner.close()
+
+
+def test_unconfirmed_stop_after_settled_expiry_is_kept_for_the_controller(
+        tmp_path):
+    clock = FakeClock(100)
+    path = tmp_path / "runner.sqlite"
+    runner = make_runner(path, clock, duration=10)
+    runner.submit("job-1.t1", runner_input())
+
+    class SlowCleanup:
+        def execute(self, lease, control):
+            runner.cancel(lease.binding.task_id)
+            clock.set(111)
+            # Someone asked first: expiry settled the cancel.
+            settled = runner.status(lease.binding.task_id)
+            assert (settled.state, settled.reason) == (
+                "ended_unsealed", "cancelled")
+            raise ExecutionNotStopped()
+
+    run = RunnerWorker(runner, SlowCleanup(), worker_id="w",
+                       heartbeat_interval_s=60).run_once()
+    assert run.disposition == "not_stopped"
+    assert runner.cleanup_reports() == ("job-1.t1",)
+    runner.close()
+
+    runner = make_runner(path, clock, duration=10)
+    assert runner.cleanup_reports() == ("job-1.t1",)
+    runner.acknowledge_cleanup_report("job-1.t1")
+    assert runner.cleanup_reports() == ()
+    runner.close()
+
+
+def test_late_unconfirmed_stop_must_name_its_own_attempt(tmp_path):
+    clock = FakeClock(100)
+    runner = make_runner(tmp_path / "runner.sqlite", clock, duration=10)
+    runner.submit("job-1.t1", runner_input())
+    lease = runner.claim("w")
+    clock.set(111)
+    runner.status("job-1.t1")
+    with pytest.raises(LeaseLost):
+        runner.stop_unconfirmed(lease.model_copy(update={"token": "0" * 64}))
+    with pytest.raises(LeaseLost):
+        runner.stop_unconfirmed(lease.model_copy(update={"generation": 2}))
+    assert runner.cleanup_reports() == ()
+    runner.stop_unconfirmed(lease)
+    assert runner.cleanup_reports() == ("job-1.t1",)
+    runner.close()

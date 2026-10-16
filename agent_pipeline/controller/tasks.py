@@ -109,6 +109,13 @@ class Runner(Protocol):
         """Stop and return the final status.  An unknown task_id is recorded
         as cancelled and answered ended_unsealed(cancelled)."""
 
+    def cleanup_reports(self) -> tuple[str, ...]:
+        """Tasks whose execution was reported not confirmed stopped after
+        their final status, not yet acknowledged."""
+
+    def acknowledge_cleanup_report(self, task_id: str) -> None:
+        """The Controller has recorded that report durably."""
+
 
 class AgentRequest(Record):
     """What an Agent Task receives (09 §7, 02 §9).  Artifacts are passed by

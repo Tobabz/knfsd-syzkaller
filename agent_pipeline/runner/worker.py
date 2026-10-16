@@ -122,7 +122,7 @@ class RunnerWorker:
             try:
                 self.runner.stop_unconfirmed(lease)
             except LeaseLost:
-                pass        # already ended; expiry recorded what it knew
+                pass        # not this attempt's to report (reclaimed, unknown)
             return WorkerRun(
                 task_id=lease.binding.task_id,
                 generation=lease.generation,
