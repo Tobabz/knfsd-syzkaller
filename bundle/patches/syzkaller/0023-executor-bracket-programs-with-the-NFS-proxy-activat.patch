@@ -1,4 +1,4 @@
-From 5c9bb60c715a76b921304d065cbc6d9f8e1bed03 Mon Sep 17 00:00:00 2001
+From 8251e2aa5c6dee66af36af116297716ef234989b Mon Sep 17 00:00:00 2001
 From: idealinsane <idealinsane@localhost>
 Date: Fri, 16 Oct 2026 13:43:53 +0000
 Subject: [PATCH] executor: bracket programs with the NFS proxy activation
@@ -28,7 +28,11 @@ For every execution with a managed remote-coverage generation:
   which is also the root of its cgroup namespace, so everything it
   starts (helpers in their own process group or session included)
   stays in it; with the cgroups feature it is the cgroup programs see
-  as ./cgroup, and the fork server stays out of it;
+  as ./cgroup, and the fork server stays out of it.  The cgroup is a
+  boundary only with nsdelegate, so target mode probes it and fails
+  when a program process could move out of it; the executor's own
+  cgroup2 mounts keep the system's hierarchy-wide options (nsdelegate)
+  instead of resetting them;
 - after its calls the program process sends DONE and waits.  DONE is
   only a request (fuzzed syscalls can send it too): the fork server
   freezes the program cgroup (SIGCONT does not undo that), finishes (or
@@ -54,19 +58,19 @@ feature probes without remote coverage) run without a window and so are
 never mutated.
 ---
  executor/common.h                     |  30 +-
- executor/common_linux.h               |  10 +-
- executor/executor.cc                  | 377 +++++++++++++++-
+ executor/common_linux.h               |  48 ++-
+ executor/executor.cc                  | 400 ++++++++++++++++-
  executor/executor_runner.h            |  14 +
  executor/nfs_proxy_activation.h       | 597 ++++++++++++++++++++++++++
- executor/nfs_proxy_activation_test.go | 191 ++++++++
- executor/test.h                       | 395 +++++++++++++++++
+ executor/nfs_proxy_activation_test.go | 216 ++++++++++
+ executor/test.h                       | 387 +++++++++++++++++
  pkg/flatrpc/flatrpc.fbs               |  32 ++
  pkg/flatrpc/flatrpc.go                | 300 ++++++++++++-
  pkg/flatrpc/flatrpc.h                 | 271 +++++++++++-
  pkg/flatrpc/helpers.go                |   6 +
  pkg/flatrpc/nfs_proxy_test.go         |  48 +++
  tools/syz-execprog/execprog.go        |  16 +
- 13 files changed, 2264 insertions(+), 23 deletions(-)
+ 13 files changed, 2341 insertions(+), 24 deletions(-)
  create mode 100644 executor/nfs_proxy_activation.h
  create mode 100644 executor/nfs_proxy_activation_test.go
  create mode 100644 pkg/flatrpc/nfs_proxy_test.go
@@ -145,10 +149,68 @@ index 0817e121b..2234c8111 100644
  			output_data->kcov_generation.store(0, std::memory_order_release);
  #endif
 diff --git a/executor/common_linux.h b/executor/common_linux.h
-index ae5bd713c..8f56de6de 100644
+index ae5bd713c..50024b927 100644
 --- a/executor/common_linux.h
 +++ b/executor/common_linux.h
-@@ -4469,7 +4469,12 @@ static void setup_cgroups_loop()
+@@ -4348,6 +4348,7 @@ static void reset_net_namespace(void)
+ 
+ #if SYZ_EXECUTOR || (SYZ_CGROUPS && (SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID))
+ #include <fcntl.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <sys/mount.h>
+ #include <sys/stat.h>
+@@ -4390,13 +4391,48 @@ static void mount_cgroups(const char* dir, const char** controllers, int count)
+ 	}
+ }
+ 
++// A cgroup2 mount from the initial cgroup namespace resets the hierarchy-wide
++// options (nsdelegate, memory_recursiveprot, ...) to the ones it is given.
++// Keep those the system mounted cgroup2 with.
++static void cgroup2_system_options(char* opts, size_t size)
++{
++	static const char* keep[] = {"nsdelegate", "favordynmods", "memory_localevents",
++				     "memory_recursiveprot", "memory_hugetlb_accounting", "pids_localevents"};
++	opts[0] = 0;
++	FILE* f = fopen("/proc/self/mountinfo", "r");
++	if (!f)
++		return;
++	char line[1024];
++	while (fgets(line, sizeof(line), f)) {
++		if (!strstr(line, " - cgroup2 "))
++			continue;
++		char* super = strrchr(line, ' ');
++		if (!super)
++			break;
++		super[strcspn(super, "\n")] = 0;
++		for (char* opt = strtok(super + 1, ","); opt; opt = strtok(NULL, ",")) {
++			for (size_t i = 0; i < sizeof(keep) / sizeof(keep[0]); i++) {
++				if (strcmp(opt, keep[i]) || strlen(opts) + strlen(opt) + 2 > size)
++					continue;
++				if (opts[0])
++					strcat(opts, ",");
++				strcat(opts, opt);
++			}
++		}
++		break;
++	}
++	fclose(f);
++}
++
+ static void mount_cgroups2(const char** controllers, int count)
+ {
+ 	if (mkdir("/syzcgroup/unified", 0777)) {
+ 		debug("mkdir(/syzcgroup/unified) failed: %d\n", errno);
+ 		return;
+ 	}
+-	if (mount("none", "/syzcgroup/unified", "cgroup2", 0, NULL)) {
++	char opts[256];
++	cgroup2_system_options(opts, sizeof(opts));
++	if (mount("none", "/syzcgroup/unified", "cgroup2", 0, opts[0] ? opts : NULL)) {
+ 		debug("mount(cgroup2) failed: %d\n", errno);
+ 		// For all cases when we don't end up mounting cgroup/cgroup2
+ 		// in /syzcgroup/{unified,net,cpu}, we need to remove the dir.
+@@ -4469,7 +4505,12 @@ static void setup_cgroups_loop()
  	write_file(file, "32");
  	// Setup some v1 groups to make things more interesting.
  	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
@@ -162,7 +224,7 @@ index ae5bd713c..8f56de6de 100644
  	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
  	if (mkdir(cgroupdir, 0777)) {
  		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
-@@ -4692,6 +4697,9 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+@@ -4692,6 +4733,9 @@ static void setup_nfs_fuzz_lane(const char* newroot)
  			}
  		}
  	}
@@ -173,7 +235,7 @@ index ae5bd713c..8f56de6de 100644
  	      procid, source);
  }
 diff --git a/executor/executor.cc b/executor/executor.cc
-index 9a6895f01..d6921422f 100644
+index 9a6895f01..899b116e7 100644
 --- a/executor/executor.cc
 +++ b/executor/executor.cc
 @@ -26,6 +26,10 @@
@@ -323,7 +385,7 @@ index 9a6895f01..d6921422f 100644
  	if (close(kOutFd) < 0)
  		fail("failed to close kOutFd");
  #endif
-@@ -966,6 +1028,267 @@ void execute_glob()
+@@ -966,6 +1028,290 @@ void execute_glob()
  	output_data->result_offset.store(off, std::memory_order_release);
  }
  
@@ -387,19 +449,32 @@ index 9a6895f01..d6921422f 100644
 +	debug("NFS proxy target mode: proc=%llu endpoint=%s\n", procid, addr.sun_path);
 +}
 +
-+// Whether a program process can join `dir`.  With nsdelegate (systemd's
-+// cgroup2 mount) only a cgroup inside the sandbox's cgroup namespace can be.
-+static bool nfsp_cgroup_joinable(int dir)
++// Probe what a program process can do with `dir`: 0 when it can join it and
++// then cannot move to `outside`, 1 when it cannot join it, 2 when it can move
++// out (cgroup2 without nsdelegate: then the cgroup is no boundary).
++static int nfsp_cgroup_probe(int dir, int outside)
 +{
 +	int pid = fork();
 +	if (pid < 0)
 +		fail("NFS proxy cgroup probe fork failed");
-+	if (pid == 0)
-+		doexit(nfsp_cg_join(dir) ? 0 : 1);
++	if (pid == 0) {
++		if (!nfsp_cg_join(dir))
++			doexit(1);
++		doexit(nfsp_cg_write(outside, "cgroup.procs", "0") ? 2 : 0);
++	}
 +	int status = 0;
 +	while (waitpid(pid, &status, __WALL) != pid) {
 +	}
-+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
++	return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
++}
++
++static void nfsp_cgroup_boundary(int probe, const char* path)
++{
++	if (probe == 1)
++		failmsg("NFS proxy program cgroup cannot be joined", "path=%s", path);
++	if (probe == 2)
++		failmsg("NFS proxy target mode needs cgroup2 with nsdelegate: a program can leave its cgroup",
++			"path=%s", path);
 +}
 +
 +// The program cgroup.  With the cgroups feature it is the one programs see as
@@ -407,7 +482,8 @@ index 9a6895f01..d6921422f 100644
 +// stay inside it, and the fork server stays out of it (setup_cgroups_loop).
 +// Otherwise, or when the sandbox cannot reach that one, it is a private one
 +// under the sandbox's cgroup namespace root, from a cgroup2 mount that is
-+// detached again at once.
++// detached again at once.  Target mode fails when a program could move out of
++// it (nfsp_cgroup_probe).
 +static void nfsp_setup_cgroup(const char* newroot)
 +{
 +	char path[192];
@@ -417,16 +493,26 @@ index 9a6895f01..d6921422f 100644
 +		if (mkdir(path, 0777) && errno != EEXIST)
 +			debug("mkdir(%s) failed: %d\n", path, errno);
 +		dir = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-+		if (dir != -1 && !nfsp_cgroup_joinable(dir)) {
++		int outside = open("/syzcgroup/unified", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++		int probe = dir != -1 && outside != -1 ? nfsp_cgroup_probe(dir, outside) : 1;
++		if (outside != -1)
++			close(outside);
++		if (probe == 1) {
 +			debug("NFS proxy: %s is outside the sandbox cgroup namespace\n", path);
-+			close(dir);
++			if (dir != -1)
++				close(dir);
 +			dir = -1;
 +		}
++		nfsp_cgroup_boundary(probe, path);
 +	}
 +	if (dir == -1) {
 +		if (snprintf(path, sizeof(path), "%s/syz-nfsp-cgroup", newroot) >= (int)sizeof(path))
 +			fail("NFS proxy cgroup mount path is too long");
-+		if (mkdir(path, 0700) || mount("none", path, "cgroup2", 0, NULL))
++		// Should the sandbox share the initial cgroup namespace, this mount
++		// resets the hierarchy-wide options: keep nsdelegate.
++		char opts[256];
++		cgroup2_system_options(opts, sizeof(opts));
++		if (mkdir(path, 0700) || mount("none", path, "cgroup2", 0, opts[0] ? opts : NULL))
 +			failmsg("mount cgroup2 for NFS proxy target mode failed", "path=%s", path);
 +		int root = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 +		if (umount2(path, MNT_DETACH) || rmdir(path))
@@ -437,11 +523,10 @@ index 9a6895f01..d6921422f 100644
 +		if (mkdirat(root, path, 0700) && errno != EEXIST)
 +			failmsg("mkdir NFS proxy program cgroup failed", "path=%s", path);
 +		dir = openat(root, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-+		close(root);
 +		if (dir == -1)
 +			failmsg("open NFS proxy program cgroup failed", "path=%s", path);
-+		if (!nfsp_cgroup_joinable(dir))
-+			failmsg("NFS proxy program cgroup cannot be joined", "path=%s", path);
++		nfsp_cgroup_boundary(nfsp_cgroup_probe(dir, root), path);
++		close(root);
 +	}
 +	if (dup3(dir, kNfspCgroupFd, O_CLOEXEC) != kNfspCgroupFd)
 +		fail("dup NFS proxy program cgroup fd failed");
@@ -591,7 +676,7 @@ index 9a6895f01..d6921422f 100644
  // execute_one executes program stored in input_data.
  void execute_one()
  {
-@@ -1021,6 +1344,22 @@ void execute_one()
+@@ -1021,6 +1367,22 @@ void execute_one()
  		}
  	}
  
@@ -614,7 +699,7 @@ index 9a6895f01..d6921422f 100644
  	int call_index = 0;
  	uint64 prog_extra_timeout = 0;
  	uint64 prog_extra_cover_timeout = 0;
-@@ -1029,6 +1368,8 @@ void execute_one()
+@@ -1029,6 +1391,8 @@ void execute_one()
  
  	read_input(&input_pos); // total number of calls
  	for (;;) {
@@ -623,7 +708,7 @@ index 9a6895f01..d6921422f 100644
  		uint64 call_num = read_input(&input_pos);
  		if (call_num == instr_eof)
  			break;
-@@ -1216,8 +1557,16 @@ void execute_one()
+@@ -1216,8 +1580,16 @@ void execute_one()
  		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
  		bool generation_resolved = false;
  #if GOOS_linux
@@ -641,7 +726,7 @@ index 9a6895f01..d6921422f 100644
  			// FINISH performs the bounded kernel-side root/token drain.  It is the
  			// publication barrier for remote extra coverage and synchronously
  			// materializes the committed snapshot before userspace consumes it.
-@@ -1576,7 +1925,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
+@@ -1576,7 +1948,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
  		}
  		calls[call.index] = call.offset;
  	}
@@ -1297,10 +1382,10 @@ index 000000000..eb9b3ab06
 +#endif // NFS_PROXY_ACTIVATION_H
 diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
 new file mode 100644
-index 000000000..eecaf0060
+index 000000000..839d2d335
 --- /dev/null
 +++ b/executor/nfs_proxy_activation_test.go
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,216 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -1492,11 +1577,36 @@ index 000000000..eecaf0060
 +		t.Fatal("execute_one must end a windowed program through nfsp_program_done")
 +	}
 +}
++
++// The program cgroup is only a boundary with nsdelegate: target mode refuses
++// to start when a program could move out of it, and the executor's own
++// cgroup2 mounts keep the system's nsdelegate instead of resetting it.
++func TestNfsProxyProgramCgroupIsABoundary(t *testing.T) {
++	setup := nfspSection(t, "executor.cc", "static void nfsp_setup_cgroup(const char* newroot)\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_setup_cgroup", setup,
++		"nfsp_cgroup_probe(dir, outside)",
++		"nfsp_cgroup_boundary(probe, path);",
++		"cgroup2_system_options(opts, sizeof(opts));",
++		`mount("none", path, "cgroup2", 0, opts[0] ? opts : NULL)`,
++		"nfsp_cgroup_boundary(nfsp_cgroup_probe(dir, root), path);",
++		"dup3(dir, kNfspCgroupFd, O_CLOEXEC)",
++	)
++	probe := nfspSection(t, "executor.cc", "static int nfsp_cgroup_probe(int dir, int outside)\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_cgroup_probe", probe,
++		"nfsp_cg_join(dir)",
++		`nfsp_cg_write(outside, "cgroup.procs", "0") ? 2 : 0`,
++	)
++	mount := nfspSection(t, "common_linux.h", "static void mount_cgroups2(", "\n}\n")
++	nfspRequireOrder(t, "mount_cgroups2", mount,
++		"cgroup2_system_options(opts, sizeof(opts));",
++		`mount("none", "/syzcgroup/unified", "cgroup2", 0, opts[0] ? opts : NULL)`,
++	)
++}
 diff --git a/executor/test.h b/executor/test.h
-index 437bf01d9..db2ff54de 100644
+index 437bf01d9..ab7c5d516 100644
 --- a/executor/test.h
 +++ b/executor/test.h
-@@ -414,6 +414,395 @@ static int test_get_last_opt()
+@@ -414,6 +414,387 @@ static int test_get_last_opt()
  	return 0;
  }
  
@@ -1794,25 +1904,11 @@ index 437bf01d9..db2ff54de 100644
 +	return -1;
 +}
 +
-+// Whether the cgroup v2 hierarchy is mounted with nsdelegate (systemd does),
-+// which makes a cgroup namespace root a boundary for moving tasks.
-+static bool nfsp_test_nsdelegate()
-+{
-+	FILE* f = fopen("/proc/self/mountinfo", "r");
-+	if (!f)
-+		return false;
-+	char line[512];
-+	bool found = false;
-+	while (!found && fgets(line, sizeof(line), f))
-+		found = strstr(line, " - cgroup2 ") && strstr(line, "nsdelegate");
-+	fclose(f);
-+	return found;
-+}
-+
 +// What a fuzzed program can do to outlive DONE: re-arm itself with a periodic
-+// SIGCONT, run a helper in its own session, and (with nsdelegate) move itself
-+// out of its cgroup.  The program cgroup's freeze holds through SIGCONT, its
-+// kill reaches the helper, and the move is refused.
++// SIGCONT, run a helper in its own session, and move itself out of its cgroup.
++// The program cgroup's freeze holds through SIGCONT, its kill reaches the
++// helper, and the move is refused.  The last needs cgroup2 with nsdelegate,
++// which target mode requires (nfsp_cgroup_probe); without it this test fails.
 +static int test_nfsp_cgroup()
 +{
 +	char name[64];
@@ -1822,20 +1918,20 @@ index 437bf01d9..db2ff54de 100644
 +		printf("no writable cgroup v2 hierarchy\n");
 +		return -1;
 +	}
-+	// progress[0]: the program, [1]: its helper, [2]: 1 if the move out was refused.
++	// progress[0]: the program, [1]: its helper, [2]: 1 if the move out was
++	// refused, [3]: the helper's pid.
 +	volatile uint64* progress = (volatile uint64*)mmap(NULL, SYZ_PAGE_SIZE, PROT_READ | PROT_WRITE,
 +							   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 +	if (progress == MAP_FAILED) {
 +		printf("mmap failed\n");
 +		return 1;
 +	}
-+	bool nsdelegate = nfsp_test_nsdelegate();
 +	int pid = fork();
 +	if (pid == 0) {
 +		if (!nfsp_cg_join(dir))
 +			doexit(1);
 +		close(dir);
-+		progress[2] = !nsdelegate || !nfsp_cg_write(root, "cgroup.procs", "0");
++		progress[2] = !nfsp_cg_write(root, "cgroup.procs", "0");
 +		close(root);
 +		struct sigevent sev = {};
 +		sev.sigev_notify = SIGEV_SIGNAL;
@@ -1845,7 +1941,10 @@ index 437bf01d9..db2ff54de 100644
 +		if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &sev, &timer) ||
 +		    syscall(SYS_timer_settime, timer, 0, &every_ms, NULL))
 +			doexit(1);
-+		if (fork() == 0) {
++		int helper = fork();
++		if (helper)
++			progress[3] = helper;
++		else {
 +			setsid();
 +			for (;;) {
 +				getppid();
@@ -1858,7 +1957,7 @@ index 437bf01d9..db2ff54de 100644
 +		}
 +	}
 +	int ret = 0;
-+	for (int i = 0; i < 1000 && !(progress[0] && progress[1]); i++)
++	for (int i = 0; i < 1000 && !(progress[0] && progress[1] && progress[3]); i++)
 +		usleep(1000);
 +	bool frozen = nfsp_cg_freeze(dir, 1000);
 +	uint64 program = progress[0], helper = progress[1];
@@ -1870,17 +1969,20 @@ index 437bf01d9..db2ff54de 100644
 +	}
 +	bool empty = nfsp_cg_empty(dir, 1000);
 +	int status = 0;
++	// Only an escaped program survives the cgroup kill.
 +	kill(pid, SIGKILL);
++	if (progress[3])
++		kill(progress[3], SIGKILL);
 +	waitpid(pid, &status, __WALL);
 +	helper = progress[1];
 +	usleep(20 * 1000);
 +	if (!empty || progress[1] != helper || nfsp_cg_event(dir, "frozen") != 0 || progress[2] != 1) {
-+		printf("kill: empty=%d helper %llu -> %llu frozen=%d move refused=%llu nsdelegate=%d\n", empty,
-+		       helper, (uint64)progress[1], nfsp_cg_event(dir, "frozen"), (uint64)progress[2], nsdelegate);
++		printf("kill: empty=%d helper %llu -> %llu frozen=%d move refused=%llu\n", empty, helper,
++		       (uint64)progress[1], nfsp_cg_event(dir, "frozen"), (uint64)progress[2]);
 +		ret = 1;
 +	}
-+	if (!nsdelegate)
-+		printf("no nsdelegate: moving out of the program cgroup is not tested\n");
++	if (progress[2] != 1)
++		printf("the program moved out of its cgroup: cgroup2 lacks nsdelegate\n");
 +	close(dir);
 +	unlinkat(root, name, AT_REMOVEDIR);
 +	close(root);
@@ -1892,7 +1994,7 @@ index 437bf01d9..db2ff54de 100644
  static struct {
  	const char* name;
  	int (*f)();
-@@ -430,6 +819,12 @@ static struct {
+@@ -430,6 +811,12 @@ static struct {
      {"test_cover_filter", test_cover_filter},
      {"test_glob", test_glob},
      {"test_get_last_opt", test_get_last_opt},

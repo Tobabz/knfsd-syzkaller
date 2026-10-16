@@ -326,9 +326,12 @@ the lane is not reused. Without an ACK, or when KCOV BEGIN gave no generation, t
 is not run. Requests without remote coverage (machine-check probes, comparisons) run without a
 window, so the Proxy leaves them unmutated.
 
-Two limits remain. First, a root program can move a task out of its cgroup, unless the guest's
-cgroup2 mount has `nsdelegate`, as it does under systemd. Second, the KCOV generation counts as
-complete on the program's own report in `DONE`. A program that disturbs its own KCOV binding,
+The cgroup is a boundary only when the guest's cgroup2 has `nsdelegate`, as it does under
+systemd. Without it a root program could move a task out of its cgroup. So the executor checks at
+start that a program process cannot leave its cgroup, and target mode fails otherwise. The
+executor's own cgroup2 mounts keep the system's `nsdelegate` instead of resetting it.
+
+One limit remains: the KCOV generation counts as complete on the program's own report in `DONE`. A program that disturbs its own KCOV binding,
 for example by closing the KCOV descriptor, only loses coverage it would have been credited with.
 
 If a window cannot be confirmed closed, the Proxy quarantined the session, or the pair carried
