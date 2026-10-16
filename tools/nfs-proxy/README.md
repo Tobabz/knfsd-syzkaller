@@ -262,8 +262,9 @@ nfs-proxy CLIENT0 CLIENT1 K_LISTEN G_LISTEN K_BACKEND G_BACKEND \
 - A held record stops only its own connection and direction. The final stats line starts with
   `target ruleset=...`, followed by a `journal ...` line.
 - On exit the Proxy first settles every answer still owed and the events they queue, then sends
-  `RUN_COMPLETE` last, and only when the session ended cleanly (every event ACKed, every opened
-  generation summarized, every batch terminal). Otherwise the stats say `run_complete=skipped` and
+  `RUN_COMPLETE` last, and only when the session ended cleanly (every event ACKed, no event left
+  unrecorded, no evidence-path failure, every opened generation summarized, every batch terminal).
+  The sink also refuses `RUN_COMPLETE` (`session_dirty`) for a session with any recorded rejection. Otherwise the stats say `run_complete=skipped` and
   the Runner ends the session.
 
 The host side is `agent_pipeline/journal_sink.py`:

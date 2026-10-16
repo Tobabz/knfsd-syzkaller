@@ -349,6 +349,11 @@ class _Session:
     ruleset_accepted: bool = False
     ended: str | None = None  # run_complete | session_end
     inconsistent: list[str] = field(default_factory=list)
+    # Dirty marks RUN_COMPLETE may not seal: rejections recorded for this
+    # session on its own channel, and evidence-path failures a generation
+    # summary reported.
+    rejections: int = 0
+    evidence_path_failures: int = 0
     generations: dict[int, _Generation] = field(default_factory=dict)
     batches: dict[int, _Batch] = field(default_factory=dict)
     decided: dict[int, _Decided] = field(default_factory=dict)
@@ -469,8 +474,10 @@ def _admit(session: _Session, request: JournalRequest) -> _Verdict:
 
 
 def _admit_run_complete(session: _Session, payload: RunCompletePayload) -> _Verdict:
-    """The session's last event: everything it opened is closed and terminal,
-    and every count the host can compute agrees."""
+    """The session's last event: the session is clean, everything it opened
+    is closed and terminal, and every count the host can compute agrees.  A
+    session with any recorded rejection or evidence-path failure ends through
+    the Runner's session end instead (05 §21)."""
     if any(g.state != "closed" for g in session.generations.values()):
         return _refuse("generations_open", inconsistent=True)
     terminals = [b.terminal for b in session.batches.values()]
@@ -481,6 +488,9 @@ def _admit_run_complete(session: _Session, payload: RunCompletePayload) -> _Verd
             or payload.forward_complete_count != terminals.count("complete")
             or payload.forward_failed_count != terminals.count("failed")):
         return _refuse("summary_mismatch", inconsistent=True)
+    if (session.rejections or session.evidence_path_failures
+            or payload.evidence_path_failures):
+        return _refuse("session_dirty", inconsistent=True)
     return _accept()
 
 
@@ -509,6 +519,7 @@ def _apply(session: _Session, request: JournalRequest) -> None:
         session.batches[payload.batch_id].terminal = "failed"  # type: ignore[attr-defined]
     elif kind == "GENERATION_COMPLETE":
         session.generations[g].state = "closed"
+        session.evidence_path_failures += payload.evidence_path_failures  # type: ignore[attr-defined]
 
 
 # --- stored records -------------------------------------------------------------
@@ -664,6 +675,10 @@ class HostJournal:
         except JournalFramingError as error:
             # Not storable as one frame: fail this channel, keep the server.
             raise JournalSinkError(f"record not storable: {error}") from error
+        if len(frame) > self.limits.segment_bytes:
+            # Alone in a fresh segment it would still exceed the limit that
+            # recovery enforces: an ACK for it could not survive a restart.
+            raise JournalSinkError("record not storable: larger than a segment")
         if self._total + len(frame) > self.max_total_bytes:
             raise JournalSinkError("journal storage limit reached")
         if self._fd is not None and (
@@ -772,10 +787,20 @@ class HostJournal:
                 "request_sha256": sha, "schema_version": REJECTION_SCHEMA,
                 "vm_instance_id": channel.vm_instance_id}
         journal_id, end, _ = self._append(FrameKind.HOST_REJECTION, canonical_json(body))
-        self._rejections.append(StoredRejection(journal_id, end, channel.vm_instance_id,
-                                                channel.channel_id, session_id, seq, etype,
-                                                sha, reason, consumed, inconsistent))
+        rejection = StoredRejection(journal_id, end, channel.vm_instance_id,
+                                    channel.channel_id, session_id, seq, etype,
+                                    sha, reason, consumed, inconsistent)
+        self._rejections.append(rejection)
+        self._count_rejection(rejection)
         return _reject_response(journal_id, seq, sha, reason)
+
+    def _count_rejection(self, rejection: StoredRejection) -> None:
+        """Mark the named session dirty when the rejection came over its own
+        channel (another channel cannot dirty a session it is not bound to)."""
+        session = self._sessions.get(rejection.proxy_session_id or "")
+        if session is not None and (rejection.vm_instance_id, rejection.channel_id) == (
+                session.binding.vm_instance_id, session.binding.channel_id):
+            session.rejections += 1
 
     def _submit(self, channel: ChannelIdentity, raw: bytes) -> bytes:
         try:
@@ -880,6 +905,7 @@ class HostJournal:
             if type(rejection.consumed) is not bool or type(rejection.inconsistent) is not bool:
                 raise JournalFramingError("invalid stored rejection")
             self._rejections.append(rejection)
+            self._count_rejection(rejection)
             session = self._sessions.get(rejection.proxy_session_id or "")
             if session is None:
                 if rejection.consumed or rejection.inconsistent:
@@ -916,6 +942,8 @@ class HostJournal:
             return {
                 "next_seq": s.next_seq, "ruleset_accepted": s.ruleset_accepted,
                 "ended": s.ended, "inconsistent": list(s.inconsistent),
+                "rejections": s.rejections,
+                "evidence_path_failures": s.evidence_path_failures,
                 "generations": {g: v.state for g, v in s.generations.items()},
                 "batches": {b: v.terminal for b, v in s.batches.items()},
             }

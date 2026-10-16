@@ -437,10 +437,102 @@ def test_run_complete_needs_closed_generations_terminal_batches_and_counts(journ
     refused(g.send("RUN_COMPLETE", run_complete(generations=1, batch_count=1,
                                                 forward_complete_count=1))[1],
             "summary_mismatch")
+    # Every count now agrees, but the refusals above dirtied the session.
+    refused(g.send("RUN_COMPLETE", run_complete(generations=1, batch_count=1,
+                                                forward_failed_count=1))[1],
+            "session_dirty")
     assert journal.session_state(SESSION)["ended"] is None
-    accepted(g.send("RUN_COMPLETE", run_complete(generations=1, batch_count=1,
-                                                 forward_failed_count=1))[1])
+
+
+def _closed_generation(g):
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1), "draining_generations": []})[1])
+    accepted(g.send("EXPOSURE_INTENT", exposure(1, 0))[1])
+    accepted(g.send("GENERATION_DRAINING", {"correlation": corr(1)})[1])
+    accepted(g.send("FORWARD_FAILED", {"batch_id": 0, "bytes_written": 3,
+                                       "correlation": corr(1), "reason": "x"})[1])
+
+
+CLOSED_RUN = run_complete(generations=1, batch_count=1, forward_failed_count=1)
+
+
+def test_run_complete_seals_only_a_clean_session(journal):
+    g = started(journal)
+    _closed_generation(g)
+    accepted(g.send("GENERATION_COMPLETE", summary(1))[1])
+    refused(g.send("RUN_COMPLETE", dict(CLOSED_RUN, evidence_path_failures=1))[1],
+            "session_dirty")
+
+
+def test_clean_session_is_sealed(journal):
+    g = started(journal)
+    _closed_generation(g)
+    accepted(g.send("GENERATION_COMPLETE", summary(1))[1])
+    accepted(g.send("RUN_COMPLETE", CLOSED_RUN)[1])
     assert journal.session_state(SESSION)["ended"] == "run_complete"
+
+
+def test_generation_evidence_failure_keeps_the_run_open(journal):
+    g = started(journal)
+    _closed_generation(g)
+    accepted(g.send("GENERATION_COMPLETE", dict(summary(1), evidence_path_failures=1))[1])
+    refused(g.send("RUN_COMPLETE", CLOSED_RUN)[1], "session_dirty")
+
+
+def test_recorded_rejection_cannot_be_sealed_even_after_restart(tmp_path):
+    """A dirty prefix stays dirty: conflict, then an all-zero RUN_COMPLETE."""
+    j = HostJournal(tmp_path / "j", "lane0")
+    j.install_session(vm_instance_id="vm-1", channel_id="nfspj-0",
+                      proxy_session_id=SESSION, lane_id=LANE, rule_set=RULES)
+    accepted(Guest(j).send("RULESET", ruleset_payload())[1])
+    other = request(0, "RULESET", ruleset_payload(rule_set(b"cand-2")))
+    refused(j.submit(CHANNEL, other), "sequence_conflict")
+    # A rejection on another channel names the session but cannot dirty it.
+    refused(j.submit(ChannelIdentity("vm-9", "nfspj-9"), other), "channel_mismatch")
+    j.close()
+    j2 = HostJournal(tmp_path / "j", "lane0")
+    assert j2.session_state(SESSION)["rejections"] == 1
+    refused(j2.submit(CHANNEL, request(1, "RUN_COMPLETE", run_complete())), "session_dirty")
+    assert j2.session_state(SESSION)["ended"] is None
+    j2.close()
+    j3 = HostJournal(tmp_path / "j", "lane0")
+    state = j3.session_state(SESSION)
+    assert state["ended"] is None
+    assert state["inconsistent"] == ["sequence_conflict", "session_dirty"]
+    j3.close()
+
+
+def test_clean_run_complete_replays_after_restart(tmp_path):
+    j = HostJournal(tmp_path / "j", "lane0")
+    j.install_session(vm_instance_id="vm-1", channel_id="nfspj-0",
+                      proxy_session_id=SESSION, lane_id=LANE, rule_set=RULES)
+    g = Guest(j)
+    accepted(g.send("RULESET", ruleset_payload())[1])
+    _closed_generation(g)
+    accepted(g.send("GENERATION_COMPLETE", summary(1))[1])
+    raw, ack = g.send("RUN_COMPLETE", CLOSED_RUN)
+    accepted(ack)
+    j.close()
+    j2 = HostJournal(tmp_path / "j", "lane0")
+    assert j2.session_state(SESSION)["ended"] == "run_complete"
+    assert j2.submit(CHANNEL, raw) == ack
+    j2.close()
+
+
+def test_frame_larger_than_a_segment_is_never_acked(tmp_path):
+    """Every ACKed record must be recoverable under the same limits."""
+    from agent_pipeline.journal_framing import FrameLimits
+    limits = FrameLimits(payload_bytes=4096, segment_bytes=700, records=100)
+    j = HostJournal(tmp_path / "j", "lane0", limits=limits)
+    j.install_session(vm_instance_id="vm-1", channel_id="nfspj-0",
+                      proxy_session_id=SESSION, lane_id=LANE, rule_set=RULES)
+    g = Guest(j)
+    with pytest.raises(JournalSinkError, match="larger than a segment"):
+        g.send("RULESET", ruleset_payload())
+    j.close()
+    j2 = HostJournal(tmp_path / "j", "lane0", limits=limits)
+    assert j2.session_state(SESSION)["next_seq"] == 0
+    assert j2.events(SESSION) == []
+    j2.close()
 
 
 def test_summary_must_match_host_generation_state(journal):

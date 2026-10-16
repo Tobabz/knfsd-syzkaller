@@ -1365,10 +1365,14 @@ M5/S1b 완료와 M1 판정 연결은 실제 sink, guest transport, relay complet
   있다(`aborted`는 admitting에서도 가능). `drained`는 `reply_unresolved_count = 0`이어야 하고,
   `exposure_batch_count`는 host가 받은 그 generation의 batch 수와 같아야 한다. `RUN_COMPLETE`는 모든
   generation이 closed이고 모든 batch가 terminal이며 generation, batch, complete/failed 수가 host 값과 같을
-  때만 받는다. 어긋나면 `closure_mismatch`, `summary_mismatch`, `generations_open`,
-  `forward_length_mismatch`로 거부하고 inconsistent로 남긴다.
+  때만 받는다. 그 위에서 session이 clean해야 한다: 그 session의 channel로 들어온 rejection이 하나도
+  없고, generation summary와 `RUN_COMPLETE` 자신의 `evidence_path_failures`가 모두 0이어야 한다.
+  어긋나면 `closure_mismatch`, `summary_mismatch`, `generations_open`, `forward_length_mismatch`,
+  `session_dirty`로 거부하고 inconsistent로 남긴다. rejection은 journal에 저장되므로 restart replay도
+  같은 판정을 낸다.
 - **Append 실패.** append나 저장 한도 초과가 실패하면 응답 없이 channel을 끝낸다. guest는 그 event와 뒤의
-  pending event를 LOST로 본다.
+  pending event를 LOST로 본다. frame 하나가 segment 한도보다 크면 쓰기 전에 같은 방식으로 실패한다(새
+  segment에 혼자 써도 recovery가 거부하므로, ACK한 record는 모두 같은 설정으로 복구된다).
 - **Segment recovery.** segment는 `<name>.NNNN.njnl`이다. restart는 모든 segment의 완전한 frame을 순서대로
   다시 admission해 같은 상태를 만들고, 새 segment에 이어 쓴다. 부분 tail은 자르거나 재사용하지 않는다.
   완전한 frame의 손상은 corruption으로 시작을 거부한다.
@@ -1381,7 +1385,8 @@ M5/S1b 완료와 M1 판정 연결은 실제 sink, guest transport, relay complet
   맞아야 ACK로 받아들인다. guest는 `vm_instance_id`/`channel_id`를 모르므로 형식만 검사한다.
 - **세션 종료.** relay가 멈춘 뒤 Proxy는 먼저 남은 답과 그 답이 만드는 event(held batch의
   `FORWARD_FAILED`, drain bound에서 닫히는 generation의 `GENERATION_COMPLETE`)를 모두 처리한다. 모든
-  event가 ACK됐고, 연 generation이 모두 summary까지 ACK됐고, 모든 batch가 terminal일 때만 마지막으로
+  event가 ACK됐고, 기록하지 못한 event가 없고(동기 submit·추적 실패나 `evidence_path_failures`가 있으면
+  `evidence_path_degraded`), 연 generation이 모두 summary까지 ACK됐고, 모든 batch가 terminal일 때만 마지막으로
   `RUN_COMPLETE`를 보낸다. 아니면 보내지 않고 Runner의 session end에 맡긴다. 이미 답을 받은 seq의 ACK는 무시하고, 그 밖의 잘못된 frame,
   EOF, I/O 오류는 pending event 전부를 LOST로 만든다.
 

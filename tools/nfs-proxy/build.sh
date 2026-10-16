@@ -270,6 +270,10 @@ if [ "$MODE" != "--test" ]; then
 		"$SRC/schema.c" "$SRC/schema_nfs4.c" "$SRC/schema_nfs3.c" \
 		"$SRC/rpc_decode.c" "$SRC/rule.c" "$SRC/target.c" \
 		"$SRC/journal.c" "$SRC/jsonw.c" "$SRC/sha256.c" -lm
+	# The fault hook the live tests build in must stay warning-free too.
+	# shellcheck disable=SC2086
+	$CC $CFLAGS -DNFSP_TARGET_FAULT_INJECT -I"$SRC" -c "$SRC/target.c" \
+		-o "$BUILD/target-faults.o"
 fi
 
 echo "=== host test suite: PASS ==="

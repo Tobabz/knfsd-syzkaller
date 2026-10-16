@@ -220,14 +220,29 @@ static int submit(struct nfsp_target *t, const char *type,
 {
 	uint64_t seq;
 
+#ifdef NFSP_TARGET_FAULT_INJECT
+	/* Test builds only: fail every submit of the named event type, as an
+	 * unrecordable event would. */
+	const char *fail = getenv("NFSP_TARGET_FAIL_SUBMIT");
+
+	if (fail != NULL && strcmp(fail, type) == 0) {
+		t->stats.evidence_path_degraded = 1;
+		return -1;
+	}
+#endif
 	if (payload->failed ||
 	    nfsp_journal_submit(t->journal, type, payload->p, payload->len,
-				cookie, &seq) != 0)
+				cookie, &seq) != 0) {
+		/* An event the session owed is not in the journal. */
+		t->stats.evidence_path_degraded = 1;
 		return -1;
-	if (ev_track(t, seq) != 0)
+	}
+	if (ev_track(t, seq) != 0) {
 		/* The event is queued but cannot be followed: the session's
 		 * bookkeeping is broken, so stop admitting anything. */
+		t->stats.evidence_path_degraded = 1;
 		return -1;
+	}
 	if (seq_out != NULL)
 		*seq_out = seq;
 	return 0;
@@ -320,6 +335,7 @@ static void gen_failure(struct nfsp_target *t, uint64_t generation)
 	struct tgen *g = find_gen(t, generation);
 
 	t->stats.evidence_path_failures++;
+	t->stats.evidence_path_degraded = 1;
 	if (g != NULL)
 		g->evidence_failures++;
 }
@@ -1701,14 +1717,17 @@ static void settle(struct nfsp_target *t, uint64_t deadline)
 }
 
 /* RUN_COMPLETE claims the session ended cleanly: every event answered
- * with an ACK, every generation the host opened is summarized, every
- * batch has its terminal.  Anything less is left to the Runner's
- * session end (05 §21). */
+ * with an ACK, no event the session owed went unrecorded, every
+ * generation the host opened is summarized, every batch has its
+ * terminal.  Anything less is left to the Runner's session end (05 §21).
+ * `evidence_path_degraded` is the one dirty mark: a host rejection, a
+ * local submit or tracking failure, or any evidence-path failure. */
 static int clean(const struct nfsp_target *t)
 {
 	if (nfsp_journal_failed(t->journal) ||
 	    nfsp_journal_pending(t->journal) != 0 ||
-	    t->stats.ruleset_state != 1 || t->stats.evidence_path_degraded)
+	    t->stats.ruleset_state != 1 || t->stats.evidence_path_degraded ||
+	    t->stats.evidence_path_failures != 0)
 		return 0;
 	for (size_t i = 0; i < t->ngens; i++) {
 		const struct tgen *g = &t->gens[i];

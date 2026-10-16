@@ -125,6 +125,16 @@ def _recv_record(sock: socket.socket) -> bytes:
 
 @pytest.fixture(scope="module")
 def proxy_binary(tmp_path_factory) -> Path:
+    return _build_proxy(tmp_path_factory)
+
+
+@pytest.fixture(scope="module")
+def proxy_binary_faults(tmp_path_factory) -> Path:
+    """The Proxy with its test-only fault hook (NFSP_TARGET_FAIL_SUBMIT)."""
+    return _build_proxy(tmp_path_factory, "-DNFSP_TARGET_FAULT_INJECT")
+
+
+def _build_proxy(tmp_path_factory, *defines: str) -> Path:
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if cc is None:
         pytest.fail("a C compiler is required to build the Proxy")
@@ -135,7 +145,7 @@ def proxy_binary(tmp_path_factory) -> Path:
     probe = subprocess.run([cc, *sanitize, "-x", "c", "-o", str(out), "-"],
                            input=b"int main(void){return 0;}", capture_output=True)
     flags = sanitize if probe.returncode == 0 else []
-    subprocess.run([cc, "-std=c11", "-O1", "-g", "-pthread", *flags, f"-I{SRC}",
+    subprocess.run([cc, "-std=c11", "-O1", "-g", "-pthread", *flags, *defines, f"-I{SRC}",
                     "-o", str(out), *[str(SRC / s) for s in SOURCES], "-lm"], check=True)
     return out
 
@@ -184,7 +194,8 @@ class Backend:
 
 class Live:
     def __init__(self, binary: Path, tmp: Path, journal: HostJournal, *, lane: int = LANE,
-                 drain_ms: int = 400, reply: bool = True) -> None:
+                 drain_ms: int = 400, reply: bool = True,
+                 env: dict[str, str] | None = None) -> None:
         self.tmp = tmp
         self.rules = rule_set()
         self.rule_set_id = hashlib.sha256(self.rules).hexdigest()
@@ -204,7 +215,7 @@ class Live:
              "--activation", str(self.activation_path), "--drain-bound-ms", str(drain_ms)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
-                 "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"})
+                 "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1", **(env or {})})
         line = self.proc.stdout.readline()
         assert line.startswith("relay ready"), line + self.proc.stderr.read()
         self.act = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -452,4 +463,31 @@ def test_shutdown_drains_owed_events_before_any_run_complete(proxy_binary, tmp_p
     failed = journal.events(SESSION)[-1].request.payload
     assert (failed.reason, failed.bytes_written) == ("connection_closed", 0)
     assert delivery_state(journal.events(SESSION), 0) == "forward_failed"
+    assert "run_complete=skipped" in out
+
+
+def test_local_submit_failure_skips_run_complete(proxy_binary_faults, tmp_path):
+    """An intent the Proxy could not even queue leaves the channel and the
+    host clean, but the session owes evidence it never recorded."""
+    journal = _journal(tmp_path)
+    live = Live(proxy_binary_faults, tmp_path, journal,
+                env={"NFSP_TARGET_FAIL_SUBMIT": "EXPOSURE_INTENT"})
+    try:
+        assert live.request(1, 1) == 0
+        live.call(71, 5)
+        # Not recordable: the record goes out unchanged.
+        assert live.backend.received[-1][0] == compound_call(71, 5)
+        assert live.request(2, 1) == 0
+        live.wait_event("GENERATION_COMPLETE")
+        out = live.stop()
+    finally:
+        if live.proc.poll() is None:
+            live.proc.kill()
+    assert journal.rejections() == []
+    assert live.types() == ["RULESET", "GENERATION_OPEN", "GENERATION_DRAINING",
+                            "GENERATION_COMPLETE"]
+    summary = journal.events(SESSION)[-1].request.payload
+    assert (summary.exposure_batch_count, summary.evidence_path_failures) == (0, 1)
+    assert journal.session_state(SESSION)["ended"] is None
+    assert "evidence_path_failures=1 evidence_path_degraded=1" in out
     assert "run_complete=skipped" in out
