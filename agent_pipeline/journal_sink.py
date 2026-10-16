@@ -19,7 +19,11 @@ guest keeps the record unmutated and the generation's evidence incomplete.
 Nothing a guest sends is corrected to a host value.  The host values
 (`vm_instance_id`, `channel_id`, `proxy_session_id`, `rule_set_id`, the lane
 and the installed rule set bytes) come from `install_session`, which the
-Runner calls before the guest starts its Proxy session.
+Runner calls before the guest starts its Proxy session.  A channel whose
+Proxy starts a fresh session each time it starts (a restarted VM after a
+quarantined or full session) is installed as a series instead
+(`install_session_series`): the host fixes everything but a random suffix of
+the session id, and installs each session before admitting its first event.
 
 Failure domain (§11): Proxy crash, guest crash, VM teardown and Runner
 restart.  Host OS or storage loss is out of scope unless `fsync=True`.
@@ -340,6 +344,20 @@ class _Decided:
     response: bytes
 
 
+# The part of a series session id after the host prefix: "." and a random
+# UUID (/proc/sys/kernel/random/uuid in the guest).
+_SERIES_SUFFIX = re.compile(
+    r"\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_SERIES_PREFIX_MAX = 256 - 37
+
+
+@dataclass(frozen=True)
+class _Series:
+    prefix: str
+    lane_id: int
+    rule_set: bytes
+
+
 @dataclass
 class _Session:
     binding: HostSessionBinding
@@ -601,6 +619,7 @@ class HostJournal:
         self.max_total_bytes = max_total_bytes
         self._lock = threading.Lock()
         self._sessions: dict[str, _Session] = {}
+        self._series: dict[tuple[str, str], _Series] = {}
         self._events: list[StoredEvent] = []
         self._rejections: list[StoredRejection] = []
         self._fd: int | None = None
@@ -717,25 +736,87 @@ class HostJournal:
 
     # -- Runner operations --
 
-    def install_session(self, *, vm_instance_id: str, channel_id: str,
-                        proxy_session_id: str, lane_id: int, rule_set: bytes) -> HostSessionBinding:
-        """Record the Runner's immutable session before the guest uses it."""
+    @staticmethod
+    def _check_install(lane_id: int, rule_set: bytes) -> None:
         if type(rule_set) is not bytes or not 12 <= len(rule_set) <= RULESET_MAX_BYTES:
             raise ValueError("rule set outside bounds")
         ruleset_header(rule_set)
         if type(lane_id) is not int or not 0 <= lane_id <= UINT32_MAX:
             raise ValueError("invalid lane")
+
+    def install_session(self, *, vm_instance_id: str, channel_id: str,
+                        proxy_session_id: str, lane_id: int, rule_set: bytes) -> HostSessionBinding:
+        """Record the Runner's immutable session before the guest uses it."""
+        self._check_install(lane_id, rule_set)
         binding = HostSessionBinding(vm_instance_id=vm_instance_id, channel_id=channel_id,
                                      proxy_session_id=proxy_session_id,
                                      rule_set_id=hashlib.sha256(rule_set).hexdigest())
         with self._lock:
             if proxy_session_id in self._sessions:
                 raise ValueError("proxy_session_id already used")
-            body = {"lane_id": lane_id, "rule_set": rule_set.hex(),
-                    "schema_version": INSTALL_SCHEMA, "session_binding": _binding_json(binding)}
-            self._append(FrameKind.JOURNAL_EVENT, canonical_json(body))
-            self._sessions[proxy_session_id] = _Session(binding, lane_id, rule_set)
+            self._install_locked(binding, lane_id, rule_set)
         return binding
+
+    def _install_locked(self, binding: HostSessionBinding, lane_id: int,
+                        rule_set: bytes) -> _Session:
+        body = {"lane_id": lane_id, "rule_set": rule_set.hex(),
+                "schema_version": INSTALL_SCHEMA, "session_binding": _binding_json(binding)}
+        self._append(FrameKind.JOURNAL_EVENT, canonical_json(body))
+        session = _Session(binding, lane_id, rule_set)
+        self._sessions[binding.proxy_session_id] = session
+        return session
+
+    def install_session_series(self, *, vm_instance_id: str, channel_id: str, prefix: str,
+                               lane_id: int, rule_set: bytes) -> list[HostSessionBinding]:
+        """Let this channel's Proxy start sessions named `prefix.<random UUID>`.
+
+        Each such session is installed with this binding, lane and rule set
+        when its first event (RULESET, seq 0) arrives, before that event is
+        admitted; the series' earlier sessions on the channel that have not
+        ended then end (`superseded`).  A Proxy restart never continues a
+        session, and a fresh one is the only way past a quarantined or full
+        one.  Returns the recovered sessions of the series, oldest first;
+        refuses when any of them differs from this binding.
+        """
+        self._check_install(lane_id, rule_set)
+        if (len(prefix) > _SERIES_PREFIX_MAX
+                or not re.fullmatch(_ID, prefix)):
+            raise ValueError("invalid session prefix")
+        rule_set_id = hashlib.sha256(rule_set).hexdigest()
+        with self._lock:
+            recovered = []
+            for session_id, session in self._sessions.items():
+                if not self._in_series(prefix, session_id):
+                    continue
+                b = session.binding
+                if ((b.vm_instance_id, b.channel_id, b.rule_set_id) !=
+                        (vm_instance_id, channel_id, rule_set_id)
+                        or session.lane_id != lane_id or session.rule_set != rule_set):
+                    raise ValueError("recovered session differs from the requested series")
+                recovered.append(b)
+            self._series[(vm_instance_id, channel_id)] = _Series(prefix, lane_id, rule_set)
+            return recovered
+
+    @staticmethod
+    def _in_series(prefix: str, session_id: str) -> bool:
+        return (session_id.startswith(prefix)
+                and _SERIES_SUFFIX.fullmatch(session_id[len(prefix):]) is not None)
+
+    def _install_from_series(self, channel: ChannelIdentity,
+                             request: JournalRequest) -> _Session | None:
+        """The session a series channel's new Proxy just started, or None."""
+        series = self._series.get((channel.vm_instance_id, channel.channel_id))
+        if (series is None or request.event_seq != 0 or request.event_type != "RULESET"
+                or not self._in_series(series.prefix, request.proxy_session_id)):
+            return None
+        for session_id, session in list(self._sessions.items()):
+            if session.ended is None and self._in_series(series.prefix, session_id):
+                self._end_locked(session_id, "superseded")
+        binding = HostSessionBinding(
+            vm_instance_id=channel.vm_instance_id, channel_id=channel.channel_id,
+            proxy_session_id=request.proxy_session_id,
+            rule_set_id=hashlib.sha256(series.rule_set).hexdigest())
+        return self._install_locked(binding, series.lane_id, series.rule_set)
 
     def resume_session(self, *, vm_instance_id: str, channel_id: str,
                        proxy_session_id: str, lane_id: int,
@@ -759,13 +840,16 @@ class HostJournal:
         if not re.fullmatch(r"[a-z_]{1,64}", reason):
             raise ValueError("invalid reason")
         with self._lock:
-            session = self._sessions[proxy_session_id]
-            if session.ended is not None:
-                return
-            body = {"proxy_session_id": proxy_session_id, "reason": reason,
-                    "schema_version": SESSION_END_SCHEMA}
-            self._append(FrameKind.JOURNAL_EVENT, canonical_json(body))
-            session.ended = "session_end"
+            self._end_locked(proxy_session_id, reason)
+
+    def _end_locked(self, proxy_session_id: str, reason: str) -> None:
+        session = self._sessions[proxy_session_id]
+        if session.ended is not None:
+            return
+        body = {"proxy_session_id": proxy_session_id, "reason": reason,
+                "schema_version": SESSION_END_SCHEMA}
+        self._append(FrameKind.JOURNAL_EVENT, canonical_json(body))
+        session.ended = "session_end"
 
     # -- guest requests --
 
@@ -808,6 +892,8 @@ class HostJournal:
         except RequestError:
             return self._reject(channel, None, None, raw, "malformed_request")
         session = self._sessions.get(request.proxy_session_id)
+        if session is None:
+            session = self._install_from_series(channel, request)
         if session is None:
             return self._reject(channel, request.proxy_session_id, request, raw,
                                 "unknown_session")
@@ -936,6 +1022,12 @@ class HostJournal:
         with self._lock:
             return list(self._rejections)
 
+    def latest_session(self, prefix: str) -> str | None:
+        """The last installed session of the series `prefix`."""
+        with self._lock:
+            found = [i for i in self._sessions if self._in_series(prefix, i)]
+            return found[-1] if found else None
+
     def session_state(self, proxy_session_id: str) -> dict[str, Any]:
         with self._lock:
             s = self._sessions[proxy_session_id]
@@ -1058,6 +1150,9 @@ def main(argv: list[str] | None = None) -> int:
         --vm vm-0 --channel virtio-journal-0 --session ps-1 --lane 0 --rules R
 
     QEMU connects to S as a chardev client (see tools/nfs-proxy/README.md).
+    With --session-prefix P instead of --session, the channel is a series
+    (`HostJournal.install_session_series`): every Proxy start uses a new
+    session P.<uuid>, as the lane fixture's target mode does.
     Runs until interrupted; the journal stays in D for sealing and judges.
     """
     import argparse
@@ -1070,7 +1165,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--socket", type=Path, required=True)
     parser.add_argument("--vm", required=True)
     parser.add_argument("--channel", required=True)
-    parser.add_argument("--session", required=True)
+    named = parser.add_mutually_exclusive_group(required=True)
+    named.add_argument("--session")
+    named.add_argument("--session-prefix")
     parser.add_argument("--lane", type=int, required=True)
     parser.add_argument("--rules", type=Path, required=True)
     parser.add_argument("--fsync", action="store_true")
@@ -1078,23 +1175,28 @@ def main(argv: list[str] | None = None) -> int:
 
     journal = HostJournal(args.dir, args.name, fsync=args.fsync)
     session = dict(vm_instance_id=args.vm, channel_id=args.channel,
-                   proxy_session_id=args.session, lane_id=args.lane,
-                   rule_set=args.rules.read_bytes())
+                   lane_id=args.lane, rule_set=args.rules.read_bytes())
     # A restart (Runner, or QEMU reconnecting) continues the recovered
     # session; it is installed only the first time.
     try:
-        binding = journal.resume_session(**session)
-        resumed = binding is not None
-        if binding is None:
-            binding = journal.install_session(**session)
+        if args.session_prefix is not None:
+            recovered = journal.install_session_series(prefix=args.session_prefix, **session)
+            state = f"series {len(recovered)} recovered session(s)"
+            named = f"session_prefix={args.session_prefix}"
+        else:
+            binding = journal.resume_session(proxy_session_id=args.session, **session)
+            state = "installed" if binding is None else "resumed"
+            if binding is None:
+                binding = journal.install_session(proxy_session_id=args.session, **session)
+            named = f"session={binding.proxy_session_id}"
     except ValueError as error:
         journal.close()
         print(f"journal sink refused: {error}", file=sys.stderr, flush=True)
         return 2
+    rule_set_id = hashlib.sha256(session["rule_set"]).hexdigest()  # type: ignore[arg-type]
     server = ChannelServer(args.socket, journal, ChannelIdentity(args.vm, args.channel))
-    print(f"journal sink ready: {'resumed' if resumed else 'installed'} "
-          f"session={binding.proxy_session_id} "
-          f"rule_set_id={binding.rule_set_id} socket={args.socket}", flush=True)
+    print(f"journal sink ready: {state} {named} "
+          f"rule_set_id={rule_set_id} socket={args.socket}", flush=True)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     try:
@@ -1103,10 +1205,15 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         server.close()
-        state = journal.session_state(args.session)
+        last = args.session if args.session is not None else journal.latest_session(
+            args.session_prefix)
         journal.close()
-        print(f"journal sink stopped: next_seq={state['next_seq']} ended={state['ended']} "
-              f"channel_ends={server.ended}", flush=True)
+        if last is None:
+            print(f"journal sink stopped: no session channel_ends={server.ended}", flush=True)
+        else:
+            state = journal.session_state(last)
+            print(f"journal sink stopped: session={last} next_seq={state['next_seq']} "
+                  f"ended={state['ended']} channel_ends={server.ended}", flush=True)
     return 0
 
 

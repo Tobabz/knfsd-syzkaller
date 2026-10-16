@@ -78,5 +78,6 @@ jobs:
           make executor
           ./bin/linux_amd64/syz-executor test test_nfsp_sha256
           ./bin/linux_amd64/syz-executor test test_nfsp_barrier
+          ./bin/linux_amd64/syz-executor test test_nfsp_broker
           go test ./pkg/flatrpc/
           go test ./executor/ -run 'NfsProxy|Generation|FixedLane'

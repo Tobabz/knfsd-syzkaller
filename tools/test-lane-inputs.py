@@ -131,7 +131,7 @@ with tempfile.TemporaryDirectory() as directory:
     subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
                     str(manager), str(target), "--version", "4.1", "--image", str(proxy),
                     "--nfs-target", str(target_inputs),
-                    "--journal-socket-dir", str(work / "sinks")],
+                    "--journal-socket-dir", str(work / "sinks"), "--qemu-version", "9.2"],
                    check=True, capture_output=True)
     target_prepared = json.loads(target.read_text())
     target_template = Path(target_prepared["workdir_template"])
@@ -145,11 +145,41 @@ with tempfile.TemporaryDirectory() as directory:
         assert ("path=%s,reconnect-ms=1000" % (work / "sinks" / ("lane%d.sock" % lane)).resolve()) \
             in target_prepared["vm"]["qemu_args"]
     assert "koov.nfs_target=1" in target_prepared["vm"]["cmdline"].split()
+    # Older QEMU only knows reconnect=SECONDS; the version is read from the
+    # configured binary unless given.
+    fake_qemu = work / "qemu-6.2"
+    fake_qemu.write_text("#!/bin/sh\necho 'QEMU emulator version 6.2.0 (Debian 1:6.2+dfsg-2ubuntu6)'\n")
+    fake_qemu.chmod(0o755)
+    old_manager = work / "manager-old-qemu.cfg"
+    old_config = json.loads(manager.read_text())
+    old_config["vm"]["qemu"] = str(fake_qemu)
+    old_manager.write_text(json.dumps(old_config))
+    for extra in ([], ["--qemu-version", "6.2"]):
+        old_target = work / ("manager-target-old%d.cfg" % len(extra))
+        subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                        str(old_manager if not extra else manager), str(old_target),
+                        "--version", "4.1", "--image", str(proxy),
+                        "--nfs-target", str(target_inputs),
+                        "--journal-socket-dir", str(work / "sinks")] + extra,
+                       check=True, capture_output=True)
+        old_args = json.loads(old_target.read_text())["vm"]["qemu_args"]
+        assert "reconnect=1 " in old_args and "reconnect-ms" not in old_args, old_args
+    old_config["vm"]["qemu"] = str(work / "no-such-qemu")
+    old_manager.write_text(json.dumps(old_config))
+    unknown = subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                              str(old_manager), str(work / "unknown.cfg"), "--version", "4.1",
+                              "--image", str(proxy), "--nfs-target", str(target_inputs),
+                              "--journal-socket-dir", str(work / "sinks")],
+                             capture_output=True, text=True)
+    assert unknown.returncode != 0 and "pass --qemu-version" in unknown.stderr, unknown.stderr
     assert "koov.lane_sha256=" + lane_sha in target_prepared["vm"]["cmdline"]
     for bad_args, needle in (
             (["--nfs-target", str(target_inputs)], "--journal-socket-dir"),
             (["--journal-socket-dir", str(work)], "--nfs-target"),
-            (["--nfs-target", str(work), "--journal-socket-dir", str(work)], "missing target input")):
+            (["--nfs-target", str(work), "--journal-socket-dir", str(work)], "missing target input"),
+            (["--qemu-version", "9.2"], "--qemu-version needs --nfs-target"),
+            (["--nfs-target", str(target_inputs), "--journal-socket-dir", str(work),
+              "--qemu-version", "nine"], "--qemu-version must look like")):
         refused = subprocess.run(
             [sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
              str(manager), str(work / "refused.cfg"), "--version", "4.1",
@@ -348,6 +378,15 @@ assert "export proxy_target_dir" in lane_source
 assert '--activation "$executor_root/proc-$lane/activation/activation.sock"' in lane_source
 assert '--journal "/dev/virtio-ports/nfsp-journal-$lane"' in lane_source
 assert '"$executor_root/proc-$setup_lane_id/activation/rule_set_id"' in lane_source
+# The server namespace replaces /run, so the proxy reads its inputs from the
+# lane root, and every Proxy start gets a fresh session in the host series.
+assert 'cp "$setup_rules" "$setup_lane_root/server/target/rules.nfsprul1"' in lane_source
+assert lane_source.index('cp "$setup_rules" "$setup_lane_root/server/target/rules.nfsprul1"') < \
+    lane_source.index('mount --bind "$lane_root/server/state/run" /run')
+assert '--target "$lane_root/server/target/rules.nfsprul1"' in lane_source
+assert '$(cat /proc/sys/kernel/random/uuid)' in lane_source
+assert '--session-id "$proxy_session"' in lane_source
+assert '$proxy_target_dir/lane$lane' not in lane_source
 assert 'printf \'%s\\n\' "$proxy_target_dir" > "$root/fixture.target"' in lane_source
 assert 'proxy_target_dir=$(cat "$root/fixture.target")' in lane_source
 assert manifest["fixtures"]["broad-knfsd"]["mixed_profile_runtime"] == "allowed"

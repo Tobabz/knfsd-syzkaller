@@ -1,4 +1,4 @@
-From 26a2e1f6fedfef012254a565d92ba9b270d654f2 Mon Sep 17 00:00:00 2001
+From cda251bf2342bc3f18ab57eb0e03fa30f8f29f2d Mon Sep 17 00:00:00 2001
 From: idealinsane <idealinsane@localhost>
 Date: Fri, 16 Oct 2026 13:43:53 +0000
 Subject: [PATCH] executor: bracket programs with the NFS proxy activation
@@ -10,58 +10,110 @@ program generation, and the executor owns that window.
 
 When the lane fixture provides /syz-nfs-lanes/proc-N/activation/ (the
 proxy's activation.sock and the installed rule_set_id), the executor
-connects to the endpoint before the sandbox chroot and keeps it only as
-an inherited fd.  For every execution with a managed remote-coverage
-generation it then:
+connects to the endpoint before the sandbox chroot.  Only the fork
+server keeps that connection: each program process closes its inherited
+copy first thing and asks the fork server, over a socket pair made for
+that program, to run its barrier.  The process that runs fuzzed
+syscalls therefore has no descriptor for the endpoint, and the broker
+answers only one ACTIVATE and one DONE in that order; anything else on
+the pair (e.g. a forged early DONE) leaves the lease uncleared.
 
-- activates the generation, with the SHA-256 of the exec-encoded program
-  as the program digest, before the first program syscall;
-- does not run the program unless the activation was ACKed, and aborts
-  the KCOV generation instead of publishing it;
-- deactivates before KCOV FINISH/ABORT, and aborts the proxy generation
-  when deactivation (or activation) is not ACKed;
-- lets the fork server end the lease of a child that died inside its
-  window before the orphan KCOV ABORT.
+For every execution with a managed remote-coverage generation:
 
-The barrier outcome is shared memory state reported in ProgInfo
-(nfs_proxy).  The runner fails, like a hung fixed lane, when the lease
-could not be confirmed released or the proxy session cannot open another
-generation, so VM recovery recreates the lane.  syz-execprog prints the
-barrier and writes it to the coverage .meta file.
+- the fork server activates the generation, with the SHA-256 of its own
+  copy of the exec-encoded program as the program digest, before the
+  first program syscall;
+- the program does not run unless the activation was ACKed (or when
+  KCOV BEGIN returned no generation), and the KCOV generation is
+  aborted instead of published;
+- the window is deactivated before KCOV FINISH/ABORT, and the proxy
+  generation is aborted when deactivation (or activation) is not ACKed;
+- the fork server ends the lease of a child that died inside its window
+  before the orphan KCOV ABORT, and only then publishes the barrier.
 
-Executions without a managed generation (comparisons, BEGIN failure) run
-without a window and so are never mutated.
+The barrier outcome is reported in ProgInfo (nfs_proxy).  The runner
+fails, like a hung fixed lane, when the lease could not be confirmed
+released or the proxy session cannot open another generation, so VM
+recovery recreates the lane.  syz-execprog prints the barrier and
+writes it to the coverage .meta file.
+
+Executions without a managed generation (comparisons, machine-check
+feature probes without remote coverage) run without a window and so are
+never mutated.
 ---
- executor/common.h                     |   5 +
+ executor/common.h                     |  21 ++
  executor/common_linux.h               |   3 +
- executor/executor.cc                  | 150 +++++++++-
+ executor/executor.cc                  | 231 +++++++++++-
  executor/executor_runner.h            |  14 +
- executor/nfs_proxy_activation.h       | 387 ++++++++++++++++++++++++++
- executor/nfs_proxy_activation_test.go |  99 +++++++
- executor/test.h                       | 171 ++++++++++++
- pkg/flatrpc/flatrpc.fbs               |  32 +++
- pkg/flatrpc/flatrpc.go                | 300 +++++++++++++++++++-
- pkg/flatrpc/flatrpc.h                 | 271 +++++++++++++++++-
+ executor/nfs_proxy_activation.h       | 498 ++++++++++++++++++++++++++
+ executor/nfs_proxy_activation_test.go | 140 ++++++++
+ executor/test.h                       | 261 ++++++++++++++
+ pkg/flatrpc/flatrpc.fbs               |  32 ++
+ pkg/flatrpc/flatrpc.go                | 300 +++++++++++++++-
+ pkg/flatrpc/flatrpc.h                 | 271 +++++++++++++-
  pkg/flatrpc/helpers.go                |   6 +
- pkg/flatrpc/nfs_proxy_test.go         |  48 ++++
- tools/syz-execprog/execprog.go        |  16 ++
- 13 files changed, 1488 insertions(+), 14 deletions(-)
+ pkg/flatrpc/nfs_proxy_test.go         |  48 +++
+ tools/syz-execprog/execprog.go        |  16 +
+ 13 files changed, 1827 insertions(+), 14 deletions(-)
  create mode 100644 executor/nfs_proxy_activation.h
  create mode 100644 executor/nfs_proxy_activation_test.go
  create mode 100644 pkg/flatrpc/nfs_proxy_test.go
 
 diff --git a/executor/common.h b/executor/common.h
-index 0817e121b..7a240e34a 100644
+index 0817e121b..17917e92f 100644
 --- a/executor/common.h
 +++ b/executor/common.h
-@@ -747,6 +747,11 @@ static void loop(void)
+@@ -648,11 +648,19 @@ static void loop(void)
+ #if SYZ_EXECUTOR
+ 		if (!flag_snapshot)
+ 			receive_execute();
++#endif
++#if SYZ_EXECUTOR && GOOS_linux
++		nfsp_broker_prefork();
+ #endif
+ 		int pid = fork();
+ 		if (pid < 0)
+ 			fail("clone failed");
+ 		if (pid == 0) {
++#if SYZ_EXECUTOR && GOOS_linux
++			// The program process never holds the NFS proxy activation
++			// endpoint; the fork server brokers its barrier.
++			nfsp_broker_child();
++#endif
+ #if SYZ_EXECUTOR || SYZ_USE_TMP_DIR
+ 			if (chdir(cwdbuf))
+ 				fail("failed to chdir");
+@@ -677,6 +685,9 @@ static void loop(void)
+ 			doexit(0);
+ 		}
+ 		debug("spawned worker pid %d\n", pid);
++#if SYZ_EXECUTOR && GOOS_linux
++		nfsp_broker_parent();
++#endif
+ 
+ #if SYZ_EXECUTOR
+ 		if (flag_snapshot)
+@@ -695,7 +706,12 @@ static void loop(void)
+ 		uint32 executed_calls = output_data->completed.load(std::memory_order_relaxed);
+ #endif
+ 		for (;;) {
++#if SYZ_EXECUTOR && GOOS_linux
++			// Also answers the program's NFS proxy barrier requests.
++			nfsp_broker_wait(10);
++#else
+ 			sleep_ms(10);
++#endif
+ 			if (waitpid(-1, &status, WNOHANG | WAIT_FLAGS) == pid)
+ 				break;
+ #if SYZ_EXECUTOR
+@@ -747,6 +763,11 @@ static void loop(void)
  			kill_and_wait(pid, &status);
  			break;
  		}
 +#if SYZ_EXECUTOR && GOOS_linux
 +		// A child that died inside its NFS proxy activation window left the
 +		// window open.  Close it before the KCOV generation is aborted.
-+		nfsp_release_orphan();
++		nfsp_broker_end();
 +#endif
  #if SYZ_EXECUTOR && GOOS_linux
  		// Cover hangs, crashes, and the BEGIN-return/shared-publication race.  If
@@ -81,7 +133,7 @@ index ae5bd713c..4a65651fd 100644
  	      procid, source);
  }
 diff --git a/executor/executor.cc b/executor/executor.cc
-index 9a6895f01..9f8e8ef44 100644
+index 9a6895f01..c0ea144f2 100644
 --- a/executor/executor.cc
 +++ b/executor/executor.cc
 @@ -26,6 +26,10 @@
@@ -95,29 +147,36 @@ index 9a6895f01..9f8e8ef44 100644
  #if defined(__GNUC__)
  #define SYSCALLAPI
  #define NORETURN __attribute__((noreturn))
-@@ -71,6 +75,10 @@ const int kInPipeFd = kMaxFd - 1; // remapped from stdin
+@@ -71,6 +75,13 @@ const int kInPipeFd = kMaxFd - 1; // remapped from stdin
  const int kOutPipeFd = kMaxFd - 2; // remapped from stdout
  const int kCoverFd = kOutPipeFd - kMaxThreads;
  const int kExtraCoverFd = kCoverFd - 1;
 +#if GOOS_linux
 +// Connection to the lane's NFS proxy activation endpoint (nfs_proxy_activation.h).
++// Only the fork server keeps it; a program process closes it first thing.
 +const int kNfspActivationFd = kExtraCoverFd - 1;
++// A program process's end of its broker pair with the fork server.
++const int kNfspBrokerFd = kNfspActivationFd - 1;
 +#endif
  const int kMaxArgs = 9;
  const int kCoverSize = 512 << 10;
  const int kFailStatus = 67;
-@@ -114,6 +122,10 @@ static void receive_handshake();
+@@ -114,6 +125,14 @@ static void receive_handshake();
  #if GOOS_linux
  static bool cover_abort_remote_generation(uint64 generation, bool best_effort);
  #endif
 +#if GOOS_linux
 +static void nfsp_setup_activation(const char* lane_source);
-+static void nfsp_release_orphan();
++static void nfsp_broker_prefork();
++static void nfsp_broker_child();
++static void nfsp_broker_parent();
++static void nfsp_broker_wait(int timeout_ms);
++static void nfsp_broker_end();
 +#endif
  
  #if SYZ_EXECUTOR_USES_FORK_SERVER
  static void SnapshotPrepareParent();
-@@ -152,6 +164,14 @@ struct alignas(8) OutputData {
+@@ -152,6 +171,14 @@ struct alignas(8) OutputData {
  	// This lives in shared memory so the fork-server watchdog can abort a
  	// generation left behind by a killed child.
  	std::atomic<uint64> kcov_generation;
@@ -132,7 +191,7 @@ index 9a6895f01..9f8e8ef44 100644
  	std::atomic<flatbuffers::Offset<flatbuffers::Vector<uint8_t>>> result_offset;
  	struct {
  		// Call index in the test program (they may be out-of-order is some syscalls block).
-@@ -167,6 +187,9 @@ struct alignas(8) OutputData {
+@@ -167,6 +194,9 @@ struct alignas(8) OutputData {
  		completed.store(0, std::memory_order_relaxed);
  		num_calls.store(0, std::memory_order_relaxed);
  		kcov_generation.store(0, std::memory_order_relaxed);
@@ -142,7 +201,7 @@ index 9a6895f01..9f8e8ef44 100644
  		result_offset.store(0, std::memory_order_relaxed);
  	}
  };
-@@ -301,6 +324,14 @@ static uint64 request_id;
+@@ -301,6 +331,17 @@ static uint64 request_id;
  static rpc::RequestType request_type;
  static uint64 all_call_signal;
  static bool all_extra_signal;
@@ -153,11 +212,14 @@ index 9a6895f01..9f8e8ef44 100644
 +// endpoint (nfsp_setup_activation).  The connection is kNfspActivationFd.
 +static bool nfsp_target_mode;
 +static nfsp_act_endpoint nfsp_endpoint = {-1, {}, 0};
++// Fork server: the barrier of the program process it is running.
++static nfsp_broker nfsp_broker_state = {-1, NULL, 0, 0, 0, 0, {}};
++static int nfsp_broker_child_fd = -1;
 +#endif
  
  // Tunable timeouts, received with execute_req.
  static uint64 syscall_timeout_ms;
-@@ -453,6 +484,9 @@ struct execute_req {
+@@ -453,6 +494,9 @@ struct execute_req {
  	uint64 all_call_signal;
  	bool all_extra_signal;
  	bool return_error;
@@ -167,7 +229,7 @@ index 9a6895f01..9f8e8ef44 100644
  };
  
  struct execute_reply {
-@@ -891,6 +925,7 @@ void parse_execute(const execute_req& req)
+@@ -891,6 +935,7 @@ void parse_execute(const execute_req& req)
  	all_call_signal = req.all_call_signal;
  	all_extra_signal = req.all_extra_signal;
  	flag_return_error = req.return_error;
@@ -175,7 +237,7 @@ index 9a6895f01..9f8e8ef44 100644
  
  	debug("[%llums] exec opts: reqid=%llu type=%llu procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d "
  	      " sandbox=%d/%d/%d/%d timeouts=%llu/%llu/%llu kernel_64_bit=%d\n",
-@@ -966,6 +1001,80 @@ void execute_glob()
+@@ -966,6 +1011,151 @@ void execute_glob()
  	output_data->result_offset.store(off, std::memory_order_release);
  }
  
@@ -185,8 +247,10 @@ index 9a6895f01..9f8e8ef44 100644
 +// The fixture marks a proc for target mode with /syz-nfs-lanes/proc-N/activation/
 +// holding the proxy's activation.sock and the installed rule_set_id.  That tree
 +// stays outside the sandbox chroot, so the endpoint is reachable only through
-+// kNfspActivationFd, connected here before the chroot and inherited by every
-+// program process the fork server creates.
++// kNfspActivationFd, connected here before the chroot.  Only the fork server
++// uses it: it runs each program's barrier as that program's broker
++// (nfsp_broker in nfs_proxy_activation.h), and the program process, which
++// runs the fuzzed syscalls, closes its inherited copy before anything else.
 +static void nfsp_setup_activation(const char* lane_source)
 +{
 +	char dir[160], path[192];
@@ -199,10 +263,11 @@ index 9a6895f01..9f8e8ef44 100644
 +	}
 +	// Fail closed from here on: a lane that asks for target mode never runs
 +	// programs without the barrier.
++	// Remote coverage is not required here: machine-check feature probes come
++	// without it.  A request without a managed KCOV generation opens no window,
++	// so the proxy relays it unmutated (execute_one).
 +	if (flag_snapshot)
 +		fail("NFS proxy target mode does not support snapshot mode");
-+	if (!flag_extra_coverage)
-+		fail("NFS proxy target mode needs remote coverage (KCOV generations)");
 +	snprintf(path, sizeof(path), "%s/rule_set_id", dir);
 +	char id[NFSP_ACT_RULE_SET_ID_LEN + 2] = {};
 +	int fd = open(path, O_RDONLY);
@@ -233,53 +298,121 @@ index 9a6895f01..9f8e8ef44 100644
 +	debug("NFS proxy target mode: proc=%llu endpoint=%s\n", procid, addr.sun_path);
 +}
 +
-+// The fork server kills a program that completes no syscall for
-+// syscall_timeout_ms * 20 (loop() in common.h).  A barrier waits on the host
-+// journal, so bound it well below that.
-+static void nfsp_set_timeout()
-+{
-+	nfsp_endpoint.timeout_ms = syscall_timeout_ms * 10;
-+}
-+
-+// Fork server, after its child is gone: a child killed or crashed between
-+// activation and deactivation leaves the lease held.  Deactivate (or abort)
-+// before the KCOV ABORT that follows in loop().
-+static void nfsp_release_orphan()
++// Fork server, before fork(): a fresh broker pair for this one program.  The
++// child's end is at kNfspBrokerFd.
++static void nfsp_broker_prefork()
 +{
 +	if (!nfsp_target_mode)
 +		return;
-+	nfsp_set_timeout();
-+	nfsp_act_release(&nfsp_endpoint, &output_data->nfsp);
++	int sv[2];
++	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv))
++		fail("NFS proxy broker socketpair failed");
++	if (dup3(sv[1], kNfspBrokerFd, O_CLOEXEC) != kNfspBrokerFd)
++		fail("dup NFS proxy broker fd failed");
++	close(sv[1]);
++	nfsp_broker_child_fd = kNfspBrokerFd;
++	// The program bytes are the fork server's own copy of the request.
++	nfsp_broker_start(&nfsp_broker_state, sv[0], input_data,
++			  std::min<uint64>(request_prog_size, kMaxInput));
++	// The fork server kills a program that completes no syscall for
++	// syscall_timeout_ms * 20 (loop() in common.h).  A barrier waits on the
++	// host journal, so bound it well below that.
++	nfsp_endpoint.timeout_ms = syscall_timeout_ms * 10;
++}
++
++// Program process, right after fork(): keep only its end of the pair.
++static void nfsp_broker_child()
++{
++	if (!nfsp_target_mode)
++		return;
++	close(kNfspActivationFd);
++	close(nfsp_broker_state.fd);
++	nfsp_endpoint.fd = -1;
++	nfsp_broker_state.fd = -1;
++}
++
++// Fork server, after fork().
++static void nfsp_broker_parent()
++{
++	if (!nfsp_target_mode)
++		return;
++	close(nfsp_broker_child_fd);
++	nfsp_broker_child_fd = -1;
++}
++
++// Fork server, in place of its 10ms watchdog sleep.
++static void nfsp_broker_wait(int timeout_ms)
++{
++	if (!nfsp_target_mode) {
++		sleep_ms(timeout_ms);
++		return;
++	}
++	uint64 start = current_time_ms();
++	nfsp_broker_serve(&nfsp_endpoint, &nfsp_broker_state, timeout_ms);
++	uint64 spent = current_time_ms() - start;
++	if (spent < (uint64)timeout_ms)
++		sleep_ms(timeout_ms - spent);
++}
++
++// Fork server, once the program process is gone: a program killed or crashed
++// inside its window left it open.  Close it before the KCOV ABORT that follows
++// in loop(), and only now publish the barrier, which the program process can
++// no longer touch.
++static void nfsp_broker_end()
++{
++	if (!nfsp_target_mode)
++		return;
++	nfsp_broker_finish(&nfsp_endpoint, &nfsp_broker_state);
++	output_data->nfsp = nfsp_broker_state.b;
++}
++
++// Program process: ask the fork server for an activation window of
++// `generation` (0: BEGIN failed, so no window).  True when the program may run.
++static bool nfsp_program_activate(uint64 generation)
++{
++	int answer = nfsp_broker_call(kNfspBrokerFd, NFSP_BROKER_ACTIVATE, generation);
++	if (answer < 0)
++		fail("NFS proxy broker failed before the program");
++	return answer == 1;
++}
++
++// Program process: the calls are over; the fork server closes the window.
++static void nfsp_program_done()
++{
++	// Failing here also covers a fuzzed call that closed or replaced
++	// kNfspBrokerFd: the window may have ended early.
++	if (nfsp_broker_call(kNfspBrokerFd, NFSP_BROKER_DONE, 0) != 1)
++		fail("NFS proxy broker failed after the program");
 +}
 +#endif
 +
  // execute_one executes program stored in input_data.
  void execute_one()
  {
-@@ -1021,6 +1130,22 @@ void execute_one()
+@@ -1021,6 +1211,22 @@ void execute_one()
  		}
  	}
  
-+	// In NFS proxy target mode the program runs only inside an ACKed activation
-+	// window of its own generation.  Executions without a managed generation
-+	// (comparisons, BEGIN failure) run unmutated: the proxy sees no window.
++	// In NFS proxy target mode a program with a managed generation runs only
++	// inside an ACKed activation window of that generation; one whose BEGIN
++	// failed does not run at all.  Executions without a managed generation
++	// (comparisons, machine-check probes) run unmutated: the proxy sees no
++	// window.
 +	bool nfsp_skip_program = false;
 +#if GOOS_linux
++	bool nfsp_windowed = false;
 +	if (nfsp_target_mode && remote_generation_managed) {
 +		uint64 generation = remote_generation.load(std::memory_order_acquire);
-+		nfsp_set_timeout();
-+		if (generation)
-+			nfsp_skip_program = !nfsp_act_activate(&nfsp_endpoint, &output_data->nfsp, generation, input_data,
-+							       std::min<uint64>(request_prog_size, kMaxInput));
-+		debug("NFS proxy activate: generation=%llu status=%u\n", generation,
-+		      output_data->nfsp.activation_status);
++		nfsp_windowed = nfsp_program_activate(generation);
++		nfsp_skip_program = !nfsp_windowed;
++		debug("NFS proxy activate: generation=%llu run=%d\n", generation, nfsp_windowed);
 +	}
 +#endif
 +
  	int call_index = 0;
  	uint64 prog_extra_timeout = 0;
  	uint64 prog_extra_cover_timeout = 0;
-@@ -1029,6 +1154,8 @@ void execute_one()
+@@ -1029,6 +1235,8 @@ void execute_one()
  
  	read_input(&input_pos); // total number of calls
  	for (;;) {
@@ -288,15 +421,15 @@ index 9a6895f01..9f8e8ef44 100644
  		uint64 call_num = read_input(&input_pos);
  		if (call_num == instr_eof)
  			break;
-@@ -1216,8 +1343,17 @@ void execute_one()
+@@ -1216,8 +1424,17 @@ void execute_one()
  		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
  		bool generation_resolved = false;
  #if GOOS_linux
 +		// Close the activation window before the KCOV generation ends.  A
 +		// deactivation without ACK still lets FINISH/ABORT run below; the lease
 +		// then decides whether the lane may be reused.
-+		if (nfsp_target_mode)
-+			nfsp_act_release(&nfsp_endpoint, &output_data->nfsp);
++		if (nfsp_windowed)
++			nfsp_program_done();
  		uint64 generation = remote_generation.load(std::memory_order_acquire);
 -		if (generation) {
 +		if (generation && nfsp_skip_program) {
@@ -307,14 +440,14 @@ index 9a6895f01..9f8e8ef44 100644
  			// FINISH performs the bounded kernel-side root/token drain.  It is the
  			// publication barrier for remote extra coverage and synchronously
  			// materializes the committed snapshot before userspace consumes it.
-@@ -1576,7 +1712,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
+@@ -1576,7 +1793,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
  		}
  		calls[call.index] = call.offset;
  	}
 -	auto prog_info_off = rpc::CreateProgInfoRawDirect(fbb, &calls, &extra, 0, elapsed, freshness);
 +	flatbuffers::Offset<rpc::NfsProxyActivationRaw> nfs_proxy_off = 0;
 +#if GOOS_linux
-+	if (const nfsp_act_barrier& b = output->nfsp; b.generation) {
++	if (const nfsp_act_barrier& b = output->nfsp; b.activation != NFSP_ACT_BARRIER_NONE) {
 +		std::vector<uint8_t> digest(b.digest, b.digest + sizeof(b.digest));
 +		nfs_proxy_off = rpc::CreateNfsProxyActivationRawDirect(
 +		    fbb, b.generation, &digest, static_cast<rpc::NfsProxyBarrierRaw>(b.activation),
@@ -360,10 +493,10 @@ index 231c9b87e..c4733a940 100644
  		msg_.reset();
 diff --git a/executor/nfs_proxy_activation.h b/executor/nfs_proxy_activation.h
 new file mode 100644
-index 000000000..bdec89f3b
+index 000000000..ad2aad2f0
 --- /dev/null
 +++ b/executor/nfs_proxy_activation.h
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,498 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -372,7 +505,9 @@ index 000000000..bdec89f3b
 +// In target mode the proxy applies one immutable semantic rule set, but only
 +// to NFS calls that start inside an activation window of a KCOV program
 +// generation.  The executor owns that window: it activates the generation
-+// before the first program syscall and deactivates it after the last one.  A
++// before the first program syscall and deactivates it after the last one.  The
++// fork server does both on the program process's behalf (nfsp_broker below),
++// so the process that runs fuzzed syscalls never holds the endpoint.  A
 +// barrier is ACKed only after the host journal stored GENERATION_OPEN or
 +// GENERATION_DRAINING, so an ACK is the only evidence that the window exists.
 +//
@@ -398,6 +533,7 @@ index 000000000..bdec89f3b
 +#include <string.h>
 +#include <sys/socket.h>
 +#include <time.h>
++#include <unistd.h>
 +
 +#define NFSP_ACT_REQ_LEN 120
 +#define NFSP_ACT_ANSWER_LEN 24
@@ -421,6 +557,9 @@ index 000000000..bdec89f3b
 +#define NFSP_ACT_STATUS_NOT_READY 1000u
 +// Not a proxy code: no answer arrived before the deadline.
 +#define NFSP_ACT_NO_ANSWER 0xffffffffu
++// Not a proxy answer: the program had no KCOV generation to activate (BEGIN
++// failed), so the barrier refused it without asking the proxy.
++#define NFSP_ACT_NO_GENERATION 0xfffffffeu
 +
 +// --- SHA-256 (FIPS 180-4), for the program digest -------------------------
 +
@@ -664,8 +803,8 @@ index 000000000..bdec89f3b
 +	uint64_t timeout_ms; // per barrier
 +};
 +
-+// One program's barrier.  The executor keeps it in memory shared with the
-+// fork server and the runner, which read it after the program process ended.
++// One program's barrier.  The fork server runs it and, once the program
++// process is gone, publishes it in memory shared with the runner.
 +struct nfsp_act_barrier {
 +	uint64_t generation;
 +	uint8_t digest[32];
@@ -750,13 +889,118 @@ index 000000000..bdec89f3b
 +	return 0;
 +}
 +
++// The broker.  The program process runs fuzzed syscalls, so it never holds
++// the activation endpoint: any descriptor it has, those syscalls can write to.
++// Its trusted parent (the fork server) holds the endpoint and runs the barrier
++// on the program's behalf, asked over a socket pair created for that one
++// program.  The program process sends exactly
++//
++//   ACTIVATE(generation)  before its first call; answer 1 = run, 0 = skip
++//   DONE                  after its calls, only if it ran; answer 1
++//
++// and the parent answers only those, in that order.  Anything else on the
++// pair can only come from the fuzzed program, e.g. a forged early DONE (which
++// would end the window while calls still run): the parent then marks the lease
++// UNCLEARED, so the lane is not reused, and does not answer.
++
++#define NFSP_BROKER_ACTIVATE 1u
++#define NFSP_BROKER_DONE 2u
++
++struct nfsp_broker_msg {
++	uint32_t op; // NFSP_BROKER_*
++	uint32_t zero;
++	uint64_t generation;
++};
++
++struct nfsp_broker {
++	int fd; // the parent's end of the pair
++	const void* prog; // the exec-encoded program, from the parent's own copy
++	size_t prog_len;
++	int activated; // ACTIVATE handled
++	int done; // DONE handled
++	int violation; // an unexpected message
++	struct nfsp_act_barrier b;
++};
++
++static void nfsp_broker_start(struct nfsp_broker* k, int fd, const void* prog, size_t prog_len)
++{
++	memset(k, 0, sizeof(*k));
++	k->fd = fd;
++	k->prog = prog;
++	k->prog_len = prog_len;
++}
++
++// A program process that does not get its answer fails by itself.
++static void nfsp_broker_answer(struct nfsp_broker* k, uint8_t answer)
++{
++	(void)!send(k->fd, &answer, 1, MSG_NOSIGNAL | MSG_DONTWAIT);
++}
++
++// Parent: wait up to timeout_ms for a message, then handle every queued one.
++static void nfsp_broker_serve(const struct nfsp_act_endpoint* ep, struct nfsp_broker* k, int timeout_ms)
++{
++	struct pollfd pfd = {k->fd, POLLIN, 0};
++	if (poll(&pfd, 1, timeout_ms) <= 0)
++		return;
++	for (;;) {
++		struct nfsp_broker_msg m;
++		ssize_t n = recv(k->fd, &m, sizeof(m), MSG_DONTWAIT | MSG_TRUNC);
++		if (n < 0 || n == 0)
++			return; // empty, or the program process closed its end
++		if (n != (ssize_t)sizeof(m) || m.zero) {
++			k->violation = 1;
++		} else if (m.op == NFSP_BROKER_ACTIVATE && !k->activated) {
++			k->activated = 1;
++			if (!m.generation) {
++				memset(&k->b, 0, sizeof(k->b));
++				k->b.activation = NFSP_ACT_BARRIER_REFUSED;
++				k->b.activation_status = NFSP_ACT_NO_GENERATION;
++				nfsp_broker_answer(k, 0);
++			} else {
++				nfsp_broker_answer(k, (uint8_t)nfsp_act_activate(ep, &k->b, m.generation,
++											  k->prog, k->prog_len));
++			}
++		} else if (m.op == NFSP_BROKER_DONE && k->b.executed && !k->done) {
++			k->done = 1;
++			nfsp_act_release(ep, &k->b);
++			nfsp_broker_answer(k, 1);
++		} else {
++			k->violation = 1;
++		}
++	}
++}
++
++// Parent, once the program process is gone (exited, crashed or killed): handle
++// what it sent last, close a window it left open, and settle the lease.
++static void nfsp_broker_finish(const struct nfsp_act_endpoint* ep, struct nfsp_broker* k)
++{
++	nfsp_broker_serve(ep, k, 0);
++	nfsp_act_release(ep, &k->b);
++	if (k->violation)
++		k->b.lease = NFSP_ACT_LEASE_UNCLEARED;
++	close(k->fd);
++	k->fd = -1;
++}
++
++// Program process: one message, one answer byte.  -1 when the pair failed.
++static int nfsp_broker_call(int fd, uint32_t op, uint64_t generation)
++{
++	struct nfsp_broker_msg m = {op, 0, generation};
++	uint8_t answer;
++	if (send(fd, &m, sizeof(m), MSG_NOSIGNAL) != (ssize_t)sizeof(m))
++		return -1;
++	if (recv(fd, &answer, 1, 0) != 1)
++		return -1;
++	return answer;
++}
++
 +#endif // NFS_PROXY_ACTIVATION_H
 diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
 new file mode 100644
-index 000000000..76e9d2874
+index 000000000..ddfdcc38a
 --- /dev/null
 +++ b/executor/nfs_proxy_activation_test.go
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,140 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -806,12 +1050,16 @@ index 000000000..76e9d2874
 +	nfspRequireOrder(t, "execute_one", body,
 +		// Activation is keyed to the generation BEGIN returned and published.
 +		"output_data->kcov_generation.store(generation, std::memory_order_release);",
-+		"nfsp_skip_program = !nfsp_act_activate(&nfsp_endpoint, &output_data->nfsp, generation, input_data,",
++		// A managed program asks even with generation zero (BEGIN failed),
++		// and runs only on a yes.
++		"if (nfsp_target_mode && remote_generation_managed) {",
++		"nfsp_windowed = nfsp_program_activate(generation);",
++		"nfsp_skip_program = !nfsp_windowed;",
 +		// Without an ACK no program syscall runs.
 +		"if (nfsp_skip_program)\n\t\t\tbreak;",
 +		"uint64 call_num = read_input(&input_pos);",
 +		// The window closes before the KCOV generation ends.
-+		"nfsp_act_release(&nfsp_endpoint, &output_data->nfsp);",
++		"nfsp_program_done();",
 +		"cover_abort_remote_generation(generation, false);",
 +		"cover_finish_remote_generation(generation",
 +	)
@@ -821,7 +1069,7 @@ index 000000000..76e9d2874
 +	body := nfspSection(t, "common.h", `debug("killing hanging pid %d\n", pid);`, "WEXITSTATUS(status) == kFailStatus")
 +	nfspRequireOrder(t, "loop", body,
 +		"kill_and_wait(pid, &status);",
-+		"nfsp_release_orphan();",
++		"nfsp_broker_end();",
 +		"cover_abort_remote_generation(orphan_generation, true)",
 +	)
 +}
@@ -844,6 +1092,43 @@ index 000000000..76e9d2874
 +		"nfsp_endpoint.fd = kNfspActivationFd;",
 +		"nfsp_target_mode = true;",
 +	)
++	// Machine-check probes come without remote coverage; they must not be
++	// refused here (they run without a window).
++	if bytes.Contains(setup, []byte("flag_extra_coverage")) {
++		t.Fatal("nfsp_setup_activation must not require remote coverage")
++	}
++}
++
++// The program process runs fuzzed syscalls, so it must not hold the endpoint:
++// the fork server brokers its barrier over a per-program pair.
++func TestNfsProxyProgramProcessHasNoEndpoint(t *testing.T) {
++	body := nfspSection(t, "common.h", "nfsp_broker_prefork();", "reply_execute(0);")
++	nfspRequireOrder(t, "loop", body,
++		"int pid = fork();",
++		"nfsp_broker_child();",
++		"execute_one();",
++		"nfsp_broker_parent();",
++		"nfsp_broker_wait(10);",
++		"waitpid(-1, &status, WNOHANG | WAIT_FLAGS) == pid",
++		"nfsp_broker_end();",
++	)
++	child := nfspSection(t, "executor.cc", "static void nfsp_broker_child()\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_broker_child", child,
++		"close(kNfspActivationFd);",
++		"close(nfsp_broker_state.fd);",
++	)
++	// The program process reaches the broker only through its pair.
++	program := nfspSection(t, "executor.cc", "void execute_one()", "thread_t* schedule_call")
++	if bytes.Contains(program, []byte("nfsp_endpoint")) || bytes.Contains(program, []byte("nfsp_act_")) {
++		t.Fatal("execute_one must not use the activation endpoint")
++	}
++	// The barrier result is published by the fork server after the program
++	// process is gone, not by the program process.
++	end := nfspSection(t, "executor.cc", "static void nfsp_broker_end()\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_broker_end", end,
++		"nfsp_broker_finish(&nfsp_endpoint, &nfsp_broker_state);",
++		"output_data->nfsp = nfsp_broker_state.b;",
++	)
 +}
 +
 +func TestNfsProxyUnclearedLeaseFailsRunner(t *testing.T) {
@@ -857,10 +1142,10 @@ index 000000000..76e9d2874
 +	)
 +}
 diff --git a/executor/test.h b/executor/test.h
-index 437bf01d9..3b9001176 100644
+index 437bf01d9..08df9d5ca 100644
 --- a/executor/test.h
 +++ b/executor/test.h
-@@ -414,6 +414,173 @@ static int test_get_last_opt()
+@@ -414,6 +414,262 @@ static int test_get_last_opt()
  	return 0;
  }
  
@@ -1029,18 +1314,108 @@ index 437bf01d9..3b9001176 100644
 +	}
 +	return ret;
 +}
++
++// The fork server's broker: a program process asks over its pair, the broker
++// runs the barrier on the endpoint.  Messages the program process sends are
++// written by hand on the program's end of the pair.
++static bool nfsp_test_send(int fd, uint32 op, uint64 generation)
++{
++	nfsp_broker_msg m = {op, 0, generation};
++	return send(fd, &m, sizeof(m), MSG_NOSIGNAL) == (ssize_t)sizeof(m);
++}
++
++static int nfsp_test_answers(int fd)
++{
++	uint8 buf[8];
++	int answers = 0;
++	while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) == 1)
++		answers = answers * 10 + buf[0] + 1; // "2" for answer 1, "1" for answer 0
++	return answers;
++}
++
++static int test_nfsp_broker()
++{
++	const uint32 ack = 0, act = NFSP_ACT_OP_ACTIVATE, deact = NFSP_ACT_OP_DEACTIVATE;
++	const uint32 ACT = NFSP_BROKER_ACTIVATE, DONE = NFSP_BROKER_DONE;
++	struct {
++		const char* name;
++		uint32 sends[3][2]; // (op, generation) the program process sends, op 0 = none
++		bool program_exits; // closes its end before the broker finishes
++		nfsp_test_step steps[2];
++		int nsteps;
++		int want_answers;
++		uint32 want_activation;
++		uint32 want_lease;
++	} cases[] = {
++	    {"activate and done", {{ACT, 42}, {DONE, 0}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 22, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_CLEAR},
++	    {"no KCOV generation: skipped, proxy not asked", {{ACT, 0}}, false, {}, 0, 1, NFSP_ACT_BARRIER_REFUSED, NFSP_ACT_LEASE_CLEAR},
++	    {"refused: skipped, DONE is a violation", {{ACT, 42}, {DONE, 0}}, false, {{act, 10, false}, {NFSP_ACT_OP_ABORT, NFSP_ACT_STATUS_UNKNOWN_GENERATION, false}}, 2, 1, NFSP_ACT_BARRIER_REFUSED, NFSP_ACT_LEASE_UNCLEARED},
++	    {"second DONE (forged early one)", {{ACT, 42}, {DONE, 0}, {DONE, 0}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 22, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_UNCLEARED},
++	    {"second ACTIVATE", {{ACT, 42}, {ACT, 43}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_UNCLEARED},
++	    {"DONE before ACTIVATE", {{DONE, 0}}, false, {}, 0, 0, NFSP_ACT_BARRIER_NONE, NFSP_ACT_LEASE_UNCLEARED},
++	    {"program died in its window", {{ACT, 42}}, true, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_CLEAR},
++	};
++	static uint8 program[] = "exec-encoded program bytes";
++	nfsp_act_endpoint ep = {-1, {}, 50};
++	memcpy(ep.rule_set_id, kNfspTestRuleSet, NFSP_ACT_RULE_SET_ID_LEN);
++	int ret = 0;
++	for (size_t i = 0; i < ARRAY_SIZE(cases) && !ret; i++) {
++		const auto& c = cases[i];
++		int proxy_sv[2], pair[2];
++		if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, proxy_sv) ||
++		    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair)) {
++			printf("socketpair failed\n");
++			return 1;
++		}
++		ep.fd = proxy_sv[0];
++		nfsp_test_proxy proxy = {proxy_sv[1], c.steps, c.nsteps, 0, false, {}};
++		pthread_t th;
++		pthread_create(&th, NULL, nfsp_test_proxy_thread, &proxy);
++		nfsp_broker k;
++		nfsp_broker_start(&k, pair[0], program, sizeof(program));
++		int answers = 0;
++		for (int j = 0; j < 3 && c.sends[j][0]; j++) {
++			if (!nfsp_test_send(pair[1], c.sends[j][0], c.sends[j][1])) {
++				printf("%s: send failed\n", c.name);
++				ret = 1;
++			}
++			nfsp_broker_serve(&ep, &k, 100);
++			int a = nfsp_test_answers(pair[1]);
++			if (a)
++				answers = answers * 10 + a;
++		}
++		if (c.program_exits)
++			close(pair[1]);
++		nfsp_broker_finish(&ep, &k);
++		if (!c.program_exits)
++			close(pair[1]);
++		close(proxy_sv[0]);
++		pthread_join(th, NULL);
++		close(proxy_sv[1]);
++		uint32 want_status = c.sends[0][0] == ACT && !c.sends[0][1] ? NFSP_ACT_NO_GENERATION : k.b.activation_status;
++		if (ret || proxy.bad || proxy.handled != c.nsteps || answers != c.want_answers ||
++		    k.b.activation != c.want_activation || k.b.lease != c.want_lease ||
++		    k.b.activation_status != want_status || k.fd != -1) {
++			printf("%s: handled=%d/%d answers=%d activation=%u/%u lease=%u\n", c.name, proxy.handled,
++			       c.nsteps, answers, k.b.activation, k.b.activation_status, k.b.lease);
++			ret = 1;
++		}
++	}
++	return ret;
++}
 +#endif
 +
  static struct {
  	const char* name;
  	int (*f)();
-@@ -430,6 +597,10 @@ static struct {
+@@ -430,6 +686,11 @@ static struct {
      {"test_cover_filter", test_cover_filter},
      {"test_glob", test_glob},
      {"test_get_last_opt", test_get_last_opt},
 +#if GOOS_linux
 +    {"test_nfsp_sha256", test_nfsp_sha256},
 +    {"test_nfsp_barrier", test_nfsp_barrier},
++    {"test_nfsp_broker", test_nfsp_broker},
 +#endif
  };
  

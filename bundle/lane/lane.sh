@@ -38,8 +38,10 @@
 #                     maps koov.nfs_trace=1 to this variable.
 #   NFS_PROXY_TARGET_DIR
 #                     unset (default) | DIR.  Target mode: every lane relay
-#                     applies the NFSPRUL1 rule set DIR/laneN.nfsprul1 in the
-#                     proxy session named by DIR/laneN.session, records to the
+#                     applies the NFSPRUL1 rule set DIR/laneN.nfsprul1 in a
+#                     fresh proxy session DIR/laneN.session + "." + a random
+#                     UUID per Proxy start (the host sink's --session-prefix
+#                     series), records to the
 #                     host journal on /dev/virtio-ports/nfsp-journal-N, and
 #                     serves the executor activation endpoint in
 #                     /syz-nfs-lanes/proc-N/activation (with rule_set_id).
@@ -571,6 +573,11 @@ setup_lane()
         mkdir -m 0700 "$executor_root/proc-$setup_lane_id/activation"
         sha256sum "$setup_rules" | cut -d' ' -f1 \
             > "$executor_root/proc-$setup_lane_id/activation/rule_set_id"
+        # The proxy starts in the server namespace, where the lane's own
+        # state/run replaces /run (and with it the boot copy of the inputs).
+        mkdir -m 0700 "$setup_lane_root/server/target"
+        cp "$setup_rules" "$setup_lane_root/server/target/rules.nfsprul1"
+        cp "$setup_session" "$setup_lane_root/server/target/session_prefix"
     fi
 
     ip netns add "$setup_server_ns"
@@ -910,11 +917,15 @@ EOF
                 exit 1
             }
             if [ -n "$proxy_target_dir" ]; then
+                # A fresh session id per Proxy start, in the series the host
+                # sink installed (journal_sink --session-prefix): a restarted
+                # VM never continues a full or quarantined session.
+                proxy_session="$(cat "$lane_root/server/target/session_prefix").$(cat /proc/sys/kernel/random/uuid)"
                 nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
                     "10.89.$lane.1:$server_port" "10.89.$lane.5:$server_port" \
                     "10.89.$lane.1:$knfsd_port" "10.89.$lane.5:$ganesha_port" \
-                    --target "$proxy_target_dir/lane$lane.nfsprul1" \
-                    --session-id "$(cat "$proxy_target_dir/lane$lane.session")" \
+                    --target "$lane_root/server/target/rules.nfsprul1" \
+                    --session-id "$proxy_session" \
                     --journal "/dev/virtio-ports/nfsp-journal-$lane" \
                     --lane "$lane" \
                     --activation "$executor_root/proc-$lane/activation/activation.sock" \

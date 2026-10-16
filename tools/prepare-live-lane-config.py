@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
+import subprocess
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -65,11 +67,40 @@ def select_profile_calls(parser, config, profiles, allow_raw):
     config["enable_syscalls"] = enabled
 
 
+def chardev_reconnect(parser, args, vm):
+    """The chardev reconnect option of the QEMU that will run the VM.
+
+    QEMU 9.2 added reconnect-ms=MS and deprecated reconnect=SECONDS, which
+    older QEMU (e.g. 6.2) only knows.
+    """
+    version = args.qemu_version
+    if version is None:
+        binary = vm.get("qemu") or "qemu-system-x86_64"
+        try:
+            out = subprocess.run([binary, "--version"], capture_output=True,
+                                 text=True, timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            out = ""
+        found = re.search(r"version (\d+)\.(\d+)", out)
+        if not found:
+            parser.error("cannot tell the QEMU version of %s; pass --qemu-version"
+                         % binary)
+        version = "%s.%s" % found.groups()
+    parsed = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)?", version)
+    if not parsed:
+        parser.error("--qemu-version must look like 9.2")
+    if (int(parsed.group(1)), int(parsed.group(2))) >= (9, 2):
+        return "reconnect-ms=1000"
+    return "reconnect=1"
+
+
 def target_inputs(parser, args):
     """Per-lane target-mode inputs as (name, bytes), or [] without --nfs-target."""
     if args.nfs_target is None:
         if args.journal_socket_dir is not None:
             parser.error("--journal-socket-dir needs --nfs-target")
+        if args.qemu_version is not None:
+            parser.error("--qemu-version needs --nfs-target")
         return []
     if args.journal_socket_dir is None:
         parser.error("--nfs-target needs --journal-socket-dir")
@@ -116,6 +147,11 @@ def main():
         help=("with --nfs-target: host directory of the journal sinks' "
               "sockets, laneN.sock (python -m agent_pipeline.journal_sink "
               "--socket DIR/laneN.sock --channel nfsp-journal-N)"))
+    parser.add_argument(
+        "--qemu-version", metavar="X.Y",
+        help=("with --nfs-target: the QEMU version that runs the VM, which "
+              "picks the journal ports' reconnect option; by default it is "
+              "read from vm.qemu (or qemu-system-x86_64) --version"))
     parser.add_argument(
         "--state-dir", type=Path,
         help=("persistent campaign state directory; sets config.workdir to "
@@ -207,14 +243,16 @@ def main():
     if target_files:
         # One virtio-serial journal port per lane (/dev/virtio-ports/
         # nfsp-journal-N in the guest), each a client of its host sink.
-        # Start the sinks before the VM; reconnect-ms needs QEMU 9.2.
+        # Start the sinks before the VM.
+        reconnect = chardev_reconnect(parser, args, vm)
         sockets = args.journal_socket_dir.resolve()
         vm["qemu_args"] += " -device virtio-serial-pci,id=nfspser"
         for lane in range(LANES):
             vm["qemu_args"] += (
-                " -chardev socket,id=nfspj%d,path=%s,reconnect-ms=1000"
+                " -chardev socket,id=nfspj%d,path=%s,%s"
                 " -device virtserialport,bus=nfspser.0,chardev=nfspj%d,"
-                "name=nfsp-journal-%d" % (lane, sockets / ("lane%d.sock" % lane), lane, lane))
+                "name=nfsp-journal-%d" % (lane, sockets / ("lane%d.sock" % lane),
+                                          reconnect, lane, lane))
         fixture_arg += " koov.nfs_target=1"
     vm["cmdline"] = (cmdline + " %s koov.lane_sha256=%s"
                      % (fixture_arg, digest)).strip()

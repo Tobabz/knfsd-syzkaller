@@ -2,7 +2,8 @@
 
 The barrier code is `executor/nfs_proxy_activation.h`, which the checked-in
 syzkaller patch adds.  This test takes that header out of the patch, compiles
-it into a small driver, and runs the driver against the built Proxy in
+it into a small driver (a program-process thread asking the fork server's
+broker over a socket pair, as in the executor), and runs it against the built Proxy in
 target mode with the real host sink -- the same pieces as
 `test_journal_live.py`, with the executor's client instead of the test's own
 activation requests.  How the executor places the barrier around a program
@@ -38,6 +39,7 @@ CLEAR, HELD, UNCLEARED = 0, 1, 2
 QUARANTINE = 31
 
 DRIVER = r"""
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,17 +48,50 @@ DRIVER = r"""
 #include <unistd.h>
 #include "nfs_proxy_activation.h"
 
-/* argv: SOCKET RULE_SET_ID TIMEOUT_MS.  stdin, one command per line:
- *   activate GEN PROGRAM_HEX   nfsp_act_activate on the barrier
- *   release                    nfsp_act_release on the same barrier */
+/* The executor's two sides: the program process (a thread here) asks over
+ * its pair, the fork server (main) brokers the barrier on the endpoint.
+ *
+ * argv: SOCKET RULE_SET_ID TIMEOUT_MS.  stdin, one command per line:
+ *   activate GEN PROGRAM_HEX   the program asks for its window
+ *   release                    DONE if it ran, then the program process ends */
+struct ask {
+	int fd;
+	unsigned op;
+	unsigned long long generation;
+	int answer;
+	volatile int finished;
+};
+
+static void* program_process(void* arg)
+{
+	struct ask* a = arg;
+	a->answer = nfsp_broker_call(a->fd, a->op, a->generation);
+	a->finished = 1;
+	return NULL;
+}
+
+static int ask_broker(struct nfsp_act_endpoint* ep, struct nfsp_broker* k, int fd, unsigned op,
+		      unsigned long long generation)
+{
+	struct ask a = {fd, op, generation, -1, 0};
+	pthread_t th;
+	pthread_create(&th, NULL, program_process, &a);
+	while (!a.finished)
+		nfsp_broker_serve(ep, k, 10);
+	pthread_join(th, NULL);
+	return a.answer;
+}
+
 int main(int argc, char **argv)
 {
 	struct nfsp_act_endpoint ep;
-	struct nfsp_act_barrier b;
+	struct nfsp_broker k;
 	struct sockaddr_un addr = {0};
 	char line[8192], hex[4096];
-	unsigned char prog[2048];
+	static unsigned char prog[2048];
 	unsigned long long gen;
+	int pair[2] = {-1, -1};
+	int ran = 0;
 
 	if (argc != 4)
 		return 2;
@@ -69,22 +104,27 @@ int main(int argc, char **argv)
 		return 5;
 	memcpy(ep.rule_set_id, argv[2], NFSP_ACT_RULE_SET_ID_LEN);
 	ep.timeout_ms = strtoull(argv[3], NULL, 10);
-	memset(&b, 0, sizeof(b));
 	while (fgets(line, sizeof(line), stdin)) {
 		if (sscanf(line, "activate %llu %4095s", &gen, hex) == 2) {
 			size_t n = strlen(hex) / 2;
 			for (size_t i = 0; i < n; i++)
 				sscanf(hex + 2 * i, "%2hhx", &prog[i]);
-			int ok = nfsp_act_activate(&ep, &b, gen, prog, n);
-			printf("ok=%d activation=%u/%u lease=%u executed=%u digest=", ok,
-			       b.activation, b.activation_status, b.lease, b.executed);
+			if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair))
+				return 6;
+			nfsp_broker_start(&k, pair[0], prog, n);
+			ran = ask_broker(&ep, &k, pair[1], NFSP_BROKER_ACTIVATE, gen) == 1;
+			printf("ok=%d activation=%u/%u lease=%u executed=%u digest=", ran,
+			       k.b.activation, k.b.activation_status, k.b.lease, k.b.executed);
 			for (int i = 0; i < 32; i++)
-				printf("%02x", b.digest[i]);
+				printf("%02x", k.b.digest[i]);
 			printf("\n");
 		} else if (strncmp(line, "release", 7) == 0) {
-			nfsp_act_release(&ep, &b);
-			printf("deactivation=%u/%u lease=%u\n", b.deactivation,
-			       b.deactivation_status, b.lease);
+			if (ran && ask_broker(&ep, &k, pair[1], NFSP_BROKER_DONE, 0) != 1)
+				return 7;
+			close(pair[1]);
+			nfsp_broker_finish(&ep, &k);
+			printf("deactivation=%u/%u lease=%u\n", k.b.deactivation,
+			       k.b.deactivation_status, k.b.lease);
 		} else {
 			return 4;
 		}
@@ -122,7 +162,7 @@ def driver(tmp_path_factory) -> Path:
     (work / "nfs_proxy_activation.h").write_text(executor_header())
     (work / "driver.c").write_text(DRIVER)
     out = work / "driver"
-    subprocess.run([cc, "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Werror",
+    subprocess.run([cc, "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Werror", "-pthread",
                     f"-I{work}", "-o", str(out), str(work / "driver.c")], check=True)
     return out
 

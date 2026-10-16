@@ -992,10 +992,13 @@ target rule 설치, activation, mutated output 노출을 host durability와 함�
 남은 것:
 - S1a는 syzkaller patch 0023으로 구현됐다(2026-10-16): executor가 program마다 ACK된 `ACTIVATE` 뒤에만
   program을 실행하고, KCOV FINISH/ABORT 전에 `DEACTIVATE`/`ABORT`로 창을 닫으며, 닫힘을 확인하지 못하면
-  Runner가 executor를 실패시켜 VM을 재시작한다. barrier 결과는 `ProgInfo.nfs_proxy`로 보고된다. 검증은
-  executor `test_nfsp_barrier`(fake proxy), patch의 Go source-order test, 그리고 patch의 header를 실제
-  Proxy·sink에 붙이는 `tests/agent_pipeline/test_executor_activation.py`. guest에서 실제 executor로 도는
-  것은 아래 KVM gate에 포함된다. 한계: Proxy session당 generation slot 256개(가득 차면 lane 재시작).
+  Runner가 executor를 실패시켜 VM을 재시작한다. endpoint는 fork server만 갖고, fuzz syscall을 실행하는
+  program process는 program마다 만든 socket pair로 fork server에 barrier를 요청한다(broker). barrier 결과는
+  `ProgInfo.nfs_proxy`로 보고된다. Proxy는 시작할 때마다 host sink의 session series(`--session-prefix`)에서
+  새 session을 쓰므로, generation slot 256개가 찬 session도 VM 재시작 뒤 새 session으로 이어간다. 검증은
+  executor `test_nfsp_barrier`·`test_nfsp_broker`(fake proxy), patch의 Go source-order test, sink series
+  test, 그리고 patch의 header를 실제 Proxy·sink에 붙이는 `tests/agent_pipeline/test_executor_activation.py`.
+  guest에서 실제 executor로 도는 것은 아래 KVM gate에 포함된다.
 - KVM gate: guest에서 virtio-serial로 실제 sink에 붙여 knfsd/Ganesha 트래픽에 돌리는 live 실행은 사람이
   KVM host에서 한다(`tools/nfs-proxy/README.md` "Target mode").
 - Runner의 generation 봉인과 M1 판정 연결, `EXPOSURE_INTENT`의 `predicate_values`/`transform_source_values`

@@ -300,14 +300,26 @@ qemu-system-x86_64 ... \
 **Executor barrier (S1a).** Syzkaller patch 0023 makes the executor drive `--activation`. In a
 target-mode lane, `lane.sh` starts the Proxy with `--target`, `--session-id`, `--journal
 /dev/virtio-ports/nfsp-journal-N` and `--activation` on a socket under the executor's
-`proc-N/activation/`, which the executor connects to before it chroots (the fd stays outside the
-fuzz namespace). For every program the executor sends `ACTIVATE` with the KCOV generation and the
-SHA-256 of the exec-encoded program, and runs the program only after the ACK. It sends
-`DEACTIVATE` before KCOV FINISH, and `DEACTIVATE`/`ABORT` before the orphan KCOV ABORT. Without
-an ACK the program is not run and its KCOV generation is aborted. If a window cannot be confirmed
-closed (or the Proxy quarantined the session), the Runner fails the executor and the VM is
+`proc-N/activation/`, which the executor connects to before it chroots. Only the fork server
+keeps that connection: each program process closes its copy before anything else and asks the
+fork server, over a socket pair made for that program, to open and close its window, so the
+process that runs fuzzed syscalls has no descriptor for the endpoint. For every program with a
+KCOV generation, the fork server sends `ACTIVATE` with the generation and the SHA-256 of the
+exec-encoded program, and the program runs only after the ACK. `DEACTIVATE` goes out before KCOV
+FINISH, and `DEACTIVATE`/`ABORT` before the orphan KCOV ABORT. Without an ACK, or when KCOV BEGIN
+gave no generation, the program is not run. Requests without remote coverage (machine-check
+probes, comparisons) run without a window, so the Proxy leaves them unmutated. If a window cannot
+be confirmed closed, the Proxy quarantined the session, or the program process sent the fork
+server anything but one `ACTIVATE` and one `DONE`, the Runner fails the executor and the VM is
 restarted. The exec result carries the barrier as `ProgInfo.nfs_proxy`, and `syz-execprog` logs
 it as `nfs proxy barrier: ...`.
+
+Each Proxy start uses a new session `PREFIX.<random UUID>`, where `PREFIX` is
+`TARGET/laneN.session`. The host sink is started for that series (`--session-prefix`). It installs
+each new session, with the binding fixed on its command line, when that session's `RULESET`
+arrives, and ends the series' earlier session (`superseded`). A Proxy session has 256 generation
+slots; a full session is treated like a quarantine, and the restarted VM continues in a fresh
+session.
 
 To boot a target-mode lane (KVM host, by hand):
 
@@ -315,7 +327,7 @@ To boot a target-mode lane (KVM host, by hand):
 # One sink per lane, started before the VM.
 python -m agent_pipeline.journal_sink --dir JOURNAL_DIR --name lane0 \
     --socket /run/knfsd-syzkaller/nfsp/lane0.sock --vm vm-0 --channel nfsp-journal-0 \
-    --session "$(cat TARGET/lane0.session)" --lane 0 --rules TARGET/lane0.nfsprul1
+    --session-prefix "$(cat TARGET/lane0.session)" --lane 0 --rules TARGET/lane0.nfsprul1
 # ... the same for lane1..lane3.
 tools/prepare-live-lane-config.py ... \
     --nfs-target TARGET --journal-socket-dir /run/knfsd-syzkaller/nfsp
@@ -323,8 +335,9 @@ tools/prepare-live-lane-config.py ... \
 
 `TARGET` holds `laneN.nfsprul1` and `laneN.session` for lanes 0-3. Target mode needs `vm.count`
 1 and `SERVER_IMPL=both`; the prepared config adds the virtio-serial ports and
-`koov.nfs_target=1`. A Proxy session has 256 generation slots, and a full session is treated
-like a quarantine (the VM restarts with a new session).
+`koov.nfs_target=1`. The ports' reconnect option follows the QEMU version, read from `vm.qemu`
+(default `qemu-system-x86_64`) `--version`: `reconnect-ms=1000` from 9.2 on, `reconnect=1`
+before. Pass `--qemu-version X.Y` when the preparing host cannot run that QEMU.
 
 ## Building
 
