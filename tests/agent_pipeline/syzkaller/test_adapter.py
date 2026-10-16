@@ -76,6 +76,8 @@ def test_real_parser_refuses(program, parser, identity):
 @pytest.mark.parametrize("program,reason,index,call", [
     (LANE + b"r1 = syz_not_in_build(0x0)\n", "call_unresolved", 1, "syz_not_in_build"),
     (LANE + b"clone3(0x0, 0x0)\n", "call_disabled", 1, "clone3"),
+    (LANE + b"clone3 \t(0x0, 0x0)\n", "call_disabled", 1, "clone3"),
+    (LANE + b"syz_not_in_build ()\n", "call_unresolved", 1, "syz_not_in_build"),
     (LANE + b"syz_open_nfs_lane$client0(0x0)\n", "nfs_acquisition_unverified", 1,
      "syz_open_nfs_lane$client0"),
 ])
