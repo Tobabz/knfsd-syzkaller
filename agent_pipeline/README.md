@@ -37,7 +37,8 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `agent_tasks/runtime.py` | injectable structured-output runtime protocol; task policy selects provider/model and output-repair allowance |
 | `agent_tasks/pydantic_ai_runtime.py` | optional PydanticAI driver with typed output, the pinned toolbox, bounded requests and output repairs, and response-derived model identity |
 | `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis and Reachability Planning; records the runtime's actual `provider:model` id through existing Controller callbacks |
-| `runner/` | restart-safe SQLite task leases/cancellation/completion plus an injected capture backend that seals evidence and records host provenance receipts |
+| `runner/` | restart-safe SQLite leases/completion, evidence sealing, accepted-receipt Q1 publication and lease-aware Linux process supervision |
+| `journal_framing.py` | bounded M5 journal frame recovery and canonical ACK codec; persistence and event admission remain separate |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |
 | `controller/store.py` | SQLite: one transaction per transition |
 | `controller/service.py` | events in, tasks out after commit; `poll()` and `recover()` send a failed or unanswered call again (each failure is recorded per job in `effect_failures`, and the other jobs go on); `replay()` |
@@ -120,12 +121,27 @@ Runner accepted the same digest as its final `sealed` result and that receipt
 is present and valid. A manifest left by late lease loss or receipt failure is
 an orphan, not Judge input.
 
+`RunnerQ1ReceiptBridge` checks an accepted completion and sealing receipt against
+the trusted dispatch, candidate, kernel identity and target mapping. It records
+immutable publication history and builds an `ArtifactQ1Judge` snapshot. Missing
+authority defers publication so the Controller can retry without recording a
+transient verdict. See [`Q1_RECEIPTS.md`](runner/Q1_RECEIPTS.md).
+
+`ProcessSupervisor` executes a trusted host command with bounded output, runtime,
+lease renewal and cancellation. A Linux guardian retains the resource lock until
+its owned process tree is reaped; uncertain restart state blocks replacement.
+This primitive must still be wired into a concrete execution engine with a
+consistent resource identity. See [`PROCESS_SUPERVISOR.md`](runner/PROCESS_SUPERVISOR.md).
+
 The standalone M1 kernel consumes a host-verified projection of a generation
 journal. It treats a durable `EXPOSURE_INTENT` as application evidence,
 requires both barriers plus a clean terminal summary for `NOT_APPLIED`, and
 keeps forwarding completion as a separate delivery result. A sealed-evidence
 adapter and the M5 journal producer are still required before this kernel can
 judge production runs.
+`journal_framing` fixes the versioned frame header and ACK shape, detects complete
+corrupt frames, and reports an incomplete final append without modifying input.
+It does not persist records, validate event semantics or send acknowledgements.
 
 `ArtifactQ2Judge` follows the same split without depending on Stage 2
 Controller integration. Its `TrustedQ2Execution` receipt is the authority for
@@ -173,9 +189,9 @@ an HTTP mock without sending live provider requests. Importing the base
 deadline and response-identity requirements.
 
 Also not here yet: broader NFS resource-provenance extraction, a concrete
-VM/KCOV execution engine and external-process fencing, raw KCOV/counter collection and
-normalization, automatic DWARF/runtime-PC mapping, Runner-receipt adapters for
-the Judges, approved production HCAP/judge data, and Stage 2 Controller/Runner
+VM/KCOV execution engine with process/resource supervision wired in, raw
+KCOV/counter collection and normalization, automatic DWARF/runtime-PC mapping,
+Runner-receipt integration for Q2, approved production HCAP/judge data, and Stage 2 Controller/Runner
 integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
 VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
 remains false-only. The nfs-proxy semantic runtime remains a separate component

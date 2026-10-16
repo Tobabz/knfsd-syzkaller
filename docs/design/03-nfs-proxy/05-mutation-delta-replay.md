@@ -1237,7 +1237,8 @@ application evidence subrecord, Layer 0 regression fixture로 남을 수 있다.
 durability 기반이 아니다(§11, issue #3).
 
 Dynamic semantic campaign의 top-level artifact는 이 contract의 semantic MutationDelta다.
-새 format magic/version은 implementation gap analysis에서 정한다.
+host frame magic/version과 ACK envelope은 §45에서 정한다. event payload별 canonical encoding과
+guest transport는 후속 M5/S1b 구현에서 이 framing 위에 연결한다.
 
 ### 43. current applied_count와 target cardinality
 
@@ -1262,6 +1263,79 @@ Q2 crash reproduced
 ```
 
 Q2는 crash/sanitizer evidence가 별도로 판단한다.
+
+### 45. M5 host frame 및 ACK 계약 v1
+
+첫 구현은 `agent_pipeline/journal_framing.py`의 frame codec, bounded prefix reader와 ACK schema다.
+이 구현은 event payload admission, session/generation 상태 복원, durable writer 또는 live transport를
+아직 제공하지 않는다. frame 검증 성공이나 `JournalAck` 객체 생성은 `(D)`의 증명이 아니다.
+
+**Frame layout.** 모든 정수는 unsigned big-endian이며 header는 80 bytes다.
+
+| offset | 크기 | 필드 |
+|---|---|---|
+| 0 | 8 | magic `NFSPJNL1` |
+| 8 | 2 | frame version = 1 |
+| 10 | 2 | kind: 1 = host journal event, 2 = host rejection record, 3 = host ACK |
+| 12 | 4 | payload byte length, 1–4 MiB |
+| 16 | 32 | SHA-256(payload) |
+| 48 | 32 | SHA-256(header bytes 0–47) |
+| 80 | length | payload bytes |
+
+kind/version/length를 포함한 header hash를 payload 읽기 전에 검사한다. 길이 필드 손상 때문에 뒤의
+정상 record까지 incomplete tail로 숨기는 것을 막는다. 완전한 frame의 hash 오류는 마지막 frame이어도
+corruption이다. 불완전한 마지막 header/payload만 tail로 보고하며, known magic/version/kind/length가
+이미 잘못된 prefix는 tail로 구제하지 않는다. reader는 input을 자르거나 고쳐 쓰지 않는다.
+hash는 무결성 검사이며 channel 인증이나 host provenance를 대신하지 않는다.
+
+reader는 segment당 최대 64 MiB, 16,384 records를 읽고 한도를 낮출 수 있다. ACK frame은 journal
+record로 읽지 않는다. `JournalPrefix.complete_bytes`는 framing이 완전한 prefix의 길이이며, event가
+admission되었다거나 ACK되었다는 의미가 아니다. frame payload는 codec에서 opaque bytes이고, future sink는
+§6–§21의 event별 canonical encoding/schema/limits를 따로 검증해야 한다. 큰 rule snapshot이나 concrete
+snapshot을 artifact로 분리하면 해당 bytes도 ACK 전에 host에서 보존·검증해야 한다. segment 회전과
+총 session 저장량 제한은 sink 구현에서 정하며, 한도 초과를 silent drop으로 처리하지 않는다.
+
+**ACK envelope.** kind 3 payload는 repository `canonical_json`으로 직렬화한 다음 필드다.
+duplicate key, 추가 필드, 비정규 JSON 표현과 범위를 벗어난 값은 거부한다.
+
+```text
+schema_version = "nfs-proxy-journal-ack.v1"
+journal_id                    # host segment identifier
+session_binding
+    vm_instance_id
+    channel_id
+    proxy_session_id
+    rule_set_id               # exact NFSPRUL1 snapshot SHA-256
+event_seq                     # uint64, per-session
+request_sha256                # exact canonical request bytes
+record_sha256                 # complete stored frame, including header
+committed_end_offset          # exclusive offset in that host segment
+```
+
+이 ACK는 host-stamped binding과 현재 한 개 outstanding request의 sequence/digest가 모두 같을 때만
+수신 측에서 사용한다. guest가 보낸 `vm_instance_id`/channel/binding은 host 값과 대조하며, 다른 값을
+host 값으로 덮어 성공시키지 않는다. channel 인증과 lifetime은 transport/Runner 책임이다.
+
+**Sink가 지켜야 할 처리 순서.** 다음 순서는 계약이며 codec이 수행하는 동작이 아니다.
+
+1. host channel binding과 설치된 immutable rule set을 선택한다. request framing/payload를 bound하고
+   §6의 scope, `event_seq`, batch, admitting/draining/closed 상태를 검증한다.
+2. exact request digest와 host-stamped event를 하나의 frame으로 append한다. short write는 끝까지 처리하고,
+   referenced snapshot bytes까지 host에 보존한 뒤에만 성공으로 간주한다. 기존 §11의 failure domain을
+   유지한다. host OS/storage crash 보장은 별도 확장이다.
+3. ACK는 완성된 frame의 digest와 끝 offset을 가리킨다. append 성공 뒤 ACK 유실은 재전송으로 복구한다.
+   같은 session/sequence/request bytes에는 동일한 ACK를 반환하고 다시 append하지 않는다.
+4. 같은 sequence의 다른 request, gap, batch 충돌, stale binding, post-summary event는 host rejection
+   record로 남긴다. 이런 거부를 success ACK로 표현하지 않는다. 거부 자체를 기록할 수 없으면 channel을
+   실패시키고 evidence를 불완전으로 남긴다. 거부 response의 payload encoding은 sink/transport에서 정한다.
+5. restart 시 완전한 frame만 읽은 후 event semantics와 session별 순서를 다시 검증한다. framing prefix만
+   읽고 generation을 accepting 상태로 되돌리지 않는다. 부분 tail의 재사용/절단은 외부 ACK 기록과 기존
+   segment 보존 여부를 포함한 writer recovery 정책에서 명시한다. codec은 자동 절단을 하지 않는다.
+
+후속 구현의 필수 검증은 ACK 유실 재전송, 동일 sequence의 다른 payload, 다른 lane/VM/session,
+draining 중 CALL 거부 및 REPLY 허용, summary 뒤 event 거부, short write/append 중 종료와 restart다.
+지금의 codec 검증은 모든 마지막 append 절단 위치와 frame 손상·한도·ACK canonicality를 검사한다.
+M5/S1b 완료와 M1 판정 연결은 실제 sink, guest transport, relay completion 및 봉인이 연결된 뒤에 판단한다.
 
 ## 설계 근거
 

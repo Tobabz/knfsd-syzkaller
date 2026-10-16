@@ -4,8 +4,9 @@
 SQLite queue. It stores canonical task input, lifecycle and cancellation
 facts, exclusive lease attempts, and a canonical completion receipt before it
 acknowledges each transition. `RunnerWorker` only adapts an injected backend;
-this package does not boot VMs, run programs, collect or fabricate evidence,
-or emit Q1/Q2 verdicts.
+the queue and worker do not boot VMs, collect evidence or emit Q1/Q2 verdicts.
+The optional process supervisor can run a trusted host command; an execution
+engine must connect it to VM/capture infrastructure.
 
 The Controller's `task_id` is the unique stage execution identifier because
 the current `RunnerInput` has no separate stage field. A completion receipt
@@ -80,11 +81,28 @@ limits before storage, and calls `EvidenceStore.seal` only after preflight.
 After sealing, the adapter verifies the stored bytes and persists a canonical
 `RunnerEvidenceReceipt` keyed by the manifest digest. The receipt records
 capture provenance and artifact inventory; it makes no Q1/Q2 assertion.
-Concrete VM lifecycle, KCOV collection, proxy journal capture, backend process
-fencing and campaign streaming are still outside this package.
+Concrete VM lifecycle, KCOV collection, proxy journal capture and campaign
+streaming are still outside this package.
 
 A CAS manifest is consumable downstream only when the durable Runner has an
 accepted `sealed` completion naming that digest and the receipt store returns
 the matching valid `RunnerEvidenceReceipt`. A late lease loss or receipt-store
 failure can leave an unreferenced manifest after `EvidenceStore.seal` succeeds.
 That manifest is an orphan, not evidence that a Controller or Judge may use.
+
+## Accepted completion to Q1
+
+[`RunnerQ1ReceiptBridge`](Q1_RECEIPTS.md) enforces that consumption rule and
+cross-checks explicit host authority against the dispatch/materialization,
+candidate target, kernel identity and mapping. Its append-only publication
+history produces immutable `ArtifactQ1Judge` snapshots for Controller retries
+and replay. It does not infer host authority from guest bytes.
+
+## Host process supervision
+
+[`ProcessSupervisor`](PROCESS_SUPERVISOR.md) provides lease-aware Linux command
+execution with bounded output, timeouts, renewal and cancellation. Its guardian
+holds a shared resource lock through descendant cleanup. After an uncertain
+crash, dirty ownership state refuses replacement without signalling old PIDs.
+This is a host process primitive; the execution engine must select the actual
+resource identity and account for VM or external effects outside the process tree.
