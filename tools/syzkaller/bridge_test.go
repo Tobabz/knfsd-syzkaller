@@ -162,6 +162,10 @@ func TestTypedRefusals(t *testing.T) {
 		{"getpid()\n# c\n\nunknown_call()\n", refusal{"call_unresolved", 1, "unknown_call"}},
 		{lane + "r1 = syz_not_in_build(0x0)\n", refusal{"call_unresolved", 1, "syz_not_in_build"}},
 		{lane + "clone3(0x0, 0x0)\n", refusal{"call_disabled", 1, "clone3"}},
+		{lane + "clone3 (0x0, 0x0)\n", refusal{"call_disabled", 1, "clone3"}},
+		{lane + "clone3\t(0x0, 0x0)\n", refusal{"call_disabled", 1, "clone3"}},
+		{lane + "syz_not_in_build ()\n", refusal{"call_unresolved", 1, "syz_not_in_build"}},
+		{lane + "r1 =\tsyz_not_in_build\t()\n", refusal{"call_unresolved", 1, "syz_not_in_build"}},
 		{lane + "r1 = syz_open_nfs_lane$client0(0x0)\n", refusal{"nfs_acquisition_unverified", 1, "syz_open_nfs_lane$client0"}},
 	} {
 		t.Run(c.source, func(t *testing.T) {

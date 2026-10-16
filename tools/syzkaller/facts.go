@@ -80,7 +80,8 @@ func strictRefusal(target *prog.Target, data []byte, reason string) *refusal {
 		}
 		name := line
 		if paren := strings.IndexByte(line, '('); paren >= 0 {
-			name = line[:paren]
+			// The parser allows blanks between the name and "(".
+			name = strings.TrimRight(line[:paren], " \t")
 		}
 		meta := target.SyscallMap[name]
 		if (reason == "call_unresolved" && meta == nil) ||
