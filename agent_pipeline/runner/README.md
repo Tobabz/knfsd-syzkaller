@@ -40,6 +40,13 @@ expiry, after the backend's own lease deadline, the task ends
 resource fence (for `ProcessSupervisor`, the resource lock) refuses the next
 execution.
 
+Cleanup can outlast the lease. `stop_unconfirmed()` is authenticated by the
+attempt (generation, worker, token), not by a live lease: an expired attempt
+still active ends `cleanup_unconfirmed` at once, and one that expiry already
+ended (as `cancelled` or `runner_restart`) is kept in `cleanup_reports()`
+until the Controller records it and calls `acknowledge_cleanup_report()`.
+A late result is still never accepted as evidence.
+
 ## Backend fencing requirement
 
 The generation and bearer token in `WorkLease` must also fence the concrete

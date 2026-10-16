@@ -151,11 +151,20 @@ class CancelConfirmed(Record):
     cleanup_unconfirmed: bool = False
 
 
+class CleanupUnconfirmed(Record):
+    """The Runner reported, after the task's final status, that its
+    execution was not confirmed stopped (09 §8)."""
+
+    type: Literal["cleanup_unconfirmed"] = "cleanup_unconfirmed"
+    task_id: str
+
+
 Event = Annotated[
     Union[IntakeChecked, AgentSucceeded, AgentFailed, AgentAttemptRestarted,
           RunnerFinished, RunnerInputDigestMigrated, ApprovalGiven,
           ApprovalDenied, IssueChanged, BindingChanged, JudgeVersionsChanged,
-          PolicyChanged, OperatorAction, CancelConfirmed],
+          PolicyChanged, OperatorAction, CancelConfirmed,
+          CleanupUnconfirmed],
     Field(discriminator="type"),
 ]
 

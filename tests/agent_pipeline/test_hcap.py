@@ -587,6 +587,25 @@ def test_seed_declaration_requires_pinned_provenance_but_not_admission(synthetic
     assert check(synthetic, plan=plan).violations == ("invalid_plan_artifact",)
 
 
+@pytest.mark.parametrize("missing", ["program", "manifest", "both"])
+def test_missing_agent_proposed_seed_is_a_plan_finding(synthetic, missing):
+    """An existing seed is an Agent-proposed reference: one that does not
+    exist goes to repair, unlike a missing host artifact."""
+    plan = plan_data(synthetic)
+    manifest = synthetic.store.put(b"SYNTHETIC ONLY: seed manifest")
+    plan["program_proposal"].update(
+        kind="seed", seed_manifest_ref=manifest, seed_id="synthetic-seed")
+    assert check(synthetic, plan=plan).ok
+    absent = "f" * 64
+    if missing in ("program", "both"):
+        plan["program_proposal"]["artifact_ref"] = absent
+    if missing in ("manifest", "both"):
+        plan["program_proposal"]["seed_manifest_ref"] = "e" * 64
+    result = check(synthetic, plan=plan)
+    assert result.violations == ("seed_reference_not_found",)
+    assert not result.host_authority
+
+
 def test_program_cannot_claim_seed_provenance(synthetic):
     plan = plan_data(synthetic)
     plan["program_proposal"].update(

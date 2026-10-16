@@ -93,6 +93,18 @@ CREATE TABLE IF NOT EXISTS runner_attempts (
     PRIMARY KEY (task_id, generation),
     FOREIGN KEY (task_id) REFERENCES runner_tasks(task_id)
 );
+-- An execution reported not confirmed stopped after its attempt had already
+-- ended (lease expiry settled it first).  Kept until the Controller
+-- acknowledges it, so the report outlives the lease.
+CREATE TABLE IF NOT EXISTS runner_cleanup_reports (
+    task_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    reported_at_ns INTEGER NOT NULL,
+    acknowledged_at_ns INTEGER,
+    PRIMARY KEY (task_id, generation),
+    FOREIGN KEY (task_id, generation)
+        REFERENCES runner_attempts(task_id, generation)
+);
 CREATE INDEX IF NOT EXISTS runner_claimable
     ON runner_tasks(lifecycle, lease_expires_at_ns, submission_order);
 """
@@ -463,18 +475,63 @@ class DurableRunner:
     def stop_unconfirmed(self, lease: WorkLease) -> None:
         """Record that this lease's execution could not be confirmed
         stopped.  The task then ends ``cleanup_unconfirmed`` at lease
-        expiry, not ``cancelled`` or ``runner_restart``."""
+        expiry, not ``cancelled`` or ``runner_restart``.
+
+        Cleanup can outlast the lease.  The report is authenticated by the
+        attempt (generation, worker, token), not by a live lease: an expired
+        attempt still active ends ``cleanup_unconfirmed`` now, and one that
+        expiry already ended is kept in ``cleanup_reports()``."""
 
         lease = WorkLease.model_validate(lease)
+        task_id = lease.binding.task_id
         with self._transaction():
             now = self._now()
-            row = self._row(lease.binding.task_id)
-            self._require_current_lease(row, lease, now, allow_cancel=True)
+            row = self._row(task_id)
+            attempt = self._db.execute(
+                """SELECT * FROM runner_attempts
+                   WHERE task_id = ? AND generation = ?""",
+                (task_id, lease.generation),
+            ).fetchone()
+            if (row is None or attempt is None
+                    or attempt["worker_id"] != lease.worker_id
+                    or attempt["token"] != lease.token
+                    or self._binding(row) != lease.binding
+                    or self._load_input(row) != lease.task_input):
+                raise LeaseLost(task_id)
+            if attempt["outcome"] == "active":
+                self._db.execute(
+                    """UPDATE runner_attempts SET reason = ?
+                       WHERE task_id = ? AND generation = ?""",
+                    (CLEANUP_UNCONFIRMED, task_id, lease.generation),
+                )
+                if row["lease_expires_at_ns"] <= now:
+                    self._end_expired_leases(now)
+                return
             self._db.execute(
-                """UPDATE runner_attempts SET reason = ?
-                   WHERE task_id = ? AND generation = ?
-                     AND outcome = 'active'""",
-                (CLEANUP_UNCONFIRMED, lease.binding.task_id, lease.generation),
+                """INSERT OR IGNORE INTO runner_cleanup_reports
+                   (task_id, generation, reported_at_ns) VALUES (?, ?, ?)""",
+                (task_id, lease.generation, now),
+            )
+
+    def cleanup_reports(self) -> tuple[str, ...]:
+        """Tasks with an unacknowledged late ``stop_unconfirmed`` report."""
+
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT DISTINCT task_id FROM runner_cleanup_reports
+                   WHERE acknowledged_at_ns IS NULL ORDER BY task_id"""
+            ).fetchall()
+        return tuple(row["task_id"] for row in rows)
+
+    def acknowledge_cleanup_report(self, task_id: str) -> None:
+        """The Controller recorded the task as not confirmed stopped."""
+
+        task_id = self._task_id(task_id)
+        with self._transaction():
+            self._db.execute(
+                """UPDATE runner_cleanup_reports SET acknowledged_at_ns = ?
+                   WHERE task_id = ? AND acknowledged_at_ns IS NULL""",
+                (self._now(), task_id),
             )
 
     def stop_requested(self, lease: WorkLease) -> bool:

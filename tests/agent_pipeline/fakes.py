@@ -183,6 +183,8 @@ class FakeRunner:
         self.slow_cancel: set[str] = set()
         #: Tasks whose cancel ends without confirmed cleanup.
         self.unconfirmed: set[str] = set()
+        #: Late "not confirmed stopped" reports, until acknowledged.
+        self.late_reports: set[str] = set()
 
     def _status(self, task_id: str) -> RunnerStatus:
         t = self.tasks.get(task_id)
@@ -226,6 +228,12 @@ class FakeRunner:
                 "cleanup_unconfirmed" if task_id in self.unconfirmed
                 else "cancelled")
         return self._status(task_id)
+
+    def cleanup_reports(self) -> tuple[str, ...]:
+        return tuple(sorted(self.late_reports))
+
+    def acknowledge_cleanup_report(self, task_id) -> None:
+        self.late_reports.discard(task_id)
 
     def finish(self, task_id: str, bundle: str | None = None,
                reason: str | None = None) -> None:
