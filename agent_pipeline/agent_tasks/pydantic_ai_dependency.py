@@ -1,10 +1,8 @@
-"""Explicit dependency gate for the pending PydanticAI runtime binding.
+"""Exact-version gate for the optional concrete PydanticAI runtime.
 
-Decision 2026-10-13 selects ``pydantic-ai-slim==2.55.0``.  The package was
-not present locally and network resolution was forbidden for this change, so
-``pyproject.toml`` and ``uv.lock`` are deliberately untouched.  This module
-makes that deployment gap fail clearly; it does not substitute a home-grown
-provider loop for PydanticAI.
+The base Stage 1 package does not import the driver. Install the locked
+``agent-runtime`` extra for injected models, or ``agent-openai`` for the
+default OpenAI Responses driver. The dev group includes both for CI.
 """
 
 from __future__ import annotations
@@ -27,7 +25,8 @@ def require_pydantic_ai() -> None:
     except PackageNotFoundError as exc:
         raise PydanticAIDependencyUnavailable(
             f"{PYDANTIC_AI_DISTRIBUTION}=={PYDANTIC_AI_VERSION} is not "
-            "installed; inject an AgentRuntime or install the reviewed lock"
+            "installed; run uv sync --locked --extra agent-runtime "
+            "(or --extra agent-openai for the default provider)"
         ) from exc
     if installed != PYDANTIC_AI_VERSION:
         raise PydanticAIDependencyUnavailable(

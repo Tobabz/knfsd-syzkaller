@@ -2,8 +2,8 @@
 
 ``SyzkallerCallTable`` is an explicit trusted export of the supplied build.
 This module verifies and binds that export; it does not derive the table from
-syzkaller source or binaries.  A production call-table exporter is outside
-this patch.
+syzkaller source or binaries. The pinned parser/exporter in ``syzkaller``
+produces it from the generated target table.
 """
 
 from __future__ import annotations

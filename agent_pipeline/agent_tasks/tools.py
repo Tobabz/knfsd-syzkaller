@@ -38,6 +38,16 @@ class ToolBoundaryError(ValueError):
     """A tool call attempted to cross its pinned read-only boundary."""
 
 
+class BackendBoundaryError(ToolBoundaryError):
+    """The source index answered outside the boundary: a backend fault the
+    model cannot correct."""
+
+
+class SourceNotFound(ToolBoundaryError):
+    """The requested file does not exist at the pinned commit: a mistake
+    in the call, not a backend failure."""
+
+
 @dataclass(frozen=True)
 class IndexedMatch:
     """One trusted source-index response before output bounding."""
@@ -307,11 +317,14 @@ class Stage1Toolbox:
         if args.end_line - args.start_line + 1 > MAX_SOURCE_LINES:
             raise ToolBoundaryError(
                 f"source reads are limited to {MAX_SOURCE_LINES} lines")
-        text = self._source.read(
-            self._commit, path, args.start_line, args.end_line,
-            MAX_SOURCE_BYTES)
+        try:
+            text = self._source.read(
+                self._commit, path, args.start_line, args.end_line,
+                MAX_SOURCE_BYTES)
+        except FileNotFoundError:
+            text = None
         if text is None:
-            raise FileNotFoundError(path)
+            raise SourceNotFound(f"{path} does not exist at the pinned commit")
         truncated = isinstance(text, IndexedSource) and text.truncated
         text, cut = _bounded(text, MAX_SOURCE_BYTES)
         return SourceExcerpt(path=path, start_line=args.start_line,
@@ -324,14 +337,19 @@ class Stage1Toolbox:
         result = []
         truncated = len(values) > requested
         for value in limited:
-            path = _source_path(value.path)
+            try:
+                path = _source_path(value.path)
+            except ToolBoundaryError as exc:
+                raise BackendBoundaryError(
+                    f"source index returned a path {exc}") from None
             if type(value.line) is not int or value.line < 1:
-                raise ToolBoundaryError("source index returned an invalid line")
+                raise BackendBoundaryError(
+                    "source index returned an invalid line")
             snippet, cut = _bounded(value.text, MAX_SNIPPET_BYTES)
             symbol = value.symbol
             if symbol is not None and re.fullmatch(
                     r"[A-Za-z_][A-Za-z0-9_]*", symbol) is None:
-                raise ToolBoundaryError(
+                raise BackendBoundaryError(
                     "source index returned an invalid symbol")
             result.append(SourceMatch(path=path, line=value.line,
                                       text=snippet, symbol=symbol))
@@ -352,8 +370,12 @@ class Stage1Toolbox:
 
     def _callees(self, args: CalleeLookupArgs) -> SourceMatches:
         path = _source_path(args.path)
-        values = self._source.callees(self._commit, path, args.symbol,
-                                      args.max_results + 1)
+        try:
+            values = self._source.callees(self._commit, path, args.symbol,
+                                          args.max_results + 1)
+        except FileNotFoundError:
+            raise SourceNotFound(
+                f"{path} does not exist at the pinned commit") from None
         return self._matches(values, args.max_results)
 
     def _lookup_hcap(self, args: HcapLookupArgs) -> HcapLookup:

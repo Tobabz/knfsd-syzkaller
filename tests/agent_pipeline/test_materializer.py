@@ -66,6 +66,7 @@ from agent_pipeline.materializer import (
     ParsedProgram,
     ReachabilityHarness,
     StaticExecutionHarnessAuthority,
+    SyzParseFailure,
     descriptor_id,
 )
 
@@ -464,6 +465,43 @@ def test_harness_authority_current_only_while_hcap_refs_are_unchanged(
         corrupt, world.binding)
     with pytest.raises(OSError):
         materializer.harness_authority_current("e" * 64, world.binding)
+
+
+@pytest.mark.parametrize("error", [TimeoutError("bridge timed out"),
+                                   ChildProcessError("bridge killed")])
+def test_parser_host_failure_is_raised_not_a_rejection(world, error):
+    world.parser.results[world.scenario_ref] = error
+    with pytest.raises(OSError):
+        world.materializer.materialize(world.plan_ref, world.binding)
+
+
+@pytest.mark.parametrize(("error", "reason", "detail"), [
+    (SyzParseFailure("x", reason="call_unresolved", call="syz_not_in_build",
+                     call_index=1),
+     CALL_UNRESOLVED, "scenario:1:syz_not_in_build"),
+    (SyzParseFailure("x", reason="call_disabled", call="clone3",
+                     call_index=2),
+     DISALLOWED_OR_UNAVAILABLE_CALL, "scenario:2:clone3:disabled"),
+    (SyzParseFailure("x", reason="nfs_acquisition_unverified",
+                     call="syz_socket_connect_nfs", call_index=0),
+     PROFILE_FIXTURE_ROUTE_MISMATCH,
+     "scenario:0:syz_socket_connect_nfs:nfs_acquisition_unverified"),
+    # Untyped or malformed refusals stay a bare parse failure.
+    (SyzParseFailure("x"), PARSE_FAILURE, "scenario_strict_parse_failed"),
+    (SyzParseFailure("x", reason="other", call="clone3", call_index=0),
+     PARSE_FAILURE, "scenario_strict_parse_failed"),
+    (SyzParseFailure("x", reason="call_disabled", call="clone3\n",
+                     call_index=0),
+     PARSE_FAILURE, "scenario_strict_parse_failed"),
+    (SyzParseFailure("x", reason="call_disabled", call="clone3",
+                     call_index=-1),
+     PARSE_FAILURE, "scenario_strict_parse_failed"),
+])
+def test_typed_parser_refusal_reaches_planning(world, error, reason, detail):
+    world.parser.results[world.scenario_ref] = error
+    refused = world.materializer.materialize(world.plan_ref, world.binding)
+    assert isinstance(refused, MaterializeRejected)
+    assert (refused.reason, refused.detail) == (reason, detail)
 
 
 def test_seed_flow_has_no_admission_bypass(world):
