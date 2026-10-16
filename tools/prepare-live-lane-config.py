@@ -23,6 +23,8 @@ PROFILE_VARIANTS = {
     for profile in PROFILE_VERSIONS
 }
 BROAD_PROFILES = ("knfsd-v3", "knfsd-v40", "knfsd-v41", "knfsd-v42")
+# boot-fixture.sh always sets up this many lanes.
+LANES = 4
 PROFILE_CALL = "syz_open_nfs_lane_profile"
 RAW_CALL_PREFIXES = (
     "syz_socket_connect_nfs",
@@ -63,6 +65,30 @@ def select_profile_calls(parser, config, profiles, allow_raw):
     config["enable_syscalls"] = enabled
 
 
+def target_inputs(parser, args):
+    """Per-lane target-mode inputs as (name, bytes), or [] without --nfs-target."""
+    if args.nfs_target is None:
+        if args.journal_socket_dir is not None:
+            parser.error("--journal-socket-dir needs --nfs-target")
+        return []
+    if args.journal_socket_dir is None:
+        parser.error("--nfs-target needs --journal-socket-dir")
+    socket_dir = str(args.journal_socket_dir.resolve())
+    if any(char.isspace() for char in socket_dir) or "," in socket_dir:
+        parser.error("journal socket path cannot contain whitespace or commas")
+    files = []
+    for lane in range(LANES):
+        for name in ("lane%d.nfsprul1" % lane, "lane%d.session" % lane):
+            path = args.nfs_target / name
+            if not path.is_file():
+                parser.error("missing target input: %s" % path)
+            files.append((name, path.read_bytes()))
+        session = files[-1][1].decode("ascii", "replace").strip()
+        if not session or any(not (char.isalnum() or char in "_.:/-") for char in session):
+            parser.error("lane%d.session is not a proxy session id" % lane)
+    return files
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, help="existing syz-manager JSON config")
@@ -80,6 +106,16 @@ def main():
                         default=REPO / "env/images/bookworm-kcov-fresh.qcow2")
     parser.add_argument("--lane-script", type=Path,
                         default=REPO / "bundle/lane/lane.sh")
+    parser.add_argument(
+        "--nfs-target", type=Path, metavar="DIR",
+        help=("proxy target mode: DIR holds laneN.nfsprul1 (rule set) and "
+              "laneN.session (proxy session id) for every lane; the executor "
+              "then brackets each program with the activation barrier"))
+    parser.add_argument(
+        "--journal-socket-dir", type=Path, metavar="DIR",
+        help=("with --nfs-target: host directory of the journal sinks' "
+              "sockets, laneN.sock (python -m agent_pipeline.journal_sink "
+              "--socket DIR/laneN.sock --channel nfsp-journal-N)"))
     parser.add_argument(
         "--state-dir", type=Path,
         help=("persistent campaign state directory; sets config.workdir to "
@@ -99,9 +135,13 @@ def main():
         parser.error("missing reusable image: %s" % args.image)
     source = args.lane_script.read_bytes()
     digest = hashlib.sha256(source).hexdigest()
+    target_files = target_inputs(parser, args)
+    template_id = hashlib.sha256(source)
+    for name, data in target_files:
+        template_id.update(b"\0%s\0%d\0" % (name.encode(), len(data)) + data)
     state_dir = args.state_dir.resolve() if args.state_dir else None
     snapshot_parent = state_dir or args.output.resolve().parent
-    snapshot = snapshot_parent / ("lane-template-" + digest[:16])
+    snapshot = snapshot_parent / ("lane-template-" + template_id.hexdigest()[:16])
     if any(char.isspace() for char in str(snapshot)) or "," in str(snapshot):
         parser.error("snapshot path cannot contain whitespace or commas")
     config = json.loads(args.config.read_text())
@@ -110,6 +150,9 @@ def main():
         parser.error("expected a qemu syz-manager config")
     if config.get("workdir_template") or vm.get("qemu_args"):
         parser.error("config already has a VM template or custom qemu_args")
+    if target_files and vm.get("count", 1) != 1:
+        # Every VM would attach its journal ports to the same host sinks.
+        parser.error("--nfs-target needs vm.count 1")
     cmdline = vm.get("cmdline", "")
     if "nfs.localio_enabled=N" not in cmdline.split():
         parser.error("vm.cmdline must contain nfs.localio_enabled=N")
@@ -135,6 +178,17 @@ def main():
     else:
         lane_copy.write_bytes(source)
         lane_copy.chmod(0o444)
+    if target_files:
+        target_dir = snapshot / "target"
+        target_dir.mkdir(exist_ok=True)
+        for name, data in target_files:
+            copy = target_dir / name
+            if copy.exists():
+                if copy.read_bytes() != data:
+                    parser.error("existing target snapshot does not match its hash")
+            else:
+                copy.write_bytes(data)
+                copy.chmod(0o444)
     config["workdir_template"] = str(snapshot)
     config["image"] = str(args.image.resolve())
     # vm.snapshot is QEMU's -snapshot disk overlay (default true); program
@@ -150,6 +204,18 @@ def main():
     )
     fixture_arg = ("koov.nfs_fixture=broad-knfsd" if args.broad_knfsd else
                    "koov.nfs_version=%s" % version)
+    if target_files:
+        # One virtio-serial journal port per lane (/dev/virtio-ports/
+        # nfsp-journal-N in the guest), each a client of its host sink.
+        # Start the sinks before the VM; reconnect-ms needs QEMU 9.2.
+        sockets = args.journal_socket_dir.resolve()
+        vm["qemu_args"] += " -device virtio-serial-pci,id=nfspser"
+        for lane in range(LANES):
+            vm["qemu_args"] += (
+                " -chardev socket,id=nfspj%d,path=%s,reconnect-ms=1000"
+                " -device virtserialport,bus=nfspser.0,chardev=nfspj%d,"
+                "name=nfsp-journal-%d" % (lane, sockets / ("lane%d.sock" % lane), lane, lane))
+        fixture_arg += " koov.nfs_target=1"
     vm["cmdline"] = (cmdline + " %s koov.lane_sha256=%s"
                      % (fixture_arg, digest)).strip()
     args.output.write_text(json.dumps(config, indent=2) + "\n")

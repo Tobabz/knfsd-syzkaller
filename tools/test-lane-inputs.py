@@ -120,6 +120,51 @@ with tempfile.TemporaryDirectory() as directory:
                            "recvfrom$inet_nfs_fuzz"))
                for call in ganesha_prepared["enable_syscalls"])
 
+    # Proxy target mode: rule sets and sessions ride the lane share, one
+    # journal port per lane points at that lane's host sink.
+    target_inputs = work / "target-inputs"
+    target_inputs.mkdir()
+    for lane in range(4):
+        (target_inputs / ("lane%d.nfsprul1" % lane)).write_bytes(b"NFSPRUL1 lane %d" % lane)
+        (target_inputs / ("lane%d.session" % lane)).write_text("ps-%d\n" % lane)
+    target = work / "manager-target.cfg"
+    subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                    str(manager), str(target), "--version", "4.1", "--image", str(proxy),
+                    "--nfs-target", str(target_inputs),
+                    "--journal-socket-dir", str(work / "sinks")],
+                   check=True, capture_output=True)
+    target_prepared = json.loads(target.read_text())
+    target_template = Path(target_prepared["workdir_template"])
+    assert target_template != Path(prepared["workdir_template"])
+    assert (target_template / "lane.sh").read_bytes() == lane_bytes
+    for lane in range(4):
+        assert (target_template / "target" / ("lane%d.nfsprul1" % lane)).read_bytes() == \
+            b"NFSPRUL1 lane %d" % lane
+        assert ("chardev=nfspj%d,name=nfsp-journal-%d" % (lane, lane)) in \
+            target_prepared["vm"]["qemu_args"]
+        assert ("path=%s,reconnect-ms=1000" % (work / "sinks" / ("lane%d.sock" % lane)).resolve()) \
+            in target_prepared["vm"]["qemu_args"]
+    assert "koov.nfs_target=1" in target_prepared["vm"]["cmdline"].split()
+    assert "koov.lane_sha256=" + lane_sha in target_prepared["vm"]["cmdline"]
+    for bad_args, needle in (
+            (["--nfs-target", str(target_inputs)], "--journal-socket-dir"),
+            (["--journal-socket-dir", str(work)], "--nfs-target"),
+            (["--nfs-target", str(work), "--journal-socket-dir", str(work)], "missing target input")):
+        refused = subprocess.run(
+            [sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+             str(manager), str(work / "refused.cfg"), "--version", "4.1",
+             "--image", str(proxy)] + bad_args, capture_output=True, text=True)
+        assert refused.returncode != 0 and needle in refused.stderr, refused.stderr
+    multi = work / "manager-multi.cfg"
+    multi.write_text(json.dumps({**json.loads(manager.read_text()),
+                                 "vm": {"cmdline": "nfs.localio_enabled=N", "count": 2}}))
+    refused = subprocess.run(
+        [sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+         str(multi), str(work / "refused.cfg"), "--version", "4.1", "--image", str(proxy),
+         "--nfs-target", str(target_inputs), "--journal-socket-dir", str(work / "sinks")],
+        capture_output=True, text=True)
+    assert refused.returncode != 0 and "vm.count 1" in refused.stderr, refused.stderr
+
     broad = work / "manager-broad.cfg"
     broad_state = work / "persistent-broad-state"
     subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
@@ -252,8 +297,8 @@ assert manifest["purpose"] == "mutation_seed"
 assert Path(ROOT / manifest["required_syzkaller_patch"]).is_file()
 assert Path(ROOT / manifest["required_syzkaller_validator_patch"]).is_file()
 syzkaller_patches = sorted((ROOT / "bundle/patches/syzkaller").glob("*.patch"))
-assert len(syzkaller_patches) == 22
-assert syzkaller_patches[-1].name.startswith("0022-")
+assert len(syzkaller_patches) == 23
+assert syzkaller_patches[-1].name.startswith("0023-")
 programs = {entry["path"]: entry for entry in manifest["programs"]}
 assert len(programs) == len(manifest["programs"]) == 12
 for entry in manifest["programs"]:
@@ -290,6 +335,21 @@ assert '"nfs_trace":%s' in lane_source
 boot_source = (ROOT / "bundle/lane/boot-fixture.sh").read_text()
 assert "koov.nfs_trace=*) trace=${arg#koov.nfs_trace=} ;;" in boot_source
 assert "trace=0\n" in boot_source
+# Proxy target mode is opt-in: koov.nfs_target=1 maps the share's target/
+# files to NFS_PROXY_TARGET_DIR, which swaps the legacy arm socket for the
+# rule set, journal port and executor activation endpoint.
+assert "koov.nfs_target=*) target=${arg#koov.nfs_target=} ;;" in boot_source
+assert "target=0\n" in boot_source
+assert "NFS_PROXY_TARGET_DIR=/run/frozen-phase9/target" in boot_source
+assert boot_source.index("NFS_PROXY_TARGET_DIR=/run/frozen-phase9/target") < \
+    boot_source.index('umount "$source_dir"\nactual_sha')
+assert "proxy_target_dir=${NFS_PROXY_TARGET_DIR:-}" in lane_source
+assert "export proxy_target_dir" in lane_source
+assert '--activation "$executor_root/proc-$lane/activation/activation.sock"' in lane_source
+assert '--journal "/dev/virtio-ports/nfsp-journal-$lane"' in lane_source
+assert '"$executor_root/proc-$setup_lane_id/activation/rule_set_id"' in lane_source
+assert 'printf \'%s\\n\' "$proxy_target_dir" > "$root/fixture.target"' in lane_source
+assert 'proxy_target_dir=$(cat "$root/fixture.target")' in lane_source
 assert manifest["fixtures"]["broad-knfsd"]["mixed_profile_runtime"] == "allowed"
 assert manifest["fixtures"]["broad-knfsd"]["promotion_policy"] == {
     "nfs_root_required": True,

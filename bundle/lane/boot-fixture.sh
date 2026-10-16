@@ -10,6 +10,7 @@ minor=1
 version=
 fixture_mode=single
 trace=0
+target=0
 expected_sha=
 
 for arg in $(cat /proc/cmdline); do
@@ -18,12 +19,17 @@ for arg in $(cat /proc/cmdline); do
 		koov.nfs_version=*) version=${arg#koov.nfs_version=} ;;
 		koov.nfs_fixture=*) fixture_mode=${arg#koov.nfs_fixture=} ;;
 		koov.nfs_trace=*) trace=${arg#koov.nfs_trace=} ;;
+		koov.nfs_target=*) target=${arg#koov.nfs_target=} ;;
 		koov.lane_sha256=*) expected_sha=${arg#koov.lane_sha256=} ;;
 	esac
 done
 case "$trace" in
 	0|1) NFS_TRACE=$trace; export NFS_TRACE ;;
 	*) echo "koov.nfs_trace must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$target" in
+	0|1) ;;
+	*) echo "koov.nfs_target must be 0 or 1" >&2; exit 2 ;;
 esac
 case "$fixture_mode" in
 	single)
@@ -54,6 +60,21 @@ esac
 mkdir -p /run/frozen-phase9 "$source_dir"
 mount -t 9p -o trans=virtio,version=9p2000.L,ro koov-lane "$source_dir"
 install -m 0755 "$source_dir/lane.sh" "$fixture"
+if [ "$target" = 1 ]; then
+	# Proxy target mode: per-lane rule sets and session ids from the host
+	# share (tools/prepare-live-lane-config.py --nfs-target).  The host sink
+	# checks each relay RULESET against the rule set it was started with.
+	rm -rf /run/frozen-phase9/target
+	mkdir -m 0700 /run/frozen-phase9/target
+	cp "$source_dir"/target/lane*.nfsprul1 "$source_dir"/target/lane*.session \
+		/run/frozen-phase9/target/ || {
+		umount "$source_dir"
+		echo "koov.nfs_target=1 but the lane share has no target/ files" >&2
+		exit 1
+	}
+	NFS_PROXY_TARGET_DIR=/run/frozen-phase9/target
+	export NFS_PROXY_TARGET_DIR
+fi
 umount "$source_dir"
 actual_sha=$(sha256sum "$fixture")
 case "$actual_sha" in

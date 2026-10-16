@@ -43,3 +43,40 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 tools/test-lane-inputs.py
       - run: sh tools/lane-quote-lint.sh
+
+  syzkaller-patches:
+    # The checked-in syzkaller series applies to its pinned base, and the
+    # executor and flatrpc tests the series carries pass: the S1a activation
+    # barrier against a test double of the proxy endpoint, and where the
+    # executor places it.  The barrier against the real Proxy is
+    # tests/agent_pipeline/test_executor_activation.py.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GIT_AUTHOR_NAME: ci
+      GIT_AUTHOR_EMAIL: ci@localhost
+      GIT_COMMITTER_NAME: ci
+      GIT_COMMITTER_EMAIL: ci@localhost
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch syzkaller at the pinned base
+        run: |
+          commit=$(sed -n 's/^syzkaller_commit=//p' bundle/patches/BASE)
+          git init -q "$RUNNER_TEMP/syzkaller"
+          git -C "$RUNNER_TEMP/syzkaller" fetch -q --depth 1 \
+            https://github.com/google/syzkaller.git "$commit"
+          git -C "$RUNNER_TEMP/syzkaller" checkout -q FETCH_HEAD
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ runner.temp }}/syzkaller/go.mod
+          cache: false
+      - run: tools/fport-apply.sh syzkaller "$RUNNER_TEMP/syzkaller"
+      - name: Executor and flatrpc tests
+        working-directory: ${{ runner.temp }}/syzkaller
+        run: |
+          make descriptions
+          make executor
+          ./bin/linux_amd64/syz-executor test test_nfsp_sha256
+          ./bin/linux_amd64/syz-executor test test_nfsp_barrier
+          go test ./pkg/flatrpc/
+          go test ./executor/ -run 'NfsProxy|Generation|FixedLane'

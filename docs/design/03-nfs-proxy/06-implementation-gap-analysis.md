@@ -990,8 +990,12 @@ target rule 설치, activation, mutated output 노출을 host durability와 함�
   미기록 시 미전달, 잘못된 lane의 activation 미ACK, drain bound closure).
 
 남은 것:
-- S1a: syzkaller executor가 activation endpoint를 쓰는 patch(barrier 실패 처리, exec result 보고 포함)는
-  없다. e2e는 executor 대신 test driver가 endpoint를 쓴다.
+- S1a는 syzkaller patch 0023으로 구현됐다(2026-10-16): executor가 program마다 ACK된 `ACTIVATE` 뒤에만
+  program을 실행하고, KCOV FINISH/ABORT 전에 `DEACTIVATE`/`ABORT`로 창을 닫으며, 닫힘을 확인하지 못하면
+  Runner가 executor를 실패시켜 VM을 재시작한다. barrier 결과는 `ProgInfo.nfs_proxy`로 보고된다. 검증은
+  executor `test_nfsp_barrier`(fake proxy), patch의 Go source-order test, 그리고 patch의 header를 실제
+  Proxy·sink에 붙이는 `tests/agent_pipeline/test_executor_activation.py`. guest에서 실제 executor로 도는
+  것은 아래 KVM gate에 포함된다. 한계: Proxy session당 generation slot 256개(가득 차면 lane 재시작).
 - KVM gate: guest에서 virtio-serial로 실제 sink에 붙여 knfsd/Ganesha 트래픽에 돌리는 live 실행은 사람이
   KVM host에서 한다(`tools/nfs-proxy/README.md` "Target mode").
 - Runner의 generation 봉인과 M1 판정 연결, `EXPOSURE_INTENT`의 `predicate_values`/`transform_source_values`

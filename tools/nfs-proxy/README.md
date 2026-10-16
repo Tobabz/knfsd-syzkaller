@@ -295,8 +295,36 @@ qemu-system-x86_64 ... \
 ```
 
 (QEMU older than 9.2 spells the option `reconnect=1`.) The guest Proxy binary from
-`build-guest.sh` includes target mode. Nothing drives `--activation` from syzkaller yet: the
-executor barrier is S1a, a separate syzkaller patch.
+`build-guest.sh` includes target mode.
+
+**Executor barrier (S1a).** Syzkaller patch 0023 makes the executor drive `--activation`. In a
+target-mode lane, `lane.sh` starts the Proxy with `--target`, `--session-id`, `--journal
+/dev/virtio-ports/nfsp-journal-N` and `--activation` on a socket under the executor's
+`proc-N/activation/`, which the executor connects to before it chroots (the fd stays outside the
+fuzz namespace). For every program the executor sends `ACTIVATE` with the KCOV generation and the
+SHA-256 of the exec-encoded program, and runs the program only after the ACK. It sends
+`DEACTIVATE` before KCOV FINISH, and `DEACTIVATE`/`ABORT` before the orphan KCOV ABORT. Without
+an ACK the program is not run and its KCOV generation is aborted. If a window cannot be confirmed
+closed (or the Proxy quarantined the session), the Runner fails the executor and the VM is
+restarted. The exec result carries the barrier as `ProgInfo.nfs_proxy`, and `syz-execprog` logs
+it as `nfs proxy barrier: ...`.
+
+To boot a target-mode lane (KVM host, by hand):
+
+```sh
+# One sink per lane, started before the VM.
+python -m agent_pipeline.journal_sink --dir JOURNAL_DIR --name lane0 \
+    --socket /run/knfsd-syzkaller/nfsp/lane0.sock --vm vm-0 --channel nfsp-journal-0 \
+    --session "$(cat TARGET/lane0.session)" --lane 0 --rules TARGET/lane0.nfsprul1
+# ... the same for lane1..lane3.
+tools/prepare-live-lane-config.py ... \
+    --nfs-target TARGET --journal-socket-dir /run/knfsd-syzkaller/nfsp
+```
+
+`TARGET` holds `laneN.nfsprul1` and `laneN.session` for lanes 0-3. Target mode needs `vm.count`
+1 and `SERVER_IMPL=both`; the prepared config adds the virtio-serial ports and
+`koov.nfs_target=1`. A Proxy session has 256 generation slots, and a full session is treated
+like a quarantine (the VM restarts with a new session).
 
 ## Building
 
