@@ -35,6 +35,7 @@ from .authority import DescriptorKernelIdentity
 from .config import Stage1Config
 from .engine import CommandEngineConfig, CommandExecutionEngine
 from .service import Stage1Parts, Stage1Service
+from kcsan_pipeline import ProgramPolicyPipeline
 
 #: States where the loop has nothing to do until a person acts.
 STOP_STATES = TERMINAL | {JobState.S1_REACHED, JobState.S1_APPROVAL,
@@ -72,6 +73,10 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
             engine_config, store, ProcessSupervisor(state / "processes"))
 
     tree = GitSourceTree(config.kernel_repo)
+
+    def preparer(store, root):
+        return ProgramPolicyPipeline(
+            store, root / "kcsan-policies").prepare
     parts = Stage1Parts(
         state_dir=state, artifacts=artifacts, tree=tree,
         registry=ArtifactHarnessRegistry(artifacts, config.harness_catalog_ref),
@@ -84,7 +89,8 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         policies=config.policies, sealer_id=config.sealer_id,
         worker_id=config.worker_id,
         lease_duration_ns=int(config.lease_duration_s * 1e9),
-        agent_workers=config.agent_workers, run_agents=run_agents)
+        agent_workers=config.agent_workers, run_agents=run_agents,
+        prepare_candidate=preparer)
     return stack.enter_context(Stage1Service(parts))
 
 

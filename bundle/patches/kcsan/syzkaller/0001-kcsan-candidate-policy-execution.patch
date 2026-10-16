@@ -1,0 +1,986 @@
+From 7337930c43659c072c29afa33577cfe84b661a3f Mon Sep 17 00:00:00 2001
+From: HYUNSOL MUN <muumthf@gmail.com>
+Date: Fri, 16 Oct 2026 19:41:06 +0900
+Subject: [PATCH] kcsan: execute candidate policy per campaign
+
+Select one candidate policy from the manager's payload file. Register it
+in each VM before starting the runner, then pass its candidate ID through
+regular and snapshot execution requests to the policy generation ioctl.
+Leave ordinary programs on the original generation path.
+
+Co-authored-by: Codex <codex@openai.com>
+---
+ executor/executor.cc        |  25 +++++++-
+ executor/executor_linux.h   | 123 +++++++++++++++++++++++++++++++++---
+ executor/executor_runner.h  |   3 +
+ executor/snapshot.h         |   6 ++
+ pkg/execbackend/rpc.go      |  28 ++++++++
+ pkg/execbackend/snapshot.go |  23 ++++---
+ pkg/flatrpc/flatrpc.fbs     |   3 +
+ pkg/flatrpc/flatrpc.go      |  54 +++++++++++++---
+ pkg/flatrpc/flatrpc.h       |  60 ++++++++++++++----
+ pkg/mgrconfig/config.go     |   2 +
+ pkg/mgrconfig/load.go       |  49 +++++++++++++-
+ pkg/rpcserver/rpcserver.go  |  27 ++++----
+ pkg/rpcserver/runner.go     |  18 ++++--
+ 13 files changed, 363 insertions(+), 58 deletions(-)
+
+diff --git a/executor/executor.cc b/executor/executor.cc
+index 9a6895f01..6a4f0f67a 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -298,6 +298,7 @@ static bool flag_threaded;
+ static bool flag_comparisons;
+ 
+ static uint64 request_id;
++static char candidate_id[128];
+ static rpc::RequestType request_type;
+ static uint64 all_call_signal;
+ static bool all_extra_signal;
+@@ -448,6 +449,7 @@ struct handshake_req {
+ struct execute_req {
+ 	uint64 magic;
+ 	uint64 id;
++	char candidate_id[128];
+ 	rpc::RequestType type;
+ 	uint64 exec_flags;
+ 	uint64 all_call_signal;
+@@ -602,6 +604,18 @@ int main(int argc, char** argv)
+ 		fprintf(stderr, "no command");
+ 		return 1;
+ 	}
++	if (strcmp(argv[1], "policy-load") == 0) {
++#if GOOS_linux
++		if (argc != 4) {
++			fprintf(stderr, "usage: syz-executor policy-load PAYLOAD POLICY_ID\n");
++			return 1;
++		}
++		return load_kcsan_policy(argv[2], argv[3]);
++#else
++		fprintf(stderr, "KCSAN Policy Loader is Linux-only\n");
++		return 1;
++#endif
++	}
+ 	if (strcmp(argv[1], "runner") == 0) {
+ 		runner(argv, argc);
+ 		fail("runner returned");
+@@ -882,6 +896,9 @@ void receive_execute()
+ void parse_execute(const execute_req& req)
+ {
+ 	request_id = req.id;
++	if (!memchr(req.candidate_id, 0, sizeof(req.candidate_id)))
++		fail("unterminated KCSAN candidate ID");
++	memcpy(candidate_id, req.candidate_id, sizeof(candidate_id));
+ 	request_type = req.type;
+ 	flag_collect_signal = req.exec_flags & (uint64)rpc::ExecFlag::CollectSignal;
+ 	flag_collect_cover = req.exec_flags & (uint64)rpc::ExecFlag::CollectCover;
+@@ -932,9 +949,13 @@ void realloc_output_data()
+ 	 * shared-memory region the manager maps, currently 14 MiB) must stay at
+ 	 * or above the result, otherwise the executor's own coverage probe fails.
+ 	 */
++#if GOOS_linux
+ 	const int kRemoteCoverCallHeadroom = 256 << 10;  /* entries, ~2 MiB of PCs */
+ 	const int kMaxOutputCoverage =
+ 		(kExtraCoverSize + kRemoteCoverCallHeadroom) * (int)sizeof(uint64_t);
++#else
++	const int kMaxOutputCoverage = kMaxOutput;
++#endif
+ 
+ 	if (flag_comparisons)
+ 		mmap_output(kMaxOutputComparisons);
+@@ -997,6 +1018,8 @@ void execute_one()
+ 	remote_generation_published = false;
+ 	remote_generation.store(0, std::memory_order_relaxed);
+ 	output_data->kcov_generation.store(0, std::memory_order_relaxed);
++	if (candidate_id[0] && (!cover_collection_required() || !flag_extra_coverage || flag_comparisons))
++		failmsg("KCSAN Policy requires remote coverage", "candidate_id=%s", candidate_id);
+ 
+ 	if (cover_collection_required()) {
+ 		if (!flag_threaded)
+@@ -1011,7 +1034,7 @@ void execute_one()
+ 			remote_generation_published = false;
+ 			remote_generation_bind_failed.store(false, std::memory_order_relaxed);
+ #if GOOS_linux
+-			uint64 generation = cover_begin_remote_generation();
++			uint64 generation = cover_begin_remote_generation(candidate_id);
+ 			remote_generation.store(generation, std::memory_order_release);
+ 			if (!generation)
+ 				remote_generation_bind_failed.store(true, std::memory_order_release);
+diff --git a/executor/executor_linux.h b/executor/executor_linux.h
+index 73606bd07..1a6b73c79 100644
+--- a/executor/executor_linux.h
++++ b/executor/executor_linux.h
+@@ -8,10 +8,90 @@
+ #include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/mount.h>
+ #include <sys/prctl.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ 
++// Register one already-converted Policy before the runner accepts programs.
++// The single write is the kernel's atomic registration boundary.
++static int load_kcsan_policy(const char* path, const char* candidate_id)
++{
++	size_t id_len = strnlen(candidate_id, 128);
++	if (!id_len || id_len == 128) {
++		fprintf(stderr, "invalid KCSAN candidate ID\n");
++		return 1;
++	}
++	int input = open(path, O_RDONLY | O_CLOEXEC);
++	if (input < 0) {
++		perror("open Policy payload");
++		return 1;
++	}
++	char payload[4097];
++	ssize_t size = read(input, payload, sizeof(payload));
++	close(input);
++	if (size <= 0 || size > 4096) {
++		fprintf(stderr, "Policy payload must be 1..4096 bytes\n");
++		return 1;
++	}
++	unsigned int schema = 0, rules = 0;
++	char embedded[128];
++	unsigned int weight = 0, task_delay = 0, interrupt_delay = 0;
++	payload[size] = 0;
++	if (sscanf(payload, "policy %127s %u %u %u %u %u", embedded, &schema,
++	           &weight, &task_delay, &interrupt_delay, &rules) != 6 ||
++	    strcmp(embedded, candidate_id) || schema != 5 || !rules) {
++		fprintf(stderr, "Policy payload header does not match candidate ID\n");
++		return 1;
++	}
++	const char* register_path = "/sys/kernel/debug/kcsan_policy/register";
++	int output = open(register_path, O_WRONLY | O_CLOEXEC);
++	if (output < 0) {
++		// The VM image may not mount debugfs during early boot.
++		if (mount("debugfs", "/sys/kernel/debug", "debugfs", 0, nullptr) && errno != EBUSY) {
++			perror("mount debugfs");
++			return 1;
++		}
++		output = open(register_path, O_WRONLY | O_CLOEXEC);
++	}
++	if (output < 0) {
++		perror("open KCSAN Policy register");
++		return 1;
++	}
++	ssize_t written = write(output, payload, size);
++	int write_errno = errno;
++	close(output);
++	if (written != size) {
++		errno = written < 0 ? write_errno : EIO;
++		perror("register KCSAN Policy");
++		return 1;
++	}
++	FILE* status = fopen("/sys/kernel/debug/kcsan_policy/policies", "r");
++	if (!status) {
++		perror("open KCSAN Policy Store");
++		return 1;
++	}
++	char line[512];
++	bool found = false;
++	while (fgets(line, sizeof(line), status)) {
++		unsigned int count = 0;
++		char registered[128];
++		if (sscanf(line, "policy candidate_id=%127s schema_version=%*u default_weight=%*u "
++		           "task_delay_us=%*u interrupt_delay_us=%*u nr_rules=%u", registered, &count) == 2 &&
++		    !strcmp(registered, candidate_id) && count == rules) {
++			found = true;
++			break;
++		}
++	}
++	fclose(status);
++	if (!found) {
++		fprintf(stderr, "Policy %s was not found in the kernel Store\n", candidate_id);
++		return 1;
++	}
++	printf("KCSAN Policy %s registered (%u rules)\n", candidate_id, rules);
++	return 0;
++}
++
+ #ifndef __GLIBC__
+ // musl (and other non-glibc libcs) don't declare the pkey_* wrappers or the
+ // PKEY_DISABLE_WRITE flag, even though the kernel syscalls exist on any
+@@ -89,6 +169,14 @@ struct kcov_remote_generation {
+ };
+ static_assert(sizeof(kcov_remote_generation) == 16);
+ 
++struct kcov_remote_generation_policy {
++	uint64 generation;
++	uint32 timeout_ms;
++	uint32 flags;
++	char candidate_id[128];
++};
++static_assert(sizeof(kcov_remote_generation_policy) == 144);
++
+ #define KCOV_INIT_TRACE32 _IOR('c', 1, uint32)
+ #define KCOV_INIT_TRACE64 _IOR('c', 1, uint64)
+ #define KCOV_ENABLE _IO('c', 100)
+@@ -99,6 +187,7 @@ static_assert(sizeof(kcov_remote_generation) == 16);
+ #define KCOV_REMOTE_GENERATION_BIND _IOW('c', 110, kcov_remote_generation)
+ #define KCOV_REMOTE_GENERATION_FINISH _IOW('c', 111, kcov_remote_generation)
+ #define KCOV_REMOTE_GENERATION_ABORT _IOW('c', 112, kcov_remote_generation)
++#define KCOV_REMOTE_GENERATION_BEGIN_POLICY _IOWR('c', 113, kcov_remote_generation_policy)
+ 
+ #define KCOV_SUBSYSTEM_COMMON (0x00ull << 56)
+ #define KCOV_SUBSYSTEM_USB (0x01ull << 56)
+@@ -265,21 +354,39 @@ static void cover_enable(cover_t* cov, bool collect_comps, bool extra)
+ 	cov->enabled = true;
+ }
+ 
+-static uint64 cover_begin_remote_generation()
++static uint64 cover_begin_remote_generation(const char* candidate_id)
+ {
+-	kcov_remote_generation arg = {};
+-	if (ioctl(extra_cov.fd, KCOV_REMOTE_GENERATION_BEGIN, &arg)) {
+-		// Instrumentation admission must not prevent the real program from
+-		// running.  The caller suppresses remote extra while preserving normal
+-		// per-call coverage.
++	uint64 generation = 0;
++	int rv;
++	if (candidate_id[0]) {
++		kcov_remote_generation_policy arg = {};
++		size_t id_len = strnlen(candidate_id, sizeof(arg.candidate_id));
++		if (id_len == sizeof(arg.candidate_id))
++			fail("KCSAN candidate ID is too long");
++		memcpy(arg.candidate_id, candidate_id, id_len + 1);
++		rv = ioctl(extra_cov.fd, KCOV_REMOTE_GENERATION_BEGIN_POLICY, &arg);
++		generation = arg.generation;
++	} else {
++		kcov_remote_generation arg = {};
++		rv = ioctl(extra_cov.fd, KCOV_REMOTE_GENERATION_BEGIN, &arg);
++		generation = arg.generation;
++	}
++	if (rv) {
++		if (candidate_id[0])
++			failmsg("KCOV policy generation begin failed", "candidate_id=%s errno=%d", candidate_id, errno);
++		// Attribution and instrumentation admission must not prevent the real
++		// program from running. The caller suppresses remote extra while
++		// preserving normal per-call coverage.
+ 		debug("KCOV generation begin failed: errno=%d\n", errno);
+ 		return 0;
+ 	}
+-	if (!arg.generation) {
++	if (!generation) {
++		if (candidate_id[0])
++			failmsg("KCOV policy generation begin returned zero", "candidate_id=%s", candidate_id);
+ 		debug("KCOV generation begin returned generation zero\n");
+ 		return 0;
+ 	}
+-	return arg.generation;
++	return generation;
+ }
+ 
+ static bool cover_bind_remote_generation(uint64 generation)
+diff --git a/executor/executor_runner.h b/executor/executor_runner.h
+index 231c9b87e..50838c77a 100644
+--- a/executor/executor_runner.h
++++ b/executor/executor_runner.h
+@@ -451,6 +451,9 @@ private:
+ 		    .all_extra_signal = all_extra_signal,
+ 		    .return_error = IsSet(msg_->flags, rpc::RequestFlag::ReturnError),
+ 		};
++		if (msg_->candidate_id.size() >= sizeof(req.candidate_id))
++			fail("KCSAN candidate ID is too long");
++		memcpy(req.candidate_id, msg_->candidate_id.c_str(), msg_->candidate_id.size() + 1);
+ 		exec_start_ = current_time_ms();
+ 		ChangeState(State::Executing);
+ 		if (write(req_pipe_, &req, sizeof(req)) != sizeof(req)) {
+diff --git a/executor/snapshot.h b/executor/snapshot.h
+index 71c0b3940..48a9d13e7 100644
+--- a/executor/snapshot.h
++++ b/executor/snapshot.h
+@@ -250,6 +250,12 @@ static void SnapshotStart()
+ 	    .all_call_signal = msg->all_call_signal(),
+ 	    .all_extra_signal = msg->all_extra_signal(),
+ 	};
++	auto snapshot_candidate_id = msg->candidate_id();
++	if (snapshot_candidate_id) {
++		if (snapshot_candidate_id->size() >= sizeof(req.candidate_id))
++			fail("KCSAN candidate ID is too long");
++		memcpy(req.candidate_id, snapshot_candidate_id->c_str(), snapshot_candidate_id->size() + 1);
++	}
+ 	parse_execute(req);
+ 	output_data->num_calls.store(msg->num_calls(), std::memory_order_relaxed);
+ 	input_data = const_cast<uint8*>(msg->prog_data()->Data());
+diff --git a/pkg/execbackend/rpc.go b/pkg/execbackend/rpc.go
+index 62d586faa..f30fb8e8c 100644
+--- a/pkg/execbackend/rpc.go
++++ b/pkg/execbackend/rpc.go
+@@ -54,6 +54,14 @@ func (b *rpcBackend) RunRequests(ctx context.Context, inst *vm.Instance,
+ 			return nil, fmt.Errorf("failed to copy binary: %w", err)
+ 		}
+ 	}
++	if b.cfg.KCSANCandidateID != "" {
++		if err := loadKCSANPolicy(ctx, inst, reporter, executorBin, b.cfg.KCSANPolicyFile,
++			b.cfg.KCSANCandidateID); err != nil {
++			return nil, err
++		}
++		log.Logf(0, "VM %d: KCSAN candidate %s available before runner start", inst.Index(),
++			b.cfg.KCSANCandidateID)
++	}
+ 
+ 	var cmd string
+ 	if b.cfg.VMLess {
+@@ -127,3 +135,23 @@ func (b *rpcBackend) RunRequests(ctx context.Context, inst *vm.Instance,
+ 
+ 	return reps, err
+ }
++
++func loadKCSANPolicy(ctx context.Context, inst *vm.Instance, reporter *report.Reporter,
++	executorBin, hostPayload, candidateID string) error {
++	guestPayload, err := inst.Copy(hostPayload)
++	if err != nil {
++		return fmt.Errorf("failed to copy KCSAN Policy payload: %w", err)
++	}
++	loadCtx, cancel := context.WithTimeout(ctx, time.Minute)
++	defer cancel()
++	command := fmt.Sprintf("%s policy-load %s %s", executorBin, guestPayload, candidateID)
++	output, reports, err := inst.Run(loadCtx, reporter, command, vm.WithExitCondition(vm.ExitNormal))
++	if err != nil {
++		return fmt.Errorf("VM %d KCSAN Policy registration failed: %w; output: %s",
++			inst.Index(), err, output)
++	}
++	if len(reports) != 0 {
++		return fmt.Errorf("VM %d crashed during KCSAN Policy registration: %s", inst.Index(), output)
++	}
++	return nil
++}
+diff --git a/pkg/execbackend/snapshot.go b/pkg/execbackend/snapshot.go
+index 7047ee709..c1092f8c4 100644
+--- a/pkg/execbackend/snapshot.go
++++ b/pkg/execbackend/snapshot.go
+@@ -28,11 +28,11 @@ type SnapshotConfig struct {
+ 
+ type snapshotServer struct {
+ 	Server
+-	cfg      SnapshotConfig
+-	source   *queue.DynamicSourceCtl
+-	dist     *queue.Distributor
+-	bootDone chan struct{}
+-	bootOnce sync.Once
++	cfg         SnapshotConfig
++	source      *queue.DynamicSourceCtl
++	dist        *queue.Distributor
++	bootDone    chan struct{}
++	bootOnce    sync.Once
+ }
+ 
+ func NewSnapshotBackend(base Server, cfg SnapshotConfig) Server {
+@@ -87,6 +87,12 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if serv.cfg.KCSANCandidateID != "" {
++		if err := loadKCSANPolicy(ctx, inst, reporter, executorBin, serv.cfg.KCSANPolicyFile,
++			serv.cfg.KCSANCandidateID); err != nil {
++			return nil, err
++		}
++	}
+ 
+ 	// All network connections (including ssh) will break once we start restoring snapshots.
+ 	// So we start a background process and log to /dev/kmsg.
+@@ -190,9 +196,10 @@ func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.
+ 		}, nil, nil
+ 	}
+ 	msg := flatrpc.SnapshotRequestT{
+-		ExecFlags: req.ExecOpts.ExecFlags,
+-		NumCalls:  int32(len(req.Prog.Calls)),
+-		ProgData:  progData,
++		ExecFlags:   req.ExecOpts.ExecFlags,
++		NumCalls:    int32(len(req.Prog.Calls)),
++		ProgData:    progData,
++		CandidateId: serv.cfg.KCSANCandidateID,
+ 	}
+ 	for _, call := range req.ReturnAllSignal {
+ 		if call < 0 {
+diff --git a/pkg/flatrpc/flatrpc.fbs b/pkg/flatrpc/flatrpc.fbs
+index b8542bf9e..f85284141 100644
+--- a/pkg/flatrpc/flatrpc.fbs
++++ b/pkg/flatrpc/flatrpc.fbs
+@@ -183,6 +183,8 @@ table ExecRequestRaw {
+ 	flags			:RequestFlag;
+ 	// Return all signal for these calls.
+ 	all_signal		:[int32];
++	// Candidate whose Policy is selected; empty retains baseline KCSAN.
++	candidate_id		:string;
+ }
+ 
+ table SignalUpdateRaw {
+@@ -311,4 +313,5 @@ table SnapshotRequest {
+ 	all_call_signal		:uint64;
+ 	all_extra_signal	:bool;
+ 	prog_data		:[uint8];
++	candidate_id		:string;
+ }
+diff --git a/pkg/flatrpc/flatrpc.go b/pkg/flatrpc/flatrpc.go
+index 9f86b077a..d76c26222 100644
+--- a/pkg/flatrpc/flatrpc.go
++++ b/pkg/flatrpc/flatrpc.go
+@@ -2073,13 +2073,14 @@ func CreateExecOptsRaw(builder *flatbuffers.Builder, envFlags ExecEnv, execFlags
+ }
+ 
+ type ExecRequestRawT struct {
+-	Id        int64         `json:"id"`
+-	Type      RequestType   `json:"type"`
+-	Avoid     uint64        `json:"avoid"`
+-	Data      []byte        `json:"data"`
+-	ExecOpts  *ExecOptsRawT `json:"exec_opts"`
+-	Flags     RequestFlag   `json:"flags"`
+-	AllSignal []int32       `json:"all_signal"`
++	Id          int64         `json:"id"`
++	Type        RequestType   `json:"type"`
++	Avoid       uint64        `json:"avoid"`
++	Data        []byte        `json:"data"`
++	ExecOpts    *ExecOptsRawT `json:"exec_opts"`
++	Flags       RequestFlag   `json:"flags"`
++	AllSignal   []int32       `json:"all_signal"`
++	CandidateId string        `json:"candidate_id"`
+ }
+ 
+ func (t *ExecRequestRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
+@@ -2099,6 +2100,10 @@ func (t *ExecRequestRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffset
+ 		}
+ 		allSignalOffset = builder.EndVector(allSignalLength)
+ 	}
++	candidateIdOffset := flatbuffers.UOffsetT(0)
++	if t.CandidateId != "" {
++		candidateIdOffset = builder.CreateString(t.CandidateId)
++	}
+ 	ExecRequestRawStart(builder)
+ 	ExecRequestRawAddId(builder, t.Id)
+ 	ExecRequestRawAddType(builder, t.Type)
+@@ -2108,6 +2113,7 @@ func (t *ExecRequestRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffset
+ 	ExecRequestRawAddExecOpts(builder, execOptsOffset)
+ 	ExecRequestRawAddFlags(builder, t.Flags)
+ 	ExecRequestRawAddAllSignal(builder, allSignalOffset)
++	ExecRequestRawAddCandidateId(builder, candidateIdOffset)
+ 	return ExecRequestRawEnd(builder)
+ }
+ 
+@@ -2123,6 +2129,7 @@ func (rcv *ExecRequestRaw) UnPackTo(t *ExecRequestRawT) {
+ 	for j := 0; j < allSignalLength; j++ {
+ 		t.AllSignal[j] = rcv.AllSignal(j)
+ 	}
++	t.CandidateId = string(rcv.CandidateId())
+ }
+ 
+ func (rcv *ExecRequestRaw) UnPack() *ExecRequestRawT {
+@@ -2290,8 +2297,16 @@ func (rcv *ExecRequestRaw) MutateAllSignal(j int, n int32) bool {
+ 	return false
+ }
+ 
++func (rcv *ExecRequestRaw) CandidateId() []byte {
++	o := flatbuffers.UOffsetT(rcv._tab.Offset(18))
++	if o != 0 {
++		return rcv._tab.ByteVector(o + rcv._tab.Pos)
++	}
++	return nil
++}
++
+ func ExecRequestRawStart(builder *flatbuffers.Builder) {
+-	builder.StartObject(7)
++	builder.StartObject(8)
+ }
+ func ExecRequestRawAddId(builder *flatbuffers.Builder, id int64) {
+ 	builder.PrependInt64Slot(0, id, 0)
+@@ -2320,6 +2335,9 @@ func ExecRequestRawAddAllSignal(builder *flatbuffers.Builder, allSignal flatbuff
+ func ExecRequestRawStartAllSignalVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+ 	return builder.StartVector(4, numElems, 4)
+ }
++func ExecRequestRawAddCandidateId(builder *flatbuffers.Builder, candidateId flatbuffers.UOffsetT) {
++	builder.PrependUOffsetTSlot(7, flatbuffers.UOffsetT(candidateId), 0)
++}
+ func ExecRequestRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
+ 	return builder.EndObject()
+ }
+@@ -3891,6 +3909,7 @@ type SnapshotRequestT struct {
+ 	AllCallSignal  uint64   `json:"all_call_signal"`
+ 	AllExtraSignal bool     `json:"all_extra_signal"`
+ 	ProgData       []byte   `json:"prog_data"`
++	CandidateId    string   `json:"candidate_id"`
+ }
+ 
+ func (t *SnapshotRequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
+@@ -3901,12 +3920,17 @@ func (t *SnapshotRequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffse
+ 	if t.ProgData != nil {
+ 		progDataOffset = builder.CreateByteString(t.ProgData)
+ 	}
++	candidateIdOffset := flatbuffers.UOffsetT(0)
++	if t.CandidateId != "" {
++		candidateIdOffset = builder.CreateString(t.CandidateId)
++	}
+ 	SnapshotRequestStart(builder)
+ 	SnapshotRequestAddExecFlags(builder, t.ExecFlags)
+ 	SnapshotRequestAddNumCalls(builder, t.NumCalls)
+ 	SnapshotRequestAddAllCallSignal(builder, t.AllCallSignal)
+ 	SnapshotRequestAddAllExtraSignal(builder, t.AllExtraSignal)
+ 	SnapshotRequestAddProgData(builder, progDataOffset)
++	SnapshotRequestAddCandidateId(builder, candidateIdOffset)
+ 	return SnapshotRequestEnd(builder)
+ }
+ 
+@@ -3916,6 +3940,7 @@ func (rcv *SnapshotRequest) UnPackTo(t *SnapshotRequestT) {
+ 	t.AllCallSignal = rcv.AllCallSignal()
+ 	t.AllExtraSignal = rcv.AllExtraSignal()
+ 	t.ProgData = rcv.ProgDataBytes()
++	t.CandidateId = string(rcv.CandidateId())
+ }
+ 
+ func (rcv *SnapshotRequest) UnPack() *SnapshotRequestT {
+@@ -4044,8 +4069,16 @@ func (rcv *SnapshotRequest) MutateProgData(j int, n byte) bool {
+ 	return false
+ }
+ 
++func (rcv *SnapshotRequest) CandidateId() []byte {
++	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
++	if o != 0 {
++		return rcv._tab.ByteVector(o + rcv._tab.Pos)
++	}
++	return nil
++}
++
+ func SnapshotRequestStart(builder *flatbuffers.Builder) {
+-	builder.StartObject(5)
++	builder.StartObject(6)
+ }
+ func SnapshotRequestAddExecFlags(builder *flatbuffers.Builder, execFlags ExecFlag) {
+ 	builder.PrependUint64Slot(0, uint64(execFlags), 0)
+@@ -4065,6 +4098,9 @@ func SnapshotRequestAddProgData(builder *flatbuffers.Builder, progData flatbuffe
+ func SnapshotRequestStartProgDataVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+ 	return builder.StartVector(1, numElems, 1)
+ }
++func SnapshotRequestAddCandidateId(builder *flatbuffers.Builder, candidateId flatbuffers.UOffsetT) {
++	builder.PrependUOffsetTSlot(5, flatbuffers.UOffsetT(candidateId), 0)
++}
+ func SnapshotRequestEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
+ 	return builder.EndObject()
+ }
+diff --git a/pkg/flatrpc/flatrpc.h b/pkg/flatrpc/flatrpc.h
+index 6807434e6..bd48a3ca2 100644
+--- a/pkg/flatrpc/flatrpc.h
++++ b/pkg/flatrpc/flatrpc.h
+@@ -1858,6 +1858,7 @@ struct ExecRequestRawT : public ::flatbuffers::NativeTable {
+   std::unique_ptr<rpc::ExecOptsRaw> exec_opts{};
+   rpc::RequestFlag flags = static_cast<rpc::RequestFlag>(0);
+   std::vector<int32_t> all_signal{};
++  std::string candidate_id{};
+   ExecRequestRawT() = default;
+   ExecRequestRawT(const ExecRequestRawT &o);
+   ExecRequestRawT(ExecRequestRawT&&) FLATBUFFERS_NOEXCEPT = default;
+@@ -1874,7 +1875,8 @@ struct ExecRequestRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+     VT_DATA = 10,
+     VT_EXEC_OPTS = 12,
+     VT_FLAGS = 14,
+-    VT_ALL_SIGNAL = 16
++    VT_ALL_SIGNAL = 16,
++    VT_CANDIDATE_ID = 18
+   };
+   int64_t id() const {
+     return GetField<int64_t>(VT_ID, 0);
+@@ -1897,6 +1899,9 @@ struct ExecRequestRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+   const ::flatbuffers::Vector<int32_t> *all_signal() const {
+     return GetPointer<const ::flatbuffers::Vector<int32_t> *>(VT_ALL_SIGNAL);
+   }
++  const ::flatbuffers::String *candidate_id() const {
++    return GetPointer<const ::flatbuffers::String *>(VT_CANDIDATE_ID);
++  }
+   bool Verify(::flatbuffers::Verifier &verifier) const {
+     return VerifyTableStart(verifier) &&
+            VerifyField<int64_t>(verifier, VT_ID, 8) &&
+@@ -1908,6 +1913,8 @@ struct ExecRequestRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+            VerifyField<uint64_t>(verifier, VT_FLAGS, 8) &&
+            VerifyOffset(verifier, VT_ALL_SIGNAL) &&
+            verifier.VerifyVector(all_signal()) &&
++           VerifyOffset(verifier, VT_CANDIDATE_ID) &&
++           verifier.VerifyString(candidate_id()) &&
+            verifier.EndTable();
+   }
+   ExecRequestRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+@@ -1940,6 +1947,9 @@ struct ExecRequestRawBuilder {
+   void add_all_signal(::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> all_signal) {
+     fbb_.AddOffset(ExecRequestRaw::VT_ALL_SIGNAL, all_signal);
+   }
++  void add_candidate_id(::flatbuffers::Offset<::flatbuffers::String> candidate_id) {
++    fbb_.AddOffset(ExecRequestRaw::VT_CANDIDATE_ID, candidate_id);
++  }
+   explicit ExecRequestRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+         : fbb_(_fbb) {
+     start_ = fbb_.StartTable();
+@@ -1959,12 +1969,14 @@ inline ::flatbuffers::Offset<ExecRequestRaw> CreateExecRequestRaw(
+     ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> data = 0,
+     const rpc::ExecOptsRaw *exec_opts = nullptr,
+     rpc::RequestFlag flags = static_cast<rpc::RequestFlag>(0),
+-    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> all_signal = 0) {
++    ::flatbuffers::Offset<::flatbuffers::Vector<int32_t>> all_signal = 0,
++    ::flatbuffers::Offset<::flatbuffers::String> candidate_id = 0) {
+   ExecRequestRawBuilder builder_(_fbb);
+   builder_.add_flags(flags);
+   builder_.add_avoid(avoid);
+   builder_.add_type(type);
+   builder_.add_id(id);
++  builder_.add_candidate_id(candidate_id);
+   builder_.add_all_signal(all_signal);
+   builder_.add_exec_opts(exec_opts);
+   builder_.add_data(data);
+@@ -1979,9 +1991,11 @@ inline ::flatbuffers::Offset<ExecRequestRaw> CreateExecRequestRawDirect(
+     const std::vector<uint8_t> *data = nullptr,
+     const rpc::ExecOptsRaw *exec_opts = nullptr,
+     rpc::RequestFlag flags = static_cast<rpc::RequestFlag>(0),
+-    const std::vector<int32_t> *all_signal = nullptr) {
++    const std::vector<int32_t> *all_signal = nullptr,
++    const char *candidate_id = nullptr) {
+   auto data__ = data ? _fbb.CreateVector<uint8_t>(*data) : 0;
+   auto all_signal__ = all_signal ? _fbb.CreateVector<int32_t>(*all_signal) : 0;
++  auto candidate_id__ = candidate_id ? _fbb.CreateString(candidate_id) : 0;
+   return rpc::CreateExecRequestRaw(
+       _fbb,
+       id,
+@@ -1990,7 +2004,8 @@ inline ::flatbuffers::Offset<ExecRequestRaw> CreateExecRequestRawDirect(
+       data__,
+       exec_opts,
+       flags,
+-      all_signal__);
++      all_signal__,
++      candidate_id__);
+ }
+ 
+ ::flatbuffers::Offset<ExecRequestRaw> CreateExecRequestRaw(::flatbuffers::FlatBufferBuilder &_fbb, const ExecRequestRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+@@ -2867,6 +2882,7 @@ struct SnapshotRequestT : public ::flatbuffers::NativeTable {
+   uint64_t all_call_signal = 0;
+   bool all_extra_signal = false;
+   std::vector<uint8_t> prog_data{};
++  std::string candidate_id{};
+ };
+ 
+ struct SnapshotRequest FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+@@ -2877,7 +2893,8 @@ struct SnapshotRequest FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+     VT_NUM_CALLS = 6,
+     VT_ALL_CALL_SIGNAL = 8,
+     VT_ALL_EXTRA_SIGNAL = 10,
+-    VT_PROG_DATA = 12
++    VT_PROG_DATA = 12,
++    VT_CANDIDATE_ID = 14
+   };
+   rpc::ExecFlag exec_flags() const {
+     return static_cast<rpc::ExecFlag>(GetField<uint64_t>(VT_EXEC_FLAGS, 0));
+@@ -2894,6 +2911,9 @@ struct SnapshotRequest FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+   const ::flatbuffers::Vector<uint8_t> *prog_data() const {
+     return GetPointer<const ::flatbuffers::Vector<uint8_t> *>(VT_PROG_DATA);
+   }
++  const ::flatbuffers::String *candidate_id() const {
++    return GetPointer<const ::flatbuffers::String *>(VT_CANDIDATE_ID);
++  }
+   bool Verify(::flatbuffers::Verifier &verifier) const {
+     return VerifyTableStart(verifier) &&
+            VerifyField<uint64_t>(verifier, VT_EXEC_FLAGS, 8) &&
+@@ -2902,6 +2922,8 @@ struct SnapshotRequest FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+            VerifyField<uint8_t>(verifier, VT_ALL_EXTRA_SIGNAL, 1) &&
+            VerifyOffset(verifier, VT_PROG_DATA) &&
+            verifier.VerifyVector(prog_data()) &&
++           VerifyOffset(verifier, VT_CANDIDATE_ID) &&
++           verifier.VerifyString(candidate_id()) &&
+            verifier.EndTable();
+   }
+   SnapshotRequestT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+@@ -2928,6 +2950,9 @@ struct SnapshotRequestBuilder {
+   void add_prog_data(::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> prog_data) {
+     fbb_.AddOffset(SnapshotRequest::VT_PROG_DATA, prog_data);
+   }
++  void add_candidate_id(::flatbuffers::Offset<::flatbuffers::String> candidate_id) {
++    fbb_.AddOffset(SnapshotRequest::VT_CANDIDATE_ID, candidate_id);
++  }
+   explicit SnapshotRequestBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+         : fbb_(_fbb) {
+     start_ = fbb_.StartTable();
+@@ -2945,10 +2970,12 @@ inline ::flatbuffers::Offset<SnapshotRequest> CreateSnapshotRequest(
+     int32_t num_calls = 0,
+     uint64_t all_call_signal = 0,
+     bool all_extra_signal = false,
+-    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> prog_data = 0) {
++    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> prog_data = 0,
++    ::flatbuffers::Offset<::flatbuffers::String> candidate_id = 0) {
+   SnapshotRequestBuilder builder_(_fbb);
+   builder_.add_all_call_signal(all_call_signal);
+   builder_.add_exec_flags(exec_flags);
++  builder_.add_candidate_id(candidate_id);
+   builder_.add_prog_data(prog_data);
+   builder_.add_num_calls(num_calls);
+   builder_.add_all_extra_signal(all_extra_signal);
+@@ -2961,15 +2988,18 @@ inline ::flatbuffers::Offset<SnapshotRequest> CreateSnapshotRequestDirect(
+     int32_t num_calls = 0,
+     uint64_t all_call_signal = 0,
+     bool all_extra_signal = false,
+-    const std::vector<uint8_t> *prog_data = nullptr) {
++    const std::vector<uint8_t> *prog_data = nullptr,
++    const char *candidate_id = nullptr) {
+   auto prog_data__ = prog_data ? _fbb.CreateVector<uint8_t>(*prog_data) : 0;
++  auto candidate_id__ = candidate_id ? _fbb.CreateString(candidate_id) : 0;
+   return rpc::CreateSnapshotRequest(
+       _fbb,
+       exec_flags,
+       num_calls,
+       all_call_signal,
+       all_extra_signal,
+-      prog_data__);
++      prog_data__,
++      candidate_id__);
+ }
+ 
+ ::flatbuffers::Offset<SnapshotRequest> CreateSnapshotRequest(::flatbuffers::FlatBufferBuilder &_fbb, const SnapshotRequestT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+@@ -3331,7 +3361,8 @@ inline ExecRequestRawT::ExecRequestRawT(const ExecRequestRawT &o)
+         data(o.data),
+         exec_opts((o.exec_opts) ? new rpc::ExecOptsRaw(*o.exec_opts) : nullptr),
+         flags(o.flags),
+-        all_signal(o.all_signal) {
++        all_signal(o.all_signal),
++        candidate_id(o.candidate_id) {
+ }
+ 
+ inline ExecRequestRawT &ExecRequestRawT::operator=(ExecRequestRawT o) FLATBUFFERS_NOEXCEPT {
+@@ -3342,6 +3373,7 @@ inline ExecRequestRawT &ExecRequestRawT::operator=(ExecRequestRawT o) FLATBUFFER
+   std::swap(exec_opts, o.exec_opts);
+   std::swap(flags, o.flags);
+   std::swap(all_signal, o.all_signal);
++  std::swap(candidate_id, o.candidate_id);
+   return *this;
+ }
+ 
+@@ -3361,6 +3393,7 @@ inline void ExecRequestRaw::UnPackTo(ExecRequestRawT *_o, const ::flatbuffers::r
+   { auto _e = exec_opts(); if (_e) _o->exec_opts = std::unique_ptr<rpc::ExecOptsRaw>(new rpc::ExecOptsRaw(*_e)); }
+   { auto _e = flags(); _o->flags = _e; }
+   { auto _e = all_signal(); if (_e) { _o->all_signal.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->all_signal[_i] = _e->Get(_i); } } else { _o->all_signal.resize(0); } }
++  { auto _e = candidate_id(); if (_e) _o->candidate_id = _e->str(); }
+ }
+ 
+ inline ::flatbuffers::Offset<ExecRequestRaw> ExecRequestRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const ExecRequestRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+@@ -3378,6 +3411,7 @@ inline ::flatbuffers::Offset<ExecRequestRaw> CreateExecRequestRaw(::flatbuffers:
+   auto _exec_opts = _o->exec_opts ? _o->exec_opts.get() : nullptr;
+   auto _flags = _o->flags;
+   auto _all_signal = _o->all_signal.size() ? _fbb.CreateVector(_o->all_signal) : 0;
++  auto _candidate_id = _o->candidate_id.empty() ? 0 : _fbb.CreateString(_o->candidate_id);
+   return rpc::CreateExecRequestRaw(
+       _fbb,
+       _id,
+@@ -3386,7 +3420,8 @@ inline ::flatbuffers::Offset<ExecRequestRaw> CreateExecRequestRaw(::flatbuffers:
+       _data,
+       _exec_opts,
+       _flags,
+-      _all_signal);
++      _all_signal,
++      _candidate_id);
+ }
+ 
+ inline SignalUpdateRawT *SignalUpdateRaw::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
+@@ -3770,6 +3805,7 @@ inline void SnapshotRequest::UnPackTo(SnapshotRequestT *_o, const ::flatbuffers:
+   { auto _e = all_call_signal(); _o->all_call_signal = _e; }
+   { auto _e = all_extra_signal(); _o->all_extra_signal = _e; }
+   { auto _e = prog_data(); if (_e) { _o->prog_data.resize(_e->size()); std::copy(_e->begin(), _e->end(), _o->prog_data.begin()); } }
++  { auto _e = candidate_id(); if (_e) _o->candidate_id = _e->str(); }
+ }
+ 
+ inline ::flatbuffers::Offset<SnapshotRequest> SnapshotRequest::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const SnapshotRequestT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+@@ -3785,13 +3821,15 @@ inline ::flatbuffers::Offset<SnapshotRequest> CreateSnapshotRequest(::flatbuffer
+   auto _all_call_signal = _o->all_call_signal;
+   auto _all_extra_signal = _o->all_extra_signal;
+   auto _prog_data = _o->prog_data.size() ? _fbb.CreateVector(_o->prog_data) : 0;
++  auto _candidate_id = _o->candidate_id.empty() ? 0 : _fbb.CreateString(_o->candidate_id);
+   return rpc::CreateSnapshotRequest(
+       _fbb,
+       _exec_flags,
+       _num_calls,
+       _all_call_signal,
+       _all_extra_signal,
+-      _prog_data);
++      _prog_data,
++      _candidate_id);
+ }
+ 
+ inline bool VerifyHostMessagesRaw(::flatbuffers::Verifier &verifier, const void *obj, HostMessagesRaw type) {
+diff --git a/pkg/mgrconfig/config.go b/pkg/mgrconfig/config.go
+index 2bc36f517..7a95ea5b8 100644
+--- a/pkg/mgrconfig/config.go
++++ b/pkg/mgrconfig/config.go
+@@ -109,6 +109,8 @@ type Config struct {
+ 	// for binaries in bin subdir (does not have to be syzkaller checkout as
+ 	// long as it preserves `bin` dir structure)
+ 	Syzkaller string `json:"syzkaller"`
++	// This payload is registered in each VM before its runner starts.
++	KCSANPolicyFile string `json:"kcsan_policy_file,omitempty"`
+ 
+ 	// Number of parallel test processes inside of each VM.
+ 	// Allowed values are 1-32, recommended range is ~4-8, default value is 6.
+diff --git a/pkg/mgrconfig/load.go b/pkg/mgrconfig/load.go
+index 3191b8e23..df126c417 100644
+--- a/pkg/mgrconfig/load.go
++++ b/pkg/mgrconfig/load.go
+@@ -24,8 +24,9 @@ import (
+ 
+ // Derived config values that are handy to keep with the config, filled after reading user config.
+ type Derived struct {
+-	Target    *prog.Target
+-	SysTarget *targets.Target
++	KCSANCandidateID string
++	Target           *prog.Target
++	SysTarget        *targets.Target
+ 
+ 	// Parsed Target:
+ 	TargetOS     string
+@@ -168,6 +169,9 @@ func Complete(cfg *Config) error {
+ 	if err := cfg.completeBinaries(); err != nil {
+ 		return err
+ 	}
++	if err := cfg.completeKCSANPolicy(); err != nil {
++		return err
++	}
+ 	if cfg.Procs < 1 || cfg.Procs > prog.MaxPids {
+ 		return fmt.Errorf("bad config param procs: '%v', want [1, %v]", cfg.Procs, prog.MaxPids)
+ 	}
+@@ -221,6 +225,47 @@ func Complete(cfg *Config) error {
+ 	return nil
+ }
+ 
++func (cfg *Config) completeKCSANPolicy() error {
++	cfg.KCSANCandidateID = ""
++	if cfg.KCSANPolicyFile == "" {
++		return nil
++	}
++	if cfg.TargetOS != "linux" || cfg.Type == "none" {
++		return fmt.Errorf("kcsan_policy_file requires a Linux VM")
++	}
++	if !cfg.Cover || !cfg.Experimental.RemoteCover {
++		return fmt.Errorf("kcsan_policy_file requires cover and experimental.remote_cover")
++	}
++	cfg.KCSANPolicyFile = osutil.Abs(cfg.KCSANPolicyFile)
++	name := filepath.Base(cfg.KCSANPolicyFile)
++	candidateID := strings.TrimSuffix(name, "_policy.payload")
++	if candidateID == name || candidateID == "." || candidateID == ".." ||
++		len(candidateID) == 0 || len(candidateID) >= 128 ||
++		!regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(candidateID) {
++		return fmt.Errorf("invalid KCSAN payload filename %q", name)
++	}
++	info, err := os.Lstat(cfg.KCSANPolicyFile)
++	if err != nil {
++		return fmt.Errorf("stat KCSAN payload %q: %w", cfg.KCSANPolicyFile, err)
++	}
++	if !info.Mode().IsRegular() {
++		return fmt.Errorf("KCSAN payload %q is not a regular file", cfg.KCSANPolicyFile)
++	}
++	payload, err := os.ReadFile(cfg.KCSANPolicyFile)
++	if err != nil {
++		return fmt.Errorf("read KCSAN payload %q: %w", cfg.KCSANPolicyFile, err)
++	}
++	if len(payload) == 0 || len(payload) > 4096 {
++		return fmt.Errorf("KCSAN payload %q must be 1..4096 bytes", cfg.KCSANPolicyFile)
++	}
++	header := strings.Fields(strings.SplitN(string(payload), "\n", 2)[0])
++	if len(header) != 7 || header[0] != "policy" || header[1] != candidateID || header[2] != "5" {
++		return fmt.Errorf("KCSAN payload %q has a mismatched candidate ID or schema", cfg.KCSANPolicyFile)
++	}
++	cfg.KCSANCandidateID = candidateID
++	return nil
++}
++
+ func (cfg *Config) completeServices() error {
+ 	if cfg.HubClient != "" {
+ 		if err := checkNonEmpty(
+diff --git a/pkg/rpcserver/rpcserver.go b/pkg/rpcserver/rpcserver.go
+index cc9d2e6fa..bc6ec9baa 100644
+--- a/pkg/rpcserver/rpcserver.go
++++ b/pkg/rpcserver/rpcserver.go
+@@ -69,13 +69,14 @@ type Config struct {
+ 	FilterSignal      bool
+ 	PrintMachineCheck bool
+ 	// Abort early on syz-executor not replying to requests and print extra debugging information.
+-	DebugTimeouts bool
+-	Procs         int
+-	Slowdown      int
+-	ExecutorBin   string
+-	Timeouts      targets.Timeouts
+-	pcBase        uint64
+-	localModules  []*vminfo.KernelModule
++	DebugTimeouts    bool
++	Procs            int
++	Slowdown         int
++	ExecutorBin      string
++	Timeouts         targets.Timeouts
++	KCSANCandidateID string
++	pcBase           uint64
++	localModules     []*vminfo.KernelModule
+ 
+ 	// RPCServer closes the channel once the machine check has begun. Used for fault injection during testing.
+ 	machineCheckStarted chan struct{}
+@@ -204,6 +205,7 @@ func New(cfg *RemoteConfig) (Server, error) {
+ 		Slowdown:          cfg.Timeouts.Slowdown,
+ 		ExecutorBin:       cfg.ExecutorBin,
+ 		Timeouts:          cfg.Timeouts,
++		KCSANCandidateID:  cfg.KCSANCandidateID,
+ 		pcBase:            pcBase,
+ 		localModules:      cfg.LocalModules,
+ 	}, cfg.Manager), nil
+@@ -580,11 +582,12 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo Updat
+ 		executing:     make(map[int64]bool),
+ 		hanged:        make(map[int64]bool),
+ 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
+-		lastExec: MakeLastExecuting(prog.MaxPids, 6),
+-		stats:    serv.runnerStats,
+-		procs:    serv.cfg.Procs,
+-		updInfo:  updInfo,
+-		resultCh: make(chan error, 1),
++		lastExec:    MakeLastExecuting(prog.MaxPids, 6),
++		stats:       serv.runnerStats,
++		procs:       serv.cfg.Procs,
++		updInfo:     updInfo,
++		resultCh:    make(chan error, 1),
++		candidateID: serv.cfg.KCSANCandidateID,
+ 	}
+ 	serv.mu.Lock()
+ 	defer serv.mu.Unlock()
+diff --git a/pkg/rpcserver/runner.go b/pkg/rpcserver/runner.go
+index 5f80d5d01..a1a3a38e9 100644
+--- a/pkg/rpcserver/runner.go
++++ b/pkg/rpcserver/runner.go
+@@ -32,6 +32,7 @@ type Runner struct {
+ 	filterSignal    bool
+ 	debug           bool
+ 	debugTimeouts   bool
++	candidateID     string
+ 	progTarget      *prog.Target
+ 	sysTarget       *targets.Target
+ 	stats           *runnerStats
+@@ -325,8 +326,10 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
+ 		opts.EnvFlags |= flatrpc.ExecEnvDebug
+ 	}
+ 	var data []byte
++	var candidateID string
+ 	switch req.Type {
+ 	case flatrpc.RequestTypeProgram:
++		candidateID = runner.candidateID
+ 		progData, err := req.Prog.SerializeForExec()
+ 		if err != nil {
+ 			// It's bad if we systematically fail to serialize programs,
+@@ -366,13 +369,14 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
+ 		Msg: &flatrpc.HostMessages{
+ 			Type: flatrpc.HostMessagesRawExecRequest,
+ 			Value: &flatrpc.ExecRequest{
+-				Id:        id,
+-				Type:      req.Type,
+-				Avoid:     avoid,
+-				Data:      data,
+-				Flags:     flags,
+-				ExecOpts:  &opts,
+-				AllSignal: allSignal,
++				Id:          id,
++				Type:        req.Type,
++				Avoid:       avoid,
++				Data:        data,
++				Flags:       flags,
++				ExecOpts:    &opts,
++				AllSignal:   allSignal,
++				CandidateId: candidateID,
+ 			},
+ 		},
+ 	}
+-- 
+2.43.0
+
