@@ -47,8 +47,8 @@ This repository distributes the following components with their own licensing:
   protocol definitions verbatim (four size constants it states as prose are
   written as `const`, and `FSINFOargs` takes the name `FSINFO3args` its
   program uses) only so the proxy can decode the protocol; `SOURCES` pins the
-  RFC text and the file by SHA-256. Pending the repository owner's acceptance,
-  as for RFC 5531 above.
+  RFC text and the file by SHA-256. The repository owner accepted this use
+  (2026-10-16, PR #42).
 - RFC 9754's own extraction script yields XDR without the license text, so
   `rfc9754.x` (kept byte for byte as the RFC prints it, to match its pin) has
   none. Its Code Components are under the same IETF Trust Revised BSD
