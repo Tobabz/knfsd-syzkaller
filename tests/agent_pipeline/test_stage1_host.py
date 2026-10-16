@@ -10,6 +10,7 @@ the model responses and the syzkaller parser.
 from __future__ import annotations
 
 import json
+import runpy
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,7 @@ from agent_pipeline.stage1.host.__main__ import main as host_main
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
-from agent_pipeline.stage1.host.generate import generate
+from agent_pipeline.stage1.host.generate import generate, series_fingerprint
 from agent_pipeline.stage1.host.target_pcs import (parse_addr2line,
                                                    parse_callsites,
                                                    path_matches)
@@ -108,7 +109,10 @@ def _bundle(root: Path) -> SyzkallerTargetIdentity:
     (bundle / "provenance.json").write_bytes(canonical_json({
         "source_commit": commit,
         "source_tree": _git(checkout, "rev-parse", "HEAD^{tree}")}))
-    patches = b"synthetic syzkaller patch series\n"
+    # tools/syzkaller/build.py's patch-series.bin of the checked-in series.
+    patches = b"".join(
+        p.name.encode() + b"\0" + p.read_bytes() + b"\0" for p in sorted(
+            (REPO / "bundle" / "patches" / "syzkaller").glob("*.patch")))
     (bundle / "patch-series.bin").write_bytes(patches)
     import hashlib
     sha = lambda b: hashlib.sha256(b).hexdigest()  # noqa: E731
@@ -141,6 +145,13 @@ def _compile_vmlinux(linux: Path, out: Path) -> None:
                    check=True)
 
 
+def _write_syz_record(env: Path, **override) -> None:
+    record = {"series_sha256": series_fingerprint("syzkaller"),
+              "head": _git(env / "syzkaller", "rev-parse", "HEAD"),
+              **override}
+    (env / "syzkaller" / "bin" / "build.json").write_text(json.dumps(record))
+
+
 @pytest.fixture
 def host(tmp_path):
     """A bootstrap env, a parser bundle and a host spec over them."""
@@ -153,7 +164,8 @@ def host(tmp_path):
     _compile_vmlinux(linux, variant / "vmlinux")
     (variant / "bzImage").write_bytes(b"synthetic bzImage")
     (variant / ".config").write_text("CONFIG_KCOV=y\nCONFIG_KASAN=y\n")
-    (variant / "build.json").write_text(json.dumps({"head": kernel_commit}))
+    (variant / "build.json").write_text(json.dumps({
+        "head": kernel_commit, "series_sha256": series_fingerprint("kernel")}))
     (images / "bookworm-kcov-fresh.qcow2").write_bytes(b"synthetic image")
     identity = _bundle(tmp_path / "syz-build")
     subprocess.run(["git", "clone", "-q", str(tmp_path / "syz-build" /
@@ -163,6 +175,7 @@ def host(tmp_path):
     bin_dir.mkdir(parents=True)
     (bin_dir / "syz-executor").write_bytes(b"synthetic executor")
     (bin_dir / "syz-execprog").write_bytes(b"synthetic execprog")
+    _write_syz_record(env)
     (tmp_path / "artifacts").mkdir()
     (tmp_path / "artifacts" / "id_rsa").write_text("synthetic key\n")
     (tmp_path / "neutral.syz").write_bytes(NEUTRAL)
@@ -233,6 +246,20 @@ def test_missing_counter_is_unknown_not_zero():
     counters = kcov.generation_counters(kcov.parse_stats(STATS_BEFORE), after)
     assert counters.scratch_overflow is None
     assert counters.generation_begin == 1
+
+
+def test_window_starts_only_when_every_generation_settled():
+    settled = ("owner 1 state COMMITTED outstanding_tokens 0 object_refs 1 "
+               "active_roots 0 retry_deadline_active 0 generation 5\n"
+               "owner 2 state ABORTED outstanding_tokens 0 object_refs 1 "
+               "active_roots 0 retry_deadline_active 0 generation 6\n")
+    assert kcov.unsettled_generations("") == []
+    assert kcov.unsettled_generations(settled) == []
+    draining = settled.replace("ABORTED outstanding_tokens 0",
+                               "ABORTED outstanding_tokens 2")
+    assert len(kcov.unsettled_generations(draining)) == 1
+    assert len(kcov.unsettled_generations(
+        settled.replace("COMMITTED", "OPEN"))) == 1
 
 
 def test_cover_pcs_and_lane_state():
@@ -316,8 +343,47 @@ def test_generate_refuses_executor_built_from_another_tree(host):
     (host.env / "syzkaller" / "extra").write_text("drift\n")
     _git(host.env / "syzkaller", "add", "extra")
     _git(host.env / "syzkaller", "commit", "-qm", "drift")
+    with pytest.raises(ValueError, match="moved since the syzkaller build"):
+        generate(host.spec)
+    # Rebuilt from the drifted tree: the record is current, but the parser
+    # bundle was built from another tree.
+    _write_syz_record(host.env)
     with pytest.raises(ValueError, match="different trees"):
         generate(host.spec)
+
+
+@needs_gcc
+def test_generate_refuses_builds_of_another_patch_series(host):
+    # Executor binaries built from an older syzkaller series.
+    _write_syz_record(host.env, series_sha256="0" * 64)
+    with pytest.raises(ValueError, match="syzkaller build used another"):
+        generate(host.spec)
+    (host.env / "syzkaller" / "bin" / "build.json").unlink()
+    with pytest.raises(ValueError, match="missing or unreadable"):
+        generate(host.spec)
+    _write_syz_record(host.env)
+    # A kernel built from an older kernel series: its instrumentation is
+    # not the checked-in series the manifest would pin.
+    record = host.env / "images" / "kasan" / "build.json"
+    good = record.read_text()
+    record.write_text(json.dumps({"head": host.kernel_commit,
+                                  "series_sha256": "1" * 64}))
+    with pytest.raises(ValueError, match="kernel build used another"):
+        generate(host.spec)
+    record.write_text(good)
+    generate(host.spec)
+    # A parser bundle whose patch-series.bin is not its identity's series.
+    (host.root / "syz-build" / "bundle" / "patch-series.bin").write_bytes(
+        b"older series\n")
+    with pytest.raises(ValueError, match="parser bundle was built from"):
+        generate(host.spec)
+
+
+def test_series_fingerprint_is_the_bootstrap_record_digest():
+    bootstrap = runpy.run_path(str(REPO / "tools" / "bootstrap-kcov-env.py"))
+    for kind in ("kernel", "syzkaller"):
+        assert series_fingerprint(kind) == \
+            bootstrap["series_fingerprint"](kind)
 
 
 # ------------------------------------------------------------ collector
@@ -390,7 +456,14 @@ def test_collector_writes_a_generation_attributed_capture(host, tmp_path):
             obs.generation_attributed) == (True,) * 7
     assert obs.runtime_errors == ()
     assert obs.published_pcs == (0x401000, 0x401010)
+    # The machine check's own generation is before the gate, so the window
+    # holds the program's generation alone.
+    assert obs.generation.generation_begin == 1
     assert obs.generation.aggregate_published == 1
+    commands = run.guest.commands
+    stats = [i for i, c in enumerate(commands) if "*_stats" in c]
+    released = commands.index("touch /tmp/stage1/gate.go")
+    assert stats[0] < released < stats[1]
     assert obs.lane_trace_mode == "off"
     coverage = PublishedCoverage.model_validate_json(
         (run.out / "coverage.json").read_bytes())
@@ -416,6 +489,25 @@ def test_collector_records_guest_failures_as_facts(host, tmp_path):
     run = _collect(host, tmp_path / "c", boot_error="no ssh")
     assert not run.observation.boot_ok
     assert run.observation.generation.generation_begin is None
+
+
+@needs_gcc
+def test_collector_needs_the_gate_and_a_settled_window(host, tmp_path):
+    # An execprog without -gate exits before the program: no window at all.
+    obs = _collect(host, tmp_path / "a", pcs=["0x401000"], gate="exited",
+                   exec_rc="2").observation
+    assert not obs.runner_completed and not obs.collection_started
+    assert not obs.generation_attributed
+    assert obs.generation.generation_begin is None
+    assert "execprog_failed_before_gate:exited:rc=2" in obs.runtime_errors
+    # A generation still draining at the gate would leak into the window.
+    obs = _collect(host, tmp_path / "b", pcs=["0x401000"],
+                   generations="owner 1 state CLOSING outstanding_tokens 1 "
+                   "object_refs 2 active_roots 1 generation 5\n").observation
+    assert obs.runner_completed and not obs.collection_started
+    assert not obs.generation_attributed
+    assert any(e.startswith("generation_unsettled_at_window_start")
+               for e in obs.runtime_errors)
 
 
 @needs_gcc

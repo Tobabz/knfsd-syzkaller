@@ -95,12 +95,14 @@ guest. Read `probe-1/probe.json`:
    `collection_completed` and `extra_present` should all be true, and
    `runtime_errors` should be empty.
 2. **Generation counters.** `generation_begin` and `aggregate_published`
-   are measured as deltas across the whole execprog run. They should both
-   be 1. If execprog's machine check opens its own generation, they come
-   out higher and the Judge returns
-   `INCONCLUSIVE(multiple_generations_in_single_generation_evidence)`.
-   That needs a collector change: either measure from the per-generation
-   `phase6_state`, or take the "before" snapshot after the machine check.
+   should both be 1. execprog's machine check runs its own extra-coverage
+   request, which opens a generation, so the window does not cover the
+   whole execprog run: execprog stops at `-gate` after the check
+   (syzkaller patch 0022), the collector reads the "before" snapshot
+   there, once every listed generation in `phase4_state` has settled, and
+   then lets the program run. `execprog_gate` in `collector-result.json`
+   should read `ready`. An execprog built without patch 0022 exits at the
+   unknown flag and the run reports `execprog_failed_before_gate`.
 3. **Counter names.** `counter_labels` lists every counter as the Judge
    will see it. A name printed by more than one stats file is qualified
    (`phase5_stats.remote_refs`). The `judge_profile` counters must use
@@ -118,6 +120,12 @@ guest. Read `probe-1/probe.json`:
   size. This keeps multi-GB files out of the CAS. `collect`, `probe` and
   `target-pcs` refuse a file that does not match its pin. `pins.json` caches
   digests by inode, size and mtime.
+- **Build records.** `generate` refuses a kernel or syzkaller build whose
+  bootstrap record (`images/<variant>/build.json`,
+  `syzkaller/bin/build.json`) names another patch series than the checked-in
+  one or another commit than the tree's HEAD, and a parser bundle whose
+  series is not the checked-in syzkaller series. After a series change,
+  rerun step 1 without `--skip-build` and step 2 into a new directory.
 - **Instrumentation.** The `instrumentation` artifact is an
   `InstrumentationManifest` of the kernel patch series and `.config`. The
   support boundary's `instrumentation_sha256` is the same digest.

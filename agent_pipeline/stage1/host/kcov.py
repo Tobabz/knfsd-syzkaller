@@ -2,8 +2,9 @@
 
 Inputs are what the guest prints: the ``sunrpc_fuzz`` debugfs ``*_stats``
 files (one ``name value`` per line, dumped as ``== <path>`` sections) before
-and after the program, and the ``cover_prog<N>.extra`` remote coverage file
-written by ``syz-execprog -coverfile``.  Nothing here runs a VM, so every
+and after the program, the ``phase4_state`` generation list at the start of
+the window, and the ``cover_prog<N>.extra`` remote coverage file written by
+``syz-execprog -coverfile``.  Nothing here runs a VM, so every
 mapping from guest text to a record field is unit-tested.
 """
 
@@ -18,8 +19,10 @@ from ...q1 import (CounterDelta, ExecutionCorrelation, GenerationCounters,
                    KernelIdentity, RemoteKcovObservation)
 from ...sealed_q1 import PublishedCoverage
 
-#: The window every counter delta is measured over: from after the lane
-#: grace period, before the program starts, to after the drain period.
+#: The window every counter delta is measured over: from the execprog gate
+#: (the machine check has finished, the program has not started) to after
+#: the drain period.  The machine check runs its own extra-coverage request,
+#: which opens a generation of its own; the gate keeps it out of the window.
 WINDOW = "generation-plus-drain"
 
 #: GenerationCounters field -> (stats file, counter, how it is read).
@@ -43,6 +46,9 @@ FATAL_DMESG = re.compile(
 
 STATS_COMMAND = ("for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do "
                  "echo \"== $f\"; cat \"$f\"; done")
+STATE_COMMAND = "cat /sys/kernel/debug/sunrpc_fuzz/phase4_state"
+#: Generation states that no longer collect or drain coverage.
+SETTLED_STATES = {"ABORTED", "COMMITTED", "DEAD"}
 
 Stats = dict[str, dict[str, int]]
 
@@ -95,6 +101,24 @@ def counter_deltas(before: Stats, after: Stats,
             label = name if len(owners[name]) == 1 else f"{section}.{name}"
             out.append(CounterDelta(counter=label, window=window, value=a - b))
     return tuple(out)
+
+
+def unsettled_generations(state: str) -> list[str]:
+    """``phase4_state`` lines (``owner 1 state COMMITTED outstanding_tokens 0
+    object_refs 1 active_roots 0 ... generation 7``) of generations that are
+    still open or draining.  The window may only start when this is empty:
+    otherwise an earlier generation's work lands in the program's deltas."""
+    busy = []
+    for line in state.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        pairs = dict(zip(fields[::2], fields[1::2]))
+        if (pairs.get("state") not in SETTLED_STATES
+                or pairs.get("outstanding_tokens") != "0"
+                or pairs.get("active_roots") != "0"):
+            busy.append(line.strip())
+    return busy
 
 
 def parse_cover_pcs(text: str) -> set[int]:

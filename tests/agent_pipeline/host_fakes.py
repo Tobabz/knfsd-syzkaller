@@ -1,7 +1,9 @@
 """A scripted guest for the Stage 1 host collector tests.
 
 It answers the collector's commands the way a healthy fixture does, so the
-collector's parsing and record building run unchanged without KVM.  The
+collector's parsing and record building run unchanged without KVM.  Its
+counters move the way the guest's do: execprog's machine check opens one
+generation before the gate, and the program opens one after it.  The
 remote coverage it returns is read from ``TEST_COVER_PCS`` (a file of hex
 PCs, one per line) when the coverage is fetched.
 """
@@ -14,11 +16,11 @@ import os
 import tarfile
 from pathlib import Path
 
-STATS_BEFORE = """== /sys/kernel/debug/sunrpc_fuzz/lane_stats
+STATS_BOOT = """== /sys/kernel/debug/sunrpc_fuzz/lane_stats
 lane_owner_failed 0
 lane_attribution 1
 == /sys/kernel/debug/sunrpc_fuzz/phase4_stats
-generation_begin 5
+generation_begin 4
 generation_aborted 0
 outstanding_tokens 0
 object_refs 0
@@ -26,30 +28,42 @@ object_refs 0
 remote_start_ok 3
 remote_refs 0
 == /sys/kernel/debug/sunrpc_fuzz/phase6_stats
-aggregate_published 2
+aggregate_published 1
 scratch_overflow 0
 aggregate_merge_truncated 0
 remote_refs 0
 """
+
+#: After the machine check: its extra-coverage request opened and
+#: published one generation of its own.
+STATS_BEFORE = STATS_BOOT.replace("generation_begin 4", "generation_begin 5") \
+    .replace("aggregate_published 1", "aggregate_published 2")
 
 STATS_AFTER = STATS_BEFORE.replace("generation_begin 5", "generation_begin 6") \
     .replace("remote_start_ok 3", "remote_start_ok 5") \
     .replace("aggregate_published 2", "aggregate_published 3")
 
 
+GENERATIONS = ("owner 1 state COMMITTED outstanding_tokens 0 object_refs 1 "
+               "active_roots 0 retry_deadline_active 0 generation 5\n")
+
+
 class FakeGuest:
     def __init__(self, config, *, pcs=None, fixture="active", lane_sha=None,
-                 nfs_version="4.1", execprog_rc="rc=0", dmesg="",
-                 boot_error=None):
+                 nfs_version="4.1", gate="ready", exec_rc="0", dmesg="",
+                 generations=GENERATIONS, boot_error=None):
         self.config = config
         self.pcs = pcs
         self.fixture = fixture
         self.lane_sha = lane_sha
         self.nfs_version = nfs_version
-        self.execprog_rc = execprog_rc
+        self.gate = gate
+        self.exec_rc = exec_rc
+        self.generations = generations
+        #: boot -> started -> checked (at the gate) -> released -> done
+        self.phase = "boot"
         self.dmesg = dmesg
         self.boot_error = boot_error
-        self.stats = [STATS_BEFORE, STATS_AFTER]
         self.commands: list[str] = []
         self.puts: list[tuple[Path, str]] = []
         self.stopped = False
@@ -77,10 +91,28 @@ class FakeGuest:
         if command.startswith("ip netns exec"):
             return 0, "lane_id 0 lane_epoch 1 valid 1 unhealthy 0 owner 1\n"
         if "sunrpc_fuzz/*_stats" in command:
-            return 0, self.stats.pop(0)
-        if "syz-execprog" in command:
-            return 0, self.execprog_rc + "\n"
-        if command.startswith("cat /tmp/exec.log"):
+            return 0, {"boot": STATS_BOOT, "started": STATS_BOOT,
+                       "done": STATS_AFTER}.get(self.phase, STATS_BEFORE)
+        if command.endswith("phase4_state"):
+            return 0, self.generations
+        if command.startswith("rm -rf /tmp/cov"):
+            assert "-gate=/tmp/stage1/gate" in command
+            self.phase = "started"
+            return 0, ""
+        if command.startswith("if [ -e /tmp/stage1/exec.rc ]"):
+            if self.phase == "started":
+                self.phase = "checked" if self.gate == "ready" else "done"
+                return 0, ("ready" if self.gate == "ready" else "exited") + "\n"
+            if self.phase == "released":
+                self.phase = "done"
+            return 0, "exited\n" if self.phase == "done" else ""
+        if command == "touch /tmp/stage1/gate.go":
+            assert self.phase == "checked"
+            self.phase = "released"
+            return 0, ""
+        if command.startswith("cat /tmp/stage1/exec.rc"):
+            return 0, self.exec_rc + "\n"
+        if command.startswith("cat /tmp/stage1/exec.log"):
             return 0, "CALL 0: signal 3, coverage 9 errno 0\n"
         if command == "dmesg":
             return 0, self.dmesg

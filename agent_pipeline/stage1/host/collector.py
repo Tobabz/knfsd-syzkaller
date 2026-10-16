@@ -34,8 +34,9 @@ from ...hcap import RuntimeSelection
 from ...materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ...q1 import ExecutionCorrelation, KernelIdentity
 from ...sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE
-from .kcov import (STATS_COMMAND, LaneRun, capture_records, fatal_dmesg,
-                   lane_state_ok, parse_cover_pcs, parse_stats)
+from .kcov import (STATE_COMMAND, STATS_COMMAND, LaneRun, capture_records,
+                   fatal_dmesg, lane_state_ok, parse_cover_pcs, parse_stats,
+                   unsettled_generations)
 from .pins import HostFilePin, PinCache, verify_file
 from .vm import Guest, QemuGuest, VmConfig
 
@@ -43,6 +44,12 @@ from .vm import Guest, QemuGuest, VmConfig
 RUN_FILES = ("bzimage", "vm-image", "lane-script", "syz-executor",
              "syz-execprog")
 GUEST_DIR = "/tmp/stage1"
+#: ``syz-execprog -gate``: it creates ``GATE.ready`` after the machine check
+#: and runs the program once ``GATE.go`` exists (syzkaller patch 0022).
+GATE = f"{GUEST_DIR}/gate"
+EXEC_LOG = f"{GUEST_DIR}/exec.log"
+EXEC_RC = f"{GUEST_DIR}/exec.rc"
+POLL_S = 1.0
 #: execprog runs one proc, which the executor binds to lane 0.
 LANE = 0
 LOG_LIMIT = 4 * 1024 * 1024
@@ -166,15 +173,36 @@ def _lane_state(guest: Guest) -> str:
 
 
 def execprog_argv(timeout_s: float) -> str:
+    """Start execprog in the background.  It stops at the gate after the
+    machine check; ``EXEC_RC`` holds its exit status once it is done."""
     argv = [f"{GUEST_DIR}/syz-execprog",
             f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
             "-arch=amd64", "-vmarch=amd64", "-sandbox=none", "-procs=1",
             "-repeat=1", "-threaded=false", "-cover=true",
             "-coverfile=/tmp/cov/cover", "-remote-cover=true",
             "-disable=all", "-debug", "-vv=1", "-slowdown=1",
-            f"{GUEST_DIR}/program.syz"]
-    return (f"rm -rf /tmp/cov; mkdir -p /tmp/cov; timeout {int(timeout_s)} "
-            f"{shlex.join(argv)} > /tmp/exec.log 2>&1; echo rc=$?")
+            f"-gate={GATE}", f"{GUEST_DIR}/program.syz"]
+    body = (f"timeout {int(timeout_s)} {shlex.join(argv)} > {EXEC_LOG} 2>&1; "
+            f"echo $? > {EXEC_RC}")
+    return (f"rm -rf /tmp/cov {GATE}.ready {GATE}.go {EXEC_RC}; "
+            f"mkdir -p /tmp/cov; setsid nohup sh -c {shlex.quote(body)} "
+            "< /dev/null > /dev/null 2>&1 &")
+
+
+def _wait_execprog(guest: Guest, want_ready: bool, timeout_s: float,
+                   sleep: Callable[[float], None]) -> str:
+    """``ready`` (stopped at the gate), ``exited`` or ``timeout``."""
+    deadline = time.monotonic() + timeout_s
+    probe = (f"if [ -e {EXEC_RC} ]; then echo exited; "
+             + (f"elif [ -e {GATE}.ready ]; then echo ready; " if want_ready
+                else "") + "fi")
+    while True:
+        _, out = guest.run(probe)
+        if out.strip() in ("ready", "exited"):
+            return out.strip()
+        if time.monotonic() >= deadline:
+            return "timeout"
+        sleep(POLL_S)
 
 
 def run_lane(guest: Guest, files: dict[str, Path], program: Path,
@@ -209,17 +237,37 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
         _checked(guest, f"chmod 0755 {GUEST_DIR}/syz-executor "
                         f"{GUEST_DIR}/syz-execprog")
         sleep(config.grace_s)
-        raw_before = _checked(guest, STATS_COMMAND)
-        result["stats_before"] = raw_before
-        run.stats_before = parse_stats(raw_before)
-        run.collection_started = bool(run.stats_before)
-        rc, rc_line = guest.run(execprog_argv(config.exec_timeout_s),
-                                timeout=config.exec_timeout_s + 60)
-        result["execprog"] = rc_line.strip()
-        run.runner_completed = rc == 0 and rc_line.strip() == "rc=0"
+        _checked(guest, execprog_argv(config.exec_timeout_s))
+        gate = _wait_execprog(guest, True, config.exec_timeout_s, sleep)
+        result["execprog_gate"] = gate
+        if gate == "ready":
+            # execprog has finished the machine check and waits: the
+            # window opens here, so only the program's generation is in it.
+            state = _checked(guest, STATE_COMMAND)
+            result["generations_before"] = state
+            busy = unsettled_generations(state)
+            raw_before = _checked(guest, STATS_COMMAND)
+            result["stats_before"] = raw_before
+            if busy:
+                run.runtime_errors.append(
+                    f"generation_unsettled_at_window_start:{busy[0][:200]}")
+            else:
+                run.stats_before = parse_stats(raw_before)
+                run.collection_started = bool(run.stats_before)
+            _checked(guest, f"touch {GATE}.go")
+            done = _wait_execprog(guest, False, config.exec_timeout_s + 60,
+                                  sleep)
+        else:
+            done = gate
+        rc_text = _checked(guest, f"cat {EXEC_RC} 2>/dev/null || true").strip()
+        result["execprog"] = f"{done}:rc={rc_text}"
+        run.runner_completed = gate == "ready" and done == "exited" \
+            and rc_text == "0"
         if not run.runner_completed:
-            run.runtime_errors.append(f"execprog_failed:{rc_line.strip()}")
-        _, log = guest.run("cat /tmp/exec.log", timeout=120)
+            stage = "before_gate" if gate != "ready" else "after_gate"
+            run.runtime_errors.append(
+                f"execprog_failed_{stage}:{done}:rc={rc_text}")
+        _, log = guest.run(f"cat {EXEC_LOG}", timeout=120)
         _write_log(out / "executor.log", log)
         sleep(config.drain_s)
         raw_after = _checked(guest, STATS_COMMAND)

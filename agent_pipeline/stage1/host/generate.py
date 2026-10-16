@@ -136,6 +136,40 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def series_fingerprint(kind: str) -> str:
+    """The checked-in ``bundle/patches/<kind>`` series digest.  It is the
+    ``series_sha256`` ``tools/bootstrap-kcov-env.py`` records for a build,
+    and, for syzkaller, the ``patch_series_sha256`` of the parser bundle
+    ``tools/syzkaller/build.py`` makes (same bytes: name, NUL, patch, NUL)."""
+    digest = hashlib.sha256()
+    for path in sorted((REPO / "bundle" / "patches" / kind).glob("*.patch")):
+        digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def _build_record(path: Path, kind: str, tree: Path) -> dict:
+    """A bootstrap build record that matches the checked-in series and the
+    tree as it is now; the same rules as the bootstrap's ``stale_build``."""
+    try:
+        record = _read_json(path)
+    except (OSError, ValueError):
+        raise GenerationError(f"{path} is missing or unreadable; rebuild "
+                              "with tools/bootstrap-kcov-env.py") from None
+    current = series_fingerprint(kind)
+    if record.get("series_sha256") != current:
+        raise GenerationError(
+            f"{path}: the {kind} build used another patch series "
+            f"({record.get('series_sha256')}, checked-in {current}); "
+            "rebuild with tools/bootstrap-kcov-env.py")
+    head = _git(tree, "rev-parse", "HEAD")
+    if record.get("head") != head:
+        raise GenerationError(
+            f"{path}: {tree} moved since the {kind} build (built "
+            f"{record.get('head')}, now {head}); rebuild or check out that "
+            "commit")
+    return record
+
+
 def _sorted_selections(items):
     return tuple(sorted(items, key=_runtime_key))
 
@@ -174,12 +208,10 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     images = env / "images"
     variant = images / spec.variant.value
     kernel_repo = env / "linux"
-    build = _read_json(variant / "build.json")
+    # The instrumentation manifest below pins the checked-in kernel series,
+    # so the kernel must have been built from exactly that series.
+    build = _build_record(variant / "build.json", "kernel", kernel_repo)
     kernel_commit = build["head"]
-    if _git(kernel_repo, "rev-parse", "HEAD") != kernel_commit:
-        raise GenerationError(
-            f"{kernel_repo} HEAD is not the commit {variant}/build.json "
-            f"records ({kernel_commit}); rebuild or check out that commit")
     files = {
         "bzimage": variant / "bzImage",
         "kernel": variant / "vmlinux",
@@ -207,8 +239,14 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     builds.sort(key=lambda b: b.name)
 
     # ---------------------------------------------------- syzkaller
+    # The executor binaries, the tree they were built from and the parser
+    # bundle must all be the checked-in syzkaller series: the binaries'
+    # build record names their series and tree, the bundle's identity
+    # names its series, and both trees must be the same.
     checkout = bundle.parent / "checkout"
     provenance = _read_json(bundle / "provenance.json")
+    syz_build = _build_record(env / "syzkaller" / "bin" / "build.json",
+                              "syzkaller", env / "syzkaller")
     syz_tree = _git(env / "syzkaller", "rev-parse", "HEAD^{tree}")
     if syz_tree != provenance["source_tree"]:
         raise GenerationError(
@@ -217,6 +255,15 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             f"{provenance['source_tree']}")
     identity = SyzkallerTargetIdentity.model_validate_json(
         (bundle / "identity.json").read_bytes())
+    series_bytes = (bundle / "patch-series.bin").read_bytes()
+    if (identity.patch_series_sha256 != series_fingerprint("syzkaller")
+            or hashlib.sha256(series_bytes).hexdigest()
+            != identity.patch_series_sha256):
+        raise GenerationError(
+            "the parser bundle was built from another syzkaller patch series "
+            f"({identity.patch_series_sha256}, checked-in "
+            f"{series_fingerprint('syzkaller')}); rebuild it with "
+            "tools/syzkaller/build.py")
     manifest = SyzkallerBuildManifest.model_validate_json(
         (bundle / "build-manifest.json").read_bytes())
     table = SyzkallerCallTable.model_validate_json(
@@ -225,7 +272,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         if store.put((bundle / f.path).read_bytes()) != f.artifact_ref:
             raise GenerationError(f"bundle file {f.path} differs from its "
                                   "build manifest")
-    store.put((bundle / "patch-series.bin").read_bytes())
+    store.put(series_bytes)
     for record in (manifest, table):
         put_record(store, record)
     if (identity.build_manifest_sha256 != put_record(store, manifest)
@@ -348,7 +395,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         "spec_sha256": hashlib.sha256(
             spec_path.read_bytes()).hexdigest(),
         "kernel_commit": kernel_commit, "kernel_build": build,
-        "syzkaller_provenance": provenance,
+        "syzkaller_build": syz_build, "syzkaller_provenance": provenance,
         "execution_harness_id": harness_id, "hcap_revision": hcap_ref,
         "digests": dict(sorted(digests.items())),
     }
