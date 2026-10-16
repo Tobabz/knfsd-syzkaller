@@ -1035,7 +1035,12 @@ Decoder가 target field와 span을 정확히 해석했음을 검증한다.
   않았다(2026-10-13 기준 XDR을 바꾸는 verified erratum 없음). XDR이 선언하지 않고 rpcgen의 C 환경에서 가져오는
   이름(주석으로만 적힌 basic typedef, RFC 5531의 `auth_flavor`와 `authsys_parms`)은 같은 pinned text에서
   규칙으로 만든 `prelude.x`가 공급한다. 손으로 쓴 XDR은 없다.
-- **미결:** NFSv3 XDR source. RFC 1813에는 추출 가능한 XDR 파일이 없어 source 형태를 따로 정해야 한다.
+- **결정됨:** NFSv3 XDR source는 RFC 1813이다. RFC 1813에는 추출 script가 없어 본문에 흩어진 정의를
+  `schema/rfc_xdr.py`의 `assemble` 규칙으로 하나씩 복사해 `tools/nfs-proxy/schema/nfs3/nfs3.x`를 만든다. RFC
+  본문과 결과 파일의 SHA-256을 `nfs3/SOURCES`에 pin한다. 본문에 prose로만 적힌 크기 상수(`NFS3_FHSIZE 64`)는
+  `const`로 바꾸고, program이 `FSINFO3args`로 부르는 `FSINFOargs`는 그 이름으로 바꿔 복사한다. `uint32`·`int32`가
+  쓰는 rpcgen의 `long`은 normalizer가 4 byte로 읽는다. RFC 1813 errata는 없다(2026-10-16). NFS program만
+  다루고 MOUNT, NLM, NFSACL은 `unsupported_schema`다.
 - **결정됨(2026-10-13, 저장소 소유자):** knfsd가 구현하는 NFSv4.2 확장을 지원한다. RFC 8276 xattr operation
   (72-75)과 RFC 9754 delegation type(4, 5)의 XDR을 RFC에서 추출해 pin하고(`SOURCES`), normalizer의 `extension`
   규칙이 RFC 7863 위에 합친다. 합치는 규칙은 새 정의 추가, 값이 늘어난 enum 재정의, RFC의 "Following lines are

@@ -2,8 +2,8 @@
 """Tests for rfc_xdr.py: pins, the RFC's own extraction rule, the prelude.
 
 Synthetic "RFC" texts stand in for the real ones, so these run offline.
-The real RFCs are checked by `rfc_xdr.py nfs4/SOURCES --verify`, which
-needs the network.  Run: python3 tools/nfs-proxy/schema/test_rfc_xdr.py
+The real RFCs are checked by `rfc_xdr.py nfs4/SOURCES --verify` and
+`rfc_xdr.py nfs3/SOURCES --verify`, which need the network.  Run: python3 tools/nfs-proxy/schema/test_rfc_xdr.py
 """
 
 import contextlib
@@ -230,9 +230,168 @@ class Copy(unittest.TestCase):
         self.assertIn("spans a page", str(cm.exception))
 
 
+# An RFC that prints its XDR only in its prose, the way RFC 1813 does:
+# a size stated as `NAME V`, a typedef stated twice, definitions that cross
+# a page break, a union, a program, and a name the program spells
+# differently from its declaration.
+RFC3 = """\
+RFC 9993                     Prose XDR                     October 2026
+
+   X_SIZE 8
+      The size of a verifier.
+
+   u32
+         typedef unsigned long u32;
+
+      enum xstat {
+         X_OK  = 0,
+         X_ERR = 1
+      };
+
+      struct xargs {
+           opaque  verf[X_SIZE];
+           u32     n;
+
+
+
+Someone                      Informational                     [Page 2]
+\f
+RFC 9993                     Prose XDR                     October 2026
+
+
+           u32     m;
+      };
+
+      union xres switch (xstat status) {
+      case X_OK:
+           u32  n;
+      default:
+           void;
+      };
+
+      struct XPINGargs {
+           u32  v;
+      };
+
+      program X_PROGRAM {
+         version X_V1 {
+            xres X_DO(xargs) = 1;
+            void X_PING(XPING1args) = 2;
+         } = 1;
+      } = 0x20000999;
+
+   Appendix: the same typedef, restated.
+
+         typedef unsigned long u32;
+"""
+
+ASSEMBLE = """\
+assemble x.x {pin}
+constant 9993 X_SIZE
+copy 9993 typedef u32
+copy 9993 enum xstat
+copy 9993 struct xargs
+copy 9993 union xres
+copy 9993 struct XPINGargs as XPING1args
+copy 9993 program X_PROGRAM
+"""
+
+
+class Assemble(unittest.TestCase):
+    """An XDR source assembled from an RFC's prose (RFC 1813)."""
+
+    def tree(self, rfc3=RFC3, body=ASSEMBLE):
+        t = Tree()
+        (t.rfcs / "rfc9993.txt").write_text(rfc3)
+        with open(t.manifest, "a") as f:
+            f.write(f"rfc 9993 {h(rfc3)}\n" + body.format(pin="0" * 64))
+        return t
+
+    def build(self, rfc3=RFC3, body=ASSEMBLE):
+        with self.tree(rfc3, body) as t:
+            return rfc_xdr.rebuild(t.manifest, t.rfcs)[1]["x.x"].decode()
+
+    def test_assembled_in_order(self):
+        x = self.build()
+        self.assertIn("/* RFC 9993 line 3, stated as prose */\n"
+                      "const X_SIZE = 8;\n", x)
+        self.assertIn("/* RFC 9993 line 7 */\ntypedef unsigned long u32;\n",
+                      x)
+        order = [x.index(k) for k in ("const X_SIZE", "typedef", "enum xstat",
+                                      "struct xargs", "union xres",
+                                      "struct XPING1args",
+                                      "program X_PROGRAM")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("not in its", rfc_xdr.build_file(
+            {"kind": "fragment", "parts": []}, {}, {}).decode())
+        self.assertIn("only in its prose", x)
+
+    def test_page_break_is_joined(self):
+        x = self.build()
+        self.assertIn("struct xargs {\n"
+                      "     opaque  verf[X_SIZE];\n"
+                      "     u32     n;\n"
+                      "     u32     m;\n"
+                      "};\n", x)
+        self.assertNotIn("Page", x)
+        self.assertNotIn("\f", x)
+        self.assertIn("/* RFC 9993 lines 14-26 */", x)
+
+    def test_union_program_and_rename(self):
+        x = self.build()
+        self.assertIn("union xres switch (xstat status) {\n", x)
+        self.assertIn("/* RFC 9993 lines 35-37, renamed from XPINGargs */\n"
+                      "struct XPING1args {\n", x)
+        self.assertIn("program X_PROGRAM {\n", x)
+        self.assertTrue(x.rstrip().endswith("} = 0x20000999;"))
+
+    def test_built_and_pinned(self):
+        with self.tree() as t:
+            x = rfc_xdr.rebuild(t.manifest, t.rfcs)[1]["x.x"]
+            (t.dir / "x.x").write_bytes(x)
+            text = t.manifest.read_text().replace("0" * 64,
+                                                  rfc_xdr.sha256(x))
+            t.manifest.write_text(text)
+            self.assertEqual(t.run("--verify"), 0)
+            self.assertEqual(quiet([str(t.manifest), "--check"]), 0)
+
+    def test_refusals(self):
+        for rfc3, body, needle in (
+                (RFC3.replace("   X_SIZE 8", "   X_SIZE 8\n   X_SIZE 9"),
+                 ASSEMBLE, "`X_SIZE N` occurs 2 times"),
+                (RFC3.replace("restated.\n\n         typedef unsigned long",
+                              "restated.\n\n         typedef long"),
+                 ASSEMBLE, "differently"),
+                (RFC3.replace("RFC 9993                     Prose XDR    "
+                              "                 October 2026\n\n\n",
+                              "\n\n"),
+                 ASSEMBLE, "page break that is not whole"),
+                (RFC3, ASSEMBLE.replace("copy 9993 union xres",
+                                        "copy 9993 union nosuch"),
+                 "occurs 0 times")):
+            with self.assertRaises(rfc_xdr.SourceError) as cm:
+                self.build(rfc3, body)
+            self.assertIn(needle, str(cm.exception))
+
+    def test_manifest_refusals(self):
+        for extra, needle in (
+                ("fragment f.x {}\nconstant 9992 X\n", "in an assemble"),
+                ("fragment f.x {}\ncopy 9992 enum flavor as other\n",
+                 "copy N KEYWORD NAME"),
+                ("assemble f.x {}\ncopy 9992 const X\n", "copy of a const")):
+            with Tree(extra=extra.format("0" * 64)) as t:
+                with self.assertRaises(rfc_xdr.SourceError) as cm:
+                    rfc_xdr.parse_manifest(t.manifest)
+            self.assertIn(needle, str(cm.exception))
+
+
 class Committed(unittest.TestCase):
     def test_nfs4_files_match_their_pins(self):
         self.assertEqual(rfc_xdr.main([str(HERE / "nfs4" / "SOURCES"),
+                                       "--check"]), 0)
+
+    def test_nfs3_files_match_their_pins(self):
+        self.assertEqual(rfc_xdr.main([str(HERE / "nfs3" / "SOURCES"),
                                        "--check"]), 0)
 
 

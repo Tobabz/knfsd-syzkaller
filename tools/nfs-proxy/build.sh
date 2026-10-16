@@ -74,12 +74,13 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_rpc_decode:$TEST/test_rpc_decode.c:$SRC/rpc_decode.c:$SRC/rpc_record.c:$SRC/walk.c\
        test_nfs_decode:$TEST/test_nfs_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$TEST/schema_tproto.c:$TEST/schema_tflat.c:$TEST/schema_tedge.c\
        test_nfs4_decode:$TEST/test_nfs4_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c\
+       test_nfs3_decode:$TEST/test_nfs3_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs3.c:$SRC/schema_nfs4.c\
        test_txn:$TEST/test_txn.c:$SRC/txn.c\
        test_activation:$TEST/test_activation.c:$SRC/activation.c\
        test_rule:$TEST/test_rule.c:$SRC/rule.c:$SRC/schema.c:$SRC/schema_nfs4.c:$TEST/schema_tproto.c:$TEST/schema_tflat.c:$TEST/schema_tedge.c\
        test_resolver:$TEST/test_resolver.c:$SRC/resolver.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$TEST/schema_tproto.c\
        test_mutation_apply:$TEST/test_mutation_apply.c:$SRC/mutation_apply.c:$SRC/resolver.c:$SRC/edit.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/rpc_record.c:$SRC/walk.c:$SRC/framing.c:$TEST/schema_tproto.c\
-       test_semantic:$TEST/test_semantic.c:$SRC/semantic.c:$SRC/txn.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c\
+       test_semantic:$TEST/test_semantic.c:$SRC/semantic.c:$SRC/txn.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c:$SRC/schema_nfs3.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c:$SRC/rpc_record.c:$SRC/rpc_decode.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
 
@@ -89,12 +90,13 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
 SCHEMAS="$TEST/schema/tproto.ann:$TEST/schema_tproto.c\
 	 $TEST/schema/tflat.ann:$TEST/schema_tflat.c\
 	 $TEST/schema/tedge.ann:$TEST/schema_tedge.c\
-	 $HERE/schema/nfs4/nfs4.ann:$SRC/schema_nfs4.c"
+	 $HERE/schema/nfs4/nfs4.ann:$SRC/schema_nfs4.c\
+	 $HERE/schema/nfs3/nfs3.ann:$SRC/schema_nfs3.c"
 
 # Pinned RFC XDR: every file here must still hash to its SOURCES pin.  The
 # offline check only; `schema/rfc_xdr.py SOURCES --verify` re-extracts from
 # the RFCs themselves and needs the network.
-XDR_SOURCES="$HERE/schema/nfs4/SOURCES"
+XDR_SOURCES="$HERE/schema/nfs4/SOURCES $HERE/schema/nfs3/SOURCES"
 
 # Fail early and loudly if a compiler is missing, rather than at the first use.
 for c in "$CC" "$SANCC" python3; do
@@ -264,7 +266,8 @@ if [ "$MODE" != "--test" ]; then
 		"$SRC/control.c" "$SRC/delta.c" "$SRC/walk.c" "$SRC/edit.c" \
 		"$SRC/semantic.c" "$SRC/resolver.c" "$SRC/mutation_apply.c" \
 		"$SRC/txn.c" "$SRC/activation.c" "$SRC/nfs_decode.c" \
-		"$SRC/schema.c" "$SRC/schema_nfs4.c" "$SRC/rpc_decode.c"
+		"$SRC/schema.c" "$SRC/schema_nfs4.c" "$SRC/schema_nfs3.c" \
+		"$SRC/rpc_decode.c"
 fi
 
 echo "=== host test suite: PASS ==="
