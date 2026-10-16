@@ -661,7 +661,7 @@ def test_late_cleanup_report_is_tracked_after_the_task_settled(world):
     assert job.state is JobState.S1_RUNNING
     replacement = job.pending_task.task_id
 
-    world.runner.late_reports.add(old)
+    world.runner.late_reports.add((old, 1))
     world.restart()
     job = world.job(j)
     assert job.uncleaned_tasks == (old,)
@@ -673,3 +673,34 @@ def test_late_cleanup_report_is_tracked_after_the_task_settled(world):
     assert world.c.replay(j) == job
     world.c.poll()                      # acknowledged: not applied again
     assert world.job(j) == job
+
+
+def test_late_cleanup_report_resent_after_failed_ack_applies_once(world):
+    """A report recorded on the job but not acknowledged is sent again; it
+    must not undo the operator's later cleanup confirmation."""
+    j = world.to_running()
+    old = world.job(j).pending_task.task_id
+    world.registry.put(binding("build-2"))
+    world.c.on_registry_changed()
+    world.runner.late_reports.add((old, 1))
+    world.runner.fail_ack = True
+    assert [f.effect for f in world.c.poll()] == [f"cleanup:{old}:1"]
+    world.expected_failures = 1
+    job = world.job(j)
+    assert job.state_reason == "execution_cleanup"
+    assert world.runner.late_reports == {(old, 1)}
+
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.uncleaned_tasks == ()
+    assert job.state is JobState.S1_RUNNING
+    resumed = job.pending_task.task_id
+
+    world.runner.fail_ack = False
+    world.restart()
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.pending_task.task_id == resumed
+    assert world.runner.cancel_calls[resumed] == 0
+    assert world.runner.late_reports == set()
+    assert world.c.replay(j) == job

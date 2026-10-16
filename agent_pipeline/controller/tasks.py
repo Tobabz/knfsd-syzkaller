@@ -109,11 +109,12 @@ class Runner(Protocol):
         """Stop and return the final status.  An unknown task_id is recorded
         as cancelled and answered ended_unsealed(cancelled)."""
 
-    def cleanup_reports(self) -> tuple[str, ...]:
-        """Tasks whose execution was reported not confirmed stopped after
-        their final status, not yet acknowledged."""
+    def cleanup_reports(self) -> tuple[tuple[str, int], ...]:
+        """(task_id, generation) of each execution reported not confirmed
+        stopped after its final status, not yet acknowledged."""
 
-    def acknowledge_cleanup_report(self, task_id: str) -> None:
+    def acknowledge_cleanup_report(self, task_id: str,
+                                   generation: int) -> None:
         """The Controller has recorded that report durably."""
 
 
