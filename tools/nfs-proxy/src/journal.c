@@ -209,7 +209,7 @@ int nfsp_journal_submit(struct nfsp_journal *j, const char *event_type,
 	    payload_json[payload_len - 1] != '}' ||
 	    !valid_event_type(event_type) || j->next_seq == UINT64_MAX)
 		return -1;
-	nfsp_jb_init(&b, NFSP_JOURNAL_MAX_PAYLOAD);
+	nfsp_jb_init(&b, NFSP_JOURNAL_MAX_REQUEST);
 	nfsp_jb_raw(&b, "{");
 	nfsp_jb_key(&b, "event_seq", 1);
 	nfsp_jb_u64(&b, j->next_seq);
@@ -373,58 +373,142 @@ static int write_head(struct nfsp_journal *j)
 }
 
 /* 0: handled (matched or stale), -1: not a valid answer here. */
+static int str_member(struct nfsp_jval obj, const char *key, char *out,
+		      size_t cap)
+{
+	struct nfsp_jval v;
+
+	return nfsp_json_member(obj, key, &v) == 0 &&
+	       nfsp_json_str(v, out, cap) == 0 ? 0 : -1;
+}
+
+static int valid_reason(const char *s)
+{
+	size_t n = 0;
+
+	for (; s[n] != '\0'; n++)
+		if (n >= NFSP_JOURNAL_REASON_MAX || !((s[n] >= 'a' && s[n] <= 'z') ||
+						      s[n] == '_'))
+			return 0;
+	return n > 0;
+}
+
+/* An answer is accepted only as the exact canonical document the host
+ * sink writes (agent_pipeline/journal_framing.py JournalAck, and
+ * journal_sink.py's reject response): every field present with its type
+ * and bound, no other field, sorted keys, no whitespace.  Rebuilding it
+ * from the values read and comparing the bytes checks all of that. */
+static int same_doc(const struct nfsp_jbuf *b, const char *doc, size_t len)
+{
+	return !b->failed && b->len == len && memcmp(b->p, doc, len) == 0;
+}
+
 static int answer(struct nfsp_journal *j, unsigned kind, const char *doc,
 		  size_t len)
 {
 	struct nfsp_jval root = { doc, len }, v, binding;
-	uint64_t seq = 0;
-	int has_seq;
+	uint64_t seq = 0, end = 0;
+	int has_seq, ok;
 	char reason[NFSP_JOURNAL_REASON_MAX + 1];
+	char journal_id[NFSP_JOURNAL_SESSION_ID_MAX + 1];
+	char sha[65], record_sha[65], session[NFSP_JOURNAL_SESSION_ID_MAX + 1];
+	char rule_set_id[65], vm[NFSP_JOURNAL_SESSION_ID_MAX + 1];
+	char channel[NFSP_JOURNAL_SESSION_ID_MAX + 1];
+	struct nfsp_jbuf b;
 	struct pending *p = j->head;
 
-	if (nfsp_json_valid(doc, len) != 0)
-		return -1;
-	if (kind == KIND_ACK) {
-		if (nfsp_json_member(root, "schema_version", &v) != 0 ||
-		    nfsp_json_str_eq(v, "nfs-proxy-journal-ack.v1") != 0 ||
-		    nfsp_json_member(root, "session_binding", &binding) != 0 ||
-		    nfsp_json_member(binding, "proxy_session_id", &v) != 0 ||
-		    nfsp_json_str_eq(v, j->session) != 0 ||
-		    nfsp_json_member(binding, "rule_set_id", &v) != 0 ||
-		    nfsp_json_str_eq(v, j->rule_set_id) != 0 ||
-		    nfsp_json_member(root, "event_seq", &v) != 0 ||
-		    nfsp_json_u64(v, &seq) != 0 ||
-		    nfsp_json_member(root, "request_sha256", &v) != 0)
-			return -1;
-		if (p == NULL || seq < p->seq) {
-			j->stats.stale_answers++;
-			return 0;
-		}
-		if (seq != p->seq || !p->sent_once ||
-		    nfsp_json_str_eq(v, p->sha) != 0)
-			return -1;
-		pop(j, NFSP_JOURNAL_ACKED, "");
-		return 0;
-	}
-	if (nfsp_json_member(root, "schema_version", &v) != 0 ||
-	    nfsp_json_str_eq(v, "nfs-proxy-journal-reject.v1") != 0 ||
-	    nfsp_json_member(root, "reason", &v) != 0 ||
-	    nfsp_json_str(v, reason, sizeof(reason)) != 0 ||
+	if (nfsp_json_valid(doc, len) != 0 ||
+	    str_member(root, "journal_id", journal_id, sizeof(journal_id)) != 0 ||
+	    !valid_session_id(journal_id) ||
+	    str_member(root, "request_sha256", sha, sizeof(sha)) != 0 ||
+	    !valid_hex64(sha) ||
 	    nfsp_json_member(root, "event_seq", &v) != 0)
 		return -1;
-	has_seq = !nfsp_json_is_null(v);
+	has_seq = kind == KIND_ACK || !nfsp_json_is_null(v);
 	if (has_seq && nfsp_json_u64(v, &seq) != 0)
 		return -1;
-	if (nfsp_json_member(root, "request_sha256", &v) != 0)
+	nfsp_jb_init(&b, len + 1u);
+	nfsp_jb_raw(&b, "{");
+	if (kind == KIND_ACK) {
+		if (nfsp_json_member(root, "committed_end_offset", &v) != 0 ||
+		    nfsp_json_u64(v, &end) != 0 ||
+		    end <= NFSP_JOURNAL_HEADER_LEN || end > (64u << 20) ||
+		    str_member(root, "record_sha256", record_sha,
+			       sizeof(record_sha)) != 0 ||
+		    !valid_hex64(record_sha) ||
+		    nfsp_json_member(root, "session_binding", &binding) != 0 ||
+		    str_member(binding, "channel_id", channel,
+			       sizeof(channel)) != 0 ||
+		    !valid_session_id(channel) ||
+		    str_member(binding, "proxy_session_id", session,
+			       sizeof(session)) != 0 ||
+		    str_member(binding, "rule_set_id", rule_set_id,
+			       sizeof(rule_set_id)) != 0 ||
+		    str_member(binding, "vm_instance_id", vm, sizeof(vm)) != 0 ||
+		    !valid_session_id(vm)) {
+			nfsp_jb_free(&b);
+			return -1;
+		}
+		nfsp_jb_key(&b, "committed_end_offset", 1);
+		nfsp_jb_u64(&b, end);
+		nfsp_jb_key(&b, "event_seq", 0);
+		nfsp_jb_u64(&b, seq);
+		nfsp_jb_key(&b, "journal_id", 0);
+		nfsp_jb_str(&b, journal_id);
+		nfsp_jb_key(&b, "record_sha256", 0);
+		nfsp_jb_str(&b, record_sha);
+		nfsp_jb_key(&b, "request_sha256", 0);
+		nfsp_jb_str(&b, sha);
+		nfsp_jb_key(&b, "schema_version", 0);
+		nfsp_jb_str(&b, "nfs-proxy-journal-ack.v1");
+		nfsp_jb_key(&b, "session_binding", 0);
+		nfsp_jb_raw(&b, "{");
+		nfsp_jb_key(&b, "channel_id", 1);
+		nfsp_jb_str(&b, channel);
+		/* The binding must be this session's own. */
+		nfsp_jb_key(&b, "proxy_session_id", 0);
+		nfsp_jb_str(&b, j->session);
+		nfsp_jb_key(&b, "rule_set_id", 0);
+		nfsp_jb_str(&b, j->rule_set_id);
+		nfsp_jb_key(&b, "vm_instance_id", 0);
+		nfsp_jb_str(&b, vm);
+		nfsp_jb_raw(&b, "}}");
+	} else {
+		if (str_member(root, "reason", reason, sizeof(reason)) != 0 ||
+		    !valid_reason(reason)) {
+			nfsp_jb_free(&b);
+			return -1;
+		}
+		nfsp_jb_key(&b, "event_seq", 1);
+		if (has_seq)
+			nfsp_jb_u64(&b, seq);
+		else
+			nfsp_jb_raw(&b, "null");
+		nfsp_jb_key(&b, "journal_id", 0);
+		nfsp_jb_str(&b, journal_id);
+		nfsp_jb_key(&b, "reason", 0);
+		nfsp_jb_str(&b, reason);
+		nfsp_jb_key(&b, "request_sha256", 0);
+		nfsp_jb_str(&b, sha);
+		nfsp_jb_key(&b, "schema_version", 0);
+		nfsp_jb_str(&b, "nfs-proxy-journal-reject.v1");
+		nfsp_jb_raw(&b, "}");
+	}
+	ok = same_doc(&b, doc, len);
+	nfsp_jb_free(&b);
+	if (!ok)
 		return -1;
 	if (p == NULL || (has_seq && seq < p->seq)) {
+		/* The answer to a retransmission of an event already
+		 * answered. */
 		j->stats.stale_answers++;
 		return 0;
 	}
 	if ((has_seq && seq != p->seq) || !p->sent_once ||
-	    nfsp_json_str_eq(v, p->sha) != 0)
+	    strcmp(sha, p->sha) != 0)
 		return -1;
-	pop(j, NFSP_JOURNAL_REJECTED, reason);
+	pop(j, kind == KIND_ACK ? NFSP_JOURNAL_ACKED : NFSP_JOURNAL_REJECTED,
+	    kind == KIND_ACK ? "" : reason);
 	return 0;
 }
 

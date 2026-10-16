@@ -414,3 +414,181 @@ def test_cli_serves_an_installed_session(tmp_path):
     reopened = HostJournal(tmp_path / "j", "lane0")
     assert [e.request.event_type for e in reopened.events(SESSION)] == ["RULESET"]
     reopened.close()
+
+
+def run_complete(**kw):
+    p = {"batch_count": 0, "evidence_path_failures": 0, "forward_complete_count": 0,
+         "forward_failed_count": 0, "generations": 0, "outside_activation_window": 0}
+    p.update(kw)
+    return p
+
+
+def test_run_complete_needs_closed_generations_terminal_batches_and_counts(journal):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1), "draining_generations": []})[1])
+    refused(g.send("RUN_COMPLETE", run_complete(generations=1))[1], "generations_open")
+    accepted(g.send("EXPOSURE_INTENT", exposure(1, 0))[1])
+    accepted(g.send("GENERATION_DRAINING", {"correlation": corr(1)})[1])
+    refused(g.send("RUN_COMPLETE", run_complete(generations=1, batch_count=1))[1],
+            "generations_open")
+    accepted(g.send("FORWARD_FAILED", {"batch_id": 0, "bytes_written": 3,
+                                       "correlation": corr(1), "reason": "x"})[1])
+    accepted(g.send("GENERATION_COMPLETE", summary(1))[1])
+    refused(g.send("RUN_COMPLETE", run_complete(generations=1, batch_count=1,
+                                                forward_complete_count=1))[1],
+            "summary_mismatch")
+    assert journal.session_state(SESSION)["ended"] is None
+    accepted(g.send("RUN_COMPLETE", run_complete(generations=1, batch_count=1,
+                                                 forward_failed_count=1))[1])
+    assert journal.session_state(SESSION)["ended"] == "run_complete"
+
+
+def test_summary_must_match_host_generation_state(journal):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1), "draining_generations": []})[1])
+    no_batches = dict(summary(1), exposure_batch_count=0)
+    # A clean drain needs the host to have seen the generation draining.
+    refused(g.send("GENERATION_COMPLETE", no_batches)[1], "closure_mismatch")
+    refused(g.send("GENERATION_COMPLETE",
+                   dict(no_batches, closure={"drain_bound_ms": 5000,
+                                             "reason": "reply_unresolved",
+                                             "reply_unresolved_count": 1}))[1],
+            "closure_mismatch")
+    # An abort may close an admitting generation.
+    accepted(g.send("GENERATION_COMPLETE", summary_with(no_batches, "aborted"))[1])
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(2), "draining_generations": []})[1])
+    accepted(g.send("GENERATION_DRAINING", {"correlation": corr(2)})[1])
+    dirty = dict(summary(2), exposure_batch_count=0,
+                 closure={"drain_bound_ms": 5000, "reason": "drained",
+                          "reply_unresolved_count": 2})
+    refused(g.send("GENERATION_COMPLETE", dirty)[1], "closure_mismatch")
+    refused(g.send("GENERATION_COMPLETE", summary(2))[1], "summary_mismatch")
+    accepted(g.send("GENERATION_COMPLETE", dict(summary(2), exposure_batch_count=0))[1])
+
+
+def summary_with(base, reason):
+    return dict(base, closure={"drain_bound_ms": 5000, "reason": reason,
+                               "reply_unresolved_count": 0})
+
+
+def test_terminal_length_must_match_the_intent(journal):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1), "draining_generations": []})[1])
+    accepted(g.send("EXPOSURE_INTENT", exposure(1, 0))[1])  # 200 bytes
+    refused(g.send("FORWARD_COMPLETE", {"batch_id": 0, "correlation": corr(1),
+                                        "forwarded_length": 1})[1], "forward_length_mismatch")
+    refused(g.send("FORWARD_FAILED", {"batch_id": 0, "bytes_written": 200,
+                                      "correlation": corr(1), "reason": "x"})[1],
+            "forward_length_mismatch")
+    assert delivery_state(journal.events(SESSION), 0) == "delivery_unknown"
+    accepted(g.send("FORWARD_COMPLETE", {"batch_id": 0, "correlation": corr(1),
+                                         "forwarded_length": 200})[1])
+    assert delivery_state(journal.events(SESSION), 0) == "forward_complete"
+
+
+def _sized_exposure(seq, size):
+    """An EXPOSURE_INTENT request of exactly `size` canonical bytes."""
+    payload = exposure(1, 0)
+    edit = payload["applications"][0]["concrete_edits"][0]
+    edit["data"] = ""
+    base = len(request(seq, "EXPOSURE_INTENT", payload))
+    extra = size - base
+    edit["data"] = "00" * (extra // 2)
+    if extra % 2:
+        payload["applications"][0]["semantic_path"] += "x"
+    raw = request(seq, "EXPOSURE_INTENT", payload)
+    assert len(raw) == size
+    return raw
+
+
+def test_request_size_bound_leaves_room_for_the_stored_envelope(journal):
+    from agent_pipeline.journal_sink import MAX_REQUEST_BYTES
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1), "draining_generations": []})[1])
+    refused(journal.submit(CHANNEL, _sized_exposure(2, MAX_REQUEST_BYTES + 1)),
+            "malformed_request")
+    raw = _sized_exposure(2, MAX_REQUEST_BYTES)
+    accepted(journal.submit(CHANNEL, raw), raw)
+
+
+def test_unstorable_record_fails_the_channel_not_the_server(tmp_path):
+    from agent_pipeline.journal_framing import FrameLimits
+    j = HostJournal(tmp_path / "j", "lane0", limits=FrameLimits(payload_bytes=4096))
+    j.install_session(vm_instance_id="vm-1", channel_id="nfspj-0",
+                      proxy_session_id=SESSION, lane_id=LANE, rule_set=RULES)
+    host, guest = socket.socketpair()
+    ended = []
+    t = threading.Thread(target=lambda: ended.append(serve_channel(host, j, CHANNEL)))
+    t.start()
+    g = Guest(j)
+    accepted(g.send("RULESET", ruleset_payload())[1])
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1), "draining_generations": []})[1])
+    big = _sized_exposure(2, 8192)
+    guest.sendall(encode_frame(JournalFrame(FrameKind.JOURNAL_EVENT, big)))
+    t.join(timeout=5)
+    assert ended == ["sink_failed"]
+    guest.close()
+    host.close()
+    j.close()
+
+
+def test_fsync_makes_a_new_directory_chain_durable(tmp_path, monkeypatch):
+    synced = []
+    real = os.fsync
+
+    def record(fd):
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        return real(fd)
+    monkeypatch.setattr(os, "fsync", record)
+    j = HostJournal(tmp_path / "a" / "b", "lane0", fsync=True)
+    j.close()
+    # Each created entry is made durable in its parent: b in a, a in tmp.
+    assert synced[:2] == [str(tmp_path / "a"), str(tmp_path)]
+
+
+def _cli(tmp_path, rules, *extra):
+    import subprocess
+    import sys
+    return subprocess.Popen(
+        [sys.executable, "-m", "agent_pipeline.journal_sink", "--dir", str(tmp_path / "j"),
+         "--name", "lane0", "--socket", str(tmp_path / "s.sock"),
+         "--vm", CHANNEL.vm_instance_id, "--channel", CHANNEL.channel_id,
+         "--session", SESSION, "--rules", str(rules), *extra],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def test_cli_restart_resumes_the_recovered_session(tmp_path):
+    import signal
+    rules = tmp_path / "rules.bin"
+    rules.write_bytes(RULES)
+    raw = request(0, "RULESET", ruleset_payload())
+    answers = []
+    for _ in range(2):
+        proc = _cli(tmp_path, rules, "--lane", str(LANE))
+        try:
+            line = proc.stdout.readline()
+            assert line.startswith("journal sink ready:"), proc.stderr.read()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as guest:
+                guest.settimeout(10)
+                guest.connect(str(tmp_path / "s.sock"))
+                guest.sendall(encode_frame(JournalFrame(FrameKind.JOURNAL_EVENT, raw)))
+                header = guest.recv(80, socket.MSG_WAITALL)
+                answers.append(header + guest.recv(int.from_bytes(header[12:16], "big"),
+                                                   socket.MSG_WAITALL))
+            proc.send_signal(signal.SIGTERM)
+            proc.communicate(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        assert proc.returncode == 0
+    assert "resumed" in line
+    # The lost-ACK path: the restarted sink re-answers without appending.
+    assert answers[0] == answers[1]
+    accepted(answers[1], raw)
+    reopened = HostJournal(tmp_path / "j", "lane0")
+    assert [e.request.event_type for e in reopened.events(SESSION)] == ["RULESET"]
+    reopened.close()
+    # Another lane under the same session id is refused, not reinstalled.
+    proc = _cli(tmp_path, rules, "--lane", str(LANE + 1))
+    _, err = proc.communicate(timeout=10)
+    assert proc.returncode == 2 and "differs" in err

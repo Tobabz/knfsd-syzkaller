@@ -55,6 +55,11 @@ REJECT_RESPONSE_SCHEMA = "nfs-proxy-journal-reject.v1"
 INSTALL_SCHEMA = "nfs-proxy-journal-install.v1"
 SESSION_END_SCHEMA = "nfs-proxy-journal-session-end.v1"
 
+# A request is stored inside an envelope (binding, digest, schema) that must
+# still fit one frame; this much of the frame is kept for that envelope.
+ENVELOPE_RESERVE_BYTES = 64 * 1024
+MAX_REQUEST_BYTES = MAX_PAYLOAD_BYTES - ENVELOPE_RESERVE_BYTES
+
 RULESET_MAGIC = b"NFSPRUL1"
 RULESET_MAX_BYTES = 1 << 20
 SEMANTIC_RUNTIME_VERSION = 1
@@ -260,8 +265,8 @@ class RequestError(ValueError):
 
 
 def parse_request(raw: bytes) -> JournalRequest:
-    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_PAYLOAD_BYTES:
-        raise RequestError("request payload outside framing bounds")
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_REQUEST_BYTES:
+        raise RequestError("request payload outside admission bounds")
     try:
         parse_json(raw)
         envelope = _Envelope.model_validate_json(raw)
@@ -318,6 +323,7 @@ class ChannelIdentity:
 class _Batch:
     generation: int
     message_type: str
+    final_record_length: int
     terminal: str | None = None
 
 
@@ -396,7 +402,7 @@ def _admit(session: _Session, request: JournalRequest) -> _Verdict:
     if not session.ruleset_accepted:
         return _refuse("ruleset_required")
     if kind == "RUN_COMPLETE":
-        return _accept()
+        return _admit_run_complete(session, payload)  # type: ignore[arg-type]
     corr: Correlation = payload.correlation  # type: ignore[attr-defined]
     if corr.lane_id != session.lane_id:
         return _refuse("wrong_lane")
@@ -438,11 +444,43 @@ def _admit(session: _Session, request: JournalRequest) -> _Verdict:
             return _refuse("batch_generation_mismatch")
         if batch.terminal is not None:
             return _refuse("batch_conflict", inconsistent=True)
+        # The terminal names the bytes of the batch's own output (§16-§18).
+        if isinstance(payload, ForwardCompletePayload):
+            if payload.forwarded_length != batch.final_record_length:
+                return _refuse("forward_length_mismatch", inconsistent=True)
+        elif payload.bytes_written >= batch.final_record_length:  # type: ignore[attr-defined]
+            return _refuse("forward_length_mismatch", inconsistent=True)
         return _accept()
     assert kind == "GENERATION_COMPLETE"
-    if any(b.generation == corr.kcov_generation and b.terminal is None
-           for b in session.batches.values()):
+    assert isinstance(payload, GenerationCompletePayload)
+    batches = [b for b in session.batches.values() if b.generation == corr.kcov_generation]
+    if any(b.terminal is None for b in batches):
         return _refuse("batches_unterminated", inconsistent=True)
+    closure = payload.closure
+    # Only an abort may close a generation the host never saw draining; a
+    # clean drain leaves nothing unresolved (01 §16).
+    if gen.state != "draining" and closure.reason != "aborted":
+        return _refuse("closure_mismatch", inconsistent=True)
+    if closure.reason == "drained" and closure.reply_unresolved_count != 0:
+        return _refuse("closure_mismatch", inconsistent=True)
+    if payload.exposure_batch_count != len(batches):
+        return _refuse("summary_mismatch", inconsistent=True)
+    return _accept()
+
+
+def _admit_run_complete(session: _Session, payload: RunCompletePayload) -> _Verdict:
+    """The session's last event: everything it opened is closed and terminal,
+    and every count the host can compute agrees."""
+    if any(g.state != "closed" for g in session.generations.values()):
+        return _refuse("generations_open", inconsistent=True)
+    terminals = [b.terminal for b in session.batches.values()]
+    if None in terminals:
+        return _refuse("batches_unterminated", inconsistent=True)
+    if (payload.generations != len(session.generations)
+            or payload.batch_count != len(terminals)
+            or payload.forward_complete_count != terminals.count("complete")
+            or payload.forward_failed_count != terminals.count("failed")):
+        return _refuse("summary_mismatch", inconsistent=True)
     return _accept()
 
 
@@ -464,7 +502,7 @@ def _apply(session: _Session, request: JournalRequest) -> None:
     elif kind == "EXPOSURE_INTENT":
         assert isinstance(payload, ExposureIntentPayload)
         session.batches[payload.batch_id] = _Batch(
-            g, payload.record_context.message_type)
+            g, payload.record_context.message_type, payload.output.final_record_length)
     elif kind == "FORWARD_COMPLETE":
         session.batches[payload.batch_id].terminal = "complete"  # type: ignore[attr-defined]
     elif kind == "FORWARD_FAILED":
@@ -557,8 +595,29 @@ class HostJournal:
         self._fd: int | None = None
         self._failed = False
         self._total = 0
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self._make_directory()
         self._recover()
+
+    def _make_directory(self) -> None:
+        """Create the journal directory; with fsync, make every entry this
+        created durable in its parent before anything is ACKed."""
+        created = []
+        path = self.directory.absolute()
+        while not path.exists():
+            created.append(path)
+            path = path.parent
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if self.fsync:
+            for child in created:  # bottom-up: the entry, then its parent's
+                self._fsync_dir(child.parent)
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     # -- segments --
 
@@ -594,17 +653,17 @@ class HostJournal:
         path = self.directory / f"{self._journal_id()}{SEGMENT_SUFFIX}"
         self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
         if self.fsync:
-            dfd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            self._fsync_dir(self.directory)
 
     def _append(self, kind: FrameKind, payload: bytes) -> tuple[str, int, bytes]:
         """Append one complete frame; (journal_id, end offset, frame bytes)."""
         if self._failed:
             raise JournalSinkError("journal writer failed earlier")
-        frame = encode_frame(JournalFrame(kind, payload), limits=self.limits)
+        try:
+            frame = encode_frame(JournalFrame(kind, payload), limits=self.limits)
+        except JournalFramingError as error:
+            # Not storable as one frame: fail this channel, keep the server.
+            raise JournalSinkError(f"record not storable: {error}") from error
         if self._total + len(frame) > self.max_total_bytes:
             raise JournalSinkError("journal storage limit reached")
         if self._fd is not None and (
@@ -662,6 +721,23 @@ class HostJournal:
             self._append(FrameKind.JOURNAL_EVENT, canonical_json(body))
             self._sessions[proxy_session_id] = _Session(binding, lane_id, rule_set)
         return binding
+
+    def resume_session(self, *, vm_instance_id: str, channel_id: str,
+                       proxy_session_id: str, lane_id: int,
+                       rule_set: bytes) -> HostSessionBinding | None:
+        """The recovered session, when it is exactly this one; None when no
+        such session was installed.  A different binding, lane or rule set
+        under the same id is refused: a restart never changes a session."""
+        with self._lock:
+            session = self._sessions.get(proxy_session_id)
+            if session is None:
+                return None
+            b = session.binding
+            if ((b.vm_instance_id, b.channel_id, b.rule_set_id) !=
+                    (vm_instance_id, channel_id, hashlib.sha256(rule_set).hexdigest())
+                    or session.lane_id != lane_id or session.rule_set != rule_set):
+                raise ValueError("recovered session differs from the requested one")
+            return b
 
     def end_session(self, proxy_session_id: str, reason: str) -> None:
         """No more events will be accepted (Proxy restart, channel/VM end)."""
@@ -958,6 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     import argparse
     import signal
+    import sys
 
     parser = argparse.ArgumentParser(prog="python -m agent_pipeline.journal_sink")
     parser.add_argument("--dir", type=Path, required=True)
@@ -972,11 +1049,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     journal = HostJournal(args.dir, args.name, fsync=args.fsync)
-    binding = journal.install_session(
-        vm_instance_id=args.vm, channel_id=args.channel, proxy_session_id=args.session,
-        lane_id=args.lane, rule_set=args.rules.read_bytes())
+    session = dict(vm_instance_id=args.vm, channel_id=args.channel,
+                   proxy_session_id=args.session, lane_id=args.lane,
+                   rule_set=args.rules.read_bytes())
+    # A restart (Runner, or QEMU reconnecting) continues the recovered
+    # session; it is installed only the first time.
+    try:
+        binding = journal.resume_session(**session)
+        resumed = binding is not None
+        if binding is None:
+            binding = journal.install_session(**session)
+    except ValueError as error:
+        journal.close()
+        print(f"journal sink refused: {error}", file=sys.stderr, flush=True)
+        return 2
     server = ChannelServer(args.socket, journal, ChannelIdentity(args.vm, args.channel))
-    print(f"journal sink ready: session={binding.proxy_session_id} "
+    print(f"journal sink ready: {'resumed' if resumed else 'installed'} "
+          f"session={binding.proxy_session_id} "
           f"rule_set_id={binding.rule_set_id} socket={args.socket}", flush=True)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

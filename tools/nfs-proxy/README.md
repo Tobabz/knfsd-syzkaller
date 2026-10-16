@@ -261,6 +261,10 @@ nfs-proxy CLIENT0 CLIENT1 K_LISTEN G_LISTEN K_BACKEND G_BACKEND \
   `APPLY_REFUSAL` before the refused record moves, and without a host answer it never moves.
 - A held record stops only its own connection and direction. The final stats line starts with
   `target ruleset=...`, followed by a `journal ...` line.
+- On exit the Proxy first settles every answer still owed and the events they queue, then sends
+  `RUN_COMPLETE` last, and only when the session ended cleanly (every event ACKed, every opened
+  generation summarized, every batch terminal). Otherwise the stats say `run_complete=skipped` and
+  the Runner ends the session.
 
 The host side is `agent_pipeline/journal_sink.py`:
 
@@ -269,6 +273,10 @@ python -m agent_pipeline.journal_sink --dir JOURNAL_DIR --name lane0 \
     --socket /run/knfsd-syzkaller/nfsp-journal.sock --vm vm-0 --channel nfsp-journal \
     --session ps-1 --lane 0 --rules RULES.nfsprul1
 ```
+
+Run the same command again after a restart: it resumes the recovered session (and re-answers a
+retransmitted event without storing it twice), and refuses to start if the binding, lane or rule
+set differ.
 
 `tests/agent_pipeline/test_journal_live.py` runs the built Proxy (with ASan when the compiler has
 it) against this sink on loopback; `tools/nfs-proxy/build.sh` covers `test_journal` and the relay

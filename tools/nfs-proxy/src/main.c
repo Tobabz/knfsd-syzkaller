@@ -377,8 +377,11 @@ int main(int argc, char **argv)
 	signal(SIGTERM, stop_signal);
 	signal(SIGUSR1, snapshot_signal);
 	rc = nfsp_proxy_run(&cfg, &stats, ready, NULL);
-	/* RUN_COMPLETE, and a bounded wait for every answer still owed. */
-	nfsp_target_finish(app.target, 5000u);
+	/* Every answer still owed, then RUN_COMPLETE if the session is clean.
+	 * The wait covers a draining generation's bound. */
+	nfsp_target_finish(app.target,
+			   (tcfg.drain_bound_ms ? tcfg.drain_bound_ms :
+			    NFSP_TARGET_DEFAULT_DRAIN_MS) + 5000u);
 	report(&stats, "final", &app);
 	nfsp_target_close(app.target);
 	if (app.semantic != NULL)

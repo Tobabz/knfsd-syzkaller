@@ -52,6 +52,8 @@ struct tgen {
 	uint64_t generation;
 	uint8_t digest[32];
 	int draining_acked, complete_sent, drain_deadline_set;
+	int open_sent;
+	uint64_t open_seq, complete_seq;
 	uint64_t drain_deadline;
 	uint64_t exposures, evidence_failures, open_batches;
 	uint64_t *counts;	/* nrules * NCOUNT */
@@ -140,7 +142,7 @@ struct nfsp_target {
 
 	struct current cur;
 	uint8_t *release;	/* output handed to the relay last time */
-	int run_sent;
+	enum { RUN_NOT_SENT = 0, RUN_SENT, RUN_SKIPPED } run_state;
 	uint64_t run_seq;
 	struct nfsp_target_stats stats;
 };
@@ -505,6 +507,7 @@ gate(void *arg, const struct nfsp_activation_gate_request *req)
 	struct tgen *g = find_gen(t, req->barrier.generation);
 	struct nfsp_jbuf b;
 	int draining = req->barrier.event == NFSP_GATE_GENERATION_DRAINING;
+	uint64_t seq = 0;
 	int rc;
 
 	if (!draining) {
@@ -547,8 +550,12 @@ gate(void *arg, const struct nfsp_activation_gate_request *req)
 	}
 	nfsp_jb_raw(&b, "}");
 	rc = submit(t, draining ? "GENERATION_DRAINING" : "GENERATION_OPEN",
-		    &b, COOKIE(CK_BARRIER, req->barrier.id), NULL);
+		    &b, COOKIE(CK_BARRIER, req->barrier.id), &seq);
 	nfsp_jb_free(&b);
+	if (rc == 0 && !draining) {
+		g->open_sent = 1;
+		g->open_seq = seq;
+	}
 	return rc == 0 ? NFSP_ACTIVATION_GATE_PENDING :
 			 NFSP_ACTIVATION_GATE_NO_ACK;
 }
@@ -636,7 +643,7 @@ static void complete_generation(struct nfsp_target *t, struct tgen *g,
 	}
 	nfsp_jb_raw(&b, "]}");
 	if (submit(t, "GENERATION_COMPLETE", &b,
-		   COOKIE(CK_COMPLETE, g->generation), NULL) != 0)
+		   COOKIE(CK_COMPLETE, g->generation), &g->complete_seq) != 0)
 		gen_failure(t, g->generation);
 	nfsp_jb_free(&b);
 	g->complete_sent = 1;
@@ -1661,49 +1668,100 @@ fail:
 	return -1;
 }
 
-void nfsp_target_finish(struct nfsp_target *t, uint32_t wait_ms)
+/* Pump until nothing is owed or the deadline passes.  Answers can queue
+ * more events (a batch's terminal, a generation's summary), so this runs
+ * the lifecycle too and stops only when the queue stays empty. */
+static void settle(struct nfsp_target *t, uint64_t deadline)
 {
-	uint64_t deadline = monotonic_ms() + wait_ms;
-
-	if (t == NULL)
-		return;
-	if (!t->run_sent && !nfsp_journal_failed(t->journal)) {
-		struct nfsp_jbuf b;
-		uint64_t batches = 0;
-
-		for (size_t i = 0; i < t->nbatches; i++)
-			if (t->batches[i].state != B_DEAD)
-				batches++;
-		nfsp_jb_init(&b, NFSP_JOURNAL_MAX_PAYLOAD);
-		nfsp_jb_raw(&b, "{");
-		nfsp_jb_key(&b, "batch_count", 1);
-		nfsp_jb_u64(&b, batches);
-		nfsp_jb_key(&b, "evidence_path_failures", 0);
-		nfsp_jb_u64(&b, t->stats.evidence_path_failures);
-		nfsp_jb_key(&b, "forward_complete_count", 0);
-		nfsp_jb_u64(&b, t->stats.forward_complete);
-		nfsp_jb_key(&b, "forward_failed_count", 0);
-		nfsp_jb_u64(&b, t->stats.forward_failed);
-		nfsp_jb_key(&b, "generations", 0);
-		nfsp_jb_u64(&b, t->ngens);
-		nfsp_jb_key(&b, "outside_activation_window", 0);
-		nfsp_jb_u64(&b, outside_window(t));
-		nfsp_jb_raw(&b, "}");
-		if (submit(t, "RUN_COMPLETE", &b, COOKIE(CK_RUN, 0),
-			   &t->run_seq) == 0)
-			t->run_sent = 1;
-		nfsp_jb_free(&b);
-	}
-	while (nfsp_journal_pending(t->journal) != 0 &&
-	       !nfsp_journal_failed(t->journal) && monotonic_ms() < deadline) {
+	for (;;) {
 		struct pollfd pfd;
 
+		nfsp_journal_pump(t->journal);
+		lifecycle(t);
+		nfsp_journal_pump(t->journal);
+		if (nfsp_journal_failed(t->journal) ||
+		    monotonic_ms() >= deadline)
+			return;
+		if (nfsp_journal_pending(t->journal) == 0) {
+			int open = 0;
+
+			/* A draining generation still closes at its bound. */
+			for (size_t i = 0; i < t->ngens; i++)
+				if (t->gens[i].draining_acked &&
+				    !t->gens[i].complete_sent)
+					open = 1;
+			if (!open)
+				return;
+		}
 		pfd.fd = nfsp_journal_fd(t->journal);
 		pfd.events = nfsp_journal_events(t->journal);
 		pfd.revents = 0;
-		(void)poll(&pfd, 1, 50);
-		nfsp_journal_pump(t->journal);
+		(void)poll(&pfd, 1, 20);
 	}
+}
+
+/* RUN_COMPLETE claims the session ended cleanly: every event answered
+ * with an ACK, every generation the host opened is summarized, every
+ * batch has its terminal.  Anything less is left to the Runner's
+ * session end (05 §21). */
+static int clean(const struct nfsp_target *t)
+{
+	if (nfsp_journal_failed(t->journal) ||
+	    nfsp_journal_pending(t->journal) != 0 ||
+	    t->stats.ruleset_state != 1 || t->stats.evidence_path_degraded)
+		return 0;
+	for (size_t i = 0; i < t->ngens; i++) {
+		const struct tgen *g = &t->gens[i];
+
+		if (!g->open_sent || ev_state(t, g->open_seq) != EV_ACKED ||
+		    !g->complete_sent ||
+		    ev_state(t, g->complete_seq) != EV_ACKED)
+			return 0;
+	}
+	for (size_t i = 0; i < t->nbatches; i++)
+		if (t->batches[i].state != B_DONE &&
+		    t->batches[i].state != B_DEAD)
+			return 0;
+	return 1;
+}
+
+void nfsp_target_finish(struct nfsp_target *t, uint32_t wait_ms)
+{
+	uint64_t deadline = monotonic_ms() + wait_ms;
+	struct nfsp_jbuf b;
+	uint64_t batches = 0;
+
+	if (t == NULL || t->run_state != RUN_NOT_SENT)
+		return;
+	settle(t, deadline);
+	if (!clean(t)) {
+		t->run_state = RUN_SKIPPED;
+		return;
+	}
+	for (size_t i = 0; i < t->nbatches; i++)
+		if (t->batches[i].state == B_DONE)
+			batches++;
+	nfsp_jb_init(&b, NFSP_JOURNAL_MAX_PAYLOAD);
+	nfsp_jb_raw(&b, "{");
+	nfsp_jb_key(&b, "batch_count", 1);
+	nfsp_jb_u64(&b, batches);
+	nfsp_jb_key(&b, "evidence_path_failures", 0);
+	nfsp_jb_u64(&b, t->stats.evidence_path_failures);
+	nfsp_jb_key(&b, "forward_complete_count", 0);
+	nfsp_jb_u64(&b, t->stats.forward_complete);
+	nfsp_jb_key(&b, "forward_failed_count", 0);
+	nfsp_jb_u64(&b, t->stats.forward_failed);
+	nfsp_jb_key(&b, "generations", 0);
+	nfsp_jb_u64(&b, t->ngens);
+	nfsp_jb_key(&b, "outside_activation_window", 0);
+	nfsp_jb_u64(&b, outside_window(t));
+	nfsp_jb_raw(&b, "}");
+	if (submit(t, "RUN_COMPLETE", &b, COOKIE(CK_RUN, 0), &t->run_seq) == 0)
+		t->run_state = RUN_SENT;
+	else
+		t->run_state = RUN_SKIPPED;
+	nfsp_jb_free(&b);
+	settle(t, deadline);
 }
 
 void nfsp_target_close(struct nfsp_target *t)
@@ -1757,7 +1815,7 @@ void nfsp_target_report(const struct nfsp_target *t, FILE *out)
 		"forward_complete=%llu forward_failed=%llu held_dropped=%llu "
 		"evidence_path_failures=%llu evidence_path_degraded=%d "
 		"outside_activation_window=%llu late_after_close=%llu "
-		"generations=%zu generations_complete=%llu\n",
+		"generations=%zu generations_complete=%llu run_complete=%s\n",
 		s->ruleset_state > 0 ? "acked" :
 		s->ruleset_state < 0 ? "failed" : "pending",
 		(unsigned long long)s->records,
@@ -1775,7 +1833,11 @@ void nfsp_target_report(const struct nfsp_target *t, FILE *out)
 		(unsigned long long)outside_window(t),
 		(unsigned long long)t->act.stats.late_after_close,
 		t->ngens,
-		(unsigned long long)s->generations_complete);
+		(unsigned long long)s->generations_complete,
+		t->run_state == RUN_SKIPPED ? "skipped" :
+		t->run_state == RUN_NOT_SENT ? "not_sent" :
+		ev_state(t, t->run_seq) == EV_ACKED ? "acked" :
+		ev_state(t, t->run_seq) == EV_PENDING ? "pending" : "failed");
 	fprintf(out, "journal submitted=%llu sent=%llu retransmits=%llu "
 		"acked=%llu rejected=%llu lost=%llu stale_answers=%llu "
 		"pending=%zu channel=%s\n",

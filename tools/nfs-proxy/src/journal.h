@@ -30,6 +30,9 @@
 
 #define NFSP_JOURNAL_HEADER_LEN		80u
 #define NFSP_JOURNAL_MAX_PAYLOAD	(4u << 20)
+/* A request is stored inside the host's envelope, which must still fit one
+ * frame: journal_sink.py MAX_REQUEST_BYTES. */
+#define NFSP_JOURNAL_MAX_REQUEST	(NFSP_JOURNAL_MAX_PAYLOAD - (64u << 10))
 #define NFSP_JOURNAL_DEFAULT_RETRANSMIT_MS	1000u
 #define NFSP_JOURNAL_SESSION_ID_MAX	256u
 #define NFSP_JOURNAL_REASON_MAX		64u

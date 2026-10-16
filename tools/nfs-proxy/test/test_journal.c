@@ -360,6 +360,109 @@ static void test_wrong_session_ack(void)
 	close(h.fd);
 }
 
+/* Only the host's exact canonical document is an answer: a reduced, padded,
+ * extended or reordered one fails the channel like any bad frame. */
+#define ZERO64 "0000000000000000000000000000000000000000000000000000000000000000"
+
+/* tmpl with its one '@' replaced by sha. */
+static void with_sha(char *out, size_t cap, const char *tmpl, const char *sha)
+{
+	const char *at = strchr(tmpl, '@');
+	size_t head = at ? (size_t)(at - tmpl) : strlen(tmpl);
+
+	snprintf(out, cap, "%.*s%s%s", (int)head, tmpl, at ? sha : "",
+		 at ? at + 1 : "");
+}
+
+static void test_ack_must_be_exact(void)
+{
+	static const char *const bad[] = {
+		/* the five fields journal.c once checked, nothing else */
+		"{\"event_seq\":0,\"request_sha256\":\"@\",\"schema_version\":"
+		"\"nfs-proxy-journal-ack.v1\",\"session_binding\":{"
+		"\"proxy_session_id\":\"" SESSION "\",\"rule_set_id\":\"" RSID "\"}}",
+		/* an extra field */
+		"{\"committed_end_offset\":200,\"event_seq\":0,\"extra\":1,"
+		"\"journal_id\":\"lane0.0001\",\"record_sha256\":\"" ZERO64 "\","
+		"\"request_sha256\":\"@\",\"schema_version\":"
+		"\"nfs-proxy-journal-ack.v1\",\"session_binding\":{"
+		"\"channel_id\":\"c\",\"proxy_session_id\":\"" SESSION "\","
+		"\"rule_set_id\":\"" RSID "\",\"vm_instance_id\":\"vm\"}}",
+		/* whitespace: valid JSON, not canonical */
+		"{\"committed_end_offset\": 200,\"event_seq\":0,"
+		"\"journal_id\":\"lane0.0001\",\"record_sha256\":\"" ZERO64 "\","
+		"\"request_sha256\":\"@\",\"schema_version\":"
+		"\"nfs-proxy-journal-ack.v1\",\"session_binding\":{"
+		"\"channel_id\":\"c\",\"proxy_session_id\":\"" SESSION "\","
+		"\"rule_set_id\":\"" RSID "\",\"vm_instance_id\":\"vm\"}}",
+		/* keys out of order */
+		"{\"event_seq\":0,\"committed_end_offset\":200,"
+		"\"journal_id\":\"lane0.0001\",\"record_sha256\":\"" ZERO64 "\","
+		"\"request_sha256\":\"@\",\"schema_version\":"
+		"\"nfs-proxy-journal-ack.v1\",\"session_binding\":{"
+		"\"channel_id\":\"c\",\"proxy_session_id\":\"" SESSION "\","
+		"\"rule_set_id\":\"" RSID "\",\"vm_instance_id\":\"vm\"}}",
+		/* an end offset inside the header: names no stored frame */
+		"{\"committed_end_offset\":80,\"event_seq\":0,"
+		"\"journal_id\":\"lane0.0001\",\"record_sha256\":\"" ZERO64 "\","
+		"\"request_sha256\":\"@\",\"schema_version\":"
+		"\"nfs-proxy-journal-ack.v1\",\"session_binding\":{"
+		"\"channel_id\":\"c\",\"proxy_session_id\":\"" SESSION "\","
+		"\"rule_set_id\":\"" RSID "\",\"vm_instance_id\":\"vm\"}}",
+		/* the binding without its host identity */
+		"{\"committed_end_offset\":200,\"event_seq\":0,"
+		"\"journal_id\":\"lane0.0001\",\"record_sha256\":\"" ZERO64 "\","
+		"\"request_sha256\":\"@\",\"schema_version\":"
+		"\"nfs-proxy-journal-ack.v1\",\"session_binding\":{"
+		"\"proxy_session_id\":\"" SESSION "\","
+		"\"rule_set_id\":\"" RSID "\"}}",
+	};
+
+	printf("journal: an answer must be the host's exact canonical document\n");
+	for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		struct host h;
+		struct done_log log;
+		struct nfsp_journal *j = open_pair(&h, &log);
+		char json[1024];
+
+		if (j == NULL) { CHECK(0, "open"); return; }
+		submit(j, "RULESET", "{}", 1, 0);
+		nfsp_journal_pump(j);
+		CHECK(host_read(&h) == 1, "sent");
+		with_sha(json, sizeof(json), bad[i], h.sha);
+		host_send(&h, 3, json);
+		nfsp_journal_pump(j);
+		CHECK(log.n == 1 && log.outcome[0] == NFSP_JOURNAL_LOST,
+		      "bad answer %u released the event", i);
+		nfsp_journal_close(j);
+		close(h.fd);
+	}
+	{
+		/* A rejection that names no seq still answers the head. */
+		struct host h;
+		struct done_log log;
+		struct nfsp_journal *j = open_pair(&h, &log);
+		char json[512];
+
+		if (j == NULL) { CHECK(0, "open"); return; }
+		submit(j, "RULESET", "{}", 1, 0);
+		nfsp_journal_pump(j);
+		CHECK(host_read(&h) == 1, "sent");
+		snprintf(json, sizeof(json),
+			 "{\"event_seq\":null,\"journal_id\":\"lane0.0001\","
+			 "\"reason\":\"malformed_request\",\"request_sha256\":"
+			 "\"%s\",\"schema_version\":"
+			 "\"nfs-proxy-journal-reject.v1\"}", h.sha);
+		host_send(&h, 2, json);
+		nfsp_journal_pump(j);
+		CHECK(log.n == 1 && log.outcome[0] == NFSP_JOURNAL_REJECTED &&
+		      strcmp(log.reason[0], "malformed_request") == 0,
+		      "seq-less rejection");
+		nfsp_journal_close(j);
+		close(h.fd);
+	}
+}
+
 static void test_split_answer_and_eof(void)
 {
 	struct host h;
@@ -439,6 +542,7 @@ int main(void)
 	test_json();
 	test_one_outstanding_and_answers();
 	test_wrong_session_ack();
+	test_ack_must_be_exact();
 	test_split_answer_and_eof();
 	test_bad_arguments();
 	printf("%u checks, %u failures\n", checks, failures);

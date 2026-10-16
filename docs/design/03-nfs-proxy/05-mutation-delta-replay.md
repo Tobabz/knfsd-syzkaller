@@ -1344,9 +1344,13 @@ M5/S1b 완료와 M1 판정 연결은 실제 sink, guest transport, relay complet
   `{event_seq, event_type, payload, proxy_session_id, rule_set_id, schema_version =
   "nfs-proxy-journal-request.v1"}`. `payload`는 event type별 strict schema(추가 필드 거부)이며
   canonical이 아닌 bytes는 `malformed_request`다. `request_sha256`은 이 payload bytes 전체의 SHA-256이다.
+  request는 최대 4 MiB − 64 KiB다. 남긴 64 KiB는 저장 envelope(binding, digest)가 한 frame에 들어가게
+  하는 몫이고, 그래도 저장할 수 없는 record는 그 channel만 실패시킨다.
 - **Install / session end.** Runner의 `install_session`이 `nfs-proxy-journal-install.v1`(binding, lane,
   rule set bytes)을, `end_session`이 `nfs-proxy-journal-session-end.v1`을 kind 1 record로 먼저 남긴다.
-  restart는 이 record로 session을 복원한다. guest가 이 값을 정하지 않는다.
+  restart는 이 record로 session을 복원한다. guest가 이 값을 정하지 않는다. 실행 entry
+  (`python -m agent_pipeline.journal_sink`)는 같은 session이 이미 복원됐으면 binding, lane, rule set
+  bytes가 정확히 같을 때만 그 session을 이어 쓰고, 하나라도 다르면 시작을 거부한다.
 - **Accepted.** stored record는 `nfs-proxy-journal-event.v1` `{event_seq, event_type, request,
   request_sha256, schema_version, session_binding}`이고 응답은 이 frame을 가리키는 `JournalAck`다.
 - **Rejected.** stored record는 kind 2 `nfs-proxy-journal-rejection.v1` `{channel_id, consumed, event_seq,
@@ -1355,6 +1359,14 @@ M5/S1b 완료와 M1 판정 연결은 실제 sink, guest transport, relay complet
   schema_version}`이다. 기대한 seq의 request는 수락·거부와 관계없이 seq를 소비한다(`consumed`).
   낮은 seq의 같은 digest는 기억한 응답을 다시 보내고 append하지 않는다. 낮은 seq의 다른 digest는
   `sequence_conflict`, 높은 seq는 `sequence_violation`이며 둘 다 seq를 소비하지 않는다.
+- **Terminal과 summary 대조.** `FORWARD_COMPLETE.forwarded_length`는 그 batch `EXPOSURE_INTENT`의
+  `final_record_length`와 같아야 하고, `FORWARD_FAILED.bytes_written`은 그보다 작아야 한다.
+  `GENERATION_COMPLETE`는 host가 draining으로 본 generation만 `drained`/`reply_unresolved`로 닫을 수
+  있다(`aborted`는 admitting에서도 가능). `drained`는 `reply_unresolved_count = 0`이어야 하고,
+  `exposure_batch_count`는 host가 받은 그 generation의 batch 수와 같아야 한다. `RUN_COMPLETE`는 모든
+  generation이 closed이고 모든 batch가 terminal이며 generation, batch, complete/failed 수가 host 값과 같을
+  때만 받는다. 어긋나면 `closure_mismatch`, `summary_mismatch`, `generations_open`,
+  `forward_length_mismatch`로 거부하고 inconsistent로 남긴다.
 - **Append 실패.** append나 저장 한도 초과가 실패하면 응답 없이 channel을 끝낸다. guest는 그 event와 뒤의
   pending event를 LOST로 본다.
 - **Segment recovery.** segment는 `<name>.NNNN.njnl`이다. restart는 모든 segment의 완전한 frame을 순서대로
@@ -1363,8 +1375,14 @@ M5/S1b 완료와 M1 판정 연결은 실제 sink, guest transport, relay complet
 - **Transport.** guest는 virtio-serial port(`/dev/virtio-ports/NAME`)를 stream으로 쓰고, QEMU chardev가 host
   Unix socket(`ChannelServer`)에 client로 붙는다. 연결은 VM 하나의 channel identity로 고정된다.
 - **Guest 순서.** journal.c는 한 번에 event 하나만 보내고, 답이 없으면 `retransmit_ms`(기본 1000 ms) 뒤 같은
-  bytes를 다시 보낸다. ACK는 schema, binding의 `proxy_session_id`/`rule_set_id`, `event_seq`,
-  `request_sha256`가 모두 맞아야 받아들인다. 이미 답을 받은 seq의 ACK는 무시하고, 그 밖의 잘못된 frame,
+  bytes를 다시 보낸다. 답은 sink가 쓰는 canonical 문서 그대로여야 한다. 모든 field의 존재, 타입,
+  범위(`committed_end_offset` > 80 등), 추가 field 없음, key 순서와 공백까지 값을 다시 직렬화해 bytes로
+  비교한다. 그 위에서 binding의 `proxy_session_id`/`rule_set_id`, `event_seq`, `request_sha256`가 모두
+  맞아야 ACK로 받아들인다. guest는 `vm_instance_id`/`channel_id`를 모르므로 형식만 검사한다.
+- **세션 종료.** relay가 멈춘 뒤 Proxy는 먼저 남은 답과 그 답이 만드는 event(held batch의
+  `FORWARD_FAILED`, drain bound에서 닫히는 generation의 `GENERATION_COMPLETE`)를 모두 처리한다. 모든
+  event가 ACK됐고, 연 generation이 모두 summary까지 ACK됐고, 모든 batch가 terminal일 때만 마지막으로
+  `RUN_COMPLETE`를 보낸다. 아니면 보내지 않고 Runner의 session end에 맡긴다. 이미 답을 받은 seq의 ACK는 무시하고, 그 밖의 잘못된 frame,
   EOF, I/O 오류는 pending event 전부를 LOST로 만든다.
 
 ## 설계 근거

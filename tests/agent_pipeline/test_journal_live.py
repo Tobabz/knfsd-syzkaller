@@ -317,6 +317,7 @@ def test_mutation_reaches_peer_only_after_its_exposure_is_stored(proxy_binary, t
     assert (run.batch_count, run.forward_complete_count, run.generations) == (1, 1, 1)
     assert journal.session_state(SESSION)["ended"] == "run_complete"
     assert "target ruleset=acked" in out and "exposures=1" in out
+    assert "run_complete=acked" in out
 
 
 class _FailsExposure(HostJournal):
@@ -357,7 +358,9 @@ def test_refused_open_is_never_acknowledged(proxy_binary, tmp_path):
     finally:
         if live.proc.poll() is None:
             live.proc.kill()
+    # The session did not end cleanly: no RUN_COMPLETE, the Runner ends it.
     assert [r.reason for r in journal.rejections()] == ["wrong_lane"]
+    assert live.types() == ["RULESET"]
 
 
 class _FailsRefusal(HostJournal):
@@ -403,3 +406,50 @@ def test_unanswered_call_closes_at_the_drain_bound(proxy_binary, tmp_path):
     assert summary.closure.reason == "reply_unresolved"
     assert summary.closure.reply_unresolved_count == 1
     assert summary.closure.drain_bound_ms == 200
+
+
+class _HoldsExposure(HostJournal):
+    """A sink that answers EXPOSURE_INTENT only once `release` is set."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.release = threading.Event()
+        self.waiting = threading.Event()
+
+    def submit(self, channel, raw):  # type: ignore[override]
+        if parse_request(raw).event_type == "EXPOSURE_INTENT":
+            self.waiting.set()
+            self.release.wait(20)
+        return super().submit(channel, raw)
+
+
+def test_shutdown_drains_owed_events_before_any_run_complete(proxy_binary, tmp_path):
+    journal = _journal(tmp_path, cls=_HoldsExposure)
+    live = Live(proxy_binary, tmp_path, journal)
+    try:
+        assert live.request(1, 1) == 0
+        live.call(61, 5, expect_reply=False)
+        assert journal.waiting.wait(10)
+        # Stop while the intent is unanswered: the held record is dropped,
+        # and its FORWARD_FAILED can only follow the late ACK.
+        live.client.close()
+        live.act.close()
+        live.proc.send_signal(signal.SIGTERM)
+        time.sleep(0.3)
+        journal.release.set()
+        out, err = live.proc.communicate(timeout=30)
+        assert live.proc.returncode == 0, err
+        live.channel.close()
+        live.backend.close()
+    finally:
+        journal.release.set()
+        if live.proc.poll() is None:
+            live.proc.kill()
+    assert live.backend.received == []
+    assert journal.rejections() == []
+    # Generation 1 never closed: the session is not clean, so no RUN_COMPLETE.
+    assert live.types() == ["RULESET", "GENERATION_OPEN", "EXPOSURE_INTENT", "FORWARD_FAILED"]
+    failed = journal.events(SESSION)[-1].request.payload
+    assert (failed.reason, failed.bytes_written) == ("connection_closed", 0)
+    assert delivery_state(journal.events(SESSION), 0) == "forward_failed"
+    assert "run_complete=skipped" in out

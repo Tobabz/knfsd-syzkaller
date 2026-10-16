@@ -113,7 +113,13 @@ int nfsp_target_request(struct nfsp_target *t, uint32_t op,
 					  uint32_t status),
 			void *answer_arg);
 
-/* Queue RUN_COMPLETE and wait up to wait_ms for every answer. */
+/* Session end, after the relay stopped: wait up to wait_ms for every answer
+ * owed and the events those answers still queue (a held batch's
+ * FORWARD_FAILED, a draining generation's GENERATION_COMPLETE at its drain
+ * bound).  Only when the session then ended cleanly -- every event ACKed,
+ * every opened generation summarized, every batch terminal -- is
+ * RUN_COMPLETE queued, last, and waited for.  Otherwise it is left out and
+ * the Runner ends the session (05 §21). */
 void nfsp_target_finish(struct nfsp_target *t, uint32_t wait_ms);
 
 const struct nfsp_target_stats *nfsp_target_stats(const struct nfsp_target *t);
