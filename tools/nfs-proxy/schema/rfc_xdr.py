@@ -8,6 +8,11 @@ WHAT THIS IS
   plain text, and a SOURCES manifest pins the SHA-256 of every RFC text and
   of every file made from it.  This script is the only writer of those files.
 
+  RFC 1813 (NFSv3) prints no extraction script: its XDR is spread through
+  the prose, one definition at a time, and its size constants are stated
+  as prose ("NFS3_FHSIZE 64").  schema/nfs3/nfs3.x is assembled from it by
+  the same rules, one `copy` or `constant` line per definition.
+
   The NFSv4 XDR also uses names it never declares, because rpcgen takes them
   from the C environment: the basic typedefs (stated only in a comment),
   authsys_parms and the auth flavor constants.  The `prelude` file holds
@@ -27,11 +32,28 @@ MANIFEST (one directive per line, `#` starts a comment line)
                             a definition an RFC states only in its prose,
                             not in its `///` XDR (RFC 8435 and RFC 8154
                             restate layouttype4 that way)
+  assemble FILE SHA256      FILE is a whole XDR source built from the
+                            `copy` and `constant` lines that follow, in
+                            order, for an RFC that prints its XDR only in
+                            its prose (RFC 1813)
   typedefs FILE...          every `typedef` line each FILE states inside a
                             comment; the files must all state the same ones
                             (prelude only)
-  copy N KEYWORD NAME       the definition `KEYWORD NAME {` ... `};` in RFC N,
-                            which must occur exactly once and not span a page
+  copy N KEYWORD NAME [as NEW]
+                            the definition of NAME in RFC N, which must occur
+                            exactly once: `struct`/`enum NAME {`, `union NAME
+                            switch (...) {` or `program NAME {` up to the
+                            closing `}...;` at the same indentation, or the
+                            one-line `typedef ... NAME...;` (which may occur
+                            more than once if every occurrence is the same).
+                            A page break inside is dropped only when it is a
+                            whole one: the `[Page N]` footer, the form feed
+                            and the `RFC N` running header.  `as NEW` renames
+                            the definition, for a name the RFC itself uses
+                            elsewhere (assemble only; the file says so)
+  constant N NAME           `const NAME = V;` from the prose line `NAME V` of
+                            RFC N, which must occur exactly once (assemble
+                            only)
 
 USAGE
 
@@ -85,13 +107,13 @@ def parse_manifest(path):
                 raise SourceError(f"{where}: extract FILE N SHA256 CMD")
             m["extract"].append({"file": args[0], "rfc": args[1],
                                  "sha256": args[2], "cmd": args[3]})
-        elif kw in ("prelude", "fragment"):
+        elif kw in ("prelude", "fragment", "assemble"):
             args = rest.split()
             if len(args) != 2 or not hexpin.fullmatch(args[1]) or \
                     (kw == "prelude" and m["prelude"]):
                 raise SourceError(f"{where}: one prelude FILE SHA256"
                                   if kw == "prelude" else
-                                  f"{where}: fragment FILE SHA256")
+                                  f"{where}: {kw} FILE SHA256")
             if any(b["file"] == args[0] for b in m["built"]) or \
                     any(e["file"] == args[0] for e in m["extract"]):
                 raise SourceError(f"{where}: {args[0]} is built twice")
@@ -100,15 +122,26 @@ def parse_manifest(path):
             m["built"].append(b)
             if kw == "prelude":
                 m["prelude"] = b
-        elif kw in ("typedefs", "copy"):
+        elif kw in ("typedefs", "copy", "constant"):
             args = rest.split()
             if not m["built"]:
-                raise SourceError(f"{where}: {kw} before prelude or "
-                                  f"fragment")
-            if kw == "copy" and len(args) != 3:
-                raise SourceError(f"{where}: copy N KEYWORD NAME")
-            if kw == "typedefs" and (not args or
-                                     m["built"][-1]["kind"] != "prelude"):
+                raise SourceError(f"{where}: {kw} before prelude, "
+                                  f"fragment or assemble")
+            into = m["built"][-1]["kind"]
+            if kw == "copy" and not (
+                    len(args) == 3 or
+                    (len(args) == 5 and args[3] == "as" and
+                     into == "assemble")):
+                raise SourceError(f"{where}: copy N KEYWORD NAME"
+                                  + (" [as NEW]" if into == "assemble"
+                                     else ""))
+            if kw == "copy" and args[1] not in COPY_KEYWORDS:
+                raise SourceError(f"{where}: copy of a {args[1]}")
+            if kw == "constant" and (len(args) != 2 or
+                                     into != "assemble"):
+                raise SourceError(f"{where}: constant N NAME in an "
+                                  f"assemble")
+            if kw == "typedefs" and (not args or into != "prelude"):
                 raise SourceError(f"{where}: typedefs FILE... in a prelude")
             m["built"][-1]["parts"].append((kw, args))
         else:
@@ -121,8 +154,8 @@ def parse_manifest(path):
         if not b["parts"]:
             raise SourceError(f"{path}: {b['kind']} {b['file']} is empty")
         for kw, args in b["parts"]:
-            if kw == "copy" and args[0] not in m["rfc"]:
-                raise SourceError(f"{path}: copy: RFC {args[0]} is not "
+            if kw in ("copy", "constant") and args[0] not in m["rfc"]:
+                raise SourceError(f"{path}: {kw}: RFC {args[0]} is not "
                                   f"pinned")
     return m
 
@@ -167,29 +200,89 @@ def commented_typedefs(name, text):
     return out
 
 
-def copy_definition(n, rfc_text, keyword, name):
-    lines = rfc_text.decode("utf-8-sig").split("\n")
-    head = f"{keyword} {name} {{"
-    starts = [i for i, ln in enumerate(lines) if ln.strip() == head]
-    if len(starts) != 1:
-        raise SourceError(f"RFC {n}: `{head}` occurs {len(starts)} times")
-    first = starts[0]
-    for last in range(first, len(lines)):
-        ln = lines[last]
-        if "\f" in ln or re.search(r"\[Page \d+\]\s*$", ln):
-            raise SourceError(f"RFC {n}: {keyword} {name} spans a page")
-        if ln.strip() == "};":
-            break
-    else:
-        raise SourceError(f"RFC {n}: {keyword} {name} has no `}};`")
+COPY_KEYWORDS = ("struct", "enum", "union", "program", "typedef")
+_FOOTER = re.compile(r"\[Page \d+\]\s*$")
+
+
+def _page_break(lines, i, n):
+    """The number of lines of a whole page break starting at lines[i], the
+    footer, or 0.  Only footer, form feed and running header make one; the
+    header may share the form feed's line."""
+    if not _FOOTER.search(lines[i]) or i + 1 >= len(lines) or \
+            not lines[i + 1].startswith("\f"):
+        return 0
+    j = i + 1 if lines[i + 1] != "\f" else i + 2
+    if j < len(lines) and lines[j].lstrip("\f").startswith(f"RFC {n} "):
+        return j + 1 - i
+    return 0
+
+
+def _join_pages(n, lines, first, keyword, name):
+    """lines[first:] up to the definition's end with whole page breaks and
+    the blank lines around them dropped.  Returns (last, body) where last
+    is the index of the definition's final line."""
     indent = len(lines[first]) - len(lines[first].lstrip(" "))
-    body = []
-    for ln in lines[first:last + 1]:
-        if ln[:indent].strip():
+    out, i = [], first
+    while i < len(lines):
+        ln = lines[i]
+        if "\f" in ln or _FOOTER.search(ln):
+            k = _page_break(lines, i, n)
+            if not k:
+                raise SourceError(f"RFC {n}: {keyword} {name} spans a "
+                                  f"page break that is not whole")
+            while out and not out[-1].strip():
+                out.pop()
+            i += k
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            continue
+        if ln.strip() and ln[:indent].strip():
             raise SourceError(f"RFC {n}: {keyword} {name} is not indented "
                               f"consistently")
-        body.append(ln[indent:].rstrip())
-    return first + 1, last + 1, body
+        out.append(ln[indent:].rstrip())
+        if i > first and len(ln) - len(ln.lstrip(" ")) == indent and \
+                re.fullmatch(r"\}(\s*=\s*\w+)?\s*;", ln.strip()):
+            return i, out
+        i += 1
+    raise SourceError(f"RFC {n}: {keyword} {name} has no `}};`")
+
+
+def copy_definition(n, rfc_text, keyword, name):
+    lines = rfc_text.decode("utf-8-sig").split("\n")
+    if keyword == "typedef":
+        decl = re.compile(r"typedef\s.*\b" + re.escape(name) +
+                          r"\s*(\[[^\]]*\]|<[^>]*>)?\s*;")
+        found = [(i, " ".join(ln.split())) for i, ln in enumerate(lines)
+                 if decl.fullmatch(ln.strip())]
+        if not found or len({t for _, t in found}) != 1:
+            raise SourceError(f"RFC {n}: `typedef ... {name};` occurs "
+                              f"{len(found)} times, differently"
+                              if found else
+                              f"RFC {n}: `typedef ... {name};` occurs 0 "
+                              f"times")
+        return found[0][0] + 1, found[0][0] + 1, [found[0][1]]
+    if keyword == "union":
+        head = re.compile(r"union " + re.escape(name) +
+                          r" switch \(.*\) \{")
+    else:
+        head = re.compile(re.escape(f"{keyword} {name} {{"))
+    starts = [i for i, ln in enumerate(lines) if head.fullmatch(ln.strip())]
+    if len(starts) != 1:
+        raise SourceError(f"RFC {n}: `{keyword} {name}` occurs "
+                          f"{len(starts)} times")
+    last, body = _join_pages(n, lines, starts[0], keyword, name)
+    return starts[0] + 1, last + 1, body
+
+
+def prose_constant(n, rfc_text, name):
+    lines = rfc_text.decode("utf-8-sig").split("\n")
+    rx = re.compile(re.escape(name) + r" (\d+)")
+    found = [(i, m.group(1)) for i, m in
+             ((i, rx.fullmatch(ln.strip())) for i, ln in enumerate(lines))
+             if m]
+    if len(found) != 1:
+        raise SourceError(f"RFC {n}: `{name} N` occurs {len(found)} times")
+    return found[0][0] + 1, f"const {name} = {found[0][1]};"
 
 
 PRELUDE_HEAD = [
@@ -205,6 +298,13 @@ FRAGMENT_HEAD = [
     " * Code Components of the RFC: Simplified (Revised) BSD License, whose",
     " * text heads rfc8276.x; see THIRD-PARTY-LICENSES.md.",
 ]
+ASSEMBLE_HEAD = [
+    " * XDR that an RFC prints only in its prose, one definition at a time,",
+    " * assembled by rule from the pinned RFC text in the order SOURCES",
+    " * lists it.  Each definition is copied verbatim, dedented, with whole",
+    " * page breaks dropped; a size constant the RFC states as prose",
+    " * (`NAME V`) becomes `const NAME = V;`.  See SOURCES.",
+]
 
 
 def build_file(b, files, rfcs):
@@ -213,7 +313,8 @@ def build_file(b, files, rfcs):
         " * GENERATED by tools/nfs-proxy/schema/rfc_xdr.py from SOURCES -- "
         "DO NOT EDIT.",
         " *",
-    ] + (PRELUDE_HEAD if b["kind"] == "prelude" else FRAGMENT_HEAD) + [
+    ] + {"prelude": PRELUDE_HEAD, "fragment": FRAGMENT_HEAD,
+         "assemble": ASSEMBLE_HEAD}[b["kind"]] + [
         " */",
     ]
     for kw, args in b["parts"]:
@@ -227,10 +328,25 @@ def build_file(b, files, rfcs):
             out.append(f"/* {', '.join(args)}: stated only inside a "
                        f"comment */")
             out.extend(stated[0])
+        elif kw == "constant":
+            n, name = args
+            line, decl = prose_constant(n, rfcs[n], name)
+            out.append(f"/* RFC {n} line {line}, stated as prose */")
+            out.append(decl)
         else:
-            n, keyword, name = args
+            n, keyword, name = args[:3]
             first, last, body = copy_definition(n, rfcs[n], keyword, name)
-            out.append(f"/* RFC {n} lines {first}-{last} */")
+            where = (f"line {first}" if first == last else
+                     f"lines {first}-{last}")
+            if len(args) == 5:
+                new = args[4]
+                old = f"{keyword} {name}"
+                if not body[0].startswith(old + " "):
+                    raise SourceError(f"RFC {n}: cannot rename {name}")
+                body[0] = f"{keyword} {new}" + body[0][len(old):]
+                out.append(f"/* RFC {n} {where}, renamed from {name} */")
+            else:
+                out.append(f"/* RFC {n} {where} */")
             out.extend(body)
     return ("\n".join(out) + "\n").encode("ascii")
 

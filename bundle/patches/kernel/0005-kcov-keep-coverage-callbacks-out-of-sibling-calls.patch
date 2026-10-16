@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Fri, 16 Oct 2026 17:00:00 +0900
+Subject: [PATCH] kcov: keep coverage callbacks out of sibling calls
+
+GCC turns a coverage callback at the end of an instrumented function into a
+tail jump to __sanitizer_cov_trace_pc(). The callback records _RET_IP_, and
+after a jump that is the return address in the instrumented function's
+caller, not a site in the instrumented function. A GCC 11.4 amd64 KASAN
+build had 14,239 such jumps, and a remote KCOV run published 323 PCs that
+were ordinary call sites in other functions, while the instrumented paths
+behind those jumps were never reported.
+
+Disable sibling-call optimization for KCOV-instrumented objects only. In
+the same build no tail jump to the callback remained, and every published
+PC was a callback call site.
+---
+ scripts/Makefile.kcov | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/scripts/Makefile.kcov b/scripts/Makefile.kcov
+index 78305a8..27a9624 100644
+--- a/scripts/Makefile.kcov
++++ b/scripts/Makefile.kcov
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ kcov-flags-y					+= -fsanitize-coverage=trace-pc
+ kcov-flags-$(CONFIG_KCOV_ENABLE_COMPARISONS)	+= -fsanitize-coverage=trace-cmp
++# A tail jump to __sanitizer_cov_trace_pc() makes _RET_IP_ the caller's return
++# address instead of the instrumented call site.
++kcov-flags-y					+= -fno-optimize-sibling-calls
+ 
+ kcov-rflags-y					+= -Cpasses=sancov-module
+ kcov-rflags-y					+= -Cllvm-args=-sanitizer-coverage-level=3
+-- 
+2.43.0
+

@@ -194,10 +194,14 @@ an HTTP mock without sending live provider requests. Importing the base
 [`PYDANTIC_AI_RUNTIME.md`](agent_tasks/PYDANTIC_AI_RUNTIME.md) for factory,
 deadline and response-identity requirements.
 
-Also not here yet: broader NFS resource-provenance extraction, the VM lane
-collector behind the `stage1` host command, raw
-KCOV/counter collection and normalization, automatic DWARF/runtime-PC mapping,
-Runner-receipt integration for Q2, approved production HCAP/judge data, and Stage 2 Controller/Runner
+`stage1/host/` has the VM lane collector, the host record generator and
+target-PC mapping for a real run, tested without a guest; its runbook is
+[`stage1/host/README.md`](stage1/host/README.md). The HCAP and judge data
+it generates from the template are operator statements, not approved
+production data.
+
+Also not here yet: broader NFS resource-provenance extraction,
+Runner-receipt integration for Q2 and Stage 2 Controller/Runner
 integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
 VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
 remains false-only. The nfs-proxy semantic runtime remains a separate component

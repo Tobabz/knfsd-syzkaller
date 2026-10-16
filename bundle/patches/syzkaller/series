@@ -19,3 +19,4 @@
 0019-sys-linux-executor-add-variable-length-proxy-arm.patch
 0020-sys-linux-select-versioned-NFS-lane-profiles.patch
 0021-tools-syz-nfs-corpus-recognize-profile-and-typed-NFS.patch
+0022-tools-execprog-gate-programs-after-the-machine-check.patch

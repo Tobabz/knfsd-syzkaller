@@ -252,8 +252,8 @@ assert manifest["purpose"] == "mutation_seed"
 assert Path(ROOT / manifest["required_syzkaller_patch"]).is_file()
 assert Path(ROOT / manifest["required_syzkaller_validator_patch"]).is_file()
 syzkaller_patches = sorted((ROOT / "bundle/patches/syzkaller").glob("*.patch"))
-assert len(syzkaller_patches) == 21
-assert syzkaller_patches[-1].name.startswith("0021-")
+assert len(syzkaller_patches) == 22
+assert syzkaller_patches[-1].name.startswith("0022-")
 programs = {entry["path"]: entry for entry in manifest["programs"]}
 assert len(programs) == len(manifest["programs"]) == 12
 for entry in manifest["programs"]:

@@ -10,8 +10,8 @@
 
 > 구현 갱신(2026-10-14): 아래 요약·Gap Matrix와 §3-§22의 `Current`/`Gap` 서술은
 > 별도 구현 갱신 문단이 없는 한 구현 시작 시점의 baseline이다. 현재 상태는 §24-§27을 따른다.
-> M1/M3, M2의 NFSv4 subset, M4a-M4d component까지 구현됐다.
-> NFSv3 schema, live `main`/relay 및 S1a 연결, M5-M7은 아직 남아 있다.
+> M1/M3, M2의 NFSv4·NFSv3 schema, M4a-M4d component까지 구현됐다.
+> live `main`/relay 및 S1a 연결, M5-M7은 아직 남아 있다.
 
 ## 요약
 
@@ -279,7 +279,8 @@ M2에서 normalizer language와 generated artifact format을 정했다. Python �
 확인한다. 상세는 `02-semantic-decoder.md`의 한계와 미결 사항에 있다. NFSv4.0/4.1/4.2 XDR은 RFC
 7531/5662/7863에서 pin해 반입했고, 4.2에는 knfsd가 구현하는 RFC 8276, RFC 9754 확장을, 4.1과 4.2에는
 pNFS layout type RFC 8435, RFC 8154를 합쳤다
-(`tools/nfs-proxy/schema/nfs4/`). NFSv3 source는 남았다.
+(`tools/nfs-proxy/schema/nfs4/`). NFSv3 XDR은 RFC 1813 본문에서 정의를 하나씩 규칙으로 복사해
+조립하고 pin했다(`tools/nfs-proxy/schema/nfs3/`).
 
 ### 6. NFS Semantic Decoder
 
@@ -876,8 +877,8 @@ bounded lifecycle/expiry
 초기에는 existing single-thread event loop를 활용해 ordering/concurrency complexity를 줄인다.
 
 구현 상태: `src/txn.*`(table), `src/semantic.*`(observer), `main.c --semantic`. NFSv4
-request/result context와 bounded lifecycle/expiry가 구현됐다. NFSv3 reply procedure context는
-entry가 procedure를 보존하므로 준비됐지만 NFSv3 schema가 없어 decode는 `unsupported_schema`다.
+request/result context, NFSv3 reply procedure context와 bounded lifecycle/expiry가 구현됐다. NFSv3
+REPLY는 entry가 보존한 procedure의 schema(`src/schema_nfs3.c`, RFC 1813)로만 decode한다(oracle 11).
 `request.forwarded`는 M4 Resolver 전까지 original 또는 unknown이다(`03` 한계와 미결 사항).
 
 ### 27. M4 — Semantic rule ABI / Resolver / concrete edit adapter
