@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..contracts import (AgentTask, CandidateSubmission, GapRef,
+from ..contracts import (AgentModelPolicy, AgentTask, CandidateSubmission, GapRef,
                          HarnessBinding, JudgeVersions, Materialized,
                          Q1Result, Record, VulnerabilityCandidate)
 
@@ -48,6 +48,8 @@ class BlockedReason(str, enum.Enum):
     RUNTIME_RETRY_EXHAUSTED = "runtime_retry_exhausted"
     GAP_ID_UNKNOWN = "gap_id_unknown"
     UNEXPECTED_EVENT = "unexpected_event"
+    HOST_AUTHORITY = "host_authority"
+    EXECUTION_CLEANUP = "execution_cleanup"
 
 
 class RepairCause(str, enum.Enum):
@@ -121,6 +123,10 @@ class PendingTask(Record):
     kind: TaskKind
     input_digest: str
     agent_task: AgentTask | None = None
+    # Pinned when the task is minted so a policy change or Controller restart
+    # cannot silently run the same task identity with another model policy.
+    # None preserves replay of tasks stored before model policy was explicit.
+    model_policy: AgentModelPolicy | None = None
     attempt: int = 1                        # agent only
     repair: RepairInput | None = None
 
@@ -171,6 +177,11 @@ class Job(BaseModel):
     counters: Counters = Field(default_factory=Counters)
     pending_task: PendingTask | None = None
     cancelling_tasks: tuple[str, ...] = ()
+    #: Runner tasks whose lease ended without confirmed cleanup (09 §8).
+    uncleaned_tasks: tuple[str, ...] = ()
+    #: Late Runner cleanup reports already applied, as "task_id:generation",
+    #: so a report re-sent after a lost acknowledgement applies once.
+    cleanup_reports_applied: tuple[str, ...] = ()
     resume_point: Target | None = None
     analysis_ref: str | None = None
     plan_ref: str | None = None

@@ -12,7 +12,8 @@ import sqlite3
 from pathlib import Path
 from typing import Iterator
 
-from ..contracts import GapRef, JobPolicy, Q1Result, VulnerabilityCandidate
+from ..contracts import (GapRef, JobPolicy, JudgeVersions, Q1Result,
+                         VulnerabilityCandidate)
 from .records import AgentAttempt, Job, JobState, Transition
 
 SCHEMA = """
@@ -39,6 +40,12 @@ CREATE TABLE IF NOT EXISTS gap_links (
     job_id TEXT NOT NULL, gap_class TEXT NOT NULL,
     missing_capability_id TEXT NOT NULL,
     PRIMARY KEY (job_id, gap_class, missing_capability_id));
+CREATE TABLE IF NOT EXISTS job_issues (
+    job_id TEXT PRIMARY KEY, issue_ref TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS issue_marks (
+    job_id TEXT PRIMARY KEY, event_id INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS controller_settings (
+    key TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS effect_failures (
     job_id TEXT NOT NULL, effect TEXT NOT NULL, error TEXT NOT NULL,
     at TEXT NOT NULL);
@@ -47,6 +54,10 @@ CREATE TABLE IF NOT EXISTS effect_failures (
 
 class StaleJob(Exception):
     """The job changed after the transition was computed."""
+
+
+class StaleIssueEvent(StaleJob):
+    """The job already took this issue event or a later one."""
 
 
 class Store:
@@ -83,6 +94,21 @@ class Store:
         if row is None:
             raise KeyError(policy_id)
         return JobPolicy.model_validate_json(row[0])
+
+    # ---------------------------------------------------------- judge
+
+    def save_judge_versions(self, versions: JudgeVersions) -> None:
+        """The fallback Q1 authorities the Controller adopted (09 §5)."""
+        with self._tx():
+            self.db.execute(
+                "INSERT OR REPLACE INTO controller_settings VALUES (?, ?)",
+                ("judge_versions", versions.model_dump_json()))
+
+    def judge_versions(self) -> JudgeVersions | None:
+        row = self.db.execute("SELECT body FROM controller_settings WHERE "
+                              "key = 'judge_versions'").fetchone()
+        return None if row is None else \
+            JudgeVersions.model_validate_json(row[0])
 
     # ---------------------------------------------------------- candidates
 
@@ -122,8 +148,18 @@ class Store:
             self._append(transition)
 
     def commit(self, prev_seq: int, job: Job, transition: Transition,
-               verdicts: list[Q1Result] = ()) -> None:
+               verdicts: list[Q1Result] = (),
+               issue_event: int | None = None) -> None:
+        """``issue_event``: the issue event this transition applies.  It is
+        recorded with the transition, and refused when the job already took
+        it or a later one, so concurrent deliverers apply it once, in order."""
         with self._tx():
+            if issue_event is not None:
+                mark = self._issue_mark(job.job_id)
+                if mark is not None and mark >= issue_event:
+                    raise StaleIssueEvent(job.job_id)
+                self.db.execute("INSERT OR REPLACE INTO issue_marks VALUES "
+                                "(?, ?)", (job.job_id, issue_event))
             cur = self.db.execute("UPDATE jobs SET state = ?, seq = ?, "
                                   "body = ? WHERE job_id = ? AND seq = ?",
                                   (job.state.value, job.seq,
@@ -141,6 +177,10 @@ class Store:
                 (job.job_id, waiting,
                  job.gap.gap_class.value if waiting else "",
                  job.gap.missing_capability_id if waiting else ""))
+            self.db.execute(
+                "DELETE FROM job_issues WHERE job_id = ? AND NOT EXISTS "
+                "(SELECT 1 FROM gap_links WHERE job_id = ?)",
+                (job.job_id, job.job_id))
             self._append(transition)
             for v in verdicts:
                 self.db.execute("INSERT OR IGNORE INTO verdicts VALUES "
@@ -210,6 +250,8 @@ class Store:
                 self.db.execute("INSERT OR IGNORE INTO gap_links VALUES "
                                 "(?, ?, ?)", (job_id, gap.gap_class.value,
                                               gap.missing_capability_id))
+                self.db.execute("INSERT OR REPLACE INTO job_issues VALUES "
+                                "(?, ?)", (job_id, issue_ref))
 
     def record_failure(self, job_id: str, effect: str, error: str,
                        at: str) -> None:
@@ -235,6 +277,30 @@ class Store:
             "missing_capability_id = ?", (job_id, gap.gap_class.value,
                                           gap.missing_capability_id)
         ).fetchone() is not None
+
+    def job_issue(self, job_id: str) -> str | None:
+        """The issue of the job's current gap wait, or None when the wait is
+        not linked yet.  A link stored before per-job issues existed falls
+        back to the gap's issue."""
+        row = self.db.execute("SELECT issue_ref FROM job_issues WHERE "
+                              "job_id = ?", (job_id,)).fetchone()
+        if row is not None:
+            return row[0]
+        row = self.db.execute(
+            "SELECT i.issue_ref FROM gap_links l JOIN gap_issues i ON "
+            "i.gap_class = l.gap_class AND "
+            "i.missing_capability_id = l.missing_capability_id "
+            "WHERE l.job_id = ?", (job_id,)).fetchone()
+        return row[0] if row else None
+
+    def _issue_mark(self, job_id: str) -> int | None:
+        row = self.db.execute("SELECT event_id FROM issue_marks WHERE "
+                              "job_id = ?", (job_id,)).fetchone()
+        return row[0] if row else None
+
+    def issue_mark(self, job_id: str) -> int | None:
+        """The last issue event the job took, if any."""
+        return self._issue_mark(job_id)
 
     def issue_ref(self, gap: GapRef) -> str | None:
         row = self.db.execute("SELECT issue_ref FROM gap_issues WHERE "

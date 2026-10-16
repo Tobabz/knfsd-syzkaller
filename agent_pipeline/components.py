@@ -1,6 +1,7 @@
 """Interfaces of the deterministic components and outside systems the
-Controller calls.  The real HCAP checker, Harness Materializer and Q1 Judge
-come with their own PRs; tests use fakes.
+Controller calls. Artifact-backed HCAP, Q1 and Materializer implementations
+live in hcap, sealed_q1 and materializer. Durable execution services remain a
+separate Runner boundary.
 
 The machine calls HcapChecker, Materializer and Q1Judge inside a transition,
 so each must be a pure function of its arguments (09 rationale 1): replaying
@@ -12,7 +13,8 @@ from __future__ import annotations
 from typing import Protocol
 
 from .contracts import (HarnessBinding, HcapCheck, JudgeVersions, GapRef,
-                        MaterializeRejected, Materialized, Q1Result, Sanitizer)
+                        MaterializationHcapAuthority, MaterializeRejected,
+                        Materialized, Q1Result, Sanitizer)
 
 
 class HcapChecker(Protocol):
@@ -20,18 +22,47 @@ class HcapChecker(Protocol):
         """04 §1.1: capabilities exist, usable_by has agent_stage1, the plan
         names this hcap_revision."""
 
+    def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        """Check a stored plan against a newly selected HCAP catalog.
+
+        The plan keeps the revision under which the Agent produced it; all
+        capability, status, scope and interface declarations are checked
+        against ``hcap_revision``.
+        """
+
+    def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
+        """Return the Q1 authorities pinned by this HCAP, when present."""
+
     def knows_capability(self, hcap_revision: str,
                          missing_capability_id: str) -> bool:
         """Is the id in this revision's controlled vocabulary (07 §3)?"""
 
 
 class Materializer(Protocol):
-    def materialize(self, plan_ref: str, binding: HarnessBinding
+    def materialize(self, plan_ref: str, binding: HarnessBinding, *,
+                    hcap_authority: MaterializationHcapAuthority | None = None
                     ) -> Materialized | MaterializeRejected:
-        """05 §11."""
+        """05 §11.  Omitted authority requires an exact plan revision."""
+
+    def harness_authority_current(self, harness_ref: str,
+                                  binding: HarnessBinding) -> bool:
+        """Would `binding`'s HCAP revision give this harness the same
+        call admission profile and neutral control catalog refs?  False
+        for any record or approval problem; OSError propagates."""
 
 
 class Q1Judge(Protocol):
+    def matches_execution(self, bundle_ref: str, *, job_id: str,
+                          task_id: str) -> bool:
+        """Does trusted host provenance bind the bundle to this Runner task?
+
+        The Controller calls this before first consuming a bundle. Checking
+        only a bundle against its own receipt cannot prevent cross-task reuse.
+        This lookup, like judge(), must remain reproducible during replay.
+        Raise if host provenance is not available yet, so the Controller can
+        retry without committing a mismatch that would later change meaning.
+        """
+
     def judge(self, bundle_ref: str, plan_ref: str, candidate_id: str,
               versions: JudgeVersions) -> Q1Result:
         """06 §8-§10 over one sealed bundle (01 §11.1)."""

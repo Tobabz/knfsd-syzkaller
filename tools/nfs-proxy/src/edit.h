@@ -48,6 +48,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "concrete_edit.h"
 #include "delta.h"	/* nfsp_msg_ctx, nfsp_apply_stats, enums, ANCHOR_MAX */
 #include "walk.h"	/* nfsp_walk, for op-array layout */
 

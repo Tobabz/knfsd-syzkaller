@@ -1,12 +1,17 @@
 # NFS Proxy Target-vs-Current Implementation Gap Analysis
 
-> 상태: draft · 최종 확인: 2026-10-12
+> 상태: draft · 최종 확인: 2026-10-14
 > 기준: kernel v7.3-rc5 / syzkaller 801f0966669a37e048adabf9e5f38ce52825ea82
 > 대상 구현: `tools/nfs-proxy`
 > 상위 설계: `01-architecture.md`
 > 상세 계약: `02-semantic-decoder.md`, `03-transaction-context.md`,
 > `04-semantic-mutation-runtime.md`, `05-mutation-delta-replay.md`
 > 목적: target architecture를 current implementation에 매핑해 구현 순서를 결정
+
+> 구현 갱신(2026-10-14): 아래 요약·Gap Matrix와 §3-§22의 `Current`/`Gap` 서술은
+> 별도 구현 갱신 문단이 없는 한 구현 시작 시점의 baseline이다. 현재 상태는 §24-§27을 따른다.
+> M1/M3, M2의 NFSv4 subset, M4a-M4d component까지 구현됐다.
+> NFSv3 schema, live `main`/relay 및 S1a 연결, M5-M7은 아직 남아 있다.
 
 ## 요약
 
@@ -930,10 +935,12 @@ issue #18 F1). deactivation은 CALL admission만 닫고, draining G의 REPLY는 
 REPLY는 변조하지 않는다. closure reason과 `reply_unresolved_count`를 만든다.
 
 구현 상태: M4는 M4a(rule set serialization/validation), M4b(Resolver), M4c(preflight와 concrete edit
-adapter), M4d(activation 창과 generation 단계, sink는 test double)로 나눠 진행한다. M4a가 구현됐다.
-`src/rule.*`는 `NFSPRUL1`(`04-semantic-mutation-runtime.md` §35)을 읽고 schema에 대해 all-or-nothing으로
-검증하며, `src/schema.*`의 `nfsp_schema_resolve()`가 semantic path를 type graph에서 찾는다. 설치 경로와
-`RULESET` 기록은 아직 없다(§9, S1a).
+adapter), M4d(activation 창과 generation 단계, sink는 test double) component까지 구현됐다.
+`src/rule.*`는 `NFSPRUL1`(`04-semantic-mutation-runtime.md` §35)을 all-or-nothing으로 검증하고,
+`src/resolver.*`와 `src/mutation_apply.*`는 같은 snapshot에서 resolve한 batch를 한 번에 rebuild한다.
+`src/activation.*`는 test gate 뒤에서 CALL admission, draining REPLY와 closure facts를 관리한다. 이는
+host durability를 증명하지 않는다. 실제 설치 endpoint와 executor barrier(S1a), `RULESET`과
+`EXPOSURE_INTENT` 기록(M5/S1b), `main`/`proxy` live target-mode 연결은 아직 없다.
 
 ### 28. M5 — Semantic Delta journal / relay completion
 
@@ -1277,7 +1284,8 @@ Host tests 뒤 실제 lane/guest에서 semantic request/response mutation과 rep
 ## 한계와 미결 사항
 
 - **결정됨:** current framing/relay/concrete edit safety code는 가능한 한 재사용한다.
-- **결정됨:** target semantic decoder/Transaction Context/Resolver는 current code에 없다.
+- **구현됨(component):** target semantic decoder, Transaction Context, Resolver는 M2-M4에
+  구현됐다. production live path 연결과 promotion은 아직 남아 있다.
 - **결정됨:** marker-inclusive current record coordinates와 marker-free target WireRef 사이 adapter가 필요하다.
 - **결정됨:** semantic rule ABI는 NFSPARM1/2와 별도여야 한다.
 - **결정됨:** semantic path는 current v1->v2 sequential semantics를 사용하지 않는다.
@@ -1291,13 +1299,16 @@ Host tests 뒤 실제 lane/guest에서 semantic request/response mutation과 rep
 - **결정됨:** target durability는 Runner host journal sink의 ACK다. guest `O_SYNC` writer는 legacy다(issue #3).
 - **결정됨:** M1 판정 계약은 M4/M5의 선행 조건이며 `../02-llm-agent/01-two-stage-agent-architecture.md`
   §7에 고정됐다(issue #4).
-- **미결:** exact ProtocolSchema source/artifact paths.
-- **미결:** concrete new source filenames/API naming.
-- **미결:** semantic rule serialization binary/text format.
-- **미결:** semantic journal binary format/magic.
+- **부분 해결:** NFSv4 ProtocolSchema source/artifact path는 고정됐다. NFSv3 source는 남았다.
+- **부분 해결:** M1-M4 source/API 이름은 고정됐다. M5-M6 source/API는 남았다.
+- **해결:** semantic rule serialization은 canonical binary `NFSPRUL1`로 고정됐다.
+- **부분 해결:** host framing `NFSPJNL1`과 ACK envelope은 `05` §45에 고정했다.
+  bounded codec/prefix reader는 구현됐으며 event payload encoding/admission, durable sink와 transport는 남았다.
 - **미결:** legacy/semantic CLI mode exact flags/config format.
-- **미결:** initial protocol operation coverage subset.
-- **미결:** numeric limits for context/rules/resolved edits/journal snapshots.
+- **부분 해결:** initial NFSv4.0/4.1/4.2 component subset은 고정됐다. NFSv3와 promotion
+  subset은 남았다.
+- **부분 해결:** context/rules/resolved-edit/activation 및 journal frame/segment limits는 고정됐다.
+  M5 session 전체 저장량·회전과 M6 replay limits는 남았다.
 - **미결:** v4.0 separate callback routing을 initial implementation에 포함할지 별도 milestone로 둘지.
 - **미결:** guest-to-host journal transport, rule set 설치 경로, activation 메시지 형식.
 - **미검증:** current source refactor 후 syz-manager workload performance.

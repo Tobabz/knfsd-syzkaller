@@ -1,11 +1,16 @@
 """Oracle 2 (09 검증 오라클): negative controls, the Stage 1 ones."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
-from agent_pipeline.contracts import (AnalysisOutput, GapClass, GapRef,
+from agent_pipeline.contracts import (HOST_AUTHORITY_UNAVAILABLE,
+                                      AnalysisOutput, GapClass, GapRef,
+                                      MaterializeRejected,
                                       HarnessBinding, PlanOutput, Q1Status,
                                       Sanitizer)
+from agent_pipeline.controller import events as ev
 from agent_pipeline.controller.records import (BlockedReason, JobState,
                                                TargetKind, TaskKind)
 
@@ -214,6 +219,188 @@ def test_rejudge_under_the_same_binding_routes_from_the_origin(world):
     assert world.job(j).state is JobState.S1_REACHED
 
 
+def test_binding_event_atomically_rebuilds_reached_stage2_for_new_judge(
+        world):
+    j = world.to_running()
+    bundle = world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    versions = VERSIONS.model_copy(update={"judge_profile_id": "jp-2"})
+    world.judge.add(
+        bundle, before.binding.execution_harness_id,
+        before.candidate.candidate_id, Q1Status.REACHED, profile="jp-2")
+
+    out = world.c._apply(j, ev.BindingChanged(
+        binding=before.binding, judge_versions=versions,
+        rematerialize_authority=True))
+
+    assert out is not None
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    assert job.judge_versions == versions
+    assert job.last_verdict.result.judge_profile_id == "jp-2"
+    assert job.stage2_input.q1_verdict_id == \
+        job.last_verdict.result.verdict_id
+    assert job.stage2_input.q1_verdict_id != \
+        before.stage2_input.q1_verdict_id
+
+
+def test_binding_and_judge_change_clear_stale_stage2_before_new_run(world):
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    versions = VERSIONS.model_copy(update={"judge_profile_id": "jp-2"})
+    replacement = binding(hcap="hcap-2")
+
+    world.c._apply(j, ev.BindingChanged(
+        binding=replacement, judge_versions=versions,
+        rematerialize_authority=True))
+
+    job = world.job(j)
+    assert job.binding == replacement
+    assert job.judge_versions == versions
+    assert job.state is JobState.S1_RUNNING
+    assert job.stage2_input is None
+    assert job.harness.harness_ref != before.harness.harness_ref
+
+
+def test_registry_change_rebinds_reached_job_in_one_atomic_transition(world):
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    versions = VERSIONS.model_copy(update={"judge_profile_id": "jp-2"})
+    replacement = binding(hcap="hcap-2")
+    world.hcap.judge_versions = lambda revision: \
+        versions if revision == replacement.hcap_revision else None
+    world.materializer.authority_changed.add(replacement.hcap_revision)
+    world.registry.put(replacement)
+
+    world.c.on_registry_changed()
+
+    transitions = [
+        item for item in world.store.transitions(j)
+        if item.seq > before.seq
+    ]
+    assert len(transitions) == 1
+    transition = transitions[0]
+    assert transition.event["type"] == "binding_changed"
+    assert transition.event["rematerialize_authority"] is True
+    job = world.job(j)
+    assert transition.job == job
+    assert job.binding == replacement
+    assert job.judge_versions == versions
+    assert job.harness.hcap_revision == replacement.hcap_revision
+    assert job.state is JobState.S1_RUNNING
+    assert job.stage2_input is None
+    assert world.c.replay(j) == job
+
+
+def test_flagless_binding_event_replays_historical_judge_assignment(world):
+    j = world.to_running()
+    gap = GapRef(
+        gap_class=GapClass.REMOTE_KCOV_ATTRIBUTION,
+        missing_capability_id="remote_kcov.context.softirq")
+    bundle = world.run(
+        j, Q1Status.INCONCLUSIVE, "unsupported_attribution", gap)
+    blocked = world.job(j)
+    world.c._apply(j, ev.IssueChanged(
+        gap=gap, status="resolved", resolution="historical"))
+    assert world.job(j).state is JobState.RETRY_PENDING
+
+    versions = VERSIONS.model_copy(update={"judge_profile_id": "jp-2"})
+    world.judge.add(
+        bundle, blocked.binding.execution_harness_id,
+        blocked.candidate.candidate_id, Q1Status.REACHED, profile="jp-2")
+    historical = ev.BindingChanged(
+        binding=blocked.binding, judge_versions=versions)
+    assert "rematerialize_authority" not in historical.model_fields_set
+    world.c._apply(j, historical)
+    stored = world.job(j)
+    assert stored.state is JobState.S1_RUNNING
+    assert stored.judge_versions == versions
+    assert stored.last_verdict.result.judge_profile_id == \
+        VERSIONS.judge_profile_id
+
+    transition = world.store.transitions(j)[-1]
+    raw = json.loads(transition.model_dump_json())
+    assert raw["event"].pop("rematerialize_authority") is False
+    world.store.db.execute(
+        "UPDATE transitions SET body = ? WHERE job_id = ? AND seq = ?",
+        (json.dumps(raw, sort_keys=True), j, transition.seq))
+
+    assert world.c.replay(j) == stored
+
+
+def test_same_route_rejudge_rejects_conflicting_execution_identity(world):
+    j = world.to_running()
+    bundle = world.run(j, Q1Status.REACHED)
+    job = world.job(j)
+    world.judge.add(
+        bundle, job.binding.execution_harness_id,
+        job.candidate.candidate_id, Q1Status.REACHED, profile="jp-2")
+    world.judge.bundles[bundle]["harness_id"] = sha("foreign-build")
+
+    world.c.on_judge_versions(VERSIONS.model_copy(
+        update={"judge_profile_id": "jp-2"}))
+
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == BlockedReason.Q1_EVIDENCE.value
+    assert job.stage2_input is None
+
+
+def test_same_reason_rejudge_routes_changed_gap_signal(world):
+    first = GapRef(
+        gap_class=GapClass.REMOTE_KCOV_ATTRIBUTION,
+        missing_capability_id="remote_kcov.context.softirq")
+    second = GapRef(
+        gap_class=GapClass.REMOTE_KCOV_ATTRIBUTION,
+        missing_capability_id="remote_kcov.context.workqueue")
+    j = world.to_running()
+    bundle = world.run(
+        j, Q1Status.INCONCLUSIVE, "unsupported_attribution", first)
+    job = world.job(j)
+    world.judge.add(
+        bundle, job.binding.execution_harness_id,
+        job.candidate.candidate_id, Q1Status.INCONCLUSIVE,
+        "unsupported_attribution", second, profile="jp-2")
+
+    world.c.on_judge_versions(VERSIONS.model_copy(
+        update={"judge_profile_id": "jp-2"}))
+
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_HARNESS_GAP
+    assert job.gap == first
+    assert job.resume_point.kind is TargetKind.BLOCKED_HARNESS_GAP
+    assert job.resume_point.gap == second
+
+
+def test_same_not_reached_rejudge_reissues_repair_with_new_verdict(world):
+    j = world.to_running()
+    bundle = world.run(j, Q1Status.NOT_REACHED)
+    before = world.job(j)
+    old_task = before.pending_task
+    repairs = before.counters.agent_repair_stage1
+    world.judge.add(
+        bundle, before.binding.execution_harness_id,
+        before.candidate.candidate_id, Q1Status.NOT_REACHED,
+        profile="jp-2")
+
+    world.c.on_judge_versions(VERSIONS.model_copy(
+        update={"judge_profile_id": "jp-2"}))
+
+    job = world.job(j)
+    assert job.state is JobState.S1_PLANNING
+    assert job.last_verdict.result.judge_profile_id == "jp-2"
+    assert job.pending_task.task_id != old_task.task_id
+    assert job.pending_task.input_digest != old_task.input_digest
+    assert job.pending_task.repair.findings == (
+        job.last_verdict.result.model_dump_json(),)
+    assert job.counters.agent_repair_stage1 == repairs
+    assert world.store.attempt(old_task.task_id, old_task.attempt).status == \
+        "abandoned"
+    assert world.c.replay(j) == job
+
+
 def test_rejudge_needing_evidence_reruns_without_budget(world):
     j = world.to_running()
     world.run(j, Q1Status.NOT_REACHED)
@@ -255,15 +442,102 @@ def test_hcap_change_in_planning_restarts_the_task(world):
         "abandoned"
 
 
-def test_hcap_change_while_running_keeps_the_run(world):
+def test_hcap_change_while_running_rematerializes_and_restarts(world):
+    """The new HCAP revision changes the call admission or neutral
+    control authority refs: the harness is rebuilt and the run restarted."""
     j = world.to_running()
-    task = world.job(j).pending_task.task_id
+    before = world.job(j)
+    task = before.pending_task.task_id
+    world.materializer.authority_changed.add("hcap-2")
     world.registry.put(binding(hcap="hcap-2"))
     world.c.on_registry_changed()
     job = world.job(j)
     assert job.state is JobState.S1_RUNNING
+    assert job.harness.harness_ref != before.harness.harness_ref
+    assert job.pending_task.task_id != task
+    assert world.runner.cancel_calls[task] == 1
+
+
+def test_hcap_change_while_running_keeps_harness_with_same_authority(world):
+    """09 §5 `hcap_revision`-only row: the plan re-validates and the
+    authority refs are unchanged, so the run goes on."""
+    j = world.to_running()
+    before = world.job(j)
+    task = before.pending_task.task_id
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.binding.hcap_revision == "hcap-2"
+    assert job.harness.harness_ref == before.harness.harness_ref
+    assert job.harness.hcap_revision == "hcap-1"
+    assert job.harness.authority_hcap_revision == "hcap-2"
     assert job.pending_task.task_id == task
-    assert world.runner.cancel_calls[task] == 0
+    assert task not in world.runner.cancel_calls
+    assert job.counters == before.counters
+    seq = job.seq
+    world.c.on_registry_changed()               # no repeated migration
+    assert world.job(j).seq == seq
+    assert world.c.replay(j) == world.job(j)
+
+
+def test_hcap_change_keeps_reached_job_with_same_authority(world):
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    assert before.state is JobState.S1_REACHED
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    assert job.stage2_input == before.stage2_input
+    assert job.last_verdict == before.last_verdict
+    assert job.harness.harness_ref == before.harness.harness_ref
+    assert world.c.replay(j) == job
+
+
+def test_host_authority_refusal_blocks_without_llm_repair(world):
+    """09 §3: a host-side Materializer refusal (unapproved HCAP, corrupt
+    build artifact) is not an Agent mistake: no repair task, no charge."""
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    refusal = MaterializeRejected(
+        reason=HOST_AUTHORITY_UNAVAILABLE,
+        detail="hcap_not_approved_for_execution_harness")
+    world.materializer.refusals[(before.plan_ref,
+                                 before.binding.execution_harness_id)] = \
+        refusal
+    world.materializer.authority_changed.add("hcap-2")
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "host_authority"
+    assert job.pending_task is None
+    assert job.counters.agent_repair_stage1 == \
+        before.counters.agent_repair_stage1
+
+    del world.materializer.refusals[(before.plan_ref,
+                                     before.binding.execution_harness_id)]
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.harness.hcap_revision == "hcap-2"
+    assert job.counters.agent_repair_stage1 == \
+        before.counters.agent_repair_stage1
+
+
+def test_hcap_change_with_failing_plan_replans_despite_same_authority(world):
+    j = world.to_running()
+    before = world.job(j)
+    world.hcap.violations[(before.plan_ref, "hcap-2")] = ("cap_withdrawn",)
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.S1_PLANNING
+    assert job.harness is None
+    assert world.c.replay(j) == job
 
 
 def test_sanitizer_policy_change_rebinds(world):
@@ -420,3 +694,48 @@ def test_reached_is_entered_only_on_a_reached_verdict(world):
     assert job.last_verdict.result.status is Q1Status.REACHED
     assert job.stage2_input.q1_verdict_id == \
         job.last_verdict.result.verdict_id
+
+
+def test_corrupt_host_catalog_blocks_without_llm_repair(world):
+    """A corrupt host HCAP catalog fails the plan check before the
+    Materializer runs; it is still a host failure, not a plan finding."""
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    world.hcap.corrupt.add("hcap-2")
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "host_authority"
+    assert job.pending_task is None
+    assert job.counters.agent_repair_stage1 == \
+        before.counters.agent_repair_stage1
+    assert world.c.replay(j) == job
+
+
+def test_unreadable_host_catalog_keeps_the_job_and_retries(world, monkeypatch):
+    """A missing or unreadable catalog is a host availability failure: no
+    transition and no charge; a later poll applies the change."""
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    before = world.job(j)
+    real = world.hcap.check_plan
+
+    def unreadable(plan_ref, hcap_revision):
+        if hcap_revision == "hcap-2":
+            raise FileNotFoundError("catalog")
+        return real(plan_ref, hcap_revision)
+
+    monkeypatch.setattr(world.hcap, "check_plan", unreadable)
+    world.materializer.authority_changed.add("hcap-2")
+    world.registry.put(binding(hcap="hcap-2"))
+    with pytest.raises(FileNotFoundError):     # as a Materializer OSError
+        world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state is before.state
+    assert job.binding == before.binding
+    assert job.counters == before.counters
+    monkeypatch.setattr(world.hcap, "check_plan", real)
+    world.c.on_registry_changed()
+    assert world.job(j).binding.hcap_revision == "hcap-2"

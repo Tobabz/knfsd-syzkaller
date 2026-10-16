@@ -13,7 +13,7 @@ from typing import Annotated, Literal, Union
 from pydantic import Field, TypeAdapter
 
 from ..contracts import (AgentOutput, GapRef, HarnessBinding, JudgeVersions,
-                         Record, VulnerabilityCandidate)
+                         Record, Sha256, VulnerabilityCandidate)
 
 
 class IntakeChecked(Record):
@@ -60,6 +60,16 @@ class RunnerFinished(Record):
     reason: str | None = None
 
 
+class RunnerInputDigestMigrated(Record):
+    """Replace one authenticated pre-``job_id`` Runner input digest."""
+
+    type: Literal["runner_input_digest_migrated"] = \
+        "runner_input_digest_migrated"
+    task_id: str
+    legacy_digest: Sha256
+    canonical_digest: Sha256
+
+
 class ApprovalGiven(Record):
     type: Literal["approval_given"] = "approval_given"
     task_id: str
@@ -89,11 +99,24 @@ class BindingChanged(Record):
 
     type: Literal["binding_changed"] = "binding_changed"
     binding: HarnessBinding | None
+    judge_versions: JudgeVersions | None = None
+    # Absent in historical events. New registry/recovery events set this so
+    # binding, materialization and judge authority change atomically while old
+    # transition logs retain their original reduction.
+    rematerialize_authority: bool = False
+    # Set by the service: the job's current harness has the same
+    # HCAP-derived authority refs under `binding` (09 §5).  The machine then
+    # re-validates the plan and keeps the harness instead of rebuilding it.
+    harness_authority_current: bool = False
 
 
 class JudgeVersionsChanged(Record):
     type: Literal["judge_versions_changed"] = "judge_versions_changed"
     judge_versions: JudgeVersions
+    # Absent in historical events, whose reduction kept the old verdict when
+    # the re-judge gave the same decision.  Current events consume the new
+    # authority's verdict in that case too (09 §5).
+    consume_same_verdict: bool = False
 
 
 class PolicyChanged(Record):
@@ -104,6 +127,12 @@ class PolicyChanged(Record):
     type: Literal["policy_changed"] = "policy_changed"
     job_policy_id: str
     binding: HarnessBinding | None = None
+    judge_versions: JudgeVersions | None = None
+    rematerialize_authority: bool = False
+    # Set by the service: the job's current harness has the same
+    # HCAP-derived authority refs under `binding` (09 §5).  The machine then
+    # re-validates the plan and keeps the harness instead of rebuilding it.
+    harness_authority_current: bool = False
 
 
 class OperatorAction(Record):
@@ -117,13 +146,26 @@ class CancelConfirmed(Record):
 
     type: Literal["cancel_confirmed"] = "cancel_confirmed"
     task_id: str
+    #: The final status was ``cleanup_unconfirmed``: the lease ended, but
+    #: the execution was not confirmed stopped.  Absent in earlier logs.
+    cleanup_unconfirmed: bool = False
+
+
+class CleanupUnconfirmed(Record):
+    """The Runner reported, after the task's final status, that its
+    execution was not confirmed stopped (09 §8)."""
+
+    type: Literal["cleanup_unconfirmed"] = "cleanup_unconfirmed"
+    task_id: str
+    generation: int
 
 
 Event = Annotated[
     Union[IntakeChecked, AgentSucceeded, AgentFailed, AgentAttemptRestarted,
-          RunnerFinished, ApprovalGiven, ApprovalDenied, IssueChanged,
-          BindingChanged, JudgeVersionsChanged, PolicyChanged, OperatorAction,
-          CancelConfirmed],
+          RunnerFinished, RunnerInputDigestMigrated, ApprovalGiven,
+          ApprovalDenied, IssueChanged, BindingChanged, JudgeVersionsChanged,
+          PolicyChanged, OperatorAction, CancelConfirmed,
+          CleanupUnconfirmed],
     Field(discriminator="type"),
 ]
 
