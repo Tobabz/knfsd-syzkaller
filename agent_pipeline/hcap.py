@@ -365,9 +365,22 @@ class ArtifactHcapChecker:
         try:
             _check_ref(plan_ref)
             plan = load_record(self.store, plan_ref, ReachabilityPlan)
-            self._verify_artifact(plan.program_proposal.artifact_ref)
-            if plan.program_proposal.seed_manifest_ref is not None:
-                self._verify_artifact(plan.program_proposal.seed_manifest_ref)
+        except OSError:
+            raise
+        except _ARTIFACT_ERRORS:
+            return HcapCheck(violations=("invalid_plan_artifact",))
+        proposal = plan.program_proposal
+        try:
+            self._verify_artifact(proposal.artifact_ref)
+            if proposal.seed_manifest_ref is not None:
+                self._verify_artifact(proposal.seed_manifest_ref)
+        except FileNotFoundError:
+            # An existing seed is a reference the Agent proposed: one that
+            # does not exist is a plan finding.  An inline program was
+            # stored by the executor, so its absence is the host's.
+            if proposal.kind != "seed":
+                raise
+            return HcapCheck(violations=("seed_reference_not_found",))
         except OSError:
             raise
         except _ARTIFACT_ERRORS:

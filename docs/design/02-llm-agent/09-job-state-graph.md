@@ -410,7 +410,13 @@ backend가 실행 종료를 확인하지 못하면(예: 프로세스 정리 실�
 만료되면 `ended_unsealed(cleanup_unconfirmed)`로 끝낸다. 이것은 확인된 cancel도, runtime 재시도 대상도 아니다.
 Controller는 그 task를 `uncleaned_tasks`에 남기고, 종료 상태가 아닌 job은 `blocked_operator(execution_cleanup)`로
 보낸다. operator가 실행이 사라졌음을 확인하고 `resume`하면 목록을 비우고 멈춘 곳에서 이어 간다. 종료된 job은
-그대로 두되 기록에 task가 남는다.
+그대로 두되 기록에 task가 남는다. 이미 다른 이유로 대기 중인 job은 그 이유를 유지하지만, `uncleaned_tasks`가
+남아 있는 동안에는 어떤 경로로도 Runner task를 보내지 않고 `blocked_operator(execution_cleanup)`로 간다.
+
+정리는 lease보다 오래 걸릴 수 있다. 만료로 attempt가 이미 끝난 뒤에 도착한 종료 미확인 보고도 버리지 않는다.
+Runner는 그 attempt(generation, worker, token)로 보고를 인증해 보관하고(`cleanup_reports()`), Controller는
+poll·recover마다 그 task를 job의 `uncleaned_tasks`에 기록한 뒤에야 보고를 확인 처리한다. 늦게 온 결과의 bundle은
+여전히 받지 않는다.
 
 `sealed`는 마지막 bundle까지 봉인하고 끝났다는 뜻이고, `ended_unsealed`는 마지막 bundle 없이 끝났다는 뜻이다.
 campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running` 동안에도 목록이 늘어난다.

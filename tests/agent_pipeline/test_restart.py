@@ -607,3 +607,69 @@ def test_runner_end_without_confirmed_cleanup_is_not_a_retry(world):
     assert job.uncleaned_tasks == (p.task_id,)
     assert job.counters.runtime_retry == before.runtime_retry
     assert world.c.replay(j) == job
+
+
+def test_waiting_job_still_needs_cleanup_confirmed_before_running(world):
+    """09 §8: a job already waiting for another reason when its cancel
+    settles without confirmed cleanup must not dispatch Runner work when
+    that wait ends; the operator confirms the cleanup first."""
+    j = world.to_running()
+    old = world.job(j).pending_task.task_id
+    world.runner.slow_cancel.add(old)
+    world.runner.unconfirmed.add(old)
+    world.hcap.corrupt.add("hcap-2")
+    world.registry.put(binding(hcap="hcap-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.state_reason == "host_authority"
+    assert job.cancelling_tasks == (old,)
+
+    world.c.poll()                      # the cancel settles, unconfirmed
+    job = world.job(j)
+    assert job.cancelling_tasks == ()
+    assert job.uncleaned_tasks == (old,)
+    assert job.state_reason == "host_authority"
+    assert world.c.replay(j) == job
+
+    # Replay re-checks the catalog, so it is not compared after the fix.
+    world.hcap.corrupt.discard("hcap-2")
+    world.restart()
+    started = list(world.runner.started)
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "execution_cleanup"
+    assert world.runner.started == started
+
+    world.c.operator(j, "resume")
+    job = world.job(j)
+    assert job.uncleaned_tasks == ()
+    assert job.state is JobState.S1_RUNNING
+    assert world.runner.started == started + [job.pending_task.task_id]
+
+
+def test_late_cleanup_report_is_tracked_after_the_task_settled(world):
+    """A not-confirmed-stopped report that arrives after the task's final
+    status still reaches the job, and is acknowledged only once recorded."""
+    j = world.to_running()
+    old = world.job(j).pending_task.task_id
+    world.registry.put(binding("build-2"))
+    world.c.on_registry_changed()
+    job = world.job(j)
+    assert job.cancelling_tasks == ()
+    assert job.uncleaned_tasks == ()
+    assert job.state is JobState.S1_RUNNING
+    replacement = job.pending_task.task_id
+
+    world.runner.late_reports.add(old)
+    world.restart()
+    job = world.job(j)
+    assert job.uncleaned_tasks == (old,)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "execution_cleanup"
+    assert job.pending_task is None
+    assert world.runner.cancel_calls[replacement] >= 1
+    assert world.runner.late_reports == set()
+    assert world.c.replay(j) == job
+    world.c.poll()                      # acknowledged: not applied again
+    assert world.job(j) == job

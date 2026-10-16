@@ -238,9 +238,34 @@ class Controller:
         linked.  A failing call is recorded for its job and the other jobs
         go on; returns this call's failures."""
         self.failures = []
+        self._late_cleanup_reports()
         for job in list(self.store.jobs()):
             self._settle(job.job_id)
         return self.failures
+
+    def _late_cleanup_reports(self) -> None:
+        """09 §8: an execution reported not confirmed stopped after its task
+        ended is recorded on the job before the report is acknowledged."""
+        try:
+            task_ids = self.runner.cleanup_reports()
+        except Exception as e:      # any failure of the outside call
+            f = EffectFailure(job_id="", effect="cleanup_reports",
+                              error=repr(e))
+            self.failures.append(f)
+            return
+        for task_id in task_ids:
+            job_id = job_of(task_id)
+            self._guard(job_id, f"cleanup:{task_id}",
+                        lambda j=job_id, t=task_id: self._late_cleanup(j, t))
+
+    def _late_cleanup(self, job_id: str, task_id: str) -> None:
+        try:
+            self.store.job(job_id)
+        except KeyError:
+            pass        # no job of this Controller owns the task
+        else:
+            self._apply(job_id, ev.CleanupUnconfirmed(task_id=task_id))
+        self.runner.acknowledge_cleanup_report(task_id)
 
     def _settle(self, job_id: str) -> None:
         job = self.store.job(job_id)
@@ -307,6 +332,7 @@ class Controller:
         task_id, send a new attempt of an Agent task, and process the
         queue states.  Failures are recorded per job, as in poll()."""
         self.failures = []
+        self._late_cleanup_reports()
         for job in list(self.store.jobs()):
             self._guard(job.job_id, "recover",
                         lambda j=job.job_id: self._recover(j))
