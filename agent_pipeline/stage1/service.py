@@ -63,7 +63,7 @@ class Stage1Parts:
     tree: SourceTree
     registry: HarnessRegistry
     materializer: Materializer
-    runtime: AgentRuntime
+    runtime: AgentRuntime | None
     tools: ToolboxFactory | None
     engine_factory: Callable[[ArtifactStore], ExecutionEngine]
     judge_versions: JudgeVersions
@@ -75,6 +75,34 @@ class Stage1Parts:
     agent_workers: int = 2
     issues: IssueTracker | None = None
     new_id: Callable[[], str] | None = None
+    #: False for one-shot commands: Agent Tasks are recorded but not run,
+    #: and the service loop (``run``) sends them.
+    run_agents: bool = True
+
+
+class AgentDispatchDeferred(RuntimeError):
+    """This process does not run Agent Tasks; the service loop sends them."""
+
+
+class _DeferredAgents:
+    """The Agent executor of a one-shot command.
+
+    ``start`` refuses, so the attempt stays ``sending``: a running service's
+    ``poll()`` or the next ``recover()`` sends a new attempt (09 §8).  No
+    model call is made by a process that would exit before storing it.
+    """
+
+    sink = None
+
+    def start(self, request) -> None:
+        raise AgentDispatchDeferred(
+            f"{request.task_id} is left to the service loop")
+
+    def deliver(self, **kwargs) -> int:
+        return 0
+
+    def close(self, **kwargs) -> None:
+        pass
 
 
 class Stage1Service:
@@ -99,13 +127,16 @@ class Stage1Service:
         self.issues = parts.issues or SqliteIssueTracker(state / "issues.sqlite")
         self.judge = PublishedQ1Judge(self.bridge.snapshot())
         hcap = ArtifactHcapChecker(self.artifacts)
-        tools = parts.tools or PinnedToolboxFactory(
-            _source_index(parts.tree), _hcap_source(hcap))
         # The Controller is the executor's sink, and the executor is the
         # Controller's Agent executor: bind the sink after both exist.
-        self.agents = QueuedAgentExecutor(parts.runtime, self.artifacts, tools,
-                                          sink=None,
-                                          max_workers=parts.agent_workers)
+        if parts.run_agents:
+            tools = parts.tools or PinnedToolboxFactory(
+                _source_index(parts.tree), _hcap_source(hcap))
+            self.agents = QueuedAgentExecutor(
+                parts.runtime, self.artifacts, tools, sink=None,
+                max_workers=parts.agent_workers)
+        else:
+            self.agents = _DeferredAgents()
         env = Env(policy=self.store.policy, hcap=hcap,
                   materializer=parts.materializer, judge=self.judge)
         extra = {} if parts.new_id is None else {"new_id": parts.new_id}
@@ -162,9 +193,28 @@ class Stage1Service:
         except Exception as exc:
             # The result stays queued and is offered again next step.
             report.errors.append(f"deliver: {type(exc).__name__}: {exc}")
+        report.errors.extend(self.deliver_issue_events())
         report.publications = self.publisher.publish_ready()
         report.failures = self.controller.poll()
         return report
+
+    def deliver_issue_events(self) -> list[str]:
+        """Pass recorded issue status changes to the Controller (07 §7).
+
+        A change recorded by another process (``resolve-issue``) reaches
+        the jobs linked to its gap here; it is marked delivered only after
+        the Controller applied it."""
+        pending = getattr(self.issues, "pending_events", None)
+        if pending is None:
+            return []
+        errors = []
+        for event_id, gap, status, resolution in pending():
+            try:
+                self.controller.on_issue(gap, status, resolution)
+                self.issues.mark_delivered(event_id)
+            except Exception as exc:
+                errors.append(f"issue {status}: {type(exc).__name__}: {exc}")
+        return errors
 
     def run(self, until: Callable[[], bool], *, interval_s: float = 1.0,
             timeout_s: float | None = None,
@@ -182,20 +232,32 @@ class Stage1Service:
     def job(self, job_id: str) -> Job:
         return self.store.job(job_id)
 
-    def close(self, *, worker_timeout_s: float = 10.0) -> None:
-        """Stop the loop.  A lease still running after the timeout is not
-        waited for: closing the Runner makes its renewals fail, and the
-        lease then ends ``runner_restart`` or ``cleanup_unconfirmed``."""
+    def close(self, *, worker_timeout_s: float | None = None) -> bool:
+        """Stop the loop.  By default wait for a running lease to finish,
+        so its completion or unconfirmed-cleanup report is stored.
+
+        With a timeout, a worker still running keeps the Runner and receipt
+        databases open (returns False): closing them under it would lose
+        its ``stop_unconfirmed`` report.  Agent results that finish while
+        closing are stored before the Store closes."""
         self._stop.set()
+        worker_done = True
         if self._worker_thread is not None:
             self._worker_thread.join(worker_timeout_s)
+            worker_done = not self._worker_thread.is_alive()
         self.agents.close()
+        try:
+            self.agents.deliver()
+        except Exception as exc:     # the next recover() sends it again
+            self.worker_errors.append(f"deliver on close: {exc}")
         self.bridge.close()
-        self.receipts.close()
-        self.runner.close()
+        if worker_done:
+            self.receipts.close()
+            self.runner.close()
         if self._own_issues:
             self.issues.close()
         self.store.close()
+        return worker_done
 
     def __enter__(self) -> Stage1Service:
         return self

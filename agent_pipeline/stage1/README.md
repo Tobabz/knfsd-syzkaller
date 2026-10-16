@@ -40,6 +40,18 @@ python -m agent_pipeline.stage1 --config stage1.json run --job <job id>
 approval with `approve JOB TASK REVIEW_MANIFEST_SHA256 DECISION_ID`, then
 `run` again; `replay JOB` re-checks the stored transitions.
 
+Only `run` calls a model. Every other command is one-shot: an Agent Task
+it creates (`submit`, `deny`, `operator resume`, a resolved issue) is
+recorded with its attempt left `sending`, and `run`, or a `run` already
+going in another process, sends it on its next poll. On exit, `run` waits
+for a running lease so its completion or cleanup report is stored, and
+stores Agent results that finish while it closes.
+
+A job blocked on a harness gap is linked to a local issue (`issues`).
+After fixing the gap, record it with `resolve-issue gap-N resolved`
+(or `deferred`, `reopened`, `wont_fix`); the change is stored and passed
+to the linked jobs by that command and by any running service.
+
 `stage1.json` is a `config.Stage1Config`. Every value is host authority:
 
 | Field | What |

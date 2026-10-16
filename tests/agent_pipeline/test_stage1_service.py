@@ -133,10 +133,12 @@ class Ids:
         return f"{self.n:04d}"
 
 
-def make_service(tmp_path, build, *, pcs="4096", ids=None):
+def make_service(tmp_path, build, *, pcs="4096", ids=None, command=COMMAND,
+                 run_agents=True, registry=None, engine_factory=None):
     b = build
-    registry = InMemoryRegistry()
-    registry.put(b.binding)
+    if registry is None:
+        registry = InMemoryRegistry()
+        registry.put(b.binding)
     config = CommandEngineConfig(
         argv=(sys.executable, "-I", "-c",
               "import sys; sys.path.insert(0, sys.argv.pop(1)); "
@@ -146,7 +148,7 @@ def make_service(tmp_path, build, *, pcs="4096", ids=None):
         resource_key="test-lane-0", collector_id="test-collector",
         env={"LANG": "C.UTF-8", "TEST_PCS": pcs},
         limits=ProcessLimits(timeout_s=60))
-    (tmp_path / "command.py").write_text(COMMAND)
+    (tmp_path / "command.py").write_text(command)
 
     def engine(store):
         return CommandExecutionEngine(
@@ -156,11 +158,12 @@ def make_service(tmp_path, build, *, pcs="4096", ids=None):
         state_dir=tmp_path / "state", artifacts=b.store,
         tree=FakeTree({b.binding.kernel_commit: SOURCE}), registry=registry,
         materializer=b.materializer, runtime=ScriptedRuntime(b),
-        tools=lambda request: toolbox(), engine_factory=engine,
+        tools=lambda request: toolbox(),
+        engine_factory=engine_factory or engine,
         judge_versions=versions(b),
         identities=DescriptorKernelIdentity("kernel", "instrumentation"),
         policies=(policy(),), new_id=ids or Ids(),
-        lease_duration_ns=30_000_000_000)
+        lease_duration_ns=30_000_000_000, run_agents=run_agents)
     return Stage1Service(parts)
 
 
@@ -352,3 +355,97 @@ def test_open_stage1_builds_the_production_composition(tmp_path, build):
                            timeout_s=60)
         assert service.job(job_id).state is JobState.S1_REACHED, (
             service.job(job_id), service.store.effect_failures(job_id))
+
+
+def wait_for(predicate, timeout_s=30.0) -> bool:
+    import time
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def test_fifo_capture_ends_the_lease_instead_of_hanging(tmp_path, build):
+    fifo = "import os, sys; os.mkfifo(sys.argv[2] + '/capture.json')\n"
+    with make_service(tmp_path, build, command=fifo) as service:
+        job_id = submit(service, build)
+        service.start_worker(idle_s=0.05)
+        assert service.run(lambda: bool(service.worker_runs),
+                           interval_s=0.05, timeout_s=30)
+        run = service.worker_runs[0]
+        assert run.disposition == "completed"
+        assert service.runner.receipt(run.task_id).reason == "capture_failed"
+        assert service.job(job_id).last_verdict is None
+
+
+def test_one_shot_command_leaves_agent_tasks_to_the_running_service(
+        tmp_path, build):
+    ids = Ids()
+    with make_service(tmp_path, build, ids=ids, run_agents=False) as once:
+        job_id = submit(once, build)
+        p = once.job(job_id).pending_task
+        assert once.store.attempt(p.task_id, p.attempt).status == "sending"
+        register_mapping(once, build, job_id)
+    # A service already running picks the job up in poll(), without
+    # recover(), and calls the model once per Agent Task.
+    with make_service(tmp_path, build, ids=ids) as service:
+        service.start_worker(idle_s=0.05)
+        assert service.run(stopped(service, job_id), interval_s=0.05,
+                           timeout_s=60)
+        assert service.job(job_id).state is JobState.S1_REACHED
+        assert service.parts.runtime.calls == ["candidate_analysis",
+                                               "reachability_planning"]
+
+
+def test_close_keeps_runner_open_for_a_worker_still_cleaning_up(
+        tmp_path, build):
+    import threading
+
+    from agent_pipeline.runner.worker import ExecutionNotStopped
+
+    entered, release = threading.Event(), threading.Event()
+
+    class StuckEngine:
+        def capture(self, lease, control):
+            entered.set()
+            assert release.wait(30)
+            raise ExecutionNotStopped("payload still alive")
+
+    service = make_service(tmp_path, build,
+                           engine_factory=lambda store: StuckEngine())
+    job_id = submit(service, build)
+    service.start_worker(idle_s=0.05)
+    assert service.run(entered.is_set, interval_s=0.05, timeout_s=60)
+    task_id = service.job(job_id).pending_task.task_id
+    assert service.close(worker_timeout_s=0) is False
+    release.set()
+    service._worker_thread.join(30)
+    try:
+        assert service.worker_errors == []
+        assert [r.disposition for r in service.worker_runs] == ["not_stopped"]
+        assert service.runner.status(task_id).state == "running"
+    finally:
+        service.receipts.close()
+        service.runner.close()
+
+
+def test_resolved_gap_issue_resumes_the_blocked_job(tmp_path, build):
+    registry = InMemoryRegistry()        # no harness for this commit yet
+    with make_service(tmp_path, build, registry=registry) as service:
+        job_id = submit(service, build)
+        assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
+        [issue] = service.issues.issues()
+        assert issue["jobs"] == [job_id]
+        registry.put(build.binding)
+        service.issues.change(issue["issue"], "resolved", "harness built")
+        register_mapping(service, build, job_id)
+        report = service.step()
+        assert report.errors == []
+        assert service.issues.pending_events() == []
+        assert service.job(job_id).state is JobState.S1_ANALYSIS
+        service.start_worker(idle_s=0.05)
+        assert service.run(stopped(service, job_id), interval_s=0.05,
+                           timeout_s=60)
+        assert service.job(job_id).state is JobState.S1_REACHED

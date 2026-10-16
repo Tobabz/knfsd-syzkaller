@@ -89,7 +89,10 @@ def _read_regular(directory: Path, name: str, max_bytes: int) -> bytes:
         raise CaptureError(f"capture path must be a file name: {name!r}")
     dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        # O_NONBLOCK: opening a FIFO or device left by the command must not
+        # wait for a writer; the type check below then refuses it.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=dir_fd)
     except OSError as exc:
         raise CaptureError(f"capture file unavailable: {name}") from exc
     finally:

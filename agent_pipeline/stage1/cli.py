@@ -8,6 +8,8 @@ Commands:
 ``approve`` / ``deny``  answer an ``s1_approval`` review
 ``operator``     send an operator action to a job
 ``add-mapping``  register a verified ``TargetPcMapping`` JSON file
+``issues`` / ``resolve-issue``  list harness gap issues; record a status
+                 change (resolved, deferred, reopened, wont_fix) for its jobs
 ``replay``       re-run a job's stored events and compare (09 §8)
 """
 
@@ -41,10 +43,12 @@ STOP_STATES = TERMINAL | {JobState.S1_REACHED, JobState.S1_APPROVAL,
 
 
 def open_stage1(config: Stage1Config, stack: ExitStack, *,
-                runtime=None, parser=None) -> Stage1Service:
+                runtime=None, parser=None,
+                run_agents: bool = True) -> Stage1Service:
     """Build the production service from host configuration.  Tests may
     inject ``runtime`` and ``parser``; production uses the PydanticAI
-    driver and the pinned syzkaller bundle."""
+    driver and the pinned syzkaller bundle.  ``run_agents=False`` is for
+    one-shot commands: Agent Tasks they create are left to ``run``."""
     artifacts = ArtifactStore(config.artifact_root)
     approvals = tuple(load_record(artifacts, ref, ExecutionHarnessApproval)
                       for ref in config.execution_harness_approvals)
@@ -52,7 +56,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         from ..syzkaller.adapter import PinnedSyzParser
         parser = stack.enter_context(PinnedSyzParser(
             config.syzkaller_bundle, identity=config.syzkaller_identity))
-    if runtime is None:
+    if runtime is None and run_agents:
         from ..agent_tasks.pydantic_ai_runtime import PydanticAIRuntime
         runtime = PydanticAIRuntime()
     e = config.engine
@@ -80,7 +84,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         policies=config.policies, sealer_id=config.sealer_id,
         worker_id=config.worker_id,
         lease_duration_ns=int(config.lease_duration_s * 1e9),
-        agent_workers=config.agent_workers)
+        agent_workers=config.agent_workers, run_agents=run_agents)
     return stack.enter_context(Stage1Service(parts))
 
 
@@ -151,6 +155,15 @@ def main(argv: list[str] | None = None) -> int:
     o.add_argument("job")
     o.add_argument("action")
 
+    ri = sub.add_parser("resolve-issue",
+                        help="record a harness gap issue status change")
+    ri.add_argument("issue", help="gap-N, as printed by issues")
+    ri.add_argument("status", choices=["resolved", "deferred", "reopened",
+                                       "wont_fix"])
+    ri.add_argument("--resolution", default="")
+
+    sub.add_parser("issues")
+
     m = sub.add_parser("add-mapping")
     m.add_argument("file", type=Path)
 
@@ -160,7 +173,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     config = Stage1Config.load(args.config)
     with ExitStack() as stack:
-        service = open_stage1(config, stack)
+        # Only the service loop runs Agent Tasks; a one-shot command that
+        # creates one leaves it for run, which stores its result.
+        service = open_stage1(config, stack,
+                              run_agents=args.command == "run")
         if args.command == "submit":
             job_id = service.controller.submit(CandidateSubmission(
                 kernel_commit=args.commit, location=LocationRequest(
@@ -213,6 +229,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "add-mapping":
             mapping = TargetPcMapping.model_validate_json(args.file.read_bytes())
             print(service.mappings.add(mapping))
+        elif args.command == "resolve-issue":
+            # Recorded first, so a running service also applies it; applied
+            # here too so the linked jobs show the result at once.
+            service.issues.change(args.issue, args.status, args.resolution)
+            for err in service.deliver_issue_events():
+                print(f"error: {err}", file=sys.stderr)
+            _print(service.issues.issues())
+        elif args.command == "issues":
+            _print(service.issues.issues())
         elif args.command == "replay":
             job = service.controller.replay(args.job)
             _print({"job_id": job.job_id, "replayed_seq": job.seq,
