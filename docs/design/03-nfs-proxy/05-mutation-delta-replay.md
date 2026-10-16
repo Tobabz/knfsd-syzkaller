@@ -1267,8 +1267,11 @@ Q2는 crash/sanitizer evidence가 별도로 판단한다.
 ### 45. M5 host frame 및 ACK 계약 v1
 
 첫 구현은 `agent_pipeline/journal_framing.py`의 frame codec, bounded prefix reader와 ACK schema다.
-이 구현은 event payload admission, session/generation 상태 복원, durable writer 또는 live transport를
-아직 제공하지 않는다. frame 검증 성공이나 `JournalAck` 객체 생성은 `(D)`의 증명이 아니다.
+framing 모듈은 event payload admission, session/generation 상태 복원, durable writer 또는 live transport를
+제공하지 않는다. 후속 `journal_events.py`와 `journal_admission.py`의 제한된 scalar-literal-v1 계약 및
+순수 상태 검증은 [`07-journal-event-contract.md`](07-journal-event-contract.md)를 따른다.
+durable writer와 live transport는 후속 구현 대상이다. frame 검증 성공, event 준비 성공이나
+`JournalAck` 객체 생성은 `(D)`의 증명이 아니다.
 
 **Frame layout.** 모든 정수는 unsigned big-endian이며 header는 80 bytes다.
 

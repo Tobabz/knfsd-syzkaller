@@ -39,6 +39,8 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis and Reachability Planning; records the runtime's actual `provider:model` id through existing Controller callbacks |
 | `runner/` | restart-safe SQLite leases/completion, evidence sealing, accepted-receipt Q1 publication and lease-aware Linux process supervision |
 | `journal_framing.py` | bounded M5 journal frame recovery and canonical ACK codec; persistence and event admission remain separate |
+| `journal_events.py` | canonical bounded event payloads for the scalar-literal-v1 profile, with exact NFSPRUL1 snapshot and concrete-byte checks |
+| `journal_admission.py` | pure session/generation/batch admission and prefix reconstruction; returns candidate state without storage or ACK |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |
 | `controller/store.py` | SQLite: one transaction per transition |
 | `controller/service.py` | events in, tasks out after commit; `poll()` and `recover()` send a failed or unanswered call again (each failure is recorded per job in `effect_failures`, and the other jobs go on); `replay()` |
@@ -142,6 +144,14 @@ judge production runs.
 `journal_framing` fixes the versioned frame header and ACK shape, detects complete
 corrupt frames, and reports an incomplete final append without modifying input.
 It does not persist records, validate event semantics or send acknowledgements.
+
+`journal_events` and `journal_admission` add a limited scalar-literal-v1 event
+contract and structural/lifecycle checks against independently selected host
+authority. Preparation returns immutable candidate state; only a future durable
+writer may commit it and emit an ACK. Unsupported rule forms are refused as a
+whole. These modules do not approve rules against a schema, connect a guest
+transport, or supply M1 evidence authority. See the
+[event contract](../docs/design/03-nfs-proxy/07-journal-event-contract.md).
 
 `ArtifactQ2Judge` follows the same split without depending on Stage 2
 Controller integration. Its `TrustedQ2Execution` receipt is the authority for
