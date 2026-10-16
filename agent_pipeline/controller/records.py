@@ -179,6 +179,9 @@ class Job(BaseModel):
     cancelling_tasks: tuple[str, ...] = ()
     #: Runner tasks whose lease ended without confirmed cleanup (09 §8).
     uncleaned_tasks: tuple[str, ...] = ()
+    #: Late Runner cleanup reports already applied, as "task_id:generation",
+    #: so a report re-sent after a lost acknowledgement applies once.
+    cleanup_reports_applied: tuple[str, ...] = ()
     resume_point: Target | None = None
     analysis_ref: str | None = None
     plan_ref: str | None = None

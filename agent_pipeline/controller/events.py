@@ -157,6 +157,7 @@ class CleanupUnconfirmed(Record):
 
     type: Literal["cleanup_unconfirmed"] = "cleanup_unconfirmed"
     task_id: str
+    generation: int
 
 
 Event = Annotated[

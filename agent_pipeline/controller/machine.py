@@ -544,9 +544,12 @@ class Machine:
     def _on_cleanup_unconfirmed(self, c: _Call,
                                 e: ev.CleanupUnconfirmed) -> bool:
         j = c.job
+        key = f"{e.task_id}:{e.generation}"
         if not e.task_id.startswith(j.job_id + ".t") or \
-                e.task_id in j.uncleaned_tasks:
+                key in j.cleanup_reports_applied:
             return False
+        # Applied once, even after the operator confirmed this cleanup.
+        j.cleanup_reports_applied = j.cleanup_reports_applied + (key,)
         j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
                                    if t != e.task_id)
         if self._is_pending(j.pending_task, TaskKind.RUNNER, e.task_id):

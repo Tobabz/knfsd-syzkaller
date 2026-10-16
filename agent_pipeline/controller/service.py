@@ -247,25 +247,30 @@ class Controller:
         """09 §8: an execution reported not confirmed stopped after its task
         ended is recorded on the job before the report is acknowledged."""
         try:
-            task_ids = self.runner.cleanup_reports()
+            reports = self.runner.cleanup_reports()
         except Exception as e:      # any failure of the outside call
             f = EffectFailure(job_id="", effect="cleanup_reports",
                               error=repr(e))
             self.failures.append(f)
             return
-        for task_id in task_ids:
+        for task_id, generation in reports:
             job_id = job_of(task_id)
-            self._guard(job_id, f"cleanup:{task_id}",
-                        lambda j=job_id, t=task_id: self._late_cleanup(j, t))
+            self._guard(job_id, f"cleanup:{task_id}:{generation}",
+                        lambda j=job_id, t=task_id, g=generation:
+                        self._late_cleanup(j, t, g))
 
-    def _late_cleanup(self, job_id: str, task_id: str) -> None:
+    def _late_cleanup(self, job_id: str, task_id: str,
+                      generation: int) -> None:
         try:
             self.store.job(job_id)
         except KeyError:
             pass        # no job of this Controller owns the task
         else:
-            self._apply(job_id, ev.CleanupUnconfirmed(task_id=task_id))
-        self.runner.acknowledge_cleanup_report(task_id)
+            # Idempotent per (task_id, generation): a report re-sent after
+            # a failed acknowledgement makes no second transition.
+            self._apply(job_id, ev.CleanupUnconfirmed(
+                task_id=task_id, generation=generation))
+        self.runner.acknowledge_cleanup_report(task_id, generation)
 
     def _settle(self, job_id: str) -> None:
         job = self.store.job(job_id)
