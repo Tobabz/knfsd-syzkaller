@@ -4,7 +4,7 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/nfs4_decode/txn/semantic/relay/control tests under clang
+`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/nfs4_decode/txn/rule/semantic/relay/control tests under clang
 and GCC ASan+UBSan, after the ProtocolSchema normalizer's tests, a pin check of the RFC XDR files and a freshness check of every generated schema table. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
 delta files independently of their writer and reader. `build.sh` also compiles
 the guest delta-replay probe as a build-only regression gate. The host tests
@@ -160,6 +160,30 @@ contract in [03](../../docs/design/03-nfs-proxy/03-transaction-context.md).
   `txn ...` counter lines with the stats. With `--control`/`--replay` the CALL the peer gets
   may be rewritten after the observer (even its minor version), so a REPLY then gets neither
   a dispatch nor a request summary: it is `transaction_context_missing`.
+
+## Target semantic path: rule set format and validation (M4a)
+
+[06 §27](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.md).
+
+- `src/rule.*` reads an `NFSPRUL1` rule set: canonical XDR of `CompiledMutationRule[]` with one
+  `schema_id` and one `candidate_id`. Every length and count is checked against its bound and
+  the bytes left before anything is copied, and any second encoding of the same set (trailing
+  bytes, non-zero padding, unsorted or repeated ids) is `malformed`.
+- Validation then checks each rule against the ProtocolSchema its `schema_id` names: selector,
+  target path and part, that every value the rule reads is in the target's procedure (in a
+  family dispatched by procedure, such as NFSv3, a READ rule cannot read a WRITE argument; every
+  NFSv4 operation is in COMPOUND, so no NFSv4 rule is refused for what it reads), predicate and
+  transform types, mutation shape, and that the declared context dependencies are exactly those
+  its ValueRefs need. Loading is all or nothing; the first failing rule refuses the set with a
+  typed status and its rule and predicate index.
+  What this runtime cannot apply yet (insert, delete, operation edits, builtin transforms, the
+  `encoded` part) is `unsupported_capability`.
+- `nfsp_schema_resolve()` (`src/schema.*`) finds the node a semantic path names from the type
+  graph alone. `test_nfs_decode` and `test_nfs4_decode` resolve every path the decoder emits
+  and require the same type back, so a rule and the decoder cannot disagree on a name.
+- Nothing installs or applies a rule set yet: that is the Resolver (M4b), the preflight and
+  edit adapter (M4c), and the Runner installation path (S1a).
 
 ## Building
 

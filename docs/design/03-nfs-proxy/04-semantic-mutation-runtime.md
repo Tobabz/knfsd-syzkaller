@@ -541,6 +541,7 @@ nfs version/minor valid
 operation valid
 target semantic path exists
 target WireRef part exists
+predicate / copy ValueRefs in the target's procedure
 predicate types compatible
 transform types compatible
 structure_policy valid for mutation kind
@@ -552,13 +553,21 @@ promoted registry scope 안 (runtime 광고만으로는 부족, issue #14)
 ```
 
 실패는 typed reason으로 돌려준다. `unknown_path`, `type_mismatch`, `message_type_inconsistent`,
-`missing_required_field`는 Agent가 고칠 입력 오류이고, `unsupported_capability`와
+`selector_mismatch`, `missing_required_field`는 Agent가 고칠 입력 오류이고, `unsupported_capability`와
 `requires_state_lineage`는 `HarnessGapIssue(gap_class=mutation_engine)`로 간다
 (`../02-llm-agent/08-mutation-rule-set.md` §12, issue #5).
 
 Compiler는 live record가 아직 없으므로 actual selector match, current field value,
 current WireRef offset, current TransactionEntry presence, runtime rule conflict를
-검증하지 않는다.
+검증하지 않는다. 다만 target과 다른 procedure에만 있는 값은 target을 담는 message에 있을 수 없음을
+schema만으로 알 수 있으므로 거부한다. message 하나는 procedure 하나의 값만 담는다(CALL은 그 argument,
+REPLY는 그 result, REPLY의 request view는 그 REPLY가 답하는 CALL의 argument). 그래서 target과 rule이
+읽는 모든 ValueRef는 한 procedure 안에 있어야 하고, rule이 procedure를 지정하면 그 procedure여야 한다.
+operation은 그 operation에 닿는 모든 procedure 안에 있다. 예를 들어 NFSv3 READ rule이 WRITE argument를
+읽으면 `selector_mismatch`다. NFSv4 operation은 모두 COMPOUND 안에 있으므로 NFSv4 rule은 읽는 값
+때문에 거부되지 않는다. 같은 procedure 안에서 서로 배타적인 값(고르지 않은 union arm, operation을
+하나만 담는 message의 다른 operation, 같은 COMPOUND에 없는 operation)도 거부하지 않고 값이 없는
+ValueRef로 남긴다(미결(M4b)).
 
 ### 20. schema_id compatibility
 
@@ -801,6 +810,166 @@ Edit Applier applied + durable evidence + forwarding result
 M1의 verdict 계약은 `../02-llm-agent/01-two-stage-agent-architecture.md` §7이 소유한다
 (issue #4).
 
+### 35. CompiledMutationRule serialization (NFSPRUL1)
+
+Runner가 Proxy session에 설치하고 `RULESET`(`05-mutation-delta-replay.md` §7)이 기록하는 rule set의
+byte 형식이다. reader와 load-time validation은 `tools/nfs-proxy/src/rule.{h,c}`(M4a)다. 설치 경로와
+activation은 이 절의 범위가 아니다(`06-implementation-gap-analysis.md` §9, S1a).
+
+형식은 XDR(RFC 4506)이다. big-endian 4-byte unit, string/opaque는 0 byte로 4-byte 정렬,
+`T *x`는 bool word 뒤에 값이 1일 때만 T가 온다.
+
+```text
+typedef string id<128>;              /* 비어 있지 않은 visible ASCII 0x21-0x7e */
+typedef string semantic_path<512>;   /* 같은 문자 집합 */
+
+enum direction        { C2S = 0, S2C = 1 };
+enum message_type     { CALL = 0, REPLY = 1 };
+enum target_kind      { FIELD = 0, OPERATION_ARRAY = 1 };
+enum wire_part        { VALUE = 0, ENCODED = 1, LENGTH = 2, COUNT = 3,
+                        DISCRIMINANT = 4, PADDING = 5 };
+enum value_source     { TARGET = 0, CURRENT_MESSAGE = 1,
+                        REQUEST_FORWARDED = 2, REQUEST_ORIGINAL = 3 };
+enum literal_kind     { INT = 0, UINT = 1, HYPER = 2, UHYPER = 3, BOOL = 4,
+                        ENUM = 5, OPAQUE = 6, STRING = 7 };
+enum compare_op       { EQ = 0, NE = 1, LT = 2, LE = 3, GT = 4, GE = 5 };
+enum mutation_kind    { REPLACE = 0, INSERT = 1, DELETE = 2,
+                        OP_APPEND = 3, OP_PREPEND = 4 };
+enum transform_kind   { LITERAL = 0, COPY = 1, BUILTIN = 2 };
+enum structure_policy { PRESERVE = 0, RAW = 1 };
+enum application_mode { ALL_MATCHES = 0 };
+
+union typed_literal switch (literal_kind kind) {
+case INT:    int value;
+case UINT:   unsigned int value;
+case HYPER:  hyper value;
+case UHYPER: unsigned hyper value;
+case BOOL:   bool value;
+case ENUM:   unsigned int value;     /* enum의 wire word */
+case OPAQUE: opaque value<4096>;
+case STRING: opaque value<4096>;
+};
+
+struct value_ref {
+    value_source source;
+    semantic_path path;              /* source == TARGET일 때만, 그리고 반드시 "" */
+};
+
+union operand switch (unsigned kind) {   /* 0 literal, 1 value_ref */
+case 0: typed_literal literal;
+case 1: value_ref ref;
+};
+
+struct predicate { value_ref lhs; compare_op op; operand rhs; };
+
+struct builtin_call { id transform_id; typed_literal args<8>; };
+
+union transform switch (transform_kind kind) {
+case LITERAL: typed_literal value;
+case COPY:    value_ref source;
+case BUILTIN: builtin_call builtin;
+};
+
+struct view_dependencies {
+    bool rpc_procedure;
+    bool request_operation_sequence;
+    semantic_path request_fields<16>;    /* strcmp 순서로 strictly ascending */
+};
+
+struct rule {
+    id rule_id;
+    id intent_id;
+    direction direction; unsigned backend; unsigned client;      /* traffic_scope */
+    message_type message_type; unsigned program; unsigned version;
+    unsigned *procedure;
+    string family<32>; unsigned *nfs_version; unsigned *minor_version;
+    string *operation<64>;
+    target_kind target_kind; semantic_path target_path; wire_part part;
+    predicate predicates<16>;
+    mutation_kind kind; transform *transform; structure_policy policy;
+    view_dependencies forwarded;         /* context_dependencies, view별(§10) */
+    view_dependencies original;
+    application_mode application;
+};
+
+struct rule_set {
+    opaque magic[8];                     /* "NFSPRUL1" */
+    unsigned semantic_runtime_version;   /* 1 */
+    string schema_id<256>;
+    id candidate_id;
+    rule rules<256>;                     /* rule_id strictly ascending */
+};
+```
+
+- 한 rule set은 encoding이 하나다. trailing byte, 0이 아닌 padding, 범위 밖 enum/bool, 비정렬 또는 중복
+  `rule_id`/`request_fields`, path를 가진 `TARGET` ValueRef는 모두 `malformed`다. 그래서 host가 이 bytes
+  전체에서 계산하는 content digest가 `rule_set_id`이고, `rule_set_id`는 blob 안에 없다.
+- `schema_id`와 `candidate_id`는 set에 하나씩이다(§2의 rule identity). `RULESET`도 하나씩 기록한다.
+  다른 schema의 rule은 다른 session의 다른 set이다.
+- 전체 길이는 1 MiB, rule은 256개, rule당 predicate 16개, view당 request field 16개, builtin argument
+  8개, literal은 4096 bytes까지다. "운영"의 bound를 정하기 전의 초기값이다.
+- 다른 `semantic_runtime_version`은 `unsupported_version`이다. 형식이 바뀌면 version을 올린다.
+
+Load는 all-or-nothing이다. 처음 실패한 rule이 set 전체를 거부하며 typed status와 rule/predicate index를
+돌려준다. session은 `RULESET`이 이름 붙인 set만 정확히 실행해야 하기 때문이다. Runtime은 §19의 Compiler
+검사를 다시 한다. set이 process 경계를 넘고, 적용하는 쪽이 runtime이기 때문이다.
+
+```text
+unknown_schema            schema_id를 가진 ProtocolSchema가 없다
+selector_mismatch         family/program/version/minor/procedure/operation이 schema·target과 다르다,
+                          또는 ValueRef가 target과 다른 procedure에 있다(§19)
+message_type_inconsistent CALL rule의 response path, REPLY rule의 request path,
+                          CALL rule의 request view
+unknown_path              path가 schema node를 이름 붙이지 않는다
+ambiguous_path            path가 node 둘 이상을 이름 붙인다
+part_unavailable          target에 그 WireRef part가 없다
+type_mismatch             §9, §13, §14 위반. 암묵적 재해석 없음
+mutation_invalid          kind/transform/policy/target_kind가 맞지 않는다
+dependencies_mismatch     선언한 context_dependencies가 아래 유도 결과와 다르다
+unsupported_capability    유효하지만 이 runtime이 적용하지 못한다(§19의 mutation_engine gap)
+```
+
+Path resolution은 Decoder의 naming(`02-semantic-decoder.md` §8-§9, `src/schema.h`)을 type graph에 대해
+수행한다. byte가 아니라 schema로 node를 찾는 것만 다르다. COMPOUND operation은 자기 path root
+(`<family>.<request|response>.<OP>`)이며 `argarray[]` element로는 이름 붙일 수 없다. host test는 Decoder가
+내보내는 모든 field path가 같은 type의 node로 resolve되는지 확인한다.
+
+Context dependency는 rule에서 유도되며 선언과 정확히 같아야 한다(§10).
+
+```text
+forwarded.rpc_procedure
+    = message_type == REPLY && procedure가 있다 (§4)
+<view>.request_fields
+    = 그 view source를 쓰는 모든 ValueRef(predicate 양쪽, copy source)의 path 집합
+forwarded.request_operation_sequence
+    = operation 아래의 request ValueRef가 operation 아래의 target에 bind된다 (§23)
+original.request_operation_sequence
+    = 그런 ValueRef가 request_original이다. 이때 forwarded 쪽도 필요하다 (§23)
+original.rpc_procedure
+    = 0
+```
+
+Semantic runtime version 1이 적용하는 범위:
+
+```text
+supported
+    replace, literal 또는 copy, leaf value target
+    raw policy에서 metadata edit
+        length/count/discriminant word: UINT literal
+        padding: 1-3 bytes OPAQUE literal
+
+unsupported_capability
+    insert, delete, op_append, op_prepend
+    builtin transform (registry 없음)
+    encoded part
+    leaf가 아닌 value의 replace
+    metadata로 copy
+    preserve policy의 discriminant value 변경
+```
+
+새 capability는 version 1 형식 안에서 refusal을 지우는 것으로 추가할 수 있다. 형식 자체를 바꾸는 확장
+(builtin argument type, typed operation value)은 version을 올린다.
+
 ## 설계 근거
 
 | 결정 | 근거 |
@@ -1032,13 +1201,23 @@ Expected:
 - **결정됨:** cross-transaction state lineage는 초기 target runtime(M0–M7) 범위 밖이다. 해당 intent는
   `requires_state_lineage`로 거부하고 `mutation_engine` gap(missing capability `state_lineage`)으로
   보낸다(issue #6).
-- **미결:** CompiledMutationRule serialization/control ABI.
+- **결정됨:** CompiledMutationRule serialization은 canonical XDR인 NFSPRUL1이다(§35). load는
+  all-or-nothing이고 `rule_set_id`는 그 bytes의 digest다.
+- **미결:** rule set control ABI. Runner 전용 설치 경로와 executor activation 메시지
+  (`06-implementation-gap-analysis.md` §9, S1a).
 - **미결:** initial supported builtin transform registry.
 - **미결:** insert/delete가 지원할 schema container subset.
 - **미결:** explicit ordered composite mutation representation.
 - **미결:** runtime numeric safety limits.
 - **미결:** same-container independent edit conflict granularity.
 - **미결:** existing NFSPARM engine 재사용 범위.
+- **미결(M4b):** 값이 없는 ValueRef. predicate나 copy source가 이 record에서 값을 찾지 못하는 경우(같은
+  COMPOUND에 없는 operation, 고르지 않은 union arm)의 taxonomy 값이다. §8과 §23은 view를 decode할 수
+  없거나, 값이 여럿이거나, request 대응을 증명할 수 없는 경우만 정한다. §19 검사는 target과 같은
+  procedure에 없는 값만 거부한다.
+- **미결(M4b):** 3단계(§21)에서 decode되지 않은 record의 분류. procedure selector가 없는 NFSv4 rule은
+  NULL CALL과 그 REPLY(`unsupported_schema`, `dispatch_incomplete`, `02` 결정됨(M2))에도 RPC selector가
+  맞는다. target이 있을 수 없는 procedure의 record를 hard refusal로 셀지 selector miss로 셀지 정한다.
 - **미결:** state lineage 확장. 이미 정한 불변식은 새 versioned ValueRef source와 semantic runtime
   version, bounded·명시적 scope, capture/reference의 semantic identity(literal 값을 replay identity로 쓰지
   않음), 선언된 capture/match semantics(last observed 값이나 Nth temporal identity 금지), 같은 reference를

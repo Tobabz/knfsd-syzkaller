@@ -90,6 +90,15 @@ leaf that repeats the operation discriminant's name; an operation or procedure
 whose name is only its prefix, or an operation named like a procedure; a
 leaf, in `leaf` or `operation`, that is not an identifier.
 
+A semantic path must also name a position some message carries, so these are
+build errors as well: in a family with minor versions, a procedure other than
+the selector that is not void (the decoder finds the minor version only in the
+selector's argument, so it decodes no other procedure); a non-void `default:`
+arm of a union whose `bool` or `enum` discriminant has a case for every value
+(the decoder refuses a discriminant its type does not declare, so the default
+is never decoded); an array of bound 0 (`x<0>`, `x[0]`), which never has an
+element.
+
 The parser reads every declaration in a source file, so a syntax error,
 `float`/`double`/`quadruple`, a multi-argument procedure, or a duplicate
 member or procedure name fails the build wherever it appears. The other
@@ -141,6 +150,7 @@ The RFC texts are not committed; their pins are enough to fetch and check them.
 | `nfs4/nfs4.ann` | `../src/schema_nfs4.c` | RFC 7531 (4.0), RFC 5662 + RFC 8435 + RFC 8154 (4.1), RFC 7863 + RFC 8276 + RFC 9754 + RFC 8435 + RFC 8154 (4.2) | NFSv4 COMPOUND, CALL and REPLY |
 | `../test/schema/tproto.ann` | `../test/schema_tproto.c` | written for the tests | synthetic, host tests only |
 | `../test/schema/tflat.ann` | `../test/schema_tflat.c` | written for the tests | synthetic, host tests only |
+| `../test/schema/tedge.ann` | `../test/schema_tedge.c` | written for the tests | synthetic, host tests only: operation unions outside an operation array |
 
 NFSv3 has no schema yet (RFC 1813 has no extractable XDR file), so an NFSv3
 message is `unsupported_schema`. NFSv4.2 is RFC 7863 plus the extensions knfsd

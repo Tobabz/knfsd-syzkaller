@@ -110,6 +110,39 @@ class Refusals(RefusalCase):
         self.refused("struct ARGS { opaque e[0]; };"
                      "struct RES { ARGS a<>; };", "zero-size")
 
+    def test_array_of_bound_zero(self):
+        # Its count is always 0: `x[]` would name an element no message
+        # carries.  An opaque or string of bound 0 has no element path.
+        self.refused("struct ARGS { uint32_t x<0>; }; struct RES { st s; };",
+                     "x: an array of bound 0 has no element")
+        self.refused("struct ARGS { uint32_t x[0]; }; struct RES { st s; };",
+                     "x: an array of bound 0 has no element")
+        norm_ok("struct ARGS { opaque o<0>; string s<0>; uint32_t x<1>; };"
+                "struct RES { st s; };")
+
+    def test_default_no_value_selects(self):
+        # The decoder refuses a discriminant its type does not declare, so
+        # a default beside a case for every value is never decoded.
+        self.refused("struct ARGS { uint32_t x; };"
+                     "union RES switch (st s) { case S_OK: void; "
+                     "case S_ERR: void; default: uint32_t other; };",
+                     "union RES: every enum value has a case")
+        self.refused("struct ARGS { uint32_t x; };"
+                     "union RES switch (bool b) { case TRUE: void; "
+                     "case FALSE: uint32_t f; default: uint32_t other; };",
+                     "union RES: every bool value has a case")
+        # A void default names nothing; a value without a case selects
+        # the default; an int discriminant has values without one.
+        norm_ok("struct ARGS { uint32_t x; };"
+                "union RES switch (st s) { case S_OK: void; "
+                "case S_ERR: void; default: void; };")
+        norm_ok("struct ARGS { uint32_t x; };"
+                "union RES switch (st s) { case S_OK: void; "
+                "default: uint32_t other; };")
+        norm_ok("struct ARGS { uint32_t x; };"
+                "union RES switch (uint32_t n) { case 0: void; "
+                "case 1: void; default: uint32_t other; };")
+
     def test_list_element_used_plainly(self):
         self.refused("struct ent { uint32_t x; ent *next; };"
                      "struct ARGS { ent e; }; struct RES { ent *h; };",
@@ -459,6 +492,26 @@ class Minors(unittest.TestCase):
                         "struct Pair { Item a; Other b; };" + rest)
         self.assertIn("disagree", str(cm.exception))
 
+    def test_other_procedures_must_be_void(self):
+        # The decoder finds a minor version only in the selector's
+        # argument, so it decodes no other procedure's CALL or REPLY.
+        x = HEAD + "struct ARGS { uint32_t minor; }; struct RES { st s; };"
+
+        def program(extra):
+            return PROGRAM.replace("} = 1;", extra + "} = 1;")
+
+        for extra in ("RES PROC_STAT(void) = 2;",
+                      "void PROC_STAT(uint32_t) = 2;"):
+            p = program(extra)
+            with Tmp(x + p, self.MANN, {"u.x": x + p}) as a:
+                with self.assertRaises(nz.SchemaError) as cm:
+                    nz.normalize(a)
+            self.assertIn("procedure STAT carries no minor version",
+                          str(cm.exception))
+        p = program("void PROC_PING(void) = 2;")
+        with Tmp(x + p, self.MANN, {"u.x": x + p}) as a:
+            nz.normalize(a)
+
     def test_ids_differ_per_minor(self):
         x = HEAD + "struct ARGS { uint32_t minor; }; struct RES { st s; };"
         with Tmp(x + PROGRAM, self.MANN, {"u.x": x + PROGRAM}) as a:
@@ -690,6 +743,8 @@ class Committed(unittest.TestCase):
                           TEST_SCHEMA.parent / "schema_tproto.c"),
                          (TEST_SCHEMA / "tflat.ann",
                           TEST_SCHEMA.parent / "schema_tflat.c"),
+                         (TEST_SCHEMA / "tedge.ann",
+                          TEST_SCHEMA.parent / "schema_tedge.c"),
                          (NFS4_ANN, HERE.parent / "src" / "schema_nfs4.c")):
             text = nz.emit_c(ann, *nz.normalize(ann))
             self.assertEqual(text, out.read_text(), f"{out.name} is stale")
