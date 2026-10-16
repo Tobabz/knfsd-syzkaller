@@ -53,10 +53,11 @@ DRIVER = r"""
  *
  * argv: SOCKET RULE_SET_ID TIMEOUT_MS.  stdin, one command per line:
  *   activate GEN PROGRAM_HEX   the program asks for its window
- *   release                    DONE if it ran, then the program process ends */
+ *   release                    DONE if it ran; the fork server then closes
+ *                              the window (the executor first stops the
+ *                              program process) and the program ends */
 struct ask {
 	int fd;
-	unsigned op;
 	unsigned long long generation;
 	int answer;
 	volatile int finished;
@@ -65,15 +66,15 @@ struct ask {
 static void* program_process(void* arg)
 {
 	struct ask* a = arg;
-	a->answer = nfsp_broker_call(a->fd, a->op, a->generation);
+	a->answer = nfsp_broker_activate(a->fd, a->generation);
 	a->finished = 1;
 	return NULL;
 }
 
-static int ask_broker(struct nfsp_act_endpoint* ep, struct nfsp_broker* k, int fd, unsigned op,
-		      unsigned long long generation)
+static int ask_activate(struct nfsp_act_endpoint* ep, struct nfsp_broker* k, int fd,
+			unsigned long long generation)
 {
-	struct ask a = {fd, op, generation, -1, 0};
+	struct ask a = {fd, generation, -1, 0};
 	pthread_t th;
 	pthread_create(&th, NULL, program_process, &a);
 	while (!a.finished)
@@ -112,15 +113,20 @@ int main(int argc, char **argv)
 			if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair))
 				return 6;
 			nfsp_broker_start(&k, pair[0], prog, n);
-			ran = ask_broker(&ep, &k, pair[1], NFSP_BROKER_ACTIVATE, gen) == 1;
+			ran = ask_activate(&ep, &k, pair[1], gen) == 1;
 			printf("ok=%d activation=%u/%u lease=%u executed=%u digest=", ran,
 			       k.b.activation, k.b.activation_status, k.b.lease, k.b.executed);
 			for (int i = 0; i < 32; i++)
 				printf("%02x", k.b.digest[i]);
 			printf("\n");
 		} else if (strncmp(line, "release", 7) == 0) {
-			if (ran && ask_broker(&ep, &k, pair[1], NFSP_BROKER_DONE, 0) != 1)
-				return 7;
+			if (ran) {
+				if (!nfsp_broker_send(pair[1], NFSP_BROKER_DONE, 1))
+					return 7;
+				while (!k.done)
+					nfsp_broker_serve(&ep, &k, 10);
+				nfsp_act_release(&ep, &k.b); /* the program is stopped */
+			}
 			close(pair[1]);
 			nfsp_broker_finish(&ep, &k);
 			printf("deactivation=%u/%u lease=%u\n", k.b.deactivation,

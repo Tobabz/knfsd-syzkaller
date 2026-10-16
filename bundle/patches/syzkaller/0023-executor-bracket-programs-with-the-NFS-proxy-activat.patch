@@ -1,4 +1,4 @@
-From cda251bf2342bc3f18ab57eb0e03fa30f8f29f2d Mon Sep 17 00:00:00 2001
+From 81a940b04843bc9125392cbaa5ded58e129e1712 Mon Sep 17 00:00:00 2001
 From: idealinsane <idealinsane@localhost>
 Date: Fri, 16 Oct 2026 13:43:53 +0000
 Subject: [PATCH] executor: bracket programs with the NFS proxy activation
@@ -11,56 +11,60 @@ program generation, and the executor owns that window.
 When the lane fixture provides /syz-nfs-lanes/proc-N/activation/ (the
 proxy's activation.sock and the installed rule_set_id), the executor
 connects to the endpoint before the sandbox chroot.  Only the fork
-server keeps that connection: each program process closes its inherited
-copy first thing and asks the fork server, over a socket pair made for
-that program, to run its barrier.  The process that runs fuzzed
-syscalls therefore has no descriptor for the endpoint, and the broker
-answers only one ACTIVATE and one DONE in that order; anything else on
-the pair (e.g. a forged early DONE) leaves the lease uncleared.
+server keeps that connection, and it alone decides when a program's
+window ends: the process that runs fuzzed syscalls has no descriptor
+for the endpoint, and nothing it sends can end its window early.
 
 For every execution with a managed remote-coverage generation:
 
-- the fork server activates the generation, with the SHA-256 of its own
-  copy of the exec-encoded program as the program digest, before the
-  first program syscall;
+- the program process asks the fork server, over a socket pair made
+  for that program, to ACTIVATE its generation before its first call;
+  the fork server sends the activation with the SHA-256 of its own copy
+  of the exec-encoded program and answers run or skip;
 - the program does not run unless the activation was ACKed (or when
   KCOV BEGIN returned no generation), and the KCOV generation is
   aborted instead of published;
-- the window is deactivated before KCOV FINISH/ABORT, and the proxy
-  generation is aborted when deactivation (or activation) is not ACKed;
-- the fork server ends the lease of a child that died inside its window
-  before the orphan KCOV ABORT, and only then publishes the barrier.
+- after its calls the program process sends DONE and waits.  DONE is
+  only a request (fuzzed syscalls can send it too): the fork server
+  stops the program process and its process group, so that no further
+  syscall starts, then deactivates the window, finishes (or aborts) the
+  KCOV generation itself, publishes the generation's remote coverage
+  into the program's output, and kills the program process;
+- a program process that exits, crashes, hangs or does not stop has its
+  window closed after it is gone, before the orphan KCOV ABORT;
+- anything but one ACTIVATE and one DONE on the pair leaves the lease
+  uncleared.
 
-The barrier outcome is reported in ProgInfo (nfs_proxy).  The runner
-fails, like a hung fixed lane, when the lease could not be confirmed
-released or the proxy session cannot open another generation, so VM
-recovery recreates the lane.  syz-execprog prints the barrier and
-writes it to the coverage .meta file.
+The barrier outcome is reported in ProgInfo (nfs_proxy), published by
+the fork server.  The runner fails, like a hung fixed lane, when the
+lease could not be confirmed released or the proxy session cannot open
+another generation, so VM recovery recreates the lane.  syz-execprog
+prints the barrier and writes it to the coverage .meta file.
 
 Executions without a managed generation (comparisons, machine-check
 feature probes without remote coverage) run without a window and so are
 never mutated.
 ---
- executor/common.h                     |  21 ++
+ executor/common.h                     |  30 +-
  executor/common_linux.h               |   3 +
- executor/executor.cc                  | 231 +++++++++++-
+ executor/executor.cc                  | 324 +++++++++++++++-
  executor/executor_runner.h            |  14 +
- executor/nfs_proxy_activation.h       | 498 ++++++++++++++++++++++++++
- executor/nfs_proxy_activation_test.go | 140 ++++++++
- executor/test.h                       | 261 ++++++++++++++
+ executor/nfs_proxy_activation.h       | 510 ++++++++++++++++++++++++++
+ executor/nfs_proxy_activation_test.go | 180 +++++++++
+ executor/test.h                       | 328 +++++++++++++++++
  pkg/flatrpc/flatrpc.fbs               |  32 ++
- pkg/flatrpc/flatrpc.go                | 300 +++++++++++++++-
+ pkg/flatrpc/flatrpc.go                | 300 ++++++++++++++-
  pkg/flatrpc/flatrpc.h                 | 271 +++++++++++++-
  pkg/flatrpc/helpers.go                |   6 +
  pkg/flatrpc/nfs_proxy_test.go         |  48 +++
  tools/syz-execprog/execprog.go        |  16 +
- 13 files changed, 1827 insertions(+), 14 deletions(-)
+ 13 files changed, 2040 insertions(+), 22 deletions(-)
  create mode 100644 executor/nfs_proxy_activation.h
  create mode 100644 executor/nfs_proxy_activation_test.go
  create mode 100644 pkg/flatrpc/nfs_proxy_test.go
 
 diff --git a/executor/common.h b/executor/common.h
-index 0817e121b..17917e92f 100644
+index 0817e121b..95e98a85b 100644
 --- a/executor/common.h
 +++ b/executor/common.h
 @@ -648,11 +648,19 @@ static void loop(void)
@@ -93,20 +97,27 @@ index 0817e121b..17917e92f 100644
  
  #if SYZ_EXECUTOR
  		if (flag_snapshot)
-@@ -695,7 +706,12 @@ static void loop(void)
+@@ -695,7 +706,19 @@ static void loop(void)
  		uint32 executed_calls = output_data->completed.load(std::memory_order_relaxed);
  #endif
  		for (;;) {
 +#if SYZ_EXECUTOR && GOOS_linux
 +			// Also answers the program's NFS proxy barrier requests.
 +			nfsp_broker_wait(10);
++			if (nfsp_broker_state.done) {
++				// The fork server, not the program process, ends a program
++				// that ran in an activation window.
++				if (!nfsp_broker_end_program(pid, &status))
++					kill_and_wait(pid, &status);
++				break;
++			}
 +#else
  			sleep_ms(10);
 +#endif
  			if (waitpid(-1, &status, WNOHANG | WAIT_FLAGS) == pid)
  				break;
  #if SYZ_EXECUTOR
-@@ -747,6 +763,11 @@ static void loop(void)
+@@ -747,12 +770,17 @@ static void loop(void)
  			kill_and_wait(pid, &status);
  			break;
  		}
@@ -118,6 +129,13 @@ index 0817e121b..17917e92f 100644
  #if SYZ_EXECUTOR && GOOS_linux
  		// Cover hangs, crashes, and the BEGIN-return/shared-publication race.  If
  		// the child did not publish an exact id, generation zero means "abort the
+ 		// current Generation attached to this inherited KCOV fd" (not BIND(0)).
+ 		uint64 orphan_generation = output_data->kcov_generation.load(std::memory_order_acquire);
+-		if (flag_extra_coverage &&
++		if (flag_extra_coverage && !nfsp_broker_kcov_resolved() &&
+ 		    cover_abort_remote_generation(orphan_generation, true))
+ 			output_data->kcov_generation.store(0, std::memory_order_release);
+ #endif
 diff --git a/executor/common_linux.h b/executor/common_linux.h
 index ae5bd713c..4a65651fd 100644
 --- a/executor/common_linux.h
@@ -133,7 +151,7 @@ index ae5bd713c..4a65651fd 100644
  	      procid, source);
  }
 diff --git a/executor/executor.cc b/executor/executor.cc
-index 9a6895f01..c0ea144f2 100644
+index 9a6895f01..763c0cf10 100644
 --- a/executor/executor.cc
 +++ b/executor/executor.cc
 @@ -26,6 +26,10 @@
@@ -161,7 +179,7 @@ index 9a6895f01..c0ea144f2 100644
  const int kMaxArgs = 9;
  const int kCoverSize = 512 << 10;
  const int kFailStatus = 67;
-@@ -114,6 +125,14 @@ static void receive_handshake();
+@@ -114,6 +125,17 @@ static void receive_handshake();
  #if GOOS_linux
  static bool cover_abort_remote_generation(uint64 generation, bool best_effort);
  #endif
@@ -171,12 +189,15 @@ index 9a6895f01..c0ea144f2 100644
 +static void nfsp_broker_child();
 +static void nfsp_broker_parent();
 +static void nfsp_broker_wait(int timeout_ms);
++static int nfsp_stop_program(int pid, int* status);
++static bool nfsp_broker_end_program(int pid, int* status);
 +static void nfsp_broker_end();
++static bool nfsp_broker_kcov_resolved();
 +#endif
  
  #if SYZ_EXECUTOR_USES_FORK_SERVER
  static void SnapshotPrepareParent();
-@@ -152,6 +171,14 @@ struct alignas(8) OutputData {
+@@ -152,6 +174,14 @@ struct alignas(8) OutputData {
  	// This lives in shared memory so the fork-server watchdog can abort a
  	// generation left behind by a killed child.
  	std::atomic<uint64> kcov_generation;
@@ -191,7 +212,7 @@ index 9a6895f01..c0ea144f2 100644
  	std::atomic<flatbuffers::Offset<flatbuffers::Vector<uint8_t>>> result_offset;
  	struct {
  		// Call index in the test program (they may be out-of-order is some syscalls block).
-@@ -167,6 +194,9 @@ struct alignas(8) OutputData {
+@@ -167,6 +197,9 @@ struct alignas(8) OutputData {
  		completed.store(0, std::memory_order_relaxed);
  		num_calls.store(0, std::memory_order_relaxed);
  		kcov_generation.store(0, std::memory_order_relaxed);
@@ -201,7 +222,7 @@ index 9a6895f01..c0ea144f2 100644
  		result_offset.store(0, std::memory_order_relaxed);
  	}
  };
-@@ -301,6 +331,17 @@ static uint64 request_id;
+@@ -301,6 +334,19 @@ static uint64 request_id;
  static rpc::RequestType request_type;
  static uint64 all_call_signal;
  static bool all_extra_signal;
@@ -215,11 +236,13 @@ index 9a6895f01..c0ea144f2 100644
 +// Fork server: the barrier of the program process it is running.
 +static nfsp_broker nfsp_broker_state = {-1, NULL, 0, 0, 0, 0, {}};
 +static int nfsp_broker_child_fd = -1;
++// The fork server finished or aborted the program's KCOV generation itself.
++static bool nfsp_broker_kcov_done;
 +#endif
  
  // Tunable timeouts, received with execute_req.
  static uint64 syscall_timeout_ms;
-@@ -453,6 +494,9 @@ struct execute_req {
+@@ -453,6 +499,9 @@ struct execute_req {
  	uint64 all_call_signal;
  	bool all_extra_signal;
  	bool return_error;
@@ -229,7 +252,7 @@ index 9a6895f01..c0ea144f2 100644
  };
  
  struct execute_reply {
-@@ -891,6 +935,7 @@ void parse_execute(const execute_req& req)
+@@ -891,6 +940,7 @@ void parse_execute(const execute_req& req)
  	all_call_signal = req.all_call_signal;
  	all_extra_signal = req.all_extra_signal;
  	flag_return_error = req.return_error;
@@ -237,7 +260,46 @@ index 9a6895f01..c0ea144f2 100644
  
  	debug("[%llums] exec opts: reqid=%llu type=%llu procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d "
  	      " sandbox=%d/%d/%d/%d timeouts=%llu/%llu/%llu kernel_64_bit=%d\n",
-@@ -966,6 +1011,151 @@ void execute_glob()
+@@ -916,9 +966,10 @@ void reply_execute(uint32 status)
+ 		fail("control pipe write failed");
+ }
+ 
+-void realloc_output_data()
+-{
+ #if SYZ_EXECUTOR_USES_FORK_SERVER
++// The output region this request needs.
++static uint32 request_output_size()
++{
+ 	/*
+ 	 * A request that collects remote coverage can carry up to kExtraCoverSize
+ 	 * entries in the extra record alone - 8 MiB of PCs on a 64-bit host - on
+@@ -937,11 +988,20 @@ void realloc_output_data()
+ 		(kExtraCoverSize + kRemoteCoverCallHeadroom) * (int)sizeof(uint64_t);
+ 
+ 	if (flag_comparisons)
+-		mmap_output(kMaxOutputComparisons);
+-	else if (flag_collect_cover)
+-		mmap_output(kMaxOutputCoverage);
+-	else if (flag_collect_signal)
+-		mmap_output(kMaxOutputSignal);
++		return kMaxOutputComparisons;
++	if (flag_collect_cover)
++		return kMaxOutputCoverage;
++	if (flag_collect_signal)
++		return kMaxOutputSignal;
++	return 0;
++}
++#endif
++
++void realloc_output_data()
++{
++#if SYZ_EXECUTOR_USES_FORK_SERVER
++	if (uint32 size = request_output_size())
++		mmap_output(size);
+ 	if (close(kOutFd) < 0)
+ 		fail("failed to close kOutFd");
+ #endif
+@@ -966,6 +1026,216 @@ void execute_glob()
  	output_data->result_offset.store(off, std::memory_order_release);
  }
  
@@ -314,6 +376,7 @@ index 9a6895f01..c0ea144f2 100644
 +	// The program bytes are the fork server's own copy of the request.
 +	nfsp_broker_start(&nfsp_broker_state, sv[0], input_data,
 +			  std::min<uint64>(request_prog_size, kMaxInput));
++	nfsp_broker_kcov_done = false;
 +	// The fork server kills a program that completes no syscall for
 +	// syscall_timeout_ms * 20 (loop() in common.h).  A barrier waits on the
 +	// host journal, so bound it well below that.
@@ -340,7 +403,8 @@ index 9a6895f01..c0ea144f2 100644
 +	nfsp_broker_child_fd = -1;
 +}
 +
-+// Fork server, in place of its 10ms watchdog sleep.
++// Fork server, in place of its 10ms watchdog sleep.  Returns with
++// nfsp_broker_state.done set once the program asked to end.
 +static void nfsp_broker_wait(int timeout_ms)
 +{
 +	if (!nfsp_target_mode) {
@@ -350,8 +414,69 @@ index 9a6895f01..c0ea144f2 100644
 +	uint64 start = current_time_ms();
 +	nfsp_broker_serve(&nfsp_endpoint, &nfsp_broker_state, timeout_ms);
 +	uint64 spent = current_time_ms() - start;
-+	if (spent < (uint64)timeout_ms)
++	if (!nfsp_broker_state.done && spent < (uint64)timeout_ms)
 +		sleep_ms(timeout_ms - spent);
++}
++
++// Fork server: after a DONE, stop the program process (and its process group)
++// so that no further syscall starts.  0: stopped, 1: it exited (reaped),
++// -1: it did not stop in time (a thread stuck in the kernel).
++static int nfsp_stop_program(int pid, int* status)
++{
++	kill(-pid, SIGSTOP);
++	kill(pid, SIGSTOP);
++	uint64 start = current_time_ms();
++	for (;;) {
++		int res = waitpid(pid, status, WNOHANG | WUNTRACED | __WALL);
++		if (res == pid)
++			return WIFSTOPPED(*status) ? 0 : 1;
++		if (current_time_ms() - start > syscall_timeout_ms * 10)
++			return -1;
++		sleep_ms(1);
++	}
++}
++
++// Fork server: the program asked to end (DONE, which fuzzed syscalls can also
++// send).  Completion is decided here, outside the process that runs fuzzed
++// syscalls: stop it, close the window, end the KCOV generation and publish its
++// remote coverage, all while it cannot run.  The caller then kills it.
++// Returns true when the program process already exited (and was reaped).
++static bool nfsp_broker_end_program(int pid, int* status)
++{
++	int stopped = nfsp_stop_program(pid, status);
++	if (stopped != 0) {
++		// Exited or stuck: the window closes only after it is gone
++		// (nfsp_broker_end), and the orphan path aborts the generation.
++		debug("NFS proxy: program did not stop (%d)\n", stopped);
++		return stopped == 1;
++	}
++	nfsp_broker* k = &nfsp_broker_state;
++	nfsp_act_release(&nfsp_endpoint, &k->b);
++	uint64 generation = k->b.generation;
++	bool finished = false;
++	if (k->b.lease == NFSP_ACT_LEASE_CLEAR && k->done_valid)
++		finished = cover_finish_remote_generation(generation, 1000 * slowdown_scale);
++	if (finished || cover_abort_remote_generation(generation, false))
++		nfsp_broker_kcov_done = true;
++	if (finished) {
++		// FINISH published the generation's aggregate into extra_cov, which
++		// this process maps too.  Append it to the program's output.
++		mmap_output(request_output_size());
++		output_builder.emplace(output_data, output_size, true);
++		remote_generation_managed = true;
++		remote_generation_publishable = true;
++		remote_generation_published = false;
++		write_extra_output();
++		output_builder.reset();
++		remote_generation_managed = false;
++	}
++	output_data->kcov_generation.store(0, std::memory_order_release);
++	return false;
++}
++
++static bool nfsp_broker_kcov_resolved()
++{
++	return nfsp_target_mode && nfsp_broker_kcov_done;
 +}
 +
 +// Fork server, once the program process is gone: a program killed or crashed
@@ -370,26 +495,28 @@ index 9a6895f01..c0ea144f2 100644
 +// `generation` (0: BEGIN failed, so no window).  True when the program may run.
 +static bool nfsp_program_activate(uint64 generation)
 +{
-+	int answer = nfsp_broker_call(kNfspBrokerFd, NFSP_BROKER_ACTIVATE, generation);
++	int answer = nfsp_broker_activate(kNfspBrokerFd, generation);
 +	if (answer < 0)
 +		fail("NFS proxy broker failed before the program");
 +	return answer == 1;
 +}
 +
-+// Program process: the calls are over; the fork server closes the window.
-+static void nfsp_program_done()
++// Program process: the calls are over.  The fork server stops this process,
++// closes the window, ends the KCOV generation, publishes its coverage and
++// kills this process; nothing here runs after DONE.
++static NORETURN void nfsp_program_done(bool valid)
 +{
-+	// Failing here also covers a fuzzed call that closed or replaced
-+	// kNfspBrokerFd: the window may have ended early.
-+	if (nfsp_broker_call(kNfspBrokerFd, NFSP_BROKER_DONE, 0) != 1)
++	if (!nfsp_broker_send(kNfspBrokerFd, NFSP_BROKER_DONE, valid ? 1 : 0))
 +		fail("NFS proxy broker failed after the program");
++	for (;;)
++		sleep_ms(1000);
 +}
 +#endif
 +
  // execute_one executes program stored in input_data.
  void execute_one()
  {
-@@ -1021,6 +1211,22 @@ void execute_one()
+@@ -1021,6 +1291,22 @@ void execute_one()
  		}
  	}
  
@@ -412,7 +539,7 @@ index 9a6895f01..c0ea144f2 100644
  	int call_index = 0;
  	uint64 prog_extra_timeout = 0;
  	uint64 prog_extra_cover_timeout = 0;
-@@ -1029,6 +1235,8 @@ void execute_one()
+@@ -1029,6 +1315,8 @@ void execute_one()
  
  	read_input(&input_pos); // total number of calls
  	for (;;) {
@@ -421,15 +548,14 @@ index 9a6895f01..c0ea144f2 100644
  		uint64 call_num = read_input(&input_pos);
  		if (call_num == instr_eof)
  			break;
-@@ -1216,8 +1424,17 @@ void execute_one()
+@@ -1216,8 +1504,16 @@ void execute_one()
  		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
  		bool generation_resolved = false;
  #if GOOS_linux
-+		// Close the activation window before the KCOV generation ends.  A
-+		// deactivation without ACK still lets FINISH/ABORT run below; the lease
-+		// then decides whether the lane may be reused.
++		// A program that ran in an activation window is ended by the fork
++		// server: window, then KCOV FINISH/ABORT, then this process.
 +		if (nfsp_windowed)
-+			nfsp_program_done();
++			nfsp_program_done(valid);
  		uint64 generation = remote_generation.load(std::memory_order_acquire);
 -		if (generation) {
 +		if (generation && nfsp_skip_program) {
@@ -440,7 +566,7 @@ index 9a6895f01..c0ea144f2 100644
  			// FINISH performs the bounded kernel-side root/token drain.  It is the
  			// publication barrier for remote extra coverage and synchronously
  			// materializes the committed snapshot before userspace consumes it.
-@@ -1576,7 +1793,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
+@@ -1576,7 +1872,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
  		}
  		calls[call.index] = call.offset;
  	}
@@ -493,10 +619,10 @@ index 231c9b87e..c4733a940 100644
  		msg_.reset();
 diff --git a/executor/nfs_proxy_activation.h b/executor/nfs_proxy_activation.h
 new file mode 100644
-index 000000000..ad2aad2f0
+index 000000000..732159e94
 --- /dev/null
 +++ b/executor/nfs_proxy_activation.h
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,510 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -896,12 +1022,17 @@ index 000000000..ad2aad2f0
 +// program.  The program process sends exactly
 +//
 +//   ACTIVATE(generation)  before its first call; answer 1 = run, 0 = skip
-+//   DONE                  after its calls, only if it ran; answer 1
++//   DONE(valid)           after its calls, only if it ran; no answer.
++//                         valid: its threads bound to the KCOV generation
 +//
-+// and the parent answers only those, in that order.  Anything else on the
-+// pair can only come from the fuzzed program, e.g. a forged early DONE (which
-+// would end the window while calls still run): the parent then marks the lease
-+// UNCLEARED, so the lane is not reused, and does not answer.
++// ACTIVATE comes before any fuzzed syscall, so it is the program process's
++// own.  DONE is not trusted: fuzzed syscalls can send it (or a later one can
++// hide the real one).  It only asks the parent to end the program.  The
++// parent then stops the program process, so that no further syscall starts,
++// and only after that closes the window (nfsp_broker_done is the cue; the
++// executor does the stopping), then ends the process: nothing of the program
++// runs after its window.  Anything else on the pair, which only fuzzed
++// syscalls can send, marks the lease UNCLEARED, so the lane is not reused.
 +
 +#define NFSP_BROKER_ACTIVATE 1u
 +#define NFSP_BROKER_DONE 2u
@@ -917,7 +1048,8 @@ index 000000000..ad2aad2f0
 +	const void* prog; // the exec-encoded program, from the parent's own copy
 +	size_t prog_len;
 +	int activated; // ACTIVATE handled
-+	int done; // DONE handled
++	int done; // DONE received: end the program
++	int done_valid; // DONE's claim that the KCOV generation is complete
 +	int violation; // an unexpected message
 +	struct nfsp_act_barrier b;
 +};
@@ -962,8 +1094,8 @@ index 000000000..ad2aad2f0
 +			}
 +		} else if (m.op == NFSP_BROKER_DONE && k->b.executed && !k->done) {
 +			k->done = 1;
-+			nfsp_act_release(ep, &k->b);
-+			nfsp_broker_answer(k, 1);
++			k->done_valid = m.generation == 1;
++			return; // the caller stops the program before anything else
 +		} else {
 +			k->violation = 1;
 +		}
@@ -982,12 +1114,18 @@ index 000000000..ad2aad2f0
 +	k->fd = -1;
 +}
 +
-+// Program process: one message, one answer byte.  -1 when the pair failed.
-+static int nfsp_broker_call(int fd, uint32_t op, uint64_t generation)
++// Program process: send one message.  0 when the pair failed.
++static int nfsp_broker_send(int fd, uint32_t op, uint64_t generation)
 +{
 +	struct nfsp_broker_msg m = {op, 0, generation};
++	return send(fd, &m, sizeof(m), MSG_NOSIGNAL) == (ssize_t)sizeof(m);
++}
++
++// Program process: ACTIVATE and its answer byte.  -1 when the pair failed.
++static int nfsp_broker_activate(int fd, uint64_t generation)
++{
 +	uint8_t answer;
-+	if (send(fd, &m, sizeof(m), MSG_NOSIGNAL) != (ssize_t)sizeof(m))
++	if (!nfsp_broker_send(fd, NFSP_BROKER_ACTIVATE, generation))
 +		return -1;
 +	if (recv(fd, &answer, 1, 0) != 1)
 +		return -1;
@@ -997,10 +1135,10 @@ index 000000000..ad2aad2f0
 +#endif // NFS_PROXY_ACTIVATION_H
 diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
 new file mode 100644
-index 000000000..ddfdcc38a
+index 000000000..403288c0e
 --- /dev/null
 +++ b/executor/nfs_proxy_activation_test.go
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,180 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -1058,8 +1196,8 @@ index 000000000..ddfdcc38a
 +		// Without an ACK no program syscall runs.
 +		"if (nfsp_skip_program)\n\t\t\tbreak;",
 +		"uint64 call_num = read_input(&input_pos);",
-+		// The window closes before the KCOV generation ends.
-+		"nfsp_program_done();",
++		// A program that ran in a window hands its end to the fork server.
++		"nfsp_program_done(valid);",
 +		"cover_abort_remote_generation(generation, false);",
 +		"cover_finish_remote_generation(generation",
 +	)
@@ -1141,11 +1279,51 @@ index 000000000..ddfdcc38a
 +		"resp_mem_->Reset();",
 +	)
 +}
++
++// DONE comes over a pair that fuzzed syscalls can write to, so it is only a
++// request: the fork server stops the program process before it closes the
++// window, ends the KCOV generation and publishes, and then kills it.  Nothing
++// of the program runs after its window.
++func TestNfsProxyForkServerEndsTheProgram(t *testing.T) {
++	loop := nfspSection(t, "common.h", "nfsp_broker_wait(10);", "reply_execute(0);")
++	nfspRequireOrder(t, "loop", loop,
++		"if (nfsp_broker_state.done) {",
++		"if (!nfsp_broker_end_program(pid, &status))",
++		"kill_and_wait(pid, &status);",
++		"nfsp_broker_end();",
++		"!nfsp_broker_kcov_resolved()",
++	)
++	end := nfspSection(t, "executor.cc", "static bool nfsp_broker_end_program(int pid, int* status)\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_broker_end_program", end,
++		"nfsp_stop_program(pid, status);",
++		"if (stopped != 0) {",
++		"nfsp_act_release(&nfsp_endpoint, &k->b);",
++		"cover_finish_remote_generation(generation",
++		"write_extra_output();",
++	)
++	stop := nfspSection(t, "executor.cc", "static int nfsp_stop_program(int pid, int* status)\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_stop_program", stop,
++		"kill(-pid, SIGSTOP);",
++		"kill(pid, SIGSTOP);",
++		"WNOHANG | WUNTRACED | __WALL",
++		"WIFSTOPPED(*status)",
++	)
++	done := nfspSection(t, "executor.cc", "static NORETURN void nfsp_program_done(bool valid)\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_program_done", done,
++		"nfsp_broker_send(kNfspBrokerFd, NFSP_BROKER_DONE",
++		"for (;;)",
++	)
++	// The program process itself never closes the window or answers for it.
++	program := nfspSection(t, "executor.cc", "void execute_one()", "thread_t* schedule_call")
++	if bytes.Contains(program, []byte("NFSP_BROKER_DONE")) {
++		t.Fatal("execute_one must end a windowed program through nfsp_program_done")
++	}
++}
 diff --git a/executor/test.h b/executor/test.h
-index 437bf01d9..08df9d5ca 100644
+index 437bf01d9..1a6de2f62 100644
 --- a/executor/test.h
 +++ b/executor/test.h
-@@ -414,6 +414,262 @@ static int test_get_last_opt()
+@@ -414,6 +414,328 @@ static int test_get_last_opt()
  	return 0;
  }
  
@@ -1317,7 +1495,9 @@ index 437bf01d9..08df9d5ca 100644
 +
 +// The fork server's broker: a program process asks over its pair, the broker
 +// runs the barrier on the endpoint.  Messages the program process sends are
-+// written by hand on the program's end of the pair.
++// written by hand on the program's end of the pair.  DONE is only a request:
++// the broker answers nothing and closes the window later (here, at finish;
++// in the executor, after it stopped the program process).
 +static bool nfsp_test_send(int fd, uint32 op, uint64 generation)
 +{
 +	nfsp_broker_msg m = {op, 0, generation};
@@ -1347,10 +1527,10 @@ index 437bf01d9..08df9d5ca 100644
 +		uint32 want_activation;
 +		uint32 want_lease;
 +	} cases[] = {
-+	    {"activate and done", {{ACT, 42}, {DONE, 0}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 22, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_CLEAR},
++	    {"activate and done", {{ACT, 42}, {DONE, 1}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_CLEAR},
 +	    {"no KCOV generation: skipped, proxy not asked", {{ACT, 0}}, false, {}, 0, 1, NFSP_ACT_BARRIER_REFUSED, NFSP_ACT_LEASE_CLEAR},
 +	    {"refused: skipped, DONE is a violation", {{ACT, 42}, {DONE, 0}}, false, {{act, 10, false}, {NFSP_ACT_OP_ABORT, NFSP_ACT_STATUS_UNKNOWN_GENERATION, false}}, 2, 1, NFSP_ACT_BARRIER_REFUSED, NFSP_ACT_LEASE_UNCLEARED},
-+	    {"second DONE (forged early one)", {{ACT, 42}, {DONE, 0}, {DONE, 0}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 22, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_UNCLEARED},
++	    {"second DONE", {{ACT, 42}, {DONE, 1}, {DONE, 1}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_UNCLEARED},
 +	    {"second ACTIVATE", {{ACT, 42}, {ACT, 43}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_UNCLEARED},
 +	    {"DONE before ACTIVATE", {{DONE, 0}}, false, {}, 0, 0, NFSP_ACT_BARRIER_NONE, NFSP_ACT_LEASE_UNCLEARED},
 +	    {"program died in its window", {{ACT, 42}}, true, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_CLEAR},
@@ -1393,6 +1573,13 @@ index 437bf01d9..08df9d5ca 100644
 +		pthread_join(th, NULL);
 +		close(proxy_sv[1]);
 +		uint32 want_status = c.sends[0][0] == ACT && !c.sends[0][1] ? NFSP_ACT_NO_GENERATION : k.b.activation_status;
++		// DONE asks to end the program; it is honoured only after an ACKed
++		// ACTIVATE, and carries the program's claim about its KCOV binding.
++		bool want_done = c.sends[1][0] == DONE && c.want_activation == NFSP_ACT_BARRIER_ACKED;
++		if (k.done != want_done || (want_done && !k.done_valid)) {
++			printf("%s: done=%d valid=%d\n", c.name, k.done, k.done_valid);
++			ret = 1;
++		}
 +		if (ret || proxy.bad || proxy.handled != c.nsteps || answers != c.want_answers ||
 +		    k.b.activation != c.want_activation || k.b.lease != c.want_lease ||
 +		    k.b.activation_status != want_status || k.fd != -1) {
@@ -1403,12 +1590,69 @@ index 437bf01d9..08df9d5ca 100644
 +	}
 +	return ret;
 +}
++
++// A program process that sends DONE early (as a fuzzed syscall can) and keeps
++// running: the fork server stops it on DONE, so it makes no progress after
++// that, and nfsp_stop_program() reports a process that exited instead.
++static int test_nfsp_stop()
++{
++	syscall_timeout_ms = 50;
++	volatile uint64* progress = (volatile uint64*)mmap(NULL, SYZ_PAGE_SIZE, PROT_READ | PROT_WRITE,
++							   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	if (progress == MAP_FAILED) {
++		printf("mmap failed\n");
++		return 1;
++	}
++	for (int exits = 0; exits < 2; exits++) {
++		int pair[2];
++		if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair)) {
++			printf("socketpair failed\n");
++			return 1;
++		}
++		*progress = 0;
++		int pid = fork();
++		if (pid == 0) {
++			setpgid(0, 0);
++			nfsp_test_send(pair[1], NFSP_BROKER_DONE, 1);
++			if (exits)
++				doexit(0);
++			// Keep issuing syscalls, as the rest of a program would.
++			for (;;) {
++				getppid();
++				(*progress)++;
++			}
++		}
++		close(pair[1]);
++		nfsp_broker k;
++		nfsp_broker_start(&k, pair[0], NULL, 0);
++		k.b.executed = 1; // ACTIVATE was ACKed
++		nfsp_act_endpoint ep = {-1, {}, 50};
++		while (!k.done)
++			nfsp_broker_serve(&ep, &k, 10);
++		int status = 0;
++		int stopped = nfsp_stop_program(pid, &status);
++		uint64 at_stop = *progress;
++		usleep(50 * 1000);
++		uint64 later = *progress;
++		if (stopped != 1) {
++			kill(pid, SIGKILL);
++			waitpid(pid, &status, __WALL);
++		}
++		close(pair[0]);
++		if (exits ? stopped != 1 : (stopped != 0 || later != at_stop)) {
++			printf("exits=%d: stopped=%d progress %llu -> %llu\n", exits, stopped, at_stop, later);
++			return 1;
++		}
++	}
++	munmap((void*)progress, SYZ_PAGE_SIZE);
++	return 0;
++}
 +#endif
 +
  static struct {
  	const char* name;
  	int (*f)();
-@@ -430,6 +686,11 @@ static struct {
+@@ -430,6 +752,12 @@ static struct {
      {"test_cover_filter", test_cover_filter},
      {"test_glob", test_glob},
      {"test_get_last_opt", test_get_last_opt},
@@ -1416,6 +1660,7 @@ index 437bf01d9..08df9d5ca 100644
 +    {"test_nfsp_sha256", test_nfsp_sha256},
 +    {"test_nfsp_barrier", test_nfsp_barrier},
 +    {"test_nfsp_broker", test_nfsp_broker},
++    {"test_nfsp_stop", test_nfsp_stop},
 +#endif
  };
  

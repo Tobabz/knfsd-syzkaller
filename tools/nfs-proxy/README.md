@@ -301,17 +301,26 @@ qemu-system-x86_64 ... \
 target-mode lane, `lane.sh` starts the Proxy with `--target`, `--session-id`, `--journal
 /dev/virtio-ports/nfsp-journal-N` and `--activation` on a socket under the executor's
 `proc-N/activation/`, which the executor connects to before it chroots. Only the fork server
-keeps that connection: each program process closes its copy before anything else and asks the
-fork server, over a socket pair made for that program, to open and close its window, so the
-process that runs fuzzed syscalls has no descriptor for the endpoint. For every program with a
-KCOV generation, the fork server sends `ACTIVATE` with the generation and the SHA-256 of the
-exec-encoded program, and the program runs only after the ACK. `DEACTIVATE` goes out before KCOV
-FINISH, and `DEACTIVATE`/`ABORT` before the orphan KCOV ABORT. Without an ACK, or when KCOV BEGIN
-gave no generation, the program is not run. Requests without remote coverage (machine-check
-probes, comparisons) run without a window, so the Proxy leaves them unmutated. If a window cannot
-be confirmed closed, the Proxy quarantined the session, or the program process sent the fork
-server anything but one `ACTIVATE` and one `DONE`, the Runner fails the executor and the VM is
-restarted. The exec result carries the barrier as `ProgInfo.nfs_proxy`, and `syz-execprog` logs
+keeps that connection, and only the fork server decides when a program's window ends. The process
+that runs fuzzed syscalls has no descriptor for the endpoint, and nothing it sends can end its
+window early.
+
+For every program with a KCOV generation, the program process asks the fork server, over a socket
+pair made for that program, to `ACTIVATE` its generation. The fork server sends the activation with
+the SHA-256 of its own copy of the exec-encoded program, and the program runs only after the ACK.
+After its calls the program process sends `DONE` and waits. `DONE` is only a request, since a fuzzed
+syscall could send it too. The fork server first stops the program process and its process group,
+so that no further syscall starts. It then sends `DEACTIVATE`, ends the KCOV generation itself,
+publishes its remote coverage, and kills the program process.
+
+A program process that exits, crashes or does not stop has its window closed only after it is gone,
+before the orphan KCOV ABORT. Without an ACK, or when KCOV BEGIN gave no generation, the program
+is not run. Requests without remote coverage (machine-check probes, comparisons) run without a
+window, so the Proxy leaves them unmutated.
+
+If a window cannot be confirmed closed, the Proxy quarantined the session, or the pair carried
+anything but one `ACTIVATE` and one `DONE`, the Runner fails the executor and the VM is restarted.
+The exec result carries the barrier as `ProgInfo.nfs_proxy`, and `syz-execprog` logs
 it as `nfs proxy barrier: ...`.
 
 Each Proxy start uses a new session `PREFIX.<random UUID>`, where `PREFIX` is

@@ -79,5 +79,6 @@ jobs:
           ./bin/linux_amd64/syz-executor test test_nfsp_sha256
           ./bin/linux_amd64/syz-executor test test_nfsp_barrier
           ./bin/linux_amd64/syz-executor test test_nfsp_broker
+          ./bin/linux_amd64/syz-executor test test_nfsp_stop
           go test ./pkg/flatrpc/
           go test ./executor/ -run 'NfsProxy|Generation|FixedLane'
