@@ -154,6 +154,12 @@ or a late receipt raises instead of creating a verdict, while malformed,
 miscorrelated or hash-invalid present evidence produces
 `INCONCLUSIVE(invalid_evidence)`.
 
+`RunnerQ2ReceiptBridge` publishes that authority only after matching the Runner's
+accepted completion, sealing receipt and complete inventory against independent
+host collection facts. Its immutable publication history provides detached Q2
+Judge snapshots after restart. The host must supply those facts; the bridge does
+not collect them or dispatch Stage 2. See [`Q2_RECEIPTS.md`](runner/Q2_RECEIPTS.md).
+
 Content addressing establishes byte integrity, not provenance. The artifact
 root and its provisioning, catalog/profile selection, receipt registry, mapping
 approval and transfer from a real Runner all remain trusted host responsibilities.
@@ -191,7 +197,7 @@ deadline and response-identity requirements.
 Also not here yet: broader NFS resource-provenance extraction, a concrete
 VM/KCOV execution engine with process/resource supervision wired in, raw
 KCOV/counter collection and normalization, automatic DWARF/runtime-PC mapping,
-Runner-receipt integration for Q2, approved production HCAP/judge data, and Stage 2 Controller/Runner
+live Q2 host-context collection, approved production HCAP/judge data, and Stage 2 Controller/Runner
 integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
 VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
 remains false-only. The nfs-proxy semantic runtime remains a separate component

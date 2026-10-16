@@ -89,6 +89,14 @@ candidate target, kernel identity and mapping. Its append-only publication
 history produces immutable `ArtifactQ1Judge` snapshots for Controller retries
 and replay. It does not infer host authority from guest bytes.
 
+## Accepted completion to Q2
+
+[`RunnerQ2ReceiptBridge`](Q2_RECEIPTS.md) binds the accepted completion and sealing
+receipt to independently supplied host collection facts and the complete artifact
+inventory. Publication history is immutable and produces detached `ArtifactQ2Judge`
+snapshots. Guest observation parsing and verdict precedence remain with the Judge;
+the bridge supplies neither a live collector nor Stage 2 dispatch.
+
 ## Host process supervision
 
 [`ProcessSupervisor`](PROCESS_SUPERVISOR.md) provides lease-aware Linux command
