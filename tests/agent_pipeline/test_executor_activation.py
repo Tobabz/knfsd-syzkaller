@@ -128,7 +128,7 @@ int main(int argc, char **argv)
 				nfsp_act_release(&ep, &k.b); /* the program is stopped */
 			}
 			close(pair[1]);
-			nfsp_broker_finish(&ep, &k);
+			nfsp_broker_finish(&ep, &k, 1);
 			printf("deactivation=%u/%u lease=%u\n", k.b.deactivation,
 			       k.b.deactivation_status, k.b.lease);
 		} else {
@@ -168,7 +168,10 @@ def driver(tmp_path_factory) -> Path:
     (work / "nfs_proxy_activation.h").write_text(executor_header())
     (work / "driver.c").write_text(DRIVER)
     out = work / "driver"
-    subprocess.run([cc, "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Werror", "-pthread",
+    # The header's program-cgroup helpers are the fork server's; the driver
+    # does not use them.
+    subprocess.run([cc, "-std=c11", "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Werror",
+                    "-Wno-unused-function", "-pthread",
                     f"-I{work}", "-o", str(out), str(work / "driver.c")], check=True)
     return out
 

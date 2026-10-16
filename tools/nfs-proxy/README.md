@@ -309,14 +309,27 @@ For every program with a KCOV generation, the program process asks the fork serv
 pair made for that program, to `ACTIVATE` its generation. The fork server sends the activation with
 the SHA-256 of its own copy of the exec-encoded program, and the program runs only after the ACK.
 After its calls the program process sends `DONE` and waits. `DONE` is only a request, since a fuzzed
-syscall could send it too. The fork server first stops the program process and its process group,
-so that no further syscall starts. It then sends `DEACTIVATE`, ends the KCOV generation itself,
-publishes its remote coverage, and kills the program process.
+syscall could send it too.
 
-A program process that exits, crashes or does not stop has its window closed only after it is gone,
-before the orphan KCOV ABORT. Without an ACK, or when KCOV BEGIN gave no generation, the program
+Every program process runs in a cgroup v2 directory of its own, which is also the root of its
+cgroup namespace. Everything it starts stays in that cgroup, including helpers in their own process
+group or session. On `DONE` the fork server freezes the cgroup. A frozen task stays frozen through
+`SIGCONT`. The fork server then ends the KCOV generation itself and publishes its remote coverage.
+Finally it kills the cgroup. It sends `DEACTIVATE` only once the cgroup is empty, which is after
+every task has closed its descriptors. So the NFS traffic of a program's teardown also falls inside
+its window. With the cgroups feature this cgroup is the one programs see as `./cgroup`, and the fork
+server itself stays out of it.
+
+A program that exits or crashes before `DONE` has its window closed the same way, once its cgroup
+is empty, and before the orphan KCOV ABORT. If the cgroup does not empty, the window stays open and
+the lane is not reused. Without an ACK, or when KCOV BEGIN gave no generation, the program
 is not run. Requests without remote coverage (machine-check probes, comparisons) run without a
 window, so the Proxy leaves them unmutated.
+
+Two limits remain. First, a root program can move a task out of its cgroup, unless the guest's
+cgroup2 mount has `nsdelegate`, as it does under systemd. Second, the KCOV generation counts as
+complete on the program's own report in `DONE`. A program that disturbs its own KCOV binding,
+for example by closing the KCOV descriptor, only loses coverage it would have been credited with.
 
 If a window cannot be confirmed closed, the Proxy quarantined the session, or the pair carried
 anything but one `ACTIVATE` and one `DONE`, the Runner fails the executor and the VM is restarted.

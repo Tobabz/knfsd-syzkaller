@@ -1,4 +1,4 @@
-From 81a940b04843bc9125392cbaa5ded58e129e1712 Mon Sep 17 00:00:00 2001
+From 5c9bb60c715a76b921304d065cbc6d9f8e1bed03 Mon Sep 17 00:00:00 2001
 From: idealinsane <idealinsane@localhost>
 Date: Fri, 16 Oct 2026 13:43:53 +0000
 Subject: [PATCH] executor: bracket programs with the NFS proxy activation
@@ -24,14 +24,22 @@ For every execution with a managed remote-coverage generation:
 - the program does not run unless the activation was ACKed (or when
   KCOV BEGIN returned no generation), and the KCOV generation is
   aborted instead of published;
+- every program process runs in a cgroup v2 directory of its own,
+  which is also the root of its cgroup namespace, so everything it
+  starts (helpers in their own process group or session included)
+  stays in it; with the cgroups feature it is the cgroup programs see
+  as ./cgroup, and the fork server stays out of it;
 - after its calls the program process sends DONE and waits.  DONE is
   only a request (fuzzed syscalls can send it too): the fork server
-  stops the program process and its process group, so that no further
-  syscall starts, then deactivates the window, finishes (or aborts) the
-  KCOV generation itself, publishes the generation's remote coverage
-  into the program's output, and kills the program process;
-- a program process that exits, crashes, hangs or does not stop has its
-  window closed after it is gone, before the orphan KCOV ABORT;
+  freezes the program cgroup (SIGCONT does not undo that), finishes (or
+  aborts) the KCOV generation itself, publishes the generation's remote
+  coverage into the program's output, and kills the cgroup;
+- the window is closed only once the program cgroup is empty, i.e.
+  after every task of the program ran its exit and closed its
+  descriptors, so the program's teardown is inside the window too; a
+  program that exits, crashes or hangs is handled the same way, before
+  the orphan KCOV ABORT, and a cgroup that does not empty leaves the
+  window open and the lease uncleared;
 - anything but one ACTIVATE and one DONE on the pair leaves the lease
   uncleared.
 
@@ -46,25 +54,25 @@ feature probes without remote coverage) run without a window and so are
 never mutated.
 ---
  executor/common.h                     |  30 +-
- executor/common_linux.h               |   3 +
- executor/executor.cc                  | 324 +++++++++++++++-
+ executor/common_linux.h               |  10 +-
+ executor/executor.cc                  | 377 +++++++++++++++-
  executor/executor_runner.h            |  14 +
- executor/nfs_proxy_activation.h       | 510 ++++++++++++++++++++++++++
- executor/nfs_proxy_activation_test.go | 180 +++++++++
- executor/test.h                       | 328 +++++++++++++++++
+ executor/nfs_proxy_activation.h       | 597 ++++++++++++++++++++++++++
+ executor/nfs_proxy_activation_test.go | 191 ++++++++
+ executor/test.h                       | 395 +++++++++++++++++
  pkg/flatrpc/flatrpc.fbs               |  32 ++
- pkg/flatrpc/flatrpc.go                | 300 ++++++++++++++-
- pkg/flatrpc/flatrpc.h                 | 271 +++++++++++++-
+ pkg/flatrpc/flatrpc.go                | 300 ++++++++++++-
+ pkg/flatrpc/flatrpc.h                 | 271 +++++++++++-
  pkg/flatrpc/helpers.go                |   6 +
  pkg/flatrpc/nfs_proxy_test.go         |  48 +++
  tools/syz-execprog/execprog.go        |  16 +
- 13 files changed, 2040 insertions(+), 22 deletions(-)
+ 13 files changed, 2264 insertions(+), 23 deletions(-)
  create mode 100644 executor/nfs_proxy_activation.h
  create mode 100644 executor/nfs_proxy_activation_test.go
  create mode 100644 pkg/flatrpc/nfs_proxy_test.go
 
 diff --git a/executor/common.h b/executor/common.h
-index 0817e121b..95e98a85b 100644
+index 0817e121b..2234c8111 100644
 --- a/executor/common.h
 +++ b/executor/common.h
 @@ -648,11 +648,19 @@ static void loop(void)
@@ -107,8 +115,8 @@ index 0817e121b..95e98a85b 100644
 +			if (nfsp_broker_state.done) {
 +				// The fork server, not the program process, ends a program
 +				// that ran in an activation window.
-+				if (!nfsp_broker_end_program(pid, &status))
-+					kill_and_wait(pid, &status);
++				nfsp_broker_end_program();
++				kill_and_wait(pid, &status);
 +				break;
 +			}
 +#else
@@ -122,8 +130,8 @@ index 0817e121b..95e98a85b 100644
  			break;
  		}
 +#if SYZ_EXECUTOR && GOOS_linux
-+		// A child that died inside its NFS proxy activation window left the
-+		// window open.  Close it before the KCOV generation is aborted.
++		// Close the NFS proxy activation window once nothing of the program
++		// is left, and before the KCOV generation is aborted.
 +		nfsp_broker_end();
 +#endif
  #if SYZ_EXECUTOR && GOOS_linux
@@ -137,21 +145,35 @@ index 0817e121b..95e98a85b 100644
  			output_data->kcov_generation.store(0, std::memory_order_release);
  #endif
 diff --git a/executor/common_linux.h b/executor/common_linux.h
-index ae5bd713c..4a65651fd 100644
+index ae5bd713c..8f56de6de 100644
 --- a/executor/common_linux.h
 +++ b/executor/common_linux.h
-@@ -4692,6 +4692,9 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+@@ -4469,7 +4469,12 @@ static void setup_cgroups_loop()
+ 	write_file(file, "32");
+ 	// Setup some v1 groups to make things more interesting.
+ 	snprintf(file, sizeof(file), "%s/cgroup.procs", cgroupdir);
+-	write_file(file, "%d", pid);
++#if SYZ_EXECUTOR && GOOS_linux
++	// In NFS proxy target mode this is the program cgroup (nfsp_setup_cgroup):
++	// each program process joins it, the fork server stays out.
++	if (!nfsp_target_mode)
++#endif
++		write_file(file, "%d", pid);
+ 	snprintf(cgroupdir, sizeof(cgroupdir), "/syzcgroup/cpu/syz%llu", procid);
+ 	if (mkdir(cgroupdir, 0777)) {
+ 		debug("mkdir(%s) failed: %d\n", cgroupdir, errno);
+@@ -4692,6 +4697,9 @@ static void setup_nfs_fuzz_lane(const char* newroot)
  			}
  		}
  	}
 +	// Target mode: connect the proxy activation endpoint while the source tree
 +	// is still reachable.  It is never imported into the sandbox.
-+	nfsp_setup_activation(source);
++	nfsp_setup_activation(source, newroot);
  	debug("NFS fuzz lane bound: proc=%llu clients-only source=%s target=/nfs-lane\n",
  	      procid, source);
  }
 diff --git a/executor/executor.cc b/executor/executor.cc
-index 9a6895f01..763c0cf10 100644
+index 9a6895f01..d6921422f 100644
 --- a/executor/executor.cc
 +++ b/executor/executor.cc
 @@ -26,6 +26,10 @@
@@ -165,7 +187,7 @@ index 9a6895f01..763c0cf10 100644
  #if defined(__GNUC__)
  #define SYSCALLAPI
  #define NORETURN __attribute__((noreturn))
-@@ -71,6 +75,13 @@ const int kInPipeFd = kMaxFd - 1; // remapped from stdin
+@@ -71,6 +75,16 @@ const int kInPipeFd = kMaxFd - 1; // remapped from stdin
  const int kOutPipeFd = kMaxFd - 2; // remapped from stdout
  const int kCoverFd = kOutPipeFd - kMaxThreads;
  const int kExtraCoverFd = kCoverFd - 1;
@@ -175,29 +197,31 @@ index 9a6895f01..763c0cf10 100644
 +const int kNfspActivationFd = kExtraCoverFd - 1;
 +// A program process's end of its broker pair with the fork server.
 +const int kNfspBrokerFd = kNfspActivationFd - 1;
++// The fork server's descriptor of the program cgroup (nfsp_cg in
++// nfs_proxy_activation.h); a program process closes it after joining.
++const int kNfspCgroupFd = kNfspBrokerFd - 1;
 +#endif
  const int kMaxArgs = 9;
  const int kCoverSize = 512 << 10;
  const int kFailStatus = 67;
-@@ -114,6 +125,17 @@ static void receive_handshake();
+@@ -114,6 +128,16 @@ static void receive_handshake();
  #if GOOS_linux
  static bool cover_abort_remote_generation(uint64 generation, bool best_effort);
  #endif
 +#if GOOS_linux
-+static void nfsp_setup_activation(const char* lane_source);
++static void nfsp_setup_activation(const char* lane_source, const char* newroot);
 +static void nfsp_broker_prefork();
 +static void nfsp_broker_child();
 +static void nfsp_broker_parent();
 +static void nfsp_broker_wait(int timeout_ms);
-+static int nfsp_stop_program(int pid, int* status);
-+static bool nfsp_broker_end_program(int pid, int* status);
++static void nfsp_broker_end_program();
 +static void nfsp_broker_end();
 +static bool nfsp_broker_kcov_resolved();
 +#endif
  
  #if SYZ_EXECUTOR_USES_FORK_SERVER
  static void SnapshotPrepareParent();
-@@ -152,6 +174,14 @@ struct alignas(8) OutputData {
+@@ -152,6 +176,14 @@ struct alignas(8) OutputData {
  	// This lives in shared memory so the fork-server watchdog can abort a
  	// generation left behind by a killed child.
  	std::atomic<uint64> kcov_generation;
@@ -212,7 +236,7 @@ index 9a6895f01..763c0cf10 100644
  	std::atomic<flatbuffers::Offset<flatbuffers::Vector<uint8_t>>> result_offset;
  	struct {
  		// Call index in the test program (they may be out-of-order is some syscalls block).
-@@ -167,6 +197,9 @@ struct alignas(8) OutputData {
+@@ -167,6 +199,9 @@ struct alignas(8) OutputData {
  		completed.store(0, std::memory_order_relaxed);
  		num_calls.store(0, std::memory_order_relaxed);
  		kcov_generation.store(0, std::memory_order_relaxed);
@@ -222,7 +246,7 @@ index 9a6895f01..763c0cf10 100644
  		result_offset.store(0, std::memory_order_relaxed);
  	}
  };
-@@ -301,6 +334,19 @@ static uint64 request_id;
+@@ -301,6 +336,19 @@ static uint64 request_id;
  static rpc::RequestType request_type;
  static uint64 all_call_signal;
  static bool all_extra_signal;
@@ -242,7 +266,7 @@ index 9a6895f01..763c0cf10 100644
  
  // Tunable timeouts, received with execute_req.
  static uint64 syscall_timeout_ms;
-@@ -453,6 +499,9 @@ struct execute_req {
+@@ -453,6 +501,9 @@ struct execute_req {
  	uint64 all_call_signal;
  	bool all_extra_signal;
  	bool return_error;
@@ -252,7 +276,7 @@ index 9a6895f01..763c0cf10 100644
  };
  
  struct execute_reply {
-@@ -891,6 +940,7 @@ void parse_execute(const execute_req& req)
+@@ -891,6 +942,7 @@ void parse_execute(const execute_req& req)
  	all_call_signal = req.all_call_signal;
  	all_extra_signal = req.all_extra_signal;
  	flag_return_error = req.return_error;
@@ -260,7 +284,7 @@ index 9a6895f01..763c0cf10 100644
  
  	debug("[%llums] exec opts: reqid=%llu type=%llu procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d "
  	      " sandbox=%d/%d/%d/%d timeouts=%llu/%llu/%llu kernel_64_bit=%d\n",
-@@ -916,9 +966,10 @@ void reply_execute(uint32 status)
+@@ -916,9 +968,10 @@ void reply_execute(uint32 status)
  		fail("control pipe write failed");
  }
  
@@ -273,7 +297,7 @@ index 9a6895f01..763c0cf10 100644
  	/*
  	 * A request that collects remote coverage can carry up to kExtraCoverSize
  	 * entries in the extra record alone - 8 MiB of PCs on a 64-bit host - on
-@@ -937,11 +988,20 @@ void realloc_output_data()
+@@ -937,11 +990,20 @@ void realloc_output_data()
  		(kExtraCoverSize + kRemoteCoverCallHeadroom) * (int)sizeof(uint64_t);
  
  	if (flag_comparisons)
@@ -299,7 +323,7 @@ index 9a6895f01..763c0cf10 100644
  	if (close(kOutFd) < 0)
  		fail("failed to close kOutFd");
  #endif
-@@ -966,6 +1026,216 @@ void execute_glob()
+@@ -966,6 +1028,267 @@ void execute_glob()
  	output_data->result_offset.store(off, std::memory_order_release);
  }
  
@@ -313,7 +337,9 @@ index 9a6895f01..763c0cf10 100644
 +// uses it: it runs each program's barrier as that program's broker
 +// (nfsp_broker in nfs_proxy_activation.h), and the program process, which
 +// runs the fuzzed syscalls, closes its inherited copy before anything else.
-+static void nfsp_setup_activation(const char* lane_source)
++static void nfsp_setup_cgroup(const char* newroot);
++
++static void nfsp_setup_activation(const char* lane_source, const char* newroot)
 +{
 +	char dir[160], path[192];
 +	if (snprintf(dir, sizeof(dir), "%s/activation", lane_source) >= (int)sizeof(dir))
@@ -356,8 +382,73 @@ index 9a6895f01..763c0cf10 100644
 +		fail("dup NFS proxy activation fd failed");
 +	close(fd);
 +	nfsp_endpoint.fd = kNfspActivationFd;
++	nfsp_setup_cgroup(newroot);
 +	nfsp_target_mode = true;
 +	debug("NFS proxy target mode: proc=%llu endpoint=%s\n", procid, addr.sun_path);
++}
++
++// Whether a program process can join `dir`.  With nsdelegate (systemd's
++// cgroup2 mount) only a cgroup inside the sandbox's cgroup namespace can be.
++static bool nfsp_cgroup_joinable(int dir)
++{
++	int pid = fork();
++	if (pid < 0)
++		fail("NFS proxy cgroup probe fork failed");
++	if (pid == 0)
++		doexit(nfsp_cg_join(dir) ? 0 : 1);
++	int status = 0;
++	while (waitpid(pid, &status, __WALL) != pid) {
++	}
++	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
++}
++
++// The program cgroup.  With the cgroups feature it is the one programs see as
++// ./cgroup (setup_cgroups_test), so that the cgroups they create and move into
++// stay inside it, and the fork server stays out of it (setup_cgroups_loop).
++// Otherwise, or when the sandbox cannot reach that one, it is a private one
++// under the sandbox's cgroup namespace root, from a cgroup2 mount that is
++// detached again at once.
++static void nfsp_setup_cgroup(const char* newroot)
++{
++	char path[192];
++	int dir = -1;
++	if (flag_cgroups) {
++		snprintf(path, sizeof(path), "/syzcgroup/unified/syz%llu", procid);
++		if (mkdir(path, 0777) && errno != EEXIST)
++			debug("mkdir(%s) failed: %d\n", path, errno);
++		dir = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++		if (dir != -1 && !nfsp_cgroup_joinable(dir)) {
++			debug("NFS proxy: %s is outside the sandbox cgroup namespace\n", path);
++			close(dir);
++			dir = -1;
++		}
++	}
++	if (dir == -1) {
++		if (snprintf(path, sizeof(path), "%s/syz-nfsp-cgroup", newroot) >= (int)sizeof(path))
++			fail("NFS proxy cgroup mount path is too long");
++		if (mkdir(path, 0700) || mount("none", path, "cgroup2", 0, NULL))
++			failmsg("mount cgroup2 for NFS proxy target mode failed", "path=%s", path);
++		int root = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++		if (umount2(path, MNT_DETACH) || rmdir(path))
++			failmsg("detach NFS proxy cgroup mount failed", "path=%s", path);
++		if (root == -1)
++			fail("open NFS proxy cgroup root failed");
++		snprintf(path, sizeof(path), "syz-nfsp%llu", procid);
++		if (mkdirat(root, path, 0700) && errno != EEXIST)
++			failmsg("mkdir NFS proxy program cgroup failed", "path=%s", path);
++		dir = openat(root, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++		close(root);
++		if (dir == -1)
++			failmsg("open NFS proxy program cgroup failed", "path=%s", path);
++		if (!nfsp_cgroup_joinable(dir))
++			failmsg("NFS proxy program cgroup cannot be joined", "path=%s", path);
++	}
++	if (dup3(dir, kNfspCgroupFd, O_CLOEXEC) != kNfspCgroupFd)
++		fail("dup NFS proxy program cgroup fd failed");
++	close(dir);
++	// Whatever a previous executor (or the probe) left there.
++	if (!nfsp_cg_empty(kNfspCgroupFd, 1000))
++		fail("NFS proxy program cgroup does not empty");
 +}
 +
 +// Fork server, before fork(): a fresh broker pair for this one program.  The
@@ -383,11 +474,15 @@ index 9a6895f01..763c0cf10 100644
 +	nfsp_endpoint.timeout_ms = syscall_timeout_ms * 10;
 +}
 +
-+// Program process, right after fork(): keep only its end of the pair.
++// Program process, right after fork(): join the program cgroup and keep only
++// its end of the pair.
 +static void nfsp_broker_child()
 +{
 +	if (!nfsp_target_mode)
 +		return;
++	if (!nfsp_cg_join(kNfspCgroupFd))
++		fail("NFS proxy program process failed to join its cgroup");
++	close(kNfspCgroupFd);
 +	close(kNfspActivationFd);
 +	close(nfsp_broker_state.fd);
 +	nfsp_endpoint.fd = -1;
@@ -418,43 +513,20 @@ index 9a6895f01..763c0cf10 100644
 +		sleep_ms(timeout_ms - spent);
 +}
 +
-+// Fork server: after a DONE, stop the program process (and its process group)
-+// so that no further syscall starts.  0: stopped, 1: it exited (reaped),
-+// -1: it did not stop in time (a thread stuck in the kernel).
-+static int nfsp_stop_program(int pid, int* status)
-+{
-+	kill(-pid, SIGSTOP);
-+	kill(pid, SIGSTOP);
-+	uint64 start = current_time_ms();
-+	for (;;) {
-+		int res = waitpid(pid, status, WNOHANG | WUNTRACED | __WALL);
-+		if (res == pid)
-+			return WIFSTOPPED(*status) ? 0 : 1;
-+		if (current_time_ms() - start > syscall_timeout_ms * 10)
-+			return -1;
-+		sleep_ms(1);
-+	}
-+}
-+
 +// Fork server: the program asked to end (DONE, which fuzzed syscalls can also
-+// send).  Completion is decided here, outside the process that runs fuzzed
-+// syscalls: stop it, close the window, end the KCOV generation and publish its
-+// remote coverage, all while it cannot run.  The caller then kills it.
-+// Returns true when the program process already exited (and was reaped).
-+static bool nfsp_broker_end_program(int pid, int* status)
++// send).  Freeze it, then end the KCOV generation and publish its remote
++// coverage while nothing of the program runs.  The caller then kills it, and
++// nfsp_broker_end closes the window once its cgroup is empty.  The window is
++// still open here, and only a frozen program's generation is FINISHed.
++static void nfsp_broker_end_program()
 +{
-+	int stopped = nfsp_stop_program(pid, status);
-+	if (stopped != 0) {
-+		// Exited or stuck: the window closes only after it is gone
-+		// (nfsp_broker_end), and the orphan path aborts the generation.
-+		debug("NFS proxy: program did not stop (%d)\n", stopped);
-+		return stopped == 1;
-+	}
 +	nfsp_broker* k = &nfsp_broker_state;
-+	nfsp_act_release(&nfsp_endpoint, &k->b);
++	bool frozen = nfsp_cg_freeze(kNfspCgroupFd, syscall_timeout_ms * 10);
++	if (!frozen)
++		debug("NFS proxy: program did not freeze\n");
 +	uint64 generation = k->b.generation;
 +	bool finished = false;
-+	if (k->b.lease == NFSP_ACT_LEASE_CLEAR && k->done_valid)
++	if (frozen && k->done_valid)
 +		finished = cover_finish_remote_generation(generation, 1000 * slowdown_scale);
 +	if (finished || cover_abort_remote_generation(generation, false))
 +		nfsp_broker_kcov_done = true;
@@ -471,7 +543,6 @@ index 9a6895f01..763c0cf10 100644
 +		remote_generation_managed = false;
 +	}
 +	output_data->kcov_generation.store(0, std::memory_order_release);
-+	return false;
 +}
 +
 +static bool nfsp_broker_kcov_resolved()
@@ -479,15 +550,19 @@ index 9a6895f01..763c0cf10 100644
 +	return nfsp_target_mode && nfsp_broker_kcov_done;
 +}
 +
-+// Fork server, once the program process is gone: a program killed or crashed
-+// inside its window left it open.  Close it before the KCOV ABORT that follows
-+// in loop(), and only now publish the barrier, which the program process can
-+// no longer touch.
++// Fork server, once the program process is reaped: kill whatever else of the
++// program is left (helpers in their own process group or session included)
++// and close the window only once the program cgroup is empty.  That is before
++// the KCOV ABORT that follows in loop().  Only now publish the barrier, which
++// the program can no longer touch.
 +static void nfsp_broker_end()
 +{
 +	if (!nfsp_target_mode)
 +		return;
-+	nfsp_broker_finish(&nfsp_endpoint, &nfsp_broker_state);
++	bool gone = nfsp_cg_empty(kNfspCgroupFd, syscall_timeout_ms * 20);
++	if (!gone)
++		debug("NFS proxy: program cgroup did not empty\n");
++	nfsp_broker_finish(&nfsp_endpoint, &nfsp_broker_state, gone);
 +	output_data->nfsp = nfsp_broker_state.b;
 +}
 +
@@ -501,9 +576,9 @@ index 9a6895f01..763c0cf10 100644
 +	return answer == 1;
 +}
 +
-+// Program process: the calls are over.  The fork server stops this process,
-+// closes the window, ends the KCOV generation, publishes its coverage and
-+// kills this process; nothing here runs after DONE.
++// Program process: the calls are over.  The fork server freezes the program,
++// ends the KCOV generation, publishes its coverage, kills the program and then
++// closes the window; nothing here runs after DONE.
 +static NORETURN void nfsp_program_done(bool valid)
 +{
 +	if (!nfsp_broker_send(kNfspBrokerFd, NFSP_BROKER_DONE, valid ? 1 : 0))
@@ -516,7 +591,7 @@ index 9a6895f01..763c0cf10 100644
  // execute_one executes program stored in input_data.
  void execute_one()
  {
-@@ -1021,6 +1291,22 @@ void execute_one()
+@@ -1021,6 +1344,22 @@ void execute_one()
  		}
  	}
  
@@ -539,7 +614,7 @@ index 9a6895f01..763c0cf10 100644
  	int call_index = 0;
  	uint64 prog_extra_timeout = 0;
  	uint64 prog_extra_cover_timeout = 0;
-@@ -1029,6 +1315,8 @@ void execute_one()
+@@ -1029,6 +1368,8 @@ void execute_one()
  
  	read_input(&input_pos); // total number of calls
  	for (;;) {
@@ -548,7 +623,7 @@ index 9a6895f01..763c0cf10 100644
  		uint64 call_num = read_input(&input_pos);
  		if (call_num == instr_eof)
  			break;
-@@ -1216,8 +1504,16 @@ void execute_one()
+@@ -1216,8 +1557,16 @@ void execute_one()
  		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
  		bool generation_resolved = false;
  #if GOOS_linux
@@ -566,7 +641,7 @@ index 9a6895f01..763c0cf10 100644
  			// FINISH performs the bounded kernel-side root/token drain.  It is the
  			// publication barrier for remote extra coverage and synchronously
  			// materializes the committed snapshot before userspace consumes it.
-@@ -1576,7 +1872,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
+@@ -1576,7 +1925,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
  		}
  		calls[call.index] = call.offset;
  	}
@@ -619,10 +694,10 @@ index 231c9b87e..c4733a940 100644
  		msg_.reset();
 diff --git a/executor/nfs_proxy_activation.h b/executor/nfs_proxy_activation.h
 new file mode 100644
-index 000000000..732159e94
+index 000000000..eb9b3ab06
 --- /dev/null
 +++ b/executor/nfs_proxy_activation.h
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,597 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -653,7 +728,9 @@ index 000000000..732159e94
 +#define NFS_PROXY_ACTIVATION_H
 +
 +#include <errno.h>
++#include <fcntl.h>
 +#include <poll.h>
++#include <sched.h>
 +#include <stddef.h>
 +#include <stdint.h>
 +#include <string.h>
@@ -1028,11 +1105,12 @@ index 000000000..732159e94
 +// ACTIVATE comes before any fuzzed syscall, so it is the program process's
 +// own.  DONE is not trusted: fuzzed syscalls can send it (or a later one can
 +// hide the real one).  It only asks the parent to end the program.  The
-+// parent then stops the program process, so that no further syscall starts,
-+// and only after that closes the window (nfsp_broker_done is the cue; the
-+// executor does the stopping), then ends the process: nothing of the program
-+// runs after its window.  Anything else on the pair, which only fuzzed
-+// syscalls can send, marks the lease UNCLEARED, so the lane is not reused.
++// window is not tied to DONE at all: every task of the program runs in the
++// program's own cgroup (nfsp_cg below), and the parent closes the window only
++// once that cgroup is empty, so everything the program does, including the
++// teardown of its descriptors, happens inside the window.  Anything else on
++// the pair, which only fuzzed syscalls can send, marks the lease UNCLEARED,
++// so the lane is not reused.
 +
 +#define NFSP_BROKER_ACTIVATE 1u
 +#define NFSP_BROKER_DONE 2u
@@ -1102,13 +1180,15 @@ index 000000000..732159e94
 +	}
 +}
 +
-+// Parent, once the program process is gone (exited, crashed or killed): handle
-+// what it sent last, close a window it left open, and settle the lease.
-+static void nfsp_broker_finish(const struct nfsp_act_endpoint* ep, struct nfsp_broker* k)
++// Parent, once every task of the program is gone (`gone`; nfsp_cg_empty):
++// handle what it sent last, close its window, and settle the lease.  While a
++// task may still run, the window stays open and the lane is not reused.
++static void nfsp_broker_finish(const struct nfsp_act_endpoint* ep, struct nfsp_broker* k, int gone)
 +{
 +	nfsp_broker_serve(ep, k, 0);
-+	nfsp_act_release(ep, &k->b);
-+	if (k->violation)
++	if (gone)
++		nfsp_act_release(ep, &k->b);
++	if (k->violation || !gone)
 +		k->b.lease = NFSP_ACT_LEASE_UNCLEARED;
 +	close(k->fd);
 +	k->fd = -1;
@@ -1132,13 +1212,95 @@ index 000000000..732159e94
 +	return answer;
 +}
 +
++// The program's cgroup.  The fork server puts each program process into one
++// cgroup v2 directory of its own (`dir`, a descriptor only the fork server
++// keeps), which also becomes the root of the program's cgroup namespace.
++// Every task the program creates stays in it: a new process group or session
++// does not leave it, and the namespace root forbids moving a task out of it
++// (cgroup.procs and CLONE_INTO_CGROUP need the common ancestor inside the
++// namespace).  Freezing it is not undone by SIGCONT, and killing it reaches
++// every task; it is empty only after each task ran its exit, which closes its
++// descriptors.
++
++#define NFSP_CLONE_NEWCGROUP 0x02000000
++
++static int nfsp_cg_write(int dir, const char* file, const char* value)
++{
++	int fd = openat(dir, file, O_WRONLY | O_CLOEXEC);
++	if (fd == -1)
++		return 0;
++	ssize_t len = strlen(value);
++	int ok = write(fd, value, len) == len;
++	close(fd);
++	return ok;
++}
++
++// The 0/1 value of `key` in cgroup.events, or -1.
++static int nfsp_cg_event(int dir, const char* key)
++{
++	char buf[256];
++	int fd = openat(dir, "cgroup.events", O_RDONLY | O_CLOEXEC);
++	if (fd == -1)
++		return -1;
++	ssize_t n = read(fd, buf, sizeof(buf) - 1);
++	close(fd);
++	if (n <= 0)
++		return -1;
++	buf[n] = 0;
++	size_t len = strlen(key);
++	for (const char* p = buf;;) {
++		if (!strncmp(p, key, len) && p[len] == ' ')
++			return p[len + 1] == '1';
++		p = strchr(p, '\n');
++		if (!p)
++			return -1;
++		p++;
++	}
++}
++
++static int nfsp_cg_wait(int dir, const char* key, int want, uint64_t timeout_ms)
++{
++	uint64_t start = nfsp_act_now_ms();
++	for (;;) {
++		int value = nfsp_cg_event(dir, key);
++		if (value == want)
++			return 1;
++		if (value < 0 || nfsp_act_now_ms() - start > timeout_ms)
++			return 0;
++		usleep(1000);
++	}
++}
++
++// Program process, before anything else: join the program's cgroup and make
++// it the root of a new cgroup namespace.
++static int nfsp_cg_join(int dir)
++{
++	return nfsp_cg_write(dir, "cgroup.procs", "0") && !unshare(NFSP_CLONE_NEWCGROUP);
++}
++
++// Parent: freeze every task of the program.  1 once all are frozen; a task
++// still in a syscall freezes only when that syscall returns.
++static int nfsp_cg_freeze(int dir, uint64_t timeout_ms)
++{
++	return nfsp_cg_write(dir, "cgroup.freeze", "1") && nfsp_cg_wait(dir, "frozen", 1, timeout_ms);
++}
++
++// Parent: kill every task of the program and wait until the cgroup is empty,
++// then thaw it for the next program.  0 while a task may still run.
++static int nfsp_cg_empty(int dir, uint64_t timeout_ms)
++{
++	if (!nfsp_cg_write(dir, "cgroup.kill", "1") || !nfsp_cg_wait(dir, "populated", 0, timeout_ms))
++		return 0;
++	return nfsp_cg_write(dir, "cgroup.freeze", "0");
++}
++
 +#endif // NFS_PROXY_ACTIVATION_H
 diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
 new file mode 100644
-index 000000000..403288c0e
+index 000000000..eecaf0060
 --- /dev/null
 +++ b/executor/nfs_proxy_activation_test.go
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,191 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -1216,18 +1378,19 @@ index 000000000..403288c0e
 +	lane := nfspSection(t, "common_linux.h", "static void setup_nfs_fuzz_lane(", "\n}\n")
 +	nfspRequireOrder(t, "setup_nfs_fuzz_lane", lane,
 +		"NFS fuzz lane marker mismatch",
-+		"nfsp_setup_activation(source);",
++		"nfsp_setup_activation(source, newroot);",
 +	)
 +	body := nfspSection(t, "common_linux.h", "static void sandbox_common_mount_tmpfs(void)", "\n}\n")
 +	nfspRequireOrder(t, "sandbox_common_mount_tmpfs", body,
 +		`setup_nfs_fuzz_lane("./syz-tmp/newroot");`,
 +		`chroot("./newroot")`,
 +	)
-+	setup := nfspSection(t, "executor.cc", "static void nfsp_setup_activation(const char* lane_source)\n{", "\n}\n")
++	setup := nfspSection(t, "executor.cc", "static void nfsp_setup_activation(const char* lane_source, const char* newroot)\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_setup_activation", setup,
 +		"SOCK_SEQPACKET | SOCK_CLOEXEC",
 +		"dup3(fd, kNfspActivationFd, O_CLOEXEC)",
 +		"nfsp_endpoint.fd = kNfspActivationFd;",
++		"nfsp_setup_cgroup(newroot);",
 +		"nfsp_target_mode = true;",
 +	)
 +	// Machine-check probes come without remote coverage; they must not be
@@ -1252,6 +1415,8 @@ index 000000000..403288c0e
 +	)
 +	child := nfspSection(t, "executor.cc", "static void nfsp_broker_child()\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_broker_child", child,
++		"nfsp_cg_join(kNfspCgroupFd)",
++		"close(kNfspCgroupFd);",
 +		"close(kNfspActivationFd);",
 +		"close(nfsp_broker_state.fd);",
 +	)
@@ -1264,7 +1429,8 @@ index 000000000..403288c0e
 +	// process is gone, not by the program process.
 +	end := nfspSection(t, "executor.cc", "static void nfsp_broker_end()\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_broker_end", end,
-+		"nfsp_broker_finish(&nfsp_endpoint, &nfsp_broker_state);",
++		"nfsp_cg_empty(kNfspCgroupFd",
++		"nfsp_broker_finish(&nfsp_endpoint, &nfsp_broker_state, gone);",
 +		"output_data->nfsp = nfsp_broker_state.b;",
 +	)
 +}
@@ -1281,32 +1447,39 @@ index 000000000..403288c0e
 +}
 +
 +// DONE comes over a pair that fuzzed syscalls can write to, so it is only a
-+// request: the fork server stops the program process before it closes the
-+// window, ends the KCOV generation and publishes, and then kills it.  Nothing
-+// of the program runs after its window.
++// request: the fork server freezes the program's cgroup, ends the KCOV
++// generation and publishes, kills the program, and closes the window only once
++// the cgroup is empty.  Nothing of the program runs after its window, not even
++// the teardown of its descriptors.
 +func TestNfsProxyForkServerEndsTheProgram(t *testing.T) {
 +	loop := nfspSection(t, "common.h", "nfsp_broker_wait(10);", "reply_execute(0);")
 +	nfspRequireOrder(t, "loop", loop,
 +		"if (nfsp_broker_state.done) {",
-+		"if (!nfsp_broker_end_program(pid, &status))",
++		"nfsp_broker_end_program();",
 +		"kill_and_wait(pid, &status);",
 +		"nfsp_broker_end();",
 +		"!nfsp_broker_kcov_resolved()",
 +	)
-+	end := nfspSection(t, "executor.cc", "static bool nfsp_broker_end_program(int pid, int* status)\n{", "\n}\n")
++	end := nfspSection(t, "executor.cc", "static void nfsp_broker_end_program()\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_broker_end_program", end,
-+		"nfsp_stop_program(pid, status);",
-+		"if (stopped != 0) {",
-+		"nfsp_act_release(&nfsp_endpoint, &k->b);",
++		"nfsp_cg_freeze(kNfspCgroupFd",
++		"if (frozen && k->done_valid)",
 +		"cover_finish_remote_generation(generation",
 +		"write_extra_output();",
 +	)
-+	stop := nfspSection(t, "executor.cc", "static int nfsp_stop_program(int pid, int* status)\n{", "\n}\n")
-+	nfspRequireOrder(t, "nfsp_stop_program", stop,
-+		"kill(-pid, SIGSTOP);",
-+		"kill(pid, SIGSTOP);",
-+		"WNOHANG | WUNTRACED | __WALL",
-+		"WIFSTOPPED(*status)",
++	if bytes.Contains(end, []byte("nfsp_act_release")) {
++		t.Fatal("nfsp_broker_end_program must leave the window open")
++	}
++	finish := nfspSection(t, "nfs_proxy_activation.h", "static void nfsp_broker_finish(", "\n}\n")
++	nfspRequireOrder(t, "nfsp_broker_finish", finish,
++		"if (gone)",
++		"nfsp_act_release(ep, &k->b);",
++		"if (k->violation || !gone)",
++	)
++	setup := nfspSection(t, "common_linux.h", "static void setup_cgroups_loop()", "\n}\n")
++	nfspRequireOrder(t, "setup_cgroups_loop", setup,
++		"if (!nfsp_target_mode)",
++		`write_file(file, "%d", pid);`,
 +	)
 +	done := nfspSection(t, "executor.cc", "static NORETURN void nfsp_program_done(bool valid)\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_program_done", done,
@@ -1320,14 +1493,19 @@ index 000000000..403288c0e
 +	}
 +}
 diff --git a/executor/test.h b/executor/test.h
-index 437bf01d9..1a6de2f62 100644
+index 437bf01d9..db2ff54de 100644
 --- a/executor/test.h
 +++ b/executor/test.h
-@@ -414,6 +414,328 @@ static int test_get_last_opt()
+@@ -414,6 +414,395 @@ static int test_get_last_opt()
  	return 0;
  }
  
 +#if GOOS_linux
++#include <signal.h>
++#include <sys/syscall.h>
++#include <sys/wait.h>
++#include <time.h>
++
 +// NFS proxy activation barrier (nfs_proxy_activation.h) against a test double
 +// of the proxy endpoint.  The real proxy is exercised by the knfsd-syzkaller
 +// host tests; these cover the executor's handling of every answer.
@@ -1497,7 +1675,7 @@ index 437bf01d9..1a6de2f62 100644
 +// runs the barrier on the endpoint.  Messages the program process sends are
 +// written by hand on the program's end of the pair.  DONE is only a request:
 +// the broker answers nothing and closes the window later (here, at finish;
-+// in the executor, after it stopped the program process).
++// in the executor, once the program cgroup is empty).
 +static bool nfsp_test_send(int fd, uint32 op, uint64 generation)
 +{
 +	nfsp_broker_msg m = {op, 0, generation};
@@ -1526,6 +1704,7 @@ index 437bf01d9..1a6de2f62 100644
 +		int want_answers;
 +		uint32 want_activation;
 +		uint32 want_lease;
++		bool left; // a task of the program is still alive at finish
 +	} cases[] = {
 +	    {"activate and done", {{ACT, 42}, {DONE, 1}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_CLEAR},
 +	    {"no KCOV generation: skipped, proxy not asked", {{ACT, 0}}, false, {}, 0, 1, NFSP_ACT_BARRIER_REFUSED, NFSP_ACT_LEASE_CLEAR},
@@ -1534,6 +1713,7 @@ index 437bf01d9..1a6de2f62 100644
 +	    {"second ACTIVATE", {{ACT, 42}, {ACT, 43}}, false, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_UNCLEARED},
 +	    {"DONE before ACTIVATE", {{DONE, 0}}, false, {}, 0, 0, NFSP_ACT_BARRIER_NONE, NFSP_ACT_LEASE_UNCLEARED},
 +	    {"program died in its window", {{ACT, 42}}, true, {{act, ack, false}, {deact, ack, false}}, 2, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_CLEAR},
++	    {"a task is left: the window stays open", {{ACT, 42}, {DONE, 1}}, false, {{act, ack, false}}, 1, 2, NFSP_ACT_BARRIER_ACKED, NFSP_ACT_LEASE_UNCLEARED, true},
 +	};
 +	static uint8 program[] = "exec-encoded program bytes";
 +	nfsp_act_endpoint ep = {-1, {}, 50};
@@ -1566,7 +1746,7 @@ index 437bf01d9..1a6de2f62 100644
 +		}
 +		if (c.program_exits)
 +			close(pair[1]);
-+		nfsp_broker_finish(&ep, &k);
++		nfsp_broker_finish(&ep, &k, !c.left);
 +		if (!c.program_exits)
 +			close(pair[1]);
 +		close(proxy_sv[0]);
@@ -1591,68 +1771,128 @@ index 437bf01d9..1a6de2f62 100644
 +	return ret;
 +}
 +
-+// A program process that sends DONE early (as a fuzzed syscall can) and keeps
-+// running: the fork server stops it on DONE, so it makes no progress after
-+// that, and nfsp_stop_program() reports a process that exited instead.
-+static int test_nfsp_stop()
++// A fresh cgroup v2 directory for test_nfsp_cgroup, and its parent in *root.
++// -1 without a writable cgroup v2 hierarchy (not root, or cgroup v1 only).
++static int nfsp_test_cgroup(int* root, char* name, size_t size)
 +{
-+	syscall_timeout_ms = 50;
++	const char* roots[] = {"/sys/fs/cgroup/unified", "/sys/fs/cgroup"};
++	snprintf(name, size, "syz-nfsp-test.%d", getpid());
++	for (size_t i = 0; i < ARRAY_SIZE(roots); i++) {
++		*root = open(roots[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++		if (*root == -1)
++			continue;
++		if (!mkdirat(*root, name, 0700)) {
++			int dir = openat(*root, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++			if (dir != -1 && !faccessat(dir, "cgroup.kill", W_OK, 0))
++				return dir;
++			if (dir != -1)
++				close(dir);
++			unlinkat(*root, name, AT_REMOVEDIR);
++		}
++		close(*root);
++	}
++	return -1;
++}
++
++// Whether the cgroup v2 hierarchy is mounted with nsdelegate (systemd does),
++// which makes a cgroup namespace root a boundary for moving tasks.
++static bool nfsp_test_nsdelegate()
++{
++	FILE* f = fopen("/proc/self/mountinfo", "r");
++	if (!f)
++		return false;
++	char line[512];
++	bool found = false;
++	while (!found && fgets(line, sizeof(line), f))
++		found = strstr(line, " - cgroup2 ") && strstr(line, "nsdelegate");
++	fclose(f);
++	return found;
++}
++
++// What a fuzzed program can do to outlive DONE: re-arm itself with a periodic
++// SIGCONT, run a helper in its own session, and (with nsdelegate) move itself
++// out of its cgroup.  The program cgroup's freeze holds through SIGCONT, its
++// kill reaches the helper, and the move is refused.
++static int test_nfsp_cgroup()
++{
++	char name[64];
++	int root = -1;
++	int dir = nfsp_test_cgroup(&root, name, sizeof(name));
++	if (dir == -1) {
++		printf("no writable cgroup v2 hierarchy\n");
++		return -1;
++	}
++	// progress[0]: the program, [1]: its helper, [2]: 1 if the move out was refused.
 +	volatile uint64* progress = (volatile uint64*)mmap(NULL, SYZ_PAGE_SIZE, PROT_READ | PROT_WRITE,
 +							   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 +	if (progress == MAP_FAILED) {
 +		printf("mmap failed\n");
 +		return 1;
 +	}
-+	for (int exits = 0; exits < 2; exits++) {
-+		int pair[2];
-+		if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair)) {
-+			printf("socketpair failed\n");
-+			return 1;
-+		}
-+		*progress = 0;
-+		int pid = fork();
-+		if (pid == 0) {
-+			setpgid(0, 0);
-+			nfsp_test_send(pair[1], NFSP_BROKER_DONE, 1);
-+			if (exits)
-+				doexit(0);
-+			// Keep issuing syscalls, as the rest of a program would.
++	bool nsdelegate = nfsp_test_nsdelegate();
++	int pid = fork();
++	if (pid == 0) {
++		if (!nfsp_cg_join(dir))
++			doexit(1);
++		close(dir);
++		progress[2] = !nsdelegate || !nfsp_cg_write(root, "cgroup.procs", "0");
++		close(root);
++		struct sigevent sev = {};
++		sev.sigev_notify = SIGEV_SIGNAL;
++		sev.sigev_signo = SIGCONT;
++		int timer = 0;
++		struct itimerspec every_ms = {{0, 1000000}, {0, 1000000}};
++		if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &sev, &timer) ||
++		    syscall(SYS_timer_settime, timer, 0, &every_ms, NULL))
++			doexit(1);
++		if (fork() == 0) {
++			setsid();
 +			for (;;) {
 +				getppid();
-+				(*progress)++;
++				progress[1]++;
 +			}
 +		}
-+		close(pair[1]);
-+		nfsp_broker k;
-+		nfsp_broker_start(&k, pair[0], NULL, 0);
-+		k.b.executed = 1; // ACTIVATE was ACKed
-+		nfsp_act_endpoint ep = {-1, {}, 50};
-+		while (!k.done)
-+			nfsp_broker_serve(&ep, &k, 10);
-+		int status = 0;
-+		int stopped = nfsp_stop_program(pid, &status);
-+		uint64 at_stop = *progress;
-+		usleep(50 * 1000);
-+		uint64 later = *progress;
-+		if (stopped != 1) {
-+			kill(pid, SIGKILL);
-+			waitpid(pid, &status, __WALL);
-+		}
-+		close(pair[0]);
-+		if (exits ? stopped != 1 : (stopped != 0 || later != at_stop)) {
-+			printf("exits=%d: stopped=%d progress %llu -> %llu\n", exits, stopped, at_stop, later);
-+			return 1;
++		for (;;) {
++			getppid();
++			progress[0]++;
 +		}
 +	}
++	int ret = 0;
++	for (int i = 0; i < 1000 && !(progress[0] && progress[1]); i++)
++		usleep(1000);
++	bool frozen = nfsp_cg_freeze(dir, 1000);
++	uint64 program = progress[0], helper = progress[1];
++	usleep(50 * 1000);
++	if (!frozen || progress[0] != program || progress[1] != helper) {
++		printf("freeze: frozen=%d program %llu -> %llu helper %llu -> %llu\n", frozen, program,
++		       (uint64)progress[0], helper, (uint64)progress[1]);
++		ret = 1;
++	}
++	bool empty = nfsp_cg_empty(dir, 1000);
++	int status = 0;
++	kill(pid, SIGKILL);
++	waitpid(pid, &status, __WALL);
++	helper = progress[1];
++	usleep(20 * 1000);
++	if (!empty || progress[1] != helper || nfsp_cg_event(dir, "frozen") != 0 || progress[2] != 1) {
++		printf("kill: empty=%d helper %llu -> %llu frozen=%d move refused=%llu nsdelegate=%d\n", empty,
++		       helper, (uint64)progress[1], nfsp_cg_event(dir, "frozen"), (uint64)progress[2], nsdelegate);
++		ret = 1;
++	}
++	if (!nsdelegate)
++		printf("no nsdelegate: moving out of the program cgroup is not tested\n");
++	close(dir);
++	unlinkat(root, name, AT_REMOVEDIR);
++	close(root);
 +	munmap((void*)progress, SYZ_PAGE_SIZE);
-+	return 0;
++	return ret;
 +}
 +#endif
 +
  static struct {
  	const char* name;
  	int (*f)();
-@@ -430,6 +752,12 @@ static struct {
+@@ -430,6 +819,12 @@ static struct {
      {"test_cover_filter", test_cover_filter},
      {"test_glob", test_glob},
      {"test_get_last_opt", test_get_last_opt},
@@ -1660,7 +1900,7 @@ index 437bf01d9..1a6de2f62 100644
 +    {"test_nfsp_sha256", test_nfsp_sha256},
 +    {"test_nfsp_barrier", test_nfsp_barrier},
 +    {"test_nfsp_broker", test_nfsp_broker},
-+    {"test_nfsp_stop", test_nfsp_stop},
++    {"test_nfsp_cgroup", test_nfsp_cgroup},
 +#endif
  };
  
