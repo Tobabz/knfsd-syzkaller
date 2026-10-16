@@ -235,11 +235,68 @@ format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.
   configuration may lower these or raise either lifetime ids or pending tickets to 4096, with
   `max_draining <= max_generations`. Exhaustion refuses the operation rather than recycling a
   generation or ticket id.
-- This remains component-only. `main`/`proxy` do not install rule sets, call the activation
-  component or expose rebuilt target bytes. The isolated Runner/executor endpoint and barrier
-  protocol remain S1a; durable host `RULESET`, `GENERATION_OPEN`, `GENERATION_DRAINING`,
-  `EXPOSURE_INTENT` and `GENERATION_COMPLETE` handling remain M5/S1b. The test gate does not
-  satisfy any of those durability requirements.
+- On its own the test gate satisfies none of the durability requirements. Target mode (next
+  section) replaces it with the host sink and connects these components to `main`/`proxy`.
+
+## Target mode: semantic Delta journal and live rules (M5)
+
+[06 §28](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+encodings in [05 §45](../../docs/design/03-nfs-proxy/05-mutation-delta-replay.md).
+
+```sh
+nfs-proxy CLIENT0 CLIENT1 K_LISTEN G_LISTEN K_BACKEND G_BACKEND \
+    --target RULES.nfsprul1 --session-id ps-1 --journal /dev/virtio-ports/nfsp-journal \
+    --lane 0 --activation /run/nfs-proxy/activation.sock [--drain-bound-ms 5000]
+```
+
+- `--target` installs one NFSPRUL1 rule set for the whole session and sends it as `RULESET`, the
+  session's first journal event. `--control`, `--replay` and `--semantic` cannot be combined with it.
+- `--journal` is the host channel: a virtio-serial port in a guest, or a Unix stream socket on the
+  host (tests). `src/journal.c` sends one event at a time and waits for the host's answer.
+- `--activation` is the executor's SOCK_SEQPACKET endpoint (wire format in `src/target.h`). An
+  activate or deactivate request is answered only after the host stored `GENERATION_OPEN` or
+  `GENERATION_DRAINING`. Keep the path out of reach of fuzzed programs.
+- Mutated bytes leave only after the host stored their `EXPOSURE_INTENT`; a refused or lost intent
+  sends the original record. The first hard refusal per generation and rule is stored as
+  `APPLY_REFUSAL` before the refused record moves, and without a host answer it never moves.
+- A held record stops only its own connection and direction. The final stats line starts with
+  `target ruleset=...`, followed by a `journal ...` line.
+- On exit the Proxy first settles every answer still owed and the events they queue, then sends
+  `RUN_COMPLETE` last, and only when the session ended cleanly (every event ACKed, no event left
+  unrecorded, no evidence-path failure, every opened generation summarized, every batch terminal).
+  The sink also refuses `RUN_COMPLETE` (`session_dirty`) for a session with any recorded rejection. Otherwise the stats say `run_complete=skipped` and
+  the Runner ends the session.
+
+The host side is `agent_pipeline/journal_sink.py`:
+
+```sh
+python -m agent_pipeline.journal_sink --dir JOURNAL_DIR --name lane0 \
+    --socket /run/knfsd-syzkaller/nfsp-journal.sock --vm vm-0 --channel nfsp-journal \
+    --session ps-1 --lane 0 --rules RULES.nfsprul1
+```
+
+Run the same command again after a restart: it resumes the recovered session (and re-answers a
+retransmitted event without storing it twice), and refuses to start if the binding, lane or rule
+set differ.
+
+`tests/agent_pipeline/test_journal_live.py` runs the built Proxy (with ASan when the compiler has
+it) against this sink on loopback; `tools/nfs-proxy/build.sh` covers `test_journal` and the relay
+hold hooks in `test_proxy`.
+
+**KVM step (run by hand on a KVM host; not covered by CI).** Attach the guest port to the sink's
+socket, start the sink before the VM, then run the Proxy in the guest with `--journal
+/dev/virtio-ports/nfsp-journal`:
+
+```sh
+qemu-system-x86_64 ... \
+    -device virtio-serial-pci,id=vser0 \
+    -chardev socket,id=nfspj,path=/run/knfsd-syzkaller/nfsp-journal.sock,reconnect-ms=1000 \
+    -device virtserialport,bus=vser0.0,chardev=nfspj,name=nfsp-journal
+```
+
+(QEMU older than 9.2 spells the option `reconnect=1`.) The guest Proxy binary from
+`build-guest.sh` includes target mode. Nothing drives `--activation` from syzkaller yet: the
+executor barrier is S1a, a separate syzkaller patch.
 
 ## Building
 

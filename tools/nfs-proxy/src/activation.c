@@ -939,6 +939,22 @@ static void sort_snapshots(struct nfsp_activation_generation_snapshot *items,
 }
 
 enum nfsp_activation_result
+nfsp_activation_get_generation(
+	const struct nfsp_activation *a, uint64_t generation,
+	struct nfsp_activation_generation_snapshot *snapshot)
+{
+	int32_t index;
+
+	if (!a || !a->generations || !snapshot || generation == 0)
+		return NFSP_ACTIVATION_INVALID_ARGUMENT;
+	index = find_generation(a, generation);
+	if (index < 0)
+		return NFSP_ACTIVATION_UNKNOWN_GENERATION;
+	copy_generation_snapshot(snapshot, &a->generations[index]);
+	return NFSP_ACTIVATION_OK;
+}
+
+enum nfsp_activation_result
 nfsp_activation_get_snapshot(
 	const struct nfsp_activation *a,
 	struct nfsp_activation_snapshot *snapshot,

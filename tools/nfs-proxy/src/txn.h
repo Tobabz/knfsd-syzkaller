@@ -206,6 +206,19 @@ void nfsp_txn_dispatch(const struct nfsp_txn_entry *e,
  * awaiting ones counted as expired(connection_closed).  Its connection_id
  * is never seen again, so nothing of it is kept. */
 void nfsp_txn_connection_closed(struct nfsp_txn *t, uint64_t connection_id);
+/* The same, and `dropped` (when not NULL) sees the activation_generation of
+ * every entry still outstanding, so a generation's reply debt can be
+ * settled as connection_closed rather than resolved. */
+void nfsp_txn_connection_closed_cb(struct nfsp_txn *t, uint64_t connection_id,
+				   void (*dropped)(uint64_t generation,
+						   void *arg),
+				   void *arg);
+
+/* Record what the peer was given for the CALL on `key` once that is known
+ * (target mode forwards a CALL only after its journal answer).  0, or -1
+ * when the key has no entry. */
+int nfsp_txn_mark_forwarded(struct nfsp_txn *t, const struct nfsp_txn_key *key,
+			    enum nfsp_txn_forwarded forwarded);
 
 /* Expire outstanding entries older than the timeout and drop ended ones
  * older than the retention. */

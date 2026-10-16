@@ -941,7 +941,8 @@ adapter), M4d(activation 창과 generation 단계, sink는 test double) componen
 `src/resolver.*`와 `src/mutation_apply.*`는 같은 snapshot에서 resolve한 batch를 한 번에 rebuild한다.
 `src/activation.*`는 test gate 뒤에서 CALL admission, draining REPLY와 closure facts를 관리한다. 이는
 host durability를 증명하지 않는다. 실제 설치 endpoint와 executor barrier(S1a), `RULESET`과
-`EXPOSURE_INTENT` 기록(M5/S1b), `main`/`proxy` live target-mode 연결은 아직 없다.
+`EXPOSURE_INTENT` 기록(M5/S1b), `main`/`proxy` live target-mode 연결은 아직 없다. (M5에서 Proxy 쪽
+activation endpoint, host sink와 live target mode가 생겼다. §28 구현 상태를 본다.)
 
 ### 28. M5 — Semantic Delta journal / relay completion
 
@@ -966,6 +967,36 @@ Required:
 
 M5 gate는 M4/S1a component와 실제 S1b sink를 묶은 live target-mode 실행을 포함한다(§27). 이 gate에서 처음으로
 target rule 설치, activation, mutated output 노출을 host durability와 함께 검증한다.
+
+구현 상태: M5는 Proxy와 host sink 사이를 host에서 끝까지 연결했다.
+
+- `agent_pipeline/journal_sink.py`: Runner 소유 sink. §6 scope table admission, append 뒤 ACK, 거부 record,
+  재전송 re-ACK, restart 재검증, torn tail 보존, 저장 한도, `ChannelServer`(QEMU chardev가 붙는 Unix
+  socket)와 `python -m agent_pipeline.journal_sink` 실행 entry. encoding은 `05` §45 "M5 구현 (v1)".
+- `src/journal.c`: guest Delta Recorder transport. event 하나씩 `event_seq` 순서, ACK 정확 대조, 재전송,
+  channel 실패 시 LOST.
+- `src/proxy.c`: target-mode relay hook. record를 HOLD하면 같은 connection·direction만 멈추고 나머지는 계속
+  relay한다. forward한 bytes마다 completion token을 queue에 달아 전부 쓰였을 때 또는 쓰이지 못했을 때 한 번
+  보고한다. 닫힌 connection의 held record는 dropped로 보고한다.
+- `src/target.c`, `main --target`: RULESET을 첫 event로 보내고, activation endpoint(SOCK_SEQPACKET,
+  `target.h`) 요청을 `GENERATION_OPEN`/`GENERATION_DRAINING` host ACK 뒤에만 ACK한다. 창 안 record를
+  resolve·apply하고, `EXPOSURE_INTENT` ACK 뒤에만 mutated bytes를 내보내며, 거부·유실이면 원본을 보낸다.
+  (generation, rule)별 첫 hard refusal은 `APPLY_REFUSAL`로 먼저 쓰고 host 답 뒤에만 record를 보낸다(답이
+  없으면 보내지 않는다). `FORWARD_COMPLETE`/`FORWARD_FAILED`, drain bound 뒤 강제 closure,
+  `GENERATION_COMPLETE`, 종료 시 `RUN_COMPLETE`를 보낸다.
+- 검증: `test_journal`, `test_proxy`(hold/completion/dropped), sink unit test,
+  `tests/agent_pipeline/test_journal_live.py`(빌드한 Proxy를 ASan으로 띄워 실제 sink와 붙인 e2e: mutation이
+  `EXPOSURE_INTENT` 저장 뒤에만 peer에 도달, conflict refusal write-ahead, 기록 실패 시 원본 전달, refusal
+  미기록 시 미전달, 잘못된 lane의 activation 미ACK, drain bound closure).
+
+남은 것:
+- S1a: syzkaller executor가 activation endpoint를 쓰는 patch(barrier 실패 처리, exec result 보고 포함)는
+  없다. e2e는 executor 대신 test driver가 endpoint를 쓴다.
+- KVM gate: guest에서 virtio-serial로 실제 sink에 붙여 knfsd/Ganesha 트래픽에 돌리는 live 실행은 사람이
+  KVM host에서 한다(`tools/nfs-proxy/README.md` "Target mode").
+- Runner의 generation 봉인과 M1 판정 연결, `EXPOSURE_INTENT`의 `predicate_values`/`transform_source_values`
+  기록, `GENERATION_COMPLETE`의 `outside_activation_window`를 generation별로 나누는 일(지금은 session
+  누적 값).
 
 ### 29. M6 — Semantic Replay / ReplayResult
 

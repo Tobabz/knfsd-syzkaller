@@ -73,7 +73,8 @@ int nfsp_semantic_record(const struct nfsp_rpc_record *r, void *arg)
 
 		key.call_direction = r->direction;
 		ev.txn = nfsp_txn_call(&s->txn, &key, rpc.prog, rpc.vers,
-				       rpc.proc, rpc.cred.flavor, 0,
+				       rpc.proc, rpc.cred.flavor,
+				       s->call_generation,
 				       s->forwarded, r->rpc_payload,
 				       r->rpc_payload_len, now, &e);
 		ev.entry = e;
@@ -128,7 +129,8 @@ void nfsp_semantic_connection(const struct nfsp_connection_ref *conn,
 		s->stats.connections_opened++;
 	} else {
 		s->stats.connections_closed++;
-		nfsp_txn_connection_closed(&s->txn, conn->connection_id);
+		nfsp_txn_connection_closed_cb(&s->txn, conn->connection_id,
+					      s->on_dropped, s->on_dropped_arg);
 	}
 }
 
