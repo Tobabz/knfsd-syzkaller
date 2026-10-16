@@ -449,3 +449,69 @@ def test_resolved_gap_issue_resumes_the_blocked_job(tmp_path, build):
         assert service.run(stopped(service, job_id), interval_s=0.05,
                            timeout_s=60)
         assert service.job(job_id).state is JobState.S1_REACHED
+
+
+def _fail_once(obj, name, error=OSError("synthetic transient failure")):
+    real = getattr(obj, name)
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise error
+        return real(*args, **kwargs)
+
+    setattr(obj, name, flaky)
+    return calls
+
+
+def test_issue_event_retry_does_not_reach_jobs_of_a_later_issue(
+        tmp_path, build):
+    with make_service(tmp_path, build, registry=InMemoryRegistry()) as service:
+        a = submit(service, build)
+        [issue] = service.issues.issues()
+        service.issues.change(issue["issue"], "wont_fix", "out of scope")
+        _fail_once(service.issues, "mark_delivered")
+        assert service.deliver_issue_events() != []
+        assert service.job(a).state is JobState.CLOSED_UNSUPPORTED
+        # The gap returns for another job: a new issue, still open.
+        b = submit(service, build)
+        assert service.job(b).state is JobState.BLOCKED_HARNESS_GAP
+        assert [i["jobs"] for i in service.issues.issues()] == [[a], [b]]
+        assert service.deliver_issue_events() == []
+        assert service.job(b).state is JobState.BLOCKED_HARNESS_GAP
+        assert service.issues.pending_events() == []
+
+
+def test_failed_issue_event_is_not_overtaken_by_a_later_one(tmp_path, build):
+    with make_service(tmp_path, build, registry=InMemoryRegistry()) as service:
+        job_id = submit(service, build)
+        [issue] = service.issues.issues()
+        service.issues.change(issue["issue"], "deferred")
+        service.issues.change(issue["issue"], "reopened")
+        _fail_once(service.controller, "on_issue")
+        assert len(service.deliver_issue_events()) == 1
+        assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
+        assert [e[2] for e in service.issues.pending_events()] == [
+            "deferred", "reopened"]
+        assert service.deliver_issue_events() == []
+        assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
+        assert [t.reason for t in service.store.transitions(job_id)][-2:] == [
+            "issue_deferred", "issue_reopened"]
+
+
+def test_recover_applies_an_issue_event_stored_before_restart(tmp_path, build):
+    ids = Ids()
+    registry = InMemoryRegistry()
+    with make_service(tmp_path, build, ids=ids, registry=registry,
+                      run_agents=False) as once:
+        job_id = submit(once, build)
+        [issue] = once.issues.issues()
+        # Stored, then the command stops before delivering it.
+        once.issues.change(issue["issue"], "resolved", "harness built")
+    registry.put(build.binding)
+    with make_service(tmp_path, build, ids=ids, registry=registry) as service:
+        service.recover()
+        assert service.recover_errors == []
+        assert service.issues.pending_events() == []
+        assert service.job(job_id).state is JobState.S1_ANALYSIS

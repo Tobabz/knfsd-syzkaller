@@ -155,6 +155,7 @@ class Stage1Service:
                                    worker_id=parts.worker_id)
         self.worker_runs: list[WorkerRun] = []
         self.worker_errors: list[str] = []
+        self.recover_errors: list[str] = []
         self._stop = threading.Event()
         self._worker_thread: threading.Thread | None = None
 
@@ -163,7 +164,11 @@ class Stage1Service:
     def recover(self) -> list[EffectFailure]:
         """After a restart: settle cancels, re-attach Runner tasks and send
         a new attempt of any Agent task that was in flight (09 §8)."""
-        return self.controller.recover()
+        failures = self.controller.recover()
+        # An issue change stored before the restart is applied before the
+        # caller looks at job states.
+        self.recover_errors = self.deliver_issue_events()
+        return failures
 
     def start_worker(self, *, idle_s: float = 0.5) -> None:
         if self._worker_thread is not None:
@@ -201,20 +206,24 @@ class Stage1Service:
     def deliver_issue_events(self) -> list[str]:
         """Pass recorded issue status changes to the Controller (07 §7).
 
-        A change recorded by another process (``resolve-issue``) reaches
-        the jobs linked to its gap here; it is marked delivered only after
-        the Controller applied it."""
+        Events go in recording order, each only to the jobs linked to its
+        issue when it was recorded.  A delivery is recorded after the
+        Controller applied it.  The first failure stops this pass, so a
+        later event never overtakes an earlier one; the next call resumes
+        with the failed delivery."""
         pending = getattr(self.issues, "pending_events", None)
         if pending is None:
             return []
-        errors = []
-        for event_id, gap, status, resolution in pending():
-            try:
-                self.controller.on_issue(gap, status, resolution)
-                self.issues.mark_delivered(event_id)
-            except Exception as exc:
-                errors.append(f"issue {status}: {type(exc).__name__}: {exc}")
-        return errors
+        for event_id, gap, status, resolution, job_ids in pending():
+            for job_id in job_ids:
+                try:
+                    self.controller.on_issue(gap, status, resolution,
+                                             job_ids={job_id})
+                    self.issues.mark_delivered(event_id, job_id)
+                except Exception as exc:
+                    return [f"issue {status} for {job_id}: "
+                            f"{type(exc).__name__}: {exc}"]
+        return []
 
     def run(self, until: Callable[[], bool], *, interval_s: float = 1.0,
             timeout_s: float | None = None,

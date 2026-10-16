@@ -1,13 +1,17 @@
 """A restart-safe ``IssueTracker``: one local issue per gap key (07 §3).
 
-Status changes (``change``) are recorded as events.  The service passes
-each undelivered event to ``Controller.on_issue`` and then marks it
-delivered, so a change recorded by a one-shot command reaches a running
-service, and one recorded before a crash is applied after restart.
+Status changes (``change``) are recorded as events.  Each event targets
+the jobs linked to its issue when it was recorded, never jobs that wait on
+the same gap under a later issue.  The service applies events in order,
+one job at a time, and records each (event, job) delivery after the
+Controller applied it, so a change recorded by a one-shot command reaches
+a running service, and one recorded before a crash is applied after
+restart.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -52,7 +56,10 @@ class SqliteIssueTracker:
                 n INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 resolution TEXT NOT NULL,
-                delivered INTEGER NOT NULL DEFAULT 0);
+                targets TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS issue_deliveries (
+                event_id INTEGER NOT NULL, job_id TEXT NOT NULL,
+                PRIMARY KEY (event_id, job_id));
         """)
 
     def close(self) -> None:
@@ -104,27 +111,42 @@ class SqliteIssueTracker:
                 raise UnknownIssue(issue)
             self._db.execute("UPDATE issues SET status = ? WHERE n = ?",
                              (status if status in CLOSING else "open", n))
+            targets = sorted(r[0] for r in self._db.execute(
+                "SELECT job_id FROM links WHERE n = ?", (n,)))
             self._db.execute(
-                "INSERT INTO issue_events (n, status, resolution) "
-                "VALUES (?, ?, ?)", (n, status, resolution))
+                "INSERT INTO issue_events (n, status, resolution, targets) "
+                "VALUES (?, ?, ?, ?)", (n, status, resolution,
+                                        json.dumps(targets)))
             return row[0]
 
         return GapRef.model_validate_json(self._tx(body))
 
-    def pending_events(self) -> list[tuple[int, GapRef, str, str]]:
+    def pending_events(self) -> list[tuple[int, GapRef, str, str,
+                                           tuple[str, ...]]]:
+        """Events in recording order, each with its target jobs not yet
+        delivered: (event_id, gap, status, resolution, job_ids)."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT e.id, i.gap, e.status, e.resolution FROM issue_events e "
-                "JOIN issues i ON i.n = e.n WHERE e.delivered = 0 "
+                "SELECT e.id, i.gap, e.status, e.resolution, e.targets "
+                "FROM issue_events e JOIN issues i ON i.n = e.n "
                 "ORDER BY e.id").fetchall()
-        return [(row[0], GapRef.model_validate_json(row[1]), row[2], row[3])
-                for row in rows]
+            done = self._db.execute(
+                "SELECT event_id, job_id FROM issue_deliveries").fetchall()
+        delivered = set(done)
+        pending = []
+        for event_id, gap, status, resolution, targets in rows:
+            remaining = tuple(job for job in json.loads(targets)
+                              if (event_id, job) not in delivered)
+            if remaining:
+                pending.append((event_id, GapRef.model_validate_json(gap),
+                                status, resolution, remaining))
+        return pending
 
-    def mark_delivered(self, event_id: int) -> None:
+    def mark_delivered(self, event_id: int, job_id: str) -> None:
         with self._lock:
             self._db.execute(
-                "UPDATE issue_events SET delivered = 1 WHERE id = ?",
-                (event_id,))
+                "INSERT OR IGNORE INTO issue_deliveries VALUES (?, ?)",
+                (event_id, job_id))
 
     def issues(self) -> list[dict]:
         with self._lock:

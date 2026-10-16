@@ -186,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(_job_summary(service, job_id))
         elif args.command == "run":
             service.recover()
+            for err in service.recover_errors:
+                print(f"error: {err}", file=sys.stderr)
             service.start_worker()
             seen: dict[str, str] = {}
 

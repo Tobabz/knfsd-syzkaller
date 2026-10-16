@@ -12,7 +12,7 @@ from __future__ import annotations
 import datetime
 import uuid
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Collection
 
 from pydantic import TypeAdapter
 
@@ -188,10 +188,15 @@ class Controller:
     def deny(self, job_id: str, task_id: str, note: str) -> None:
         self._apply(job_id, ev.ApprovalDenied(task_id=task_id, note=note))
 
-    def on_issue(self, gap: GapRef, status: str, resolution: str = "") -> None:
+    def on_issue(self, gap: GapRef, status: str, resolution: str = "",
+                 job_ids: Collection[str] | None = None) -> None:
+        """Apply an issue status change to the jobs waiting on `gap`, or
+        only to `job_ids` when the caller knows which jobs the issue
+        covers."""
         for job in self.store.jobs({JobState.BLOCKED_HARNESS_GAP,
                                     JobState.PARKED}):
-            if job.gap != gap:
+            if job.gap != gap or (job_ids is not None and
+                                  job.job_id not in job_ids):
                 continue
             out = self._apply(job.job_id, ev.IssueChanged(
                 gap=gap, status=status, resolution=resolution))
