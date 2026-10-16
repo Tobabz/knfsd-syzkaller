@@ -1,0 +1,515 @@
+{
+  "schema_version": "stage1-host-spec.v1",
+  "state_dir": "../stage1-state",
+  "artifact_root": "../stage1-state/cas",
+  "env_dir": "../env",
+  "variant": "kasan",
+  "ssh_key": "../artifacts/bookworm.id_rsa",
+  "syzkaller_bundle": "../syz-bridge/bundle",
+  "guest_kernel_command_line": "root=/dev/sda console=ttyS0 nokaslr nfs.localio_enabled=N",
+  "runtime_selection_capability": "HCAP-04",
+  "capabilities": [
+    {
+      "id": "HCAP-01",
+      "name": "NFS lane filesystem access",
+      "purpose": "Operate the mounted NFS lane through ordinary syscalls",
+      "usable_stage": [
+        "stage1"
+      ],
+      "usable_by": [
+        "agent_stage1"
+      ],
+      "interface": {
+        "syz_calls": [
+          "syz_open_nfs_lane_profile$client0_knfsd_v41",
+          "syz_open_nfs_lane_profile$client1_knfsd_v41",
+          "close",
+          "flock",
+          "fsync",
+          "getdents64",
+          "lseek",
+          "openat",
+          "read",
+          "renameat2",
+          "statx",
+          "unlinkat",
+          "write"
+        ]
+      },
+      "constraints": [
+        "lane client is 0 or 1",
+        "profile open only for profiles the fixture exposes (single: knfsd-<version>)",
+        "filesystem syscalls take a lane fd as their first argument"
+      ],
+      "status": "validated_subset",
+      "scope": [
+        "lane_syscalls",
+        "profile_open"
+      ],
+      "validated_scope": [
+        "lane_syscalls"
+      ],
+      "source_refs": [
+        "bundle/patches/syzkaller/0020-*",
+        "bundle/lane/lane.sh"
+      ]
+    },
+    {
+      "id": "HCAP-03",
+      "name": "remote KCOV lane attribution",
+      "purpose": "Attribute knfsd fs/nfsd and net/sunrpc coverage to the executor proc and lane",
+      "usable_stage": [
+        "stage1",
+        "stage2"
+      ],
+      "usable_by": [
+        "agent_stage1",
+        "agent_stage2"
+      ],
+      "interface": {
+        "runtime_features": [
+          "remote_cover"
+        ]
+      },
+      "constraints": [
+        "Q1 uses generation-attributed remote coverage only",
+        "attributed contexts: request, async_copy, callback_v41"
+      ],
+      "status": "validated",
+      "scope": [
+        "generation"
+      ],
+      "source_refs": [
+        "bundle/patches/kernel/0001-*",
+        "bundle/patches/kernel/0002-*"
+      ]
+    },
+    {
+      "id": "HCAP-04",
+      "name": "lane execution topology",
+      "purpose": "Runtime selections this host executes; one proc on lane 0",
+      "usable_stage": [
+        "stage1"
+      ],
+      "usable_by": [
+        "agent_stage1"
+      ],
+      "interface": {},
+      "constraints": [
+        "nfs.localio_enabled=N",
+        "single fixture, koov.nfs_version from the selection"
+      ],
+      "status": "partially_validated",
+      "scope": [
+        "one_lane"
+      ],
+      "source_refs": [
+        "bundle/lane/boot-fixture.sh"
+      ]
+    }
+  ],
+  "missing_capability_ids": [
+    "remote_kcov.context.client",
+    "remote_kcov.context.transport"
+  ],
+  "admission_source": {
+    "schema_version": "call-admission-source.v1",
+    "target": "linux/amd64",
+    "limits": {
+      "max_program_bytes": 65536,
+      "max_calls_per_program": 128,
+      "max_resources_per_program": 512
+    },
+    "entries": [
+      {
+        "call": "close",
+        "capability_ids": [
+          "HCAP-01"
+        ]
+      },
+      {
+        "call": "flock",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "fsync",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "getdents64",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "lseek",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "openat",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "read",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "renameat2",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "statx",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "syz_open_nfs_lane_profile$client0_knfsd_v41",
+        "capability_ids": [
+          "HCAP-01"
+        ]
+      },
+      {
+        "call": "syz_open_nfs_lane_profile$client1_knfsd_v41",
+        "capability_ids": [
+          "HCAP-01"
+        ]
+      },
+      {
+        "call": "unlinkat",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "write",
+        "capability_ids": [
+          "HCAP-01"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0",
+              "nfs-profile:knfsd-v41:client1"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "runtime_selections": [
+    {
+      "profile": "knfsd-v41",
+      "nfs_version": "4.1",
+      "fixture_mode": "single",
+      "route": "direct",
+      "topology": "one-lane",
+      "enabled_interfaces": [
+        "remote_cover",
+        "syz_open_nfs_lane_profile$client0_knfsd_v41",
+        "syz_open_nfs_lane_profile$client1_knfsd_v41"
+      ],
+      "trace_mode": "off"
+    }
+  ],
+  "neutral_controls": [
+    {
+      "runtime_selection": {
+        "profile": "knfsd-v41",
+        "nfs_version": "4.1",
+        "fixture_mode": "single",
+        "route": "direct",
+        "topology": "one-lane",
+        "enabled_interfaces": [
+          "remote_cover",
+          "syz_open_nfs_lane_profile$client0_knfsd_v41",
+          "syz_open_nfs_lane_profile$client1_knfsd_v41"
+        ],
+        "trace_mode": "off"
+      },
+      "program": "neutral-knfsd-v41.syz",
+      "required_capability_ids": [
+        "HCAP-01"
+      ]
+    }
+  ],
+  "judge_profile": {
+    "name": "knfsd-remote-kcov",
+    "revision": "1",
+    "minimum_remote_start_ok": 1,
+    "allowed_trace_modes": [
+      "off"
+    ],
+    "contexts": [
+      {
+        "context": "async_copy",
+        "window": "generation-plus-drain",
+        "counters": [
+          {
+            "counter": "new_root_rejected_aborted",
+            "max_delta": 0
+          },
+          {
+            "counter": "new_root_rejected_closing",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_generation",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_root",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_token",
+            "max_delta": 0
+          },
+          {
+            "counter": "async_child_rejected",
+            "max_delta": 0
+          },
+          {
+            "counter": "child_token_rejected",
+            "max_delta": 0
+          },
+          {
+            "counter": "deferred_child_rejected",
+            "max_delta": 0
+          }
+        ],
+        "normal_counters": [
+          "lane_owner_failed",
+          "lane_owner_no_generation"
+        ]
+      },
+      {
+        "context": "callback_v41",
+        "window": "generation-plus-drain",
+        "counters": [
+          {
+            "counter": "new_root_rejected_aborted",
+            "max_delta": 0
+          },
+          {
+            "counter": "new_root_rejected_closing",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_generation",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_root",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_token",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_epoch_mismatch",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_lane_unhealthy",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_owner_none",
+            "max_delta": 0
+          }
+        ],
+        "normal_counters": [
+          "lane_owner_failed",
+          "lane_owner_no_generation"
+        ]
+      },
+      {
+        "context": "request",
+        "window": "generation-plus-drain",
+        "counters": [
+          {
+            "counter": "new_root_rejected_aborted",
+            "max_delta": 0
+          },
+          {
+            "counter": "new_root_rejected_closing",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_generation",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_root",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_token",
+            "max_delta": 0
+          }
+        ],
+        "normal_counters": [
+          "lane_owner_failed",
+          "lane_owner_no_generation"
+        ]
+      }
+    ]
+  },
+  "support_boundary": {
+    "name": "knfsd-remote-kcov",
+    "revision": "1",
+    "supported_contexts": [
+      "async_copy",
+      "callback_v41",
+      "request"
+    ]
+  },
+  "policies": [
+    {
+      "policy_id": "kasan-default",
+      "sanitizer": "kasan",
+      "approval_required": false,
+      "stage1_repair_budget": 3,
+      "agent_retry_limit": 3,
+      "runtime_retry_limit": 3,
+      "stage1_agents": {
+        "candidate_analysis": {
+          "provider": "openai",
+          "model": "gpt-5"
+        },
+        "reachability_planning": {
+          "provider": "openai",
+          "model": "gpt-5"
+        }
+      }
+    }
+  ],
+  "engine": {
+    "resource_key": "kvm-lane-0",
+    "timeout_s": 1800
+  },
+  "collector": {
+    "memory_mb": 4096,
+    "cpus": 4,
+    "boot_timeout_s": 300,
+    "grace_s": 11,
+    "drain_s": 10,
+    "exec_timeout_s": 600
+  }
+}

@@ -25,3 +25,7 @@ cache/
 # host with clang and gcc; shipping the binary would hide a build that
 # no longer works from a clean checkout.
 tools/nfs-proxy/build/
+# --- Stage 1 real-run working dirs (agent_pipeline/stage1/host/README.md) ---
+stage1-host/
+stage1-state/
+syz-bridge/
