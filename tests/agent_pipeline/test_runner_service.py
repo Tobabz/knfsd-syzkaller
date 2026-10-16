@@ -690,12 +690,12 @@ def test_unconfirmed_stop_after_settled_expiry_is_kept_for_the_controller(
     run = RunnerWorker(runner, SlowCleanup(), worker_id="w",
                        heartbeat_interval_s=60).run_once()
     assert run.disposition == "not_stopped"
-    assert runner.cleanup_reports() == ("job-1.t1",)
+    assert runner.cleanup_reports() == (("job-1.t1", 1),)
     runner.close()
 
     runner = make_runner(path, clock, duration=10)
-    assert runner.cleanup_reports() == ("job-1.t1",)
-    runner.acknowledge_cleanup_report("job-1.t1")
+    assert runner.cleanup_reports() == (("job-1.t1", 1),)
+    runner.acknowledge_cleanup_report("job-1.t1", 1)
     assert runner.cleanup_reports() == ()
     runner.close()
 
@@ -713,5 +713,5 @@ def test_late_unconfirmed_stop_must_name_its_own_attempt(tmp_path):
         runner.stop_unconfirmed(lease.model_copy(update={"generation": 2}))
     assert runner.cleanup_reports() == ()
     runner.stop_unconfirmed(lease)
-    assert runner.cleanup_reports() == ("job-1.t1",)
+    assert runner.cleanup_reports() == (("job-1.t1", lease.generation),)
     runner.close()

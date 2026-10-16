@@ -375,10 +375,12 @@ class ArtifactHcapChecker:
             if proposal.seed_manifest_ref is not None:
                 self._verify_artifact(proposal.seed_manifest_ref)
         except FileNotFoundError:
-            # An existing seed is a reference the Agent proposed: one that
-            # does not exist is a plan finding.  An inline program was
-            # stored by the executor, so its absence is the host's.
-            if proposal.kind != "seed":
+            # An inline program was stored by the executor, and a seed the
+            # host's trusted manifest lists is a host artifact: their
+            # absence is the host's.  Any other seed reference is one the
+            # Agent proposed, so one that does not exist is a plan finding.
+            if proposal.kind != "seed" or self._trusted_seed(catalog,
+                                                              proposal):
                 raise
             return HcapCheck(violations=("seed_reference_not_found",))
         except OSError:
@@ -420,6 +422,32 @@ class ArtifactHcapChecker:
             if interface not in interfaces:
                 violations.append(f"interface_not_declared:{interface}")
         return HcapCheck(violations=tuple(violations))
+
+    def _trusted_seed(self, catalog: HcapCatalog,
+                      proposal: ProgramProposal) -> bool:
+        """True if the catalog's one NormalFlowSeedManifest is the proposal's
+        and lists its seed_id with exactly its program."""
+        from .materializer import NormalFlowSeedManifest  # import cycle
+
+        trusted = {
+            ref.artifact_ref
+            for ref in (*catalog.authority_refs,
+                        *(ref for capability in catalog.capabilities
+                          for ref in capability.authority_refs))
+            if ref.kind == "NormalFlowSeedManifest"
+        }
+        if trusted != {proposal.seed_manifest_ref}:
+            return False
+        try:
+            manifest = load_record(self.store, proposal.seed_manifest_ref,
+                                   NormalFlowSeedManifest)
+        except OSError:
+            raise
+        except _ARTIFACT_ERRORS:
+            return False
+        return any(seed.seed_id == proposal.seed_id
+                   and seed.program_ref == proposal.artifact_ref
+                   for seed in manifest.seeds)
 
     def check_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
         """Validate a newly submitted Agent plan, including its revision."""

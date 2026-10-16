@@ -513,25 +513,29 @@ class DurableRunner:
                 (task_id, lease.generation, now),
             )
 
-    def cleanup_reports(self) -> tuple[str, ...]:
-        """Tasks with an unacknowledged late ``stop_unconfirmed`` report."""
+    def cleanup_reports(self) -> tuple[tuple[str, int], ...]:
+        """(task_id, generation) of each unacknowledged late
+        ``stop_unconfirmed`` report."""
 
         with self._lock:
             rows = self._db.execute(
-                """SELECT DISTINCT task_id FROM runner_cleanup_reports
-                   WHERE acknowledged_at_ns IS NULL ORDER BY task_id"""
+                """SELECT task_id, generation FROM runner_cleanup_reports
+                   WHERE acknowledged_at_ns IS NULL
+                   ORDER BY task_id, generation"""
             ).fetchall()
-        return tuple(row["task_id"] for row in rows)
+        return tuple((row["task_id"], row["generation"]) for row in rows)
 
-    def acknowledge_cleanup_report(self, task_id: str) -> None:
-        """The Controller recorded the task as not confirmed stopped."""
+    def acknowledge_cleanup_report(self, task_id: str,
+                                   generation: int) -> None:
+        """The Controller recorded this attempt as not confirmed stopped."""
 
         task_id = self._task_id(task_id)
         with self._transaction():
             self._db.execute(
                 """UPDATE runner_cleanup_reports SET acknowledged_at_ns = ?
-                   WHERE task_id = ? AND acknowledged_at_ns IS NULL""",
-                (self._now(), task_id),
+                   WHERE task_id = ? AND generation = ?
+                     AND acknowledged_at_ns IS NULL""",
+                (self._now(), task_id, generation),
             )
 
     def stop_requested(self, lease: WorkLease) -> bool:

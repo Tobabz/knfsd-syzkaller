@@ -45,6 +45,8 @@ attempt (generation, worker, token), not by a live lease: an expired attempt
 still active ends `cleanup_unconfirmed` at once, and one that expiry already
 ended (as `cancelled` or `runner_restart`) is kept in `cleanup_reports()`
 until the Controller records it and calls `acknowledge_cleanup_report()`.
+Reports are identified by (task_id, generation); the Controller applies each
+once, so one re-sent after a failed acknowledgement changes nothing.
 A late result is still never accepted as evidence.
 
 ## Backend fencing requirement

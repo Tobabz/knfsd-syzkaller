@@ -886,3 +886,27 @@ def test_rejection_writes_no_partial_materialized_artifacts(world):
     result = world.materializer.materialize(world.plan_ref, world.binding)
     assert isinstance(result, MaterializeRejected)
     assert artifact_refs(world.store) == before
+
+
+def test_missing_trusted_seed_program_is_a_host_failure(world):
+    """A seed the host's trusted manifest lists is a host artifact: its
+    missing program is retried, not charged to Agent repair.  A seed the
+    manifest does not list is a reference the Agent invented."""
+    checker = ArtifactHcapChecker(world.store)
+    trusted = ProgramProposal(
+        kind="seed", artifact_ref=world.scenario_ref,
+        seed_manifest_ref=world.seed_manifest_ref, seed_id="seed-1")
+    _, ref = plan_ref(world, proposal=trusted)
+    assert checker.check_plan(ref, world.hcap_ref).ok
+    (world.store.root / world.scenario_ref[:2] / world.scenario_ref).unlink()
+    with pytest.raises(FileNotFoundError):
+        checker.check_plan(ref, world.hcap_ref)
+
+    for invented in (
+            trusted.model_copy(update={"seed_id": "seed-unlisted"}),
+            trusted.model_copy(update={"artifact_ref": "f" * 64}),
+            trusted.model_copy(update={"seed_manifest_ref": "e" * 64})):
+        _, ref = plan_ref(world, proposal=invented)
+        check = checker.check_plan(ref, world.hcap_ref)
+        assert check.violations == ("seed_reference_not_found",)
+        assert not check.host_authority
