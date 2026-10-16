@@ -6,7 +6,9 @@ the same gap under a later issue.  The service applies events in order,
 one job at a time, and records each (event, job) delivery after the
 Controller applied it, so a change recorded by a one-shot command reaches
 a running service, and one recorded before a crash is applied after
-restart.
+restart.  The Controller Store, not these delivery records, decides
+whether a job takes an event: it checks the job's current issue and keeps
+the last event each job took in the same transaction as the transition.
 """
 
 from __future__ import annotations
@@ -121,24 +123,25 @@ class SqliteIssueTracker:
 
         return GapRef.model_validate_json(self._tx(body))
 
-    def pending_events(self) -> list[tuple[int, GapRef, str, str,
+    def pending_events(self) -> list[tuple[int, str, GapRef, str, str,
                                            tuple[str, ...]]]:
         """Events in recording order, each with its target jobs not yet
-        delivered: (event_id, gap, status, resolution, job_ids)."""
+        delivered: (event_id, issue, gap, status, resolution, job_ids)."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT e.id, i.gap, e.status, e.resolution, e.targets "
+                "SELECT e.id, e.n, i.gap, e.status, e.resolution, e.targets "
                 "FROM issue_events e JOIN issues i ON i.n = e.n "
                 "ORDER BY e.id").fetchall()
             done = self._db.execute(
                 "SELECT event_id, job_id FROM issue_deliveries").fetchall()
         delivered = set(done)
         pending = []
-        for event_id, gap, status, resolution, targets in rows:
+        for event_id, n, gap, status, resolution, targets in rows:
             remaining = tuple(job for job in json.loads(targets)
                               if (event_id, job) not in delivered)
             if remaining:
-                pending.append((event_id, GapRef.model_validate_json(gap),
+                pending.append((event_id, f"gap-{n}",
+                                GapRef.model_validate_json(gap),
                                 status, resolution, remaining))
         return pending
 

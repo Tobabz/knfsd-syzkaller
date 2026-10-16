@@ -50,7 +50,11 @@ stores Agent results that finish while it closes.
 A job blocked on a harness gap is linked to a local issue (`issues`).
 After fixing the gap, record it with `resolve-issue gap-N resolved`
 (or `deferred`, `reopened`, `wont_fix`); the change is stored and passed
-to the linked jobs by that command and by any running service.
+to the linked jobs by that command and by any running service. A job takes
+a change only while its current wait is linked to that issue, and the
+Controller Store records the last change each job took in the same
+transaction as the transition, so a change delivered twice, by two
+processes at once, or after a later one is ignored.
 
 `stage1.json` is a `config.Stage1Config`. Every value is host authority:
 
@@ -116,6 +120,23 @@ Controller treats as a runtime failure, not a verdict.
 
 When any of these is missing the publication stays pending and the job
 stays in `s1_running`; it continues once the record arrives.
+
+## Real run (follow-up)
+
+This slice is verified with a scripted Agent runtime and a Python host
+command. The first real run is separate work on a KVM host, recorded here
+so its completion is checkable:
+
+- **Owner:** to be assigned when the collector work starts.
+- **Target:** the `main` commit that merges the collector, with the parser
+  bundle rebuilt from that commit by `tools/syzkaller/build.py`.
+- **Done when** one candidate goes, on that commit, through the real model
+  (PydanticAI) → syzkaller parser → VM lane collector → evidence sealing →
+  Q1 publication → `s1_reached`, and after restarting the service
+  `replay JOB` matches.
+- **Evidence:** the run's `state_dir` and `artifact_root` (Controller
+  transitions, Runner receipts, Q1 publication, `runs/*/process.log`),
+  archived with the command lines used and linked from the collector PR.
 
 ## Not here yet
 

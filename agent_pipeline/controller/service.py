@@ -26,7 +26,7 @@ from . import events as ev
 from .machine import Env, Machine, Outcome, harness_authority_stale
 from .records import (TERMINAL, AgentAttempt, Job, JobState, TaskKind,
                       Transition)
-from .store import Store
+from .store import StaleIssueEvent, Store
 from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
                     RunnerInput,
                     agent_input_digest, legacy_runner_input_digest,
@@ -189,17 +189,37 @@ class Controller:
         self._apply(job_id, ev.ApprovalDenied(task_id=task_id, note=note))
 
     def on_issue(self, gap: GapRef, status: str, resolution: str = "",
-                 job_ids: Collection[str] | None = None) -> None:
+                 job_ids: Collection[str] | None = None, *,
+                 issue: str | None = None,
+                 event_id: int | None = None) -> None:
         """Apply an issue status change to the jobs waiting on `gap`, or
         only to `job_ids` when the caller knows which jobs the issue
-        covers."""
+        covers.
+
+        With `issue`, a job takes the change only while its current wait is
+        linked to that issue: a later wait on the same gap belongs to a new
+        issue.  With `event_id` (increasing per tracker), the change commits
+        together with the job's record of it, so it is applied at most once
+        per job and never after a later event, whichever process delivers
+        it."""
         for job in self.store.jobs({JobState.BLOCKED_HARNESS_GAP,
                                     JobState.PARKED}):
             if job.gap != gap or (job_ids is not None and
                                   job.job_id not in job_ids):
                 continue
-            out = self._apply(job.job_id, ev.IssueChanged(
-                gap=gap, status=status, resolution=resolution))
+            if issue is not None and \
+                    self.store.job_issue(job.job_id) != issue:
+                continue
+            if event_id is not None:
+                mark = self.store.issue_mark(job.job_id)
+                if mark is not None and mark >= event_id:
+                    continue
+            try:
+                out = self._apply(job.job_id, ev.IssueChanged(
+                    gap=gap, status=status, resolution=resolution),
+                    issue_event=event_id)
+            except StaleIssueEvent:
+                continue    # another deliverer applied it, or a later one
             if out and out.job.state is JobState.RETRY_PENDING:
                 self._rebind(out.job)
 
@@ -461,7 +481,8 @@ class Controller:
         return self.materializer.harness_authority_current(
             h.harness_ref, binding)
 
-    def _apply(self, job_id: str, event) -> Outcome | None:
+    def _apply(self, job_id: str, event,
+               issue_event: int | None = None) -> Outcome | None:
         job = self.store.job(job_id)
         out = self.machine.handle(job, event)
         if out is None:
@@ -471,7 +492,8 @@ class Controller:
             to_state=out.job.state, reason=out.reason,
             event=event.model_dump(mode="json"),
             consumed=tuple(out.consumed), job_policy_id=out.job.job_policy_id,
-            at=self.clock(), job=out.job), out.verdicts)
+            at=self.clock(), job=out.job), out.verdicts,
+            issue_event=issue_event)
         self._after(job, out)
         return out
 

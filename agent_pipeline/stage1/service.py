@@ -210,15 +210,19 @@ class Stage1Service:
         issue when it was recorded.  A delivery is recorded after the
         Controller applied it.  The first failure stops this pass, so a
         later event never overtakes an earlier one; the next call resumes
-        with the failed delivery."""
+        with the failed delivery.  The Controller commits each event with
+        the job's record of it and checks the job's current issue, so an
+        event delivered twice (after a lost delivery record, or by another
+        process at the same time) or to a later wait changes nothing."""
         pending = getattr(self.issues, "pending_events", None)
         if pending is None:
             return []
-        for event_id, gap, status, resolution, job_ids in pending():
+        for event_id, issue, gap, status, resolution, job_ids in pending():
             for job_id in job_ids:
                 try:
                     self.controller.on_issue(gap, status, resolution,
-                                             job_ids={job_id})
+                                             job_ids={job_id}, issue=issue,
+                                             event_id=event_id)
                     self.issues.mark_delivered(event_id, job_id)
                 except Exception as exc:
                     return [f"issue {status} for {job_id}: "

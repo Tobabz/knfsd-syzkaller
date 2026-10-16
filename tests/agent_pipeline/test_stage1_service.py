@@ -492,12 +492,76 @@ def test_failed_issue_event_is_not_overtaken_by_a_later_one(tmp_path, build):
         _fail_once(service.controller, "on_issue")
         assert len(service.deliver_issue_events()) == 1
         assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
-        assert [e[2] for e in service.issues.pending_events()] == [
+        assert [e[3] for e in service.issues.pending_events()] == [
             "deferred", "reopened"]
         assert service.deliver_issue_events() == []
         assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
         assert [t.reason for t in service.store.transitions(job_id)][-2:] == [
             "issue_deferred", "issue_reopened"]
+
+
+def test_redelivered_issue_event_does_not_release_a_later_wait(
+        tmp_path, build):
+    registry = InMemoryRegistry()
+    with make_service(tmp_path, build, registry=registry) as service:
+        job_id = submit(service, build)
+        [first] = service.issues.issues()
+        service.issues.change(first["issue"], "resolved", "harness built")
+        # Still no binding: the job waits on the same gap again, under a
+        # new issue; the delivery record of the first event is lost.
+        _fail_once(service.issues, "mark_delivered")
+        assert service.deliver_issue_events() != []
+        assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
+        second = service.issues.issues()[1]
+        assert (second["status"], second["jobs"]) == ("open", [job_id])
+        registry.put(build.binding)
+        assert service.deliver_issue_events() == []
+        assert service.issues.pending_events() == []
+        assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
+        assert service.store.job_issue(job_id) == second["issue"]
+
+
+def test_wait_linked_before_per_job_issues_still_takes_its_event(
+        tmp_path, build):
+    with make_service(tmp_path, build, registry=InMemoryRegistry()) as service:
+        job_id = submit(service, build)
+        [issue] = service.issues.issues()
+        # A Store written before job_issues existed has only gap_links.
+        service.store.db.execute("DELETE FROM job_issues")
+        assert service.store.job_issue(job_id) == issue["issue"]
+        service.issues.change(issue["issue"], "deferred")
+        assert service.deliver_issue_events() == []
+        assert service.job(job_id).state is JobState.PARKED
+
+
+def test_concurrent_deliverers_apply_each_issue_event_once_in_order(
+        tmp_path, build):
+    ids = Ids()
+    with make_service(tmp_path, build, ids=ids, registry=InMemoryRegistry(),
+                      run_agents=False) as service:
+        job_id = submit(service, build)
+        [issue] = service.issues.issues()
+        service.issues.change(issue["issue"], "deferred")
+        service.issues.change(issue["issue"], "reopened")
+        with make_service(tmp_path, build, ids=ids,
+                          registry=InMemoryRegistry(),
+                          run_agents=False) as other:
+            real = service.issues.pending_events
+
+            def read_then_other_delivers():
+                events = real()
+                # A one-shot command delivers both events while this
+                # process still holds the list it read.
+                assert other.deliver_issue_events() == []
+                return events
+
+            service.issues.pending_events = read_then_other_delivers
+            assert service.deliver_issue_events() == []
+        assert service.job(job_id).state is JobState.BLOCKED_HARNESS_GAP
+        assert [t.reason for t in service.store.transitions(job_id)
+                if (t.reason or "").startswith("issue_")] == [
+            "issue_deferred", "issue_reopened"]
+        assert service.store.issue_mark(job_id) is not None
 
 
 def test_recover_applies_an_issue_event_stored_before_restart(tmp_path, build):
