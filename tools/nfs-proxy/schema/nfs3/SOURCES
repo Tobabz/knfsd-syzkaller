@@ -1,0 +1,168 @@
+# Pinned source of the NFSv3 XDR in this directory.
+#
+# RFC 1813 prints no extraction script: its XDR is spread through the prose,
+# one definition per section.  nfs3.x is assembled from the pinned text by
+# ../rfc_xdr.py, one `copy` or `constant` line per definition below, in the
+# RFC's own order; nothing in it is written by hand.  ../README.md describes
+# the rules; the directives are documented at the top of ../rfc_xdr.py.
+#
+#   rfc_xdr.py SOURCES --check     nfs3.x matches its pin (build.sh)
+#   rfc_xdr.py SOURCES --verify    fetch the RFC and rebuild nfs3.x
+#
+# Errata: RFC 1813 has none (errata.rfc-editor.org, 2026-10-16).
+#
+# Only the NFS program (100003, version 3) is taken.  The MOUNT and NLM
+# protocols of RFC 1813's appendices run on their own programs and ports,
+# and NFSACL (100227), which shares port 2049 with NFSv3 on Linux, is in no
+# RFC; all three stay unsupported_schema.
+
+rfc 1813 55118e8a8c2ee6031bede635c6d5beba10ef21fe7d23837c7145ca9c85905b20
+
+assemble nfs3.x 29d3f018c9fd05207969ebd22c6ccb2a1e11576c3b24f3333af84d512b407d95
+
+# Section 2.4: the sizes, stated as prose.
+constant 1813 NFS3_FHSIZE
+constant 1813 NFS3_COOKIEVERFSIZE
+constant 1813 NFS3_CREATEVERFSIZE
+constant 1813 NFS3_WRITEVERFSIZE
+
+# Sections 2.5 and 2.6: basic data types and structures.  uint32 and int32
+# are `unsigned long` and `long`, which normalize.py reads as rpcgen does:
+# four bytes.
+copy 1813 typedef uint64
+copy 1813 typedef int64
+copy 1813 typedef uint32
+copy 1813 typedef int32
+copy 1813 typedef filename3
+copy 1813 typedef nfspath3
+copy 1813 typedef fileid3
+copy 1813 typedef cookie3
+copy 1813 typedef cookieverf3
+copy 1813 typedef createverf3
+copy 1813 typedef writeverf3
+copy 1813 typedef uid3
+copy 1813 typedef gid3
+copy 1813 typedef size3
+copy 1813 typedef offset3
+copy 1813 typedef mode3
+copy 1813 typedef count3
+copy 1813 enum nfsstat3
+copy 1813 enum ftype3
+copy 1813 struct specdata3
+copy 1813 struct nfs_fh3
+copy 1813 struct nfstime3
+copy 1813 struct fattr3
+copy 1813 union post_op_attr
+copy 1813 struct wcc_attr
+copy 1813 union pre_op_attr
+copy 1813 struct wcc_data
+copy 1813 union post_op_fh3
+copy 1813 enum time_how
+copy 1813 union set_mode3
+copy 1813 union set_uid3
+copy 1813 union set_gid3
+copy 1813 union set_size3
+copy 1813 union set_atime
+copy 1813 union set_mtime
+copy 1813 struct sattr3
+copy 1813 struct diropargs3
+
+# Section 3: the program.  It names FSINFO3args, which Section 3.3.19
+# declares as FSINFOargs; the copy below takes the program's name.
+copy 1813 program NFS_PROGRAM
+
+# Sections 3.3.1 to 3.3.21: each procedure's arguments and results.
+copy 1813 struct GETATTR3args
+copy 1813 struct GETATTR3resok
+copy 1813 union GETATTR3res
+copy 1813 union sattrguard3
+copy 1813 struct SETATTR3args
+copy 1813 struct SETATTR3resok
+copy 1813 struct SETATTR3resfail
+copy 1813 union SETATTR3res
+copy 1813 struct LOOKUP3args
+copy 1813 struct LOOKUP3resok
+copy 1813 struct LOOKUP3resfail
+copy 1813 union LOOKUP3res
+copy 1813 struct ACCESS3args
+copy 1813 struct ACCESS3resok
+copy 1813 struct ACCESS3resfail
+copy 1813 union ACCESS3res
+copy 1813 struct READLINK3args
+copy 1813 struct READLINK3resok
+copy 1813 struct READLINK3resfail
+copy 1813 union READLINK3res
+copy 1813 struct READ3args
+copy 1813 struct READ3resok
+copy 1813 struct READ3resfail
+copy 1813 union READ3res
+copy 1813 enum stable_how
+copy 1813 struct WRITE3args
+copy 1813 struct WRITE3resok
+copy 1813 struct WRITE3resfail
+copy 1813 union WRITE3res
+copy 1813 enum createmode3
+copy 1813 union createhow3
+copy 1813 struct CREATE3args
+copy 1813 struct CREATE3resok
+copy 1813 struct CREATE3resfail
+copy 1813 union CREATE3res
+copy 1813 struct MKDIR3args
+copy 1813 struct MKDIR3resok
+copy 1813 struct MKDIR3resfail
+copy 1813 union MKDIR3res
+copy 1813 struct symlinkdata3
+copy 1813 struct SYMLINK3args
+copy 1813 struct SYMLINK3resok
+copy 1813 struct SYMLINK3resfail
+copy 1813 union SYMLINK3res
+copy 1813 struct devicedata3
+copy 1813 union mknoddata3
+copy 1813 struct MKNOD3args
+copy 1813 struct MKNOD3resok
+copy 1813 struct MKNOD3resfail
+copy 1813 union MKNOD3res
+copy 1813 struct REMOVE3args
+copy 1813 struct REMOVE3resok
+copy 1813 struct REMOVE3resfail
+copy 1813 union REMOVE3res
+copy 1813 struct RMDIR3args
+copy 1813 struct RMDIR3resok
+copy 1813 struct RMDIR3resfail
+copy 1813 union RMDIR3res
+copy 1813 struct RENAME3args
+copy 1813 struct RENAME3resok
+copy 1813 struct RENAME3resfail
+copy 1813 union RENAME3res
+copy 1813 struct LINK3args
+copy 1813 struct LINK3resok
+copy 1813 struct LINK3resfail
+copy 1813 union LINK3res
+copy 1813 struct READDIR3args
+copy 1813 struct entry3
+copy 1813 struct dirlist3
+copy 1813 struct READDIR3resok
+copy 1813 struct READDIR3resfail
+copy 1813 union READDIR3res
+copy 1813 struct READDIRPLUS3args
+copy 1813 struct entryplus3
+copy 1813 struct dirlistplus3
+copy 1813 struct READDIRPLUS3resok
+copy 1813 struct READDIRPLUS3resfail
+copy 1813 union READDIRPLUS3res
+copy 1813 struct FSSTAT3args
+copy 1813 struct FSSTAT3resok
+copy 1813 struct FSSTAT3resfail
+copy 1813 union FSSTAT3res
+copy 1813 struct FSINFOargs as FSINFO3args
+copy 1813 struct FSINFO3resok
+copy 1813 struct FSINFO3resfail
+copy 1813 union FSINFO3res
+copy 1813 struct PATHCONF3args
+copy 1813 struct PATHCONF3resok
+copy 1813 struct PATHCONF3resfail
+copy 1813 union PATHCONF3res
+copy 1813 struct COMMIT3args
+copy 1813 struct COMMIT3resok
+copy 1813 struct COMMIT3resfail
+copy 1813 union COMMIT3res

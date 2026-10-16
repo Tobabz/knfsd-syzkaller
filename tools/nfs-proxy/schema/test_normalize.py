@@ -265,6 +265,22 @@ struct ARGS { uint32_t x; };
         self.assertEqual([f for f, _ in ent["fields"]], ["x"])
         self.assertEqual(ent["min_size"], 8)
 
+    def test_long_is_four_bytes(self):
+        # RFC 1813 §2.5 declares uint32 and int32 with rpcgen's `long`.
+        (sch,) = norm_ok("typedef unsigned long u32l; typedef long i32l;"
+                         "struct ARGS { u32l a; i32l b; };"
+                         "struct RES { st s; };")
+        args = types_by_name(sch)["ARGS"]
+        kinds = [sch["types"][t]["kind"] for _, t in args["fields"]]
+        self.assertEqual(kinds, ["uint", "int"])
+        self.assertEqual(args["min_size"], 8)
+
+    def test_long_may_still_name_a_member(self):
+        (sch,) = norm_ok("struct ARGS { uint32_t long; };"
+                         "struct RES { st s; };")
+        self.assertEqual([f for f, _ in types_by_name(sch)["ARGS"]
+                          ["fields"]], ["long"])
+
     def test_procedure_prefix_stripped(self):
         (sch,) = norm_ok("struct ARGS { uint32_t x; }; struct RES { st s; };")
         self.assertEqual([p["name"] for p in sch["procedures"]],
@@ -734,6 +750,45 @@ class Extensions(unittest.TestCase):
                      EXT_ANN.replace("extension 2", "extension 3"))
 
 
+NFS3_ANN = HERE / "nfs3" / "nfs3.ann"
+
+
+class Nfs3(unittest.TestCase):
+    """Properties of the real NFSv3 schema that the decoder relies on."""
+
+    @classmethod
+    def setUpClass(cls):
+        _, cls.schemas = nz.normalize(NFS3_ANN)
+
+    def test_program(self):
+        (s,) = self.schemas
+        self.assertIsNone(s["minor"])
+        self.assertEqual((s["program"], s["version"]), (100003, 3))
+        self.assertEqual(len(s["procedures"]), 22)
+        self.assertEqual(s["procedures"][0]["name"], "NULL")
+        self.assertEqual(s["procedures"][19]["name"], "FSINFO")
+        self.assertEqual(s["procedures"][21]["name"], "COMMIT")
+        self.assertTrue(s["schema_id"].startswith("nfs3/sha256:"))
+
+    def test_every_result_starts_with_its_status(self):
+        # Every procedure but NULL returns a union on nfsstat3, so a
+        # reply's status is its first word.
+        (s,) = self.schemas
+        types = s["types"]
+        for p in s["procedures"][1:]:
+            res = types[p["res"]]
+            self.assertEqual(res["kind"], "union", p["name"])
+            self.assertEqual(res["disc"][1], s["status_type"], p["name"])
+
+    def test_sizes_and_words(self):
+        (s,) = self.schemas
+        by = types_by_name(s)
+        fh = s["types"][by["nfs_fh3"]["fields"][0][1]]
+        self.assertEqual((fh["kind"], fh["bound"]), ("opaque_var", 64))
+        self.assertEqual(by["fattr3"]["min_size"], 84)      # RFC 1813 §2.6
+        self.assertEqual(by["wcc_attr"]["min_size"], 24)
+
+
 class Committed(unittest.TestCase):
     """The committed tables match their XDR (build.sh checks this too,
     through --check; this keeps the unit tests self-contained)."""
@@ -745,7 +800,8 @@ class Committed(unittest.TestCase):
                           TEST_SCHEMA.parent / "schema_tflat.c"),
                          (TEST_SCHEMA / "tedge.ann",
                           TEST_SCHEMA.parent / "schema_tedge.c"),
-                         (NFS4_ANN, HERE.parent / "src" / "schema_nfs4.c")):
+                         (NFS4_ANN, HERE.parent / "src" / "schema_nfs4.c"),
+                         (NFS3_ANN, HERE.parent / "src" / "schema_nfs3.c")):
             text = nz.emit_c(ann, *nz.normalize(ann))
             self.assertEqual(text, out.read_text(), f"{out.name} is stale")
 

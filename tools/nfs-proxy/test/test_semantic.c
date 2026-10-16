@@ -2,8 +2,8 @@
  *
  * The observer is driven the way the proxy drives it (on_rpc_record and
  * on_connection), with NFSv4 messages built word by word, and checked
- * through on_decoded.  These are design 03-nfs-proxy/03 oracles 11a, 12 and
- * 13, plus the parts of the CALL/REPLY order (§6, §7) only the observer
+ * through on_decoded.  These are design 03-nfs-proxy/03 oracles 11 (NFSv3),
+ * 11a, 12 and 13, plus the parts of the CALL/REPLY order (§6, §7) only the observer
  * owns: which direction a REPLY looks up, that a REPLY never borrows another
  * CALL's dispatch, and when a request summary may be used.
  */
@@ -15,9 +15,12 @@
 #include <string.h>
 
 extern const struct nfsp_schema_family nfsp_schema_family_nfs4;
+extern const struct nfsp_schema_family nfsp_schema_family_nfs3;
 
+/* As the proxy registers them (main.c). */
 static const struct nfsp_schema_family *const fams[] = {
 	&nfsp_schema_family_nfs4,
+	&nfsp_schema_family_nfs3,
 };
 
 static int failures;
@@ -41,6 +44,8 @@ static int checks;
 #define OP_SEQUENCE	53u
 #define OP_PUTROOTFH	24u
 #define OP_GETFH	10u
+#define NFS3_READ	6u
+#define NFS3_WRITE	7u
 
 struct msg {
 	uint8_t b[512];
@@ -168,6 +173,56 @@ static void short_call(struct msg *m, uint32_t xid)
 	w32(m, 0);		/* tag, then nothing */
 }
 
+/* NFSv3 WRITE of five bytes, FILE_SYNC. */
+static void v3_write_call(struct msg *m, uint32_t xid)
+{
+	call_header(m, xid, NFS4_PROG, 3, NFS3_WRITE);
+	w32(m, 8);		/* file.data */
+	wraw(m, "fh-00001", 8);
+	w32(m, 0);		/* offset */
+	w32(m, 0);
+	w32(m, 5);		/* count */
+	w32(m, 2);		/* stable FILE_SYNC */
+	w32(m, 5);		/* data */
+	wraw(m, "hello", 5);
+}
+
+static void v3_read_call(struct msg *m, uint32_t xid)
+{
+	call_header(m, xid, NFS4_PROG, 3, NFS3_READ);
+	w32(m, 8);		/* file.data */
+	wraw(m, "fh-00001", 8);
+	w32(m, 0);		/* offset */
+	w32(m, 0);
+	w32(m, 5);		/* count */
+}
+
+/* WRITE3res NFS3_OK: before attributes present, after absent. */
+static void v3_write_reply(struct msg *m, uint32_t xid)
+{
+	reply_header(m, xid);
+	w32(m, 0);		/* status */
+	w32(m, 1);		/* before.attributes_follow */
+	for (int i = 0; i < 6; i++)
+		w32(m, 0);	/* size, mtime, ctime */
+	w32(m, 0);		/* after.attributes_follow */
+	w32(m, 5);		/* count */
+	w32(m, 2);		/* committed */
+	wraw(m, "verf0001", 8);
+}
+
+/* READ3res NFS3_OK, eof, five bytes. */
+static void v3_read_reply(struct msg *m, uint32_t xid)
+{
+	reply_header(m, xid);
+	w32(m, 0);		/* status */
+	w32(m, 0);		/* file_attributes.attributes_follow */
+	w32(m, 5);		/* count */
+	w32(m, 1);		/* eof */
+	w32(m, 5);		/* data */
+	wraw(m, "hello", 5);
+}
+
 static void cb_call(struct msg *m, uint32_t xid)
 {
 	call_header(m, xid, CB_PROG, 1, 1);
@@ -197,6 +252,8 @@ struct seen {
 	enum nfsp_dispatch_source source;
 	int has_minor;
 	uint32_t minor, nops;
+	uint32_t version, procedure, nfields;
+	char proc_name[16];
 };
 
 static void on_decoded(const struct nfsp_semantic_event *ev, void *arg)
@@ -226,6 +283,12 @@ static void on_decoded(const struct nfsp_semantic_event *ev, void *arg)
 	s->has_minor = ev->msg->has_minor;
 	s->minor = ev->msg->minor_version;
 	s->nops = ev->msg->nops;
+	s->version = ev->msg->version;
+	s->procedure = ev->msg->procedure;
+	s->nfields = ev->msg->nfields;
+	if (ev->msg->procedure_name)
+		snprintf(s->proc_name, sizeof(s->proc_name), "%s",
+			 ev->msg->procedure_name);
 }
 
 static uint64_t clock_now;
@@ -244,7 +307,7 @@ static void setup(struct nfsp_semantic *s, enum nfsp_txn_forwarded fwd)
 
 	memset(s, 0, sizeof(*s));
 	s->families = fams;
-	s->nfamilies = 1;
+	s->nfamilies = sizeof(fams) / sizeof(fams[0]);
 	s->forwarded = fwd;
 	s->clock_ms = test_clock;
 	s->on_decoded = on_decoded;
@@ -356,6 +419,68 @@ static void test_no_dispatch(void)
 	CHECK(seen.txn == NFSP_TXN_FOUND &&
 	      seen.status == NFSP_DECODE_DISPATCH_INCOMPLETE &&
 	      !seen.has_request, "no minor: %s",
+	      nfsp_decode_strstatus(seen.status));
+	nfsp_semantic_free(&s);
+}
+
+/* Oracle 11: an NFSv3 REPLY names no procedure, so its result schema is
+ * the one its own CALL gives.  The same XID on two connections carries a
+ * WRITE and a READ; each REPLY decodes under its own CALL, and WRITE's reply
+ * bytes are never decoded under a READ CALL's context. */
+static void test_nfs3_reply_schema(void)
+{
+	struct nfsp_semantic s;
+	struct msg m;
+
+	setup(&s, NFSP_TXN_FWD_ORIGINAL);
+	v3_write_call(&m, 9);
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	CHECK(seen.txn == NFSP_TXN_INSERTED &&
+	      seen.status == NFSP_DECODE_DECODED && seen.version == 3 &&
+	      !seen.has_minor && !strcmp(seen.proc_name, "WRITE"),
+	      "v3 WRITE CALL: %s/%s", nfsp_txn_strresult(seen.txn),
+	      nfsp_decode_strstatus(seen.status));
+	v3_read_call(&m, 9);
+	feed(&s, 2, NFSP_DIR_C2S, &m);
+	CHECK(seen.txn == NFSP_TXN_INSERTED &&
+	      !strcmp(seen.proc_name, "READ"), "v3 READ CALL, same XID");
+
+	/* Replies in the other order. */
+	v3_read_reply(&m, 9);
+	feed(&s, 2, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_FOUND && seen.entry_proc == NFS3_READ &&
+	      seen.status == NFSP_DECODE_DECODED &&
+	      seen.source == NFSP_DISPATCH_TRANSACTION_ENTRY &&
+	      seen.procedure == NFS3_READ && !strcmp(seen.proc_name, "READ") &&
+	      seen.nfields > 0, "READ reply: %s",
+	      nfsp_decode_strstatus(seen.status));
+	CHECK(seen.has_request && seen.request_nops == 0,
+	      "an NFSv3 request summary has no operations");
+	v3_write_reply(&m, 9);
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_FOUND && seen.entry_proc == NFS3_WRITE &&
+	      seen.status == NFSP_DECODE_DECODED &&
+	      seen.procedure == NFS3_WRITE &&
+	      !strcmp(seen.proc_name, "WRITE"), "WRITE reply: %s",
+	      nfsp_decode_strstatus(seen.status));
+
+	/* A READ CALL answered with WRITE's result bytes: found, but the
+	 * READ schema refuses them; nothing is decoded as WRITE. */
+	v3_read_call(&m, 11);
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	v3_write_reply(&m, 11);
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_FOUND && seen.entry_proc == NFS3_READ &&
+	      seen.status != NFSP_DECODE_DECODED && seen.nfields == 0,
+	      "WRITE bytes under a READ CALL: %s",
+	      nfsp_decode_strstatus(seen.status));
+
+	/* No CALL: no schema, however well the bytes would parse. */
+	v3_write_reply(&m, 12);
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_MISSING &&
+	      seen.status == NFSP_DECODE_TRANSACTION_CONTEXT_MISSING &&
+	      seen.nfields == 0, "v3 reply without CALL: %s",
 	      nfsp_decode_strstatus(seen.status));
 	nfsp_semantic_free(&s);
 }
@@ -550,6 +675,7 @@ int main(void)
 	test_call_reply();
 	test_out_of_order_minors();
 	test_no_dispatch();
+	test_nfs3_reply_schema();
 	test_backchannel();
 	test_forwarded_unknown();
 	test_reuse_after_unresolved();

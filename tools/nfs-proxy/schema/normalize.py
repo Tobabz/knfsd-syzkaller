@@ -437,7 +437,16 @@ class Parser:
                 return ("uint",)
             if self.accept("hyper"):
                 return ("uhyper",)
+            if self.peek()[1] == "long" and self.peek(1)[0] == "ident":
+                self.take()
+                return ("uint",)      # `unsigned long`, see `long` below
             return ("uint",)          # bare `unsigned` (RFC 4506 §6.3)
+        if w == "long" and self.peek(1)[0] == "ident":
+            # Not XDR (RFC 4506), but RFC 1813 §2.5 declares uint32 and
+            # int32 with it, and rpcgen, which that XDR was written for,
+            # encodes `long` as `int`: four bytes.
+            self.take()
+            return ("int",)
         if w in ("int", "hyper", "bool", "void", "opaque", "string"):
             self.take()
             return {"int": ("int",), "hyper": ("hyper",), "bool": ("bool",),

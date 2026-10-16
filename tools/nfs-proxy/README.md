@@ -134,7 +134,10 @@ contract in [02](../../docs/design/03-nfs-proxy/02-semantic-decoder.md).
 - `src/schema_nfs4.c` holds NFSv4.0, 4.1 and 4.2, generated from the XDR of RFC 7531, RFC 5662
   and RFC 7863. `schema/rfc_xdr.py` extracts that XDR with each RFC's own rule and pins every RFC
   text and extracted file by SHA-256 (`schema/nfs4/SOURCES`); `build.sh` checks the pins offline.
-  NFSv3 has no schema yet, so its messages are `unsupported_schema`.
+- `src/schema_nfs3.c` holds NFSv3, generated from the XDR of RFC 1813. RFC 1813 prints no
+  extraction script, so `schema/rfc_xdr.py` assembles `schema/nfs3/nfs3.x` from its prose, one
+  pinned definition at a time (`schema/nfs3/SOURCES`). An NFSv3 REPLY decodes only under the
+  procedure of its CALL's TransactionEntry; MOUNT, NLM and NFSACL stay `unsupported_schema`.
 
 ## Target semantic path: Transaction Context (M3)
 

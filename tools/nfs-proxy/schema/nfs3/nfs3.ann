@@ -1,0 +1,15 @@
+# Semantic annotations for NFSv3.
+#
+# The XDR is RFC 1813, assembled and pinned by SOURCES.  This file names
+# things; it never states a field, offset or width.
+notice Derived from the XDR of RFC 1813 (Sun Microsystems, 1995), assembled
+notice by rule from the pinned RFC text into nfs3.x; see
+notice THIRD-PARTY-LICENSES.md.
+family nfs3
+program NFS_PROGRAM NFS_V3
+procedure-prefix NFSPROC3_
+leaf args result
+status-type nfsstat3
+source nfs3.x
+# Every other case label keeps its lowercased XDR name (nfs3err_perm, ...).
+branch NFS3_OK ok

@@ -14,9 +14,11 @@ static _Atomic int stop_requested;
 static _Atomic int snapshot_requested;
 
 extern const struct nfsp_schema_family nfsp_schema_family_nfs4;
+extern const struct nfsp_schema_family nfsp_schema_family_nfs3;
 
 static const struct nfsp_schema_family *const families[] = {
 	&nfsp_schema_family_nfs4,
+	&nfsp_schema_family_nfs3,
 };
 
 /* What the event loop's hooks share: either part may be absent. */

@@ -41,7 +41,7 @@ One directive per line, `#` starts a comment.
 | `leaf REQ RES` | path word after a procedure name; default `args result` |
 | `operation DIR UNION LEAF PREFIX` | `UNION` is the COMPOUND op for `DIR` (`request`/`response`); its arms become path roots `<family>.<DIR>.<OP>`, the arm value `.LEAF`, `PREFIX` is stripped from case labels |
 | `status-type ENUM` | the enum whose value at the start of a response operation is its status |
-| `source FILE` | the single XDR file, for a family without minor versions |
+| `source FILE` | the single XDR file, for a family without minor versions (`nfs3`) |
 | `prelude FILE` | XDR read before every source file, into the same namespace; a name defined in both is an error |
 | `extension N FILE` | an NFSv4 extension (RFC 8178) applied after minor `N`'s source: new definitions join the namespace, an enum restated with more values widens it (every value the source declared must stay; several restatements add up, whatever their order, and one value with two names is an error), and the RFC's own `/* Following lines are to be added to [enum\|union] NAME */` blocks add their lines to `NAME`; nothing else may change an existing definition |
 | `alias-arm UNION LABEL LIKE` | a case value the XDR declares with no arm in `UNION` is decoded with `LIKE`'s arm. The only layout fact an annotation may state; each use names the implementation it follows. A `LABEL` that already has an arm, a `LIKE` with none, or an alias used in no minor version is an error |
@@ -99,6 +99,11 @@ arm of a union whose `bool` or `enum` discriminant has a case for every value
 is never decoded); an array of bound 0 (`x<0>`, `x[0]`), which never has an
 element.
 
+`long` and `unsigned long` are read as `int` and `unsigned int`, four bytes,
+as rpcgen reads them. They are not XDR (RFC 4506), but RFC 1813 §2.5 declares
+`uint32` and `int32` with them. `long` stays an ordinary identifier anywhere
+it is not followed by one.
+
 The parser reads every declaration in a source file, so a syntax error,
 `float`/`double`/`quadruple`, a multi-argument procedure, or a duplicate
 member or procedure name fails the build wherever it appears. The other
@@ -121,6 +126,7 @@ a `SOURCES` manifest from RFC plain text whose SHA-256 the manifest pins:
 ```sh
 schema/rfc_xdr.py schema/nfs4/SOURCES --check    # files match their pins (build.sh)
 schema/rfc_xdr.py schema/nfs4/SOURCES --verify   # fetch the RFCs, rebuild, compare
+schema/rfc_xdr.py schema/nfs3/SOURCES --verify   # the same for RFC 1813
 python3 schema/test_rfc_xdr.py                   # its tests (build.sh runs them)
 ```
 
@@ -130,9 +136,23 @@ python3 schema/test_rfc_xdr.py                   # its tests (build.sh runs them
 - `prelude`: what the XDR uses without declaring it, because rpcgen takes it
   from the C environment. `typedefs` copies the basic typedefs every NFSv4
   file states only in a comment (the files must agree); `copy` copies one
-  `KEYWORD NAME { ... };` definition from an RFC, which must occur once and not
-  cross a page break. For NFSv4 that is RFC 5531's `auth_flavor` (the
-  `AUTH_NONE`, `AUTH_SYS`, `RPCSEC_GSS` case labels) and `authsys_parms`.
+  definition from an RFC, which must occur once. For NFSv4 that is RFC 5531's
+  `auth_flavor` (the `AUTH_NONE`, `AUTH_SYS`, `RPCSEC_GSS` case labels) and
+  `authsys_parms`.
+- `copy N KEYWORD NAME`: `struct`/`enum NAME {`, `union NAME switch (...) {`
+  or `program NAME {`, up to the closing `}...;` at the head's indentation,
+  dedented; or the one-line `typedef ... NAME;`, which may be stated more than
+  once if every statement is the same. A page break inside a definition is
+  dropped only when it is whole (the `[Page N]` footer, the form feed and the
+  `RFC N` running header); any other form feed or footer is an error.
+- `assemble`: a whole XDR source for an RFC that prints its XDR only in its
+  prose, one definition per section, with no extraction script. RFC 1813
+  (NFSv3) is one. Its lines are `copy` lines in the RFC's own order, plus
+  `constant N NAME`, which turns the prose line `NAME V` (RFC 1813 §2.4 states
+  `NFS3_FHSIZE 64` that way) into `const NAME = V;`. `copy ... as NEW` renames
+  a definition for the name the RFC itself uses elsewhere: RFC 1813 declares
+  `FSINFOargs` but its program names `FSINFO3args`. Every copy says its RFC
+  line range in the file, and a renamed one says so.
 - `fragment`: a file of `copy` lines, for a definition an RFC states in its
   prose but not in its `///` XDR. RFC 8435 (flex files) and RFC 8154 (SCSI)
   restate `layouttype4` that way, each with its own new value; each fragment
@@ -148,12 +168,16 @@ The RFC texts are not committed; their pins are enough to fetch and check them.
 | Annotation | Table | Source | Status |
 |---|---|---|---|
 | `nfs4/nfs4.ann` | `../src/schema_nfs4.c` | RFC 7531 (4.0), RFC 5662 + RFC 8435 + RFC 8154 (4.1), RFC 7863 + RFC 8276 + RFC 9754 + RFC 8435 + RFC 8154 (4.2) | NFSv4 COMPOUND, CALL and REPLY |
+| `nfs3/nfs3.ann` | `../src/schema_nfs3.c` | RFC 1813, assembled (`nfs3/SOURCES`) | NFSv3, all 22 procedures, CALL and REPLY |
 | `../test/schema/tproto.ann` | `../test/schema_tproto.c` | written for the tests | synthetic, host tests only |
 | `../test/schema/tflat.ann` | `../test/schema_tflat.c` | written for the tests | synthetic, host tests only |
 | `../test/schema/tedge.ann` | `../test/schema_tedge.c` | written for the tests | synthetic, host tests only: operation unions outside an operation array |
 
-NFSv3 has no schema yet (RFC 1813 has no extractable XDR file), so an NFSv3
-message is `unsupported_schema`. NFSv4.2 is RFC 7863 plus the extensions knfsd
+NFSv3 is RFC 1813's NFS program only. The MOUNT and NLM protocols of its
+appendices run on their own programs, and NFSACL (100227), which shares port
+2049 with NFSv3 on Linux, is in no RFC; their messages are
+`unsupported_schema`. An NFSv3 REPLY decodes only with the procedure its
+CALL's TransactionEntry gives (design 03 §8). NFSv4.2 is RFC 7863 plus the extensions knfsd
 implements: the RFC 8276 xattr operations and the RFC 9754 attribute
 delegation types. RFC 9754 declares delegation types 4 and 5 but no
 `open_delegation4` arm for them; `nfs4.ann` aliases them to the READ and WRITE

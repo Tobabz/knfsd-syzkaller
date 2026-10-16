@@ -978,10 +978,11 @@ tools/nfs-proxy/src/semantic.{h,c}   on_rpc_record / on_connection observer:
                                      RPC Decoder -> txn -> NFS Semantic Decoder -> enrichment
 tools/nfs-proxy/src/main.c           --semantic (observe only, counters in stats output)
 tools/nfs-proxy/test/test_txn.c      oracle 1-10 (+ supersede, random model check)
-tools/nfs-proxy/test/test_semantic.c oracle 11a, 12, 13 (NFSv4), forwarded unknown, lifecycle
+tools/nfs-proxy/test/test_semantic.c oracle 11 (NFSv3), 11a, 12, 13 (NFSv4), forwarded unknown, lifecycle
+tools/nfs-proxy/test/test_nfs3_decode.c  NFSv3 reply decode under its CALL's procedure only (oracle 11)
 ```
 
-NFSv3 schema가 없으므로 oracle 11은 NFSv3 schema 추가 시 검증한다. Oracle 14는 Resolver(M4)가
+Oracle 14는 Resolver(M4)가
 `request.forwarded`를 채울 때 검증한다. `activation_generation`은 M4 전까지 0이다.
 
 변경 시 최소 다음을 함께 변경/검증한다.
