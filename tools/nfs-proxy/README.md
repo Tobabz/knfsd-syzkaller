@@ -4,7 +4,7 @@
 NFS clients and servers. It applies mutation rules supplied by syzkaller programs to
 RPC/XDR traffic, with deterministic edits, mutation logging and replay.
 
-`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/nfs4_decode/txn/rule/semantic/relay/control tests under clang
+`build.sh` runs host framing/walk/delta/golden/rpc_record/rpc_decode/nfs_decode/nfs4_decode/txn/activation/rule/resolver/mutation_apply/semantic/relay/control tests under clang
 and GCC ASan+UBSan, after the ProtocolSchema normalizer's tests, a pin check of the RFC XDR files and a freshness check of every generated schema table. `test_golden` pins the bytes of legacy `NFSPDLT1`/`NFSPDLT2`
 delta files independently of their writer and reader. `build.sh` also compiles
 the guest delta-replay probe as a build-only regression gate. The host tests
@@ -161,7 +161,7 @@ contract in [03](../../docs/design/03-nfs-proxy/03-transaction-context.md).
   may be rewritten after the observer (even its minor version), so a REPLY then gets neither
   a dispatch nor a request summary: it is `transaction_context_missing`.
 
-## Target semantic path: rule set format and validation (M4a)
+## Target semantic path: rule resolution, application and activation (M4a–M4d)
 
 [06 §27](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
 format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.md).
@@ -182,8 +182,61 @@ format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.
 - `nfsp_schema_resolve()` (`src/schema.*`) finds the node a semantic path names from the type
   graph alone. `test_nfs_decode` and `test_nfs4_decode` resolve every path the decoder emits
   and require the same type back, so a rule and the decoder cannot disagree on a name.
-- Nothing installs or applies a rule set yet: that is the Resolver (M4b), the preflight and
-  edit adapter (M4c), and the Runner installation path (S1a).
+- `src/resolver.*` resolves every rule against one immutable decoded payload. It evaluates
+  selectors and typed conjunctions, binds a `current_message` reference to the target's
+  operation occurrence, binds explicit forwarded/original request snapshots by proven
+  operation sequence, evaluates literal/copy transforms, and owns the live original and
+  output value snapshots in each `ResolvedMutation`. Rule summaries and mutations are
+  canonical by `rule_id`, so permuting the input rules produces identical eligibility and
+  conflict results.
+- Runtime version 1 uses `all_matches`. Repeated target fields all become candidates, while a
+  repeated predicate reference in one operation is
+  `predicate_reference_ambiguous`. Preserve replacements of variable opaque/string values
+  own their complete XDR encoding for conflict preflight; raw replacements own only the
+  selected schema-proven span. Overlapping ownership refuses the whole eligible set as
+  `conflict` rather than selecting a rule by registration order.
+- Request-field views are an explicit resolver input. The current M3 transaction table keeps
+  dispatch and operation summaries but not arbitrary decoded field snapshots, so an absent
+  required view is `transaction_context_unusable`; the resolver never substitutes the other
+  view.
+- `src/concrete_edit.h` and the lower rebuild boundary in `src/edit.c` accept only an already
+  resolved batch. They preflight every shape, span, same-boundary/overlap conflict, original
+  precondition and final size before copying, then rebuild once in original canonical-payload
+  coordinates. The legacy arm selector behavior remains above this shared byte-moving core.
+- `src/mutation_apply.*` lowers a READY resolution to that deterministic batch. Preserve
+  replacements of variable opaque/string values derive a live XDR length and zero padding;
+  raw replacements change only their selected schema-proven span. The component checks the
+  complete rebuilt bytes, re-decodes structure-safe output to verify every semantic target,
+  and emits one last-fragment record only after re-parsing its framing successfully. Stale
+  originals, structural inconsistencies and concrete conflicts return typed refusals without
+  output. Rule registration permutations produce the same batch result and final bytes.
+- `src/activation.*` owns one immutable, nonempty `rule_set_id` (at most 128 bytes) for a
+  component session and excludes legacy registration for that session. A test-double gate must
+  accept `GENERATION_OPEN` before one generation admits CALLs; deactivation closes CALL
+  admission before submitting `GENERATION_DRAINING`. A rejected or missing draining ACK
+  quarantines the lane permanently, while pending barriers use non-reusable tokens so late ACKs
+  cannot reopen it. The callback is only a component test double and provides no durability.
+- CALL admission returns the generation to pass to `nfsp_txn_call` plus a bounded, monotonic
+  accounting ticket; only consuming that ticket as an inserted transaction adds reply debt.
+  Deactivation closes CALL admission immediately but cannot submit its draining gate or close
+  cleanly while a ticket is pending. Duplicate, stale and mismatched accounting is typed and
+  cannot change counters. A forced abort cancels pending tickets and records each conservatively
+  in `reply_unresolved_count`. A REPLY uses its transaction entry's generation, so admitted and draining
+  generations are eligible while closed, unknown and generation-zero entries increment
+  `outside_activation_window`. Connection-close accounting can satisfy a clean drain without
+  claiming a resolved REPLY. Other missing replies block normal closure and require an explicit
+  `reply_unresolved` or `aborted` forced-closure reason, which freezes the unresolved count.
+- Generation snapshots are sorted by id and retain barrier, admission, reply and closure facts
+  for future `GENERATION_COMPLETE` input. Defaults are 256 generation ids retained for the
+  session, 16 simultaneous draining generations and 64 pending CALL-account tickets;
+  configuration may lower these or raise either lifetime ids or pending tickets to 4096, with
+  `max_draining <= max_generations`. Exhaustion refuses the operation rather than recycling a
+  generation or ticket id.
+- This remains component-only. `main`/`proxy` do not install rule sets, call the activation
+  component or expose rebuilt target bytes. The isolated Runner/executor endpoint and barrier
+  protocol remain S1a; durable host `RULESET`, `GENERATION_OPEN`, `GENERATION_DRAINING`,
+  `EXPOSURE_INTENT` and `GENERATION_COMPLETE` handling remain M5/S1b. The test gate does not
+  satisfy any of those durability requirements.
 
 ## Building
 

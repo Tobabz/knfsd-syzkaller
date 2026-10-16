@@ -18,16 +18,19 @@ from pydantic import TypeAdapter
 
 from ..artifacts import ArtifactStore
 from ..components import HarnessRegistry, IssueTracker
-from ..contracts import (AgentOutput, CandidateSubmission, GapRef,
-                         JudgeVersions, LocationRequest,
+from ..contracts import (AgentOutput, AgentTask, CandidateSubmission, GapRef,
+                         HarnessBinding, JudgeVersions, LocationRequest,
                          VulnerabilityCandidate)
 from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
-from .machine import Env, Machine, Outcome
+from .machine import Env, Machine, Outcome, harness_authority_stale
 from .records import (TERMINAL, AgentAttempt, Job, JobState, TaskKind,
                       Transition)
 from .store import Store
-from .tasks import AgentExecutor, AgentRequest, Runner, RunnerInput
+from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
+                    RunnerInput,
+                    agent_input_digest, legacy_runner_input_digest,
+                    runner_input_digest)
 
 FINAL = ("sealed", "ended_unsealed")
 #: Agent attempt states that can still give a result.
@@ -37,6 +40,14 @@ AGENT_OUTPUT = TypeAdapter(AgentOutput)
 
 class ReplayMismatch(Exception):
     pass
+
+
+class LegacyTaskPolicyUnavailable(RuntimeError):
+    """A legacy logical Agent task has no authenticated historical policy."""
+
+
+class RunnerInputDigestMismatch(RuntimeError):
+    """A pending Runner digest is neither canonical nor exactly legacy."""
 
 
 @dataclass(frozen=True)
@@ -62,13 +73,17 @@ class Controller:
                  ) -> None:
         self.store = store
         self.machine = Machine(env)
+        self.hcap = env.hcap
+        self.materializer = env.materializer
         self.runner = runner
         self.agents = agents
         self.issues = issues
         self.registry = registry
         self.tree = tree
         self.artifacts = artifacts
-        self.judge_versions = judge_versions
+        # An adopted fallback outlives the process; the constructor value is
+        # only the first default (09 §5).
+        self.judge_versions = store.judge_versions() or judge_versions
         self.clock = clock
         self.new_id = new_id
         self.failures: list[EffectFailure] = []
@@ -118,12 +133,21 @@ class Controller:
                 judge_versions=self.judge_versions)
         else:
             policy = self.store.policy(job.job_policy_id)
+            binding = self.registry.lookup(result.kernel_commit,
+                                           policy.sanitizer)
             event = ev.IntakeChecked(
                 candidate=result,
-                binding=self.registry.lookup(result.kernel_commit,
-                                             policy.sanitizer),
-                judge_versions=self.judge_versions)
+                binding=binding,
+                judge_versions=self._versions_for(binding))
         self._apply(job_id, event)
+
+    def _versions_for(self, binding: HarnessBinding | None) -> JudgeVersions:
+        """Resolve the immutable Q1 authorities selected by this binding."""
+        if binding is not None:
+            selected = self.hcap.judge_versions(binding.hcap_revision)
+            if selected is not None:
+                return selected
+        return self.judge_versions
 
     # ------------------------------------------------------------ inputs
 
@@ -177,30 +201,30 @@ class Controller:
     def on_registry_changed(self) -> None:
         """A harness build or HCAP revision changed: look every live job's
         binding up again (09 §5)."""
-        for job in self.store.jobs():
-            if job.state in TERMINAL or job.candidate is None or \
-                    job.state is JobState.SUBMITTED:
-                continue
-            policy = self.store.policy(job.job_policy_id)
-            b = self.registry.lookup(job.candidate.kernel_commit,
-                                     policy.sanitizer)
-            if b != job.binding:
-                self._apply(job.job_id, ev.BindingChanged(binding=b))
+        for job in list(self.store.jobs()):
+            self._reconcile_registry(job.job_id)
 
     def on_judge_versions(self, versions: JudgeVersions) -> None:
+        self.store.save_judge_versions(versions)
         self.judge_versions = versions
         for job in self.store.jobs():
-            if job.state not in TERMINAL and job.judge_versions != versions:
+            if job.state in TERMINAL:
+                continue
+            selected = self._versions_for(job.binding)
+            if job.judge_versions != selected:
                 self._apply(job.job_id, ev.JudgeVersionsChanged(
-                    judge_versions=versions))
+                    judge_versions=selected, consume_same_verdict=True))
 
     def set_policy(self, job_id: str, policy_id: str) -> None:
         policy = self.store.policy(policy_id)
         job = self.store.job(job_id)
         binding = None if job.candidate is None else self.registry.lookup(
             job.candidate.kernel_commit, policy.sanitizer)
-        self._apply(job_id, ev.PolicyChanged(job_policy_id=policy_id,
-                                             binding=binding))
+        self._apply(job_id, ev.PolicyChanged(
+            job_policy_id=policy_id, binding=binding,
+            judge_versions=self._versions_for(binding),
+            rematerialize_authority=True,
+            harness_authority_current=self._authority_current(job, binding)))
 
     def operator(self, job_id: str, action: str) -> Outcome | None:
         return self._apply(job_id, ev.OperatorAction(
@@ -214,9 +238,39 @@ class Controller:
         linked.  A failing call is recorded for its job and the other jobs
         go on; returns this call's failures."""
         self.failures = []
+        self._late_cleanup_reports()
         for job in list(self.store.jobs()):
             self._settle(job.job_id)
         return self.failures
+
+    def _late_cleanup_reports(self) -> None:
+        """09 §8: an execution reported not confirmed stopped after its task
+        ended is recorded on the job before the report is acknowledged."""
+        try:
+            reports = self.runner.cleanup_reports()
+        except Exception as e:      # any failure of the outside call
+            f = EffectFailure(job_id="", effect="cleanup_reports",
+                              error=repr(e))
+            self.failures.append(f)
+            return
+        for task_id, generation in reports:
+            job_id = job_of(task_id)
+            self._guard(job_id, f"cleanup:{task_id}:{generation}",
+                        lambda j=job_id, t=task_id, g=generation:
+                        self._late_cleanup(j, t, g))
+
+    def _late_cleanup(self, job_id: str, task_id: str,
+                      generation: int) -> None:
+        try:
+            self.store.job(job_id)
+        except KeyError:
+            pass        # no job of this Controller owns the task
+        else:
+            # Idempotent per (task_id, generation): a report re-sent after
+            # a failed acknowledgement makes no second transition.
+            self._apply(job_id, ev.CleanupUnconfirmed(
+                task_id=task_id, generation=generation))
+        self.runner.acknowledge_cleanup_report(task_id, generation)
 
     def _settle(self, job_id: str) -> None:
         job = self.store.job(job_id)
@@ -229,10 +283,16 @@ class Controller:
                     lambda: self._poll_pending(job_id))
 
     def _recancel(self, job_id: str, task_id: str) -> None:
-        if self.runner.status(task_id).state in FINAL:
-            self._apply(job_id, ev.CancelConfirmed(task_id=task_id))
+        st = self.runner.status(task_id)
+        if st.state in FINAL:
+            self._confirm_cancel(job_id, task_id, st)
         else:
             self._cancel(job_id, task_id)
+
+    def _confirm_cancel(self, job_id: str, task_id: str, st) -> None:
+        self._apply(job_id, ev.CancelConfirmed(
+            task_id=task_id,
+            cleanup_unconfirmed=st.reason == CLEANUP_UNCONFIRMED))
 
     def _poll_pending(self, job_id: str) -> None:
         job = self.store.job(job_id)
@@ -260,6 +320,10 @@ class Controller:
         if p is None or p.kind is not TaskKind.RUNNER or \
                 job.cancelling_tasks:
             return
+        if self._migrate_runner_input_digest(job):
+            return
+        job = self.store.job(job_id)
+        p = job.pending_task
         st = self.runner.status(p.task_id)
         if st.state == "unknown":
             self._dispatch(job_id)
@@ -273,12 +337,17 @@ class Controller:
         task_id, send a new attempt of an Agent task, and process the
         queue states.  Failures are recorded per job, as in poll()."""
         self.failures = []
+        self._late_cleanup_reports()
         for job in list(self.store.jobs()):
             self._guard(job.job_id, "recover",
                         lambda j=job.job_id: self._recover(j))
         return self.failures
 
     def _recover(self, job_id: str) -> None:
+        # Reconcile authority before touching pending tasks. In particular,
+        # never reconnect a legacy Runner task whose harness cannot prove it
+        # was materialized under the binding now stored for the job.
+        self._reconcile_registry(job_id)
         job = self.store.job(job_id)
         for task_id in job.cancelling_tasks:
             self._guard(job_id, f"cancel:{task_id}",
@@ -306,20 +375,86 @@ class Controller:
         job = ts[0].job
         for t in ts[1:]:
             out = self.machine.handle(job, ev.EVENT.validate_python(t.event))
-            if out is None or out.job != t.job:
+            if out is None:
                 raise ReplayMismatch(f"{job_id} seq {t.seq}")
-            job = out.job
+            replayed = self._legacy_materialized_provenance(out.job, t.job)
+            if not self._replay_job_matches(replayed, t.job):
+                raise ReplayMismatch(f"{job_id} seq {t.seq}")
+            # Continue from the exact historical snapshot.  Before the
+            # migration event exists, this may carry an authenticated old
+            # Runner digest or an unpinned Agent task into later transitions.
+            job = t.job
         if job != self.store.job(job_id):
             raise ReplayMismatch(f"{job_id}: stored job differs")
         return job
 
     # ------------------------------------------------------------ internals
 
+    @staticmethod
+    def _legacy_materialized_provenance(actual: Job, expected: Job) -> Job:
+        """Normalize only the field absent from pre-migration snapshots.
+
+        A current record that explicitly stores null is not accepted as a
+        legacy snapshot. Every other field must still match exactly.
+        """
+
+        old = expected.harness
+        current = actual.harness
+        if old is None or current is None or \
+                "hcap_revision" in old.model_fields_set:
+            return actual
+        without_provenance = current.model_copy(
+            update={"hcap_revision": None})
+        if without_provenance != old:
+            return actual
+        return actual.model_copy(update={"harness": old})
+
+    def _reconcile_registry(self, job_id: str) -> None:
+        """Append binding facts, including same-binding stale authority."""
+
+        job = self.store.job(job_id)
+        if job.state in TERMINAL or job.candidate is None or \
+                job.state is JobState.SUBMITTED:
+            return
+        policy = self.store.policy(job.job_policy_id)
+        binding = self.registry.lookup(job.candidate.kernel_commit,
+                                       policy.sanitizer)
+        stale = binding == job.binding and \
+            harness_authority_stale(job, binding)
+        if binding != job.binding or stale:
+            out = self._apply(job_id, ev.BindingChanged(
+                binding=binding,
+                judge_versions=self._versions_for(binding),
+                rematerialize_authority=True,
+                harness_authority_current=self._authority_current(
+                    job, binding)))
+            if out is None:
+                raise RuntimeError(
+                    f"materialization authority migration refused for "
+                    f"{job_id}")
+
     def _rebind(self, job: Job) -> None:
         policy = self.store.policy(job.job_policy_id)
         b = self.registry.lookup(job.candidate.kernel_commit,
                                  policy.sanitizer)
-        self._apply(job.job_id, ev.BindingChanged(binding=b))
+        self._apply(job.job_id, ev.BindingChanged(
+            binding=b, judge_versions=self._versions_for(b),
+            rematerialize_authority=True,
+            harness_authority_current=self._authority_current(job, b)))
+
+    def _authority_current(self, job: Job,
+                           binding: HarnessBinding | None) -> bool:
+        """Does the job's harness keep its HCAP-derived authority refs
+        under `binding`?  Only then may an HCAP-only change keep it
+        (09 §5).  Infrastructure errors propagate."""
+        h = job.harness
+        if binding is None or h is None or h.hcap_revision is None or \
+                h.execution_harness_id != binding.execution_harness_id:
+            return False
+        if not harness_authority_stale(job, binding):
+            return True
+        return self.materializer.harness_authority_current(
+            h.harness_ref, binding)
 
     def _apply(self, job_id: str, event) -> Outcome | None:
         job = self.store.job(job_id)
@@ -381,6 +516,9 @@ class Controller:
         if p.kind is TaskKind.AGENT:
             if self.store.attempt(p.task_id, p.attempt) is not None:
                 return
+            model_policy = p.model_policy
+            if model_policy is None:
+                model_policy = self._legacy_model_policy(job, p)
             self.store.save_attempt(AgentAttempt(
                 task_id=p.task_id, attempt=p.attempt, job_id=job_id,
                 agent_task=p.agent_task, input_digest=p.input_digest,
@@ -390,6 +528,7 @@ class Controller:
             self.agents.start(AgentRequest(
                 job_id=job_id, task_id=p.task_id, attempt=p.attempt,
                 agent_task=p.agent_task, candidate=job.candidate,
+                model_policy=model_policy,
                 hcap_revision=job.binding.hcap_revision,
                 analysis_ref=job.analysis_ref, plan_ref=job.plan_ref,
                 repair=p.repair))
@@ -398,6 +537,10 @@ class Controller:
                 self.store.save_attempt(a.model_copy(
                     update={"status": "running"}))
         elif p.kind is TaskKind.RUNNER and not job.cancelling_tasks:
+            if self._migrate_runner_input_digest(job):
+                return
+            job = self.store.job(job_id)
+            p = job.pending_task
             # Idempotent by task_id: sending it again never starts a second
             # run (09 §8).
             st = self.runner.submit(p.task_id, RunnerInput(
@@ -405,10 +548,156 @@ class Controller:
                 execution_harness_id=job.harness.execution_harness_id))
             self._take_status(job_id, p.task_id, st)
 
+    @staticmethod
+    def _runner_input(job: Job) -> RunnerInput:
+        if job.harness is None:
+            raise RunnerInputDigestMismatch(
+                f"pending Runner task for {job.job_id} has no harness")
+        return RunnerInput(
+            job_id=job.job_id, harness_ref=job.harness.harness_ref,
+            execution_harness_id=job.harness.execution_harness_id)
+
+    def _migrate_runner_input_digest(self, job: Job) -> bool:
+        """Commit an authenticated legacy-to-canonical digest transition.
+
+        Returns true when the transition was committed.  Its normal
+        post-commit dispatch performs the Runner side effect, so the caller
+        must stop rather than submit a second time.
+        """
+
+        pending = job.pending_task
+        if pending is None or pending.kind is not TaskKind.RUNNER:
+            return False
+        task_input = self._runner_input(job)
+        canonical = runner_input_digest(task_input)
+        if pending.input_digest == canonical:
+            return False
+        legacy = legacy_runner_input_digest(task_input)
+        if pending.input_digest != legacy:
+            raise RunnerInputDigestMismatch(
+                f"pending Runner task {pending.task_id} has an "
+                "unauthenticated input digest")
+        out = self._apply(job.job_id, ev.RunnerInputDigestMigrated(
+            task_id=pending.task_id, legacy_digest=legacy,
+            canonical_digest=canonical))
+        if out is None:
+            raise RunnerInputDigestMismatch(
+                f"pending Runner task {pending.task_id} migration refused")
+        return True
+
+    @classmethod
+    def _replay_job_matches(cls, actual: Job, stored: Job) -> bool:
+        """Compare a replay result, recognizing exact historical encodings.
+
+        A pre-pin Agent task omitted model_policy and hashed only its other
+        inputs. Authenticate both digests against the replayed inputs before
+        normalizing those two fields. Explicit null or a different policy is
+        not that historical encoding. Every other field must match exactly.
+        """
+
+        if actual == stored:
+            return True
+        actual_pending = actual.pending_task
+        stored_pending = stored.pending_task
+        if actual_pending is None or stored_pending is None or \
+                actual_pending.kind is not stored_pending.kind:
+            return False
+        if actual_pending.kind is TaskKind.AGENT:
+            if "model_policy" in stored_pending.model_fields_set or \
+                    actual_pending.model_policy is None or \
+                    actual.candidate is None or actual.binding is None:
+                return False
+            inputs = dict(
+                agent_task=actual_pending.agent_task,
+                model_policy=actual_pending.model_policy,
+                candidate=actual.candidate,
+                hcap_revision=actual.binding.hcap_revision,
+                analysis_ref=actual.analysis_ref,
+                plan_ref=actual.plan_ref,
+                repair=actual_pending.repair)
+            if actual_pending.input_digest != agent_input_digest(**inputs) or \
+                    stored_pending.input_digest != agent_input_digest(
+                        **inputs, include_model_policy=False):
+                return False
+            reproduced = actual.model_copy(update={
+                "pending_task": actual_pending.model_copy(update={
+                    "input_digest": stored_pending.input_digest,
+                    "model_policy": None,
+                }),
+            })
+            return reproduced == stored
+        if actual_pending.kind is not TaskKind.RUNNER:
+            return False
+        task_input = cls._runner_input(actual)
+        if actual_pending.input_digest != runner_input_digest(task_input) or \
+                stored_pending.input_digest != \
+                legacy_runner_input_digest(task_input):
+            return False
+        reproduced = actual.model_copy(update={
+            "pending_task": actual_pending.model_copy(update={
+                "input_digest": stored_pending.input_digest,
+            }),
+        })
+        return reproduced == stored
+
+    @staticmethod
+    def _model_policy_for(policy, agent_task: AgentTask):
+        if agent_task is AgentTask.CANDIDATE_ANALYSIS:
+            return policy.stage1_agents.candidate_analysis
+        if agent_task is AgentTask.REACHABILITY_PLANNING:
+            return policy.stage1_agents.reachability_planning
+        raise LegacyTaskPolicyUnavailable(
+            f"no model policy for legacy task {agent_task}")
+
+    def _legacy_model_policy(self, job: Job, pending):
+        """Recover a pre-pin task from the transition that minted its ID.
+
+        Policies are immutable by ID.  The first transition containing this
+        task therefore supplies the historical policy, while the task digest
+        authenticates both the modern and pre-model-policy input encodings.
+        Consulting the job's current policy here would reinterpret the same
+        logical task after a same-sanitizer policy update.
+        """
+
+        for transition in self.store.transitions(job.job_id):
+            snapshot = transition.job
+            historical = snapshot.pending_task
+            if historical is None or historical.kind is not TaskKind.AGENT or \
+                    historical.task_id != pending.task_id:
+                continue
+            if historical.agent_task is not pending.agent_task or \
+                    historical.input_digest != pending.input_digest or \
+                    snapshot.candidate is None or snapshot.binding is None:
+                break
+            try:
+                policy = self.store.policy(transition.job_policy_id)
+                model_policy = self._model_policy_for(
+                    policy, historical.agent_task)
+                common = dict(
+                    agent_task=historical.agent_task,
+                    model_policy=model_policy,
+                    candidate=snapshot.candidate,
+                    hcap_revision=snapshot.binding.hcap_revision,
+                    analysis_ref=snapshot.analysis_ref,
+                    plan_ref=snapshot.plan_ref,
+                    repair=historical.repair)
+                valid = {
+                    agent_input_digest(**common),
+                    agent_input_digest(
+                        **common, include_model_policy=False),
+                }
+            except (KeyError, TypeError, ValueError):
+                break
+            if pending.input_digest in valid:
+                return model_policy
+            break
+        raise LegacyTaskPolicyUnavailable(
+            f"legacy task {pending.task_id} has no authenticated policy pin")
+
     def _cancel(self, job_id: str, task_id: str) -> None:
         st = self.runner.cancel(task_id)
         if st.state in FINAL:
-            self._apply(job_id, ev.CancelConfirmed(task_id=task_id))
+            self._confirm_cancel(job_id, task_id, st)
 
     def _take_status(self, job_id: str, task_id: str, st) -> None:
         if st.state in FINAL:

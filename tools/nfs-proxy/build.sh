@@ -75,7 +75,10 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_nfs_decode:$TEST/test_nfs_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$TEST/schema_tproto.c:$TEST/schema_tflat.c:$TEST/schema_tedge.c\
        test_nfs4_decode:$TEST/test_nfs4_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c\
        test_txn:$TEST/test_txn.c:$SRC/txn.c\
+       test_activation:$TEST/test_activation.c:$SRC/activation.c\
        test_rule:$TEST/test_rule.c:$SRC/rule.c:$SRC/schema.c:$SRC/schema_nfs4.c:$TEST/schema_tproto.c:$TEST/schema_tflat.c:$TEST/schema_tedge.c\
+       test_resolver:$TEST/test_resolver.c:$SRC/resolver.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$TEST/schema_tproto.c\
+       test_mutation_apply:$TEST/test_mutation_apply.c:$SRC/mutation_apply.c:$SRC/resolver.c:$SRC/edit.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/rpc_record.c:$SRC/walk.c:$SRC/framing.c:$TEST/schema_tproto.c\
        test_semantic:$TEST/test_semantic.c:$SRC/semantic.c:$SRC/txn.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs4.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c:$SRC/rpc_record.c:$SRC/rpc_decode.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c"
@@ -259,7 +262,8 @@ if [ "$MODE" != "--test" ]; then
 	$CC $CFLAGS -I"$SRC" -o "$BUILD/nfs-proxy" \
 		"$SRC/main.c" "$SRC/proxy.c" "$SRC/framing.c" "$SRC/rpc_record.c" \
 		"$SRC/control.c" "$SRC/delta.c" "$SRC/walk.c" "$SRC/edit.c" \
-		"$SRC/semantic.c" "$SRC/txn.c" "$SRC/nfs_decode.c" \
+		"$SRC/semantic.c" "$SRC/resolver.c" "$SRC/mutation_apply.c" \
+		"$SRC/txn.c" "$SRC/activation.c" "$SRC/nfs_decode.c" \
 		"$SRC/schema.c" "$SRC/schema_nfs4.c" "$SRC/rpc_decode.c"
 fi
 

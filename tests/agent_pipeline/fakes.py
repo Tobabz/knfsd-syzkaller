@@ -82,9 +82,21 @@ class FakeHcap:
         self.vocabulary: set[str] = {"syzlang.nfs4.op_lock",
                                      "fixture.lease_expiry"}
 
+        #: HCAP revisions whose host catalog is corrupt.
+        self.corrupt: set[str] = set()
+
     def check_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        if hcap_revision in self.corrupt:
+            return HcapCheck(violations=("invalid_hcap_artifact",),
+                             host_authority=True)
         return HcapCheck(violations=self.violations.get(
             (plan_ref, hcap_revision), ()))
+
+    def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        return self.check_plan(plan_ref, hcap_revision)
+
+    def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
+        return None
 
     def knows_capability(self, hcap_revision: str, cap: str) -> bool:
         return cap in self.vocabulary
@@ -93,17 +105,28 @@ class FakeHcap:
 class FakeMaterializer:
     def __init__(self) -> None:
         self.refusals: dict[tuple[str, str], MaterializeRejected] = {}
+        #: HCAP revisions whose call admission / neutral control refs differ
+        #: from every earlier revision's.
+        self.authority_changed: set[str] = set()
 
-    def materialize(self, plan_ref: str, binding: HarnessBinding):
+    def materialize(self, plan_ref: str, binding: HarnessBinding, *,
+                    hcap_authority=None):
         r = self.refusals.get((plan_ref, binding.execution_harness_id))
         if r is not None:
             return r
         return Materialized(
             harness_ref=sha("harness", plan_ref,
-                            binding.execution_harness_id),
+                            binding.execution_harness_id,
+                            binding.hcap_revision),
             review_manifest_sha256=sha("manifest", plan_ref,
-                                       binding.execution_harness_id),
-            execution_harness_id=binding.execution_harness_id)
+                                       binding.execution_harness_id,
+                                       binding.hcap_revision),
+            execution_harness_id=binding.execution_harness_id,
+            hcap_revision=binding.hcap_revision)
+
+    def harness_authority_current(self, harness_ref: str,
+                                  binding: HarnessBinding) -> bool:
+        return binding.hcap_revision not in self.authority_changed
 
 
 class FakeJudge:
@@ -121,6 +144,11 @@ class FakeJudge:
             "by_profile": {}})
         entry["by_profile"][profile] = (status, reason, gap)
         return bundle
+
+    def matches_execution(self, bundle_ref, *, job_id, task_id) -> bool:
+        # Routing fixtures pre-register bundles. Real provenance/cross-task
+        # rejection is covered with ArtifactQ1Judge in test_sealed_q1.
+        return bundle_ref in self.bundles
 
     def judge(self, bundle_ref, plan_ref, candidate_id,
               versions: JudgeVersions) -> Q1Result:
@@ -153,6 +181,12 @@ class FakeRunner:
         self.cancelled: set[str] = set()
         self.cancel_calls: Counter = Counter()
         self.slow_cancel: set[str] = set()
+        #: Tasks whose cancel ends without confirmed cleanup.
+        self.unconfirmed: set[str] = set()
+        #: Late "not confirmed stopped" reports, (task_id, generation),
+        #: until acknowledged.
+        self.late_reports: set[tuple[str, int]] = set()
+        self.fail_ack = False
 
     def _status(self, task_id: str) -> RunnerStatus:
         t = self.tasks.get(task_id)
@@ -192,8 +226,18 @@ class FakeRunner:
             self.slow_cancel.discard(task_id)
             return self._status(task_id)
         if t["state"] == "running":
-            t["state"], t["reason"] = "ended_unsealed", "cancelled"
+            t["state"], t["reason"] = "ended_unsealed", (
+                "cleanup_unconfirmed" if task_id in self.unconfirmed
+                else "cancelled")
         return self._status(task_id)
+
+    def cleanup_reports(self) -> tuple[tuple[str, int], ...]:
+        return tuple(sorted(self.late_reports))
+
+    def acknowledge_cleanup_report(self, task_id, generation) -> None:
+        if self.fail_ack:
+            raise OSError("synthetic acknowledgement failure")
+        self.late_reports.discard((task_id, generation))
 
     def finish(self, task_id: str, bundle: str | None = None,
                reason: str | None = None) -> None:
@@ -275,11 +319,11 @@ class World:
                           new_id=self._new_id)
 
     def restart(self) -> Controller:
-        versions = self.controller.judge_versions
+        # A fresh Controller with the configured default: adopted judge
+        # versions must come back from the Store, not from memory.
         self.store.close()
         self.store = Store(self.tmp / "jobs.sqlite")
         self.controller = self._controller()
-        self.controller.judge_versions = versions
         self.controller.recover()
         return self.controller
 

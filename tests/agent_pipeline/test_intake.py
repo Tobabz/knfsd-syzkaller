@@ -52,6 +52,8 @@ def test_function_lines_given_must_match():
      "path_not_normalized"),
     (sub(path="/fs/nfsd/nfs4xdr.c", symbol="helper"), "path_not_normalized"),
     (sub(path="fs/nfsd/nope.c", symbol="helper"), "path_not_found"),
+    (sub(path="mm/slub.c", symbol="helper"), "path_outside_analysis_roots"),
+    (sub(path="fs/super.c", symbol="helper"), "path_outside_analysis_roots"),
     (sub(kind=LocationKind.SOURCE_RANGE, start=3, end=2),
      "range_invalid"),
     (sub(kind=LocationKind.SOURCE_RANGE, start=1, end=999),
