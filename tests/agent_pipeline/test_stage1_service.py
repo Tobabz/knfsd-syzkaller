@@ -521,6 +521,26 @@ def test_redelivered_issue_event_does_not_release_a_later_wait(
         assert service.store.job_issue(job_id) == second["issue"]
 
 
+def test_failed_rebind_after_a_resolved_issue_is_retried_by_poll(
+        tmp_path, build):
+    registry = InMemoryRegistry()
+    with make_service(tmp_path, build, registry=registry) as service:
+        job_id = submit(service, build)
+        [issue] = service.issues.issues()
+        registry.put(build.binding)
+        service.issues.change(issue["issue"], "resolved", "harness built")
+        # The event commits (retry_pending), then the rebind fails once.
+        _fail_once(registry, "lookup")
+        assert service.deliver_issue_events() == []
+        assert service.issues.pending_events() == []
+        assert service.job(job_id).state is JobState.RETRY_PENDING
+        assert [f[1] for f in service.store.effect_failures(job_id)] == [
+            "rebind"]
+        report = service.step()
+        assert report.errors == [] and report.failures == []
+        assert service.job(job_id).state is JobState.S1_ANALYSIS
+
+
 def test_wait_linked_before_per_job_issues_still_takes_its_event(
         tmp_path, build):
     with make_service(tmp_path, build, registry=InMemoryRegistry()) as service:

@@ -221,7 +221,10 @@ class Controller:
             except StaleIssueEvent:
                 continue    # another deliverer applied it, or a later one
             if out and out.job.state is JobState.RETRY_PENDING:
-                self._rebind(out.job)
+                # The event is taken; a failed rebind stays due and poll()
+                # or recover() sends it again.
+                self._guard(out.job.job_id, "rebind",
+                            lambda j=out.job: self._rebind(j))
 
     def on_registry_changed(self) -> None:
         """A harness build or HCAP revision changed: look every live job's
@@ -259,8 +262,8 @@ class Controller:
         """Ask the Runner about every job's Runner tasks and finish what a
         lost answer left undone (09 §8): a cancel not yet confirmed is sent
         again, a pending task the Runner does not know is submitted again
-        with its task_id, and a gap job not linked to its issue is
-        linked.  A failing call is recorded for its job and the other jobs
+        with its task_id, a gap job not linked to its issue is linked, and
+        a retry_pending job is bound again.  A failing call is recorded for its job and the other jobs
         go on; returns this call's failures."""
         self.failures = []
         self._late_cleanup_reports()
@@ -306,6 +309,14 @@ class Controller:
                     lambda: self._link_gap(self.store.job(job_id)))
         self._guard(job_id, "pending_task",
                     lambda: self._poll_pending(job_id))
+        self._guard(job_id, "rebind", lambda: self._retry_rebind(job_id))
+
+    def _retry_rebind(self, job_id: str) -> None:
+        """A job left in retry_pending (its issue resolved, the binding
+        lookup or its commit failed) is bound again."""
+        job = self.store.job(job_id)
+        if job.state is JobState.RETRY_PENDING and job.pending_task is None:
+            self._rebind(job)
 
     def _recancel(self, job_id: str, task_id: str) -> None:
         st = self.runner.status(task_id)
