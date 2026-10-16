@@ -4,7 +4,8 @@ Date: Fri, 16 Oct 2026 13:40:00 +0900
 Subject: [PATCH] tools/execprog: gate programs after the machine check
 
 With -gate=PATH, execprog creates PATH.ready once the machine check has
-finished and waits for PATH.go before it runs the first program.
+finished and waits for PATH.go before it runs the first program. SIGINT
+or SIGTERM while waiting exits before any program has run.
 
 The check runs its own executor requests. The extra coverage feature check
 opens a KCOV remote generation of its own, so an observer that reads
@@ -12,14 +13,27 @@ generation counters around the whole execprog process counts two
 generations for one program. The gate gives the observer a quiescent
 point between the two.
 ---
- tools/syz-execprog/execprog.go | 18 ++++++++++++++++++
- 1 file changed, 18 insertions(+)
+ tools/syz-execprog/execprog.go | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
 
 diff --git a/tools/syz-execprog/execprog.go b/tools/syz-execprog/execprog.go
-index a98365c..2f0f1da 100644
+index a98365c..1c421c4 100644
 --- a/tools/syz-execprog/execprog.go
 +++ b/tools/syz-execprog/execprog.go
-@@ -43,6 +43,8 @@ var (
+@@ -12,10 +12,12 @@ import (
+ 	"fmt"
+ 	"math/rand"
+ 	"os"
++	"os/signal"
+ 	"runtime"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ 
+ 	pkgfeatures "github.com/google/syzkaller/pkg/vminfo/features"
+@@ -43,6 +45,8 @@ var (
  	flagCoverFile   = flag.String("coverfile", "", "write coverage to the file")
  	flagRemoteCover = flag.Bool("remote-cover", true,
  		"collect extra/remote coverage (equivalent to experimental.remote_cover)")
@@ -28,7 +42,7 @@ index a98365c..2f0f1da 100644
  	flagRepeat     = flag.Int("repeat", 1, "repeat execution that many times (0 for infinite loop)")
  	flagProcs      = flag.Int("procs", 2*runtime.NumCPU(), "number of parallel processes to execute programs")
  	flagOutput     = flag.Bool("output", false, "write programs and results to stdout")
-@@ -231,9 +233,25 @@ func (ctx *Context) machineChecked(features flatrpc.Feature, syscalls map[*prog.
+@@ -231,9 +235,32 @@ func (ctx *Context) machineChecked(features flatrpc.Feature, syscalls map[*prog.
  		ctx.choiceTable = ctx.target.BuildChoiceTable(ctx.progs, syscalls)
  	}
  	ctx.defaultOpts.EnvFlags |= pkgfeatures.FeaturesToFlags(features, nil)
@@ -42,12 +56,19 @@ index a98365c..2f0f1da 100644
 +// check and the first program. Every check request has completed by now, and
 +// some of them (the extra coverage feature check) open their own KCOV remote
 +// generations, which must not be counted as the program's.
++// SIGINT or SIGTERM while waiting exits before any program has run.
 +func waitGate(gate string) {
++	interrupted, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
++	defer stop()
 +	if err := osutil.WriteFile(gate+".ready", nil); err != nil {
 +		log.Fatalf("failed to write gate file: %v", err)
 +	}
 +	for !osutil.IsExist(gate + ".go") {
-+		time.Sleep(10 * time.Millisecond)
++		select {
++		case <-interrupted.Done():
++			log.Fatalf("interrupted at the gate, no program was run")
++		case <-time.After(10 * time.Millisecond):
++		}
 +	}
 +}
 +
