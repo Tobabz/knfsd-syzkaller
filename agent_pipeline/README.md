@@ -43,10 +43,12 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `controller/store.py` | SQLite: one transaction per transition |
 | `controller/service.py` | events in, tasks out after commit; `poll()` and `recover()` send a failed or unanswered call again (each failure is recorded per job in `effect_failures`, and the other jobs go on); `replay()` |
 | `controller/tasks.py` | the Runner and Agent executor task contracts (09 §8) |
+| `stage1/` | the wired service: Controller + `QueuedAgentExecutor` + durable Runner worker + host-command execution engine + Q1 authority publication, and its CLI. See [`stage1/README.md`](stage1/README.md) |
 
 ## Using the artifact-backed components
 
-These are injectable library components, not a runnable pipeline service.
+These are injectable library components. `stage1/` assembles them into a
+runnable Stage 1 service.
 Persist typed records with `data.put_record(store, record)` and retain the
 returned digest; `load_record` checks the stored bytes against both that
 digest and the requested schema. The catalog digest is its HCAP revision.
@@ -165,7 +167,11 @@ Tests cover corrupt/missing artifacts, noncanonical records, conflicting
 correlation and versions, HCAP scope restrictions, Q1 precedence and loss
 policies. Controller integration tests use the real HCAP checker and sealed Q1
 adapter, including event replay; they still use fake Agent, Materializer and
-Runner execution. All coverage and mappings in those tests are synthetic.
+Runner execution. `test_stage1_service.py` runs the wired service end to end
+with the real Controller, Agent executor, Materializer, durable Runner,
+process supervisor, sealing backend and Q1 bridge; only model responses, the
+parser and the host command's capture are synthetic. All coverage and
+mappings in those tests are synthetic.
 
 Candidate Analysis and Reachability Planning can use the concrete
 `PydanticAIRuntime`. The lock pins `pydantic-ai-slim==2.55.0`; the dev group
@@ -188,8 +194,8 @@ an HTTP mock without sending live provider requests. Importing the base
 [`PYDANTIC_AI_RUNTIME.md`](agent_tasks/PYDANTIC_AI_RUNTIME.md) for factory,
 deadline and response-identity requirements.
 
-Also not here yet: broader NFS resource-provenance extraction, a concrete
-VM/KCOV execution engine with process/resource supervision wired in, raw
+Also not here yet: broader NFS resource-provenance extraction, the VM lane
+collector behind the `stage1` host command, raw
 KCOV/counter collection and normalization, automatic DWARF/runtime-PC mapping,
 Runner-receipt integration for Q2, approved production HCAP/judge data, and Stage 2 Controller/Runner
 integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
