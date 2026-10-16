@@ -38,7 +38,10 @@ from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
 from agent_pipeline.stage1.host.generate import generate, series_fingerprint
-from agent_pipeline.stage1.host.target_pcs import (parse_addr2line,
+from agent_pipeline.stage1.host.target_pcs import (CallbackSites,
+                                                   build_mapping, check_pcs,
+                                                   parse_addr2line,
+                                                   parse_branches,
                                                    parse_callsites,
                                                    path_matches)
 
@@ -280,8 +283,12 @@ def test_objdump_and_addr2line_parsing():
              "<__sanitizer_cov_trace_pc>",
              "ffffffff81000015:\tcall   ffffffff81b00000 <kfree>",
              "ffffffff81000020:\tcall   ffffffff81a00000 "
-             "<__sanitizer_cov_trace_pc+0x4>"]
+             "<__sanitizer_cov_trace_pc+0x4>",
+             "ffffffff81000030:\tjmp    ffffffff81a00000 "
+             "<__sanitizer_cov_trace_pc>"]
     assert list(parse_callsites(lines)) == [0xffffffff81000010]
+    assert list(parse_branches(lines)) == [("call", 0xffffffff81000010),
+                                           ("jmp", 0xffffffff81000030)]
     frames = parse_addr2line(
         "0xffffffff81000010\nhelper\n/b/include/x.h:7\n"
         "nfsd4_open\n/b/fs/nfsd/nfs4proc.c:120 (discriminator 2)\n"
@@ -290,6 +297,21 @@ def test_objdump_and_addr2line_parsing():
     assert frames[0xffffffff81000020][0].line is None
     assert path_matches("/b/fs/nfsd/nfs4proc.c", "fs/nfsd/nfs4proc.c")
     assert not path_matches("/b/fs/nfsd/xnfs4proc.c", "fs/nfsd/nfs4proc.c")
+
+
+def test_mapping_refuses_a_vmlinux_with_callback_tail_jumps(tmp_path):
+    # A tail jump makes KCOV record the caller's return address, so the
+    # call-site mapping would silently miss the paths behind it.
+    sha = "a" * 64
+    (tmp_path / f"kcov-sites-{sha}.json").write_text(json.dumps(
+        {"callsites": [0x1000], "tail_jumps": 3}))
+    target = SimpleNamespace(path="fs/nfsd/x.c", start_line=1, end_line=2)
+    with pytest.raises(RuntimeError, match="3 tail jumps"):
+        build_mapping(tmp_path / "vmlinux", target, None, sha,
+                      cache=tmp_path)
+    assert check_pcs([0x1000], CallbackSites([0x1000], 3)) == {
+        "published": 1, "callsites": 1, "callsite_plus_5": 0,
+        "callback_tail_jumps": 3}
 
 
 # ------------------------------------------------------------ generation

@@ -175,7 +175,8 @@ def cmd_check_pcs(args) -> int:
     cache = args.cache or Path(config.state_dir) / "target-pcs-cache"
     report = check_pcs(pcs, vmlinux_callsites(vmlinux, cache, pin.sha256))
     print(json.dumps(report))
-    ok = report["published"] and report["callsites"] == report["published"]
+    ok = (report["published"] and not report["callback_tail_jumps"]
+          and report["callsites"] == report["published"])
     return 0 if ok else 1
 
 

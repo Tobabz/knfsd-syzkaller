@@ -108,9 +108,13 @@ guest. Read `probe-1/probe.json`:
    (`phase5_stats.remote_refs`). The `judge_profile` counters must use
    these labels. A counter that is missing makes a miss INCONCLUSIVE; a
    hit is unaffected.
-4. **PC form.** `check-pcs` should report `callsites == published`. If
-   `callsite_plus_5` matches instead, the coverage file holds return
-   addresses, and `target-pcs` must shift its PCs to match.
+4. **PC form.** `check-pcs` should report `callsites == published` and
+   `callback_tail_jumps` 0. A GCC tail jump to `__sanitizer_cov_trace_pc`
+   makes KCOV record the caller's return address instead of a call site;
+   kernel patch 0005 builds KCOV objects with `-fno-optimize-sibling-calls`
+   so there are none, and `target-pcs` refuses a vmlinux that still has
+   them. If `callsite_plus_5` matches instead, the coverage file holds
+   return addresses, and `target-pcs` must shift its PCs to match.
 
 ## How the pieces bind
 

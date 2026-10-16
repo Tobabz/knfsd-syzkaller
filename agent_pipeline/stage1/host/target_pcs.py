@@ -12,6 +12,13 @@ coverage call sites whose source position is in the target's range:
 3. keep the call sites with a frame in the target file whose line is in
    the intake-resolved ``[start_line, end_line]``.
 
+A ``jmp __sanitizer_cov_trace_pc`` (GCC's sibling-call optimization of a
+callback at a function's end) breaks step 1: the callback then records the
+return address in the instrumented function's caller, which is not a call
+site.  Kernel patch 0005 builds KCOV objects with
+``-fno-optimize-sibling-calls``; mapping refuses a vmlinux that still has
+such jumps instead of silently missing the paths behind them.
+
 With ``nokaslr`` the runtime PC is the link address, so no relocation is
 applied.  ``check`` reports how many published PCs are call sites, which is
 the quick test that the coverage file and this mapping use the same form.
@@ -31,7 +38,8 @@ from ...q1 import CandidateTarget, KernelIdentity, TargetPcMapping
 
 METHOD = "kcov-callsite-addr2line-inline.v1"
 CALLBACK = "__sanitizer_cov_trace_pc"
-_CALL = re.compile(r"^\s*([0-9a-f]+):\s+call\S*\s+[0-9a-f]+ <([^>+]+)>")
+_BRANCH = re.compile(
+    r"^\s*([0-9a-f]+):\s+(call|jmp)\S*\s+[0-9a-f]+ <([^>+]+)>")
 _LOCATION = re.compile(r"^(.*):(\d+|\?)(?: \(discriminator \d+\))?$")
 
 
@@ -45,10 +53,18 @@ class Frame:
 def parse_callsites(lines: Iterable[str],
                     callback: str = CALLBACK) -> Iterator[int]:
     """``objdump -d --no-show-raw-insn`` lines -> call-site addresses."""
+    for kind, pc in parse_branches(lines, callback):
+        if kind == "call":
+            yield pc
+
+
+def parse_branches(lines: Iterable[str],
+                   callback: str = CALLBACK) -> Iterator[tuple[str, int]]:
+    """``(call|jmp, address)`` of every direct branch to ``callback``."""
     for line in lines:
-        m = _CALL.match(line)
-        if m and m.group(2) == callback:
-            yield int(m.group(1), 16)
+        m = _BRANCH.match(line)
+        if m and m.group(3) == callback:
+            yield m.group(2), int(m.group(1), 16)
 
 
 def iter_addr2line(lines: Iterable[str]) -> Iterator[tuple[int, list[Frame]]]:
@@ -104,24 +120,38 @@ def select_target_pcs(frames: dict[int, list[Frame]],
                         if frame_hits(chain, target)))
 
 
+@dataclass(frozen=True)
+class CallbackSites:
+    callsites: list[int]
+    #: ``jmp`` to the callback: coverage there is not call-site form.
+    tail_jumps: int
+
+
 def vmlinux_callsites(vmlinux: Path, cache: Path | None,
                       vmlinux_sha256: str,
-                      objdump: str = "objdump") -> list[int]:
+                      objdump: str = "objdump") -> CallbackSites:
     if cache is not None:
-        cached = cache / f"callsites-{vmlinux_sha256}.json"
+        cached = cache / f"kcov-sites-{vmlinux_sha256}.json"
         if cached.is_file():
-            return json.loads(cached.read_text())
+            return CallbackSites(**json.loads(cached.read_text()))
     proc = subprocess.Popen(
         [objdump, "-d", "--no-show-raw-insn", str(vmlinux)],
         stdout=subprocess.PIPE, text=True, bufsize=1 << 20)
     assert proc.stdout is not None
+    calls, jumps = set(), 0
     with proc.stdout:
-        sites = sorted(set(parse_callsites(proc.stdout)))
+        for kind, pc in parse_branches(proc.stdout):
+            if kind == "call":
+                calls.add(pc)
+            else:
+                jumps += 1
     if proc.wait() != 0:
         raise RuntimeError(f"objdump failed on {vmlinux}")
+    sites = CallbackSites(callsites=sorted(calls), tail_jumps=jumps)
     if cache is not None:
         cache.mkdir(parents=True, exist_ok=True)
-        cached.write_text(json.dumps(sites))
+        cached.write_text(json.dumps({"callsites": sites.callsites,
+                                      "tail_jumps": sites.tail_jumps}))
     return sites
 
 
@@ -151,11 +181,17 @@ def build_mapping(vmlinux: Path, target: CandidateTarget,
                   identity: KernelIdentity, vmlinux_file_sha256: str, *,
                   cache: Path | None = None, objdump: str = "objdump",
                   addr2line: str = "addr2line") -> TargetPcMapping:
-    sites = vmlinux_callsites(vmlinux, cache, vmlinux_file_sha256, objdump)
-    if not sites:
+    found = vmlinux_callsites(vmlinux, cache, vmlinux_file_sha256, objdump)
+    if found.tail_jumps:
+        raise RuntimeError(
+            f"{vmlinux} has {found.tail_jumps} tail jumps to {CALLBACK}; "
+            "their coverage is a caller's return address, not a call site, "
+            "so this mapping would miss the paths behind them. Rebuild the "
+            "kernel with patch 0005 (-fno-optimize-sibling-calls)")
+    if not found.callsites:
         raise RuntimeError(f"no {CALLBACK} call sites in {vmlinux}; "
                            "is it a KCOV build?")
-    pcs = target_callsites(vmlinux, sites, target, addr2line)
+    pcs = target_callsites(vmlinux, found.callsites, target, addr2line)
     if not pcs:
         raise RuntimeError(
             f"no coverage call site maps to {target.path}:"
@@ -164,12 +200,14 @@ def build_mapping(vmlinux: Path, target: CandidateTarget,
                            target=target, identity=identity, target_pcs=pcs)
 
 
-def check_pcs(published: Iterable[int], sites: Iterable[int]) -> dict:
-    """How the published PCs relate to the coverage call sites.  Call-site
-    form should match almost all; return-address form (site + 5 on amd64)
-    means the coverage file and the mapping disagree."""
+def check_pcs(published: Iterable[int], found: CallbackSites) -> dict:
+    """How the published PCs relate to the coverage call sites.  Every one
+    should be a call site; return-address form (site + 5 on amd64) means
+    the coverage file and the mapping disagree, and tail jumps mean some
+    PCs are not call sites at all."""
     published = set(published)
-    sites = set(sites)
+    sites = set(found.callsites)
     return {"published": len(published),
             "callsites": len(published & sites),
-            "callsite_plus_5": len({pc - 5 for pc in published} & sites)}
+            "callsite_plus_5": len({pc - 5 for pc in published} & sites),
+            "callback_tail_jumps": found.tail_jumps}

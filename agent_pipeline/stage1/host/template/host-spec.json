@@ -39,7 +39,8 @@
       "constraints": [
         "lane client is 0 or 1",
         "profile open only for profiles the fixture exposes (single: knfsd-<version>)",
-        "filesystem syscalls take a lane fd as their first argument"
+        "filesystem syscalls take a lane fd as their first argument",
+        "open the lane with both const arguments, exactly: r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0) or r0 = syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1)"
       ],
       "status": "validated_subset",
       "scope": [
