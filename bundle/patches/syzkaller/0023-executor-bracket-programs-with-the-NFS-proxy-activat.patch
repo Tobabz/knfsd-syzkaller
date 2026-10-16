@@ -1,4 +1,4 @@
-From 438ac18981127d11f25b2c7b969249baf9c58c74 Mon Sep 17 00:00:00 2001
+From b7422bf49c3512a1e67f2383386b9cf14ab5b3c2 Mon Sep 17 00:00:00 2001
 From: idealinsane <idealinsane@localhost>
 Date: Fri, 16 Oct 2026 13:43:53 +0000
 Subject: [PATCH] executor: bracket programs with the NFS proxy activation
@@ -31,8 +31,9 @@ For every execution with a managed remote-coverage generation:
   as ./cgroup (or a private one when the sandbox cannot reach that),
   and the fork server stays out of it.  The cgroup is a boundary only
   with nsdelegate and when programs cannot re-enter the fork server's
-  cgroup namespace, so the fork server is not dumpable (programs have
-  no CAP_SYS_PTRACE), and target mode probes it and fails when a
+  cgroup namespace, so the fork server is not dumpable and drops
+  CAP_SYS_PTRACE from the bounding set too (programs run as root, and
+  an execve would refill it), and target mode probes it and fails when a
   program process could leave it either way; the executor's own
   cgroup2 mounts keep the system's hierarchy-wide options (nsdelegate)
   instead of resetting them;
@@ -62,18 +63,18 @@ never mutated.
 ---
  executor/common.h                     |  30 +-
  executor/common_linux.h               |  48 +-
- executor/executor.cc                  | 416 ++++++++++++++++-
+ executor/executor.cc                  | 420 ++++++++++++++++-
  executor/executor_runner.h            |  14 +
- executor/nfs_proxy_activation.h       | 626 ++++++++++++++++++++++++++
- executor/nfs_proxy_activation_test.go | 226 ++++++++++
- executor/test.h                       | 412 +++++++++++++++++
+ executor/nfs_proxy_activation.h       | 641 ++++++++++++++++++++++++++
+ executor/nfs_proxy_activation_test.go | 237 ++++++++++
+ executor/test.h                       | 433 +++++++++++++++++
  pkg/flatrpc/flatrpc.fbs               |  32 ++
  pkg/flatrpc/flatrpc.go                | 300 +++++++++++-
  pkg/flatrpc/flatrpc.h                 | 271 ++++++++++-
  pkg/flatrpc/helpers.go                |   6 +
  pkg/flatrpc/nfs_proxy_test.go         |  48 ++
  tools/syz-execprog/execprog.go        |  16 +
- 13 files changed, 2421 insertions(+), 24 deletions(-)
+ 13 files changed, 2472 insertions(+), 24 deletions(-)
  create mode 100644 executor/nfs_proxy_activation.h
  create mode 100644 executor/nfs_proxy_activation_test.go
  create mode 100644 pkg/flatrpc/nfs_proxy_test.go
@@ -238,7 +239,7 @@ index ae5bd713c..50024b927 100644
  	      procid, source);
  }
 diff --git a/executor/executor.cc b/executor/executor.cc
-index 9a6895f01..160594348 100644
+index 9a6895f01..d8c452b75 100644
 --- a/executor/executor.cc
 +++ b/executor/executor.cc
 @@ -26,6 +26,10 @@
@@ -388,7 +389,7 @@ index 9a6895f01..160594348 100644
  	if (close(kOutFd) < 0)
  		fail("failed to close kOutFd");
  #endif
-@@ -966,6 +1028,306 @@ void execute_glob()
+@@ -966,6 +1028,310 @@ void execute_glob()
  	output_data->result_offset.store(off, std::memory_order_release);
  }
  
@@ -456,7 +457,7 @@ index 9a6895f01..160594348 100644
 +// then cannot leave it, 1 when it cannot join it, 2 when it can move to
 +// `outside` (cgroup2 without nsdelegate), 3 when it can re-enter the fork
 +// server's cgroup namespace (the fork server is dumpable, or the program has
-+// CAP_SYS_PTRACE).
++// CAP_SYS_PTRACE), 4 when an execve would give it CAP_SYS_PTRACE back.
 +static int nfsp_cgroup_probe(int dir, int outside)
 +{
 +	int pid = fork();
@@ -468,7 +469,9 @@ index 9a6895f01..160594348 100644
 +		if (nfsp_cg_write(outside, "cgroup.procs", "0"))
 +			doexit(2);
 +		// Still before the chroot: /proc is not the sandbox's, a pidfd is.
-+		doexit(nfsp_cg_reenter(getppid(), 0) ? 3 : 0);
++		if (nfsp_cg_reenter(getppid(), 0))
++			doexit(3);
++		doexit(prctl(PR_CAPBSET_READ, NFSP_CAP_SYS_PTRACE, 0, 0, 0) != 0 ? 4 : 0);
 +	}
 +	int status = 0;
 +	while (waitpid(pid, &status, __WALL) != pid) {
@@ -485,6 +488,8 @@ index 9a6895f01..160594348 100644
 +			"path=%s", path);
 +	if (probe == 3)
 +		failmsg("NFS proxy program can re-enter the fork server's cgroup namespace", "path=%s", path);
++	if (probe == 4)
++		failmsg("NFS proxy program can regain CAP_SYS_PTRACE by execve", "path=%s", path);
 +}
 +
 +// The program cgroup.  With the cgroups feature it is the one programs see as
@@ -496,12 +501,12 @@ index 9a6895f01..160594348 100644
 +// (nfsp_cgroup_probe).
 +static void nfsp_setup_cgroup(const char* newroot)
 +{
-+	// This process becomes the fork server.  Not dumpable, its cgroup
-+	// namespace (/proc/1/ns/cgroup, a pidfd) is closed to programs, which
-+	// have no CAP_SYS_PTRACE (drop_caps).  Program processes are made
++	// This process becomes the fork server.  Its cgroup namespace
++	// (/proc/1/ns/cgroup, a pidfd) is closed to programs, which have no
++	// CAP_SYS_PTRACE, not even after an execve.  Program processes are made
 +	// dumpable again (nfsp_broker_child).
-+	if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0))
-+		fail("NFS proxy: making the fork server non-dumpable failed");
++	if (!nfsp_cg_seal_server())
++		fail("NFS proxy: sealing the fork server failed");
 +	char path[192];
 +	int dir = -1;
 +	if (flag_cgroups) {
@@ -695,7 +700,7 @@ index 9a6895f01..160594348 100644
  // execute_one executes program stored in input_data.
  void execute_one()
  {
-@@ -1021,6 +1383,22 @@ void execute_one()
+@@ -1021,6 +1387,22 @@ void execute_one()
  		}
  	}
  
@@ -718,7 +723,7 @@ index 9a6895f01..160594348 100644
  	int call_index = 0;
  	uint64 prog_extra_timeout = 0;
  	uint64 prog_extra_cover_timeout = 0;
-@@ -1029,6 +1407,8 @@ void execute_one()
+@@ -1029,6 +1411,8 @@ void execute_one()
  
  	read_input(&input_pos); // total number of calls
  	for (;;) {
@@ -727,7 +732,7 @@ index 9a6895f01..160594348 100644
  		uint64 call_num = read_input(&input_pos);
  		if (call_num == instr_eof)
  			break;
-@@ -1216,8 +1596,16 @@ void execute_one()
+@@ -1216,8 +1600,16 @@ void execute_one()
  		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
  		bool generation_resolved = false;
  #if GOOS_linux
@@ -745,7 +750,7 @@ index 9a6895f01..160594348 100644
  			// FINISH performs the bounded kernel-side root/token drain.  It is the
  			// publication barrier for remote extra coverage and synchronously
  			// materializes the committed snapshot before userspace consumes it.
-@@ -1576,7 +1964,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
+@@ -1576,7 +1968,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
  		}
  		calls[call.index] = call.offset;
  	}
@@ -798,10 +803,10 @@ index 231c9b87e..c4733a940 100644
  		msg_.reset();
 diff --git a/executor/nfs_proxy_activation.h b/executor/nfs_proxy_activation.h
 new file mode 100644
-index 000000000..c5f6ce33a
+index 000000000..1b17f7166
 --- /dev/null
 +++ b/executor/nfs_proxy_activation.h
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,641 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -839,6 +844,7 @@ index 000000000..c5f6ce33a
 +#include <stdint.h>
 +#include <stdio.h>
 +#include <string.h>
++#include <sys/prctl.h>
 +#include <sys/socket.h>
 +#include <sys/syscall.h>
 +#include <time.h>
@@ -1326,14 +1332,28 @@ index 000000000..c5f6ce33a
 +// (cgroup.procs and CLONE_INTO_CGROUP need the common ancestor inside the
 +// namespace, which takes nsdelegate).  The fork server is not dumpable, so a
 +// program, which has no CAP_SYS_PTRACE, cannot open its cgroup namespace
-+// (/proc/1/ns/cgroup, a pidfd) to re-enter it.  Freezing the cgroup is not
++// (/proc/1/ns/cgroup, a pidfd) to re-enter it (nfsp_cg_seal_server).  Freezing the cgroup is not
 +// undone by SIGCONT, and killing it reaches every task; it is empty only after
 +// each task ran its exit, which closes its descriptors.
 +
 +#define NFSP_CLONE_NEWCGROUP 0x02000000
++#define NFSP_CAP_SYS_PTRACE 19
 +#ifndef __NR_pidfd_open
 +#define __NR_pidfd_open 434
 +#endif
++
++// Fork server, before any program: make its cgroup namespace unreachable to
++// programs.  Not dumpable, /proc/<pid>/ns and pidfds of it need
++// CAP_SYS_PTRACE.  Programs run as root, and an execve gives a root process
++// the bounding set's capabilities back, so CAP_SYS_PTRACE also leaves the
++// bounding set (removing it from the current sets alone does not survive
++// exec).  Both are inherited by every program process.
++static int nfsp_cg_seal_server(void)
++{
++	return !prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) &&
++	       (!prctl(PR_CAPBSET_DROP, NFSP_CAP_SYS_PTRACE, 0, 0, 0) ||
++		prctl(PR_CAPBSET_READ, NFSP_CAP_SYS_PTRACE, 0, 0, 0) == 0);
++}
 +
 +static int nfsp_cg_write(int dir, const char* file, const char* value)
 +{
@@ -1430,10 +1450,10 @@ index 000000000..c5f6ce33a
 +#endif // NFS_PROXY_ACTIVATION_H
 diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
 new file mode 100644
-index 000000000..9a41eed95
+index 000000000..3c1da7acf
 --- /dev/null
 +++ b/executor/nfs_proxy_activation_test.go
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,237 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -1633,7 +1653,7 @@ index 000000000..9a41eed95
 +func TestNfsProxyProgramCgroupIsABoundary(t *testing.T) {
 +	setup := nfspSection(t, "executor.cc", "static void nfsp_setup_cgroup(const char* newroot)\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_setup_cgroup", setup,
-+		"prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)",
++		"nfsp_cg_seal_server()",
 +		"nfsp_cgroup_probe(dir, outside)",
 +		// An unreachable feature cgroup falls back to a private one.
 +		"if (probe == 1) {",
@@ -1647,7 +1667,8 @@ index 000000000..9a41eed95
 +	nfspRequireOrder(t, "nfsp_cgroup_probe", probe,
 +		"nfsp_cg_join(dir)",
 +		`if (nfsp_cg_write(outside, "cgroup.procs", "0"))`,
-+		"nfsp_cg_reenter(getppid(), 0) ? 3 : 0",
++		"nfsp_cg_reenter(getppid(), 0)",
++		"PR_CAPBSET_READ, NFSP_CAP_SYS_PTRACE",
 +	)
 +	child := nfspSection(t, "executor.cc", "static void nfsp_broker_child()\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_broker_child", child,
@@ -1660,11 +1681,21 @@ index 000000000..9a41eed95
 +		`mount("none", "/syzcgroup/unified", "cgroup2", 0, opts[0] ? opts : NULL)`,
 +	)
 +}
++
++// The fork server's seal survives a program's execve: CAP_SYS_PTRACE leaves
++// the bounding set, not only the current sets.
++func TestNfsProxySealSurvivesExec(t *testing.T) {
++	seal := nfspSection(t, "nfs_proxy_activation.h", "static int nfsp_cg_seal_server(void)\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_cg_seal_server", seal,
++		"PR_SET_DUMPABLE, 0",
++		"PR_CAPBSET_DROP, NFSP_CAP_SYS_PTRACE",
++	)
++}
 diff --git a/executor/test.h b/executor/test.h
-index 437bf01d9..e5c3d6de8 100644
+index 437bf01d9..9c039b3ef 100644
 --- a/executor/test.h
 +++ b/executor/test.h
-@@ -414,6 +414,412 @@ static int test_get_last_opt()
+@@ -414,6 +414,432 @@ static int test_get_last_opt()
  	return 0;
  }
  
@@ -1986,19 +2017,25 @@ index 437bf01d9..e5c3d6de8 100644
 +		printf("mmap failed\n");
 +		return 1;
 +	}
-+	// A fork server set up as in target mode (no CAP_SYS_PTRACE, drop_caps;
-+	// not dumpable, nfsp_setup_cgroup) and its program, which tries to enter
-+	// the fork server's cgroup namespace.  Exit status 0: refused.
++	// A fork server set up as in target mode (drop_caps, nfsp_cg_seal_server)
++	// and its program, which tries to enter the fork server's cgroup namespace,
++	// then execs itself (as test_nfsp_reenter) and tries again: a root execve
++	// refills capabilities from the bounding set.  Exit status 0: refused.
 +	int server = fork();
 +	if (server == 0) {
 +		drop_caps();
-+		prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
++		if (!nfsp_cg_seal_server())
++			doexit(4);
 +		int program = fork();
 +		if (program == 0) {
 +			if (!nfsp_cg_join(dir))
 +				doexit(2);
 +			prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
-+			doexit(nfsp_cg_reenter(getppid(), 1));
++			if (nfsp_cg_reenter(getppid(), 1))
++				doexit(1);
++			const char* env[] = {"SYZ_NFSP_REENTER=1", NULL};
++			execle("/proc/self/exe", "syz-executor", "test", "test_nfsp_reenter", NULL, env);
++			doexit(3);
 +		}
 +		int status = 0;
 +		waitpid(program, &status, __WALL);
@@ -2009,6 +2046,8 @@ index 437bf01d9..e5c3d6de8 100644
 +	reentry = WIFEXITED(reentry) ? WEXITSTATUS(reentry) : 3;
 +	if (reentry)
 +		printf("re-entering the fork server's cgroup namespace: %d (1: it succeeded)\n", reentry);
++	// The exec'd program's own cgroup is empty again.
++	nfsp_cg_empty(dir, 1000);
 +	int pid = fork();
 +	if (pid == 0) {
 +		if (!nfsp_cg_join(dir))
@@ -2074,10 +2113,22 @@ index 437bf01d9..e5c3d6de8 100644
 +}
 +#endif
 +
++// test_nfsp_cgroup's program after its execve: whether it can now enter its
++// fork server's cgroup namespace.  Skipped when run on its own.
++static int test_nfsp_reenter()
++{
++	if (!getenv("SYZ_NFSP_REENTER"))
++		return -1;
++	if (!nfsp_cg_reenter(getppid(), 1))
++		return 0;
++	printf("after execve the program entered its fork server's cgroup namespace\n");
++	return 1;
++}
++
  static struct {
  	const char* name;
  	int (*f)();
-@@ -430,6 +836,12 @@ static struct {
+@@ -430,6 +856,13 @@ static struct {
      {"test_cover_filter", test_cover_filter},
      {"test_glob", test_glob},
      {"test_get_last_opt", test_get_last_opt},
@@ -2086,6 +2137,7 @@ index 437bf01d9..e5c3d6de8 100644
 +    {"test_nfsp_barrier", test_nfsp_barrier},
 +    {"test_nfsp_broker", test_nfsp_broker},
 +    {"test_nfsp_cgroup", test_nfsp_cgroup},
++    {"test_nfsp_reenter", test_nfsp_reenter},
 +#endif
  };
  
