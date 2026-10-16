@@ -391,6 +391,17 @@ enum nfsp_txn_result nfsp_txn_reply(struct nfsp_txn *t,
 	return NFSP_TXN_EXPIRED_ENTRY;
 }
 
+int nfsp_txn_mark_forwarded(struct nfsp_txn *t, const struct nfsp_txn_key *key,
+			    enum nfsp_txn_forwarded forwarded)
+{
+	int32_t i = find(t, key);
+
+	if (i == NONE)
+		return -1;
+	E(t, i)->forwarded = forwarded;
+	return 0;
+}
+
 void nfsp_txn_dispatch(const struct nfsp_txn_entry *e,
 		       struct nfsp_reply_dispatch *rd)
 {
@@ -406,15 +417,26 @@ void nfsp_txn_dispatch(const struct nfsp_txn_entry *e,
 
 void nfsp_txn_connection_closed(struct nfsp_txn *t, uint64_t connection_id)
 {
+	nfsp_txn_connection_closed_cb(t, connection_id, NULL, NULL);
+}
+
+void nfsp_txn_connection_closed_cb(struct nfsp_txn *t, uint64_t connection_id,
+				   void (*dropped)(uint64_t generation,
+						   void *arg),
+				   void *arg)
+{
 	for (uint32_t i = 0; i < t->nslots; i++) {
 		struct nfsp_txn_entry *e = &t->slots[i];
 
 		if (!e->used || e->key.connection_id != connection_id)
 			continue;
-		if (e->outstanding)
+		if (e->outstanding) {
 			t->stats.expired_connection_closed++;
-		else
+			if (dropped != NULL && e->activation_generation != 0)
+				dropped(e->activation_generation, arg);
+		} else {
 			t->stats.retired++;
+		}
 		free_slot(t, (int32_t)i);
 	}
 }

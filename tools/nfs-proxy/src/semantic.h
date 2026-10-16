@@ -82,6 +82,14 @@ struct nfsp_semantic {
 	void *clock_arg;
 	void (*on_decoded)(const struct nfsp_semantic_event *ev, void *arg);
 	void *on_decoded_arg;
+	/* The activation_generation a CALL's new entry takes (txn.h): zero
+	 * outside any activation window.  Target mode sets it for each CALL
+	 * from the activation component before handing the record over. */
+	uint64_t call_generation;
+	/* Target mode: each awaiting entry a closed connection drops, with
+	 * its generation, so the activation component can account it. */
+	void (*on_dropped)(uint64_t generation, void *arg);
+	void *on_dropped_arg;
 
 	struct nfsp_txn txn;
 	struct nfsp_decoded_msg msg;

@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
@@ -856,8 +857,13 @@ static void rpc_call(uint8_t *p, uint32_t xid)
 	}
 }
 
-/* One raw backend behind both routes, observed by observe_record. */
-static int raw_proxy_up(struct fixture *f, struct raw_backend *rb, struct observed *o)
+struct holder;
+static void holder_install(struct nfsp_proxy_cfg *cfg, struct holder *h);
+
+/* One raw backend behind both routes, observed by observe_record, or by the
+ * target-mode relay hooks of `h` when it is not NULL. */
+static int raw_proxy_up(struct fixture *f, struct raw_backend *rb, struct observed *o,
+			struct holder *h)
 {
 	struct sockaddr_in sa = {0};
 	socklen_t slen = sizeof(sa);
@@ -882,6 +888,8 @@ static int raw_proxy_up(struct fixture *f, struct raw_backend *rb, struct observ
 	f->cfg.connect_timeout_ms = 500;
 	f->cfg.on_rpc_record = observe_record;
 	f->cfg.on_rpc_record_arg = o;
+	if (h != NULL)
+		holder_install(&f->cfg, h);
 	f->cfg.on_connection = log_conn;
 	f->cfg.on_connection_arg = &f->conns;
 	if (pthread_create(&f->proxy_thread, NULL, run_proxy, f) != 0) return -1;
@@ -932,7 +940,7 @@ static void test_rpc_record_observer(void)
 	off += 44;
 	rb.want = off;
 
-	if (raw_proxy_up(&f, &rb, &o) != 0) { CHECK(0, "proxy setup"); return; }
+	if (raw_proxy_up(&f, &rb, &o, NULL) != 0) { CHECK(0, "proxy setup"); return; }
 	fd = client_socket(&f, 1, 0);
 	CHECK(fd >= 0, "client connect");
 	if (fd >= 0)
@@ -985,7 +993,7 @@ static void test_rpc_record_refusal(void)
 	o.refuse = 1;
 	stamp(wire, 40);
 	rpc_call(wire + 4, 1);
-	if (raw_proxy_up(&f, &rb, &o) != 0) { CHECK(0, "proxy setup"); return; }
+	if (raw_proxy_up(&f, &rb, &o, NULL) != 0) { CHECK(0, "proxy setup"); return; }
 	fd = client_socket(&f, 0, 0);
 	CHECK(fd >= 0, "client connect");
 	if (fd >= 0) {
@@ -1004,6 +1012,217 @@ static void test_rpc_record_refusal(void)
 	      "record_refused=%u records=%u", f.stats.record_refused,
 	      f.stats.records[0][0][0]);
 	CHECK(atomic_load(&f.conns.nclosed) == 1, "refusal did not close the ConnectionRef");
+}
+
+
+/* Target-mode relay hooks (M5): the first C2S record is held until the test
+ * releases it through a descriptor the loop polls, then forwarded changed
+ * with a completion token.  The records behind it in the same direction
+ * must wait for it, in order, and the peer must see nothing before. */
+static void sleep_ms(long ms)
+{
+	struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
+	while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+}
+
+struct holder {
+	int pipe[2];
+	_Atomic int released;
+	_Atomic unsigned relayed, holds_offered, forwarded, complete;
+	_Atomic uint64_t completion;
+	_Atomic size_t written;
+	uint8_t changed[44];
+	int drop;		/* second test: refuse on release instead */
+	_Atomic unsigned dropped;
+};
+
+static int holder_relay(const struct nfsp_rpc_record *r, const uint8_t *framed,
+			size_t len, struct nfsp_relay_verdict *v, void *arg)
+{
+	struct holder *h = arg;
+	unsigned n = atomic_fetch_add(&h->relayed, 1u);
+	(void)r;
+	if (n != 0 || len != sizeof(h->changed))
+		return NFSP_RELAY_FORWARD;
+	memcpy(h->changed, framed, len);
+	h->changed[4] ^= 0xffu;		/* the xid's first byte */
+	v->hold = 7;
+	return NFSP_RELAY_HOLD;
+}
+
+static int holder_hold(uint64_t token, const uint8_t *framed, size_t len,
+		       struct nfsp_relay_verdict *v, void *arg)
+{
+	struct holder *h = arg;
+	(void)framed;
+	atomic_fetch_add(&h->holds_offered, 1u);
+	if (token != 7 || len != sizeof(h->changed))
+		return NFSP_RELAY_REFUSE;
+	if (!atomic_load(&h->released))
+		return NFSP_RELAY_HOLD;
+	if (h->drop)
+		return NFSP_RELAY_REFUSE;
+	v->out = h->changed;
+	v->out_len = sizeof(h->changed);
+	v->completion = 42;
+	return NFSP_RELAY_FORWARD;
+}
+
+static void holder_dropped(uint64_t token, void *arg)
+{
+	struct holder *h = arg;
+	if (token == 7)
+		atomic_fetch_add(&h->dropped, 1u);
+}
+
+static void holder_forwarded(uint64_t completion, int complete, size_t written,
+			     size_t len, void *arg)
+{
+	struct holder *h = arg;
+	(void)len;
+	atomic_store(&h->completion, completion);
+	atomic_store(&h->written, written);
+	atomic_fetch_add(&h->forwarded, 1u);
+	if (complete)
+		atomic_fetch_add(&h->complete, 1u);
+}
+
+static size_t holder_fds(struct pollfd *fds, size_t max, void *arg)
+{
+	struct holder *h = arg;
+	if (max == 0)
+		return 0;
+	fds[0].fd = h->pipe[0];
+	fds[0].events = POLLIN;
+	fds[0].revents = 0;
+	return 1;
+}
+
+static void holder_tick(void *arg)
+{
+	struct holder *h = arg;
+	char c;
+	if (read(h->pipe[0], &c, 1) == 1)
+		atomic_store(&h->released, 1);
+}
+
+static void holder_install(struct nfsp_proxy_cfg *cfg, struct holder *h)
+{
+	cfg->on_rpc_record = NULL;
+	cfg->on_relay = holder_relay;
+	cfg->on_hold = holder_hold;
+	cfg->on_hold_dropped = holder_dropped;
+	cfg->on_forwarded = holder_forwarded;
+	cfg->poll_fds = holder_fds;
+	cfg->relay_arg = h;
+	cfg->on_tick = holder_tick;
+	cfg->on_tick_arg = h;
+}
+
+static void hold_case(int drop)
+{
+	struct raw_backend rb = {0};
+	struct fixture f;
+	struct observed o = {0};
+	struct holder h;
+	uint8_t wire[3 * 44], want[3 * 44];
+	int fd;
+
+	printf("a held record blocks its direction until decided (%s)\n",
+	       drop ? "refused" : "forwarded changed");
+	memset(&h, 0, sizeof(h));
+	h.drop = drop;
+	if (pipe(h.pipe) != 0) { CHECK(0, "pipe"); return; }
+	(void)fcntl(h.pipe[0], F_SETFL, O_NONBLOCK);
+	for (unsigned i = 0; i < 3; i++) {
+		stamp(wire + 44 * i, 40);
+		rpc_call(wire + 44 * i + 4, 0x10u + i);
+	}
+	rb.want = drop ? 1 : sizeof(wire);
+	if (raw_proxy_up(&f, &rb, &o, &h) != 0) { CHECK(0, "proxy setup"); return; }
+	fd = client_socket(&f, 0, 0);
+	CHECK(fd >= 0, "client connect");
+	if (fd >= 0)
+		CHECK(send(fd, wire, sizeof(wire), MSG_NOSIGNAL) == (ssize_t)sizeof(wire),
+		      "send");
+	sleep_ms(200);
+	CHECK(rb.got_len == 0, "peer got %zu bytes while the first record was held",
+	      rb.got_len);
+	CHECK(atomic_load(&h.relayed) == 1, "%u records relayed behind a hold",
+	      atomic_load(&h.relayed));
+	CHECK(write(h.pipe[1], "x", 1) == 1, "release");
+	if (drop && fd >= 0) {
+		uint8_t sink;
+		CHECK(recv(fd, &sink, 1, 0) <= 0, "a refused hold must close");
+	}
+	pthread_join(rb.thread, NULL);
+	if (fd >= 0) close(fd);
+	atomic_store(&f.stop, 1);
+	pthread_join(f.proxy_thread, NULL);
+	close(rb.listener);
+	pthread_mutex_destroy(&f.mutex);
+	pthread_cond_destroy(&f.cond);
+	close(h.pipe[0]);
+	close(h.pipe[1]);
+
+	if (drop) {
+		CHECK(rb.got_len == 0, "peer got %zu bytes of a refused hold", rb.got_len);
+		CHECK(atomic_load(&h.forwarded) == 0, "completion for nothing sent");
+		return;
+	}
+	memcpy(want, h.changed, 44);
+	memcpy(want + 44, wire + 44, 88);
+	CHECK(rb.got_len == sizeof(want) && memcmp(rb.got, want, sizeof(want)) == 0,
+	      "peer got %zu bytes, or not changed-first-then-in-order", rb.got_len);
+	CHECK(atomic_load(&h.relayed) == 3, "relayed %u", atomic_load(&h.relayed));
+	CHECK(atomic_load(&h.forwarded) == 1 && atomic_load(&h.complete) == 1 &&
+	      atomic_load(&h.completion) == 42 && atomic_load(&h.written) == 44,
+	      "completion: forwarded=%u complete=%u token=%llu written=%zu",
+	      atomic_load(&h.forwarded), atomic_load(&h.complete),
+	      (unsigned long long)atomic_load(&h.completion),
+	      atomic_load(&h.written));
+	CHECK(atomic_load(&h.dropped) == 0, "a forwarded hold was reported dropped");
+}
+
+static void test_relay_hold(void)
+{
+	hold_case(0);
+	hold_case(1);
+}
+
+/* A held record whose connection closes is reported dropped, never sent. */
+static void test_relay_hold_dropped(void)
+{
+	struct raw_backend rb = {0};
+	struct fixture f;
+	struct observed o = {0};
+	struct holder h;
+	uint8_t wire[44];
+	int fd;
+
+	printf("a held record of a closed connection is reported dropped\n");
+	memset(&h, 0, sizeof(h));
+	if (pipe(h.pipe) != 0) { CHECK(0, "pipe"); return; }
+	(void)fcntl(h.pipe[0], F_SETFL, O_NONBLOCK);
+	stamp(wire, 40);
+	rpc_call(wire + 4, 0x55u);
+	rb.want = 1;
+	if (raw_proxy_up(&f, &rb, &o, &h) != 0) { CHECK(0, "proxy setup"); return; }
+	fd = client_socket(&f, 0, 0);
+	CHECK(fd >= 0, "client connect");
+	if (fd >= 0) {
+		CHECK(send(fd, wire, sizeof(wire), MSG_NOSIGNAL) == (ssize_t)sizeof(wire),
+		      "send");
+		sleep_ms(100);
+		close(fd);
+	}
+	for (int i = 0; i < 100 && atomic_load(&h.dropped) == 0; i++)
+		sleep_ms(10);
+	raw_proxy_down(&f, &rb);
+	close(h.pipe[0]);
+	close(h.pipe[1]);
+	CHECK(atomic_load(&h.dropped) == 1, "dropped=%u", atomic_load(&h.dropped));
+	CHECK(rb.got_len == 0, "peer got %zu bytes", rb.got_len);
 }
 
 /* Exit status: 0 pass, 1 a check failed, 2 usage, 3 the fixture topology does
@@ -1040,6 +1259,8 @@ int main(int argc, char **argv)
 	test_connection_id_not_reused();
 	test_rpc_record_observer();
 	test_rpc_record_refusal();
+	test_relay_hold();
+	test_relay_hold_dropped();
 	printf("%u checks, %u failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

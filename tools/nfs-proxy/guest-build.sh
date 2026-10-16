@@ -20,7 +20,9 @@ gcc -std=c11 -O2 -g -pthread -Wall -Wextra -Werror -Wshadow \
     /src/rpc_record.c \
     /src/control.c /src/delta.c /src/walk.c /src/edit.c \
     /src/semantic.c /src/txn.c /src/nfs_decode.c /src/schema.c \
-    /src/schema_nfs4.c /src/schema_nfs3.c /src/rpc_decode.c
+    /src/schema_nfs4.c /src/schema_nfs3.c /src/rpc_decode.c \
+    /src/resolver.c /src/mutation_apply.c /src/activation.c /src/rule.c \
+    /src/target.c /src/journal.c /src/jsonw.c /src/sha256.c
 gcc -std=c11 -O2 -g -Wall -Wextra -Werror -Wshadow -Wconversion \
     -Wsign-conversion -Wpointer-arith -Wcast-qual -Wwrite-strings \
     -Wmissing-prototypes -Wstrict-prototypes -Wformat=2 \
@@ -72,6 +74,11 @@ validate_binary /work/guest-delta-replay replay-probe
         /src/nfs_decode.c /src/nfs_decode.h /src/schema.c /src/schema.h \
         /src/schema_nfs4.c /src/schema_nfs3.c /src/rpc_decode.c \
         /src/rpc_decode.h \
+        /src/resolver.c /src/resolver.h /src/mutation_apply.c \
+        /src/mutation_apply.h /src/activation.c /src/activation.h \
+        /src/rule.c /src/rule.h /src/target.c /src/target.h \
+        /src/journal.c /src/journal.h /src/jsonw.c /src/jsonw.h \
+        /src/sha256.c /src/sha256.h /src/concrete_edit.h \
         /test/guest-delta-replay.c
     sha256sum /work/nfs-proxy /work/guest-delta-replay
 } > /work/provenance.txt

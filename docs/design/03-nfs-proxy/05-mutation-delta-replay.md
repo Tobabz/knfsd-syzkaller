@@ -1267,8 +1267,8 @@ Q2는 crash/sanitizer evidence가 별도로 판단한다.
 ### 45. M5 host frame 및 ACK 계약 v1
 
 첫 구현은 `agent_pipeline/journal_framing.py`의 frame codec, bounded prefix reader와 ACK schema다.
-이 구현은 event payload admission, session/generation 상태 복원, durable writer 또는 live transport를
-아직 제공하지 않는다. frame 검증 성공이나 `JournalAck` 객체 생성은 `(D)`의 증명이 아니다.
+codec 자체는 event payload admission, session/generation 상태 복원, durable writer 또는 live transport를
+제공하지 않는다(그 부분은 아래 "M5 구현 (v1)"의 sink다). frame 검증 성공이나 `JournalAck` 객체 생성은 `(D)`의 증명이 아니다.
 
 **Frame layout.** 모든 정수는 unsigned big-endian이며 header는 80 bytes다.
 
@@ -1336,6 +1336,36 @@ host 값으로 덮어 성공시키지 않는다. channel 인증과 lifetime은 t
 draining 중 CALL 거부 및 REPLY 허용, summary 뒤 event 거부, short write/append 중 종료와 restart다.
 지금의 codec 검증은 모든 마지막 append 절단 위치와 frame 손상·한도·ACK canonicality를 검사한다.
 M5/S1b 완료와 M1 판정 연결은 실제 sink, guest transport, relay completion 및 봉인이 연결된 뒤에 판단한다.
+
+**M5 구현 (v1).** `agent_pipeline/journal_sink.py`(host sink)와 `tools/nfs-proxy/src/journal.c`,
+`target.c`(guest Delta Recorder)가 위 계약을 다음 encoding으로 구현한다.
+
+- **Request.** guest는 kind 1 frame 하나에 canonical JSON request를 담아 보낸다:
+  `{event_seq, event_type, payload, proxy_session_id, rule_set_id, schema_version =
+  "nfs-proxy-journal-request.v1"}`. `payload`는 event type별 strict schema(추가 필드 거부)이며
+  canonical이 아닌 bytes는 `malformed_request`다. `request_sha256`은 이 payload bytes 전체의 SHA-256이다.
+- **Install / session end.** Runner의 `install_session`이 `nfs-proxy-journal-install.v1`(binding, lane,
+  rule set bytes)을, `end_session`이 `nfs-proxy-journal-session-end.v1`을 kind 1 record로 먼저 남긴다.
+  restart는 이 record로 session을 복원한다. guest가 이 값을 정하지 않는다.
+- **Accepted.** stored record는 `nfs-proxy-journal-event.v1` `{event_seq, event_type, request,
+  request_sha256, schema_version, session_binding}`이고 응답은 이 frame을 가리키는 `JournalAck`다.
+- **Rejected.** stored record는 kind 2 `nfs-proxy-journal-rejection.v1` `{channel_id, consumed, event_seq,
+  event_type, inconsistent, proxy_session_id, reason, request_sha256, schema_version, vm_instance_id}`,
+  응답은 kind 2 `nfs-proxy-journal-reject.v1` `{event_seq, journal_id, reason, request_sha256,
+  schema_version}`이다. 기대한 seq의 request는 수락·거부와 관계없이 seq를 소비한다(`consumed`).
+  낮은 seq의 같은 digest는 기억한 응답을 다시 보내고 append하지 않는다. 낮은 seq의 다른 digest는
+  `sequence_conflict`, 높은 seq는 `sequence_violation`이며 둘 다 seq를 소비하지 않는다.
+- **Append 실패.** append나 저장 한도 초과가 실패하면 응답 없이 channel을 끝낸다. guest는 그 event와 뒤의
+  pending event를 LOST로 본다.
+- **Segment recovery.** segment는 `<name>.NNNN.njnl`이다. restart는 모든 segment의 완전한 frame을 순서대로
+  다시 admission해 같은 상태를 만들고, 새 segment에 이어 쓴다. 부분 tail은 자르거나 재사용하지 않는다.
+  완전한 frame의 손상은 corruption으로 시작을 거부한다.
+- **Transport.** guest는 virtio-serial port(`/dev/virtio-ports/NAME`)를 stream으로 쓰고, QEMU chardev가 host
+  Unix socket(`ChannelServer`)에 client로 붙는다. 연결은 VM 하나의 channel identity로 고정된다.
+- **Guest 순서.** journal.c는 한 번에 event 하나만 보내고, 답이 없으면 `retransmit_ms`(기본 1000 ms) 뒤 같은
+  bytes를 다시 보낸다. ACK는 schema, binding의 `proxy_session_id`/`rule_set_id`, `event_seq`,
+  `request_sha256`가 모두 맞아야 받아들인다. 이미 답을 받은 seq의 ACK는 무시하고, 그 밖의 잘못된 frame,
+  EOF, I/O 오류는 pending event 전부를 LOST로 만든다.
 
 ## 설계 근거
 
