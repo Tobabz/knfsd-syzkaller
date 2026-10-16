@@ -1,4 +1,4 @@
-From 8251e2aa5c6dee66af36af116297716ef234989b Mon Sep 17 00:00:00 2001
+From 438ac18981127d11f25b2c7b969249baf9c58c74 Mon Sep 17 00:00:00 2001
 From: idealinsane <idealinsane@localhost>
 Date: Fri, 16 Oct 2026 13:43:53 +0000
 Subject: [PATCH] executor: bracket programs with the NFS proxy activation
@@ -28,9 +28,12 @@ For every execution with a managed remote-coverage generation:
   which is also the root of its cgroup namespace, so everything it
   starts (helpers in their own process group or session included)
   stays in it; with the cgroups feature it is the cgroup programs see
-  as ./cgroup, and the fork server stays out of it.  The cgroup is a
-  boundary only with nsdelegate, so target mode probes it and fails
-  when a program process could move out of it; the executor's own
+  as ./cgroup (or a private one when the sandbox cannot reach that),
+  and the fork server stays out of it.  The cgroup is a boundary only
+  with nsdelegate and when programs cannot re-enter the fork server's
+  cgroup namespace, so the fork server is not dumpable (programs have
+  no CAP_SYS_PTRACE), and target mode probes it and fails when a
+  program process could leave it either way; the executor's own
   cgroup2 mounts keep the system's hierarchy-wide options (nsdelegate)
   instead of resetting them;
 - after its calls the program process sends DONE and waits.  DONE is
@@ -58,19 +61,19 @@ feature probes without remote coverage) run without a window and so are
 never mutated.
 ---
  executor/common.h                     |  30 +-
- executor/common_linux.h               |  48 ++-
- executor/executor.cc                  | 400 ++++++++++++++++-
+ executor/common_linux.h               |  48 +-
+ executor/executor.cc                  | 416 ++++++++++++++++-
  executor/executor_runner.h            |  14 +
- executor/nfs_proxy_activation.h       | 597 ++++++++++++++++++++++++++
- executor/nfs_proxy_activation_test.go | 216 ++++++++++
- executor/test.h                       | 387 +++++++++++++++++
+ executor/nfs_proxy_activation.h       | 626 ++++++++++++++++++++++++++
+ executor/nfs_proxy_activation_test.go | 226 ++++++++++
+ executor/test.h                       | 412 +++++++++++++++++
  pkg/flatrpc/flatrpc.fbs               |  32 ++
- pkg/flatrpc/flatrpc.go                | 300 ++++++++++++-
- pkg/flatrpc/flatrpc.h                 | 271 +++++++++++-
+ pkg/flatrpc/flatrpc.go                | 300 +++++++++++-
+ pkg/flatrpc/flatrpc.h                 | 271 ++++++++++-
  pkg/flatrpc/helpers.go                |   6 +
- pkg/flatrpc/nfs_proxy_test.go         |  48 +++
+ pkg/flatrpc/nfs_proxy_test.go         |  48 ++
  tools/syz-execprog/execprog.go        |  16 +
- 13 files changed, 2341 insertions(+), 24 deletions(-)
+ 13 files changed, 2421 insertions(+), 24 deletions(-)
  create mode 100644 executor/nfs_proxy_activation.h
  create mode 100644 executor/nfs_proxy_activation_test.go
  create mode 100644 pkg/flatrpc/nfs_proxy_test.go
@@ -235,7 +238,7 @@ index ae5bd713c..50024b927 100644
  	      procid, source);
  }
 diff --git a/executor/executor.cc b/executor/executor.cc
-index 9a6895f01..899b116e7 100644
+index 9a6895f01..160594348 100644
 --- a/executor/executor.cc
 +++ b/executor/executor.cc
 @@ -26,6 +26,10 @@
@@ -385,7 +388,7 @@ index 9a6895f01..899b116e7 100644
  	if (close(kOutFd) < 0)
  		fail("failed to close kOutFd");
  #endif
-@@ -966,6 +1028,290 @@ void execute_glob()
+@@ -966,6 +1028,306 @@ void execute_glob()
  	output_data->result_offset.store(off, std::memory_order_release);
  }
  
@@ -450,8 +453,10 @@ index 9a6895f01..899b116e7 100644
 +}
 +
 +// Probe what a program process can do with `dir`: 0 when it can join it and
-+// then cannot move to `outside`, 1 when it cannot join it, 2 when it can move
-+// out (cgroup2 without nsdelegate: then the cgroup is no boundary).
++// then cannot leave it, 1 when it cannot join it, 2 when it can move to
++// `outside` (cgroup2 without nsdelegate), 3 when it can re-enter the fork
++// server's cgroup namespace (the fork server is dumpable, or the program has
++// CAP_SYS_PTRACE).
 +static int nfsp_cgroup_probe(int dir, int outside)
 +{
 +	int pid = fork();
@@ -460,7 +465,10 @@ index 9a6895f01..899b116e7 100644
 +	if (pid == 0) {
 +		if (!nfsp_cg_join(dir))
 +			doexit(1);
-+		doexit(nfsp_cg_write(outside, "cgroup.procs", "0") ? 2 : 0);
++		if (nfsp_cg_write(outside, "cgroup.procs", "0"))
++			doexit(2);
++		// Still before the chroot: /proc is not the sandbox's, a pidfd is.
++		doexit(nfsp_cg_reenter(getppid(), 0) ? 3 : 0);
 +	}
 +	int status = 0;
 +	while (waitpid(pid, &status, __WALL) != pid) {
@@ -475,6 +483,8 @@ index 9a6895f01..899b116e7 100644
 +	if (probe == 2)
 +		failmsg("NFS proxy target mode needs cgroup2 with nsdelegate: a program can leave its cgroup",
 +			"path=%s", path);
++	if (probe == 3)
++		failmsg("NFS proxy program can re-enter the fork server's cgroup namespace", "path=%s", path);
 +}
 +
 +// The program cgroup.  With the cgroups feature it is the one programs see as
@@ -482,10 +492,16 @@ index 9a6895f01..899b116e7 100644
 +// stay inside it, and the fork server stays out of it (setup_cgroups_loop).
 +// Otherwise, or when the sandbox cannot reach that one, it is a private one
 +// under the sandbox's cgroup namespace root, from a cgroup2 mount that is
-+// detached again at once.  Target mode fails when a program could move out of
-+// it (nfsp_cgroup_probe).
++// detached again at once.  Target mode fails when a program could leave it
++// (nfsp_cgroup_probe).
 +static void nfsp_setup_cgroup(const char* newroot)
 +{
++	// This process becomes the fork server.  Not dumpable, its cgroup
++	// namespace (/proc/1/ns/cgroup, a pidfd) is closed to programs, which
++	// have no CAP_SYS_PTRACE (drop_caps).  Program processes are made
++	// dumpable again (nfsp_broker_child).
++	if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0))
++		fail("NFS proxy: making the fork server non-dumpable failed");
 +	char path[192];
 +	int dir = -1;
 +	if (flag_cgroups) {
@@ -498,12 +514,14 @@ index 9a6895f01..899b116e7 100644
 +		if (outside != -1)
 +			close(outside);
 +		if (probe == 1) {
-+			debug("NFS proxy: %s is outside the sandbox cgroup namespace\n", path);
++			// Not reachable from the sandbox: use a private one below.
++			debug("NFS proxy: %s cannot be joined\n", path);
 +			if (dir != -1)
 +				close(dir);
 +			dir = -1;
++		} else {
++			nfsp_cgroup_boundary(probe, path);
 +		}
-+		nfsp_cgroup_boundary(probe, path);
 +	}
 +	if (dir == -1) {
 +		if (snprintf(path, sizeof(path), "%s/syz-nfsp-cgroup", newroot) >= (int)sizeof(path))
@@ -568,6 +586,7 @@ index 9a6895f01..899b116e7 100644
 +	if (!nfsp_cg_join(kNfspCgroupFd))
 +		fail("NFS proxy program process failed to join its cgroup");
 +	close(kNfspCgroupFd);
++	prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
 +	close(kNfspActivationFd);
 +	close(nfsp_broker_state.fd);
 +	nfsp_endpoint.fd = -1;
@@ -676,7 +695,7 @@ index 9a6895f01..899b116e7 100644
  // execute_one executes program stored in input_data.
  void execute_one()
  {
-@@ -1021,6 +1367,22 @@ void execute_one()
+@@ -1021,6 +1383,22 @@ void execute_one()
  		}
  	}
  
@@ -699,7 +718,7 @@ index 9a6895f01..899b116e7 100644
  	int call_index = 0;
  	uint64 prog_extra_timeout = 0;
  	uint64 prog_extra_cover_timeout = 0;
-@@ -1029,6 +1391,8 @@ void execute_one()
+@@ -1029,6 +1407,8 @@ void execute_one()
  
  	read_input(&input_pos); // total number of calls
  	for (;;) {
@@ -708,7 +727,7 @@ index 9a6895f01..899b116e7 100644
  		uint64 call_num = read_input(&input_pos);
  		if (call_num == instr_eof)
  			break;
-@@ -1216,8 +1580,16 @@ void execute_one()
+@@ -1216,8 +1596,16 @@ void execute_one()
  		bool valid = !remote_generation_bind_failed.load(std::memory_order_acquire);
  		bool generation_resolved = false;
  #if GOOS_linux
@@ -726,7 +745,7 @@ index 9a6895f01..899b116e7 100644
  			// FINISH performs the bounded kernel-side root/token drain.  It is the
  			// publication barrier for remote extra coverage and synchronously
  			// materializes the committed snapshot before userspace consumes it.
-@@ -1576,7 +1948,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
+@@ -1576,7 +1964,17 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
  		}
  		calls[call.index] = call.offset;
  	}
@@ -779,10 +798,10 @@ index 231c9b87e..c4733a940 100644
  		msg_.reset();
 diff --git a/executor/nfs_proxy_activation.h b/executor/nfs_proxy_activation.h
 new file mode 100644
-index 000000000..eb9b3ab06
+index 000000000..c5f6ce33a
 --- /dev/null
 +++ b/executor/nfs_proxy_activation.h
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,626 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -818,8 +837,10 @@ index 000000000..eb9b3ab06
 +#include <sched.h>
 +#include <stddef.h>
 +#include <stdint.h>
++#include <stdio.h>
 +#include <string.h>
 +#include <sys/socket.h>
++#include <sys/syscall.h>
 +#include <time.h>
 +#include <unistd.h>
 +
@@ -1303,11 +1324,16 @@ index 000000000..eb9b3ab06
 +// Every task the program creates stays in it: a new process group or session
 +// does not leave it, and the namespace root forbids moving a task out of it
 +// (cgroup.procs and CLONE_INTO_CGROUP need the common ancestor inside the
-+// namespace).  Freezing it is not undone by SIGCONT, and killing it reaches
-+// every task; it is empty only after each task ran its exit, which closes its
-+// descriptors.
++// namespace, which takes nsdelegate).  The fork server is not dumpable, so a
++// program, which has no CAP_SYS_PTRACE, cannot open its cgroup namespace
++// (/proc/1/ns/cgroup, a pidfd) to re-enter it.  Freezing the cgroup is not
++// undone by SIGCONT, and killing it reaches every task; it is empty only after
++// each task ran its exit, which closes its descriptors.
 +
 +#define NFSP_CLONE_NEWCGROUP 0x02000000
++#ifndef __NR_pidfd_open
++#define __NR_pidfd_open 434
++#endif
 +
 +static int nfsp_cg_write(int dir, const char* file, const char* value)
 +{
@@ -1363,6 +1389,28 @@ index 000000000..eb9b3ab06
 +	return nfsp_cg_write(dir, "cgroup.procs", "0") && !unshare(NFSP_CLONE_NEWCGROUP);
 +}
 +
++// Program process: whether it can enter the cgroup namespace of `pid` (its
++// fork server) through a pidfd, or also through /proc when `proc` is this
++// pid namespace's.  0 is the expected answer: both need ptrace access.
++static int nfsp_cg_reenter(int pid, int proc)
++{
++	int entered = 0;
++	int fd = -1;
++	if (proc) {
++		char path[64];
++		snprintf(path, sizeof(path), "/proc/%d/ns/cgroup", pid);
++		fd = open(path, O_RDONLY | O_CLOEXEC);
++		entered = fd != -1 && !setns(fd, NFSP_CLONE_NEWCGROUP);
++		if (fd != -1)
++			close(fd);
++	}
++	fd = syscall(__NR_pidfd_open, pid, 0);
++	entered |= fd != -1 && !setns(fd, NFSP_CLONE_NEWCGROUP);
++	if (fd != -1)
++		close(fd);
++	return entered;
++}
++
 +// Parent: freeze every task of the program.  1 once all are frozen; a task
 +// still in a syscall freezes only when that syscall returns.
 +static int nfsp_cg_freeze(int dir, uint64_t timeout_ms)
@@ -1382,10 +1430,10 @@ index 000000000..eb9b3ab06
 +#endif // NFS_PROXY_ACTIVATION_H
 diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
 new file mode 100644
-index 000000000..839d2d335
+index 000000000..9a41eed95
 --- /dev/null
 +++ b/executor/nfs_proxy_activation_test.go
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,226 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -1578,14 +1626,18 @@ index 000000000..839d2d335
 +	}
 +}
 +
-+// The program cgroup is only a boundary with nsdelegate: target mode refuses
-+// to start when a program could move out of it, and the executor's own
-+// cgroup2 mounts keep the system's nsdelegate instead of resetting it.
++// The program cgroup is only a boundary with nsdelegate and a fork server
++// whose cgroup namespace programs cannot enter: target mode refuses to start
++// when a program could leave it either way, and the executor's own cgroup2
++// mounts keep the system's nsdelegate instead of resetting it.
 +func TestNfsProxyProgramCgroupIsABoundary(t *testing.T) {
 +	setup := nfspSection(t, "executor.cc", "static void nfsp_setup_cgroup(const char* newroot)\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_setup_cgroup", setup,
++		"prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)",
 +		"nfsp_cgroup_probe(dir, outside)",
-+		"nfsp_cgroup_boundary(probe, path);",
++		// An unreachable feature cgroup falls back to a private one.
++		"if (probe == 1) {",
++		"} else {\n\t\t\tnfsp_cgroup_boundary(probe, path);",
 +		"cgroup2_system_options(opts, sizeof(opts));",
 +		`mount("none", path, "cgroup2", 0, opts[0] ? opts : NULL)`,
 +		"nfsp_cgroup_boundary(nfsp_cgroup_probe(dir, root), path);",
@@ -1594,7 +1646,13 @@ index 000000000..839d2d335
 +	probe := nfspSection(t, "executor.cc", "static int nfsp_cgroup_probe(int dir, int outside)\n{", "\n}\n")
 +	nfspRequireOrder(t, "nfsp_cgroup_probe", probe,
 +		"nfsp_cg_join(dir)",
-+		`nfsp_cg_write(outside, "cgroup.procs", "0") ? 2 : 0`,
++		`if (nfsp_cg_write(outside, "cgroup.procs", "0"))`,
++		"nfsp_cg_reenter(getppid(), 0) ? 3 : 0",
++	)
++	child := nfspSection(t, "executor.cc", "static void nfsp_broker_child()\n{", "\n}\n")
++	nfspRequireOrder(t, "nfsp_broker_child", child,
++		"close(kNfspCgroupFd);",
++		"prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);",
 +	)
 +	mount := nfspSection(t, "common_linux.h", "static void mount_cgroups2(", "\n}\n")
 +	nfspRequireOrder(t, "mount_cgroups2", mount,
@@ -1603,10 +1661,10 @@ index 000000000..839d2d335
 +	)
 +}
 diff --git a/executor/test.h b/executor/test.h
-index 437bf01d9..ab7c5d516 100644
+index 437bf01d9..e5c3d6de8 100644
 --- a/executor/test.h
 +++ b/executor/test.h
-@@ -414,6 +414,387 @@ static int test_get_last_opt()
+@@ -414,6 +414,412 @@ static int test_get_last_opt()
  	return 0;
  }
  
@@ -1905,10 +1963,12 @@ index 437bf01d9..ab7c5d516 100644
 +}
 +
 +// What a fuzzed program can do to outlive DONE: re-arm itself with a periodic
-+// SIGCONT, run a helper in its own session, and move itself out of its cgroup.
-+// The program cgroup's freeze holds through SIGCONT, its kill reaches the
-+// helper, and the move is refused.  The last needs cgroup2 with nsdelegate,
-+// which target mode requires (nfsp_cgroup_probe); without it this test fails.
++// SIGCONT, run a helper in its own session, move itself out of its cgroup, and
++// re-enter its fork server's cgroup namespace to move out from there.  The
++// program cgroup's freeze holds through SIGCONT, its kill reaches the helper,
++// and both ways out are refused.  Refusing the move needs cgroup2 with
++// nsdelegate, which target mode requires (nfsp_cgroup_probe); without it this
++// test fails.
 +static int test_nfsp_cgroup()
 +{
 +	char name[64];
@@ -1926,6 +1986,29 @@ index 437bf01d9..ab7c5d516 100644
 +		printf("mmap failed\n");
 +		return 1;
 +	}
++	// A fork server set up as in target mode (no CAP_SYS_PTRACE, drop_caps;
++	// not dumpable, nfsp_setup_cgroup) and its program, which tries to enter
++	// the fork server's cgroup namespace.  Exit status 0: refused.
++	int server = fork();
++	if (server == 0) {
++		drop_caps();
++		prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
++		int program = fork();
++		if (program == 0) {
++			if (!nfsp_cg_join(dir))
++				doexit(2);
++			prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
++			doexit(nfsp_cg_reenter(getppid(), 1));
++		}
++		int status = 0;
++		waitpid(program, &status, __WALL);
++		doexit(WIFEXITED(status) ? WEXITSTATUS(status) : 3);
++	}
++	int reentry = 0;
++	waitpid(server, &reentry, __WALL);
++	reentry = WIFEXITED(reentry) ? WEXITSTATUS(reentry) : 3;
++	if (reentry)
++		printf("re-entering the fork server's cgroup namespace: %d (1: it succeeded)\n", reentry);
 +	int pid = fork();
 +	if (pid == 0) {
 +		if (!nfsp_cg_join(dir))
@@ -1956,7 +2039,7 @@ index 437bf01d9..ab7c5d516 100644
 +			progress[0]++;
 +		}
 +	}
-+	int ret = 0;
++	int ret = reentry != 0;
 +	for (int i = 0; i < 1000 && !(progress[0] && progress[1] && progress[3]); i++)
 +		usleep(1000);
 +	bool frozen = nfsp_cg_freeze(dir, 1000);
@@ -1994,7 +2077,7 @@ index 437bf01d9..ab7c5d516 100644
  static struct {
  	const char* name;
  	int (*f)();
-@@ -430,6 +811,12 @@ static struct {
+@@ -430,6 +836,12 @@ static struct {
      {"test_cover_filter", test_cover_filter},
      {"test_glob", test_glob},
      {"test_get_last_opt", test_get_last_opt},

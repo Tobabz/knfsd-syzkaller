@@ -326,10 +326,14 @@ the lane is not reused. Without an ACK, or when KCOV BEGIN gave no generation, t
 is not run. Requests without remote coverage (machine-check probes, comparisons) run without a
 window, so the Proxy leaves them unmutated.
 
-The cgroup is a boundary only when the guest's cgroup2 has `nsdelegate`, as it does under
-systemd. Without it a root program could move a task out of its cgroup. So the executor checks at
-start that a program process cannot leave its cgroup, and target mode fails otherwise. The
-executor's own cgroup2 mounts keep the system's `nsdelegate` instead of resetting it.
+The cgroup is a boundary only under two conditions. First, the guest's cgroup2 must have
+`nsdelegate`, as it does under systemd; without it a root program could move a task out of its
+cgroup. Second, the program must not be able to re-enter the fork server's cgroup namespace
+through `/proc/1/ns/cgroup` or a pidfd. The fork server is therefore not dumpable, and programs
+have no `CAP_SYS_PTRACE`. At start the executor checks that a program process can leave its cgroup
+neither way, and target mode fails otherwise. The executor's own cgroup2 mounts keep the system's
+`nsdelegate` instead of resetting it. When the sandbox cannot reach the cgroups feature's cgroup,
+for example in a machine check, the executor uses a private cgroup instead.
 
 One limit remains: the KCOV generation counts as complete on the program's own report in `DONE`. A program that disturbs its own KCOV binding,
 for example by closing the KCOV descriptor, only loses coverage it would have been credited with.
