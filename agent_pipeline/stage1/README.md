@@ -123,11 +123,12 @@ stays in `s1_running`; it continues once the record arrives.
 
 ## Real run (follow-up)
 
-This slice is verified with a scripted Agent runtime and a Python host
-command. The first real run is separate work on a KVM host, recorded here
-so its completion is checkable:
+The VM lane collector, the record generator and target-PC mapping are in
+[`host/`](host/README.md), with the runbook for the KVM host. They are
+tested without a guest; the first real run is recorded here so its
+completion is checkable:
 
-- **Owner:** to be assigned when the collector work starts.
+- **Owner:** to be assigned when the run starts.
 - **Target:** the `main` commit that merges the collector, with the parser
   bundle rebuilt from that commit by `tools/syzkaller/build.py`.
 - **Done when** one candidate goes, on that commit, through the real model
@@ -141,6 +142,5 @@ so its completion is checkable:
 ## Not here yet
 
 The service runs on one host with one Runner worker and one resource key.
-The VM lane collector behind the host command, automatic target-PC mapping,
-measured KASLR relocation, generators for the approved HCAP/descriptor/judge
-records, external issue filing and Stage 2 remain separate work.
+Measured KASLR relocation (the collector requires `nokaslr`), external
+issue filing and Stage 2 remain separate work.
