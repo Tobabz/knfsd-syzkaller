@@ -472,6 +472,11 @@ class Machine:
                     # Stage 2 works from the new authority's verdict too.
                     j.stage2_basis = j.stage2_basis.model_copy(
                         update={"q1_verdict_id": r.verdict_id})
+                    p = j.pending_task
+                    if j.state is JobState.S2_STRATEGY and p is not None:
+                        # The basis is part of the task's logical input:
+                        # reissue it, its repair already charged.
+                        self._goto(c, self._agent_target(p, charged=True))
                 return True
             t = new_target
             # A NOT_REACHED re-judge replaces the evidence embedded in the

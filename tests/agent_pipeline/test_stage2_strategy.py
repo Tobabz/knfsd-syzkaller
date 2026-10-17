@@ -25,7 +25,8 @@ from agent_pipeline.controller.records import (BlockedReason, JobState,
                                                RepairCause, Stage2Input,
                                                TargetKind)
 from agent_pipeline.controller import events as ev
-from agent_pipeline.controller.tasks import AgentRequest, agent_input_payload
+from agent_pipeline.controller.tasks import (AgentRequest, agent_input_digest,
+                                             agent_input_payload)
 from agent_pipeline.data import load_record, put_record
 
 from .fakes import FakeCompiler, binding, sha
@@ -637,6 +638,54 @@ def test_judge_change_points_stage2_at_the_new_verdict(world):
     assert j.state is JobState.S2_STRATEGY
     assert j.stage2_basis.q1_verdict_id != old.q1_verdict_id
     assert j.stage2_basis.bundle_ref == old.bundle_ref
+    assert_pending_strategy_matches(world, j)
+    assert world.agents.requests[-1].stage2_input == j.stage2_basis
+    assert world.c.replay(job_id) == world.job(job_id)
+
+
+def assert_pending_strategy_matches(world, j):
+    """The pending task's digest is the job's current logical input."""
+    p = j.pending_task
+    assert p.input_digest == agent_input_digest(
+        agent_task=p.agent_task, model_policy=p.model_policy,
+        candidate=j.candidate, hcap_revision=j.binding.hcap_revision,
+        analysis_ref=j.analysis_ref, plan_ref=j.plan_ref, repair=p.repair,
+        stage2_input=j.stage2_basis, rule_set_ref=j.rule_set_ref)
+
+
+def test_judge_change_reissues_a_repair_without_charging_it(world):
+    fc = use_compiler(world)
+    job_id = in_strategy(world)
+    fc.refusals[(sha("rules-1"), "hcap-1")] = CompileRejected(
+        reason="unknown_path")
+    rule_set(world, job_id)
+    before = world.job(job_id)
+    world.c.on_judge_versions(JudgeVersions(judge_profile_id="jp-2",
+                                            support_boundary_id="sb-1"))
+    j = world.job(job_id)
+    assert j.pending_task.task_id != before.pending_task.task_id
+    assert j.pending_task.repair == before.pending_task.repair
+    assert j.counters.agent_repair_stage2 == 1
+    assert_pending_strategy_matches(world, j)
+    # A late result of the superseded task makes no transition.
+    p = before.pending_task
+    world.c.on_agent_result(p.task_id, p.attempt,
+                            RuleSetOutput(rule_set_ref=sha("late")),
+                            "test:fake")
+    assert world.job(job_id).pending_task == j.pending_task
+    assert world.c.replay(job_id) == world.job(job_id)
+
+
+def test_judge_change_restart_dispatches_a_matching_input(world):
+    job_id = in_strategy(world)
+    world.c.on_judge_versions(JudgeVersions(judge_profile_id="jp-2",
+                                            support_boundary_id="sb-1"))
+    world.restart()
+    j = world.job(job_id)
+    assert_pending_strategy_matches(world, j)
+    a = world.store.attempt(j.pending_task.task_id, j.pending_task.attempt)
+    assert a.input_digest == j.pending_task.input_digest
+    assert world.agents.requests[-1].stage2_input == j.stage2_basis
 
 
 def test_stage1_agent_digest_encoding_is_unchanged():
