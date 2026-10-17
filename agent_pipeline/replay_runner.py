@@ -156,6 +156,27 @@ def parse_crash_context(log: str, *, vm_instance_id: str, bound: int,
         # Without a context line the printed proc was not rewritten.
         if record["lane"] is None:
             record["lane"] = record["proc"]
+    # Hanged() appends a second record for a program whose Note() record is
+    # still in the ring: same (lane, id), a synthetic proc, and the barrier.
+    # It is one execution, so keep one record at the Note() position (the
+    # start; the hung record is stamped at hang time) carrying the barrier.
+    merged: list[dict] = []
+    seen: dict[tuple[int, int], int] = {}
+    for record in records:
+        key = (record["lane"], record["id"])
+        if record["id"] < 0 or key not in seen:
+            if record["id"] >= 0:
+                seen[key] = len(merged)
+            merged.append(record)
+            continue
+        first = merged[seen[key]]
+        if "\n".join(first["program"]).strip("\n") != "\n".join(record["program"]).strip("\n"):
+            raise PlanError(f"lane {key[0]} id {key[1]} is listed with different programs")
+        if record["barrier"] is not None:
+            if first["barrier"] is not None and first["barrier"] != record["barrier"]:
+                raise PlanError(f"lane {key[0]} id {key[1]} is listed with different barriers")
+            merged[seen[key]] = record
+    records = merged
     lane = records[-1]["lane"] if lane_id is None else lane_id
     # Collect() sorts by start time, so log order is execution order.
     selected = [r for r in records if r["lane"] == lane][-bound:]

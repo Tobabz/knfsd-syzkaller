@@ -77,3 +77,46 @@ def test_execprog_barriers_in_order():
     barriers = parse_execprog_barriers(out)
     assert [(b.kcov_generation, b.executed) for b in barriers] == [(7, True), (8, False)]
     assert barriers[1].activation == "Refused" and barriers[1].activation_status == 2
+
+
+# The exact shape patch 0024's Collect() emits for a hung program: the
+# Note() record stays in the ring (printed proc = lane, no context line) and
+# Hanged() appends a second record with a synthetic proc, the lane and the
+# barrier, stamped at hang time.
+HUNG_LOG = """\
+last executing test programs:
+
+5.0s ago: executing program 1 (id=41):
+nfs-proxy: lane=1 generation=6 program_digest=aa activation=Acked/0 deactivation=Acked/0 executed=true lease_cleared=true
+getpid()
+
+4.0s ago: executing program 1 (id=42):
+gettid()
+
+2.0s ago: executing program 32 (id=42):
+nfs-proxy: lane=1 generation=7 program_digest=bb activation=Acked/0 deactivation=NoAnswer/4294967295 executed=true lease_cleared=false
+gettid()
+
+1.0s ago: executing program 1 (id=43):
+getppid()
+
+kernel console output (not intermixed with test programs):
+"""
+
+
+def test_hung_program_is_one_execution():
+    window = parse_crash_context(HUNG_LOG, vm_instance_id="vm-0", bound=8)
+    assert [e.exec_id for e in window.entries] == [41, 42, 43]
+    hung = window.entries[1]
+    assert (hung.printed_proc, hung.lane_id) == (32, 1)
+    assert hung.barrier.kcov_generation == 7 and hung.barrier.deactivation == "NoAnswer"
+    assert hung.program == "gettid()\n"
+    # The bound counts executions, not log records.
+    assert [e.exec_id for e in parse_crash_context(
+        HUNG_LOG, vm_instance_id="vm-0", bound=2).entries] == [42, 43]
+
+
+def test_duplicate_records_that_disagree_are_refused():
+    with pytest.raises(PlanError):
+        parse_crash_context(HUNG_LOG.replace("gettid()\n\n1.0s", "getuid()\n\n1.0s"),
+                            vm_instance_id="vm-0", bound=8)
