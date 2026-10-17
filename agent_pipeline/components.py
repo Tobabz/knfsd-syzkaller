@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .contracts import (HarnessBinding, HcapCheck, JudgeVersions, GapRef,
+from .contracts import (CompileRejected, CompiledRuleSet, HarnessBinding,
+                        HcapCheck, JudgeVersions, GapRef,
                         MaterializationHcapAuthority, MaterializeRejected,
                         Materialized, Q1Result, Sanitizer)
 
@@ -71,6 +72,17 @@ class Q1Judge(Protocol):
                               versions: JudgeVersions) -> bool:
         """Can `versions` judge this bundle without running again
         (01 §11.2)?"""
+
+
+class MutationRuleCompiler(Protocol):
+    def compile(self, rule_set_ref: str, harness_ref: str,
+                binding: HarnessBinding) -> CompiledRuleSet | CompileRejected:
+        """08 §12, 03-nfs-proxy/04 §19: validate the MutationRuleSet against
+        the ProtocolSchema and the promoted semantic registry of
+        ``binding.hcap_revision``, bind its traffic scope to the harness's
+        Stage 1 route and lower it.  Pure, like the other components: the
+        Controller calls it again on replay.  It infers nothing from prose
+        and computes no live offset, original bytes or ordinal."""
 
 
 class HarnessRegistry(Protocol):

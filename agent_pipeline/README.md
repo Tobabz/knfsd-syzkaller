@@ -1,7 +1,8 @@
 # agent_pipeline
 
-The Agent pipeline Stage 1 Controller, its deterministic host components, and
-independent M1/Q2 decision kernels. The Controller owns the candidate job:
+The Agent pipeline Controller (Stage 1, and Stage 2 up to the Mutation Rule
+Compiler), its deterministic host components, and independent M1/Q2 decision
+kernels. The Controller owns the candidate job:
 intake, harness binding, the job state machine, and the record of every
 transition.
 The design is [09-job-state-graph.md](../docs/design/02-llm-agent/09-job-state-graph.md).
@@ -32,11 +33,12 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `sealed_q2.py` | Controller-side Q2 adapter; binds raw reports and console capture to a trusted host receipt and complete artifact inventory |
 | `agent_tasks/analysis.py` | bounded structured `CandidateAnalysis` output contract (03 §5–§10) |
 | `agent_tasks/planning.py` | structured planning variants and host-side conversion of bounded inline program text to a content-addressed `ReachabilityPlan` |
+| `agent_tasks/mutation.py` | the typed `MutationRuleSet` (08 §5–§11) and the Mutation Strategy variants `rule_set` / `unsupported(mutation_engine)` (08 §15) |
 | `agent_tasks/tools.py` | the complete Agent tool allowlist: pinned kernel read/search, caller/callee index lookup and pinned HCAP lookup; paths and outputs are bounded |
 | `agent_tasks/source_index.py` | immutable Git-object implementation of the source-index protocol; full commit OIDs, trusted roots and process/output/time bounds are enforced |
 | `agent_tasks/runtime.py` | injectable structured-output runtime protocol; task policy selects provider/model and output-repair allowance |
 | `agent_tasks/pydantic_ai_runtime.py` | optional PydanticAI driver with typed output, the pinned toolbox, bounded requests and output repairs, and response-derived model identity |
-| `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis and Reachability Planning; records the runtime's actual `provider:model` id through existing Controller callbacks |
+| `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis, Reachability Planning and Mutation Strategy; records the runtime's actual `provider:model` id through existing Controller callbacks |
 | `runner/` | restart-safe SQLite leases/completion, evidence sealing, accepted-receipt Q1 publication and lease-aware Linux process supervision |
 | `journal_framing.py` | bounded M5 journal frame recovery and canonical ACK codec; persistence and event admission remain separate |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |
@@ -200,9 +202,22 @@ target-PC mapping for a real run, tested without a guest; its runbook is
 it generates from the template are operator statements, not approved
 production data.
 
+Stage 2 starts when an operator calls `Controller.start_stage2(job_id)` on
+a job in `s1_reached` whose Q1 evidence ran on the job's bound identity. The
+Mutation Strategy Agent Task returns a typed `MutationRuleSet` or a
+`mutation_engine` gap. The Controller routes Compiler results through an
+injected `MutationRuleCompiler` (`Env.compiler`, 08 §12): an Agent-fixable
+refusal is a Stage 2 repair (`compiler_rejected`, counted against
+`stage2_repair_budget`), `unsupported_capability` and
+`requires_state_lineage` wait on a `mutation_engine` gap and compile the same
+rule set again once it closes. No Compiler is implemented yet, and no
+semantic subset has passed M7 promotion, so a real run ends in a gap or in
+`blocked_operator(stage2_compiler_unavailable)`. A compiled rule set waits in
+`blocked_operator(stage2_gate_unavailable)` until the gate exists.
+
 Also not here yet: broader NFS resource-provenance extraction,
-Runner-receipt integration for Q2 and Stage 2 Controller/Runner
-integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
+Runner-receipt integration for Q2, the Mutation Rule Compiler, and the
+Stage 2 gate, campaign and replay Runner integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
 VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
-remains false-only. The nfs-proxy semantic runtime remains a separate component
+remains false-only until the whole of Stage 2 is in. The nfs-proxy semantic runtime remains a separate component
 until its Runner and durable journal paths are wired.

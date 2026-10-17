@@ -81,7 +81,9 @@ class Store:
                                   "policy_id = ?",
                                   (policy.policy_id,)).fetchone()
             body = policy.model_dump_json()
-            if row and row[0] != body:
+            # Compared as values: a policy stored before a field with a
+            # default existed is still the same policy (01 §11.1).
+            if row and JobPolicy.model_validate_json(row[0]) != policy:
                 # A policy identity names one policy forever (01 §11.1).
                 raise ValueError(f"policy {policy.policy_id} already exists "
                                  f"with other values")

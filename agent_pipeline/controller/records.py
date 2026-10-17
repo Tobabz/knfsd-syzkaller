@@ -7,13 +7,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..contracts import (AgentModelPolicy, AgentTask, CandidateSubmission, GapRef,
-                         HarnessBinding, JudgeVersions, Materialized,
-                         Q1Result, Record, VulnerabilityCandidate)
+from ..contracts import (AgentModelPolicy, AgentTask, CandidateSubmission,
+                         CompiledRuleSet, GapRef, HarnessBinding,
+                         JudgeVersions, Materialized, Q1Result, Record,
+                         VulnerabilityCandidate)
 
 
 class JobState(str, enum.Enum):
-    """09 §1, the Stage 1 states.  Stage 2 states come with Stage 2."""
+    """09 §1.  Of Stage 2 only s2_strategy exists so far; the gate,
+    campaign and replay states come with their Runner tasks."""
 
     SUBMITTED = "submitted"
     S1_ANALYSIS = "s1_analysis"
@@ -21,6 +23,7 @@ class JobState(str, enum.Enum):
     S1_APPROVAL = "s1_approval"
     S1_RUNNING = "s1_running"
     S1_REACHED = "s1_reached"
+    S2_STRATEGY = "s2_strategy"
     BLOCKED_HARNESS_GAP = "blocked_harness_gap"
     RETRY_PENDING = "retry_pending"
     PARKED = "parked"
@@ -39,21 +42,26 @@ TERMINAL = frozenset({JobState.REJECTED, JobState.CLOSED_UNSUPPORTED,
 
 
 class BlockedReason(str, enum.Enum):
-    """blocked_operator reasons used in Stage 1 (09 §3, §6, §2)."""
+    """blocked_operator reasons (09 §2-§4, §6)."""
 
     Q1_EVIDENCE = "q1_evidence"
     Q1_MAPPING = "q1_mapping"
     STAGE1_REPAIR_BUDGET = "stage1_repair_budget"
+    STAGE2_REPAIR_BUDGET = "stage2_repair_budget"
     AGENT_FAILURE = "agent_failure"
     RUNTIME_RETRY_EXHAUSTED = "runtime_retry_exhausted"
     GAP_ID_UNKNOWN = "gap_id_unknown"
     UNEXPECTED_EVENT = "unexpected_event"
     HOST_AUTHORITY = "host_authority"
     EXECUTION_CLEANUP = "execution_cleanup"
+    # Not in 09: the step after s2_strategy is not built yet.  The job waits
+    # with its rule set; resume compiles it again.
+    STAGE2_COMPILER_UNAVAILABLE = "stage2_compiler_unavailable"
+    STAGE2_GATE_UNAVAILABLE = "stage2_gate_unavailable"
 
 
 class RepairCause(str, enum.Enum):
-    """09 §7, the Stage 1 causes."""
+    """09 §7."""
 
     HCAP_INVALID = "hcap_invalid"
     MATERIALIZER_REJECTED = "materializer_rejected"
@@ -61,20 +69,34 @@ class RepairCause(str, enum.Enum):
     Q1_NOT_REACHED = "q1_not_reached"
     REANALYSIS_REQUESTED = "reanalysis_requested"
     HCAP_CHANGED = "hcap_changed"
+    COMPILER_REJECTED = "compiler_rejected"
+    GATE_NOT_APPLIED = "gate_not_applied"
+    CAMPAIGN_NOT_APPLIED = "campaign_not_applied"
+    CAMPAIGN_NO_SIGNAL = "campaign_no_signal"
+
+
+#: Causes of a Mutation Strategy repair; they count agent_repair[stage2].
+STAGE2_CAUSES = frozenset({RepairCause.COMPILER_REJECTED,
+                           RepairCause.GATE_NOT_APPLIED,
+                           RepairCause.CAMPAIGN_NOT_APPLIED,
+                           RepairCause.CAMPAIGN_NO_SIGNAL})
 
 
 class TargetKind(str, enum.Enum):
     """Where a job can be sent.  analysis/planning start an Agent Task,
     materialize runs the HCAP check and Materializer on the stored plan,
     running enters s1_running through the approval guard, reached is
-    s1_reached; the last two are waiting states with a resume point of their
-    own (`inner`)."""
+    s1_reached; strategy starts Mutation Strategy, compile runs the Mutation
+    Rule Compiler on the stored rule set; the last two are waiting states
+    with a resume point of their own (`inner`)."""
 
     ANALYSIS = "analysis"
     PLANNING = "planning"
     MATERIALIZE = "materialize"
     RUNNING = "running"
     REACHED = "reached"
+    STRATEGY = "strategy"
+    COMPILE = "compile"
     BLOCKED_OPERATOR = "blocked_operator"
     BLOCKED_HARNESS_GAP = "blocked_harness_gap"
 
@@ -83,7 +105,7 @@ class Target(Record):
     """A resume point, or where a transition sends a job (09 §1, §5)."""
 
     kind: TargetKind
-    cause: RepairCause | None = None        # repair, for analysis/planning
+    cause: RepairCause | None = None        # repair, for an Agent target
     findings: tuple[str, ...] = ()
     charged: bool = False                   # repair already counted (§6)
     rerun: bool = False                     # running: same Runner input
@@ -135,6 +157,7 @@ class Counters(Record):
     """09 §6."""
 
     agent_repair_stage1: int = 0
+    agent_repair_stage2: int = 0
     agent_retry: int = 0
     runtime_retry: int = 0
 
@@ -189,6 +212,12 @@ class Job(BaseModel):
     approved_manifests: tuple[str, ...] = ()
     last_verdict: ConsumedVerdict | None = None
     stage2_input: Stage2Input | None = None
+    #: The Stage2Input a started Stage 2 works from (01 §5.1).  Kept while
+    #: the job is in Stage 2 or waits to return there; cleared when it
+    #: goes back to Stage 1 work.
+    stage2_basis: Stage2Input | None = None
+    rule_set_ref: str | None = None
+    compiled: CompiledRuleSet | None = None
     seq: int = 0
     task_seq: int = 0
 

@@ -3,7 +3,8 @@
 > 상태: draft · 최종 확인: 2026-10-13
 > 상위 설계: `01-two-stage-agent-architecture.md` §12, §14 12번
 > 선행 계약: `02`–`08`, `../03-nfs-proxy/05-mutation-delta-replay.md` §27–§29
-> 관련 구현: `agent_pipeline/` (Stage 1: §3, §5, §6, §8. Stage 2 미구현). 구현 스택은
+> 관련 구현: `agent_pipeline/` (Stage 1: §3, §5, §6, §8. Stage 2는 §4의 `s1_reached`·`s2_strategy` 행과
+> Compiler 거부 행까지. Compiler 구현, `s2_gate` 이후 미구현). 구현 스택은
 > `../decisions/2026-10-13-agent-implementation-stack.md`
 > 관련 게이트: Q1 / Stage 2 baseline-with-rules gate / Q2 / Replay
 
@@ -646,7 +647,13 @@ bundle fixture로 대신한다.
   구현에서 정한다.
 - **미결:** triage 목록의 형식과 처리 주체.
 - **미결:** Stage 2 실행 전 사람 승인. 기존 계약의 approval binding은 Stage 1 review manifest뿐이다(`05` §11).
-- **미검증:** Stage 2 행(§4와 §5의 Stage 2 부분)은 구현과 대조하지 않았다. Stage 1 행과 검증 오라클 1–5의 Stage 1
+- **구현 범위(#46):** `s1_reached`·`s2_strategy` 행과 Compiler 결과 행은 `tests/agent_pipeline/test_stage2_strategy.py`가
+  가짜 model과 가짜 Compiler로 확인한다. `run_stage2`가 거짓만 받는 동안 Stage 2는 operator 동작
+  `start_stage2`로 시작한다. Compiler가 설정되지 않았거나 compile이 성공하면 아직 다음 단계가 없으므로
+  `blocked_operator(stage2_compiler_unavailable)` 또는 `blocked_operator(stage2_gate_unavailable)`에서 rule set과
+  함께 기다리고, `resume`은 그 rule set을 다시 compile한다. 이 두 reason은 Compiler와 gate가 들어오면 없앤다.
+  `agent_repair[stage2]`의 한도(`stage2_repair_budget`)는 Stage 1과 같은 3회로 두었다(저장소 소유자 결정 아님).
+- **미검증:** `s2_gate` 이후의 Stage 2 행(§4와 §5의 Stage 2 부분)은 구현과 대조하지 않았다. Stage 1 행과 검증 오라클 1–5의 Stage 1
   부분은 `tests/agent_pipeline/`이 확인한다(가짜 component, LLM과 VM 없음). 실제 Runner와 Agent provider로는
   확인하지 않았다.
 

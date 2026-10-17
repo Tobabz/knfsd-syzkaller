@@ -1,4 +1,5 @@
-"""The Stage 1 job state machine (09 §2, §3, §5, §6).
+"""The job state machine (09 §2-§6): Stage 1 and Stage 2 up to the
+Mutation Rule Compiler.
 
 handle(job, event) is a function of the job, the event, the job's JobPolicy
 and the deterministic components.  It returns the next job and what the
@@ -16,26 +17,37 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
-from ..components import HcapChecker, Materializer, Q1Judge
-from ..contracts import (HOST_AUTHORITY_UNAVAILABLE, HcapCheck,
+from ..components import (HcapChecker, Materializer, MutationRuleCompiler,
+                          Q1Judge)
+from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
+                         HOST_AUTHORITY_UNAVAILABLE, CompiledRuleSet,
+                         HcapCheck,
                          NEUTRAL_CONTROL_UNAVAILABLE, TASK_VARIANTS, AgentTask,
                          GapClass, GapRef, HarnessBinding, JobPolicy,
                          MaterializationHcapAuthority, MaterializeRejected,
                          Q1Result, Q1Status, kernel_revision_gap)
 from . import events as ev
-from .records import (TERMINAL, WAITING, BlockedReason, ConsumedVerdict,
-                      Job, JobState, PendingTask, RepairCause, RepairInput,
-                      Stage2Input, Target, TargetKind, TaskKind)
+from .records import (STAGE2_CAUSES, TERMINAL, WAITING, BlockedReason,
+                      ConsumedVerdict, Job, JobState, PendingTask,
+                      RepairCause, RepairInput, Stage2Input, Target,
+                      TargetKind, TaskKind)
 from .tasks import (CLEANUP_UNCONFIRMED, RunnerInput, agent_input_digest,
                     legacy_runner_input_digest, runner_input_digest)
 
 AGENT_STATES = {JobState.S1_ANALYSIS: AgentTask.CANDIDATE_ANALYSIS,
-                JobState.S1_PLANNING: AgentTask.REACHABILITY_PLANNING}
+                JobState.S1_PLANNING: AgentTask.REACHABILITY_PLANNING,
+                JobState.S2_STRATEGY: AgentTask.MUTATION_STRATEGY}
+AGENT_KINDS = {AgentTask.CANDIDATE_ANALYSIS: TargetKind.ANALYSIS,
+               AgentTask.REACHABILITY_PLANNING: TargetKind.PLANNING,
+               AgentTask.MUTATION_STRATEGY: TargetKind.STRATEGY}
+TASK_OF_KIND = {k: t for t, k in AGENT_KINDS.items()}
+STATE_OF_TASK = {t: s for s, t in AGENT_STATES.items()}
 WAITING_KINDS = {TargetKind.BLOCKED_OPERATOR, TargetKind.BLOCKED_HARNESS_GAP}
 
 #: Counter an operator `resume` puts back to 0 (09 §5, §6).
 RESET_ON_RESUME = {
     BlockedReason.STAGE1_REPAIR_BUDGET: "agent_repair_stage1",
+    BlockedReason.STAGE2_REPAIR_BUDGET: "agent_repair_stage2",
     BlockedReason.AGENT_FAILURE: "agent_retry",
     BlockedReason.RUNTIME_RETRY_EXHAUSTED: "runtime_retry",
 }
@@ -68,6 +80,9 @@ class Env:
     hcap: HcapChecker
     materializer: Materializer
     judge: Q1Judge
+    #: None until a Mutation Rule Compiler is configured; a rule set then
+    #: waits in blocked_operator(stage2_compiler_unavailable).
+    compiler: MutationRuleCompiler | None = None
 
 
 @dataclass
@@ -152,18 +167,26 @@ class Machine:
             j.harness = None
             c.consumed.append(out.plan_ref)
             self._goto(c, self._materialize(c, require_revision=True))
+        elif out.variant == "rule_set":
+            j.rule_set_ref = out.rule_set_ref
+            j.compiled = None
+            c.consumed.append(out.rule_set_ref)
+            self._goto(c, self._compile(c))
         elif out.variant == "unsupported":
+            again = Target(kind=AGENT_KINDS[p.agent_task])
+            if p.agent_task is AgentTask.MUTATION_STRATEGY and \
+                    out.gap_class is not GapClass.MUTATION_ENGINE:
+                # 09 §2: Mutation Strategy's gap is mutation_engine only.
+                return self._unexpected(c, here)
             gap = GapRef(gap_class=out.gap_class,
                          missing_capability_id=out.missing_capability_id)
             if not out.missing_capability_id or \
                     not self.env.hcap.knows_capability(
                         j.binding.hcap_revision, out.missing_capability_id):
-                self._block(c, BlockedReason.GAP_ID_UNKNOWN,
-                            Target(kind=TargetKind.PLANNING))
+                self._block(c, BlockedReason.GAP_ID_UNKNOWN, again)
             else:
                 self._goto(c, Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
-                                     gap=gap,
-                                     inner=Target(kind=TargetKind.PLANNING)))
+                                     gap=gap, inner=again))
         else:
             self._goto(c, Target(kind=TargetKind.ANALYSIS,
                                  cause=RepairCause.REANALYSIS_REQUESTED,
@@ -445,6 +468,15 @@ class Machine:
                     return True
                 if j.state is JobState.S1_REACHED:
                     self._goto(c, Target(kind=TargetKind.REACHED))
+                elif j.stage2_basis is not None:
+                    # Stage 2 works from the new authority's verdict too.
+                    j.stage2_basis = j.stage2_basis.model_copy(
+                        update={"q1_verdict_id": r.verdict_id})
+                    p = j.pending_task
+                    if j.state is JobState.S2_STRATEGY and p is not None:
+                        # The basis is part of the task's logical input:
+                        # reissue it, its repair already charged.
+                        self._goto(c, self._agent_target(p, charged=True))
                 return True
             t = new_target
             # A NOT_REACHED re-judge replaces the evidence embedded in the
@@ -505,6 +537,11 @@ class Machine:
     def _on_operator(self, c: _Call, e: ev.OperatorAction) -> bool:
         j = c.job
         c.consumed.append(e.action_id)
+        if e.action == "start_stage2":
+            if j.state is not JobState.S1_REACHED:
+                return False
+            self._start_stage2(c)
+            return True
         if e.action == "resume":
             if j.state is not JobState.BLOCKED_OPERATOR:
                 return False
@@ -575,31 +612,54 @@ class Machine:
         if not (t.kind is TargetKind.RUNNING and t.rerun):
             # 09 §6: runtime_retry ends with any row that is not a rerun.
             j.counters = j.counters.model_copy(update={"runtime_retry": 0})
-        if t.kind in (TargetKind.ANALYSIS, TargetKind.PLANNING):
-            task = AgentTask.CANDIDATE_ANALYSIS \
-                if t.kind is TargetKind.ANALYSIS \
-                else AgentTask.REACHABILITY_PLANNING
+        if t.kind in TASK_OF_KIND:
+            task = TASK_OF_KIND[t.kind]
+            stage2 = task is AgentTask.MUTATION_STRATEGY
+            if stage2 and j.stage2_basis is None:
+                # No Q1 package to work from: never enter Stage 2.
+                c.reason = "unexpected_event"
+                self._block(c, BlockedReason.UNEXPECTED_EVENT,
+                            Target(kind=TargetKind.RUNNING))
+                return
+            if t.cause is not None and \
+                    (t.cause in STAGE2_CAUSES) is not stage2:
+                c.reason = "unexpected_event"
+                self._block(c, BlockedReason.UNEXPECTED_EVENT,
+                            Target(kind=t.kind))
+                return
             repair = None
             if t.cause is not None:
                 charged = t.charged or t.cause is RepairCause.HCAP_CHANGED
-                n = j.counters.agent_repair_stage1
+                if stage2:
+                    counter, budget, exhausted = (
+                        "agent_repair_stage2", c.policy.stage2_repair_budget,
+                        BlockedReason.STAGE2_REPAIR_BUDGET)
+                    previous = (j.analysis_ref, j.plan_ref, j.rule_set_ref)
+                    evidence = (j.stage2_basis.bundle_ref,)
+                else:
+                    counter, budget, exhausted = (
+                        "agent_repair_stage1", c.policy.stage1_repair_budget,
+                        BlockedReason.STAGE1_REPAIR_BUDGET)
+                    previous = (j.analysis_ref, j.plan_ref)
+                    evidence = (j.last_verdict.bundle_ref,) \
+                        if j.last_verdict else ()
+                n = getattr(j.counters, counter)
                 if not charged:
-                    if n >= c.policy.stage1_repair_budget:
-                        self._block(c, BlockedReason.STAGE1_REPAIR_BUDGET, t)
+                    if n >= budget:
+                        self._block(c, exhausted, t)
                         return
                     n += 1
-                    j.counters = j.counters.model_copy(
-                        update={"agent_repair_stage1": n})
+                    j.counters = j.counters.model_copy(update={counter: n})
                 repair = RepairInput(
                     job_id=j.job_id, attempt=n, agent_task=task,
                     cause=t.cause,
-                    previous_outputs=tuple(r for r in (j.analysis_ref,
-                                                       j.plan_ref) if r),
+                    previous_outputs=tuple(r for r in previous if r),
                     findings=t.findings,
-                    evidence_refs=(j.last_verdict.bundle_ref,)
-                    if j.last_verdict else (),
-                    remaining_budget=c.policy.stage1_repair_budget - n)
+                    evidence_refs=evidence,
+                    remaining_budget=budget - n)
             self._start_agent(c, task, repair)
+        elif t.kind is TargetKind.COMPILE:
+            self._goto(c, self._compile(c), external)
         elif t.kind is TargetKind.MATERIALIZE:
             self._goto(c, self._materialize(c), external)
         elif t.kind is TargetKind.RUNNING:
@@ -613,6 +673,9 @@ class Machine:
                 q1_verdict_id=lv.result.verdict_id, bundle_ref=lv.bundle_ref,
                 plan_ref=lv.plan_ref, harness_ref=lv.harness_ref,
                 execution_harness_id=lv.result.execution_harness_id)
+            self._leave_stage2(j)
+            if c.policy.run_stage2:
+                self._start_stage2(c)
         elif t.kind is TargetKind.BLOCKED_OPERATOR:
             self._drop_task(c)
             j.state = JobState.BLOCKED_OPERATOR
@@ -682,6 +745,81 @@ class Machine:
             return self._unexpected_target(TargetKind.MATERIALIZE)
         j.harness = m
         return Target(kind=TargetKind.RUNNING)
+
+    def _start_stage2(self, c: _Call) -> None:
+        """09 §4, the s1_reached rows.  Stage 2 starts from the Stage2Input
+        only when its Q1 evidence ran on the job's bound identity and
+        harness; otherwise Q1 is established again (01 §5.1, §11.2)."""
+        j = c.job
+        s2 = j.stage2_input
+        if s2 is None or j.binding is None:
+            self._unexpected(c, Target(kind=TargetKind.REACHED))
+            return
+        if j.harness is None or \
+                s2.execution_harness_id != j.binding.execution_harness_id or \
+                s2.harness_ref != j.harness.harness_ref:
+            c.reason = "stage2_identity_changed"
+            j.harness = None
+            self._goto(c, self._materialize(c, RepairCause.HCAP_CHANGED))
+            return
+        c.reason = "stage2_started"
+        j.stage2_basis = s2
+        j.rule_set_ref = None
+        j.compiled = None
+        self._goto(c, Target(kind=TargetKind.STRATEGY))
+
+    @staticmethod
+    def _leave_stage2(j: Job) -> None:
+        j.stage2_basis = None
+        j.rule_set_ref = None
+        j.compiled = None
+
+    def _compile(self, c: _Call) -> Target:
+        """The Mutation Rule Compiler on the stored rule set (09 §4, the
+        s2_strategy rows; 08 §12)."""
+        j = c.job
+        j.compiled = None
+        here = Target(kind=TargetKind.COMPILE)
+        if j.stage2_basis is None or j.rule_set_ref is None:
+            return self._unexpected_target(TargetKind.STRATEGY)
+        compiler = self.env.compiler
+        if compiler is None:
+            return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                          reason=BlockedReason.STAGE2_COMPILER_UNAVAILABLE,
+                          inner=here)
+        r = compiler.compile(j.rule_set_ref, j.stage2_basis.harness_ref,
+                             j.binding)
+        if isinstance(r, CompiledRuleSet):
+            if r.rule_set_ref != j.rule_set_ref or \
+                    r.hcap_revision != j.binding.hcap_revision:
+                return self._unexpected_target(TargetKind.COMPILE)
+            j.compiled = r
+            c.consumed.append(r.compiled_ref)
+            # s2_gate is the next state (09 §4); it is not built yet.
+            return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                          reason=BlockedReason.STAGE2_GATE_UNAVAILABLE,
+                          inner=here)
+        if r.reason in COMPILER_AGENT_FIXABLE:
+            return Target(kind=TargetKind.STRATEGY,
+                          cause=RepairCause.COMPILER_REJECTED,
+                          findings=(r.model_dump_json(),))
+        if r.reason in COMPILER_GAP:
+            cap = r.missing_capability_id
+            if cap is None and r.reason == "requires_state_lineage":
+                cap = "state_lineage"           # 08 §15, 07 §4
+            if not cap or not self.env.hcap.knows_capability(
+                    j.binding.hcap_revision, cap):
+                return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                              reason=BlockedReason.GAP_ID_UNKNOWN,
+                              inner=here)
+            # resume_point: compile the same rule set again (09 §4).
+            return Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
+                          gap=GapRef(gap_class=GapClass.MUTATION_ENGINE,
+                                     missing_capability_id=cap),
+                          inner=here)
+        c.reason = "unexpected_event"
+        return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                      reason=BlockedReason.UNEXPECTED_EVENT, inner=here)
 
     def _q1_target(self, c: _Call, r: Q1Result) -> Target:
         """09 §3, the s1_running rows."""
@@ -825,12 +963,19 @@ class Machine:
         self._drop_task(c)
         if not retry:
             j.counters = j.counters.model_copy(update={"agent_retry": 0})
+        stage2 = {}
         if task is AgentTask.CANDIDATE_ANALYSIS:
             model_policy = c.policy.stage1_agents.candidate_analysis
         elif task is AgentTask.REACHABILITY_PLANNING:
             model_policy = c.policy.stage1_agents.reachability_planning
+        elif task is AgentTask.MUTATION_STRATEGY:
+            model_policy = c.policy.stage2_agents.mutation_strategy
+            stage2 = dict(stage2_input=j.stage2_basis,
+                          rule_set_ref=j.rule_set_ref)
         else:
             raise ValueError(f"no model policy for {task}")
+        if not stage2:
+            self._leave_stage2(j)
         j.pending_task = PendingTask(task_id=self._mint(j),
                                      kind=TaskKind.AGENT,
                                      input_digest=agent_input_digest(
@@ -841,12 +986,11 @@ class Machine:
                                          j.binding.hcap_revision,
                                          analysis_ref=j.analysis_ref,
                                          plan_ref=j.plan_ref,
-                                         repair=repair),
+                                         repair=repair, **stage2),
                                      agent_task=task,
                                      model_policy=model_policy,
                                      repair=repair)
-        j.state = JobState.S1_ANALYSIS if \
-            task is AgentTask.CANDIDATE_ANALYSIS else JobState.S1_PLANNING
+        j.state = STATE_OF_TASK[task]
         j.state_reason = repair.cause.value if repair else None
         j.resume_point = None
         j.gap = None
@@ -871,6 +1015,7 @@ class Machine:
             j.counters = j.counters.model_copy(
                 update={"runtime_retry": n + 1})
         self._drop_task(c)
+        self._leave_stage2(j)
         h = j.harness
         if c.policy.approval_required and \
                 h.review_manifest_sha256 not in j.approved_manifests:
@@ -929,9 +1074,7 @@ class Machine:
 
     @staticmethod
     def _agent_target(p: PendingTask, charged: bool) -> Target:
-        kind = TargetKind.ANALYSIS if \
-            p.agent_task is AgentTask.CANDIDATE_ANALYSIS \
-            else TargetKind.PLANNING
+        kind = AGENT_KINDS[p.agent_task]
         if p.repair is None:
             return Target(kind=kind)
         return Target(kind=kind, cause=p.repair.cause,
@@ -947,4 +1090,6 @@ class Machine:
             return Target(kind=TargetKind.ANALYSIS)
         if j.state is JobState.S1_REACHED:
             return Target(kind=TargetKind.REACHED)
+        if j.state is JobState.S2_STRATEGY:
+            return Target(kind=TargetKind.STRATEGY)
         return Target(kind=TargetKind.RUNNING)

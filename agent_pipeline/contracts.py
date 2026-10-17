@@ -109,6 +109,13 @@ class Stage1AgentPolicy(Record):
         AgentModelPolicy(provider="openai", model="gpt-5"))
 
 
+class Stage2AgentPolicy(Record):
+    """Model policy of the Stage 2 Agent Task (08 §1)."""
+
+    mutation_strategy: AgentModelPolicy = Field(default_factory=lambda:
+        AgentModelPolicy(provider="openai", model="gpt-5"))
+
+
 class JobPolicy(Record):
     """01 §11.1, 09 §6.  Limits count retries: how many times the counted
     thing may happen after the first try.  With a limit of 1 one repair runs
@@ -117,7 +124,8 @@ class JobPolicy(Record):
     Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
     Agent retries, three Runner reruns, no human approval before a run.
     run_stage2 becomes true by default once Stage 2 is implemented; until
-    then it only accepts false."""
+    then it only accepts false, and an operator starts Stage 2 of a reached
+    job.  The Stage 2 repair budget follows the Stage 1 default."""
 
     policy_id: str
     sanitizer: Sanitizer
@@ -126,7 +134,9 @@ class JobPolicy(Record):
     # REACHED job waits in s1_reached (09 rationale 11).
     run_stage2: Literal[False] = False
     stage1_agents: Stage1AgentPolicy = Field(default_factory=Stage1AgentPolicy)
+    stage2_agents: Stage2AgentPolicy = Field(default_factory=Stage2AgentPolicy)
     stage1_repair_budget: int = Field(default=3, ge=1)
+    stage2_repair_budget: int = Field(default=3, ge=1)
     agent_retry_limit: int = Field(default=3, ge=1)
     runtime_retry_limit: int = Field(default=3, ge=1)
 
@@ -207,6 +217,7 @@ class JudgeVersions(Record):
 class AgentTask(str, enum.Enum):
     CANDIDATE_ANALYSIS = "candidate_analysis"
     REACHABILITY_PLANNING = "reachability_planning"
+    MUTATION_STRATEGY = "mutation_strategy"
 
 
 class AnalysisOutput(Record):
@@ -221,6 +232,13 @@ class PlanOutput(Record):
 
     variant: Literal["plan"] = "plan"
     plan_ref: Sha256
+
+
+class RuleSetOutput(Record):
+    """08 §5, a MutationRuleSet stored as an artifact."""
+
+    variant: Literal["rule_set"] = "rule_set"
+    rule_set_ref: Sha256
 
 
 class UnsupportedOutput(Record):
@@ -241,7 +259,8 @@ class ReanalysisRequired(Record):
 
 
 AgentOutput = Annotated[
-    Union[AnalysisOutput, PlanOutput, UnsupportedOutput, ReanalysisRequired],
+    Union[AnalysisOutput, PlanOutput, RuleSetOutput, UnsupportedOutput,
+          ReanalysisRequired],
     Field(discriminator="variant"),
 ]
 
@@ -251,6 +270,7 @@ TASK_VARIANTS = {
     AgentTask.CANDIDATE_ANALYSIS: {"analysis"},
     AgentTask.REACHABILITY_PLANNING: {"plan", "unsupported",
                                       "reanalysis_required"},
+    AgentTask.MUTATION_STRATEGY: {"rule_set", "unsupported"},
 }
 
 
@@ -317,3 +337,32 @@ class MaterializeRejected(Record):
     detail: str = ""
     profile: str | None = None
 
+
+
+# ---------------------------------------------------------------- Stage 2
+
+#: Mutation Rule Compiler refusals (08 §12).  The Agent can fix these.
+COMPILER_AGENT_FIXABLE = frozenset({
+    "unknown_path", "type_mismatch", "message_type_inconsistent",
+    "selector_mismatch", "missing_required_field"})
+#: Schema-valid, but the runtime cannot do it: a mutation_engine gap.
+COMPILER_GAP = frozenset({"unsupported_capability", "requires_state_lineage"})
+
+
+class CompiledRuleSet(Record):
+    """08 §12: the CompiledMutationRule[] artifact of one rule set."""
+
+    rule_set_ref: Sha256
+    compiled_ref: Sha256
+    hcap_revision: str
+
+
+class CompileRejected(Record):
+    """08 §12: a typed refusal.  ``reason`` stays a string so a value 08
+    does not name reaches the Controller and routes to unexpected_event.
+    A gap reason names the HCAP vocabulary id it lacks."""
+
+    reason: str
+    intent_id: str | None = None
+    detail: str = ""
+    missing_capability_id: str | None = None
