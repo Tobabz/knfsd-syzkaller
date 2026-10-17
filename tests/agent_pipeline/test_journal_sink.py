@@ -684,3 +684,107 @@ def test_cli_restart_resumes_the_recovered_session(tmp_path):
     proc = _cli(tmp_path, rules, "--lane", str(LANE + 1))
     _, err = proc.communicate(timeout=10)
     assert proc.returncode == 2 and "differs" in err
+
+
+# --- session series: a fresh Proxy session per Proxy start ---------------------------
+
+PREFIX = "lane0-ps"
+UUIDS = ["0f6c1a2e-1111-4a5b-8c9d-0123456789ab", "7d3e9b10-2222-4c6d-9e0f-abcdef012345"]
+
+
+def series(journal, **kw):
+    args = dict(vm_instance_id=CHANNEL.vm_instance_id, channel_id=CHANNEL.channel_id,
+                prefix=PREFIX, lane_id=LANE, rule_set=RULES)
+    args.update(kw)
+    return journal.install_session_series(**args)
+
+
+def test_series_installs_each_new_session_and_supersedes_the_last(tmp_path):
+    journal = HostJournal(tmp_path, "lane0")
+    assert series(journal) == []
+    first = Guest(journal, session=f"{PREFIX}.{UUIDS[0]}")
+    accepted(first.send("RULESET", ruleset_payload())[1])
+    accepted(first.send("GENERATION_OPEN", {"correlation": corr(1),
+                                            "draining_generations": []})[1])
+    # The VM restarted (e.g. the first session ran out of generations).
+    second = Guest(journal, session=f"{PREFIX}.{UUIDS[1]}")
+    ack = accepted(second.send("RULESET", ruleset_payload())[1])
+    assert ack.session_binding.proxy_session_id == second.session
+    assert ack.session_binding.rule_set_id == RULE_SET_ID
+    assert journal.session_state(first.session)["ended"] == "session_end"
+    assert journal.session_state(second.session)["ended"] is None
+    refused(first.send("GENERATION_OPEN", {"correlation": corr(2),
+                                           "draining_generations": []})[1], "session_ended")
+    assert journal.latest_session(PREFIX) == second.session
+    journal.close()
+
+    # Recovery replays the installs and the supersession.
+    reopened = HostJournal(tmp_path, "lane0")
+    recovered = series(reopened)
+    assert [b.proxy_session_id for b in recovered] == [first.session, second.session]
+    assert reopened.session_state(first.session)["ended"] == "session_end"
+    with pytest.raises(ValueError, match="differs"):
+        series(reopened, lane_id=LANE + 1)
+    reopened.close()
+
+
+@pytest.mark.parametrize("session,seq,event_type", [
+    (f"{PREFIX}.{UUIDS[0]}", 1, "GENERATION_OPEN"),  # not the session's first event
+    (f"{PREFIX}.{UUIDS[0]}", 0, "RUN_COMPLETE"),
+    (f"{PREFIX}.not-a-uuid", 0, "RULESET"),
+    (f"{PREFIX}x.{UUIDS[0]}", 0, "RULESET"),
+    (f"other.{UUIDS[0]}", 0, "RULESET"),
+])
+def test_series_installs_only_a_series_session_at_its_ruleset(tmp_path, session, seq, event_type):
+    journal = HostJournal(tmp_path, "lane0")
+    series(journal)
+    payload = {"RULESET": ruleset_payload(), "RUN_COMPLETE": run_complete(),
+               "GENERATION_OPEN": {"correlation": corr(1), "draining_generations": []}}[event_type]
+    refused(journal.submit(CHANNEL, request(seq, event_type, payload, session=session)),
+            "unknown_session")
+    journal.close()
+
+
+def test_series_belongs_to_its_channel(tmp_path):
+    journal = HostJournal(tmp_path, "lane0")
+    series(journal)
+    other = ChannelIdentity(CHANNEL.vm_instance_id, "nfspj-1")
+    raw = request(0, "RULESET", ruleset_payload(), session=f"{PREFIX}.{UUIDS[0]}")
+    refused(journal.submit(other, raw), "unknown_session")
+    accepted(journal.submit(CHANNEL, raw))
+    journal.close()
+
+
+def test_cli_serves_a_session_series(tmp_path):
+    import signal
+    import subprocess
+    import sys
+
+    rules = tmp_path / "rules.bin"
+    rules.write_bytes(RULES)
+    sock_path = tmp_path / "s.sock"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agent_pipeline.journal_sink", "--dir", str(tmp_path / "j"),
+         "--name", "lane0", "--socket", str(sock_path), "--vm", CHANNEL.vm_instance_id,
+         "--channel", CHANNEL.channel_id, "--session-prefix", PREFIX, "--lane", str(LANE),
+         "--rules", str(rules)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        line = proc.stdout.readline()
+        assert line.startswith("journal sink ready: series"), proc.stderr.read()
+        for uuid in UUIDS:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as guest:
+                guest.settimeout(10)
+                guest.connect(str(sock_path))
+                raw = request(0, "RULESET", ruleset_payload(), session=f"{PREFIX}.{uuid}")
+                guest.sendall(encode_frame(JournalFrame(FrameKind.JOURNAL_EVENT, raw)))
+                header = guest.recv(80, socket.MSG_WAITALL)
+                body = guest.recv(int.from_bytes(header[12:16], "big"), socket.MSG_WAITALL)
+                accepted(header + body, raw)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 0
+    assert f"session={PREFIX}.{UUIDS[1]} next_seq=1" in out

@@ -120,6 +120,81 @@ with tempfile.TemporaryDirectory() as directory:
                            "recvfrom$inet_nfs_fuzz"))
                for call in ganesha_prepared["enable_syscalls"])
 
+    # Proxy target mode: rule sets and sessions ride the lane share, one
+    # journal port per lane points at that lane's host sink.
+    target_inputs = work / "target-inputs"
+    target_inputs.mkdir()
+    for lane in range(4):
+        (target_inputs / ("lane%d.nfsprul1" % lane)).write_bytes(b"NFSPRUL1 lane %d" % lane)
+        (target_inputs / ("lane%d.session" % lane)).write_text("ps-%d\n" % lane)
+    target = work / "manager-target.cfg"
+    subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                    str(manager), str(target), "--version", "4.1", "--image", str(proxy),
+                    "--nfs-target", str(target_inputs),
+                    "--journal-socket-dir", str(work / "sinks"), "--qemu-version", "9.2"],
+                   check=True, capture_output=True)
+    target_prepared = json.loads(target.read_text())
+    target_template = Path(target_prepared["workdir_template"])
+    assert target_template != Path(prepared["workdir_template"])
+    assert (target_template / "lane.sh").read_bytes() == lane_bytes
+    for lane in range(4):
+        assert (target_template / "target" / ("lane%d.nfsprul1" % lane)).read_bytes() == \
+            b"NFSPRUL1 lane %d" % lane
+        assert ("chardev=nfspj%d,name=nfsp-journal-%d" % (lane, lane)) in \
+            target_prepared["vm"]["qemu_args"]
+        assert ("path=%s,reconnect-ms=1000" % (work / "sinks" / ("lane%d.sock" % lane)).resolve()) \
+            in target_prepared["vm"]["qemu_args"]
+    assert "koov.nfs_target=1" in target_prepared["vm"]["cmdline"].split()
+    # Older QEMU only knows reconnect=SECONDS; the version is read from the
+    # configured binary unless given.
+    fake_qemu = work / "qemu-6.2"
+    fake_qemu.write_text("#!/bin/sh\necho 'QEMU emulator version 6.2.0 (Debian 1:6.2+dfsg-2ubuntu6)'\n")
+    fake_qemu.chmod(0o755)
+    old_manager = work / "manager-old-qemu.cfg"
+    old_config = json.loads(manager.read_text())
+    old_config["vm"]["qemu"] = str(fake_qemu)
+    old_manager.write_text(json.dumps(old_config))
+    for extra in ([], ["--qemu-version", "6.2"]):
+        old_target = work / ("manager-target-old%d.cfg" % len(extra))
+        subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                        str(old_manager if not extra else manager), str(old_target),
+                        "--version", "4.1", "--image", str(proxy),
+                        "--nfs-target", str(target_inputs),
+                        "--journal-socket-dir", str(work / "sinks")] + extra,
+                       check=True, capture_output=True)
+        old_args = json.loads(old_target.read_text())["vm"]["qemu_args"]
+        assert "reconnect=1 " in old_args and "reconnect-ms" not in old_args, old_args
+    old_config["vm"]["qemu"] = str(work / "no-such-qemu")
+    old_manager.write_text(json.dumps(old_config))
+    unknown = subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+                              str(old_manager), str(work / "unknown.cfg"), "--version", "4.1",
+                              "--image", str(proxy), "--nfs-target", str(target_inputs),
+                              "--journal-socket-dir", str(work / "sinks")],
+                             capture_output=True, text=True)
+    assert unknown.returncode != 0 and "pass --qemu-version" in unknown.stderr, unknown.stderr
+    assert "koov.lane_sha256=" + lane_sha in target_prepared["vm"]["cmdline"]
+    for bad_args, needle in (
+            (["--nfs-target", str(target_inputs)], "--journal-socket-dir"),
+            (["--journal-socket-dir", str(work)], "--nfs-target"),
+            (["--nfs-target", str(work), "--journal-socket-dir", str(work)], "missing target input"),
+            (["--qemu-version", "9.2"], "--qemu-version needs --nfs-target"),
+            (["--nfs-target", str(target_inputs), "--journal-socket-dir", str(work),
+              "--qemu-version", "nine"], "--qemu-version must look like")):
+        refused = subprocess.run(
+            [sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+             str(manager), str(work / "refused.cfg"), "--version", "4.1",
+             "--image", str(proxy)] + bad_args, capture_output=True, text=True)
+        assert refused.returncode != 0 and needle in refused.stderr, refused.stderr
+    multi = work / "manager-multi.cfg"
+    multi.write_text(json.dumps({**json.loads(manager.read_text()),
+                                 "vm": {"cmdline": "nfs.localio_enabled=N", "count": 2}}))
+    refused = subprocess.run(
+        [sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
+         str(multi), str(work / "refused.cfg"), "--version", "4.1", "--image", str(proxy),
+         "--nfs-target", str(target_inputs), "--journal-socket-dir", str(work / "sinks")],
+        capture_output=True, text=True)
+    assert refused.returncode != 0 and "vm.count 1" in refused.stderr, refused.stderr
+
     broad = work / "manager-broad.cfg"
     broad_state = work / "persistent-broad-state"
     subprocess.run([sys.executable, str(ROOT / "tools/prepare-live-lane-config.py"),
@@ -252,8 +327,8 @@ assert manifest["purpose"] == "mutation_seed"
 assert Path(ROOT / manifest["required_syzkaller_patch"]).is_file()
 assert Path(ROOT / manifest["required_syzkaller_validator_patch"]).is_file()
 syzkaller_patches = sorted((ROOT / "bundle/patches/syzkaller").glob("*.patch"))
-assert len(syzkaller_patches) == 22
-assert syzkaller_patches[-1].name.startswith("0022-")
+assert len(syzkaller_patches) == 23
+assert syzkaller_patches[-1].name.startswith("0023-")
 programs = {entry["path"]: entry for entry in manifest["programs"]}
 assert len(programs) == len(manifest["programs"]) == 12
 for entry in manifest["programs"]:
@@ -290,6 +365,30 @@ assert '"nfs_trace":%s' in lane_source
 boot_source = (ROOT / "bundle/lane/boot-fixture.sh").read_text()
 assert "koov.nfs_trace=*) trace=${arg#koov.nfs_trace=} ;;" in boot_source
 assert "trace=0\n" in boot_source
+# Proxy target mode is opt-in: koov.nfs_target=1 maps the share's target/
+# files to NFS_PROXY_TARGET_DIR, which swaps the legacy arm socket for the
+# rule set, journal port and executor activation endpoint.
+assert "koov.nfs_target=*) target=${arg#koov.nfs_target=} ;;" in boot_source
+assert "target=0\n" in boot_source
+assert "NFS_PROXY_TARGET_DIR=/run/frozen-phase9/target" in boot_source
+assert boot_source.index("NFS_PROXY_TARGET_DIR=/run/frozen-phase9/target") < \
+    boot_source.index('umount "$source_dir"\nactual_sha')
+assert "proxy_target_dir=${NFS_PROXY_TARGET_DIR:-}" in lane_source
+assert "export proxy_target_dir" in lane_source
+assert '--activation "$executor_root/proc-$lane/activation/activation.sock"' in lane_source
+assert '--journal "/dev/virtio-ports/nfsp-journal-$lane"' in lane_source
+assert '"$executor_root/proc-$setup_lane_id/activation/rule_set_id"' in lane_source
+# The server namespace replaces /run, so the proxy reads its inputs from the
+# lane root, and every Proxy start gets a fresh session in the host series.
+assert 'cp "$setup_rules" "$setup_lane_root/server/target/rules.nfsprul1"' in lane_source
+assert lane_source.index('cp "$setup_rules" "$setup_lane_root/server/target/rules.nfsprul1"') < \
+    lane_source.index('mount --bind "$lane_root/server/state/run" /run')
+assert '--target "$lane_root/server/target/rules.nfsprul1"' in lane_source
+assert '$(cat /proc/sys/kernel/random/uuid)' in lane_source
+assert '--session-id "$proxy_session"' in lane_source
+assert '$proxy_target_dir/lane$lane' not in lane_source
+assert 'printf \'%s\\n\' "$proxy_target_dir" > "$root/fixture.target"' in lane_source
+assert 'proxy_target_dir=$(cat "$root/fixture.target")' in lane_source
 assert manifest["fixtures"]["broad-knfsd"]["mixed_profile_runtime"] == "allowed"
 assert manifest["fixtures"]["broad-knfsd"]["promotion_policy"] == {
     "nfs_root_required": True,
