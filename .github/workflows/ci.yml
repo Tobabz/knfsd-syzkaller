@@ -80,5 +80,8 @@ jobs:
           ./bin/linux_amd64/syz-executor test test_nfsp_barrier
           ./bin/linux_amd64/syz-executor test test_nfsp_broker
           ./bin/linux_amd64/syz-executor test test_nfsp_cgroup
+          # The Linux-only NFS proxy code must not leak into other executor
+          # targets; the test OS executor is built by syzkaller's own tests.
+          TARGETOS=test TARGETARCH=64 TARGETVMARCH=64 make executor
           go test ./pkg/flatrpc/
           go test ./executor/ -run 'NfsProxy|Generation|FixedLane'

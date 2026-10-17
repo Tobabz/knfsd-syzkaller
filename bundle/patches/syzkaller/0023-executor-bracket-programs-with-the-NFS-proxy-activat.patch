@@ -1,4 +1,4 @@
-From b7422bf49c3512a1e67f2383386b9cf14ab5b3c2 Mon Sep 17 00:00:00 2001
+From 8586aa53465d0847fab6b71c72a26d39bd0585ec Mon Sep 17 00:00:00 2001
 From: idealinsane <idealinsane@localhost>
 Date: Fri, 16 Oct 2026 13:43:53 +0000
 Subject: [PATCH] executor: bracket programs with the NFS proxy activation
@@ -1692,7 +1692,7 @@ index 000000000..3c1da7acf
 +	)
 +}
 diff --git a/executor/test.h b/executor/test.h
-index 437bf01d9..9c039b3ef 100644
+index 437bf01d9..204aec41e 100644
 --- a/executor/test.h
 +++ b/executor/test.h
 @@ -414,6 +414,432 @@ static int test_get_last_opt()
@@ -2111,7 +2111,6 @@ index 437bf01d9..9c039b3ef 100644
 +	munmap((void*)progress, SYZ_PAGE_SIZE);
 +	return ret;
 +}
-+#endif
 +
 +// test_nfsp_cgroup's program after its execve: whether it can now enter its
 +// fork server's cgroup namespace.  Skipped when run on its own.
@@ -2124,6 +2123,7 @@ index 437bf01d9..9c039b3ef 100644
 +	printf("after execve the program entered its fork server's cgroup namespace\n");
 +	return 1;
 +}
++#endif
 +
  static struct {
  	const char* name;
