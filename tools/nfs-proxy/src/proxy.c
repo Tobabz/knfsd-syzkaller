@@ -16,11 +16,20 @@
 #define NFSP_MAX_CONNS 64u
 #define NFSP_READ_CHUNK 16384u
 #define NFSP_DEFAULT_CONNECT_MS 2000u
+#define NFSP_EXTRA_FDS 8u
+
+/* A record in a queue whose delivery someone waits for (on_forwarded). */
+struct mark {
+	size_t start, end;
+	uint64_t token;
+};
 
 struct queue {
 	uint8_t *buf;
 	size_t len, off, cap;
 	uint32_t pending_records;
+	struct mark *marks;
+	size_t nmarks, marks_cap;
 };
 
 struct conn {
@@ -33,6 +42,11 @@ struct conn {
 	int client_eof, backend_eof, client_wr_closed, backend_wr_closed;
 	struct nfsp_framing c2s, s2c;
 	struct queue to_backend, to_client;
+	/* Target mode: a held record at the head of the framing buffer, and
+	 * bytes read after it in the same chunk, not yet framed. */
+	int held[2];
+	uint64_t hold[2];
+	struct queue backlog[2];
 };
 
 struct state {
@@ -132,9 +146,35 @@ static struct nfsp_connection_ref conn_ref(const struct conn *c)
 	return ref;
 }
 
+/* Every record still queued for this peer is not (completely) delivered. */
+static void drop_marks(struct state *s, struct queue *q)
+{
+	for (size_t i = 0; i < q->nmarks; i++) {
+		struct mark *m = &q->marks[i];
+		size_t written = q->off > m->start ?
+			(q->off < m->end ? q->off : m->end) - m->start : 0;
+		if (s->cfg->on_forwarded != NULL)
+			s->cfg->on_forwarded(m->token, 0, written, m->end - m->start,
+					     s->cfg->relay_arg);
+	}
+	free(q->marks);
+	q->marks = NULL;
+	q->nmarks = q->marks_cap = 0;
+}
+
 static void conn_close(struct state *s, struct conn *c)
 {
 	if (c->client_fd < 0) return;
+	drop_marks(s, &c->to_backend);
+	drop_marks(s, &c->to_client);
+	for (int d = 0; d < 2; d++) {
+		if (c->held[d] && s->cfg->on_hold_dropped != NULL)
+			s->cfg->on_hold_dropped(c->hold[d], s->cfg->relay_arg);
+		c->held[d] = 0;
+		free(c->backlog[d].buf);
+		c->backlog[d].buf = NULL;
+		c->backlog[d].len = c->backlog[d].cap = 0;
+	}
 	if (s->cfg->on_connection != NULL) {
 		struct nfsp_connection_ref ref = conn_ref(c);
 		s->cfg->on_connection(&ref, NFSP_CONN_CLOSED, s->cfg->on_connection_arg);
@@ -149,6 +189,39 @@ static void conn_close(struct state *s, struct conn *c)
 	if (c->connected) s->stats->active--;
 	c->client_fd = -1;
 	c->backend_fd = -1;
+}
+
+static int add_mark(struct queue *q, uint64_t token, size_t start, size_t end)
+{
+	if (q->nmarks == q->marks_cap) {
+		size_t cap = q->marks_cap ? q->marks_cap * 2u : 4u;
+		struct mark *grown = realloc(q->marks, cap * sizeof(*grown));
+		if (grown == NULL) return -1;
+		q->marks = grown;
+		q->marks_cap = cap;
+	}
+	q->marks[q->nmarks].start = start;
+	q->marks[q->nmarks].end = end;
+	q->marks[q->nmarks].token = token;
+	q->nmarks++;
+	return 0;
+}
+
+/* Report every mark whose last byte is now written. */
+static void complete_marks(struct state *s, struct queue *q)
+{
+	size_t done = 0;
+	while (done < q->nmarks && q->marks[done].end <= q->off) {
+		struct mark *m = &q->marks[done++];
+		if (s->cfg->on_forwarded != NULL)
+			s->cfg->on_forwarded(m->token, 1, m->end - m->start,
+					     m->end - m->start, s->cfg->relay_arg);
+	}
+	if (done != 0) {
+		memmove(q->marks, q->marks + done,
+			(q->nmarks - done) * sizeof(*q->marks));
+		q->nmarks -= done;
+	}
 }
 
 static int enqueue(struct queue *q, const uint8_t *p, size_t n, size_t max)
@@ -179,7 +252,11 @@ static int flush(struct state *s, struct conn *c, int dir)
 	int fd = dir == NFSP_DIR_C2S ? c->backend_fd : c->client_fd;
 	while (q->off < q->len) {
 		ssize_t n = send(fd, q->buf + q->off, q->len - q->off, MSG_NOSIGNAL);
-		if (n > 0) { q->off += (size_t)n; continue; }
+		if (n > 0) {
+			q->off += (size_t)n;
+			if (q->nmarks != 0) complete_marks(s, q);
+			continue;
+		}
 		if (n < 0 && errno == EINTR) continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
 		s->stats->relay_errors++;
@@ -210,65 +287,180 @@ static int observe(struct state *s, struct conn *c, int dir,
 	return s->cfg->on_rpc_record(&rec, s->cfg->on_rpc_record_arg);
 }
 
+/* Queue the record at the head of the framing buffer as the verdict says
+ * and consume it.  -1 closes the connection. */
+static int forward(struct state *s, struct conn *c, int dir, size_t len,
+		   const struct nfsp_relay_verdict *v)
+{
+	struct nfsp_framing *f = dir == NFSP_DIR_C2S ? &c->c2s : &c->s2c;
+	struct queue *q = dir == NFSP_DIR_C2S ? &c->to_backend : &c->to_client;
+	size_t ceiling = s->limit + NFSP_FRAG_HEADER_LEN, start = q->len;
+	/* A rebuilt record must still be a whole, in-bounds record.
+	 * Anything else would put bytes on the wire the peer cannot
+	 * frame, so it is a mutation error and closes only this
+	 * connection. */
+	if (v->out == NULL || v->out_len < NFSP_FRAG_HEADER_LEN ||
+	    v->out_len > ceiling) {
+		s->stats->mutation_errors++;
+		goto lost;
+	}
+	if (enqueue(q, v->out, v->out_len, ceiling + NFSP_READ_CHUNK) != 0) {
+		s->stats->relay_errors++;
+		goto lost;
+	}
+	if (v->completion != 0 &&
+	    add_mark(q, v->completion, start, start + v->out_len) != 0) {
+		/* The bytes are queued but cannot be reported: never send
+		 * them unreported. */
+		q->len = start;
+		q->pending_records--;
+		s->stats->relay_errors++;
+		goto lost;
+	}
+	s->stats->records[c->client][c->backend][dir]++;
+	nfsp_framing_consume(f, len);
+	return 0;
+lost:
+	if (v->completion != 0 && s->cfg->on_forwarded != NULL)
+		s->cfg->on_forwarded(v->completion, 0, 0, v->out_len,
+				     s->cfg->relay_arg);
+	return -1;
+}
+
+/* One complete record at the head of the framing buffer.  1: held. */
+static int relay_one(struct state *s, struct conn *c, int dir, size_t len)
+{
+	struct nfsp_framing *f = dir == NFSP_DIR_C2S ? &c->c2s : &c->s2c;
+	struct nfsp_relay_verdict v;
+	int action;
+
+	memset(&v, 0, sizeof(v));
+	v.out = f->buf;
+	v.out_len = len;
+	if (s->cfg->on_relay != NULL) {
+		struct nfsp_rpc_record rec;
+		if (nfsp_rpc_payload(f->buf, len, &s->payload, &rec.rpc_payload,
+				     &rec.rpc_payload_len, &rec.nfrags) !=
+		    NFSP_RECORD_OK) {
+			s->stats->record_refused++;
+			return -1;
+		}
+		rec.conn = conn_ref(c);
+		rec.direction = dir;
+		action = s->cfg->on_relay(&rec, f->buf, len, &v,
+					  s->cfg->relay_arg);
+		if (action == NFSP_RELAY_HOLD) {
+			c->held[dir] = 1;
+			c->hold[dir] = v.hold;
+			return 1;
+		}
+		if (action != NFSP_RELAY_FORWARD) {
+			s->stats->record_refused++;
+			return -1;
+		}
+		return forward(s, c, dir, len, &v);
+	}
+	if (s->cfg->on_rpc_record != NULL &&
+	    observe(s, c, dir, f->buf, len) != 0) {
+		s->stats->record_refused++;
+		return -1;
+	}
+	/* Default: forward the record exactly as received.  The callback
+	 * may redirect to a rebuilt record of a different length; framing
+	 * is consumed by the ORIGINAL length either way, since that is
+	 * what was read. */
+	if (s->cfg->on_record != NULL &&
+	    s->cfg->on_record(c->client, c->backend, dir, f->buf, len,
+			      &v.out, &v.out_len, s->cfg->on_record_arg) != 0) {
+		s->stats->mutation_errors++;
+		return -1;
+	}
+	return forward(s, c, dir, len, &v);
+}
+
+/* Relay complete records until none is left or one is held. */
+static int drain(struct state *s, struct conn *c, int dir)
+{
+	struct nfsp_framing *f = dir == NFSP_DIR_C2S ? &c->c2s : &c->s2c;
+	while (!c->held[dir]) {
+		size_t len = 0;
+		int rc = nfsp_framing_peek(f, &len, NULL, NULL);
+		if (rc < 0) {
+			s->stats->framing_errors++;
+			return -1;
+		}
+		if (rc == 0) break;
+		if (relay_one(s, c, dir, len) < 0) return -1;
+	}
+	return 0;
+}
+
 /* Feed at most the framing budget at a time.  A TCP read may contain several
  * complete records, and a previous read may have left an almost-full record.
- * Drain after EACH bounded append instead of treating coalescing as corruption. */
+ * Drain after EACH bounded append instead of treating coalescing as corruption.
+ * Once a record is held, the rest waits in the backlog, unframed. */
 static int feed(struct state *s, struct conn *c, int dir,
 		const uint8_t *data, size_t size)
 {
 	struct nfsp_framing *f = dir == NFSP_DIR_C2S ? &c->c2s : &c->s2c;
-	struct queue *q = dir == NFSP_DIR_C2S ? &c->to_backend : &c->to_client;
 	size_t pos = 0, ceiling = s->limit + NFSP_FRAG_HEADER_LEN;
 	while (pos < size) {
 		size_t take = size - pos, room;
+		if (c->held[dir]) {
+			struct queue *b = &c->backlog[dir];
+			if (enqueue(b, data + pos, size - pos,
+				    ceiling + 2u * NFSP_READ_CHUNK) != 0) {
+				s->stats->relay_errors++;
+				return -1;
+			}
+			return 0;
+		}
 		if (f->len >= ceiling) goto bad_frame;
 		room = ceiling - f->len;
 		if (take > room) take = room;
 		if (nfsp_framing_append(f, data + pos, take) != 0) goto bad_frame;
 		pos += take;
-		for (;;) {
-			size_t len = 0;
-			int rc = nfsp_framing_peek(f, &len, NULL, NULL);
-			if (rc < 0) goto bad_frame;
-			if (rc == 0) break;
-			const uint8_t *fwd = f->buf;
-			size_t fwd_len = len;
-			if (s->cfg->on_rpc_record != NULL &&
-			    observe(s, c, dir, f->buf, len) != 0) {
-				s->stats->record_refused++;
-				return -1;
-			}
-			/* Default: forward the record exactly as received.  The callback
-			 * may redirect to a rebuilt record of a different length; framing
-			 * is consumed by the ORIGINAL length either way, since that is
-			 * what was read. */
-			if (s->cfg->on_record != NULL &&
-			    s->cfg->on_record(c->client, c->backend, dir, f->buf, len,
-					      &fwd, &fwd_len, s->cfg->on_record_arg) != 0) {
-				s->stats->mutation_errors++;
-				return -1;
-			}
-			/* A rebuilt record must still be a whole, in-bounds record.
-			 * Anything else would put bytes on the wire the peer cannot
-			 * frame, so it is a mutation error and closes only this
-			 * connection. */
-			if (fwd == NULL || fwd_len < NFSP_FRAG_HEADER_LEN ||
-			    fwd_len > ceiling) {
-				s->stats->mutation_errors++;
-				return -1;
-			}
-			if (enqueue(q, fwd, fwd_len, ceiling + NFSP_READ_CHUNK) != 0) {
-				s->stats->relay_errors++;
-				return -1;
-			}
-			s->stats->records[c->client][c->backend][dir]++;
-			nfsp_framing_consume(f, len);
-		}
+		if (drain(s, c, dir) != 0) return -1;
 	}
 	return 0;
 bad_frame:
 	s->stats->framing_errors++;
 	return -1;
+}
+
+/* Offer a held record again.  -1 closes the connection. */
+static int resume(struct state *s, struct conn *c, int dir)
+{
+	struct nfsp_framing *f = dir == NFSP_DIR_C2S ? &c->c2s : &c->s2c;
+	struct nfsp_relay_verdict v;
+	struct queue backlog;
+	size_t len = 0;
+	int action, rc;
+
+	if (!c->held[dir]) return 0;
+	if (nfsp_framing_peek(f, &len, NULL, NULL) != 1) {
+		s->stats->framing_errors++;
+		return -1;
+	}
+	memset(&v, 0, sizeof(v));
+	v.out = f->buf;
+	v.out_len = len;
+	action = s->cfg->on_hold(c->hold[dir], f->buf, len, &v,
+				 s->cfg->relay_arg);
+	if (action == NFSP_RELAY_HOLD) return 0;
+	c->held[dir] = 0;
+	if (action != NFSP_RELAY_FORWARD) {
+		s->stats->record_refused++;
+		return -1;
+	}
+	if (forward(s, c, dir, len, &v) != 0) return -1;
+	if (drain(s, c, dir) != 0) return -1;
+	if (c->backlog[dir].len == 0) return 0;
+	backlog = c->backlog[dir];
+	memset(&c->backlog[dir], 0, sizeof(c->backlog[dir]));
+	rc = feed(s, c, dir, backlog.buf, backlog.len);
+	free(backlog.buf);
+	return rc;
 }
 
 static int read_side(struct state *s, struct conn *c, int side)
@@ -406,14 +598,23 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 	if (on_ready != NULL) on_ready(stats, ready_arg);
 	rc = 0;
 	while (!atomic_load(cfg->stop)) {
-		struct pollfd pfd[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS];
-		int owner[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS];
-		int side[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS];
+		struct pollfd pfd[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
+		int owner[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
+		int side[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
 		nfds_t count = 0;
 		int n;
 		uint64_t now = now_ms();
 		if (cfg->on_tick != NULL)
 			cfg->on_tick(cfg->on_tick_arg);
+		/* A held record may have been decided by what on_tick read. */
+		if (cfg->on_hold != NULL) {
+			for (i = 0; i < NFSP_MAX_CONNS; i++) {
+				struct conn *c = &s->conns[i];
+				for (int d = 0; d < 2 && c->client_fd >= 0; d++)
+					if (c->held[d] && resume(s, c, d) != 0)
+						conn_close(s, c);
+			}
+		}
 		if (cfg->on_stats != NULL)
 			cfg->on_stats(stats, cfg->on_stats_arg);
 		for (b = 0; b < NFSP_BACKENDS; b++) {
@@ -432,8 +633,10 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 			}
 			if (c->connecting) be = POLLOUT;
 			else {
-				if (!c->client_eof && c->to_backend.len == 0) ce |= POLLIN;
-				if (!c->backend_eof && c->to_client.len == 0) be |= POLLIN;
+				if (!c->client_eof && c->to_backend.len == 0 &&
+				    !c->held[NFSP_DIR_C2S]) ce |= POLLIN;
+				if (!c->backend_eof && c->to_client.len == 0 &&
+				    !c->held[NFSP_DIR_S2C]) be |= POLLIN;
 				if (c->to_client.len) ce |= POLLOUT;
 				if (c->to_backend.len) be |= POLLOUT;
 			}
@@ -443,6 +646,15 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 			pfd[count] = (struct pollfd){c->backend_fd, be, 0};
 			owner[count] = (int)i;
 			side[count++] = NFSP_DIR_S2C;
+		}
+		if (cfg->poll_fds != NULL) {
+			size_t extra = cfg->poll_fds(&pfd[count], NFSP_EXTRA_FDS,
+						     cfg->relay_arg);
+			if (extra > NFSP_EXTRA_FDS) extra = NFSP_EXTRA_FDS;
+			for (size_t e = 0; e < extra; e++) {
+				owner[count] = -2;
+				side[count++] = 0;
+			}
 		}
 		n = poll(pfd, count, 50);
 		if (n < 0) {
@@ -456,6 +668,8 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 			struct conn *c;
 			short ev = pfd[k].revents;
 			if (ev == 0) continue;
+			/* Extra descriptors are serviced by on_tick. */
+			if (owner[k] == -2) continue;
 			if (owner[k] < 0) {
 				if (ev & POLLIN) accept_route(s, (unsigned)side[k]);
 				else { stats->relay_errors++; rc = -1; }
@@ -477,14 +691,15 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 				int dir = side[k] == NFSP_DIR_C2S ? NFSP_DIR_S2C : NFSP_DIR_C2S;
 				if (flush(s, c, dir) != 0) { conn_close(s, c); continue; }
 			}
-			if ((ev & (POLLIN | POLLHUP)) &&
+			if ((ev & (POLLIN | POLLHUP)) && !c->held[side[k]] &&
 			    ((side[k] == NFSP_DIR_C2S && !c->client_eof && c->to_backend.len == 0) ||
 			     (side[k] == NFSP_DIR_S2C && !c->backend_eof && c->to_client.len == 0))) {
 				if (read_side(s, c, side[k]) != 0) { conn_close(s, c); continue; }
 			}
 			half_close(c);
 			if (c->client_eof && c->backend_eof &&
-			    c->to_backend.len == 0 && c->to_client.len == 0)
+			    c->to_backend.len == 0 && c->to_client.len == 0 &&
+			    !c->held[0] && !c->held[1])
 				conn_close(s, c);
 		}
 		if (rc != 0) break;

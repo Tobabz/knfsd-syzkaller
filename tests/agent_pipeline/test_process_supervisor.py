@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import errno
+import gc
 import hashlib
 import json
 import os
@@ -594,15 +595,22 @@ def test_spawn_failure_is_clean_but_not_retriable_with_same_lease(host, tmp_path
         supervisor.run(cmd, lease, control, resource_key="lane", limits=limits())
 
 
+def _open_descriptors() -> int:
+    # Unreachable objects of earlier tests can still hold descriptors until
+    # the collector runs; collect first so only live descriptors count.
+    gc.collect()
+    return len(list(Path("/proc/self/fd").iterdir()))
+
+
 def test_descriptor_and_process_cleanup_after_repeated_runs(host, tmp_path):
-    before = len(list(Path("/proc/self/fd").iterdir()))
+    before = _open_descriptors()
     for index in range(6):
         result, _ = run(host, tmp_path, 'print("ok")', name=f"task-{index}")
         assert result.reason == "completed"
         current = record(host[1])
         assert not Path(f"/proc/{current['guardian']['pid']}").exists()
         assert not Path(f"/proc/{current['child']['pid']}").exists()
-    assert len(list(Path("/proc/self/fd").iterdir())) == before
+    assert _open_descriptors() == before
 
 
 def test_attempt_journal_bound_fails_before_spawn(host, tmp_path):

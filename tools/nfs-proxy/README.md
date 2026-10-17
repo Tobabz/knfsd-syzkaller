@@ -235,11 +235,144 @@ format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.
   configuration may lower these or raise either lifetime ids or pending tickets to 4096, with
   `max_draining <= max_generations`. Exhaustion refuses the operation rather than recycling a
   generation or ticket id.
-- This remains component-only. `main`/`proxy` do not install rule sets, call the activation
-  component or expose rebuilt target bytes. The isolated Runner/executor endpoint and barrier
-  protocol remain S1a; durable host `RULESET`, `GENERATION_OPEN`, `GENERATION_DRAINING`,
-  `EXPOSURE_INTENT` and `GENERATION_COMPLETE` handling remain M5/S1b. The test gate does not
-  satisfy any of those durability requirements.
+- On its own the test gate satisfies none of the durability requirements. Target mode (next
+  section) replaces it with the host sink and connects these components to `main`/`proxy`.
+
+## Target mode: semantic Delta journal and live rules (M5)
+
+[06 §28](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+encodings in [05 §45](../../docs/design/03-nfs-proxy/05-mutation-delta-replay.md).
+
+```sh
+nfs-proxy CLIENT0 CLIENT1 K_LISTEN G_LISTEN K_BACKEND G_BACKEND \
+    --target RULES.nfsprul1 --session-id ps-1 --journal /dev/virtio-ports/nfsp-journal \
+    --lane 0 --activation /run/nfs-proxy/activation.sock [--drain-bound-ms 5000]
+```
+
+- `--target` installs one NFSPRUL1 rule set for the whole session and sends it as `RULESET`, the
+  session's first journal event. `--control`, `--replay` and `--semantic` cannot be combined with it.
+- `--journal` is the host channel: a virtio-serial port in a guest, or a Unix stream socket on the
+  host (tests). `src/journal.c` sends one event at a time and waits for the host's answer.
+- `--activation` is the executor's SOCK_SEQPACKET endpoint (wire format in `src/target.h`). An
+  activate or deactivate request is answered only after the host stored `GENERATION_OPEN` or
+  `GENERATION_DRAINING`. Keep the path out of reach of fuzzed programs.
+- Mutated bytes leave only after the host stored their `EXPOSURE_INTENT`; a refused or lost intent
+  sends the original record. The first hard refusal per generation and rule is stored as
+  `APPLY_REFUSAL` before the refused record moves, and without a host answer it never moves.
+- A held record stops only its own connection and direction. The final stats line starts with
+  `target ruleset=...`, followed by a `journal ...` line.
+- On exit the Proxy first settles every answer still owed and the events they queue, then sends
+  `RUN_COMPLETE` last, and only when the session ended cleanly (every event ACKed, no event left
+  unrecorded, no evidence-path failure, every opened generation summarized, every batch terminal).
+  The sink also refuses `RUN_COMPLETE` (`session_dirty`) for a session with any recorded rejection. Otherwise the stats say `run_complete=skipped` and
+  the Runner ends the session.
+
+The host side is `agent_pipeline/journal_sink.py`:
+
+```sh
+python -m agent_pipeline.journal_sink --dir JOURNAL_DIR --name lane0 \
+    --socket /run/knfsd-syzkaller/nfsp-journal.sock --vm vm-0 --channel nfsp-journal \
+    --session ps-1 --lane 0 --rules RULES.nfsprul1
+```
+
+Run the same command again after a restart: it resumes the recovered session (and re-answers a
+retransmitted event without storing it twice), and refuses to start if the binding, lane or rule
+set differ.
+
+`--fsync` makes every stored entry durable before the sink answers. An activation ACK then waits
+on that fsync, and the executor gives a barrier only `syscall_timeout_ms * 10`. On the #45 KVM run a
+slow fsync made the generation 186 open ACK miss that bound: the lane was quarantined and the VM
+restarted. Leave `--fsync` off for fuzzing unless the host's storage answers well inside the bound.
+
+`tests/agent_pipeline/test_journal_live.py` runs the built Proxy (with ASan when the compiler has
+it) against this sink on loopback; `tools/nfs-proxy/build.sh` covers `test_journal` and the relay
+hold hooks in `test_proxy`.
+
+**KVM step (run by hand on a KVM host; not covered by CI).** Attach the guest port to the sink's
+socket, start the sink before the VM, then run the Proxy in the guest with `--journal
+/dev/virtio-ports/nfsp-journal`:
+
+```sh
+qemu-system-x86_64 ... \
+    -device virtio-serial-pci,id=vser0 \
+    -chardev socket,id=nfspj,path=/run/knfsd-syzkaller/nfsp-journal.sock,reconnect-ms=1000 \
+    -device virtserialport,bus=vser0.0,chardev=nfspj,name=nfsp-journal
+```
+
+(QEMU older than 9.2 spells the option `reconnect=1`.) The guest Proxy binary from
+`build-guest.sh` includes target mode.
+
+**Executor barrier (S1a).** Syzkaller patch 0023 makes the executor drive `--activation`. In a
+target-mode lane, `lane.sh` starts the Proxy with `--target`, `--session-id`, `--journal
+/dev/virtio-ports/nfsp-journal-N` and `--activation` on a socket under the executor's
+`proc-N/activation/`, which the executor connects to before it chroots. Only the fork server
+keeps that connection, and only the fork server decides when a program's window ends. The process
+that runs fuzzed syscalls has no descriptor for the endpoint, and nothing it sends can end its
+window early.
+
+For every program with a KCOV generation, the program process asks the fork server, over a socket
+pair made for that program, to `ACTIVATE` its generation. The fork server sends the activation with
+the SHA-256 of its own copy of the exec-encoded program, and the program runs only after the ACK.
+After its calls the program process sends `DONE` and waits. `DONE` is only a request, since a fuzzed
+syscall could send it too.
+
+Every program process runs in a cgroup v2 directory of its own, which is also the root of its
+cgroup namespace. Everything it starts stays in that cgroup, including helpers in their own process
+group or session. On `DONE` the fork server freezes the cgroup. A frozen task stays frozen through
+`SIGCONT`. The fork server then ends the KCOV generation itself and publishes its remote coverage.
+Finally it kills the cgroup. It sends `DEACTIVATE` only once the cgroup is empty, which is after
+every task has closed its descriptors. So the NFS traffic of a program's teardown also falls inside
+its window. With the cgroups feature this cgroup is the one programs see as `./cgroup`, and the fork
+server itself stays out of it.
+
+A program that exits or crashes before `DONE` has its window closed the same way, once its cgroup
+is empty, and before the orphan KCOV ABORT. If the cgroup does not empty, the window stays open and
+the lane is not reused. Without an ACK, or when KCOV BEGIN gave no generation, the program
+is not run. Requests without remote coverage (machine-check probes, comparisons) run without a
+window, so the Proxy leaves them unmutated.
+
+The cgroup is a boundary only under two conditions. First, the guest's cgroup2 must have
+`nsdelegate`, as it does under systemd; without it a root program could move a task out of its
+cgroup. Second, the program must not be able to re-enter the fork server's cgroup namespace
+through `/proc/1/ns/cgroup` or a pidfd. The fork server is therefore not dumpable, and programs
+have no `CAP_SYS_PTRACE`. It is removed from the bounding set as well, so a program that runs as
+root cannot get it back with `execve`. At start the executor checks that a program process can leave its cgroup
+neither way, and target mode fails otherwise. The executor's own cgroup2 mounts keep the system's
+`nsdelegate` instead of resetting it. When the sandbox cannot reach the cgroups feature's cgroup,
+for example in a machine check, the executor uses a private cgroup instead.
+
+One limit remains: the KCOV generation counts as complete on the program's own report in `DONE`. A program that disturbs its own KCOV binding,
+for example by closing the KCOV descriptor, only loses coverage it would have been credited with.
+
+If a window cannot be confirmed closed, the Proxy quarantined the session, or the pair carried
+anything but one `ACTIVATE` and one `DONE`, the Runner fails the executor and the VM is restarted.
+The exec result carries the barrier as `ProgInfo.nfs_proxy`, and `syz-execprog` logs
+it as `nfs proxy barrier: ...`.
+
+Each Proxy start uses a new session `PREFIX.<random UUID>`, where `PREFIX` is
+`TARGET/laneN.session`. The host sink is started for that series (`--session-prefix`). It installs
+each new session, with the binding fixed on its command line, when that session's `RULESET`
+arrives, and ends the series' earlier session (`superseded`). A Proxy session has 256 generation
+slots; a full session is treated like a quarantine, and the restarted VM continues in a fresh
+session.
+
+To boot a target-mode lane (KVM host, by hand):
+
+```sh
+# One sink per lane, started before the VM.
+python -m agent_pipeline.journal_sink --dir JOURNAL_DIR --name lane0 \
+    --socket /run/knfsd-syzkaller/nfsp/lane0.sock --vm vm-0 --channel nfsp-journal-0 \
+    --session-prefix "$(cat TARGET/lane0.session)" --lane 0 --rules TARGET/lane0.nfsprul1
+# ... the same for lane1..lane3.
+tools/prepare-live-lane-config.py ... \
+    --nfs-target TARGET --journal-socket-dir /run/knfsd-syzkaller/nfsp
+```
+
+`TARGET` holds `laneN.nfsprul1` and `laneN.session` for lanes 0-3. Target mode needs `vm.count`
+1 and `SERVER_IMPL=both`; the prepared config adds the virtio-serial ports and
+`koov.nfs_target=1`. The ports' reconnect option follows the QEMU version, read from `vm.qemu`
+(default `qemu-system-x86_64`) `--version`: `reconnect-ms=1000` from 9.2 on, `reconnect=1`
+before. Pass `--qemu-version X.Y` when the preparing host cannot run that QEMU.
 
 ## Building
 

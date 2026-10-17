@@ -1,6 +1,7 @@
 #ifndef NFSP_PROXY_H
 #define NFSP_PROXY_H
 
+#include <poll.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -15,6 +16,27 @@
 /* ConnectionRef lifecycle events (on_connection). */
 #define NFSP_CONN_OPENED 0
 #define NFSP_CONN_CLOSED 1
+
+/* Target-mode relay decisions (M5).  FORWARD sends `out` (by default the
+ * record as received); HOLD keeps the record, and every later record of
+ * the same connection and direction, until on_hold decides; REFUSE closes
+ * the connection without forwarding. */
+#define NFSP_RELAY_FORWARD	0
+#define NFSP_RELAY_HOLD		1
+#define NFSP_RELAY_REFUSE	(-1)
+
+struct nfsp_relay_verdict {
+	/* FORWARD: the framed record to send.  Set on entry to the record as
+	 * received; a different buffer must stay valid until the next call
+	 * of any relay hook. */
+	const uint8_t *out;
+	size_t out_len;
+	/* FORWARD: nonzero asks for on_forwarded once these bytes were all
+	 * written to the peer socket, or are known not to be (§16-§18). */
+	uint64_t completion;
+	/* HOLD: the token on_hold and on_hold_dropped are given back. */
+	uint64_t hold;
+};
 
 /* One listening address per backend.  Routing is the accepting listener,
  * never arrival order or an RPC field.  Both client source addresses must be
@@ -86,6 +108,30 @@ struct nfsp_proxy_cfg {
 	 * Thus an arm ACK is a registration barrier with no cross-thread race. */
 	void (*on_tick)(void *arg);
 	void *on_tick_arg;
+
+	/* Target mode (M5).  When on_relay is set it replaces on_rpc_record
+	 * and on_record: it sees the record's ConnectionRef, direction and
+	 * canonical rpc_payload together with the framed bytes, and returns
+	 * an NFSP_RELAY_* action.  A held record is offered to on_hold (with
+	 * the same framed bytes) on every loop iteration until it returns
+	 * FORWARD or REFUSE; meanwhile nothing more is read or relayed in
+	 * that connection and direction, while every other one keeps
+	 * relaying.  on_hold_dropped reports a held record whose connection
+	 * closed: it never reached the peer.  on_forwarded reports each
+	 * completion token exactly once: complete (all len bytes written to
+	 * the peer socket) or not, with how many of them were written.
+	 * poll_fds adds descriptors that wake the loop (the journal channel,
+	 * the activation endpoint); on_tick runs after every wake. */
+	int (*on_relay)(const struct nfsp_rpc_record *record,
+			const uint8_t *framed, size_t len,
+			struct nfsp_relay_verdict *verdict, void *arg);
+	int (*on_hold)(uint64_t hold, const uint8_t *framed, size_t len,
+		       struct nfsp_relay_verdict *verdict, void *arg);
+	void (*on_hold_dropped)(uint64_t hold, void *arg);
+	void (*on_forwarded)(uint64_t completion, int complete,
+			     size_t written, size_t len, void *arg);
+	size_t (*poll_fds)(struct pollfd *fds, size_t max, void *arg);
+	void *relay_arg;
 };
 
 /* on_ready runs after BOTH listeners bind.  Its stats pointer is valid until

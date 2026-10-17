@@ -36,6 +36,18 @@
 #                     tracepoint PCs to the coverage signal and runs tracepoint
 #                     code paths unrelated to the fuzzed code.  boot-fixture.sh
 #                     maps koov.nfs_trace=1 to this variable.
+#   NFS_PROXY_TARGET_DIR
+#                     unset (default) | DIR.  Target mode: every lane relay
+#                     applies the NFSPRUL1 rule set DIR/laneN.nfsprul1 in a
+#                     fresh proxy session DIR/laneN.session + "." + a random
+#                     UUID per Proxy start (the host sink's --session-prefix
+#                     series), records to the
+#                     host journal on /dev/virtio-ports/nfsp-journal-N, and
+#                     serves the executor activation endpoint in
+#                     /syz-nfs-lanes/proc-N/activation (with rule_set_id).
+#                     It replaces the legacy arm control socket and needs
+#                     SERVER_IMPL=both.  boot-fixture.sh maps koov.nfs_target=1
+#                     to the rule sets copied from the host lane share.
 #
 # In both mode, a listener on .1:2049 and .5:2049 sends records to knfsd
 # :20490 and Ganesha :20491 respectively.  Each of the two client namespaces
@@ -120,6 +132,19 @@ case "$nfs_trace" in
     0|1) ;;
     *) echo "NFS_TRACE must be 0 or 1" >&2; exit 2 ;;
 esac
+proxy_target_dir=${NFS_PROXY_TARGET_DIR:-}
+if [ -n "$proxy_target_dir" ]; then
+    case "$proxy_target_dir" in
+        /*) ;;
+        *) echo "NFS_PROXY_TARGET_DIR must be absolute" >&2; exit 2 ;;
+    esac
+    test -d "$proxy_target_dir" || {
+        echo "NFS_PROXY_TARGET_DIR is not a directory" >&2; exit 2; }
+    if [ "$server_impl" != both ]; then
+        echo "NFS_PROXY_TARGET_DIR requires SERVER_IMPL=both" >&2
+        exit 2
+    fi
+fi
 # KOOV: per-backend listen ports.  In "both" mode the relay keeps 2049 and
 # each backend listens on its own port behind it.
 knfsd_port=${KOOV_KNFS_PORT:-}
@@ -148,6 +173,7 @@ export deps
 # substring test for "export server_ns" also matches the E12 label above.
 export server_ns
 export executor_root
+export proxy_target_dir
 export KOOV_GANESHA_ASAN_OPTIONS KOOV_UBSAN_OPTIONS KOOV_GANESHA_DEBUG
 
 valid_count()
@@ -258,6 +284,9 @@ fixture_source_entries()
         .lane_id .server0_ipv4 .server1_ipv4 client0 client1
     if [ "$server_impl" = both ]; then
         printf '%s\n' control
+        if [ -n "$proxy_target_dir" ]; then
+            printf '%s\n' activation
+        fi
         if [ "$fixture_mode" = broad-knfsd ]; then
             printf '%s\n' client0-knfsd client1-knfsd
         else
@@ -525,6 +554,30 @@ setup_lane()
         # into the executor sandbox at /nfs-lane/control.
         mkdir -m 0700 -p "$executor_root/proc-$setup_lane_id/control" \
             "$setup_lane_root/server/deltas"
+    fi
+    if [ -n "$proxy_target_dir" ]; then
+        # Target mode.  The executor reads rule_set_id and connects to the
+        # relay activation endpoint here, before its sandbox chroot; the
+        # directory is never imported into the sandbox.  rule_set_id is the
+        # same SHA-256 of the rule set that the relay installs.
+        setup_rules=$proxy_target_dir/lane$setup_lane_id.nfsprul1
+        setup_session=$proxy_target_dir/lane$setup_lane_id.session
+        test -f "$setup_rules" && test -s "$setup_session" || {
+            echo "KOOV: target mode needs $setup_rules and $setup_session" >&2
+            exit 1
+        }
+        test -c "/dev/virtio-ports/nfsp-journal-$setup_lane_id" || {
+            echo "KOOV: no journal port nfsp-journal-$setup_lane_id" >&2
+            exit 1
+        }
+        mkdir -m 0700 "$executor_root/proc-$setup_lane_id/activation"
+        sha256sum "$setup_rules" | cut -d' ' -f1 \
+            > "$executor_root/proc-$setup_lane_id/activation/rule_set_id"
+        # The proxy starts in the server namespace, where the lane's own
+        # state/run replaces /run (and with it the boot copy of the inputs).
+        mkdir -m 0700 "$setup_lane_root/server/target"
+        cp "$setup_rules" "$setup_lane_root/server/target/rules.nfsprul1"
+        cp "$setup_session" "$setup_lane_root/server/target/session_prefix"
     fi
 
     ip netns add "$setup_server_ns"
@@ -863,12 +916,28 @@ EOF
                 echo "KOOV: guest relay not on PATH" >&2
                 exit 1
             }
-            nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
-                "10.89.$lane.1:$server_port" "10.89.$lane.5:$server_port" \
-                "10.89.$lane.1:$knfsd_port" "10.89.$lane.5:$ganesha_port" \
-                --control "$executor_root/proc-$lane/control/arm.sock" \
-                --delta-dir "$lane_root/server/deltas" \
-                > "$lane_root/server/proxy.log" 2>&1 &
+            if [ -n "$proxy_target_dir" ]; then
+                # A fresh session id per Proxy start, in the series the host
+                # sink installed (journal_sink --session-prefix): a restarted
+                # VM never continues a full or quarantined session.
+                proxy_session="$(cat "$lane_root/server/target/session_prefix").$(cat /proc/sys/kernel/random/uuid)"
+                nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
+                    "10.89.$lane.1:$server_port" "10.89.$lane.5:$server_port" \
+                    "10.89.$lane.1:$knfsd_port" "10.89.$lane.5:$ganesha_port" \
+                    --target "$lane_root/server/target/rules.nfsprul1" \
+                    --session-id "$proxy_session" \
+                    --journal "/dev/virtio-ports/nfsp-journal-$lane" \
+                    --lane "$lane" \
+                    --activation "$executor_root/proc-$lane/activation/activation.sock" \
+                    > "$lane_root/server/proxy.log" 2>&1 &
+            else
+                nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
+                    "10.89.$lane.1:$server_port" "10.89.$lane.5:$server_port" \
+                    "10.89.$lane.1:$knfsd_port" "10.89.$lane.5:$ganesha_port" \
+                    --control "$executor_root/proc-$lane/control/arm.sock" \
+                    --delta-dir "$lane_root/server/deltas" \
+                    > "$lane_root/server/proxy.log" 2>&1 &
+            fi
             proxy_pid=$!
             printf "%s\n" "$proxy_pid" > "$lane_root/server/proxy.pid"
             proxy_wait=0
@@ -992,7 +1061,9 @@ expose_lane_to_executor()
         mkdir "$expose_source/$expose_alias"
         mount --bind "$expose_mount" "$expose_source/$expose_alias"
     done
-    if [ "$server_impl" = both ]; then
+    if [ -n "$proxy_target_dir" ]; then
+        test -S "$expose_source/activation/activation.sock"
+    elif [ "$server_impl" = both ]; then
         test -S "$expose_source/control/arm.sock"
     fi
     touch "$expose_source/.client0_netns" "$expose_source/.client1_netns"
@@ -1237,6 +1308,9 @@ cleanup_fixture()
                 "$cleanup_source/.server0_ipv4" "$cleanup_source/.server1_ipv4"
             rm -f "$cleanup_source/control/arm.sock"
             rmdir "$cleanup_source/control" 2>/dev/null || true
+            rm -f "$cleanup_source/activation/activation.sock" \
+                "$cleanup_source/activation/rule_set_id"
+            rmdir "$cleanup_source/activation" 2>/dev/null || true
             for cleanup_profile_dir in \
                 "$cleanup_source"/client?-*-v*; do
                 rmdir "$cleanup_profile_dir" 2>/dev/null || true
@@ -1285,6 +1359,11 @@ status_fixture()
     case "$status_version" in 3|4.0|4.1|4.2) ;; *) return 1 ;; esac
     status_trace=$(cat "$root/fixture.trace")
     case "$status_trace" in 0|1) ;; *) return 1 ;; esac
+    proxy_target_dir=$(cat "$root/fixture.target")
+    status_target=false
+    if [ -n "$proxy_target_dir" ]; then
+        status_target=true
+    fi
     # ExecStartPost and ExecStop are separate systemd processes and do not
     # inherit variables exported by boot-fixture.sh.  Persisted setup state is
     # therefore authoritative for status helpers and profile alias selection.
@@ -1314,9 +1393,9 @@ status_fixture()
             status_profiles='["knfsd-v41","ganesha-v41"]'
         fi
     fi
-    printf '{"lane_count":%s,"fixture_mode":"%s","profiles":%s,"nfs_version":"%s","nfs_minor":%s,"nfs_trace":%s,"localio":"N","lanes":[' \
+    printf '{"lane_count":%s,"fixture_mode":"%s","profiles":%s,"nfs_version":"%s","nfs_minor":%s,"nfs_trace":%s,"nfs_target":%s,"localio":"N","lanes":[' \
         "$status_count" "$status_mode" "$status_profiles" \
-        "$status_version" "$status_minor_json" "$status_trace"
+        "$status_version" "$status_minor_json" "$status_trace" "$status_target"
     status_lane=0
     status_previous_epoch=0
     while test "$status_lane" -lt "$status_count"; do
@@ -1483,8 +1562,16 @@ status_fixture()
             -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
         status_expected_entries=$(fixture_source_entries | LC_ALL=C sort)
         test "$status_source_entries" = "$status_expected_entries"
-        if [ "$server_impl" = both ]; then
+        if [ -n "$proxy_target_dir" ]; then
+            test -S "$status_source/activation/activation.sock"
+            test "$(cat "$status_source/activation/rule_set_id")" = \
+                "$(sha256sum "$proxy_target_dir/lane$status_lane.nfsprul1" | \
+                    cut -d' ' -f1)"
+        fi
+        if [ "$server_impl" = both ] && [ -z "$proxy_target_dir" ]; then
             test -S "$status_source/control/arm.sock"
+        fi
+        if [ "$server_impl" = both ]; then
             if [ "$status_mode" = broad-knfsd ]; then
                 for status_bind in client0-knfsd client1-knfsd; do
                     nfs_mount_exists "$status_source/$status_bind"
@@ -1604,6 +1691,7 @@ setup)
     printf '%s\n' "$fixture_mode" > "$root/fixture.mode"
     printf '%s\n' "$nfs_version" > "$root/fixture.version"
     printf '%s\n' "$nfs_trace" > "$root/fixture.trace"
+    printf '%s\n' "$proxy_target_dir" > "$root/fixture.target"
     if test -e "$executor_root" || test -L "$executor_root"; then
         echo "$executor_root is already owned by another fixture" >&2
         exit 1

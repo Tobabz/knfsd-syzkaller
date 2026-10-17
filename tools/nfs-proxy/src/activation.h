@@ -5,10 +5,12 @@
  * one generation is active, and keeps deactivated generations eligible for
  * their transaction-correlated REPLY records until closure.
  *
- * The gate callback is deliberately named a test gate.  Its ACCEPTED result
- * models a future host acknowledgement in component tests; it is not a
- * durable journal acknowledgement and must not be wired to live target-mode
- * output.  M5/S1b supplies that host boundary.
+ * The gate callback is named a test gate because a component test can
+ * answer it directly; such an ACCEPTED models a host acknowledgement and has
+ * no durability.  In target mode (target.c, M5) the callback only returns
+ * PENDING after queueing GENERATION_OPEN or GENERATION_DRAINING to the host
+ * journal sink, and the barrier is completed with ACCEPTED only from that
+ * sink's ACK, which is the durability point (D).
  */
 #ifndef NFSP_ACTIVATION_H
 #define NFSP_ACTIVATION_H
@@ -308,6 +310,12 @@ nfsp_activation_get_snapshot(
 	struct nfsp_activation_snapshot *snapshot,
 	struct nfsp_activation_generation_snapshot *generations,
 	size_t generation_capacity, size_t *generation_count);
+
+/* One generation's snapshot; UNKNOWN_GENERATION when it was never opened. */
+enum nfsp_activation_result
+nfsp_activation_get_generation(
+	const struct nfsp_activation *activation, uint64_t generation,
+	struct nfsp_activation_generation_snapshot *snapshot);
 
 const char *nfsp_activation_strresult(enum nfsp_activation_result result);
 
