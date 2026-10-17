@@ -21,3 +21,4 @@
 0021-tools-syz-nfs-corpus-recognize-profile-and-typed-NFS.patch
 0022-tools-execprog-gate-programs-after-the-machine-check.patch
 0023-executor-bracket-programs-with-the-NFS-proxy-activat.patch
+0024-rpcserver-keep-the-NFS-proxy-crash-context-per-lane.patch

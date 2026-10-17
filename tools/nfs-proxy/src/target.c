@@ -1558,6 +1558,41 @@ void nfsp_target_install(struct nfsp_target *t, struct nfsp_proxy_cfg *cfg)
 
 /* --- lifetime ----------------------------------------------------------------- */
 
+int nfsp_target_check_rules(const uint8_t *rule_set, size_t len,
+			    const struct nfsp_schema_family *const *families,
+			    size_t nfamilies, FILE *out)
+{
+	struct nfsp_ruleset rs;
+	struct nfsp_rule_error rerr;
+	enum nfsp_rule_status status;
+	uint8_t digest[NFSP_SHA256_LEN];
+	char hex[65];
+
+	nfsp_sha256(rule_set, len, digest);
+	nfsp_sha256_hex(digest, hex);
+	memset(&rs, 0, sizeof(rs));
+	memset(&rerr, 0, sizeof(rerr));
+	rerr.rule = rerr.predicate = NFSP_RULE_NONE;
+	status = len > NFSP_RULESET_MAX_LEN ? NFSP_RULE_MALFORMED :
+		 nfsp_ruleset_load(rule_set, len, families, nfamilies, &rs,
+				   &rerr);
+	if (status != NFSP_RULE_OK) {
+		fprintf(out, "rules refused rule_set_id=%s status=%s", hex,
+			nfsp_rule_strstatus(status));
+		if (rerr.rule != NFSP_RULE_NONE)
+			fprintf(out, " rule=%u", rerr.rule);
+		if (rerr.predicate != NFSP_RULE_NONE)
+			fprintf(out, " predicate=%u", rerr.predicate);
+		fprintf(out, "\n");
+		return -1;
+	}
+	fprintf(out, "rules ok rule_set_id=%s semantic_runtime_version=%u "
+		"schema_id=%s rules=%u\n", hex, rs.semantic_runtime_version,
+		rs.schema_id, rs.nrules);
+	nfsp_ruleset_free(&rs);
+	return 0;
+}
+
 int nfsp_target_open(struct nfsp_target **out,
 		     const struct nfsp_target_cfg *cfg, char *err,
 		     size_t errlen)

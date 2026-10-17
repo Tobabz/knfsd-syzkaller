@@ -92,6 +92,21 @@ struct nfsp_target_stats {
 
 struct nfsp_target;
 
+/* Semantic replay's compatibility gate (design 05 §26, §39): load a
+ * recorded rule set exactly as nfsp_target_open would, against these
+ * schemas, and print one line to out:
+ *
+ *   rules ok rule_set_id=HEX semantic_runtime_version=N schema_id=S rules=N
+ *   rules refused rule_set_id=HEX status=STATUS [rule=N] [predicate=N]
+ *
+ * STATUS is nfsp_rule_strstatus.  Nothing is served or recorded.  The
+ * Runner runs this before a replay, so a recorded set this runtime cannot
+ * run becomes REPLAY_INVALID with the runtime's own reason, never a remap.
+ * 0 when accepted, -1 when refused. */
+int nfsp_target_check_rules(const uint8_t *rule_set, size_t len,
+			    const struct nfsp_schema_family *const *families,
+			    size_t nfamilies, FILE *out);
+
 /* 0, or -1 with a message in err. */
 int nfsp_target_open(struct nfsp_target **out,
 		     const struct nfsp_target_cfg *cfg, char *err,
