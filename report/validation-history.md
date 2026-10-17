@@ -336,6 +336,45 @@ replay log는 [rebuild rerun 증거](evidence/m0-legacy-baseline-20261013-rerun/
 있다. 이전 3-patch 실행은 historical record로만 남고 이 결과가 이를
 대체한다.
 
+## S1a target-mode KVM validation: live mutation and generation rollover (2026-10-18 KST)
+
+Issue [#45](https://github.com/Tobabz/knfsd-syzkaller/issues/45)에서 PR #44 병합본
+`f99ec54568f9cb11e3a15ae05c65d30c503bdb18`을 KVM/KASAN VM에서 검증했다. 실행과
+측정값은 사용자의 [이슈 코멘트](https://github.com/Tobabz/knfsd-syzkaller/issues/45#issuecomment-6237748179)가
+원본이며, 여기서는 요약만 남긴다. 두 항목 모두 PASS다.
+
+| 입력 | 값 |
+| --- | --- |
+| syzkaller | base `801f0966669a37e048adabf9e5f38ce52825ea82`, patched HEAD `bd0001bcbd9e8cd88603dbe091fbaf560803df7e` |
+| `syz-executor` SHA-256 | `dcd069a7e267114e16f4719e5d9bcc935872dd2152f94fef19f80b1e5dc4e2fa` |
+| `nfs-proxy` SHA-256 | `d9bd5cada3d6e8b42e4807306a5b3db65cd19ec0c1a73b7c5940c42984a2d43b` |
+| rule_set_id | `66b4b69793a327263c69aacda5d94032c9ec489900b8836743e36bf4ff7f1ba6` |
+
+**1. activation window 안의 실제 변형.** lane0의 NFSv4.1 SEQUENCE 요청에
+`nfs4.request.SEQUENCE.args.sa_slotid` rule이 걸렸다. generation 2에서 offset 112가
+`00000000 -> 00000007`로 바뀌었고, host journal에 `EXPOSURE_INTENT`와 `FORWARD_COMPLETE`(152바이트)가
+남았다. barrier는 `activation=Acked/0 deactivation=Acked/0 executed=true lease_cleared=true`였다.
+활성화 전 같은 경로 트래픽은 `records=214 eligible=0 exposures=0 outside_activation_window=214`로
+변형 없이 지나갔다. 세션 `issue45-lane0.82f68644-b4c1-4d6e-8e72-c7c68fa9e8d2`.
+
+**2. 256 generation 초과 시 세션 넘김.** 세션 `issue45-lane0.633faf68-fbbb-411e-8296-7607549200fb`가
+generation 1..256을 모두 `GENERATION_OPEN/DRAINING/COMPLETE`로 닫았다(host 거부 0, inconsistent 0).
+257번째 활성화는 `generation_capacity`(13)로 거부되어 executor가
+`SYZFAIL: NFS proxy activation not cleared`로 실패했고, syz-manager가 VM을 재시작했다. sink는 이전
+세션을 `superseded`로 끝내고 새 세션 `issue45-lane0.4b38cdcb-be43-44dd-87dd-a2d1a087c46b`를 설치했으며,
+새 세션도 256 generation을 다시 닫았다. slot 한도는 기본값 256 그대로 실행했다.
+
+**무결성.** sink 종료 후 `HostJournal`로 lane0 세그먼트 3개를 다시 복구했다. framing/hash 검증 통과,
+torn tail 0, 두 세션 모두 `ended=session_end`. qcow2 검사도 오류 없음.
+
+**`--fsync` 관찰.** 초기 장시간 실행에서는 sink를 `--fsync`로 띄웠고, generation 186의 open ACK가
+executor barrier 한도(`syscall_timeout_ms * 10`)를 넘겨 `quarantine(31)`과 VM 재시작이 일어났다.
+이 실행은 rollover 증거에서 뺐고, 최종 실행은 `--fsync` 없이 했다. 운영 주의사항은
+[nfs-proxy README](../tools/nfs-proxy/README.md)에 적었다.
+
+**확인하지 않은 것.** 선택 항목인 M1 Judge(`agent_pipeline/m1.py`)로 봉인된 journal을 읽어 `APPLIED`를
+보는 검증은 실행하지 않았다. M1 gate는 여전히 synthetic fixture로만 검증돼 있다.
+
 ## Related records
 
 - [Normal-flow scope](normal-flow-corpus.md)
