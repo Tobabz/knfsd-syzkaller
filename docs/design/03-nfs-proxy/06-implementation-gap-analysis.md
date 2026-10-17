@@ -1084,12 +1084,16 @@ Harness Capability Specification을 갱신한다(§21).
   promotion한다. run은 sealed judge input을 다시 판정한 `ReplayResult`가 `REPLAY_EQUIVALENT`이고, production이 guest
   crash로 끝나 crash cut 위치의 MutationDelta가 남았고(semantic Delta crash survival), rule set의 모든 rule이 subset
   안일 때 센다. 원소는 그것을 쓰는 rule의 batch가 같은 window 위치에서 production과 replay 모두 FORWARD_COMPLETE일
-  때 덮인다. 위 검증 항목은 subset 내용에서 정해진다(request/response mutation, dynamic value, `S2C` CALL이면
+  때 덮인다. dynamic-original replay는 그런 rule이 같은 위치에서 production에 없던 original value만 replay에서
+  바꿨을 때만 덮인다(`record`가 두 journal의 EXPOSURE_INTENT `original_value` digest를 기록한다). 위 검증 항목은
+  subset 내용에서 정해진다(request/response mutation, dynamic value, `S2C` CALL이면
   backchannel, preserve/raw, 그리고 항상 crash survival과 dynamic-original replay). host test와 test double 결과는
   run으로 기록하지 않는다. run이 KVM guest에서 왔다는 것은 기록하는 operator의 진술이다.
 - 결과: `PromotedSemanticCapabilityRegistry`(registry, build identity, subset별 evidence)와, 그것을
   `authority_refs`로 참조하는 HCAP-10(`usable_by: [agent_stage2]`, `validated_subset`, scope = promoted subset id)을
-  가진 새 HCAP revision. 다른 build는 처음부터 다시 promotion한다. Agent는 `lookup_semantic_scope` 도구로 pin된
+  가진 새 HCAP revision. Agent scope는 그 HCAP-10 entry(`agent_stage2`, validated)가 참조하는 registry의
+  `validated_scope` 안 subset뿐이며, catalog의 다른 곳에 있는 registry digest는 scope가 아니다. 다른 build는
+  처음부터 다시 promotion한다. Agent는 `lookup_semantic_scope` 도구로 pin된
   revision의 subset을 읽고, `rule_set_scope`는 Compiler가 MutationRuleSet이 맞는 subset을 고르게 한다. 맞는 subset이
   없으면 gap id는 `semantic_mutation.unpromoted`다.
 - 검증: `tests/agent_pipeline/test_semantic_promotion.py`(빌드한 Proxy의 registry가 rule validation과 일치하는지,

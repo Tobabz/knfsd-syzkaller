@@ -13,6 +13,8 @@ through this gate:
   (semantic Delta crash survival), and every rule of its rule set is inside
   the subset.  A rule is exercised when a batch naming it completed
   forwarding in both production and replay at one window position;
+- dynamic-original replay is covered only when an exercised rule replaced,
+  at one position, original values in replay that production never had;
 - the §30 validation items the subset's contents call for are covered.
 
 The gate writes a ``PromotedSemanticCapabilityRegistry`` and the HCAP entry
@@ -344,6 +346,70 @@ def rule_problems(rule: RuleDescription, schema_id: str,
 # ---------------------------------------------------------------- guest runs
 
 
+class OriginalDigest(_Strict):
+    rule_id: Visible
+    semantic_path: Visible
+    original_sha256: Sha256
+
+
+class PositionOriginals(_Strict):
+    window_index: Annotated[int, Field(ge=0, lt=64)]
+    production: tuple[OriginalDigest, ...] = Field(max_length=4096)
+    replay: tuple[OriginalDigest, ...] = Field(max_length=4096)
+
+
+class DynamicOriginals(_Strict):
+    """The original values each side's forwarded batches replaced, projected
+    from the same sealed journals as the judge input (05 oracle §1: replay
+    must run on other dynamic bytes than production)."""
+
+    production_evidence_manifest_sha256: Sha256
+    replay_evidence_manifest_sha256: Sha256
+    positions: tuple[PositionOriginals, ...] = Field(max_length=64)
+
+
+def dynamic_originals(production, replay, data: ReplayJudgeInput
+                      ) -> DynamicOriginals:
+    """Project ``DynamicOriginals`` from two ``SealedJournal`` views, for the
+    generations ``data`` correlated at each window position."""
+    def digests(journal, side) -> tuple[OriginalDigest, ...]:
+        if side is None:
+            return ()
+        c = side.correlation
+        found = journal.find(vm_instance_id=c.vm_instance_id, lane_id=c.lane_id,
+                             kcov_generation=c.kcov_generation,
+                             program_digest=c.program_digest)
+        if found is None:
+            return ()
+        return tuple(sorted(
+            (OriginalDigest(rule_id=r, semantic_path=p, original_sha256=d)
+             for e in found[1].exposures if e.terminal == "complete"
+             for r, p, d in e.originals),
+            key=lambda o: (o.rule_id, o.semantic_path, o.original_sha256)))
+    return DynamicOriginals(
+        production_evidence_manifest_sha256=production.manifest_sha256(),
+        replay_evidence_manifest_sha256=replay.manifest_sha256(),
+        positions=tuple(PositionOriginals(
+            window_index=p.window_index, production=digests(production, p.production),
+            replay=digests(replay, p.replay)) for p in data.positions))
+
+
+def _dynamic_rules(run: GuestValidationRun) -> set[str]:
+    """Rules that replaced, at one position, only other original values in
+    replay than in production."""
+    found: set[str] = set()
+    for position in run.original_values.positions:
+        keys = {(o.rule_id, o.semantic_path) for o in position.production}
+        for key in keys:
+            prod = {o.original_sha256 for o in position.production
+                    if (o.rule_id, o.semantic_path) == key}
+            repl = {o.original_sha256 for o in position.replay
+                    if (o.rule_id, o.semantic_path) == key}
+            if repl and not prod & repl:
+                found.add(key[0])
+    return found
+
+
 class GuestValidationRun(_Strict):
     """One KVM validation of a subset: a crashed production window and its
     replay on the same Proxy build, judged by ``semantic_replay.evaluate``."""
@@ -360,6 +426,7 @@ class GuestValidationRun(_Strict):
     rule_set: RuleSetDescription
     judge_input: ReplayJudgeInput
     replay_result: ReplayResult
+    original_values: DynamicOriginals
     note: Annotated[str, Field(max_length=1024)] = ""
 
 
@@ -404,6 +471,14 @@ def run_problems(run: GuestValidationRun, build: BuildRegistry,
         problems.append("the rule set targets another runtime version")
     for rule in described.rules:
         problems += rule_problems(rule, described.schema_id, subset)
+    originals = run.original_values
+    if ((originals.production_evidence_manifest_sha256,
+         originals.replay_evidence_manifest_sha256) !=
+            (data.production_evidence_manifest_sha256,
+             data.replay_evidence_manifest_sha256)
+            or tuple(p.window_index for p in originals.positions)
+            != tuple(p.window_index for p in data.positions)):
+        problems.append("the original values are not from the judged journals")
     # Semantic Delta crash survival: the production window ended in a guest
     # crash and the crash-cut position's MutationDelta was read back.
     production = [p.production for p in data.positions]
@@ -480,9 +555,11 @@ def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
         problems += [f"run {ref[:12]}: {p}" for p in found]
         if found:
             continue
-        passed |= {ValidationItem.DELTA_CRASH_SURVIVAL,
-                   ValidationItem.DYNAMIC_ORIGINAL_REPLAY}
+        passed.add(ValidationItem.DELTA_CRASH_SURVIVAL)
         used = _exercised(run)
+        # Equivalent on the same originals proves nothing dynamic.
+        if used & _dynamic_rules(run):
+            passed.add(ValidationItem.DYNAMIC_ORIGINAL_REPLAY)
         for rule in run.rule_set.rules:
             if rule.rule_id in used:
                 exercised.append((run.rule_set.schema_id, rule))
@@ -580,18 +657,33 @@ def with_semantic_capability(catalog: HcapCatalog, promoted_ref: str,
                        authority_refs=catalog.authority_refs)
 
 
-def promoted_registry(store: ArtifactStore, catalog: HcapCatalog
+def promoted_registry(store: ArtifactStore, catalog: HcapCatalog, *,
+                      capability_id: str = DEFAULT_CAPABILITY_ID
                       ) -> PromotedSemanticCapabilityRegistry | None:
-    """The promoted registry this HCAP revision pins, if it has one."""
-    refs = {ref.artifact_ref
-            for ref in (*catalog.authority_refs,
-                        *(r for c in catalog.capabilities
-                          for r in c.authority_refs))
-            if ref.kind == "PromotedSemanticCapabilityRegistry"}
-    if not refs:
+    """The promoted registry this HCAP revision's semantic mutation entry
+    pins, narrowed to that entry's validated scope, or None.
+
+    Only the entry ``with_semantic_capability`` writes counts: the
+    capability ``capability_id``, usable by ``agent_stage2``, validated,
+    and referencing the registry itself.  A registry digest anywhere else in
+    the catalog (top level, another capability) is not Agent scope.
+    """
+    entry = next((c for c in catalog.capabilities if c.id == capability_id),
+                 None)
+    if (entry is None or "agent_stage2" not in entry.usable_by
+            or entry.status not in ("validated", "validated_subset")):
         return None
-    (ref,) = refs   # HcapCatalog allows one digest per authority kind
-    return load_record(store, ref, PromotedSemanticCapabilityRegistry)
+    refs = [r.artifact_ref for r in entry.authority_refs
+            if r.kind == "PromotedSemanticCapabilityRegistry"]
+    if len(refs) != 1:
+        return None
+    promoted = load_record(store, refs[0], PromotedSemanticCapabilityRegistry)
+    scope = set(entry.validated_scope if entry.status == "validated_subset"
+                else entry.scope)
+    kept = tuple(p for p in promoted.subsets if p.subset.subset_id in scope)
+    if not kept:
+        return None
+    return promoted.model_copy(update={"subsets": kept})
 
 
 # ---------------------------------------------------------------- rule-set scope
@@ -733,9 +825,10 @@ def main(argv: list[str] | None = None) -> int:
         plan = ReplayPlan.model_validate_json(args.plan.read_text())
         workdir = args.plan.parent
         compat = check_rule_set(args.proxy, plan.rule_set, workdir)
+        production = SealedJournal(args.journal_dir, plan.production_journal)
+        replay = SealedJournal(args.replay_dir, args.replay_name)
         data = judge_input(
-            plan, SealedJournal(args.journal_dir, plan.production_journal),
-            SealedJournal(args.replay_dir, args.replay_name),
+            plan, production, replay,
             replay_vm_instance_id=args.replay_vm,
             replay_lane_id=args.replay_lane,
             replay_barriers=parse_execprog_barriers(
@@ -752,7 +845,9 @@ def main(argv: list[str] | None = None) -> int:
             production_vm_instance_id=plan.window.vm_instance_id,
             replay_vm_instance_id=args.replay_vm,
             rule_set=describe_rule_set(args.proxy, plan.rule_set, workdir),
-            judge_input=data, replay_result=evaluate(data), note=args.note)
+            judge_input=data, replay_result=evaluate(data),
+            original_values=dynamic_originals(production, replay, data),
+            note=args.note)
         problems = run_problems(run, build, subset)
         print(f"run={put_record(store, run)} "
               f"verdict={run.replay_result.semantic_verdict}")
@@ -780,10 +875,11 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "BuildRegistry", "CapabilityRegistry", "DEFAULT_CAPABILITY_ID",
-    "DIMENSIONS", "GuestValidationRun", "PromotedSemanticCapabilityRegistry",
+    "DIMENSIONS", "DynamicOriginals", "GuestValidationRun", "PromotedSemanticCapabilityRegistry",
     "PromotedSubset", "PromotionRefused", "RegistryError", "RuleDescription",
     "RuleSetDescription", "ScopeCheck", "SemanticSubset", "UNPROMOTED_GAP_ID",
-    "ValidationItem", "check_runtime", "describe_rule_set", "promote",
+    "ValidationItem", "check_runtime", "describe_rule_set", "dynamic_originals",
+    "promote",
     "promoted_registry", "read_build_registry", "required_items",
     "rule_problems", "rule_set_scope", "run_problems", "subset_problems",
     "with_semantic_capability",

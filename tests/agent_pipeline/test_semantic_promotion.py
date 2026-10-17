@@ -19,8 +19,8 @@ from agent_pipeline.agent_tasks.mutation import MutationRuleSet
 from agent_pipeline.agent_tasks.tools import ArtifactHcapSource, Stage1Toolbox
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.data import canonical_json, load_record, put_record
-from agent_pipeline.hcap import (ArtifactHcapChecker, Capability, CapabilityInterface,
-                                 HcapCatalog)
+from agent_pipeline.hcap import (ArtifactHcapChecker, AuthorityRef, Capability,
+                                 CapabilityInterface, HcapCatalog)
 from agent_pipeline.replay_runner import (
     check_rule_set, judge_input, parse_crash_context, parse_execprog_barriers,
     plan_replay, write_replay_inputs,
@@ -29,7 +29,7 @@ from agent_pipeline.semantic_delta import SealedJournal
 from agent_pipeline.semantic_promotion import (
     UNPROMOTED_GAP_ID, GuestValidationRun, PromotedSemanticCapabilityRegistry,
     PromotionRefused, SemanticSubset, ValidationItem, check_runtime,
-    describe_rule_set, main, promote, promoted_registry, read_build_registry,
+    describe_rule_set, dynamic_originals, main, promote, promoted_registry, read_build_registry,
     required_items, rule_set_scope, run_problems, subset_problems,
     with_semantic_capability,
 )
@@ -164,15 +164,20 @@ def _production(binary, tmp, rules: bytes):
     return tmp / "journal"
 
 
-def _record(binary, build, tmp, rules: bytes, the_subset) -> GuestValidationRun:
+OTHER_ORIGINALS = [(11, [9, 1]), (12, [8])]     # production ran slots 5, 2 then 4
+
+
+def _record(binary, build, tmp, rules: bytes, the_subset,
+            replay_script=OTHER_ORIGINALS) -> GuestValidationRun:
     production = _production(binary, tmp / "production", rules)
     plan = plan_replay(SealedJournal(production, "lane0"),
                        parse_crash_context(_crash_log(1), vm_instance_id=VM, bound=4))
     compat = check_rule_set(binary, plan.rule_set, tmp)
     with pytest.MonkeyPatch.context() as mp:
-        replay = _replay(binary, tmp / "replay", plan, [(11, [9, 1]), (12, [8])], mp)
+        replay = _replay(binary, tmp / "replay", plan, replay_script, mp)
+    sealed = SealedJournal(production, "lane0")
     data = judge_input(
-        plan, SealedJournal(production, "lane0"), replay, replay_vm_instance_id=VM,
+        plan, sealed, replay, replay_vm_instance_id=VM,
         replay_lane_id=LANE, replay_barriers=parse_execprog_barriers(_barriers(11)),
         production_termination=Termination.GUEST_CRASH,
         replay_termination=Termination.GUEST_CRASH, compatibility=compat,
@@ -182,7 +187,8 @@ def _record(binary, build, tmp, rules: bytes, the_subset) -> GuestValidationRun:
         proxy_sha256=build.proxy_sha256, registry_digest=build.registry_digest,
         kernel_commit=KERNEL, production_vm_instance_id=VM, replay_vm_instance_id=VM,
         rule_set=describe_rule_set(binary, plan.rule_set, tmp),
-        judge_input=data, replay_result=evaluate(data))
+        judge_input=data, replay_result=evaluate(data),
+        original_values=dynamic_originals(sealed, replay, data))
 
 
 @pytest.fixture(scope="module")
@@ -199,6 +205,11 @@ def store(tmp_path):
 def test_equivalent_crash_run_promotes_its_subset(build, run, store):
     assert run.replay_result.semantic_verdict is ReplayVerdict.EQUIVALENT
     assert run_problems(run, build, subset()) == []
+    # Replay replaced other slot values (9, then 8) than production (5, 4).
+    for position in run.original_values.positions:
+        assert position.production and position.replay
+        assert not ({o.original_sha256 for o in position.production}
+                    & {o.original_sha256 for o in position.replay})
     promoted = promote(store, build, subset(), (put_record(store, run),))
     (entry,) = promoted.subsets
     assert entry.validation_items == required_items(subset()) == (
@@ -220,6 +231,28 @@ def test_every_element_needs_guest_evidence(build, run, store):
     assert "predicate_ops ['eq']" in text and "structure_policies ['raw']" in text
     assert "message_types ['reply']" in text
     assert "response_mutation" in text and "raw_behavior" in text
+
+
+def test_replay_on_the_same_originals_is_not_dynamic(proxy_binary, build, tmp_path, store):
+    # Equivalent, crash cut and in scope, but replay saw production's slot
+    # values again (5, 2 then 4): no evidence of dynamic-original replay.
+    same = _record(proxy_binary, build, tmp_path, ONE_RULE, subset(),
+                   replay_script=[(11, [5, 2]), (12, [4])])
+    assert same.replay_result.semantic_verdict is ReplayVerdict.EQUIVALENT
+    assert run_problems(same, build, subset()) == []
+    first = same.original_values.positions[0]
+    assert first.production == first.replay
+    with pytest.raises(PromotionRefused) as refused:
+        promote(store, build, subset(), (put_record(store, same),))
+    assert refused.value.problems == [
+        "validation items not covered: ['dynamic_original_semantic_replay']"]
+
+
+def test_original_values_must_come_from_the_judged_journals(build, run):
+    moved = run.model_copy(update={"original_values": run.original_values.model_copy(
+        update={"replay_evidence_manifest_sha256": "0" * 64})})
+    assert "the original values are not from the judged journals" in run_problems(
+        moved, build, subset())
 
 
 def test_subset_must_be_implemented_by_the_build(build):
@@ -338,6 +371,35 @@ def test_promotion_becomes_a_new_hcap_revision_the_agent_reads(build, run, store
     empty = Stage1Toolbox(None, ArtifactHcapSource(checker), kernel_commit=KERNEL,
                           hcap_revision=bare).invoke("lookup_semantic_scope", {})
     assert empty.subsets == () and empty.registry_digest is None
+
+
+def test_only_the_semantic_entry_exposes_a_scope(build, run, store):
+    promoted = promote(store, build, subset(), (put_record(store, run),))
+    promoted_ref = put_record(store, promoted)
+    ref = AuthorityRef(kind="PromotedSemanticCapabilityRegistry", artifact_ref=promoted_ref)
+    base = _catalog()
+    hcap02 = base.capabilities[0]
+    # A registry digest at the top level or on an unrelated capability.
+    for detached in (
+            base.model_copy(update={"authority_refs": (ref,)}),
+            base.model_copy(update={"capabilities": (
+                hcap02.model_copy(update={"authority_refs": (ref,)}),)})):
+        assert promoted_registry(store, detached) is None
+    good = with_semantic_capability(base, promoted_ref, promoted)
+    entry = next(c for c in good.capabilities if c.id == "HCAP-10")
+    for broken in (
+            {"usable_by": ("manual_legacy_campaigns",)},
+            {"status": "experimental"},
+            {"authority_refs": ()}):
+        changed = good.model_copy(update={"capabilities": (
+            hcap02, entry.model_copy(update=broken))})
+        assert promoted_registry(store, changed) is None, broken
+    # Only the entry's validated scope is exposed.
+    narrowed = entry.model_copy(update={"scope": (*entry.scope, "semantic.other"),
+                                        "validated_scope": ("semantic.other",)})
+    assert promoted_registry(store, good.model_copy(update={"capabilities": (
+        hcap02, narrowed)})) is None
+    assert promoted_registry(store, good) == promoted
 
 
 def test_rule_set_scope(build, run, store):

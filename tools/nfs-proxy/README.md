@@ -450,11 +450,15 @@ Proxy binary cover every element of it:
 - production ended in a guest crash and the crash-cut position's MutationDelta was read back;
 - every rule of the run's rule set is inside the subset, and an element counts once a rule using it
   completed forwarding in production and in replay at the same window position;
+- dynamic-original replay counts only when such a rule replaced, at one position, original values in
+  replay that production never had (`record` reads them from both journals): replay the window on
+  other dynamic state, not a copy of production's;
 - the 06 §30 items the subset calls for are covered (request or response mutation, dynamic value,
   backchannel, preserve or raw, plus crash survival and replay always).
 
 The gate writes a `PromotedSemanticCapabilityRegistry` and a new HCAP revision whose `HCAP-10` entry
-(`usable_by: [agent_stage2]`) references it by digest. A new Proxy build is promoted afresh. The
+(`usable_by: [agent_stage2]`) references it by digest. Only that entry makes the registry Agent scope,
+and only for the subsets in its `validated_scope`; a registry digest elsewhere in the catalog does not. A new Proxy build is promoted afresh. The
 Agent reads the subsets with its `lookup_semantic_scope` tool, and `rule_set_scope` tells the
 Compiler which subset a `MutationRuleSet` fits. Nothing is promoted until the KVM runs below exist.
 
