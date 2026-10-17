@@ -60,6 +60,9 @@ class ExposureDelta:
     message_type: str
     signature: tuple[SignatureItem, ...]
     terminal: str | None = None  # complete | failed
+    #: (rule_id, semantic_path, SHA-256 of original_value) per application:
+    #: what M7 compares to show replay ran on other dynamic originals.
+    originals: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass
@@ -183,7 +186,11 @@ class SealedJournal:
                     payload.batch_id, request.event_seq, payload.record_context.message_type,
                     tuple(SignatureItem(rule_id=i.rule_id, semantic_path=i.semantic_path,
                                         part=i.part, kind=i.kind, count=i.count)
-                          for i in payload.semantic_signature)))
+                          for i in payload.semantic_signature),
+                    originals=tuple(
+                        (a.rule_id, a.semantic_path,
+                         hashlib.sha256(bytes.fromhex(a.original_value)).hexdigest())
+                        for a in payload.applications)))
             elif request.event_type in ("FORWARD_COMPLETE", "FORWARD_FAILED"):
                 assert isinstance(payload, (ForwardCompletePayload, ForwardFailedPayload))
                 for exposure in gen.exposures:

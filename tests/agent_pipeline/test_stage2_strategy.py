@@ -250,7 +250,8 @@ def test_strategy_stores_the_rule_set_and_returns_its_ref(tmp_path):
     prompt = runtime.requests[0].prompt
     assert "Trusted Stage2Input JSON" in prompt
     assert "syz_test$open()" in prompt              # the Stage 1 program
-    assert runtime.requests[0].tools.names[-1] == "lookup_hcap"
+    assert runtime.requests[0].tools.names[-2:] == (
+        "lookup_hcap", "lookup_semantic_scope")
 
 
 def test_strategy_repair_sees_the_previous_rule_set(tmp_path):

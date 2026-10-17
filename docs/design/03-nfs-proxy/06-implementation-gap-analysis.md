@@ -11,7 +11,8 @@
 > 구현 갱신(2026-10-14): 아래 요약·Gap Matrix와 §3-§22의 `Current`/`Gap` 서술은
 > 별도 구현 갱신 문단이 없는 한 구현 시작 시점의 baseline이다. 현재 상태는 §24-§27을 따른다.
 > M1/M3, M2의 NFSv4·NFSv3 schema, M4a-M4d component까지 구현됐다.
-> M5/S1a/S1b는 §28, M6/S1c의 host 구현은 §29와 §34 S1c를 따른다. guest replay 실행과 M7은 남아 있다.
+> M5/S1a/S1b는 §28, M6/S1c의 host 구현은 §29와 §34 S1c, M7 promotion gate는 §30을 따른다. guest replay 실행과
+> 그것으로 하는 첫 subset promotion은 남아 있다.
 
 ## 요약
 
@@ -1071,6 +1072,36 @@ semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능�
 
 Validation evidence를 HCAP `evidence_refs`에 추가하고 subset의 registry digest와 scope를 promotion한 뒤에만
 Harness Capability Specification을 갱신한다(§21).
+
+구현 상태(2026-10-17, issue #51): gate는 host에 있고, promotion된 subset은 아직 없다.
+
+- build registry: `nfs-proxy --capability-registry`가 그 build가 구현한 범위(ProtocolSchema id, mutation kind,
+  WireRef part, transform, structure policy, ValueRef source, predicate operator, 그 사이 제약과 limit)를 canonical
+  JSON으로 낸다. registry digest와 guest Proxy binary의 SHA-256이 build identity다. `nfs-proxy --describe-rules`는
+  받아들인 NFSPRUL1 set의 각 rule을 같은 어휘로 기술하므로 gate는 runtime 자신의 parser로 evidence를 분류한다.
+- subset: scope label 하나와 차원별 허용 값 집합(`agent_pipeline/semantic_promotion.py` `SemanticSubset`).
+- gate(`promote`): subset이 registry 안에 있고, 같은 binary의 KVM validation run이 subset의 모든 원소를 덮을 때만
+  promotion한다. run은 sealed judge input을 다시 판정한 `ReplayResult`가 `REPLAY_EQUIVALENT`이고, production이 guest
+  crash로 끝나 crash cut 위치의 MutationDelta가 남았고(semantic Delta crash survival), rule set의 모든 rule이 subset
+  안일 때 센다. 원소는 그것을 쓰는 rule의 batch가 같은 window 위치에서 production과 replay 모두 FORWARD_COMPLETE일
+  때 덮인다. dynamic-original replay는 그런 rule이 같은 위치에서 production에 없던 original value만 replay에서
+  바꿨을 때만 덮인다(`record`가 두 journal의 EXPOSURE_INTENT `original_value` digest를 기록한다). 위 검증 항목은
+  subset 내용에서 정해진다(request/response mutation, dynamic value, `S2C` CALL이면
+  backchannel, preserve/raw, 그리고 항상 crash survival과 dynamic-original replay). host test와 test double 결과는
+  run으로 기록하지 않는다. run이 KVM guest에서 왔다는 것은 기록하는 operator의 진술이다.
+- 결과: `PromotedSemanticCapabilityRegistry`(registry, build identity, subset별 evidence)와, 그것을
+  `authority_refs`로 참조하는 HCAP-10(`usable_by: [agent_stage2]`, `validated_subset`, scope = promoted subset id)을
+  가진 새 HCAP revision. Agent scope는 그 HCAP-10 entry(`agent_stage2`, validated)가 참조하는 registry의
+  `validated_scope` 안 subset뿐이며, catalog의 다른 곳에 있는 registry digest는 scope가 아니다. 다른 build는
+  처음부터 다시 promotion한다. Agent는 `lookup_semantic_scope` 도구로 pin된
+  revision의 subset을 읽고, `rule_set_scope`는 Compiler가 MutationRuleSet이 맞는 subset을 고르게 한다. 맞는 subset이
+  없으면 gap id는 `semantic_mutation.unpromoted`다.
+- 검증: `tests/agent_pipeline/test_semantic_promotion.py`(빌드한 Proxy의 registry가 rule validation과 일치하는지,
+  M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI).
+
+남은 것: subset마다 KVM에서 production crash window와 replay를 실행하고 `semantic_promotion record`/`promote`로
+promotion하는 일(사람이 한다, `tools/nfs-proxy/README.md` "Capability registry and promotion"). Mutation Rule
+Compiler가 `rule_set_scope`를 쓰는 통합은 Compiler와 함께 한다.
 
 ### 31. Compatibility / cutover strategy
 

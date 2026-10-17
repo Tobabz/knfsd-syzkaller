@@ -22,6 +22,8 @@ from pydantic import Field
 
 from ..contracts import Record
 from ..hcap import ArtifactHcapChecker, HcapCatalog
+from ..semantic_promotion import (PromotedSemanticCapabilityRegistry,
+                                  promoted_registry)
 from ..intake import ANALYSIS_ROOTS, in_analysis_roots, line_count
 
 SOURCE_PREFIXES = ANALYSIS_ROOTS
@@ -99,6 +101,10 @@ class KernelSourceIndex(Protocol):
 class HcapSource(Protocol):
     def load_catalog(self, revision: str) -> HcapCatalog: ...
 
+    def load_semantic_scope(self, revision: str
+                            ) -> PromotedSemanticCapabilityRegistry | None:
+        """The promoted semantic registry the revision pins, or None."""
+
 
 class ArtifactHcapSource:
     """HCAP lookup over the already pinned artifact-backed checker."""
@@ -108,6 +114,11 @@ class ArtifactHcapSource:
 
     def load_catalog(self, revision: str) -> HcapCatalog:
         return self.checker.load_catalog(revision)
+
+    def load_semantic_scope(self, revision: str
+                            ) -> PromotedSemanticCapabilityRegistry | None:
+        return promoted_registry(self.checker.store,
+                                 self.checker.load_catalog(revision))
 
 
 class ToolArgs(Record):
@@ -144,6 +155,10 @@ class HcapLookupArgs(ToolArgs):
     capability_id: str | None = Field(default=None, max_length=256)
     max_results: int = Field(default=MAX_HCAP_RESULTS, ge=1,
                              le=MAX_HCAP_RESULTS)
+
+
+class SemanticScopeArgs(ToolArgs):
+    pass
 
 
 class SourceExcerpt(Record):
@@ -196,6 +211,34 @@ class HcapLookup(Record):
     truncated: bool
 
 
+class SemanticScopeSubset(Record):
+    subset_id: str
+    description: str
+    schema_ids: tuple[str, ...]
+    directions: tuple[str, ...]
+    message_types: tuple[str, ...]
+    target_kinds: tuple[str, ...]
+    parts: tuple[str, ...]
+    mutation_kinds: tuple[str, ...]
+    transforms: tuple[str, ...]
+    structure_policies: tuple[str, ...]
+    value_sources: tuple[str, ...]
+    predicate_ops: tuple[str, ...]
+    validation_items: tuple[str, ...]
+
+
+class SemanticScopeLookup(Record):
+    """Empty ``subsets`` means no semantic mutation is usable: a rule set
+    would only be refused, so the Agent returns a mutation_engine gap."""
+
+    hcap_revision: str
+    proxy_sha256: str | None
+    registry_digest: str | None
+    registry_constraints: tuple[str, ...]
+    subsets: tuple[SemanticScopeSubset, ...]
+    truncated: bool
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
@@ -227,6 +270,12 @@ TOOL_DEFINITIONS = (
         "lookup_hcap",
         "Read bounded capability data from the task's pinned HCAP revision.",
         HcapLookupArgs),
+    ToolDefinition(
+        "lookup_semantic_scope",
+        "Read the semantic mutation subsets the pinned HCAP revision "
+        "promoted (M7). A MutationRuleSet must fit one subset; none means "
+        "no semantic mutation is supported.",
+        SemanticScopeArgs),
 )
 
 
@@ -275,7 +324,7 @@ def _roots(path_prefix: str | None) -> tuple[str, ...]:
 
 
 class Stage1Toolbox:
-    """Pinned dispatcher containing exactly five read-only tools."""
+    """Pinned dispatcher containing exactly six read-only tools."""
 
     def __init__(self, source: KernelSourceIndex, hcap: HcapSource, *,
                  kernel_commit: str, hcap_revision: str) -> None:
@@ -308,6 +357,8 @@ class Stage1Toolbox:
             return self._callees(parsed)
         if isinstance(parsed, HcapLookupArgs):
             return self._lookup_hcap(parsed)
+        if isinstance(parsed, SemanticScopeArgs):
+            return self._lookup_semantic_scope()
         raise AssertionError("unhandled Stage 1 tool arguments")
 
     def _read(self, args: ReadSourceArgs) -> SourceExcerpt:
@@ -418,3 +469,38 @@ class Stage1Toolbox:
             missing_capability_ids=missing,
             authority_refs=authority_refs,
             truncated=truncated or cut_missing or cut_catalog_auth)
+
+    def _lookup_semantic_scope(self) -> SemanticScopeLookup:
+        promoted = self._hcap.load_semantic_scope(self._hcap_revision)
+        if promoted is None:
+            return SemanticScopeLookup(
+                hcap_revision=self._hcap_revision, proxy_sha256=None,
+                registry_digest=None, registry_constraints=(), subsets=(),
+                truncated=False)
+        selected = promoted.subsets[:MAX_HCAP_RESULTS]
+        truncated = len(promoted.subsets) > len(selected)
+        views = []
+        for entry in selected:
+            subset = entry.subset
+            fields = {}
+            for name in ("schema_ids", "directions", "message_types",
+                         "target_kinds", "parts", "mutation_kinds",
+                         "transforms", "structure_policies", "value_sources",
+                         "predicate_ops"):
+                fields[name], cut = _bounded_items(getattr(subset, name))
+                truncated |= cut
+            description, cut = _bounded(subset.description,
+                                        MAX_HCAP_TEXT_BYTES)
+            truncated |= cut
+            views.append(SemanticScopeSubset(
+                subset_id=subset.subset_id, description=description,
+                validation_items=tuple(i.value
+                                       for i in entry.validation_items),
+                **fields))
+        constraints, cut = _bounded_items(promoted.registry.constraints)
+        return SemanticScopeLookup(
+            hcap_revision=self._hcap_revision,
+            proxy_sha256=promoted.proxy_sha256,
+            registry_digest=promoted.registry_digest,
+            registry_constraints=constraints, subsets=tuple(views),
+            truncated=truncated or cut)

@@ -208,6 +208,8 @@ static void usage(const char *program)
 		"       %s ... --target RULES --session-id ID --journal PATH "
 		"--lane N [--activation PATH] [--drain-bound-ms MS]\n"
 		"       %s --check-rules RULES\n"
+		"       %s --describe-rules RULES\n"
+		"       %s --capability-registry\n"
 		"One listener per backend; client identity is the TCP source IP. "
 		"An arm rule is active only while its control FD remains open.\n"
 		"--semantic decodes every record and correlates each REPLY with "
@@ -219,12 +221,17 @@ static void usage(const char *program)
 		"SOCK_SEQPACKET endpoint --activation (target.h).\n"
 		"--check-rules loads RULES as --target would and reports, on "
 		"one line, whether this runtime accepts it (exit 0) or refuses "
-		"it (exit 3): the semantic replay compatibility gate.\n",
-		program, program, program);
+		"it (exit 3): the semantic replay compatibility gate.\n"
+		"--describe-rules prints each rule of an accepted RULES as JSON "
+		"in the capability registry's vocabulary (exit 3 when refused).\n"
+		"--capability-registry prints the semantic capability registry "
+		"this build implements (canonical JSON, one line).\n",
+		program, program, program, program, program);
 }
 
-/* Semantic replay's compatibility gate: see nfsp_target_check_rules. */
-static int check_rules(const char *path)
+/* Semantic replay's compatibility gate: see nfsp_target_check_rules.  With
+ * `describe`, M7's rule description: nfsp_target_describe_rules. */
+static int check_rules(const char *path, int describe)
 {
 	uint8_t *rules;
 	size_t len = 0;
@@ -235,9 +242,9 @@ static int check_rules(const char *path)
 		perror("read rule set");
 		return 1;
 	}
-	rc = nfsp_target_check_rules(rules, len, families,
-				     sizeof(families) / sizeof(families[0]),
-				     stdout);
+	rc = (describe ? nfsp_target_describe_rules : nfsp_target_check_rules)(
+		rules, len, families, sizeof(families) / sizeof(families[0]),
+		stdout);
 	free(rules);
 	return rc == 0 ? 0 : 3;
 }
@@ -258,7 +265,13 @@ int main(int argc, char **argv)
 	struct in_addr src[2];
 	int rc;
 	if (argc == 3 && strcmp(argv[1], "--check-rules") == 0)
-		return check_rules(argv[2]);
+		return check_rules(argv[2], 0);
+	if (argc == 3 && strcmp(argv[1], "--describe-rules") == 0)
+		return check_rules(argv[2], 1);
+	if (argc == 2 && strcmp(argv[1], "--capability-registry") == 0)
+		return nfsp_target_capability_registry(
+			families, sizeof(families) / sizeof(families[0]),
+			stdout) == 0 ? 0 : 1;
 	if (argc < 7) {
 		usage(argv[0]); return 2;
 	}

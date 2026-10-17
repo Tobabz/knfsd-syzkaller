@@ -582,7 +582,12 @@ semantic capability registry
   쓰지 않는다(§7.1).
 - path, operator, transform 목록을 이 문서나 Agent·Proxy 설계 문서에 복제하지 않는다.
 
-promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다.
+promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다. registry 생성과 promotion gate는
+구현됐다(`../03-nfs-proxy/06-implementation-gap-analysis.md` §30, issue #51). 첫 subset이 gate를 통과하면 gate가
+HCAP-10 entry를 가진 새 revision을 만든다. 그 entry는 `usable_by: [agent_stage2]`, `status: validated_subset`,
+`validated_scope`에 promoted subset id, `authority_refs`에 `PromotedSemanticCapabilityRegistry` digest를 둔다.
+subset 내용은 그 authority에만 있고 Agent는 `lookup_semantic_scope` 도구로 읽는다. vocabulary에는 어느 promoted
+subset에도 맞지 않는 intent의 gap id `semantic_mutation.unpromoted`가 더해진다.
 
 ## 5. Stage별 사용 범위
 

@@ -430,6 +430,80 @@ prints the `ReplayResult`. The production journal is only read; `judge` refuses 
 since the plan. `tests/agent_pipeline/test_semantic_replay_live.py` runs plan, replay and judge
 against the built Proxy and the real sink on the host.
 
+## Capability registry and promotion (M7)
+
+[06 §21, §30](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+[HCAP 04 §4](../../docs/design/02-llm-agent/04-harness-capability-spec.md).
+
+```sh
+nfs-proxy --capability-registry          # one line of canonical JSON
+nfs-proxy --describe-rules RULES.nfsprul1  # each rule in the same vocabulary (exit 3 when refused)
+```
+
+The registry is what this build implements: its ProtocolSchema ids, and the mutation kinds, parts,
+transforms, structure policies, value sources and comparisons `src/rule.c` accepts, with the
+constraints between them. Implemented is not usable. The Agent uses only a *promoted* subset, and
+`agent_pipeline/semantic_promotion.py` promotes a subset only when KVM validation runs on the same
+Proxy binary cover every element of it:
+
+- the run's `ReplayResult` is `REPLAY_EQUIVALENT` and is the judgment of its own sealed input;
+- production ended in a guest crash and the crash-cut position's MutationDelta was read back;
+- every rule of the run's rule set is inside the subset, and an element counts once a rule using it
+  completed forwarding in production and in replay at the same window position;
+- dynamic-original replay counts only when such a rule replaced, at one position, original values in
+  replay that production never had (`record` reads them from both journals): replay the window on
+  other dynamic state, not a copy of production's;
+- the 06 §30 items the subset calls for are covered (request or response mutation, dynamic value,
+  backchannel, preserve or raw, plus crash survival and replay always).
+
+The gate writes a `PromotedSemanticCapabilityRegistry` and a new HCAP revision whose `HCAP-10` entry
+(`usable_by: [agent_stage2]`) references it by digest. Only that entry makes the registry Agent scope,
+and only for the subsets in its `validated_scope`; a registry digest elsewhere in the catalog does not. A new Proxy build is promoted afresh. The
+Agent reads the subsets with its `lookup_semantic_scope` tool, and `rule_set_scope` tells the
+Compiler which subset a `MutationRuleSet` fits. Nothing is promoted until the KVM runs below exist.
+
+**KVM step (by hand), once per subset.** Use the guest binary from `build-guest.sh` everywhere; the
+host runs the same binary for `--capability-registry` and `--describe-rules`.
+
+1. Record the build: `python -m agent_pipeline.semantic_promotion registry --proxy GUEST_PROXY
+   --store ARTIFACTS` prints `build=REF`.
+2. Write the subset, for example:
+
+   ```json
+   {"subset_id": "semantic.nfs4_1.call_value_literal_preserve",
+    "description": "NFSv4.1 CALL leaf values replaced by a literal, preserve",
+    "schema_ids": ["nfs4.1/sha256:..."], "directions": ["C2S"], "message_types": ["call"],
+    "target_kinds": ["field"], "parts": ["value"], "mutation_kinds": ["replace"],
+    "transforms": ["literal"], "structure_policies": ["preserve"],
+    "value_sources": ["target"], "predicate_ops": ["gt"]}
+   ```
+
+   Every rule of the production rule set must fit it (`--describe-rules` shows each rule), and
+   every listed element must be used by a rule that fires in the window.
+3. Production: boot a target-mode lane with that rule set ("Target mode" above) and run until the
+   guest crashes with those rules firing in the crash window. A deliberate panic after the programs
+   is enough; the crash-cut program must have a mutation recorded.
+4. Replay: `replay_runner plan`, then boot a fresh VM on another journal directory and run
+   `syz-execprog -procs=1 -repeat=1` over `REPLAY/programs.log` ("Semantic replay" above).
+5. Record the run instead of `replay_runner judge`:
+
+   ```sh
+   python -m agent_pipeline.semantic_promotion record --store ARTIFACTS --subset SUBSET.json \
+       --proxy GUEST_PROXY --kernel-commit KERNEL_SHA --environment kvm_guest \
+       --plan REPLAY/plan.json --journal-dir JOURNAL_DIR --production-vm vm-0 \
+       --replay-dir REPLAY_JOURNAL_DIR --replay-name lane0 --replay-vm vm-1 --replay-lane 0 \
+       --execprog-output EXECPROG_OUT --production-end guest_crash --replay-end guest_crash
+   ```
+
+   It prints `run=REF` and the verdict, and exits 3 with the reasons when the run does not count.
+6. Promote: `python -m agent_pipeline.semantic_promotion promote --store ARTIFACTS --build REF
+   --subset SUBSET.json --run REF [--run REF ...] --hcap HCAP_REVISION [--previous PROMOTED_REF]`
+   prints `promoted=REF hcap_revision=REF`, or every reason it refuses. Bind the new revision in the
+   harness registry for Stage 2 to use it.
+
+`tests/agent_pipeline/test_semantic_promotion.py` runs this with the M6 host run standing in for the
+KVM run; that is a test of the gate, not evidence.
+
 ## Building
 
 ```sh

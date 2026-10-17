@@ -77,12 +77,16 @@ OPEN"), byte offset, recorded bytes, raw packet or command. State
 message_type, structure_policy and targets_baseline_traffic explicitly.
 Group intents that only trigger together into a hypothesis. Prose belongs
 only in expected_effect and uncertainties. Agent Stage 2 may use only
-semantic mutation capability the pinned HCAP lists as promoted; never lower
-an intent to legacy NFSPARM capabilities. If the change needs a value from
-an earlier transaction, or the current semantic runtime cannot express it,
-return the unsupported variant with gap_class mutation_engine and an HCAP
-vocabulary id such as state_lineage; leave the id empty when none fits and
-name the capability in the reason.\
+semantic mutation capability the pinned HCAP lists as promoted: call
+lookup_semantic_scope and fit the whole rule set inside one promoted subset
+(its ProtocolSchema, direction, message type, part, mutation kind,
+transform, structure policy, value sources and comparisons). Never lower an
+intent to legacy NFSPARM capabilities. If the change needs a value from an
+earlier transaction, return the unsupported variant with gap_class
+mutation_engine and missing_capability_id state_lineage; if no promoted
+subset can express it, use semantic_mutation.unpromoted when the HCAP
+vocabulary lists it. Leave the id empty when none fits and name the
+capability in the reason.\
 """
 
 

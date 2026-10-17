@@ -1593,6 +1593,303 @@ int nfsp_target_check_rules(const uint8_t *rule_set, size_t len,
 	return 0;
 }
 
+/* ---- M7: capability registry and rule description ---- */
+
+/* Rule vocabulary names (agent_pipeline/agent_tasks/mutation.py), indexed
+ * by the wire enums of rule.h. */
+static const char *const direction_names[] = { "C2S", "S2C" };
+static const char *const msg_type_names[] = { "call", "reply" };
+static const char *const target_kind_names[] = { "field",
+						 "operation_array" };
+static const char *const part_names[] = {
+	"value", "encoded", "metadata:length", "metadata:count",
+	"metadata:discriminant", "metadata:padding"
+};
+static const char *const kind_names[] = { "replace", "insert", "delete",
+					  "op_append", "op_prepend" };
+static const char *const transform_names[] = { "literal", "copy",
+					       "builtin" };
+static const char *const policy_names[] = { "preserve", "raw" };
+static const char *const source_names[] = {
+	"target", "current_message", "request_forwarded", "request_original"
+};
+static const char *const compare_names[] = { "eq", "ne", "lt", "le", "gt",
+					     "ge" };
+
+/* The name order of a bit set over one of the tables above. */
+static void jb_names(struct nfsp_jbuf *b, const char *const *names,
+		     size_t n, unsigned set)
+{
+	int first = 1;
+	unsigned done = 0;
+
+	nfsp_jb_raw(b, "[");
+	for (size_t k = 0; k < n; k++) {
+		size_t min = n;
+
+		for (size_t i = 0; i < n; i++)
+			if ((set & ~done & (1u << i)) &&
+			    (min == n || strcmp(names[i], names[min]) < 0))
+				min = i;
+		if (min == n)
+			break;
+		done |= 1u << min;
+		if (!first)
+			nfsp_jb_raw(b, ",");
+		nfsp_jb_str(b, names[min]);
+		first = 0;
+	}
+	nfsp_jb_raw(b, "]");
+}
+
+#define BIT(x) (1u << (unsigned)(x))
+#define NAMES(t) (t), sizeof(t) / sizeof((t)[0])
+
+static int jb_emit(struct nfsp_jbuf *b, FILE *out)
+{
+	int rc = -1;
+
+	nfsp_jb_raw(b, "\n");
+	if (!b->failed && fwrite(b->p, 1, b->len, out) == b->len &&
+	    fflush(out) == 0)
+		rc = 0;
+	nfsp_jb_free(b);
+	return rc;
+}
+
+static void jb_opt_u32(struct nfsp_jbuf *b, int has, uint32_t v)
+{
+	if (has)
+		nfsp_jb_u64(b, v);
+	else
+		nfsp_jb_raw(b, "null");
+}
+
+int nfsp_target_capability_registry(
+	const struct nfsp_schema_family *const *families, size_t nfamilies,
+	FILE *out)
+{
+	const struct nfsp_protocol_schema *all[64];
+	struct nfsp_jbuf b;
+	size_t n = 0;
+	int first = 1;
+
+	for (size_t i = 0; i < nfamilies; i++)
+		for (uint32_t k = 0; families[i] && k < families[i]->nschemas;
+		     k++)
+			if (n < sizeof(all) / sizeof(all[0]))
+				all[n++] = families[i]->schemas[k];
+	/* Canonical: schemas in schema_id order. */
+	for (size_t i = 1; i < n; i++)
+		for (size_t j = i; j > 0 &&
+		     strcmp(all[j - 1]->schema_id, all[j]->schema_id) > 0; j--) {
+			const struct nfsp_protocol_schema *t = all[j];
+
+			all[j] = all[j - 1];
+			all[j - 1] = t;
+		}
+
+	nfsp_jb_init(&b, 1u << 16);
+	nfsp_jb_raw(&b, "{");
+	/* What check_mutation and check_replace in rule.c accept. */
+	nfsp_jb_key(&b, "constraints", 1);
+	nfsp_jb_raw(&b, "[");
+	/* A discriminant changes the layout after it: raw only. */
+	nfsp_jb_str(&b, "discriminant_value_raw_only");
+	/* length, count, discriminant and padding words: raw, literal. */
+	nfsp_jb_raw(&b, ",");
+	nfsp_jb_str(&b, "metadata_part_raw_literal_only");
+	/* replace writes a leaf value, never a struct, array or union. */
+	nfsp_jb_raw(&b, ",");
+	nfsp_jb_str(&b, "value_part_leaf_only");
+	nfsp_jb_raw(&b, "]");
+	nfsp_jb_key(&b, "directions", 0);
+	jb_names(&b, NAMES(direction_names), BIT(NFSP_RULE_C2S) |
+		 BIT(NFSP_RULE_S2C));
+	nfsp_jb_key(&b, "limits", 0);
+	nfsp_jb_raw(&b, "{");
+	nfsp_jb_key(&b, "literal_bytes", 1);
+	nfsp_jb_u64(&b, NFSP_RULE_LITERAL_MAX);
+	nfsp_jb_key(&b, "path_bytes", 0);
+	nfsp_jb_u64(&b, NFSP_RULE_PATH_MAX);
+	nfsp_jb_key(&b, "predicates_per_rule", 0);
+	nfsp_jb_u64(&b, NFSP_RULE_PREDICATES_MAX);
+	nfsp_jb_key(&b, "rule_set_bytes", 0);
+	nfsp_jb_u64(&b, NFSP_RULESET_MAX_LEN);
+	nfsp_jb_key(&b, "rules", 0);
+	nfsp_jb_u64(&b, NFSP_RULES_MAX);
+	nfsp_jb_raw(&b, "}");
+	nfsp_jb_key(&b, "message_types", 0);
+	jb_names(&b, NAMES(msg_type_names), BIT(NFSP_RULE_CALL) |
+		 BIT(NFSP_RULE_REPLY));
+	nfsp_jb_key(&b, "mutation_kinds", 0);
+	jb_names(&b, NAMES(kind_names), BIT(NFSP_MUT_REPLACE));
+	nfsp_jb_key(&b, "parts", 0);
+	jb_names(&b, NAMES(part_names), BIT(NFSP_PART_VALUE) |
+		 BIT(NFSP_PART_LENGTH) | BIT(NFSP_PART_COUNT) |
+		 BIT(NFSP_PART_DISCRIMINANT) | BIT(NFSP_PART_PADDING));
+	nfsp_jb_key(&b, "predicate_ops", 0);
+	jb_names(&b, NAMES(compare_names), BIT(NFSP_CMP_EQ) |
+		 BIT(NFSP_CMP_NE) | BIT(NFSP_CMP_LT) | BIT(NFSP_CMP_LE) |
+		 BIT(NFSP_CMP_GT) | BIT(NFSP_CMP_GE));
+	nfsp_jb_key(&b, "schema_version", 0);
+	nfsp_jb_str(&b, "semantic-capability-registry.v1");
+	nfsp_jb_key(&b, "schemas", 0);
+	nfsp_jb_raw(&b, "[");
+	for (size_t i = 0; i < n; i++) {
+		if (!first)
+			nfsp_jb_raw(&b, ",");
+		first = 0;
+		nfsp_jb_raw(&b, "{");
+		nfsp_jb_key(&b, "family", 1);
+		nfsp_jb_str(&b, all[i]->family);
+		nfsp_jb_key(&b, "minor_version", 0);
+		jb_opt_u32(&b, all[i]->has_minor, all[i]->minor);
+		nfsp_jb_key(&b, "program", 0);
+		nfsp_jb_u64(&b, all[i]->program);
+		nfsp_jb_key(&b, "schema_id", 0);
+		nfsp_jb_str(&b, all[i]->schema_id);
+		nfsp_jb_key(&b, "version", 0);
+		nfsp_jb_u64(&b, all[i]->version);
+		nfsp_jb_raw(&b, "}");
+	}
+	nfsp_jb_raw(&b, "]");
+	nfsp_jb_key(&b, "semantic_runtime_version", 0);
+	nfsp_jb_u64(&b, NFSP_SEMANTIC_RUNTIME_VERSION);
+	nfsp_jb_key(&b, "structure_policies", 0);
+	jb_names(&b, NAMES(policy_names), BIT(NFSP_POLICY_PRESERVE) |
+		 BIT(NFSP_POLICY_RAW));
+	nfsp_jb_key(&b, "target_kinds", 0);
+	jb_names(&b, NAMES(target_kind_names), BIT(NFSP_RULE_FIELD));
+	/* builtin has no registered transform_id. */
+	nfsp_jb_key(&b, "transforms", 0);
+	jb_names(&b, NAMES(transform_names), BIT(NFSP_XF_LITERAL) |
+		 BIT(NFSP_XF_COPY));
+	nfsp_jb_key(&b, "value_sources", 0);
+	jb_names(&b, NAMES(source_names), BIT(NFSP_SRC_TARGET) |
+		 BIT(NFSP_SRC_CURRENT_MESSAGE) |
+		 BIT(NFSP_SRC_REQUEST_FORWARDED) |
+		 BIT(NFSP_SRC_REQUEST_ORIGINAL));
+	nfsp_jb_raw(&b, "}");
+	return jb_emit(&b, out);
+}
+
+static void describe_rule(struct nfsp_jbuf *b, const struct nfsp_rule *ru)
+{
+	unsigned sources = 0, ops = 0;
+
+	for (uint32_t i = 0; i < ru->npredicates; i++) {
+		const struct nfsp_rule_predicate *p = &ru->predicates[i];
+
+		sources |= BIT(p->lhs.source);
+		if (p->rhs_kind == NFSP_OPND_REF)
+			sources |= BIT(p->rhs_ref.source);
+		ops |= BIT(p->op);
+	}
+	if (ru->has_transform && ru->transform.kind == NFSP_XF_COPY)
+		sources |= BIT(ru->transform.source.source);
+
+	nfsp_jb_raw(b, "{");
+	nfsp_jb_key(b, "direction", 1);
+	nfsp_jb_str(b, direction_names[ru->direction]);
+	nfsp_jb_key(b, "family", 0);
+	nfsp_jb_str(b, ru->family);
+	nfsp_jb_key(b, "intent_id", 0);
+	nfsp_jb_str(b, ru->intent_id);
+	nfsp_jb_key(b, "kind", 0);
+	nfsp_jb_str(b, kind_names[ru->kind]);
+	nfsp_jb_key(b, "message_type", 0);
+	nfsp_jb_str(b, msg_type_names[ru->message_type]);
+	nfsp_jb_key(b, "minor_version", 0);
+	jb_opt_u32(b, ru->has_minor_version, ru->minor_version);
+	nfsp_jb_key(b, "nfs_version", 0);
+	jb_opt_u32(b, ru->has_nfs_version, ru->nfs_version);
+	nfsp_jb_key(b, "operation", 0);
+	if (ru->operation != NULL)
+		nfsp_jb_str(b, ru->operation);
+	else
+		nfsp_jb_raw(b, "null");
+	nfsp_jb_key(b, "part", 0);
+	nfsp_jb_str(b, part_names[ru->part]);
+	nfsp_jb_key(b, "predicate_ops", 0);
+	jb_names(b, NAMES(compare_names), ops);
+	nfsp_jb_key(b, "procedure", 0);
+	jb_opt_u32(b, ru->has_procedure, ru->procedure);
+	nfsp_jb_key(b, "program", 0);
+	nfsp_jb_u64(b, ru->program);
+	nfsp_jb_key(b, "rule_id", 0);
+	nfsp_jb_str(b, ru->rule_id);
+	nfsp_jb_key(b, "structure_policy", 0);
+	nfsp_jb_str(b, policy_names[ru->policy]);
+	nfsp_jb_key(b, "target_discriminant", 0);
+	nfsp_jb_raw(b, (ru->target.flags & NFSP_SN_DISCRIMINANT) ?
+		    "true" : "false");
+	nfsp_jb_key(b, "target_kind", 0);
+	nfsp_jb_str(b, target_kind_names[ru->target_kind]);
+	nfsp_jb_key(b, "target_path", 0);
+	nfsp_jb_str(b, ru->target_path);
+	nfsp_jb_key(b, "transform", 0);
+	if (ru->has_transform)
+		nfsp_jb_str(b, transform_names[ru->transform.kind]);
+	else
+		nfsp_jb_raw(b, "null");
+	nfsp_jb_key(b, "value_sources", 0);
+	jb_names(b, NAMES(source_names), sources);
+	nfsp_jb_key(b, "version", 0);
+	nfsp_jb_u64(b, ru->version);
+	nfsp_jb_raw(b, "}");
+}
+
+int nfsp_target_describe_rules(const uint8_t *rule_set, size_t len,
+			       const struct nfsp_schema_family *const *families,
+			       size_t nfamilies, FILE *out)
+{
+	struct nfsp_ruleset rs;
+	struct nfsp_rule_error rerr;
+	struct nfsp_jbuf b;
+	uint8_t digest[NFSP_SHA256_LEN];
+	char hex[65];
+
+	memset(&rs, 0, sizeof(rs));
+	memset(&rerr, 0, sizeof(rerr));
+	rerr.rule = rerr.predicate = NFSP_RULE_NONE;
+	if (len > NFSP_RULESET_MAX_LEN ||
+	    nfsp_ruleset_load(rule_set, len, families, nfamilies, &rs,
+			      &rerr) != NFSP_RULE_OK) {
+		nfsp_target_check_rules(rule_set, len, families, nfamilies,
+					out);
+		return -1;
+	}
+	nfsp_sha256(rule_set, len, digest);
+	nfsp_sha256_hex(digest, hex);
+	nfsp_jb_init(&b, 2u * NFSP_RULESET_MAX_LEN);
+	nfsp_jb_raw(&b, "{");
+	nfsp_jb_key(&b, "candidate_id", 1);
+	nfsp_jb_str(&b, rs.candidate_id);
+	nfsp_jb_key(&b, "rule_set_id", 0);
+	nfsp_jb_str(&b, hex);
+	nfsp_jb_key(&b, "rules", 0);
+	nfsp_jb_raw(&b, "[");
+	for (uint32_t i = 0; i < rs.nrules; i++) {
+		if (i)
+			nfsp_jb_raw(&b, ",");
+		describe_rule(&b, &rs.rules[i]);
+	}
+	nfsp_jb_raw(&b, "]");
+	nfsp_jb_key(&b, "schema_id", 0);
+	nfsp_jb_str(&b, rs.schema_id);
+	nfsp_jb_key(&b, "schema_version", 0);
+	nfsp_jb_str(&b, "semantic-rule-description.v1");
+	nfsp_jb_key(&b, "semantic_runtime_version", 0);
+	nfsp_jb_u64(&b, rs.semantic_runtime_version);
+	nfsp_jb_raw(&b, "}");
+	nfsp_ruleset_free(&rs);
+	return jb_emit(&b, out);
+}
+
+#undef NAMES
+#undef BIT
+
 int nfsp_target_open(struct nfsp_target **out,
 		     const struct nfsp_target_cfg *cfg, char *err,
 		     size_t errlen)
