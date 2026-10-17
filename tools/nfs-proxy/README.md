@@ -279,6 +279,11 @@ Run the same command again after a restart: it resumes the recovered session (an
 retransmitted event without storing it twice), and refuses to start if the binding, lane or rule
 set differ.
 
+`--fsync` makes every stored entry durable before the sink answers. An activation ACK then waits
+on that fsync, and the executor gives a barrier only `syscall_timeout_ms * 10`. On the #45 KVM run a
+slow fsync made the generation 186 open ACK miss that bound: the lane was quarantined and the VM
+restarted. Leave `--fsync` off for fuzzing unless the host's storage answers well inside the bound.
+
 `tests/agent_pipeline/test_journal_live.py` runs the built Proxy (with ASan when the compiler has
 it) against this sink on loopback; `tools/nfs-proxy/build.sh` covers `test_journal` and the relay
 hold hooks in `test_proxy`.
