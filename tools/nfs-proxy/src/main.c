@@ -207,6 +207,7 @@ static void usage(const char *program)
 		"[--semantic]\n"
 		"       %s ... --target RULES --session-id ID --journal PATH "
 		"--lane N [--activation PATH] [--drain-bound-ms MS]\n"
+		"       %s --check-rules RULES\n"
 		"One listener per backend; client identity is the TCP source IP. "
 		"An arm rule is active only while its control FD remains open.\n"
 		"--semantic decodes every record and correlates each REPLY with "
@@ -215,8 +216,30 @@ static void usage(const char *program)
 		"activated generation; every mutation is recorded on the host "
 		"journal at PATH (Unix socket or virtio-serial port) before it "
 		"is forwarded.  The executor drives activation on the "
-		"SOCK_SEQPACKET endpoint --activation (target.h).\n",
-		program, program);
+		"SOCK_SEQPACKET endpoint --activation (target.h).\n"
+		"--check-rules loads RULES as --target would and reports, on "
+		"one line, whether this runtime accepts it (exit 0) or refuses "
+		"it (exit 3): the semantic replay compatibility gate.\n",
+		program, program, program);
+}
+
+/* Semantic replay's compatibility gate: see nfsp_target_check_rules. */
+static int check_rules(const char *path)
+{
+	uint8_t *rules;
+	size_t len = 0;
+	int rc;
+
+	rules = read_file(path, NFSP_TARGET_RULES_MAX, &len);
+	if (rules == NULL) {
+		perror("read rule set");
+		return 1;
+	}
+	rc = nfsp_target_check_rules(rules, len, families,
+				     sizeof(families) / sizeof(families[0]),
+				     stdout);
+	free(rules);
+	return rc == 0 ? 0 : 3;
 }
 
 int main(int argc, char **argv)
@@ -234,6 +257,8 @@ int main(int argc, char **argv)
 	char ips[4][INET_ADDRSTRLEN];
 	struct in_addr src[2];
 	int rc;
+	if (argc == 3 && strcmp(argv[1], "--check-rules") == 0)
+		return check_rules(argv[2]);
 	if (argc < 7) {
 		usage(argv[0]); return 2;
 	}

@@ -374,6 +374,62 @@ tools/prepare-live-lane-config.py ... \
 (default `qemu-system-x86_64`) `--version`: `reconnect-ms=1000` from 9.2 on, `reconnect=1`
 before. Pass `--qemu-version X.Y` when the preparing host cannot run that QEMU.
 
+## Semantic replay (M6, S1c)
+
+[06 §29, §34 S1c](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+verdict rules in [05 §25-§39](../../docs/design/03-nfs-proxy/05-mutation-delta-replay.md).
+
+Replay is target mode again, with the rule set read back from the production journal, a separate
+host journal and the crash's window of programs run in order. There is no replay-only mutation
+path: the same Decoder, Transaction Context, Resolver and Edit Applier run, and every replay
+mutation is written ahead to the replay journal like in production.
+
+```sh
+nfs-proxy --check-rules RULES.nfsprul1
+# rules ok rule_set_id=HEX semantic_runtime_version=1 schema_id=nfs4.1/sha256:... rules=2
+# rules refused rule_set_id=HEX status=unknown_schema        (exit 3)
+```
+
+`--check-rules` loads a rule set exactly as `--target` would and serves nothing. The Runner asks
+the Proxy that will replay before it starts: a refusal makes the replay `REPLAY_INVALID`
+(`unknown_schema` is `schema_unavailable`, `unsupported_version` is `runtime_incompatible`,
+`unsupported_capability` is `transform_unsupported`), never a remap.
+
+Syzkaller patch 0024 keeps, for every program in the crash log's "last executing test programs",
+the lane it ran in and, once it finished, its barrier:
+
+```text
+1.2s ago: executing program 0 (id=10):
+nfs-proxy: lane=0 generation=186 program_digest=HEX activation=Acked/0 deactivation=Acked/0 executed=true lease_cleared=true
+```
+
+The ring behind it holds `experimental.nfs_proxy_window` programs per proc (default 6, at most 64);
+the window bound is job policy and may not exceed it. The program still running at the crash has
+no barrier line: its generation is the next one its lane opened on the journal.
+
+**KVM step (by hand).** After a crash in a target-mode lane:
+
+```sh
+python -m agent_pipeline.replay_runner plan --journal-dir JOURNAL_DIR --journal-name lane0 \
+    --vm vm-0 --crash-log CRASH_LOG --bound 4 --proxy GUEST_OR_HOST_PROXY --out REPLAY
+```
+
+writes `REPLAY/rules.bin` (the recorded bytes), `REPLAY/programs.log` (the window, in order) and
+`REPLAY/plan.json`, and prints the gate's line. Boot a fresh VM with a sink on a *different*
+journal directory, installed with `REPLAY/rules.bin` for the replay lane, and run
+`syz-execprog -procs=1 -repeat=1 ... REPLAY/programs.log` in that lane, keeping its output. Then:
+
+```sh
+python -m agent_pipeline.replay_runner judge --plan REPLAY/plan.json \
+    --journal-dir JOURNAL_DIR --replay-dir REPLAY_JOURNAL_DIR --replay-name lane0 \
+    --replay-vm vm-1 --replay-lane 0 --execprog-output EXECPROG_OUT \
+    --proxy GUEST_OR_HOST_PROXY --production-end guest_crash --replay-end guest_crash
+```
+
+prints the `ReplayResult`. The production journal is only read; `judge` refuses it if it changed
+since the plan. `tests/agent_pipeline/test_semantic_replay_live.py` runs plan, replay and judge
+against the built Proxy and the real sink on the host.
+
 ## Building
 
 ```sh

@@ -39,6 +39,9 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis and Reachability Planning; records the runtime's actual `provider:model` id through existing Controller callbacks |
 | `runner/` | restart-safe SQLite leases/completion, evidence sealing, accepted-receipt Q1 publication and lease-aware Linux process supervision |
 | `journal_framing.py` | bounded M5 journal frame recovery and canonical ACK codec; persistence and event admission remain separate |
+| `semantic_delta.py` | M6 semantic Delta reader: opens a sealed host journal read only, re-admits every frame with the sink's rules, reports torn tails, refuses corruption, and projects one generation for the replay comparator |
+| `semantic_replay.py` | pure M6 replay comparator: per-position batch-signature multisets, JudgeProfile(Replay) v1 refusal classes, refusal-evidence completeness and the 05 §29 verdict order |
+| `replay_runner.py` | M6/S1c Runner side: CrashContextWindow from a syz-manager crash log, join to the production journal, recorded rule set and `--check-rules` gate, replay inputs for `syz-execprog`, judge input |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |
 | `controller/store.py` | SQLite: one transaction per transition |
 | `controller/service.py` | events in, tasks out after commit; `poll()` and `recover()` send a failed or unanswered call again (each failure is recorded per job in `effect_failures`, and the other jobs go on); `replay()` |

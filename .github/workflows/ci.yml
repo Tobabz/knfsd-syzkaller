@@ -48,7 +48,7 @@ jobs:
     # The checked-in syzkaller series applies to its pinned base, and the
     # executor and flatrpc tests the series carries pass: the S1a activation
     # barrier against a test double of the proxy endpoint, and where the
-    # executor places it.  The barrier against the real Proxy is
+    # executor places it, and the S1c crash context syz-manager keeps.  The barrier against the real Proxy is
     # tests/agent_pipeline/test_executor_activation.py.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -85,3 +85,6 @@ jobs:
           TARGETOS=test TARGETARCH=64 TARGETVMARCH=64 make executor
           go test ./pkg/flatrpc/
           go test ./executor/ -run 'NfsProxy|Generation|FixedLane'
+          # S1c: the crash log keeps each record's lane and barrier (0024).
+          go test ./pkg/rpcserver/ -run 'LastExecuting|NfsProxy|PrependExecuting'
+          go test ./pkg/mgrconfig/
