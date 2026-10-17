@@ -1,0 +1,793 @@
+"""M7: semantic capability registry and subset promotion (06 §21, §30; 04 §4).
+
+The Proxy build says what it implements (``nfs-proxy --capability-registry``)
+and how it reads a rule set (``nfs-proxy --describe-rules``).  Neither is
+Agent capability.  A semantic subset becomes usable by ``agent_stage2`` only
+through this gate:
+
+- the subset lies inside the build's registry;
+- guest validation runs cover every element of it.  A run counts when its
+  ``ReplayResult`` re-evaluates from the sealed judge input to
+  ``REPLAY_EQUIVALENT`` with no invalid evidence, its production side ended
+  in a guest crash with the crash-cut position's MutationDelta present
+  (semantic Delta crash survival), and every rule of its rule set is inside
+  the subset.  A rule is exercised when a batch naming it completed
+  forwarding in both production and replay at one window position;
+- the §30 validation items the subset's contents call for are covered.
+
+The gate writes a ``PromotedSemanticCapabilityRegistry`` and the HCAP entry
+that references it by digest.  A different build is promoted afresh.
+
+Content addressing establishes byte integrity, not provenance.  That a run
+came from a KVM guest with the real executor and knfsd is the operator's
+statement when recording it, as for every other host-supplied record; host
+tests and test doubles are never recorded as runs (06 §27, §30).
+"""
+
+from __future__ import annotations
+
+import enum
+import hashlib
+import subprocess
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import ConfigDict, Field, field_validator, model_validator
+
+from .artifacts import ArtifactStore
+from .contracts import Record, Sha256
+from .data import canonical_json, load_record, put_record
+from .hcap import AuthorityRef, Capability, CapabilityInterface, HcapCatalog
+from .semantic_replay import (JournalIntegrity, ReplayJudgeInput, ReplayResult,
+                              ReplayVerdict, Termination, evaluate)
+
+Text = Annotated[str, Field(min_length=1, max_length=1024, pattern=r"\S")]
+Visible = Annotated[str, Field(min_length=1, max_length=512,
+                               pattern=r"^[\x21-\x7e]+$")]
+SubsetId = Annotated[str, Field(max_length=128,
+                                pattern=r"^semantic\.[a-z0-9][a-z0-9_.-]*$")]
+U32 = Annotated[int, Field(ge=0, le=0xFFFFFFFF)]
+
+Direction = Literal["C2S", "S2C"]
+MessageType = Literal["call", "reply"]
+TargetKind = Literal["field", "operation_array"]
+Part = Literal["value", "encoded", "metadata:length", "metadata:count",
+               "metadata:discriminant", "metadata:padding"]
+MutationKind = Literal["replace", "insert", "delete", "op_append",
+                       "op_prepend"]
+TransformKind = Literal["literal", "copy", "builtin"]
+Policy = Literal["preserve", "raw"]
+Source = Literal["target", "current_message", "request_forwarded",
+                 "request_original"]
+CompareOp = Literal["eq", "ne", "lt", "le", "gt", "ge"]
+
+#: Gap id for an intent no promoted subset covers (07 §3).
+UNPROMOTED_GAP_ID = "semantic_mutation.unpromoted"
+DEFAULT_CAPABILITY_ID = "HCAP-10"
+MAX_SUBSETS = 64
+MAX_RUNS = 64
+
+
+class _Strict(Record):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+
+def _sorted_unique(values: tuple, name: str) -> tuple:
+    if len(set(values)) != len(values):
+        raise ValueError(f"duplicate {name}")
+    return tuple(sorted(values))
+
+
+# ---------------------------------------------------------------- build registry
+
+
+class RegistrySchema(_Strict):
+    schema_id: Visible
+    family: Visible
+    program: U32
+    version: U32
+    minor_version: U32 | None
+
+
+class RegistryLimits(_Strict):
+    literal_bytes: U32
+    path_bytes: U32
+    predicates_per_rule: U32
+    rule_set_bytes: U32
+    rules: U32
+
+
+class CapabilityRegistry(_Strict):
+    """What one Proxy build implements, as ``--capability-registry`` prints it."""
+
+    schema_version: Literal["semantic-capability-registry.v1"]
+    semantic_runtime_version: U32
+    schemas: tuple[RegistrySchema, ...] = Field(min_length=1, max_length=64)
+    directions: tuple[Direction, ...]
+    message_types: tuple[MessageType, ...]
+    target_kinds: tuple[TargetKind, ...]
+    parts: tuple[Part, ...]
+    mutation_kinds: tuple[MutationKind, ...]
+    transforms: tuple[TransformKind, ...]
+    structure_policies: tuple[Policy, ...]
+    value_sources: tuple[Source, ...]
+    predicate_ops: tuple[CompareOp, ...]
+    constraints: tuple[Visible, ...]
+    limits: RegistryLimits
+
+    @model_validator(mode="after")
+    def _canonical(self) -> CapabilityRegistry:
+        ids = tuple(s.schema_id for s in self.schemas)
+        if ids != _sorted_unique(ids, "schema_id"):
+            raise ValueError("schemas must be in schema_id order")
+        for name in (*DIMENSIONS[1:], "constraints"):
+            values = getattr(self, name)
+            if values != _sorted_unique(values, name):
+                raise ValueError(f"{name} must be sorted")
+        return self
+
+    @property
+    def schema_ids(self) -> tuple[str, ...]:
+        return tuple(s.schema_id for s in self.schemas)
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(canonical_json(self)).hexdigest()
+
+
+class BuildRegistry(_Strict):
+    """A registry bound to the Proxy binary that printed it (04 §7.2)."""
+
+    schema_version: Literal["semantic-build-registry.v1"] = \
+        "semantic-build-registry.v1"
+    proxy_sha256: Sha256
+    registry_digest: Sha256
+    registry: CapabilityRegistry
+
+    @model_validator(mode="after")
+    def _digest(self) -> BuildRegistry:
+        if self.registry.digest != self.registry_digest:
+            raise ValueError("registry_digest is not the registry's digest")
+        return self
+
+
+class RegistryError(ValueError):
+    """The Proxy refused, or printed something that is not its contract."""
+
+
+def read_build_registry(proxy: Path) -> BuildRegistry:
+    run = subprocess.run([str(proxy), "--capability-registry"],
+                         capture_output=True, timeout=60)
+    if run.returncode != 0:
+        raise RegistryError(f"--capability-registry exited {run.returncode}: "
+                            f"{run.stderr.decode(errors='replace')[:200]}")
+    registry = CapabilityRegistry.model_validate_json(run.stdout)
+    if canonical_json(registry) + b"\n" != run.stdout:
+        raise RegistryError("--capability-registry output is not canonical")
+    return BuildRegistry(proxy_sha256=hashlib.sha256(
+        Path(proxy).read_bytes()).hexdigest(),
+        registry_digest=registry.digest, registry=registry)
+
+
+# ---------------------------------------------------------------- rule description
+
+
+class RuleDescription(_Strict):
+    """One rule of an accepted NFSPRUL1 set, in the registry's vocabulary."""
+
+    rule_id: Visible
+    intent_id: Visible
+    direction: Direction
+    message_type: MessageType
+    program: U32
+    version: U32
+    procedure: U32 | None
+    family: Visible
+    nfs_version: U32 | None
+    minor_version: U32 | None
+    operation: Visible | None
+    target_kind: TargetKind
+    target_path: Visible
+    target_discriminant: bool
+    part: Part
+    kind: MutationKind
+    transform: TransformKind | None
+    structure_policy: Policy
+    value_sources: tuple[Source, ...]
+    predicate_ops: tuple[CompareOp, ...]
+
+
+class RuleSetDescription(_Strict):
+    schema_version: Literal["semantic-rule-description.v1"]
+    rule_set_id: Sha256
+    schema_id: Visible
+    semantic_runtime_version: U32
+    candidate_id: Visible
+    rules: tuple[RuleDescription, ...] = Field(min_length=1, max_length=256)
+
+
+def describe_rule_set(proxy: Path, rule_set: bytes, workdir: Path
+                      ) -> RuleSetDescription:
+    path = Path(workdir) / "described-rules.bin"
+    path.write_bytes(rule_set)
+    run = subprocess.run([str(proxy), "--describe-rules", str(path)],
+                         capture_output=True, timeout=60)
+    if run.returncode != 0:
+        raise RegistryError("the runtime refused the rule set: "
+                            + run.stdout.decode(errors="replace").strip()[:200])
+    described = RuleSetDescription.model_validate_json(run.stdout)
+    if described.rule_set_id != hashlib.sha256(rule_set).hexdigest():
+        raise RegistryError("the runtime described other bytes")
+    return described
+
+
+# ---------------------------------------------------------------- subsets
+
+
+#: Subset dimensions; each but schema_ids is a registry field of that name.
+DIMENSIONS = ("schema_ids", "directions", "message_types", "target_kinds",
+              "parts", "mutation_kinds", "transforms", "structure_policies",
+              "value_sources", "predicate_ops")
+
+
+class SemanticSubset(_Strict):
+    """A scope label and, per dimension, exactly what it lets a rule use.
+
+    ``value_sources`` and ``predicate_ops`` are sets a rule's references and
+    comparisons must stay within; the others hold one value per rule.  Empty
+    ``value_sources`` and ``predicate_ops`` admit only rules that read no
+    value and compare nothing.  Every
+    element must be exercised by guest evidence before promotion.
+    """
+
+    subset_id: SubsetId
+    description: Text
+    schema_ids: tuple[Visible, ...] = Field(min_length=1, max_length=8)
+    directions: tuple[Direction, ...] = Field(min_length=1)
+    message_types: tuple[MessageType, ...] = Field(min_length=1)
+    target_kinds: tuple[TargetKind, ...] = Field(min_length=1)
+    parts: tuple[Part, ...] = Field(min_length=1)
+    mutation_kinds: tuple[MutationKind, ...] = Field(min_length=1)
+    transforms: tuple[TransformKind, ...] = Field(min_length=1)
+    structure_policies: tuple[Policy, ...] = Field(min_length=1)
+    value_sources: tuple[Source, ...] = ()
+    predicate_ops: tuple[CompareOp, ...] = ()
+
+    @field_validator(*DIMENSIONS)
+    @classmethod
+    def _set(cls, values: tuple, info) -> tuple:
+        return _sorted_unique(values, info.field_name)
+
+
+class ValidationItem(str, enum.Enum):
+    """06 §30's guest/runtime validation contents."""
+
+    REQUEST_MUTATION = "request_mutation"
+    RESPONSE_MUTATION = "response_mutation"
+    DYNAMIC_STATE_VALUE = "dynamic_state_value"
+    BACKCHANNEL_CORRELATION = "backchannel_correlation"
+    PRESERVE_BEHAVIOR = "preserve_behavior"
+    RAW_BEHAVIOR = "raw_behavior"
+    DELTA_CRASH_SURVIVAL = "semantic_delta_crash_survival"
+    DYNAMIC_ORIGINAL_REPLAY = "dynamic_original_semantic_replay"
+
+
+def _items_of_rule(rule: RuleDescription) -> set[ValidationItem]:
+    items = set()
+    if rule.message_type == "call":
+        items.add(ValidationItem.REQUEST_MUTATION)
+        if rule.direction == "S2C":   # a server's CALL is the backchannel
+            items.add(ValidationItem.BACKCHANNEL_CORRELATION)
+    else:
+        items.add(ValidationItem.RESPONSE_MUTATION)
+    if rule.transform == "copy" or set(rule.value_sources) - {"target"}:
+        items.add(ValidationItem.DYNAMIC_STATE_VALUE)
+    items.add(ValidationItem.PRESERVE_BEHAVIOR
+              if rule.structure_policy == "preserve"
+              else ValidationItem.RAW_BEHAVIOR)
+    return items
+
+
+def required_items(subset: SemanticSubset) -> tuple[ValidationItem, ...]:
+    """Crash survival and replay always; the rest when the subset has them."""
+    items = {ValidationItem.DELTA_CRASH_SURVIVAL,
+             ValidationItem.DYNAMIC_ORIGINAL_REPLAY}
+    if "call" in subset.message_types:
+        items.add(ValidationItem.REQUEST_MUTATION)
+        if "S2C" in subset.directions:
+            items.add(ValidationItem.BACKCHANNEL_CORRELATION)
+    if "reply" in subset.message_types:
+        items.add(ValidationItem.RESPONSE_MUTATION)
+    if "copy" in subset.transforms or set(subset.value_sources) - {"target"}:
+        items.add(ValidationItem.DYNAMIC_STATE_VALUE)
+    if "preserve" in subset.structure_policies:
+        items.add(ValidationItem.PRESERVE_BEHAVIOR)
+    if "raw" in subset.structure_policies:
+        items.add(ValidationItem.RAW_BEHAVIOR)
+    return tuple(sorted(items, key=lambda i: i.value))
+
+
+def subset_problems(subset: SemanticSubset, registry: CapabilityRegistry
+                    ) -> list[str]:
+    """What the subset claims that this build does not implement."""
+    problems = []
+    for name in DIMENSIONS:
+        have = set(registry.schema_ids if name == "schema_ids"
+                   else getattr(registry, name))
+        extra = sorted(set(getattr(subset, name)) - have)
+        if extra:
+            problems.append(f"{name} not in the build registry: {extra}")
+    return problems
+
+
+def rule_problems(rule: RuleDescription, schema_id: str,
+                  subset: SemanticSubset) -> list[str]:
+    """Where a described rule leaves the subset."""
+    single = {"schema_ids": schema_id, "directions": rule.direction,
+              "message_types": rule.message_type,
+              "target_kinds": rule.target_kind, "parts": rule.part,
+              "mutation_kinds": rule.kind,
+              "structure_policies": rule.structure_policy}
+    if rule.transform is not None:
+        single["transforms"] = rule.transform
+    problems = [f"rule {rule.rule_id}: {name} {value!r} is outside the subset"
+                for name, value in single.items()
+                if value not in getattr(subset, name)]
+    for name in ("value_sources", "predicate_ops"):
+        extra = sorted(set(getattr(rule, name)) - set(getattr(subset, name)))
+        if extra:
+            problems.append(f"rule {rule.rule_id}: {name} {extra} are "
+                            "outside the subset")
+    return problems
+
+
+# ---------------------------------------------------------------- guest runs
+
+
+class GuestValidationRun(_Strict):
+    """One KVM validation of a subset: a crashed production window and its
+    replay on the same Proxy build, judged by ``semantic_replay.evaluate``."""
+
+    schema_version: Literal["semantic-guest-validation.v1"] = \
+        "semantic-guest-validation.v1"
+    subset_id: SubsetId
+    environment: Literal["kvm_guest"]
+    proxy_sha256: Sha256
+    registry_digest: Sha256
+    kernel_commit: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+    production_vm_instance_id: Visible
+    replay_vm_instance_id: Visible
+    rule_set: RuleSetDescription
+    judge_input: ReplayJudgeInput
+    replay_result: ReplayResult
+    note: Annotated[str, Field(max_length=1024)] = ""
+
+
+def _exercised(run: GuestValidationRun) -> set[str]:
+    """Rules whose batch completed forwarding on both sides of one position."""
+    found: set[str] = set()
+    for position in run.replay_result.positions:
+        if position.production is None or position.replay is None:
+            continue
+        sides = []
+        for side in (position.production, position.replay):
+            sides.append({item.rule_id
+                          for entry in side.forward_complete_multiset
+                          for item in entry.signature.items})
+        found |= sides[0] & sides[1]
+    return found
+
+
+def run_problems(run: GuestValidationRun, build: BuildRegistry,
+                 subset: SemanticSubset) -> list[str]:
+    problems = []
+    if run.subset_id != subset.subset_id:
+        problems.append("the run validates another subset")
+    if (run.proxy_sha256, run.registry_digest) != (build.proxy_sha256,
+                                                   build.registry_digest):
+        problems.append("the run used another Proxy build")
+    data, result = run.judge_input, run.replay_result
+    if evaluate(data) != result:
+        problems.append("the ReplayResult is not the judgment of its input")
+    if not data.evidence_verified:
+        problems.append("the replay evidence was not verified")
+    if (result.semantic_verdict is not ReplayVerdict.EQUIVALENT
+            or result.invalid_evidence or result.invalid_reasons):
+        problems.append("the replay is not REPLAY_EQUIVALENT")
+    described = run.rule_set
+    if ((described.rule_set_id, described.schema_id,
+         described.semantic_runtime_version) !=
+            (data.rule_set_id, data.schema_id, data.semantic_runtime_version)):
+        problems.append("the described rule set is not the replayed one")
+    if (described.semantic_runtime_version
+            != build.registry.semantic_runtime_version):
+        problems.append("the rule set targets another runtime version")
+    for rule in described.rules:
+        problems += rule_problems(rule, described.schema_id, subset)
+    # Semantic Delta crash survival: the production window ended in a guest
+    # crash and the crash-cut position's MutationDelta was read back.
+    production = [p.production for p in data.positions]
+    last = production[-1]
+    if any(p is not None and p.termination is not Termination.GUEST_CRASH
+           for p in production):
+        problems.append("the production side did not end in a guest crash")
+    if (last is None or not last.batches or last.journal_integrity
+            is JournalIntegrity.CORRUPT):
+        problems.append("the crash-cut position has no MutationDelta")
+    return problems
+
+
+# ---------------------------------------------------------------- promotion
+
+
+class PromotedSubset(_Strict):
+    subset: SemanticSubset
+    validation_items: tuple[ValidationItem, ...]
+    evidence_refs: tuple[Sha256, ...] = Field(min_length=1,
+                                              max_length=MAX_RUNS)
+
+
+class PromotedSemanticCapabilityRegistry(_Strict):
+    """The authority HCAP references for semantic mutation (04 §4)."""
+
+    schema_version: Literal["promoted-semantic-registry.v1"] = \
+        "promoted-semantic-registry.v1"
+    proxy_sha256: Sha256
+    registry_digest: Sha256
+    registry: CapabilityRegistry
+    subsets: tuple[PromotedSubset, ...] = Field(min_length=1,
+                                                max_length=MAX_SUBSETS)
+
+    @model_validator(mode="after")
+    def _shape(self) -> PromotedSemanticCapabilityRegistry:
+        if self.registry.digest != self.registry_digest:
+            raise ValueError("registry_digest is not the registry's digest")
+        ids = tuple(p.subset.subset_id for p in self.subsets)
+        if ids != _sorted_unique(ids, "subset_id"):
+            raise ValueError("subsets must be in subset_id order")
+        return self
+
+
+class PromotionRefused(ValueError):
+    def __init__(self, problems: list[str]) -> None:
+        super().__init__("; ".join(problems))
+        self.problems = problems
+
+
+def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
+            run_refs: tuple[str, ...],
+            previous: PromotedSemanticCapabilityRegistry | None = None,
+            ) -> PromotedSemanticCapabilityRegistry:
+    """Run the M7 gate for one subset; raise PromotionRefused with every
+    reason it fails.  ``previous`` keeps the subsets already promoted on the
+    same build."""
+    problems = subset_problems(subset, build.registry)
+    if previous is not None and (previous.proxy_sha256, previous.registry_digest
+                                 ) != (build.proxy_sha256,
+                                       build.registry_digest):
+        problems.append("the promoted registry belongs to another build; "
+                        "a new build is promoted afresh")
+    if not run_refs:
+        problems.append("no guest validation run")
+    if len(set(run_refs)) != len(run_refs) or len(run_refs) > MAX_RUNS:
+        problems.append("run references must be unique and at most "
+                        f"{MAX_RUNS}")
+    exercised: list[tuple[str, RuleDescription]] = []
+    passed: set[ValidationItem] = set()
+    for ref in run_refs:
+        run = load_record(store, ref, GuestValidationRun)
+        found = run_problems(run, build, subset)
+        problems += [f"run {ref[:12]}: {p}" for p in found]
+        if found:
+            continue
+        passed |= {ValidationItem.DELTA_CRASH_SURVIVAL,
+                   ValidationItem.DYNAMIC_ORIGINAL_REPLAY}
+        used = _exercised(run)
+        for rule in run.rule_set.rules:
+            if rule.rule_id in used:
+                exercised.append((run.rule_set.schema_id, rule))
+                passed |= _items_of_rule(rule)
+    covered = {name: set() for name in DIMENSIONS}
+    for schema_id, rule in exercised:
+        covered["schema_ids"].add(schema_id)
+        covered["directions"].add(rule.direction)
+        covered["message_types"].add(rule.message_type)
+        covered["target_kinds"].add(rule.target_kind)
+        covered["parts"].add(rule.part)
+        covered["mutation_kinds"].add(rule.kind)
+        covered["structure_policies"].add(rule.structure_policy)
+        if rule.transform is not None:
+            covered["transforms"].add(rule.transform)
+        covered["value_sources"] |= set(rule.value_sources)
+        covered["predicate_ops"] |= set(rule.predicate_ops)
+    for name in DIMENSIONS:
+        missing = sorted(set(getattr(subset, name)) - covered[name])
+        if missing:
+            problems.append(f"no guest evidence exercises {name} {missing}")
+    required = required_items(subset)
+    missing_items = [i.value for i in required if i not in passed]
+    if missing_items:
+        problems.append(f"validation items not covered: {missing_items}")
+    kept = {p.subset.subset_id: p for p in (previous.subsets if previous
+                                           else ())}
+    old = kept.get(subset.subset_id)
+    if old is not None and old.subset != subset:
+        problems.append(f"{subset.subset_id} is already promoted with "
+                        "another definition")
+    if problems:
+        raise PromotionRefused(problems)
+    refs = set(run_refs) | set(old.evidence_refs if old else ())
+    kept[subset.subset_id] = PromotedSubset(
+        subset=subset, validation_items=required,
+        evidence_refs=tuple(sorted(refs)))
+    return PromotedSemanticCapabilityRegistry(
+        proxy_sha256=build.proxy_sha256, registry_digest=build.registry_digest,
+        registry=build.registry,
+        subsets=tuple(kept[k] for k in sorted(kept)))
+
+
+def check_runtime(promoted: PromotedSemanticCapabilityRegistry,
+                  runtime: BuildRegistry) -> bool:
+    """04 §7.1: the running build must be the promoted one, exactly."""
+    return ((runtime.proxy_sha256, runtime.registry_digest)
+            == (promoted.proxy_sha256, promoted.registry_digest))
+
+
+# ---------------------------------------------------------------- HCAP
+
+
+def with_semantic_capability(catalog: HcapCatalog, promoted_ref: str,
+                             promoted: PromotedSemanticCapabilityRegistry, *,
+                             capability_id: str = DEFAULT_CAPABILITY_ID
+                             ) -> HcapCatalog:
+    """A new HCAP revision whose semantic mutation entry is ``promoted``.
+
+    The entry lists the promoted subset ids as its scope and references the
+    promoted registry by digest; the subsets' contents stay in that
+    authority (04 §1.1), which the Agent reads with ``lookup_semantic_scope``.
+    """
+    ids = tuple(p.subset.subset_id for p in promoted.subsets)
+    evidence = tuple(sorted({r for p in promoted.subsets
+                             for r in p.evidence_refs}))
+    entry = Capability(
+        id=capability_id, name="Promoted semantic mutation",
+        purpose=("Semantic NFS/RPC mutation of Stage 1 traffic through the "
+                 "Proxy target mode, limited to the M7-promoted subsets."),
+        usable_stage=("stage2",), usable_by=("agent_stage2",),
+        interface=CapabilityInterface(
+            runtime_features=("nfs_proxy_target_mode",)),
+        constraints=(
+            "A MutationRuleSet must fit one promoted subset; read the subsets "
+            "with lookup_semantic_scope.",
+            "A value from an earlier transaction is state_lineage: not "
+            "supported.",
+            f"Proxy build sha256 {promoted.proxy_sha256}, registry "
+            f"{promoted.registry_digest}; any other runtime is not this "
+            "capability."),
+        status="validated_subset", scope=ids, validated_scope=ids,
+        evidence_refs=evidence,
+        authority_refs=(AuthorityRef(
+            kind="PromotedSemanticCapabilityRegistry",
+            artifact_ref=promoted_ref),),
+        source_refs=("tools/nfs-proxy/README.md",
+                     "docs/design/03-nfs-proxy/06-implementation-gap-analysis.md"))
+    capabilities = tuple(c for c in catalog.capabilities
+                         if c.id != capability_id) + (entry,)
+    missing = tuple(sorted(set(catalog.missing_capability_ids)
+                           | {UNPROMOTED_GAP_ID}))
+    return HcapCatalog(capabilities=capabilities,
+                       missing_capability_ids=missing,
+                       authority_refs=catalog.authority_refs)
+
+
+def promoted_registry(store: ArtifactStore, catalog: HcapCatalog
+                      ) -> PromotedSemanticCapabilityRegistry | None:
+    """The promoted registry this HCAP revision pins, if it has one."""
+    refs = {ref.artifact_ref
+            for ref in (*catalog.authority_refs,
+                        *(r for c in catalog.capabilities
+                          for r in c.authority_refs))
+            if ref.kind == "PromotedSemanticCapabilityRegistry"}
+    if not refs:
+        return None
+    (ref,) = refs   # HcapCatalog allows one digest per authority kind
+    return load_record(store, ref, PromotedSemanticCapabilityRegistry)
+
+
+# ---------------------------------------------------------------- rule-set scope
+
+
+class ScopeCheck(_Strict):
+    subset_id: SubsetId | None
+    missing_capability_id: str | None
+    problems: tuple[str, ...] = ()
+
+
+def _intent_problems(intent, subset: SemanticSubset,
+                     registry: CapabilityRegistry) -> list[str]:
+    sel = intent.selector
+    who = f"intent {intent.intent_id}"
+    schemas = [s.schema_id for s in registry.schemas
+               if s.family == sel.protocol.family
+               and s.program == sel.rpc.program and s.version == sel.rpc.version
+               and (sel.protocol.minor_version is None
+                    or s.minor_version == sel.protocol.minor_version)]
+    problems = []
+    if not schemas or not set(schemas) <= set(subset.schema_ids):
+        problems.append(f"{who}: its ProtocolSchema is outside the subset")
+    mutation = intent.mutation
+    transform = mutation.transform
+    sources = {p.lhs.source for p in sel.predicates}
+    sources |= {p.rhs.source for p in sel.predicates
+                if getattr(p.rhs, "kind", None) == "value_ref"}
+    kind = getattr(transform, "kind", None)
+    if kind == "copy":
+        sources.add(transform.source.source)
+    single = {"directions": intent.traffic_scope.direction,
+              "message_types": sel.rpc.message_type,
+              "target_kinds": sel.target.kind, "parts": sel.target.part,
+              "mutation_kinds": mutation.kind,
+              "structure_policies": mutation.structure_policy}
+    if transform is not None:
+        single["transforms"] = kind
+    for name, value in single.items():
+        if value not in getattr(subset, name):
+            problems.append(f"{who}: {name} {value!r} is outside the subset")
+    for name, values in (("value_sources", sources),
+                         ("predicate_ops", {p.op for p in sel.predicates})):
+        extra = sorted(values - set(getattr(subset, name)))
+        if extra:
+            problems.append(f"{who}: {name} {extra} are outside the subset")
+    return problems
+
+
+def rule_set_scope(rule_set, promoted: PromotedSemanticCapabilityRegistry | None
+                   ) -> ScopeCheck:
+    """Which promoted subset a ``MutationRuleSet`` fits as a whole, for the
+    Mutation Rule Compiler (08 §12).  One compiled set has one schema and
+    one subset's evidence, so every intent must fit the same subset.  This
+    checks scope only; paths and types are the Compiler's against the
+    ProtocolSchema."""
+    if promoted is None:
+        return ScopeCheck(subset_id=None,
+                          missing_capability_id=UNPROMOTED_GAP_ID,
+                          problems=("no semantic subset is promoted",))
+    problems = []
+    for p in promoted.subsets:
+        found = [x for i in rule_set.intents
+                 for x in _intent_problems(i, p.subset, promoted.registry)]
+        if not found:
+            return ScopeCheck(subset_id=p.subset.subset_id,
+                              missing_capability_id=None)
+        problems += [f"{p.subset.subset_id}: {x}" for x in found]
+    return ScopeCheck(subset_id=None, missing_capability_id=UNPROMOTED_GAP_ID,
+                      problems=tuple(problems))
+
+
+# ---------------------------------------------------------------- operator entry
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Operator entry for M7 (``tools/nfs-proxy/README.md`` "Promotion").
+
+    registry: print the BuildRegistry of a Proxy binary (store it with --store).
+    record:   turn one KVM validation (replay plan, both journals, the
+              execprog output) into a GuestValidationRun record.
+    promote:  run the gate for a subset over recorded runs; write the
+              promoted registry and the new HCAP revision.
+    """
+    import argparse
+    import sys
+
+    from .replay_runner import (ReplayPlan, check_rule_set, judge_input,
+                                parse_execprog_barriers)
+    from .semantic_delta import SealedJournal
+    from .semantic_replay import ReplayJudgeProfile
+
+    parser = argparse.ArgumentParser(
+        prog="python -m agent_pipeline.semantic_promotion")
+    sub = parser.add_subparsers(dest="command", required=True)
+    r = sub.add_parser("registry")
+    r.add_argument("--proxy", type=Path, required=True)
+    r.add_argument("--store", type=Path)
+    c = sub.add_parser("record")
+    c.add_argument("--store", type=Path, required=True)
+    c.add_argument("--subset", type=Path, required=True)
+    c.add_argument("--proxy", type=Path, required=True,
+                   help="the guest Proxy binary both sides ran")
+    c.add_argument("--kernel-commit", required=True)
+    c.add_argument("--environment", choices=["kvm_guest"], required=True)
+    c.add_argument("--plan", type=Path, required=True)
+    c.add_argument("--journal-dir", type=Path, required=True)
+    c.add_argument("--production-vm", required=True)
+    c.add_argument("--replay-dir", type=Path, required=True)
+    c.add_argument("--replay-name", required=True)
+    c.add_argument("--replay-vm", required=True)
+    c.add_argument("--replay-lane", type=int, required=True)
+    c.add_argument("--execprog-output", type=Path, required=True)
+    ends = [t.value for t in Termination]
+    c.add_argument("--production-end", choices=ends, required=True)
+    c.add_argument("--replay-end", choices=ends, required=True)
+    c.add_argument("--note", default="")
+    p = sub.add_parser("promote")
+    p.add_argument("--store", type=Path, required=True)
+    p.add_argument("--build", required=True, help="BuildRegistry ref")
+    p.add_argument("--subset", type=Path, required=True)
+    p.add_argument("--run", action="append", required=True, dest="runs")
+    p.add_argument("--hcap", required=True, help="the HCAP revision to extend")
+    p.add_argument("--previous", help="promoted registry ref on this build")
+    p.add_argument("--capability-id", default=DEFAULT_CAPABILITY_ID)
+    args = parser.parse_args(argv)
+
+    if args.command == "registry":
+        build = read_build_registry(args.proxy)
+        if args.store is not None:
+            print(f"build={put_record(ArtifactStore(args.store), build)}")
+        print(canonical_json(build).decode())
+        return 0
+
+    store = ArtifactStore(args.store)
+    subset = SemanticSubset.model_validate_json(args.subset.read_bytes())
+    if args.command == "record":
+        build = read_build_registry(args.proxy)
+        plan = ReplayPlan.model_validate_json(args.plan.read_text())
+        workdir = args.plan.parent
+        compat = check_rule_set(args.proxy, plan.rule_set, workdir)
+        data = judge_input(
+            plan, SealedJournal(args.journal_dir, plan.production_journal),
+            SealedJournal(args.replay_dir, args.replay_name),
+            replay_vm_instance_id=args.replay_vm,
+            replay_lane_id=args.replay_lane,
+            replay_barriers=parse_execprog_barriers(
+                args.execprog_output.read_text()),
+            production_termination=Termination(args.production_end),
+            replay_termination=Termination(args.replay_end),
+            compatibility=compat, evidence_verified=True,
+            profile=ReplayJudgeProfile(name="replay-default", revision="1"))
+        run = GuestValidationRun(
+            subset_id=subset.subset_id, environment=args.environment,
+            proxy_sha256=build.proxy_sha256,
+            registry_digest=build.registry_digest,
+            kernel_commit=args.kernel_commit,
+            production_vm_instance_id=plan.window.vm_instance_id,
+            replay_vm_instance_id=args.replay_vm,
+            rule_set=describe_rule_set(args.proxy, plan.rule_set, workdir),
+            judge_input=data, replay_result=evaluate(data), note=args.note)
+        problems = run_problems(run, build, subset)
+        print(f"run={put_record(store, run)} "
+              f"verdict={run.replay_result.semantic_verdict}")
+        for problem in problems:
+            print(f"  does not count: {problem}", file=sys.stderr)
+        return 0 if not problems else 3
+
+    build = load_record(store, args.build, BuildRegistry)
+    previous = (load_record(store, args.previous,
+                            PromotedSemanticCapabilityRegistry)
+                if args.previous else None)
+    try:
+        promoted = promote(store, build, subset, tuple(args.runs), previous)
+    except PromotionRefused as refused:
+        for problem in refused.problems:
+            print(f"promotion refused: {problem}", file=sys.stderr)
+        return 3
+    promoted_ref = put_record(store, promoted)
+    catalog = load_record(store, args.hcap, HcapCatalog)
+    hcap = with_semantic_capability(catalog, promoted_ref, promoted,
+                                    capability_id=args.capability_id)
+    print(f"promoted={promoted_ref} hcap_revision={put_record(store, hcap)}")
+    return 0
+
+
+__all__ = [
+    "BuildRegistry", "CapabilityRegistry", "DEFAULT_CAPABILITY_ID",
+    "DIMENSIONS", "GuestValidationRun", "PromotedSemanticCapabilityRegistry",
+    "PromotedSubset", "PromotionRefused", "RegistryError", "RuleDescription",
+    "RuleSetDescription", "ScopeCheck", "SemanticSubset", "UNPROMOTED_GAP_ID",
+    "ValidationItem", "check_runtime", "describe_rule_set", "promote",
+    "promoted_registry", "read_build_registry", "required_items",
+    "rule_problems", "rule_set_scope", "run_problems", "subset_problems",
+    "with_semantic_capability",
+]
+
+if __name__ == "__main__":
+    raise SystemExit(main())

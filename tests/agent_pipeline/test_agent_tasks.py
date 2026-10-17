@@ -254,7 +254,7 @@ def test_invalid_structured_output_is_repaired_without_provider_access(tmp_path)
         "test-provider:requested-model"
     assert runtime.requests[0].tools.names == (
         "read_kernel_source", "search_kernel_source", "find_callers",
-        "find_callees", "lookup_hcap")
+        "find_callees", "lookup_hcap", "lookup_semantic_scope")
     assert not sink.failures
     _, _, output, actual_model = sink.results[0]
     assert isinstance(output, AnalysisOutput)
@@ -466,7 +466,7 @@ def test_tool_dispatch_rejects_unregistered_and_unconfined_access():
     tools = toolbox()
     assert set(tools.names) == {
         "read_kernel_source", "search_kernel_source", "find_callers",
-        "find_callees", "lookup_hcap"}
+        "find_callees", "lookup_hcap", "lookup_semantic_scope"}
     with pytest.raises(ToolBoundaryError, match="not registered"):
         tools.invoke("shell", {"command": "id"})
     for path in ("/etc/passwd", "../fs/nfsd/file.c", "drivers/block/x.c"):

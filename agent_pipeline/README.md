@@ -213,9 +213,13 @@ injected `MutationRuleCompiler` (`Env.compiler`, 08 §12): an Agent-fixable
 refusal is a Stage 2 repair (`compiler_rejected`, counted against
 `stage2_repair_budget`), `unsupported_capability` and
 `requires_state_lineage` wait on a `mutation_engine` gap and compile the same
-rule set again once it closes. No Compiler is implemented yet, and no
-semantic subset has passed M7 promotion, so a real run ends in a gap or in
-`blocked_operator(stage2_compiler_unavailable)`. A compiled rule set waits in
+rule set again once it closes. The Mutation Strategy Agent reads the
+promoted semantic subsets of its pinned HCAP with `lookup_semantic_scope`.
+`semantic_promotion.py` is the M7 gate that promotes them from KVM
+validation runs (`tools/nfs-proxy/README.md` "Capability registry and
+promotion"), and its `rule_set_scope` is the Compiler's scope check. No
+Compiler is implemented yet, and no semantic subset has been promoted, so a
+real run ends in a gap or in `blocked_operator(stage2_compiler_unavailable)`. A compiled rule set waits in
 `blocked_operator(stage2_gate_unavailable)` until the gate exists.
 
 Also not here yet: broader NFS resource-provenance extraction,
