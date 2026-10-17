@@ -15,6 +15,7 @@ from pathlib import Path
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.components import InMemoryIssues, InMemoryRegistry
 from agent_pipeline.contracts import (AnalysisOutput, CandidateSubmission,
+                                      CompileRejected, CompiledRuleSet,
                                       GapRef, HarnessBinding, HcapCheck,
                                       JobPolicy, JudgeVersions,
                                       LocationKind, LocationRequest,
@@ -169,6 +170,27 @@ class FakeJudge:
         return (bundle_ref, versions.judge_profile_id) not in self.missing
 
 
+class FakeCompiler:
+    """Mutation Rule Compiler: a pure function of the rule set, harness and
+    binding.  A refusal is registered per (rule set, HCAP revision), as a
+    promotion changes the HCAP revision."""
+
+    def __init__(self) -> None:
+        self.refusals: dict[tuple[str, str], CompileRejected] = {}
+        self.calls: list[tuple[str, str, str]] = []
+
+    def compile(self, rule_set_ref, harness_ref, binding):
+        self.calls.append((rule_set_ref, harness_ref, binding.hcap_revision))
+        r = self.refusals.get((rule_set_ref, binding.hcap_revision))
+        if r is not None:
+            return r
+        return CompiledRuleSet(
+            rule_set_ref=rule_set_ref,
+            compiled_ref=sha("compiled", rule_set_ref, harness_ref,
+                             binding.hcap_revision),
+            hcap_revision=binding.hcap_revision)
+
+
 class FakeRunner:
     """09 §8.  A task runs until finish(); cancel() of a task in
     `slow_cancel` does not end it until a later cancel()."""
@@ -294,6 +316,8 @@ class World:
         self.judge = FakeJudge()
         self.runner = FakeRunner()
         self.agents = FakeAgents()
+        #: None: no Mutation Rule Compiler is configured.
+        self.compiler: FakeCompiler | None = None
         self.issues = InMemoryIssues()
         self.registry = InMemoryRegistry()
         if bound:
@@ -311,7 +335,8 @@ class World:
 
     def _controller(self) -> Controller:
         env = Env(policy=self.store.policy, hcap=self.hcap,
-                  materializer=self.materializer, judge=self.judge)
+                  materializer=self.materializer, judge=self.judge,
+                  compiler=self.compiler)
         return Controller(self.store, env, self.runner, self.agents,
                           self.issues, self.registry, self.tree,
                           self.artifacts, VERSIONS,

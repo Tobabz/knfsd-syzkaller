@@ -137,7 +137,8 @@ class PolicyChanged(Record):
 
 class OperatorAction(Record):
     type: Literal["operator"] = "operator"
-    action: Literal["resume", "close", "cancel"]
+    #: start_stage2 is the 09 §4 "Stage 2 start by operator" on s1_reached.
+    action: Literal["resume", "close", "cancel", "start_stage2"]
     action_id: str
 
 

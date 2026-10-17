@@ -254,6 +254,11 @@ class Controller:
             rematerialize_authority=True,
             harness_authority_current=self._authority_current(job, binding)))
 
+    def start_stage2(self, job_id: str) -> Outcome | None:
+        """09 §4: an operator starts Stage 2 of a job in s1_reached.  Until
+        JobPolicy.run_stage2 may be true this is the only way in."""
+        return self.operator(job_id, "start_stage2")
+
     def operator(self, job_id: str, action: str) -> Outcome | None:
         return self._apply(job_id, ev.OperatorAction(
             action=action, action_id=f"op-{self.new_id()}"))
@@ -569,7 +574,10 @@ class Controller:
                 model_policy=model_policy,
                 hcap_revision=job.binding.hcap_revision,
                 analysis_ref=job.analysis_ref, plan_ref=job.plan_ref,
-                repair=p.repair))
+                repair=p.repair,
+                **(dict(stage2_input=job.stage2_basis,
+                        rule_set_ref=job.rule_set_ref)
+                   if p.agent_task is AgentTask.MUTATION_STRATEGY else {})))
             a = self.store.attempt(p.task_id, p.attempt)
             if a.status == "sending":
                 self.store.save_attempt(a.model_copy(
@@ -684,6 +692,8 @@ class Controller:
             return policy.stage1_agents.candidate_analysis
         if agent_task is AgentTask.REACHABILITY_PLANNING:
             return policy.stage1_agents.reachability_planning
+        if agent_task is AgentTask.MUTATION_STRATEGY:
+            return policy.stage2_agents.mutation_strategy
         raise LegacyTaskPolicyUnavailable(
             f"no model policy for legacy task {agent_task}")
 
