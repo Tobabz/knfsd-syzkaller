@@ -107,6 +107,31 @@ starts Stage 2 of a reached job (`operator JOB start_stage2`); a policy may
 set it true. The campaign thresholds and `fuzz_budget_executions` are
 placeholders until the repository owner sets them.
 
+## KVM preflight
+
+Before starting a real Stage 2 job, run the read-only readiness check:
+
+```sh
+python -m agent_pipeline.stage2.host preflight \
+  --stage1 stage1-state/stage1.json \
+  --collector stage1-state/collector.json \
+  --manager stage2-manager.json
+```
+
+The check does not boot a VM or change pipeline state. It verifies access to
+`/dev/kvm`, QEMU/SSH/SCP, the configured host command and its input/output
+placeholders, every pinned harness file, the three judge profiles, each
+binding's approved HCAP and promoted semantic subset, and that the Compiler
+and replay Proxy report the promoted build. When a syz-manager config is
+provided it also requires remote coverage, a crash-context window at least
+as large as `crash_window_bound`, one KVM target-mode VM, a lane script that
+matches `koov.lane_sha256`, disabled NFS local I/O and the journal channel.
+
+Warnings identify an operator-start policy, repository placeholder campaign
+thresholds, an omitted manager config, or separate Stage 1/Stage 2 resource
+keys. Any failed check exits 2; `--json` emits the versioned
+`stage2-kvm-preflight.v1` report for archiving with a run.
+
 ## First run on KVM (manual)
 
 Nothing here has run on a real VM yet; `tests/agent_pipeline/test_stage2_service.py`
