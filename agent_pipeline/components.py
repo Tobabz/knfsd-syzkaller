@@ -12,8 +12,9 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .contracts import (CompileRejected, CompiledRuleSet, HarnessBinding,
-                        HcapCheck, JudgeVersions, GapRef,
+from .contracts import (CampaignSegment, CompileRejected, CompiledRuleSet,
+                        GateRun, HarnessBinding, HcapCheck, JudgeVersions,
+                        GapRef, ReplayOutcome,
                         MaterializationHcapAuthority, MaterializeRejected,
                         Materialized, Q1Result, Sanitizer)
 
@@ -83,6 +84,36 @@ class MutationRuleCompiler(Protocol):
         Stage 1 route and lower it.  Pure, like the other components: the
         Controller calls it again on replay.  It infers nothing from prose
         and computes no live offset, original bytes or ordinal."""
+
+
+class Stage2Judge(Protocol):
+    """The Controller-side judges of Stage 2 execution evidence (01 §11.1):
+    Q1 and M1 for the gate, Q2 and M1 for a campaign segment, the replay
+    comparator.  Each reads one sealed bundle and is a pure function of
+    its arguments, like the other components; the Controller calls it
+    again on replay."""
+
+    def matches_execution(self, bundle_ref: str, *, job_id: str,
+                          task_id: str) -> bool:
+        """Does trusted host provenance bind the bundle to this Runner
+        task?  As Q1Judge.matches_execution: raise while provenance is not
+        available yet."""
+
+    def judge_gate(self, bundle_ref: str, *, plan_ref: str,
+                   candidate_id: str, compiled: CompiledRuleSet,
+                   versions: JudgeVersions) -> GateRun:
+        """01 §3: Q1 of the scenario run with the rule set installed, rule
+        and intent M1, and the ambient control flags."""
+
+    def judge_campaign(self, bundle_ref: str, *, candidate_id: str,
+                       compiled: CompiledRuleSet) -> CampaignSegment:
+        """01 §8.2 Q2 of the segment, M1 over its CrashContextWindow and
+        the reached-generation hypothesis counts (01 §3, §12)."""
+
+    def judge_replay(self, bundle_ref: str, *, crash_bundle_ref: str,
+                     compiled: CompiledRuleSet) -> ReplayOutcome:
+        """03-nfs-proxy/05 §29 over the replay of the crash bundle's
+        CrashContextWindow with the recorded rule set."""
 
 
 class HarnessRegistry(Protocol):

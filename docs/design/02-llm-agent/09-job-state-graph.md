@@ -3,9 +3,9 @@
 > 상태: draft · 최종 확인: 2026-10-13
 > 상위 설계: `01-two-stage-agent-architecture.md` §12, §14 12번
 > 선행 계약: `02`–`08`, `../03-nfs-proxy/05-mutation-delta-replay.md` §27–§29
-> 관련 구현: `agent_pipeline/` (Stage 1: §3, §5, §6, §8. Stage 2는 §4의 `s1_reached`·`s2_strategy` 행과
-> Compiler 결과 행, 그리고 Compiler(`agent_pipeline/rule_compiler.py`)까지. `s2_gate` 이후 미구현). 구현 스택은
-> `../decisions/2026-10-13-agent-implementation-stack.md`
+> 관련 구현: `agent_pipeline/` (Stage 1: §3, §5, §6, §8. Stage 2: §4 전체와 §5의 Stage 2 부분. Compiler는
+> `agent_pipeline/rule_compiler.py`. gate·campaign·replay의 Runner backend와 artifact 기반 Stage 2 Judge는 미구현).
+> 구현 스택은 `../decisions/2026-10-13-agent-implementation-stack.md`
 > 관련 게이트: Q1 / Stage 2 baseline-with-rules gate / Q2 / Replay
 
 ## 요약
@@ -244,7 +244,8 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s2_gate` | gate Q1 `INCONCLUSIVE(unsupported_attribution)` | `blocked_harness_gap(remote_kcov_attribution, remote_kcov.context.<expected_context>)` | — | `01` §3, `06` §13 |
 | `s2_gate` | Q1 `REACHED`, 평가한 rule 중 M1 `INCONCLUSIVE`가 있음 | `s2_gate` 재실행 | runtime_retry | `01` §3 |
 | `s2_gate` | Q1 `REACHED`, `targets_baseline_traffic=true`인 intent의 M1이 `NOT_APPLIED` | `s2_strategy` (repair, `gate_not_applied`) | agent_repair | `01` §3, `08` §16 |
-| `s2_gate` | 그 밖 | `s2_campaign` | — | `01` §3 |
+| `s2_gate` | 봉인 bundle이 이 task의 것이라는 host provenance가 없음 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
+| `s2_gate` | 그 밖 | `s2_campaign` (새 campaign) | — | `01` §3 |
 | `s2_campaign` | Q2 `OBSERVED`, `CrashContextWindow`에 `APPLIED` rule이 있음 | campaign 정지, `s2_replaying` | — | `01` §3, §12 |
 | `s2_campaign` | Q2 `OBSERVED`이고 window에 `APPLIED` rule이 없음, 또는 Q2 `INCONCLUSIVE` | 상태 유지. crash evidence를 보존하고 triage 항목을 만든다 | — | `01` §3, §12 |
 | `s2_campaign` | Q2 `NOT_OBSERVED`. 아래 JobPolicy 임계값과 fuzz budget에 닿지 않음 | 상태 유지. verdict를 기록하고 임계값 집계에 더한다. 실행 중인 campaign task를 계속 기다린다 | — | `01` §11.1, §12 |
@@ -252,6 +253,7 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation에서 `APPLIED`, Q2 미관측 | campaign 정지, `s2_strategy` (repair, `campaign_no_signal`) | agent_repair | `01` §12 |
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation의 M1 `INCONCLUSIVE` 반복 | campaign 정지, `blocked_operator(evidence_path)` | — | `01` §3 |
 | `s2_campaign` | fuzz budget 소진 | campaign 정지, `blocked_operator(campaign_budget_exhausted)` | — | `01` §11.1 |
+| `s2_campaign` | 봉인 bundle이 이 task의 것이라는 host provenance가 없음 | campaign 정지, `blocked_operator(campaign_evidence)` | — | `01` §11.1 |
 | `s2_campaign` | 봉인 bundle 없는 Runner 종료. 그 전에 봉인한 bundle은 위 행대로 처리한다 | `s2_campaign` (같은 rule set으로 campaign을 이어 가는 새 task) | runtime_retry | `01` §11.2 |
 | `s2_campaign` | campaign task가 마지막 bundle을 봉인하고 끝남(`sealed`). 그 bundle을 위 행대로 먼저 처리하고, campaign이 정지하지 않았을 때 | fuzz budget이 남았으면 `s2_campaign` (campaign을 이어 가는 새 task), 아니면 위의 fuzz budget 소진 행 | — | `01` §11.1 |
 | `s2_replaying` | 비교 verdict(`REPLAY_EQUIVALENT`, `REPLAY_DIVERGED`, `REPLAY_INCONCLUSIVE`, `REPLAY_INVALID`) | `crash_review`. `resume_point`는 `s2_campaign`이다. campaign의 binding(identity, `hcap_revision`)이 job의 지금 binding과 다르면 `s2_campaign`에 §5의 해당 변경 행을 적용한 지점이다 | — | `../03-nfs-proxy/05` §29, `01` §11.2 |
@@ -260,11 +262,44 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `crash_review` | close | `closed(crash_reported)` | — | `01` §13 |
 | `crash_review` | resume | `resume_point` | — | |
 
-- triage 항목은 job 상태를 바꾸지 않는 사람 검토 목록이다. job id, 봉인 bundle 참조, 그 bundle의 Q2·M1 verdict를
-  담는다.
-- campaign을 정지한 뒤 도착한 campaign evidence도 저장하고 Judge를 돌린다. 결과는 triage 항목으로만 남고 전이를
-  만들지 않는다. window에 `APPLIED` rule이 있는 crash도 그렇다. 이 crash는 `01` §12의 replay와 검토 경로에 닿지
-  않으므로 triage 항목에 그 사실을 표시한다. 이 경로를 어떻게 이을지는 미결이다(한계와 미결 사항).
+- triage 항목은 job 상태를 바꾸지 않는 사람 검토 목록이다. job에 붙어 있고(`Job.triage`), campaign id, Runner task,
+  봉인 bundle 참조, 그 bundle의 Q2 verdict(status, reason)와 M1 verdict, window에서 `APPLIED`인 rule, 늦게 왔는지,
+  그리고 `APPLIED` crash를 어디로 보냈는지(`routing`: `none`, `replayed`, `queued`, `unrouted`)를 담는다. window에
+  `APPLIED` rule이 있어 replay로 간 crash도 항목을 남긴다.
+- **gate 반복.** gate task 하나가 JobPolicy `gate_repetitions`만큼 반복하고 반복마다 bundle 하나를 봉인한다. 각
+  반복에 위 표의 `s2_gate` 행을 적용하고, 가장 위의 행(Q1 identity 불일치, `NOT_REACHED`, Q1 `INCONCLUSIVE`, M1
+  `INCONCLUSIVE`, `NOT_APPLIED`, 통과 순)을 gate 결과로 한다. 표에 없는 값이 하나라도 있으면
+  `blocked_operator(unexpected_event)`다. `sealed`인데 bundle 수가 반복 수와 다르면 `unexpected_event`다.
+- **campaign 단위와 집계.** campaign은 gate 통과로 시작하고 campaign id를 받는다. campaign task는 실행 중에 bundle을
+  여러 번 봉인하고(fuzz VM instance의 실행 구간 하나가 bundle 하나, `01` §8.2), Controller는 `status(task_id)`의
+  목록을 순서대로 한 번씩 받는다. 한 bundle의 집계는 실행한 program 수와, Stage 2 Q1이 `REACHED`인 generation을
+  hypothesis M1으로 나눈 수다: hypothesis 하나라도 `APPLIED`, 모두 `NOT_APPLIED`, 그 밖(`INCONCLUSIVE`). campaign은
+  이 수를 더한다(`CampaignTally`). 임계값 행은 다음 조건이고 위에서부터 처음 맞는 행을 적용한다. 값은 JobPolicy가
+  가진다.
+  - `campaign_not_applied`: `APPLIED` generation이 없고 `NOT_APPLIED` generation이
+    `campaign_not_applied_generations` 이상
+  - `campaign_no_signal`: window에 `APPLIED` rule이 있는 Q2 `OBSERVED`가 campaign에 없고 `APPLIED` generation이
+    `campaign_no_signal_generations` 이상
+  - `evidence_path`: `INCONCLUSIVE` generation이 `campaign_inconclusive_generations` 이상
+  - `campaign_budget_exhausted`: 실행한 program이 `fuzz_budget_executions` 이상
+  `crash_review`의 `resume`은 같은 campaign을 집계와 함께 이어 간다. `evidence_path`와 `campaign_budget_exhausted`의
+  operator `resume`은 그 행을 만든 수를 0으로 되돌린다. 되돌리지 않으면 다음 bundle이 같은 행으로 다시 멈춘다.
+  새 gate는 새 campaign이다.
+- **늦게 온 campaign evidence.** campaign을 정지한 뒤 도착한 campaign evidence(결과를 받지 않기로 한 campaign
+  task가 종료 전에 봉인한 bundle)도 받아 Judge를 돌린다. 결과는 triage 항목(`late`)으로 남고 campaign 집계와
+  counter를 바꾸지 않는다. window에 `APPLIED` rule이 있는 crash는 `01` §12대로 replay와 검토에 보내되, 사람이 정한
+  대기를 깨지 않는 경우에만 보낸다.
+  - job이 같은 campaign의 crash를 replay하거나 검토하는 중(`s2_replaying`, `crash_review`)이면 `crash_queue`에
+    넣는다(`queued`). `crash_review`의 `resume`은 queue가 비어 있지 않으면 `resume_point` 대신 queue의 첫 crash를
+    replay하고, 그 replay도 `crash_review`로 간다. `resume_point`는 그대로 넘어간다. `close`는 queue에 남은 crash를
+    triage 항목으로만 둔 채 `closed(crash_reported)`로 간다.
+  - job이 그 campaign의 `s2_campaign`에 있거나(앞 task의 cancel이 끝나기 전에 campaign을 이어 가려던 경우), 그
+    campaign이 멈추며 시작한 Mutation Strategy repair(`campaign_not_applied`, `campaign_no_signal`)를 기다리면 그
+    작업을 멈추고 `s2_replaying`으로 간다(`replayed`). `01` §12는 `APPLIED` crash에서 autonomous mutation repair를
+    멈춘다. `crash_review`의 `resume_point`는 이어 가던 campaign, 또는 같은 repair다. 그 repair는 이미 counter에 센
+    것이라 다시 세지 않는다.
+  - 그 밖(대기 상태, Stage 1, 다른 rule set의 gate, 종료된 job)이면 상태를 바꾸지 않고 triage 항목에
+    `unrouted`로 표시한다. 사람이 그 항목을 보고 정한다.
 
 ### 5. 외부 이벤트와 operator 동작
 
@@ -498,8 +533,14 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 14. **replay는 identity나 HCAP이 바뀌어도 기록된 입력으로 마친다.** replay 입력은 crash와 같은 harness identity와
     기록된 rule set이다(`../03-nfs-proxy/05` §25, §26). 새 binding으로 옮기면 비교의 전제가 깨지고, Stage 1이나
     gate로 돌리면 window에 `APPLIED` rule이 있는 crash가 사람 검토에 닿지 않는다(`01` §12). 바뀐 binding은 검토 뒤
-    campaign을 이어 갈 지점(`crash_review`의 `resume_point`)에만 쓴다. 정지 중인 campaign에서 늦게 온 crash는 아직
-    이 경로에 닿지 않는다(§4, 미결).
+    campaign을 이어 갈 지점(`crash_review`의 `resume_point`)에만 쓴다. 정지 중인 campaign에서 늦게 온 crash가 이
+    경로에 닿는 경우는 §4가 정한다.
+17. **늦게 온 `APPLIED` crash는 사람의 대기를 깨지 않는 곳에서만 replay로 보낸다.** `01` §12는 `APPLIED` crash를
+    freeze·replay·검토로 보내라고 하지만, 대기 상태는 그 상태의 동작으로만 끝난다(근거 13). 그래서 같은 campaign의
+    검토가 진행 중이면 queue에 넣어 그 검토 뒤에 replay하고, campaign이나 그 campaign이 시작한 Agent repair처럼
+    자동으로 돌던 작업은 멈추고 replay한다. 나머지는 `unrouted` triage로 사람에게 맡긴다. replay 입력은 crash의
+    identity와 기록된 rule set이라(근거 14) job이 그 뒤 어디에 있든 replay할 수는 있지만, 대기 중인 job을 옮기면
+    사람이 정할 일을 Controller가 정하게 된다.
 15. **`runtime_retry`는 재실행을 끝내는 결과에서만 0으로 돌아간다.** 판정된 `INCONCLUSIVE(loss)`와 gate의 M1
     `INCONCLUSIVE`도 유효한 verdict지만 같은 입력을 다시 실행하게 한다. 이런 결과로 counter를 되돌리면 반복되는
     관측 실패가 한도에 닿지 않는다.
@@ -523,6 +564,8 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 | 대기 중 identity 변경을 재개할 때 적용한다 | 대기 중 여러 번 바뀌어도 한 번만 계산한다 | `resume_point`가 실제로 갈 곳을 보여 주지 않는다 | 채택 안 함. 대기 중 다시 materialize하는 비용이 커지면 재검토 |
 | 재시작 때 Runner의 실행을 모두 멈추고 다시 보낸다 | Runner 계약이 단순하다 | 진행 중인 VM 시간을 버리고, 멈췄다는 확인이 여전히 필요하다 | 채택 안 함. Runner가 task 기록을 durable하게 둘 수 없으면 재검토 |
 | Runner 실행을 Controller의 자식 프로세스로 둔다 | Controller와 함께 끝나므로 중복 실행이 없다 | Controller 재시작마다 campaign이 끊기고, Runner를 다른 호스트로 옮길 수 없다 | 채택 안 함. Runner를 한 호스트에 고정하고 Controller 재시작보다 짧은 실행만 맡기게 되면 재검토 |
+| 늦게 온 `APPLIED` crash를 triage로만 남긴다 | 단순하다. 정지 뒤의 evidence가 경로를 바꾸지 않는다 | `01` §12의 replay·검토에 닿지 않는 `APPLIED` crash가 생긴다. 여러 VM이 같은 window에서 함께 crash하면 흔하다 | 채택 안 함. §4의 queue와 repair 중단 규칙을 쓴다 |
+| 늦게 온 `APPLIED` crash가 대기 상태의 job도 replay로 옮긴다 | 모든 `APPLIED` crash가 replay된다 | budget 소진이나 gap으로 멈춘 job이 사람 동작 없이 다시 실행된다(근거 13) | 채택 안 함. `unrouted` triage로 남긴다 |
 | `runtime_retry`를 유효한 verdict에서 0으로 되돌린다 | verdict가 나왔으면 관측 경로가 동작한 것으로 본다 | 판정된 `INCONCLUSIVE(loss)`나 gate의 M1 `INCONCLUSIVE`가 반복되면 한도에 닿지 않는다 | 채택 안 함. 한도가 재실행 loop를 끝내는 유일한 장치다. 재실행 사이에 관측이 나아졌는지 판정하는 규칙이 생기면 재검토 |
 
 ## 영향
@@ -627,8 +670,8 @@ bundle fixture로 대신한다.
   종류와 되돌리는 조건(§6), 기록과 재시작 규칙, Controller가 요구하는 Runner task 계약(§8).
 - **미결:** Runner task 계약의 Runner 쪽 구현. task와 cancel 기록을 어디에 durable하게 두는지, Runner가 재시작한
   뒤 어떤 실행을 이어 갈 수 있는지는 `01` §14 14번에서 정한다.
-- **미결:** 정지 중인 campaign에서 늦게 온 bundle의 crash 중 window에 `APPLIED` rule이 있는 것을 `01` §12의 replay와
-  검토 경로로 보내는 방법. 지금은 표시한 triage 항목으로만 남는다(§4). Stage 2 구현 전에 정한다.
+- **결정됨(2026-10-18, 구현 기본값. 저장소 소유자 결정 아님):** 정지 중인 campaign에서 늦게 온 `APPLIED` crash는
+  §4의 "늦게 온 campaign evidence" 규칙(queue, repair 중단, `unrouted` triage)을 따른다(근거 17).
 - **결정됨(2026-10-13, 저장소 소유자):** JobPolicy 기본값은 Stage 1 repair 한도 3회, `agent_retry` 한도 3회, `runtime_retry` 한도
   3회, 실행 전 사람 승인 불필요다.
   `run_stage2`는 Stage 2 구현 전까지 거짓만 받고, 구현 뒤 기본값을 참으로 바꾼다
@@ -636,27 +679,41 @@ bundle fixture로 대신한다.
 - **결정됨(2026-10-13, 저장소 소유자):** `agent_retry`는 요청 단위로 센다. 새 요청이 시작되면 0에서 센다.
 - **결정됨(2026-10-13, 저장소 소유자):** candidate 하나에 job 여러 개(예: sanitizer별)를 둘 수 있다. 같은
   target(commit, location)은 같은 `candidate_id`다(`02` §7).
-- **미결:** gate를 여러 번 반복할 때 반복 결과를 합치는 규칙. `01` §3은 반복 횟수만 JobPolicy에 맡겼다. 제안: 각
-  반복에 gate 표를 적용하고 가장 위의 행을 gate 결과로 한다. Stage 2 구현 전에 `01` §3에서 고정한다.
+- **결정됨(2026-10-18, 구현 기본값):** gate 반복은 각 반복에 gate 표를 적용하고 가장 위의 행을 gate 결과로 한다
+  (§4, `01` §3). 기본 반복 수는 1이다.
 - **미결:** gate Q1 `NOT_REACHED`의 자동 진단. 지금은 사람 결정(`blocked_operator(gate_regression)`)이다. 후보는 같은
   target mode에서 빈 rule set으로 gate를 다시 돌려 rule의 영향과 runtime 퇴행을 가르는 것이다. 빈 rule set으로
   target mode를 켤 수 있는지는 미검증이다.
-- **미결:** campaign evidence를 Runner가 어떤 단위로 봉인해 보내는지(`01` §14 14번). §4 campaign 행의 이벤트 단위가
-  여기에 달려 있다.
+- **결정됨(2026-10-18, Controller 쪽):** campaign evidence의 이벤트 단위는 campaign task가 실행 중에 봉인한 bundle
+  하나다(§4). bundle 하나가 무엇을 담는지(fuzz VM instance의 실행 구간)와 Runner 쪽 봉인 구현은 `01` §14 14번이
+  정한다.
+- **미결:** campaign 임계값과 fuzz budget의 기본값(`JobPolicy`의 `campaign_*_generations`, `fuzz_budget_executions`).
+  지금 값은 loop를 끝내기 위한 자리값이며 저장소 소유자 결정이 아니다.
 - **미결:** `RepairInput.findings`에 넣을 coverage 요약의 형식(예: target 파일에서 관측된 함수). 첫 Stage 1 repair
   구현에서 정한다.
-- **미결:** triage 목록의 형식과 처리 주체.
+- **결정됨(2026-10-18, 형식):** triage 항목은 job에 붙은 `TriageItem`이다(§4). **미결:** 처리 주체와, 사람이 항목을
+  닫는 동작.
 - **미결:** Stage 2 실행 전 사람 승인. 기존 계약의 approval binding은 Stage 1 review manifest뿐이다(`05` §11).
 - **구현 범위(#46):** `s1_reached`·`s2_strategy` 행과 Compiler 결과 행은 `tests/agent_pipeline/test_stage2_strategy.py`가
   가짜 model과 가짜 Compiler로 확인한다. `run_stage2`가 거짓만 받는 동안 Stage 2는 operator 동작
   `start_stage2`로 시작한다. Compiler는 `rule_compiler.ArtifactMutationRuleCompiler`이고, host 설정에 promotion된
   Proxy build(`Stage1Config.nfs_proxy`)가 없으면 rule set은 `blocked_operator(stage2_compiler_unavailable)`에서
-  기다린다. compile이 성공하면 아직 다음 단계가 없으므로 `blocked_operator(stage2_gate_unavailable)`에서 compiled
-  rule set과 함께 기다리고, `resume`은 그 rule set을 다시 compile한다. 두 reason은 gate가 들어오면 없앤다.
-  `agent_repair[stage2]`의 한도(`stage2_repair_budget`)는 Stage 1과 같은 3회로 두었다(저장소 소유자 결정 아님).
-- **미검증:** `s2_gate` 이후의 Stage 2 행(§4와 §5의 Stage 2 부분)은 구현과 대조하지 않았다. Stage 1 행과 검증 오라클 1–5의 Stage 1
-  부분은 `tests/agent_pipeline/`이 확인한다(가짜 component, LLM과 VM 없음). 실제 Runner와 Agent provider로는
-  확인하지 않았다.
+  기다린다. `agent_repair[stage2]`의 한도(`stage2_repair_budget`)는 Stage 1과 같은 3회로 두었다(저장소 소유자 결정
+  아님).
+- **구현 범위(gate 이후):** `s2_gate`, `s2_campaign`, `s2_replaying`, `crash_review` 행, §5의 Stage 2 부분(binding
+  변경, `route(to)`), §4의 반복·집계·늦은 evidence 규칙은 `tests/agent_pipeline/test_stage2_gate.py`가 가짜 Stage 2
+  Judge와 가짜 Runner로 확인한다. Judge는 `components.Stage2Judge`(Q1·M1 gate, Q2·M1 campaign, replay comparator)로
+  주입한다. 그 artifact 기반 구현과 gate·campaign·replay를 실제로 실행하는 Runner backend는 아직 없다. 그래서 Stage 2
+  backend가 설정되지 않은 host(지금의 Stage 1 service)에서는 compile한 rule set이
+  `blocked_operator(stage2_gate_unavailable)`에서 기다리고, `resume`은 그 rule set을 다시 compile한다. 이 reason과
+  `stage2_compiler_unavailable`은 host 설정 사유라 표에 넣지 않는다. 표에 없는 reason `campaign_evidence`(campaign
+  bundle의 host provenance 불일치)는 §4 표에 더했다.
+- `run_stage2`는 Stage 2 backend가 없는 동안 거짓만 받는다. 참이 되면 실행할 수 없는 Stage 2로 job이 자동으로
+  들어가기 때문이다.
+- **미구현:** gate verdict의 JudgeProfile 재판정(§5). 재평가는 Stage 1 Q1 verdict만 다시 판정한다. Stage 2 실행 전
+  사람 승인도 없다(미결 그대로).
+- **미검증:** 검증 오라클 1–5는 `tests/agent_pipeline/`이 가짜 component로 확인한다(LLM과 VM 없음). 실제 Runner와
+  Agent provider, 실제 Stage 2 evidence로는 확인하지 않았다.
 
 ## Agent 사용 지침
 

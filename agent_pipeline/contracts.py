@@ -139,6 +139,21 @@ class JobPolicy(Record):
     stage2_repair_budget: int = Field(default=3, ge=1)
     agent_retry_limit: int = Field(default=3, ge=1)
     runtime_retry_limit: int = Field(default=3, ge=1)
+    # Stage 2 execution policy (01 §3, §11.1, §12).  The values are not
+    # owner decisions; they only bound the loop until someone sets them.
+    #: Repetitions of the baseline-with-rules gate in one gate task.
+    gate_repetitions: int = Field(default=1, ge=1)
+    #: Reached generations with no hypothesis APPLIED after which the
+    #: campaign goes back to Mutation Strategy (campaign_not_applied).
+    campaign_not_applied_generations: int = Field(default=1000, ge=1)
+    #: Reached generations with a hypothesis APPLIED, and no APPLIED crash
+    #: in the campaign, after which it is refined (campaign_no_signal).
+    campaign_no_signal_generations: int = Field(default=10000, ge=1)
+    #: Reached generations whose hypothesis M1 is INCONCLUSIVE after which
+    #: the evidence path goes to an operator (evidence_path).
+    campaign_inconclusive_generations: int = Field(default=100, ge=1)
+    #: Program executions a campaign may run before an operator decides.
+    fuzz_budget_executions: int = Field(default=100000, ge=1)
 
 
 # ---------------------------------------------------------------- binding
@@ -366,3 +381,83 @@ class CompileRejected(Record):
     intent_id: str | None = None
     detail: str = ""
     missing_capability_id: str | None = None
+
+
+# ---------------------------------------------------------------- Stage 2
+# execution verdicts.  Statuses stay strings, like Q1Result.reason: a value
+# the contracts do not name reaches the Controller and routes to
+# unexpected_event (09 §2) instead of failing to parse.
+
+M1_STATUSES = frozenset({"applied", "not_applied", "inconclusive"})
+Q2_STATUSES = frozenset({"observed", "not_observed", "inconclusive"})
+REPLAY_STATUSES = frozenset({"replay_equivalent", "replay_diverged",
+                             "replay_inconclusive", "replay_invalid"})
+#: The replay bundle failed manifest or correlation checks: no comparison
+#: verdict is made from it (01 §11.1, 03-nfs-proxy/05 §29).
+REPLAY_EVIDENCE_REJECTED = "evidence_rejected"
+
+
+class RuleM1(Record):
+    """01 §7.1, one rule in one gate execution."""
+
+    rule_id: str
+    intent_id: str
+    status: str
+
+
+class IntentM1(Record):
+    """01 §7.1 intent aggregate.  ``targets_baseline_traffic`` comes from
+    the MutationRuleSet the Judge read (08 §16)."""
+
+    intent_id: str
+    status: str
+    targets_baseline_traffic: bool
+
+
+class GateRun(Record):
+    """One judged repetition of the baseline-with-rules gate (01 §3): the
+    Stage 1 scenario with the rule set installed, and its neutral run.
+
+    ``ambient`` holds the control flags (``q1_preservation_unverifiable``,
+    ``ambient_applied:<rule>``, ``ambient_control_unavailable``).  They are
+    recorded and never change the route."""
+
+    bundle_ref: str
+    q1: Q1Result
+    m1_verdict_id: str
+    rules: tuple[RuleM1, ...]
+    intents: tuple[IntentM1, ...]
+    ambient: tuple[str, ...] = ()
+
+
+class CampaignSegment(Record):
+    """One sealed campaign bundle (a fuzz VM instance's execution span),
+    judged (01 §3, §8.2, §12).
+
+    The generation counts are over generations whose Stage 2 Q1 was
+    REACHED: ``hypothesis_applied`` counts those where some hypothesis was
+    APPLIED, ``hypothesis_not_applied`` those where every hypothesis was
+    NOT_APPLIED, and ``hypothesis_inconclusive`` the rest.
+    ``crash_window_applied`` names the rules APPLIED in the
+    CrashContextWindow of an observed signal (01 §8.1)."""
+
+    bundle_ref: str
+    q2_verdict_id: str
+    q2_status: str
+    q2_reason: str | None = None
+    m1_verdict_id: str
+    crash_window_applied: tuple[str, ...] = ()
+    executions: int = Field(ge=0)
+    reached_generations: int = Field(ge=0)
+    hypothesis_applied: int = Field(ge=0)
+    hypothesis_not_applied: int = Field(ge=0)
+    hypothesis_inconclusive: int = Field(ge=0)
+
+
+class ReplayOutcome(Record):
+    """The replay comparator's verdict on a sealed replay bundle
+    (03-nfs-proxy/05 §29), or ``evidence_rejected``."""
+
+    verdict_id: str
+    status: str
+    reason: str | None = None

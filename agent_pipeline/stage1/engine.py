@@ -135,6 +135,11 @@ class CommandExecutionEngine:
 
     def _prepare(self, lease: WorkLease) -> tuple[Path, Path]:
         b = lease.binding
+        if lease.task_input.step is not None:
+            # A Stage 2 step installs a compiled rule set; running it as
+            # the Stage 1 scenario would seal evidence without the rules.
+            raise CaptureError(
+                f"stage 2 step {lease.task_input.step} is not a Stage 1 run")
         run = self.config.work_root / f"{b.task_id}.g{lease.generation}"
         inp, out = run / "input", run / "output"
         # A new lease generation always gets a new directory.  An existing

@@ -40,7 +40,8 @@ from .service import Stage1Parts, Stage1Service
 #: States where the loop has nothing to do until a person acts.
 STOP_STATES = TERMINAL | {JobState.S1_REACHED, JobState.S1_APPROVAL,
                           JobState.BLOCKED_OPERATOR,
-                          JobState.BLOCKED_HARNESS_GAP, JobState.PARKED}
+                          JobState.BLOCKED_HARNESS_GAP, JobState.PARKED,
+                          JobState.CRASH_REVIEW}
 
 
 def open_stage1(config: Stage1Config, stack: ExitStack, *,

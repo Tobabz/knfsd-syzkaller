@@ -1,7 +1,7 @@
 # agent_pipeline
 
-The Agent pipeline Controller (Stage 1, and Stage 2 up to the Mutation Rule
-Compiler), its deterministic host components, and independent M1/Q2 decision
+The Agent pipeline Controller (Stage 1 and Stage 2), its deterministic
+host components, and independent M1/Q2 decision
 kernels. The Controller owns the candidate job:
 intake, harness binding, the job state machine, and the record of every
 transition.
@@ -231,11 +231,27 @@ cannot apply, is `unsupported_capability` with the
 `semantic_mutation.unpromoted` gap id. The stored
 `CompiledMutationRuleSet` names the NFSPRUL1 bytes the Runner installs.
 Without `nfs_proxy` a rule set waits in
-`blocked_operator(stage2_compiler_unavailable)`, and a compiled rule set
-waits in `blocked_operator(stage2_gate_unavailable)` until the gate exists.
+`blocked_operator(stage2_compiler_unavailable)`.
+
+After the Compiler the Controller runs the rest of 09 §4: `s2_gate` (the
+baseline-with-rules gate, one Runner task sealing one bundle per
+`JobPolicy.gate_repetitions`; the topmost 01 §3 row of any repetition
+decides), `s2_campaign` (a Stage2Campaign whose Runner tasks seal bundles
+while they run; the Controller takes each once, in order, as a
+`runner_bundle_sealed` event, and adds it to the campaign tally the
+JobPolicy thresholds read), `s2_replaying` and `crash_review`. Stage 2
+Runner tasks carry their step and compiled rule set in `RunnerInput`; a
+Stage 1 input keeps its encoding. The judges are the injected
+`components.Stage2Judge` (`Env.stage2`). No artifact-backed Stage2Judge or
+Runner backend for the Stage 2 steps exists yet, so the wired Stage 1
+service leaves `Env.stage2` unset and a compiled rule set waits in
+`blocked_operator(stage2_gate_unavailable)`; the Stage 1 execution engine
+refuses a Stage 2 step. Campaign evidence that arrives after the campaign
+stopped becomes a triage item (`Job.triage`); 09 §4 says when its APPLIED
+crash is still replayed and reviewed.
 
 Also not here yet: broader NFS resource-provenance extraction,
-Runner-receipt integration for Q2, and the Stage 2 gate, campaign and replay Runner integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
+Runner-receipt integration for Q2, and the Stage 2 gate, campaign and replay Runner backend and artifact-backed Stage2Judge. The standalone M1 and Q2 gates use synthetic fixtures only; no
 VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
 remains false-only until the whole of Stage 2 is in. The nfs-proxy semantic runtime remains a separate component
 until its Runner and durable journal paths are wired.

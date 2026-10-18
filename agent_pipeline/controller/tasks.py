@@ -10,7 +10,10 @@ from typing import Literal, Protocol
 from ..contracts import (AgentModelPolicy, AgentTask, Record,
                          VulnerabilityCandidate)
 from ..data import canonical_json
-from .records import RepairInput, Stage2Input
+# RunnerInput lives with the job records, which store a Stage 2 task's
+# input; it stays importable from here, where the task contract is.
+from .records import (STAGE2_STEPS, RepairInput,  # noqa: F401
+                      RunnerInput, Stage2Input)
 
 #: A Runner final reason: the lease ended while the backend could not
 #: confirm its execution stopped (09 §8).  Neither a confirmed cancel nor a
@@ -24,12 +27,6 @@ class RunnerStatus(Record):
     state: Literal["unknown", "running", "sealed", "ended_unsealed"]
     reason: str | None = None
     bundles: tuple[str, ...] = ()
-
-
-class RunnerInput(Record):
-    job_id: str
-    harness_ref: str
-    execution_harness_id: str
 
 
 def runner_input_digest(task_input: RunnerInput) -> str:
