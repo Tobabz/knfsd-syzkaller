@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 18 Oct 2026 22:49:24 +0900
+Subject: [PATCH] rpcserver: distinguish campaign evidence
+
+Snapshot the machine-check completion state when each program request is sent
+and persist it with the execution evidence. This prevents setup traffic and
+late machine-check results from being counted as Stage 2 campaign work.
+---
+ pkg/rpcserver/nfs_proxy_evidence.go      |  6 +++--
+ pkg/rpcserver/nfs_proxy_evidence_test.go |  8 ++++---
+ pkg/rpcserver/rpcserver.go               | 30 +++++++++++++-----------
+ pkg/rpcserver/runner.go                  |  9 ++++++-
+ 4 files changed, 33 insertions(+), 20 deletions(-)
+
+diff --git a/pkg/rpcserver/nfs_proxy_evidence.go b/pkg/rpcserver/nfs_proxy_evidence.go
+index 4718aa9..f25aef4 100644
+--- a/pkg/rpcserver/nfs_proxy_evidence.go
++++ b/pkg/rpcserver/nfs_proxy_evidence.go
+@@ -17,7 +17,7 @@ import (
+ )
+ 
+ const (
+-	nfsProxyEvidenceSchema = "knfsd-nfs-proxy-execution.v1"
++	nfsProxyEvidenceSchema = "knfsd-nfs-proxy-execution.v2"
+ 	maxNfsProxyEvidencePCs = 1 << 20
+ )
+ 
+@@ -30,6 +30,7 @@ type nfsProxyEvidenceRecord struct {
+ 	VM                 int      `json:"vm"`
+ 	Lane               int      `json:"lane"`
+ 	ExecutionID        int64    `json:"execution_id"`
++	Campaign           bool     `json:"campaign"`
+ 	ProgramSHA256      string   `json:"program_sha256"`
+ 	Generation         uint64   `json:"generation"`
+ 	ProgramDigest      string   `json:"program_digest"`
+@@ -72,7 +73,7 @@ func newNfsProxyEvidenceWriter(directory string) (*nfsProxyEvidenceWriter, error
+ }
+ 
+ func (writer *nfsProxyEvidenceWriter) write(vm, lane int, executionID int64,
+-	program []byte, info *flatrpc.ProgInfo, hanged bool, resultError string) error {
++	campaign bool, program []byte, info *flatrpc.ProgInfo, hanged bool, resultError string) error {
+ 	if len(resultError) > 4096 {
+ 		resultError = resultError[:4096]
+ 	}
+@@ -81,6 +82,7 @@ func (writer *nfsProxyEvidenceWriter) write(vm, lane int, executionID int64,
+ 		VM:            vm,
+ 		Lane:          lane,
+ 		ExecutionID:   executionID,
++		Campaign:      campaign,
+ 		ProgramSHA256: fmt.Sprintf("%x", sha256.Sum256(program)),
+ 		Hanged:        hanged,
+ 		Error:         resultError,
+diff --git a/pkg/rpcserver/nfs_proxy_evidence_test.go b/pkg/rpcserver/nfs_proxy_evidence_test.go
+index edd23d8..5b81ff6 100644
+--- a/pkg/rpcserver/nfs_proxy_evidence_test.go
++++ b/pkg/rpcserver/nfs_proxy_evidence_test.go
+@@ -33,7 +33,7 @@ func TestNfsProxyEvidenceWriter(t *testing.T) {
+ 			LeaseCleared:       true,
+ 		},
+ 	}
+-	require.NoError(t, writer.write(4, 2, 19, []byte("getpid()\n"), info, false, ""))
++	require.NoError(t, writer.write(4, 2, 19, true, []byte("getpid()\n"), info, false, ""))
+ 
+ 	raw, err := os.ReadFile(filepath.Join(directory, "00000000000000000000.json"))
+ 	require.NoError(t, err)
+@@ -43,6 +43,7 @@ func TestNfsProxyEvidenceWriter(t *testing.T) {
+ 	require.Equal(t, 4, record.VM)
+ 	require.Equal(t, 2, record.Lane)
+ 	require.Equal(t, int64(19), record.ExecutionID)
++	require.True(t, record.Campaign)
+ 	require.Equal(t, uint64(7), record.Generation)
+ 	require.Equal(t, digest[:], mustDecodeHex(t, record.ProgramDigest))
+ 	require.Equal(t, "Acked", record.Activation)
+@@ -63,7 +64,7 @@ func TestNfsProxyEvidenceWriterRecordsUncorrelatedExecution(t *testing.T) {
+ 	directory := t.TempDir()
+ 	writer, err := newNfsProxyEvidenceWriter(directory)
+ 	require.NoError(t, err)
+-	require.NoError(t, writer.write(0, 1, 2, []byte("getuid()\n"),
++	require.NoError(t, writer.write(0, 1, 2, false, []byte("getuid()\n"),
+ 		&flatrpc.ProgInfo{}, true, "executor failed"))
+ 	raw, err := os.ReadFile(filepath.Join(directory, "00000000000000000000.json"))
+ 	require.NoError(t, err)
+@@ -72,6 +73,7 @@ func TestNfsProxyEvidenceWriterRecordsUncorrelatedExecution(t *testing.T) {
+ 	require.Zero(t, record.Generation)
+ 	require.Empty(t, record.ProgramDigest)
+ 	require.Empty(t, record.PCs)
++	require.False(t, record.Campaign)
+ 	require.True(t, record.Hanged)
+ 	require.Equal(t, "executor failed", record.Error)
+ }
+@@ -80,7 +82,7 @@ func TestNfsProxyEvidenceWriterRejectsBadCorrelation(t *testing.T) {
+ 	directory := t.TempDir()
+ 	writer, err := newNfsProxyEvidenceWriter(directory)
+ 	require.NoError(t, err)
+-	err = writer.write(0, 0, 1, nil, &flatrpc.ProgInfo{
++	err = writer.write(0, 0, 1, false, nil, &flatrpc.ProgInfo{
+ 		NfsProxy: &flatrpc.NfsProxyActivation{
+ 			Generation: 1, ProgramDigest: []byte{1},
+ 		},
+diff --git a/pkg/rpcserver/rpcserver.go b/pkg/rpcserver/rpcserver.go
+index d5ddf20..5c3d225 100644
+--- a/pkg/rpcserver/rpcserver.go
++++ b/pkg/rpcserver/rpcserver.go
+@@ -584,23 +584,25 @@ func (serv *server) printMachineCheck(checkFilesInfo []*flatrpc.FileInfo, enable
+ 
+ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo UpdateInfo) chan error {
+ 	runner := &Runner{
+-		id:            id,
+-		source:        serv.execSource,
+-		cover:         serv.cfg.Cover,
+-		coverEdges:    serv.cfg.UseCoverEdges,
+-		filterSignal:  serv.cfg.FilterSignal,
+-		debug:         serv.cfg.Debug,
+-		debugTimeouts: serv.cfg.DebugTimeouts,
+-		progTarget:    serv.target,
+-		sysTarget:     serv.sysTarget,
+-		injectExec:    injectExec,
+-		infoc:         make(chan chan []byte),
+-		requests:      make(map[int64]*queue.Request),
+-		executing:     make(map[int64]bool),
+-		hanged:        make(map[int64]bool),
++		id:               id,
++		source:           serv.execSource,
++		cover:            serv.cfg.Cover,
++		coverEdges:       serv.cfg.UseCoverEdges,
++		filterSignal:     serv.cfg.FilterSignal,
++		debug:            serv.cfg.Debug,
++		debugTimeouts:    serv.cfg.DebugTimeouts,
++		progTarget:       serv.target,
++		sysTarget:        serv.sysTarget,
++		injectExec:       injectExec,
++		infoc:            make(chan chan []byte),
++		requests:         make(map[int64]*queue.Request),
++		campaignRequests: make(map[int64]bool),
++		executing:        make(map[int64]bool),
++		hanged:           make(map[int64]bool),
+ 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
+ 		lastExec:         MakeLastExecuting(prog.MaxPids, cmp.Or(serv.cfg.LastExecuting, DefaultLastExecuting)),
+ 		nfsProxyEvidence: serv.cfg.nfsProxyEvidence,
++		campaignReady:    serv.checkDone.Load,
+ 		stats:            serv.runnerStats,
+ 		procs:            serv.cfg.Procs,
+ 		updInfo:          updInfo,
+diff --git a/pkg/rpcserver/runner.go b/pkg/rpcserver/runner.go
+index cd3f033..25dec69 100644
+--- a/pkg/rpcserver/runner.go
++++ b/pkg/rpcserver/runner.go
+@@ -41,10 +41,12 @@ type Runner struct {
+ 	canonicalizer    *cover.CanonicalizerInstance
+ 	nextRequestID    int64
+ 	requests         map[int64]*queue.Request
++	campaignRequests map[int64]bool
+ 	executing        map[int64]bool
+ 	hanged           map[int64]bool
+ 	lastExec         *LastExecuting
+ 	nfsProxyEvidence *nfsProxyEvidenceWriter
++	campaignReady    func() bool
+ 	updInfo          UpdateInfo
+ 	resultCh         chan error
+ 	lastRequestTime  time.Time
+@@ -383,6 +385,9 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
+ 		},
+ 	}
+ 	runner.requests[id] = req
++	if req.Type == flatrpc.RequestTypeProgram && runner.nfsProxyEvidence != nil {
++		runner.campaignRequests[id] = runner.campaignReady != nil && runner.campaignReady()
++	}
+ 	return flatrpc.Send(runner.conn, msg)
+ }
+ 
+@@ -444,6 +449,8 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
+ 	}
+ 	delete(runner.requests, msg.Id)
+ 	delete(runner.executing, msg.Id)
++	campaign := runner.campaignRequests[msg.Id]
++	delete(runner.campaignRequests, msg.Id)
+ 	if req.Type == flatrpc.RequestTypeProgram && msg.Info != nil {
+ 		for len(msg.Info.Calls) < len(req.Prog.Calls) {
+ 			msg.Info.Calls = append(msg.Info.Calls, &flatrpc.CallInfo{
+@@ -478,7 +485,7 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
+ 	if req.Type == flatrpc.RequestTypeProgram {
+ 		if runner.nfsProxyEvidence != nil {
+ 			if err := runner.nfsProxyEvidence.write(runner.id, int(msg.Proc), msg.Id,
+-				req.Prog.Serialize(), msg.Info, msg.Hanged, msg.Error); err != nil {
++				campaign, req.Prog.Serialize(), msg.Info, msg.Hanged, msg.Error); err != nil {
+ 				return fmt.Errorf("failed to store NFS proxy evidence: %w", err)
+ 			}
+ 		}

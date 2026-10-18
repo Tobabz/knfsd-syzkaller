@@ -40,6 +40,8 @@ class VmConfig:
     memory_mb: int = 4096
     cpus: int = 4
     boot_timeout_s: float = 300
+    #: Trusted host-only QEMU arguments, used by Stage 2 journal channels.
+    extra_args: tuple[str, ...] = ()
 
 
 class QemuGuest:
@@ -69,7 +71,8 @@ class QemuGuest:
             "-kernel", str(c.bzimage), "-append", c.cmdline,
             "-device", "e1000,netdev=net0",
             "-netdev", "user,id=net0,restrict=on,"
-                       f"hostfwd=tcp:127.0.0.1:{self.port}-:22"]
+                       f"hostfwd=tcp:127.0.0.1:{self.port}-:22",
+            *c.extra_args]
 
     def start(self) -> None:
         self.process = subprocess.Popen(

@@ -1,0 +1,489 @@
+From efa8fb28dfba1fa16b7c5a5193abd171049c29c2 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 18 Oct 2026 22:02:18 +0900
+Subject: [PATCH] rpcserver: export NFS proxy generation coverage
+
+Write one durable, atomic JSON record for each target-mode program result
+when experimental.nfs_proxy_evidence is configured. The record joins the
+executor activation correlation with canonicalized remote KCOV PCs, and
+failures stop the runner instead of silently dropping Stage 2 evidence.
+---
+ executor/executor.cc                     |   9 +-
+ pkg/mgrconfig/config.go                  |   5 +
+ pkg/rpcserver/nfs_proxy_evidence.go      | 163 +++++++++++++++++++++++
+ pkg/rpcserver/nfs_proxy_evidence_test.go |  99 ++++++++++++++
+ pkg/rpcserver/rpcserver.go               |  30 +++--
+ pkg/rpcserver/runner.go                  |  64 +++++----
+ 6 files changed, 331 insertions(+), 39 deletions(-)
+ create mode 100644 pkg/rpcserver/nfs_proxy_evidence.go
+ create mode 100644 pkg/rpcserver/nfs_proxy_evidence_test.go
+
+diff --git a/executor/executor.cc b/executor/executor.cc
+index d8c452b..75ea903 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -985,14 +985,17 @@ static uint32 request_output_size()
+ 	 * shared-memory region the manager maps, currently 14 MiB) must stay at
+ 	 * or above the result, otherwise the executor's own coverage probe fails.
+ 	 */
+-	const int kRemoteCoverCallHeadroom = 256 << 10;  /* entries, ~2 MiB of PCs */
+-	const int kMaxOutputCoverage =
++	int max_output_coverage = kMaxOutput;
++#if GOOS_linux
++	const int kRemoteCoverCallHeadroom = 256 << 10; /* entries, ~2 MiB of PCs */
++	max_output_coverage =
+ 		(kExtraCoverSize + kRemoteCoverCallHeadroom) * (int)sizeof(uint64_t);
++#endif
+ 
+ 	if (flag_comparisons)
+ 		return kMaxOutputComparisons;
+ 	if (flag_collect_cover)
+-		return kMaxOutputCoverage;
++		return max_output_coverage;
+ 	if (flag_collect_signal)
+ 		return kMaxOutputSignal;
+ 	return 0;
+diff --git a/pkg/mgrconfig/config.go b/pkg/mgrconfig/config.go
+index 00557c0..841128d 100644
+--- a/pkg/mgrconfig/config.go
++++ b/pkg/mgrconfig/config.go
+@@ -266,6 +266,11 @@ type Experimental struct {
+ 	// Programs kept per proc for the crash log, at least this many (1-64; default 6).
+ 	// knfsd-syzkaller: the bound of the NFS proxy CrashContextWindow may not exceed it.
+ 	NfsProxyWindow int `json:"nfs_proxy_window"`
++
++	// Host directory for one atomic JSON record per completed target-mode program.
++	// knfsd-syzkaller: Stage 2 uses these records to bind each NFS proxy generation
++	// to the remote KCOV PCs returned by the executor. The directory must be empty.
++	NfsProxyEvidence string `json:"nfs_proxy_evidence,omitempty"`
+ }
+ 
+ type FocusArea struct {
+diff --git a/pkg/rpcserver/nfs_proxy_evidence.go b/pkg/rpcserver/nfs_proxy_evidence.go
+new file mode 100644
+index 0000000..4718aa9
+--- /dev/null
++++ b/pkg/rpcserver/nfs_proxy_evidence.go
+@@ -0,0 +1,163 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package rpcserver
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"slices"
++	"sync"
++
++	"github.com/google/syzkaller/pkg/flatrpc"
++)
++
++const (
++	nfsProxyEvidenceSchema = "knfsd-nfs-proxy-execution.v1"
++	maxNfsProxyEvidencePCs = 1 << 20
++)
++
++// nfsProxyEvidenceRecord is the host-side join between one target-mode
++// activation barrier and the remote coverage returned with that execution.
++// It is intentionally independent of fuzzer feedback: Stage 2 consumes the
++// immutable files after syz-manager has stopped.
++type nfsProxyEvidenceRecord struct {
++	SchemaVersion      string   `json:"schema_version"`
++	VM                 int      `json:"vm"`
++	Lane               int      `json:"lane"`
++	ExecutionID        int64    `json:"execution_id"`
++	ProgramSHA256      string   `json:"program_sha256"`
++	Generation         uint64   `json:"generation"`
++	ProgramDigest      string   `json:"program_digest"`
++	Activation         string   `json:"activation"`
++	ActivationStatus   uint32   `json:"activation_status"`
++	Deactivation       string   `json:"deactivation"`
++	DeactivationStatus uint32   `json:"deactivation_status"`
++	Executed           bool     `json:"executed"`
++	LeaseCleared       bool     `json:"lease_cleared"`
++	Hanged             bool     `json:"hanged"`
++	Error              string   `json:"error"`
++	PCs                []uint64 `json:"pcs"`
++}
++
++type nfsProxyEvidenceWriter struct {
++	directory string
++	mu        sync.Mutex
++	next      uint64
++}
++
++func newNfsProxyEvidenceWriter(directory string) (*nfsProxyEvidenceWriter, error) {
++	if directory == "" {
++		return nil, nil
++	}
++	abs, err := filepath.Abs(directory)
++	if err != nil {
++		return nil, err
++	}
++	if err := os.MkdirAll(abs, 0o755); err != nil {
++		return nil, err
++	}
++	entries, err := os.ReadDir(abs)
++	if err != nil {
++		return nil, err
++	}
++	if len(entries) != 0 {
++		return nil, fmt.Errorf("directory is not empty: %v", abs)
++	}
++	return &nfsProxyEvidenceWriter{directory: abs}, nil
++}
++
++func (writer *nfsProxyEvidenceWriter) write(vm, lane int, executionID int64,
++	program []byte, info *flatrpc.ProgInfo, hanged bool, resultError string) error {
++	if len(resultError) > 4096 {
++		resultError = resultError[:4096]
++	}
++	record := nfsProxyEvidenceRecord{
++		SchemaVersion: nfsProxyEvidenceSchema,
++		VM:            vm,
++		Lane:          lane,
++		ExecutionID:   executionID,
++		ProgramSHA256: fmt.Sprintf("%x", sha256.Sum256(program)),
++		Hanged:        hanged,
++		Error:         resultError,
++		PCs:           []uint64{},
++	}
++	if info != nil {
++		if info.Extra != nil {
++			record.PCs = slices.Clone(info.Extra.Cover)
++			slices.Sort(record.PCs)
++			record.PCs = slices.Compact(record.PCs)
++			if len(record.PCs) > maxNfsProxyEvidencePCs {
++				return fmt.Errorf("remote coverage has %v PCs, limit is %v",
++					len(record.PCs), maxNfsProxyEvidencePCs)
++			}
++		}
++		if activation := info.NfsProxy; activation != nil {
++			if activation.Generation == 0 || len(activation.ProgramDigest) != sha256.Size {
++				return fmt.Errorf("invalid target-mode correlation")
++			}
++			record.Generation = activation.Generation
++			record.ProgramDigest = hex.EncodeToString(activation.ProgramDigest)
++			record.Activation = activation.Activation.String()
++			record.ActivationStatus = activation.ActivationStatus
++			record.Deactivation = activation.Deactivation.String()
++			record.DeactivationStatus = activation.DeactivationStatus
++			record.Executed = activation.Executed
++			record.LeaseCleared = activation.LeaseCleared
++		}
++	}
++	raw, err := json.Marshal(record)
++	if err != nil {
++		return err
++	}
++	raw = append(raw, '\n')
++
++	writer.mu.Lock()
++	defer writer.mu.Unlock()
++	sequence := writer.next
++	writer.next++
++	base := fmt.Sprintf("%020d", sequence)
++	temporary := filepath.Join(writer.directory, "."+base+".tmp")
++	final := filepath.Join(writer.directory, base+".json")
++	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
++	if err != nil {
++		return err
++	}
++	ok := false
++	defer func() {
++		file.Close()
++		if !ok {
++			os.Remove(temporary)
++		}
++	}()
++	if _, err := file.Write(raw); err != nil {
++		return err
++	}
++	if err := file.Sync(); err != nil {
++		return err
++	}
++	if err := file.Close(); err != nil {
++		return err
++	}
++	if err := os.Rename(temporary, final); err != nil {
++		return err
++	}
++	directory, err := os.Open(writer.directory)
++	if err != nil {
++		return err
++	}
++	err = directory.Sync()
++	closeErr := directory.Close()
++	if err != nil {
++		return err
++	}
++	if closeErr != nil {
++		return closeErr
++	}
++	ok = true
++	return nil
++}
+diff --git a/pkg/rpcserver/nfs_proxy_evidence_test.go b/pkg/rpcserver/nfs_proxy_evidence_test.go
+new file mode 100644
+index 0000000..edd23d8
+--- /dev/null
++++ b/pkg/rpcserver/nfs_proxy_evidence_test.go
+@@ -0,0 +1,99 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package rpcserver
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/google/syzkaller/pkg/flatrpc"
++	"github.com/stretchr/testify/require"
++)
++
++func TestNfsProxyEvidenceWriter(t *testing.T) {
++	directory := t.TempDir()
++	writer, err := newNfsProxyEvidenceWriter(directory)
++	require.NoError(t, err)
++	digest := sha256.Sum256([]byte("exec encoding"))
++	info := &flatrpc.ProgInfo{
++		Extra: &flatrpc.CallInfo{Cover: []uint64{9, 3, 9}},
++		NfsProxy: &flatrpc.NfsProxyActivation{
++			Generation:         7,
++			ProgramDigest:      digest[:],
++			Activation:         flatrpc.NfsProxyBarrierRawAcked,
++			ActivationStatus:   1,
++			Deactivation:       flatrpc.NfsProxyBarrierRawRefused,
++			DeactivationStatus: 2,
++			Executed:           true,
++			LeaseCleared:       true,
++		},
++	}
++	require.NoError(t, writer.write(4, 2, 19, []byte("getpid()\n"), info, false, ""))
++
++	raw, err := os.ReadFile(filepath.Join(directory, "00000000000000000000.json"))
++	require.NoError(t, err)
++	var record nfsProxyEvidenceRecord
++	require.NoError(t, json.Unmarshal(raw, &record))
++	require.Equal(t, nfsProxyEvidenceSchema, record.SchemaVersion)
++	require.Equal(t, 4, record.VM)
++	require.Equal(t, 2, record.Lane)
++	require.Equal(t, int64(19), record.ExecutionID)
++	require.Equal(t, uint64(7), record.Generation)
++	require.Equal(t, digest[:], mustDecodeHex(t, record.ProgramDigest))
++	require.Equal(t, "Acked", record.Activation)
++	require.Equal(t, "Refused", record.Deactivation)
++	require.True(t, record.Executed)
++	require.True(t, record.LeaseCleared)
++	require.Equal(t, []uint64{3, 9}, record.PCs)
++	entries, err := os.ReadDir(directory)
++	require.NoError(t, err)
++	require.Len(t, entries, 1)
++	require.Equal(t, "00000000000000000000.json", entries[0].Name())
++
++	_, err = newNfsProxyEvidenceWriter(directory)
++	require.ErrorContains(t, err, "directory is not empty")
++}
++
++func TestNfsProxyEvidenceWriterRecordsUncorrelatedExecution(t *testing.T) {
++	directory := t.TempDir()
++	writer, err := newNfsProxyEvidenceWriter(directory)
++	require.NoError(t, err)
++	require.NoError(t, writer.write(0, 1, 2, []byte("getuid()\n"),
++		&flatrpc.ProgInfo{}, true, "executor failed"))
++	raw, err := os.ReadFile(filepath.Join(directory, "00000000000000000000.json"))
++	require.NoError(t, err)
++	var record nfsProxyEvidenceRecord
++	require.NoError(t, json.Unmarshal(raw, &record))
++	require.Zero(t, record.Generation)
++	require.Empty(t, record.ProgramDigest)
++	require.Empty(t, record.PCs)
++	require.True(t, record.Hanged)
++	require.Equal(t, "executor failed", record.Error)
++}
++
++func TestNfsProxyEvidenceWriterRejectsBadCorrelation(t *testing.T) {
++	directory := t.TempDir()
++	writer, err := newNfsProxyEvidenceWriter(directory)
++	require.NoError(t, err)
++	err = writer.write(0, 0, 1, nil, &flatrpc.ProgInfo{
++		NfsProxy: &flatrpc.NfsProxyActivation{
++			Generation: 1, ProgramDigest: []byte{1},
++		},
++	}, false, "")
++	require.ErrorContains(t, err, "invalid target-mode correlation")
++	entries, readErr := os.ReadDir(directory)
++	require.NoError(t, readErr)
++	require.Empty(t, entries)
++}
++
++func mustDecodeHex(t *testing.T, value string) []byte {
++	t.Helper()
++	decoded, err := hex.DecodeString(value)
++	require.NoError(t, err)
++	return decoded
++}
+diff --git a/pkg/rpcserver/rpcserver.go b/pkg/rpcserver/rpcserver.go
+index 4f7f5ea..d5ddf20 100644
+--- a/pkg/rpcserver/rpcserver.go
++++ b/pkg/rpcserver/rpcserver.go
+@@ -74,12 +74,14 @@ type Config struct {
+ 	// Programs kept per proc for the crash log (and the NFS proxy
+ 	// CrashContextWindow, whose job-policy bound may not exceed it).
+ 	LastExecuting int
+-	Procs         int
+-	Slowdown      int
+-	ExecutorBin   string
+-	Timeouts      targets.Timeouts
+-	pcBase        uint64
+-	localModules  []*vminfo.KernelModule
++	// Atomic per-program target-mode evidence, when explicitly configured.
++	nfsProxyEvidence *nfsProxyEvidenceWriter
++	Procs            int
++	Slowdown         int
++	ExecutorBin      string
++	Timeouts         targets.Timeouts
++	pcBase           uint64
++	localModules     []*vminfo.KernelModule
+ 
+ 	// RPCServer closes the channel once the machine check has begun. Used for fault injection during testing.
+ 	machineCheckStarted chan struct{}
+@@ -189,6 +191,10 @@ func New(cfg *RemoteConfig) (Server, error) {
+ 		}
+ 		lastExecuting = max(lastExecuting, cfg.Experimental.NfsProxyWindow)
+ 	}
++	nfsProxyEvidence, err := newNfsProxyEvidenceWriter(cfg.Experimental.NfsProxyEvidence)
++	if err != nil {
++		return nil, fmt.Errorf("failed to initialize NFS proxy evidence: %w", err)
++	}
+ 	return newImpl(&Config{
+ 		Config: vminfo.Config{
+ 			Target:     cfg.Target,
+@@ -212,6 +218,7 @@ func New(cfg *RemoteConfig) (Server, error) {
+ 		PrintMachineCheck: true,
+ 		DebugTimeouts:     cfg.Debug,
+ 		LastExecuting:     lastExecuting,
++		nfsProxyEvidence:  nfsProxyEvidence,
+ 		Procs:             cfg.Procs,
+ 		Slowdown:          cfg.Timeouts.Slowdown,
+ 		ExecutorBin:       cfg.ExecutorBin,
+@@ -592,11 +599,12 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo Updat
+ 		executing:     make(map[int64]bool),
+ 		hanged:        make(map[int64]bool),
+ 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
+-		lastExec: MakeLastExecuting(prog.MaxPids, cmp.Or(serv.cfg.LastExecuting, DefaultLastExecuting)),
+-		stats:    serv.runnerStats,
+-		procs:    serv.cfg.Procs,
+-		updInfo:  updInfo,
+-		resultCh: make(chan error, 1),
++		lastExec:         MakeLastExecuting(prog.MaxPids, cmp.Or(serv.cfg.LastExecuting, DefaultLastExecuting)),
++		nfsProxyEvidence: serv.cfg.nfsProxyEvidence,
++		stats:            serv.runnerStats,
++		procs:            serv.cfg.Procs,
++		updInfo:          updInfo,
++		resultCh:         make(chan error, 1),
+ 	}
+ 	serv.mu.Lock()
+ 	defer serv.mu.Unlock()
+diff --git a/pkg/rpcserver/runner.go b/pkg/rpcserver/runner.go
+index 01f4809..cd3f033 100644
+--- a/pkg/rpcserver/runner.go
++++ b/pkg/rpcserver/runner.go
+@@ -24,29 +24,30 @@ import (
+ )
+ 
+ type Runner struct {
+-	id              int
+-	source          *queue.Distributor
+-	procs           int
+-	cover           bool
+-	coverEdges      bool
+-	filterSignal    bool
+-	debug           bool
+-	debugTimeouts   bool
+-	progTarget      *prog.Target
+-	sysTarget       *targets.Target
+-	stats           *runnerStats
+-	finished        chan bool
+-	injectExec      chan<- bool
+-	infoc           chan chan []byte
+-	canonicalizer   *cover.CanonicalizerInstance
+-	nextRequestID   int64
+-	requests        map[int64]*queue.Request
+-	executing       map[int64]bool
+-	hanged          map[int64]bool
+-	lastExec        *LastExecuting
+-	updInfo         UpdateInfo
+-	resultCh        chan error
+-	lastRequestTime time.Time
++	id               int
++	source           *queue.Distributor
++	procs            int
++	cover            bool
++	coverEdges       bool
++	filterSignal     bool
++	debug            bool
++	debugTimeouts    bool
++	progTarget       *prog.Target
++	sysTarget        *targets.Target
++	stats            *runnerStats
++	finished         chan bool
++	injectExec       chan<- bool
++	infoc            chan chan []byte
++	canonicalizer    *cover.CanonicalizerInstance
++	nextRequestID    int64
++	requests         map[int64]*queue.Request
++	executing        map[int64]bool
++	hanged           map[int64]bool
++	lastExec         *LastExecuting
++	nfsProxyEvidence *nfsProxyEvidenceWriter
++	updInfo          UpdateInfo
++	resultCh         chan error
++	lastRequestTime  time.Time
+ 
+ 	// The mutex protects all the fields below.
+ 	mu          sync.Mutex
+@@ -324,6 +325,11 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
+ 	if runner.debug {
+ 		opts.EnvFlags |= flatrpc.ExecEnvDebug
+ 	}
++	// Stage 2 needs the remote KCOV PCs of every target-mode execution, not
++	// only executions the ordinary fuzzer chooses to re-run for raw cover.
++	if req.Type == flatrpc.RequestTypeProgram && runner.nfsProxyEvidence != nil {
++		opts.ExecFlags |= flatrpc.ExecFlagCollectCover
++	}
+ 	var data []byte
+ 	switch req.Type {
+ 	case flatrpc.RequestTypeProgram:
+@@ -469,8 +475,16 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
+ 			addFallbackSignal(req.Prog, msg.Info)
+ 		}
+ 	}
+-	if req.Type == flatrpc.RequestTypeProgram && !msg.Hanged {
+-		runner.lastExec.Finished(int(msg.Id), int(msg.Proc), nfsProxyOf(msg.Info))
++	if req.Type == flatrpc.RequestTypeProgram {
++		if runner.nfsProxyEvidence != nil {
++			if err := runner.nfsProxyEvidence.write(runner.id, int(msg.Proc), msg.Id,
++				req.Prog.Serialize(), msg.Info, msg.Hanged, msg.Error); err != nil {
++				return fmt.Errorf("failed to store NFS proxy evidence: %w", err)
++			}
++		}
++		if !msg.Hanged {
++			runner.lastExec.Finished(int(msg.Id), int(msg.Proc), nfsProxyOf(msg.Info))
++		}
+ 	}
+ 	status := queue.Success
+ 	var resErr error
+-- 
+2.34.1
+

@@ -87,8 +87,11 @@ judged REPLAY_INVALID instead of retried.
 
 ```json
 "stage2": {
-  "argv": ["/opt/knfsd/bin/stage2-step", "--manager",
-           "/var/lib/knfsd/stage2/manager.json", "{input}", "{output}"],
+  "argv": ["/opt/knfsd/venv/bin/python", "-m",
+           "agent_pipeline.stage2.host", "step", "--manager",
+           "/var/lib/knfsd/stage2/manager.json", "--collector",
+           "/var/lib/knfsd/stage1/collector.json",
+           "--campaign-executions", "128", "{input}", "{output}"],
   "cwd": "/var/lib/knfsd/stage2",
   "resource_key": "host-a/kvm",
   "replay_proxy": "/opt/knfsd/bin/nfs-proxy",
@@ -102,6 +105,9 @@ judged REPLAY_INVALID instead of retried.
 Use the Stage 1 command's `resource_key` when both use the same VMs. The
 profiles are records in the CAS (`data.put_record`). `crash_window_bound`
 must not exceed syzkaller's `experimental.nfs_proxy_window`.
+The step command limits one syz-manager invocation to 128 completed programs
+by default so its generation artifacts fit the 255-artifact segment bound.
+The Controller starts further campaign tasks until policy routes the job.
 
 `JobPolicy.run_stage2` is false by default. With it false an operator
 starts Stage 2 of a reached job (`operator JOB start_stage2`); a policy may
@@ -140,24 +146,25 @@ thresholds or separate Stage 1/Stage 2 resource keys. Any failed check exits
 2; `--json` emits the versioned
 `stage2-kvm-preflight.v1` report for archiving with a run.
 
-## First run on KVM (manual)
+## Real KVM runner
 
-Nothing here has run on a real VM yet; `tests/agent_pipeline/test_stage2_service.py`
-drives the whole path with a synthetic host command. For the first KVM run:
+`python -m agent_pipeline.stage2.host step` implements the host contract.
+Gate and replay use fresh direct-QEMU guests with the approved fixture. A
+campaign creates a private syz-manager workdir and one-program seed corpus.
+Syzkaller patches 0025--0026 force and durably export remote KCOV for every
+target-mode execution and mark whether each request was sent before or after
+machine check completion. The host excludes setup traffic and turns only
+campaign records into generation coverage.
+Run the complete service path as follows:
 
 1. Bring a job to `s1_reached` with the Stage 1 service (its README).
 2. Build the promoted Proxy and set `nfs_proxy` (the compiler) and
    `stage2.replay_proxy` to it.
 3. Store the three judge profiles and put their digests in `stage2`.
    `q2.default_q2_profile()` is the reference Q2 profile.
-4. Write the step command against the contract above. Gate: boot the
-   harness guest with `rules.nfsprul1` installed, run `program.syz` and
-   `neutral.syz` with `syz-execprog`, collect remote KCOV as Stage 1 does,
-   and copy the lane's host journal segments. Campaign: run syz-manager with
-   the rules, and per fuzz VM instance span write a segment with the Q2
-   collector's facts and, on a crash, its crash log. Replay: boot a fresh
-   VM, install `replay/rules.bin`, run `replay/programs.log` with
-   `syz-execprog -procs=1 -repeat=1` into a new journal.
+4. Configure the `step` argv above. The base manager config remains immutable;
+   the command copies it per lease and replaces only workdir, lane template,
+   journal sockets and `experimental.nfs_proxy_evidence` with private paths.
 5. `python -m agent_pipeline.stage1 --config stage1.json operator JOB start_stage2`,
    then `run --job JOB`. It stops in `crash_review`, `blocked_operator` or
    `parked`; `status --job JOB` shows the gate runs, campaign tally, triage

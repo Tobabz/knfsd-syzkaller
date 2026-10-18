@@ -1,11 +1,11 @@
-"""Read-only readiness checks for a real Stage 2 KVM deployment.
+"""Readiness checks and the real host entry point for Stage 2 KVM.
 
 The Stage 2 engine deliberately treats its host command as trusted
-configuration.  This module checks that configuration and its immutable
-authority before an operator starts a job; it does not boot a guest, run a
-candidate or write pipeline state.
+configuration.  Preflight checks that configuration and its immutable
+authority without booting a guest or writing pipeline state.  The ``step``
+subcommand is the configured host command and does run QEMU/syz-manager.
 
-Run it with::
+Run the read-only check with::
 
     python -m agent_pipeline.stage2.host preflight
         --stage1 stage1.json --manager manager.json
@@ -603,7 +603,7 @@ def _print(report: PreflightReport) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m agent_pipeline.stage2.host",
-        description="Read-only checks for a Stage 2 KVM deployment")
+        description="Stage 2 KVM readiness checks and host step runner")
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("preflight")
     check.add_argument("--stage1", type=Path, required=True)
@@ -611,7 +611,24 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--manager", type=Path, required=True)
     check.add_argument("--kvm", type=Path, default=Path("/dev/kvm"))
     check.add_argument("--json", action="store_true")
+    step = sub.add_parser("step")
+    step.add_argument("--manager", type=Path, required=True)
+    step.add_argument("--collector", type=Path, required=True)
+    step.add_argument("--campaign-executions", type=int, default=128)
+    step.add_argument("--campaign-timeout", type=float, default=1800)
+    step.add_argument("--manager-stop-timeout", type=float, default=45)
+    step.add_argument("input", type=Path)
+    step.add_argument("output", type=Path)
     args = parser.parse_args(argv)
+    if args.command == "step":
+        from .kvm import StepOptions, run_step
+        run_step(StepOptions(
+            manager=args.manager, collector=args.collector,
+            campaign_executions=args.campaign_executions,
+            campaign_timeout_s=args.campaign_timeout,
+            manager_stop_timeout_s=args.manager_stop_timeout),
+            args.input, args.output)
+        return 0
     report = preflight(args.stage1, collector_path=args.collector,
                        manager_path=args.manager, kvm_path=args.kvm)
     if args.json:
