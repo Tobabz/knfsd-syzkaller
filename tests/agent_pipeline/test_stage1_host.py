@@ -178,6 +178,8 @@ def host(tmp_path):
     bin_dir.mkdir(parents=True)
     (bin_dir / "syz-executor").write_bytes(b"synthetic executor")
     (bin_dir / "syz-execprog").write_bytes(b"synthetic execprog")
+    (env / "syzkaller" / "bin" / "syz-manager").write_bytes(
+        b"synthetic manager")
     _write_syz_record(env)
     (tmp_path / "artifacts").mkdir()
     (tmp_path / "artifacts" / "id_rsa").write_text("synthetic key\n")
@@ -329,14 +331,14 @@ def test_generate_pins_files_and_writes_consistent_configs(host):
     assert d.kernel_commit == host.kernel_commit
     assert [a.name for a in d.build_artifacts] == [
         "bzimage", "instrumentation", "kernel", "lane-script",
-        "syz-execprog", "syz-executor", "vm-image"]
+        "syz-execprog", "syz-executor", "syz-manager", "vm-image"]
     assert "nokaslr" in d.guest_kernel_command_line.split()
     collector = CollectorConfig.load(result.collector_config)
     assert config.engine.argv[-2:] == ("{input}", "{output}")
     assert Path(config.engine.argv[0]).is_absolute()
     assert set(collector.files) == {"bzimage", "kernel", "vm-image",
                                     "lane-script", "syz-executor",
-                                    "syz-execprog"}
+                                    "syz-execprog", "syz-manager"}
     from agent_pipeline.hcap import ArtifactHcapChecker
     checker = ArtifactHcapChecker(store)
     assert checker.judge_versions(result.hcap_revision) == \

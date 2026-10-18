@@ -65,7 +65,7 @@ never mutated.
  executor/common_linux.h               |  48 +-
  executor/executor.cc                  | 420 ++++++++++++++++-
  executor/executor_runner.h            |  14 +
- executor/nfs_proxy_activation.h       | 641 ++++++++++++++++++++++++++
+ executor/nfs_proxy_activation.h       | 649 ++++++++++++++++++++++++++
  executor/nfs_proxy_activation_test.go | 237 ++++++++++
  executor/test.h                       | 433 +++++++++++++++++
  pkg/flatrpc/flatrpc.fbs               |  32 ++
@@ -74,7 +74,7 @@ never mutated.
  pkg/flatrpc/helpers.go                |   6 +
  pkg/flatrpc/nfs_proxy_test.go         |  48 ++
  tools/syz-execprog/execprog.go        |  16 +
- 13 files changed, 2472 insertions(+), 24 deletions(-)
+ 13 files changed, 2480 insertions(+), 24 deletions(-)
  create mode 100644 executor/nfs_proxy_activation.h
  create mode 100644 executor/nfs_proxy_activation_test.go
  create mode 100644 pkg/flatrpc/nfs_proxy_test.go
@@ -576,10 +576,10 @@ index 9a6895f01..d8c452b75 100644
 +	nfsp_broker_start(&nfsp_broker_state, sv[0], input_data,
 +			  std::min<uint64>(request_prog_size, kMaxInput));
 +	nfsp_broker_kcov_done = false;
-+	// The fork server kills a program that completes no syscall for
-+	// syscall_timeout_ms * 20 (loop() in common.h).  A barrier waits on the
-+	// host journal, so bound it well below that.
-+	nfsp_endpoint.timeout_ms = syscall_timeout_ms * 10;
++	// loop() always gives a program 3/5 of its timeout before applying the
++	// inactivity watchdog.  Give the durable host-journal barrier 2/5, leaving
++	// a full fifth of the program budget before that watchdog can fire.
++	nfsp_endpoint.timeout_ms = nfsp_act_timeout_ms(program_timeout_ms);
 +}
 +
 +// Program process, right after fork(): join the program cgroup and keep only
@@ -803,10 +803,10 @@ index 231c9b87e..c4733a940 100644
  		msg_.reset();
 diff --git a/executor/nfs_proxy_activation.h b/executor/nfs_proxy_activation.h
 new file mode 100644
-index 000000000..1b17f7166
+index 000000000..9f58928a1
 --- /dev/null
 +++ b/executor/nfs_proxy_activation.h
-@@ -0,0 +1,641 @@
+@@ -0,0 +1,649 @@
 +// Copyright 2026 syzkaller project authors. All rights reserved.
 +// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 +
@@ -1021,6 +1021,14 @@ index 000000000..1b17f7166
 +	struct timespec ts;
 +	clock_gettime(CLOCK_MONOTONIC, &ts);
 +	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
++}
++
++// The fork-server watchdog leaves the first 3/5 of a program's timeout free
++// of inactivity checks.  A host-durable barrier gets 2/5 of that same scaled
++// budget, which is 2 seconds for syzkaller's default 5-second program timeout.
++static uint64_t nfsp_act_timeout_ms(uint64_t program_timeout_ms)
++{
++	return program_timeout_ms * 2 / 5;
 +}
 +
 +// Send one request and wait up to timeout_ms for its answer.

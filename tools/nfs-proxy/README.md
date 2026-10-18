@@ -230,11 +230,12 @@ format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.
   claiming a resolved REPLY. Other missing replies block normal closure and require an explicit
   `reply_unresolved` or `aborted` forced-closure reason, which freezes the unresolved count.
 - Generation snapshots are sorted by id and retain barrier, admission, reply and closure facts
-  for future `GENERATION_COMPLETE` input. Defaults are 256 generation ids retained for the
-  session, 16 simultaneous draining generations and 64 pending CALL-account tickets;
-  configuration may lower these or raise either lifetime ids or pending tickets to 4096, with
-  `max_draining <= max_generations`. Exhaustion refuses the operation rather than recycling a
-  generation or ticket id.
+  until target mode receives the durable `GENERATION_COMPLETE` ACK. It then retires the closed
+  detail while keeping a monotonic high-watermark, so stale generation ids still cannot reopen.
+  Defaults allow 256 simultaneously resident generation slots, 16 simultaneous draining
+  generations and 64 pending CALL-account tickets; configuration may lower these or raise either
+  resident generations or pending tickets to 4096, with `max_draining <= max_generations`.
+  Exhaustion refuses the operation rather than recycling a live generation or ticket id.
 - On its own the test gate satisfies none of the durability requirements. Target mode (next
   section) replaces it with the host sink and connects these components to `main`/`proxy`.
 
@@ -279,10 +280,11 @@ Run the same command again after a restart: it resumes the recovered session (an
 retransmitted event without storing it twice), and refuses to start if the binding, lane or rule
 set differ.
 
-`--fsync` makes every stored entry durable before the sink answers. An activation ACK then waits
-on that fsync, and the executor gives a barrier only `syscall_timeout_ms * 10`. On the #45 KVM run a
-slow fsync made the generation 186 open ACK miss that bound: the lane was quarantined and the VM
-restarted. Leave `--fsync` off for fuzzing unless the host's storage answers well inside the bound.
+`--fsync` makes every stored entry durable before the sink answers. An activation ACK therefore
+waits on that fsync. The executor reserves 2/5 of the scaled program timeout for each barrier
+(2 seconds with syzkaller's default 5-second program timeout), below the fork-server watchdog's
+initial 3/5 grace period. If storage does not answer inside that bound, the executor aborts the
+uncertain generation and the Proxy quarantines the session so the VM recreates the lane.
 
 `tests/agent_pipeline/test_journal_live.py` runs the built Proxy (with ASan when the compiler has
 it) against this sink on loopback; `tools/nfs-proxy/build.sh` covers `test_journal` and the relay
@@ -352,9 +354,11 @@ it as `nfs proxy barrier: ...`.
 Each Proxy start uses a new session `PREFIX.<random UUID>`, where `PREFIX` is
 `TARGET/laneN.session`. The host sink is started for that series (`--session-prefix`). It installs
 each new session, with the binding fixed on its command line, when that session's `RULESET`
-arrives, and ends the series' earlier session (`superseded`). A Proxy session has 256 generation
-slots; a full session is treated like a quarantine, and the restarted VM continues in a fresh
-session.
+arrives, and ends the series' earlier session (`superseded`). A Proxy session has 256 resident
+generation slots. A closed slot is reclaimed only after the host durably ACKs its
+`GENERATION_COMPLETE`; the monotonic retired-id watermark still rejects stale activation. If all
+slots are concurrently occupied, the executor treats the capacity refusal like quarantine and
+the restarted VM continues in a fresh session.
 
 To boot a target-mode lane (KVM host, by hand):
 

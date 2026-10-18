@@ -221,6 +221,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         "syz-executor",
         "syz-execprog": env / "syzkaller" / "bin" / "linux_amd64" /
         "syz-execprog",
+        "syz-manager": env / "syzkaller" / "bin" / "syz-manager",
     }
     builds: list[HarnessBuildArtifact] = []
     for name, path in sorted(files.items()):

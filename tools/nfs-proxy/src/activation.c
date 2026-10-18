@@ -484,6 +484,8 @@ nfsp_activation_activate(struct nfsp_activation *a, const char *rule_set_id,
 			return NFSP_ACTIVATION_CALL_ACCOUNT_PENDING;
 		return NFSP_ACTIVATION_GENERATION_REUSED;
 	}
+	if (generation <= a->retired_generation_high_water)
+		return NFSP_ACTIVATION_GENERATION_REUSED;
 	if (a->barrier_index >= 0)
 		return NFSP_ACTIVATION_BARRIER_IN_PROGRESS;
 	if (a->admitting_index >= 0)
@@ -520,6 +522,8 @@ nfsp_activation_deactivate(struct nfsp_activation *a,
 	if (result != NFSP_ACTIVATION_OK)
 		return result;
 	index = find_generation(a, generation);
+	if (index < 0 && generation <= a->retired_generation_high_water)
+		return NFSP_ACTIVATION_IDEMPOTENT;
 	if (index < 0)
 		return NFSP_ACTIVATION_UNKNOWN_GENERATION;
 	g = &a->generations[index];
@@ -790,7 +794,11 @@ nfsp_activation_account_reply(struct nfsp_activation *a, uint64_t generation,
 		return NFSP_ACTIVATION_INVALID_ARGUMENT;
 	index = find_generation(a, generation);
 	if (index < 0)
-		return account_outside_reply(a, 0, 1, 0);
+		return account_outside_reply(a,
+			generation != 0 &&
+			generation <= a->retired_generation_high_water,
+			generation == 0 ||
+			generation > a->retired_generation_high_water, 0);
 	g = &a->generations[index];
 	if (g->state == NFSP_GENERATION_CLOSED)
 		return account_outside_reply(a, 1, 0, 0);
@@ -840,6 +848,8 @@ nfsp_activation_close_if_drained(struct nfsp_activation *a,
 	if (!a || !a->generations || generation == 0)
 		return NFSP_ACTIVATION_INVALID_ARGUMENT;
 	index = find_generation(a, generation);
+	if (index < 0 && generation <= a->retired_generation_high_water)
+		return NFSP_ACTIVATION_IDEMPOTENT;
 	if (index < 0)
 		return NFSP_ACTIVATION_UNKNOWN_GENERATION;
 	if (a->generations[index].state == NFSP_GENERATION_CLOSED)
@@ -861,6 +871,8 @@ nfsp_activation_force_close(struct nfsp_activation *a, uint64_t generation,
 	     reason != NFSP_FORCE_ABORTED))
 		return NFSP_ACTIVATION_INVALID_ARGUMENT;
 	index = find_generation(a, generation);
+	if (index < 0 && generation <= a->retired_generation_high_water)
+		return NFSP_ACTIVATION_IDEMPOTENT;
 	if (index < 0)
 		return NFSP_ACTIVATION_UNKNOWN_GENERATION;
 	g = &a->generations[index];
@@ -888,6 +900,52 @@ nfsp_activation_force_close(struct nfsp_activation *a, uint64_t generation,
 	if (pending_calls != 0)
 		cancel_call_accounts(a, index);
 	close_generation(a, index, closure_reason, pending_calls);
+	return NFSP_ACTIVATION_OK;
+}
+
+enum nfsp_activation_result
+nfsp_activation_retire_generation(struct nfsp_activation *a,
+				  uint64_t generation)
+{
+	struct nfsp_activation_generation *g;
+	int32_t index;
+	uint32_t i;
+
+	if (!a || !a->generations || !a->call_accounts || generation == 0)
+		return NFSP_ACTIVATION_INVALID_ARGUMENT;
+	index = find_generation(a, generation);
+	if (index < 0) {
+		return generation <= a->retired_generation_high_water ?
+			NFSP_ACTIVATION_IDEMPOTENT :
+			NFSP_ACTIVATION_UNKNOWN_GENERATION;
+	}
+	g = &a->generations[index];
+	if (g->state != NFSP_GENERATION_CLOSED ||
+	    g->pending_call_accounts != 0 || a->admitting_index == index ||
+	    a->barrier_index == index)
+		return NFSP_ACTIVATION_CLOSURE_NOT_READY;
+	/* A CLOSED slot must not hide an issued CALL-account ticket.  Refuse to
+	 * reclaim on an inconsistent state rather than turning a later account
+	 * operation into an unrelated-generation lookup. */
+	for (i = 0; i < a->cfg.max_pending_calls; i++) {
+		if (a->call_accounts[i].used &&
+		    a->call_accounts[i].generation == generation)
+			return NFSP_ACTIVATION_CLOSURE_NOT_READY;
+	}
+	if (generation > a->retired_generation_high_water)
+		a->retired_generation_high_water = generation;
+	if ((uint32_t)index + 1u < a->generation_count) {
+		memmove(&a->generations[index], &a->generations[index + 1],
+			((size_t)a->generation_count - (size_t)index - 1u) *
+				sizeof(*a->generations));
+	}
+	a->generation_count--;
+	memset(&a->generations[a->generation_count], 0,
+	       sizeof(*a->generations));
+	if (a->admitting_index > index)
+		a->admitting_index--;
+	if (a->barrier_index > index)
+		a->barrier_index--;
 	return NFSP_ACTIVATION_OK;
 }
 

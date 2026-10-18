@@ -87,7 +87,8 @@ judged REPLAY_INVALID instead of retried.
 
 ```json
 "stage2": {
-  "argv": ["/opt/knfsd/bin/stage2-step", "{input}", "{output}"],
+  "argv": ["/opt/knfsd/bin/stage2-step", "--manager",
+           "/var/lib/knfsd/stage2/manager.json", "{input}", "{output}"],
   "cwd": "/var/lib/knfsd/stage2",
   "resource_key": "host-a/kvm",
   "replay_proxy": "/opt/knfsd/bin/nfs-proxy",
@@ -106,6 +107,38 @@ must not exceed syzkaller's `experimental.nfs_proxy_window`.
 starts Stage 2 of a reached job (`operator JOB start_stage2`); a policy may
 set it true. The campaign thresholds and `fuzz_budget_executions` are
 placeholders until the repository owner sets them.
+
+## KVM preflight
+
+Before starting a real Stage 2 job, run the read-only readiness check:
+
+```sh
+python -m agent_pipeline.stage2.host preflight \
+  --stage1 stage1-state/stage1.json \
+  --collector stage1-state/collector.json \
+  --manager stage2-manager.json
+```
+
+The check does not boot a VM or change pipeline state. It verifies access to
+`/dev/kvm`, QEMU/SSH/SCP, the configured host command and its input/output
+placeholders, every pinned harness file, the three judge profiles, each
+binding's approved HCAP and promoted semantic subset, and that the Compiler
+and replay Proxy report the promoted build. The required syz-manager config
+must be an explicit Stage 2 command argument. Its kernel, image, lane script
+and syzkaller binaries must match the approved harness pins; its SSH key and
+QEMU must match the collector. It also requires remote coverage, program
+snapshot mode disabled, a crash-context window at least as large as
+`crash_window_bound`, one KVM target-mode VM, the exact approved base kernel
+command line plus bounded `koov.*` fixture arguments, and one journal channel
+per active proc. The report records the manager config's SHA-256. Regenerate
+older Stage 1 harness configs so their descriptor also pins `syz-manager`; a
+Stage 2 preflight intentionally rejects descriptors that pin only the
+executor binaries.
+
+Warnings identify an operator-start policy, repository placeholder campaign
+thresholds or separate Stage 1/Stage 2 resource keys. Any failed check exits
+2; `--json` emits the versioned
+`stage2-kvm-preflight.v1` report for archiving with a run.
 
 ## First run on KVM (manual)
 
