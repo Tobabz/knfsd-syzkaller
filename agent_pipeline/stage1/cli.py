@@ -30,6 +30,7 @@ from ..materializer import (ArtifactHarnessMaterializer, ExecutionHarnessApprova
                             StaticExecutionHarnessAuthority)
 from ..q1 import TargetPcMapping
 from ..registry import ArtifactHarnessRegistry
+from ..rule_compiler import ArtifactMutationRuleCompiler
 from ..runner.process_supervisor import ProcessLimits, ProcessSupervisor
 from .authority import DescriptorKernelIdentity
 from .config import Stage1Config
@@ -84,7 +85,10 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         policies=config.policies, sealer_id=config.sealer_id,
         worker_id=config.worker_id,
         lease_duration_ns=int(config.lease_duration_s * 1e9),
-        agent_workers=config.agent_workers, run_agents=run_agents)
+        agent_workers=config.agent_workers, run_agents=run_agents,
+        compiler=None if config.nfs_proxy is None else
+        ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
+                                     state / "compile"))
     return stack.enter_context(Stage1Service(parts))
 
 

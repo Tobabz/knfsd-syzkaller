@@ -217,14 +217,25 @@ rule set again once it closes. The Mutation Strategy Agent reads the
 promoted semantic subsets of its pinned HCAP with `lookup_semantic_scope`.
 `semantic_promotion.py` is the M7 gate that promotes them from KVM
 validation runs (`tools/nfs-proxy/README.md` "Capability registry and
-promotion"), and its `rule_set_scope` is the Compiler's scope check. No
-Compiler is implemented yet, and no semantic subset has been promoted, so a
-real run ends in a gap or in `blocked_operator(stage2_compiler_unavailable)`. A compiled rule set waits in
-`blocked_operator(stage2_gate_unavailable)` until the gate exists.
+promotion"), and its `rule_set_scope` is the Compiler's scope check.
+
+`rule_compiler.py` is the Mutation Rule Compiler (08 §12 "구현"). It reads
+the HCAP revision's promoted registry, requires the configured Proxy binary
+(`Stage1Config.nfs_proxy`) to be the promoted build, binds each intent to a
+route the Stage 1 harness opens and to the harness's ProtocolSchema
+(`protocol_schema.py` resolves paths the way `src/schema.c` does), and
+lowers it to an NFSPRUL1 rule that the Proxy's own loader
+(`nfs-proxy --check-rules`) must accept. Its refusals are the 08 §12
+reasons; a rule set outside every promoted subset, or anything the runtime
+cannot apply, is `unsupported_capability` with the
+`semantic_mutation.unpromoted` gap id. The stored
+`CompiledMutationRuleSet` names the NFSPRUL1 bytes the Runner installs.
+Without `nfs_proxy` a rule set waits in
+`blocked_operator(stage2_compiler_unavailable)`, and a compiled rule set
+waits in `blocked_operator(stage2_gate_unavailable)` until the gate exists.
 
 Also not here yet: broader NFS resource-provenance extraction,
-Runner-receipt integration for Q2, the Mutation Rule Compiler, and the
-Stage 2 gate, campaign and replay Runner integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
+Runner-receipt integration for Q2, and the Stage 2 gate, campaign and replay Runner integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
 VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
 remains false-only until the whole of Stage 2 is in. The nfs-proxy semantic runtime remains a separate component
 until its Runner and durable journal paths are wired.

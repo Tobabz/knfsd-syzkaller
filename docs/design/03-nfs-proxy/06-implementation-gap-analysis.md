@@ -1101,7 +1101,8 @@ Harness Capability Specification을 갱신한다(§21).
 
 남은 것: subset마다 KVM에서 production crash window와 replay를 실행하고 `semantic_promotion record`/`promote`로
 promotion하는 일(사람이 한다, `tools/nfs-proxy/README.md` "Capability registry and promotion"). Mutation Rule
-Compiler가 `rule_set_scope`를 쓰는 통합은 Compiler와 함께 한다.
+Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
+한 subset에 맞는지 확인한다(`../02-llm-agent/08-mutation-rule-set.md` §12 "구현").
 
 ### 31. Compatibility / cutover strategy
 

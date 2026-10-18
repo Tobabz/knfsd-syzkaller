@@ -376,6 +376,31 @@ Compiler는 live field offset, current original bytes, runtime XID 또는 Nth-me
 정의한다. 전체 Proxy 경계는
 [`../03-nfs-proxy/01-architecture.md`](../03-nfs-proxy/01-architecture.md)가 소유한다.
 
+### 구현
+
+`agent_pipeline/rule_compiler.py`의 `ArtifactMutationRuleCompiler`가 `components.MutationRuleCompiler`를 구현한다.
+한 rule set에 대해 다음 순서로 일한다.
+
+1. `binding.hcap_revision`의 promoted semantic registry(HCAP-10)를 읽는다. 없으면 `unsupported_capability`
+   (`semantic_mutation.unpromoted`)다.
+2. 받은 Proxy binary가 promotion된 build와 정확히 같아야 한다(`04` §7.1). 다르거나, schema가 없거나, runtime이
+   Compiler가 쓴 형식을 거부하면 `CompilerUnavailable`을 던진다. rule set을 고쳐서 풀리는 문제가 아니다.
+3. intent마다 bind한다. `traffic_scope`는 Stage 1 harness가 여는 lane profile(`syz_open_nfs_lane_profile$<client>_<backend>_v<N>`)
+   중 하나여야 하고, backend는 `knfsd`=0·`ganesha`=1, client는 `client0`=0·`client1`=1로 낮춘다. ProtocolSchema는
+   harness NFS version의 schema다. enum 이름은 비교·기록 대상 node의 enum 안에서 wire word로 바꾼다(같은 word를
+   가진 다른 enum 이름은 `type_mismatch`). context dependency는 `../03-nfs-proxy/04` §35대로 유도한다. path 해석은
+   `agent_pipeline/protocol_schema.py`가 normalizer 출력으로 `src/schema.c`와 같은 규칙을 따른다.
+4. intent마다 낮춘 rule 하나를 `nfs-proxy --check-rules`로 runtime loader에 넣는다. 거부 status는 위 사유로 바꾼다
+   (`ambiguous_path` → `unknown_path`, `part_unavailable`·`mutation_invalid` → `type_mismatch`). intent 순서에서
+   첫 Agent 수정 가능 거부가 답이고, 없으면 첫 `unsupported_capability`가 답이다.
+5. `semantic_promotion.rule_set_scope`로 set 전체가 promoted subset 하나에 맞는지 본다. 안 맞으면
+   `unsupported_capability`(`semantic_mutation.unpromoted`)다.
+6. set 전체를 한 번 더 loader에 넣고, NFSPRUL1 bytes와 `CompiledMutationRuleSet`(rule별 `rule_id`·`intent_id`,
+   subset, build, schema)을 저장한다. `CompiledRuleSet.compiled_ref`가 그 record다.
+
+intent 하나는 rule 하나가 된다(OR가 없어 alternative가 생기지 않는다). `rule_id`는 intent 순서의 `r000`, `r001`, ...이다.
+`requires_state_lineage`는 지금 vocabulary에서 생기지 않는다. 이전 transaction을 읽는 ValueRef source가 없기 때문이다.
+
 ## 13. wire record capture의 위치
 
 Raw wire capture는 Compiler의 mandatory input이 아니다.

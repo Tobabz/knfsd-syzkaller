@@ -75,6 +75,8 @@ typed MutationIntent in the Proxy semantic vocabulary: ProtocolSchema
 operation and path names, content predicates, never an ordinal ("the second
 OPEN"), byte offset, recorded bytes, raw packet or command. State
 message_type, structure_policy and targets_baseline_traffic explicitly.
+traffic_scope names a route the Stage 1 harness opens: backend knfsd or
+ganesha, client client0 or client1, as its lane profiles show.
 Group intents that only trigger together into a hypothesis. Prose belongs
 only in expected_effect and uncertainties. Agent Stage 2 may use only
 semantic mutation capability the pinned HCAP lists as promoted: call
