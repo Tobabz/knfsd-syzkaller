@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..artifacts import ArtifactStore, validate_digest
-from ..contracts import JudgeVersions, Q1Result
+from ..contracts import JudgeVersions, Q1Result, VulnerabilityCandidate
 from ..controller.records import Job, TaskKind
 from ..controller.store import Store
 from ..data import load_record, put_record
@@ -57,8 +57,7 @@ class PublishedQ1Judge:
         return self.snapshot.has_required_evidence(bundle_ref, versions)
 
 
-def _target(job: Job) -> CandidateTarget:
-    candidate = job.candidate
+def candidate_target(candidate: VulnerabilityCandidate) -> CandidateTarget:
     return CandidateTarget(candidate_id=candidate.candidate_id,
                            kernel_commit=candidate.kernel_commit,
                            **candidate.location.model_dump(mode="json"))
@@ -170,8 +169,9 @@ class Q1AuthorityPublisher:
         published = False
         for job in list(self.store.jobs()):
             p = job.pending_task
-            if p is None or p.kind is not TaskKind.RUNNER:
-                continue
+            if p is None or p.kind is not TaskKind.RUNNER or \
+                    p.runner_input is not None:
+                continue            # Stage 2 has its own authority
             completion = self.runner.receipt(p.task_id)
             if completion is None or completion.final_state != "sealed":
                 continue
@@ -231,7 +231,7 @@ class Q1AuthorityPublisher:
             raise Q1AuthorityPending(
                 "no host kernel identity: the descriptor must boot with "
                 "nokaslr and name the vmlinux and instrumentation artifacts")
-        mapping_ref = self.mappings.lookup(_target(dispatched), identity)
+        mapping_ref = self.mappings.lookup(candidate_target(dispatched.candidate), identity)
         if mapping_ref is None:
             raise Q1AuthorityPending("no verified target mapping is registered")
         record = load_record(self.artifacts, harness.harness_ref,

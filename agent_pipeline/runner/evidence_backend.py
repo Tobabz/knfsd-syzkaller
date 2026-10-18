@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator, Literal, Protocol
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
 from ..artifacts import validate_digest
 from ..controller.tasks import RunnerInput, runner_input_digest
@@ -106,6 +106,17 @@ class RunnerEvidenceReceipt(HostRecord):
     collection: CollectionMetadata
     sealing: SealingMetadata
     artifacts: tuple[ReceiptInventory, ...] = Field(min_length=1, max_length=256)
+    #: A Stage 2 lease's full task input (step, compiled rule set, ...).
+    #: Left out of the encoding when unset, so a Stage 1 receipt keeps its
+    #: bytes; its input is then the harness alone.
+    stage2_input: RunnerInput | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_stage1(self, handler):
+        data = handler(self)
+        if data.get("stage2_input") is None:
+            data.pop("stage2_input", None)
+        return data
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -124,10 +135,17 @@ class RunnerEvidenceReceipt(HostRecord):
             or self.correlation.execution_harness_id != self.execution_harness_id
         ):
             raise ValueError("receipt identity conflicts with correlation")
-        task_input = RunnerInput(
+        task_input = self.stage2_input or RunnerInput(
             job_id=self.job_id,
             harness_ref=self.harness_ref,
             execution_harness_id=self.execution_harness_id)
+        if self.stage2_input is not None and (
+                self.stage2_input.step is None
+                or self.stage2_input.job_id != self.job_id
+                or self.stage2_input.harness_ref != self.harness_ref
+                or self.stage2_input.execution_harness_id
+                != self.execution_harness_id):
+            raise ValueError("Stage 2 input conflicts with receipt identity")
         if self.task_input_sha256 != runner_input_digest(task_input):
             raise ValueError("receipt task input digest conflicts with identity")
         identities = tuple(artifact.identity for artifact in self.artifacts)
@@ -326,6 +344,14 @@ class EvidenceSealingBackend:
             if self._stopped(control):
                 return self._unsealed(LEASE_LOST_DURING_CAPTURE)
             return self._unsealed(CAPTURE_FAILED)
+        return self.seal(lease, control, raw_capture)
+
+    def seal(
+        self, lease: WorkLease, control: LeaseControl, raw_capture: object
+    ) -> BackendResult:
+        """Validate one capture of ``lease``, seal it, verify the stored
+        bytes and persist its receipt.  The bundle is not yet the task's:
+        the caller completes the lease with it, or adds it to the task."""
         try:
             capture = ExecutionCapture.model_validate(raw_capture)
             active_lease = WorkLease.model_validate(control.lease)
@@ -432,6 +458,8 @@ class EvidenceSealingBackend:
             return self._unsealed(LEASE_LOST_DURING_CAPTURE)
 
         receipt = RunnerEvidenceReceipt(
+            stage2_input=lease.task_input
+            if lease.task_input.step is not None else None,
             bundle_ref=bundle_ref,
             manifest_sha256=bundle_ref,
             task_input_sha256=runner_input_digest(lease.task_input),
@@ -461,3 +489,109 @@ class EvidenceSealingBackend:
         if self._stopped(control):
             return self._unsealed(LEASE_LOST_DURING_CAPTURE)
         return BackendResult(bundle_ref=bundle_ref)
+
+
+class StreamingExecutionEngine(Protocol):
+    def run(
+        self, lease: WorkLease, control: LeaseControl,
+        emit: Callable[[ExecutionCapture], None],
+    ) -> None:
+        """Execute once and pass each finished capture to ``emit``, in
+        order, while the execution runs.  ``emit`` raises when a capture
+        cannot be sealed; the engine then stops and lets it propagate.
+        Raise to end the execution without further captures."""
+
+
+class CaptureRefused(Exception):
+    """A streamed capture could not be sealed; ``reason`` is the unsealed
+    reason the lease ends with."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class BundleSink(Protocol):
+    def append_bundle(self, lease: WorkLease, bundle_ref: str) -> object: ...
+
+
+class StreamingSealingBackend(EvidenceSealingBackend):
+    """Seal every capture of one execution as its own bundle, as it comes.
+
+    Each sealed bundle is added to the task (``DurableRunner.append_bundle``)
+    before the next capture is taken, so the Controller can consume it
+    while the execution still runs.  The lease completes with the last
+    bundle; if the execution fails after some captures, it ends unsealed
+    and the bundles already added stay the task's (09 §8)."""
+
+    def __init__(
+        self,
+        engine: StreamingExecutionEngine,
+        evidence: EvidenceStore,
+        receipts: EvidenceReceiptSink,
+        bundles: BundleSink,
+        *,
+        sealer_id: str,
+        clock: Callable[[], int] = time.time_ns,
+    ) -> None:
+        super().__init__(engine, evidence, receipts, sealer_id=sealer_id,
+                         clock=clock)
+        self.bundles = bundles
+
+    def execute(
+        self, lease: WorkLease, control: LeaseControl
+    ) -> BackendResult:
+        try:
+            lease = WorkLease.model_validate(lease)
+            active_lease = WorkLease.model_validate(control.lease)
+        except (TypeError, ValueError, AttributeError):
+            return self._unsealed(INVALID_LEASE_BINDING)
+        if not self._same_lease(lease, active_lease) or not self._binding_is_exact(lease):
+            return self._unsealed(INVALID_LEASE_BINDING)
+        if self._stopped(control):
+            return self._unsealed(LEASE_LOST_DURING_CAPTURE)
+        sealed: list[str] = []
+
+        def emit(capture: ExecutionCapture) -> None:
+            result = self.seal(lease, control, capture)
+            if result.bundle_ref is None:
+                raise CaptureRefused(result.reason)
+            self.bundles.append_bundle(control.lease, result.bundle_ref)
+            sealed.append(result.bundle_ref)
+
+        try:
+            self.engine.run(lease, control, emit)
+        except ExecutionNotStopped:
+            raise
+        except CaptureRefused as exc:
+            return self._unsealed(exc.reason)
+        except Exception:
+            if self._stopped(control):
+                return self._unsealed(LEASE_LOST_DURING_CAPTURE)
+            return self._unsealed(CAPTURE_FAILED)
+        if not sealed:
+            return self._unsealed(CAPTURE_FAILED)
+        return BackendResult(bundle_ref=sealed[-1])
+
+
+STAGE2_BACKEND_UNAVAILABLE = "stage2_backend_unavailable"
+
+
+class StepRoutingBackend:
+    """Run a Stage 1 lease on ``stage1`` and a Stage 2 one (its input
+    names a step) on ``stage2``.  Without a Stage 2 backend such a lease
+    ends unsealed; the Controller does not dispatch one then (09 §4)."""
+
+    def __init__(self, stage1: EvidenceSealingBackend,
+                 stage2: StreamingSealingBackend | None) -> None:
+        self.stage1 = stage1
+        self.stage2 = stage2
+
+    def execute(self, lease: WorkLease, control: LeaseControl
+                ) -> BackendResult:
+        step = getattr(getattr(lease, "task_input", None), "step", None)
+        if step is None:
+            return self.stage1.execute(lease, control)
+        if self.stage2 is None:
+            return BackendResult(reason=STAGE2_BACKEND_UNAVAILABLE)
+        return self.stage2.execute(lease, control)

@@ -142,5 +142,6 @@ completion is checkable:
 ## Not here yet
 
 The service runs on one host with one Runner worker and one resource key.
-Measured KASLR relocation (the collector requires `nokaslr`), external
-issue filing and Stage 2 remain separate work.
+Measured KASLR relocation (the collector requires `nokaslr`) and external
+issue filing remain separate work. Stage 2 runs in the same service when
+`stage2` is configured; see `agent_pipeline/stage2/README.md`.

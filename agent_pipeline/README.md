@@ -242,16 +242,20 @@ while they run; the Controller takes each once, in order, as a
 JobPolicy thresholds read), `s2_replaying` and `crash_review`. Stage 2
 Runner tasks carry their step and compiled rule set in `RunnerInput`; a
 Stage 1 input keeps its encoding. The judges are the injected
-`components.Stage2Judge` (`Env.stage2`). No artifact-backed Stage2Judge or
-Runner backend for the Stage 2 steps exists yet, so the wired Stage 1
-service leaves `Env.stage2` unset and a compiled rule set waits in
-`blocked_operator(stage2_gate_unavailable)`; the Stage 1 execution engine
-refuses a Stage 2 step. Campaign evidence that arrives after the campaign
+`components.Stage2Judge` (`Env.stage2`). `agent_pipeline/stage2` is the
+backend (see its README): a host command per gate, campaign or replay
+lease whose segments are sealed as bundles while it runs, append-only
+host authority for each bundle, and `ArtifactStage2Judge` over the
+existing Q1, M1, Q2 and replay kernels. The wired service uses it when
+`Stage1Config.stage2` is set; otherwise `Env.stage2` stays unset and a
+compiled rule set waits in `blocked_operator(stage2_gate_unavailable)`. Campaign evidence that arrives after the campaign
 stopped becomes a triage item (`Job.triage`); 09 §4 says when its APPLIED
 crash is still replayed and reviewed.
 
 Also not here yet: broader NFS resource-provenance extraction,
-Runner-receipt integration for Q2, and the Stage 2 gate, campaign and replay Runner backend and artifact-backed Stage2Judge. The standalone M1 and Q2 gates use synthetic fixtures only; no
-VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
-remains false-only until the whole of Stage 2 is in. The nfs-proxy semantic runtime remains a separate component
+and a Stage 2 run on a real VM: the Stage 2 backend is tested end to end
+with a synthetic host command only. The standalone M1 and Q2 gates use
+synthetic fixtures only; no VM/LLM run or end-to-end runtime validation is
+claimed. `JobPolicy.run_stage2` is false by default (a policy may opt in)
+until a KVM run and the owner's campaign thresholds are in. The nfs-proxy semantic runtime remains a separate component
 until its Runner and durable journal paths are wired.

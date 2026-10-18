@@ -226,6 +226,15 @@ class RunnerQ1ReceiptBridge:
         if not mapping.verified:
             raise Q1AuthorityPending("target mapping is not verified")
 
+    def check_materialization(self, context: Q1HostContext) -> None:
+        """The descriptor, plan, harness and mapping checks of ``publish``
+        alone.  A Stage 2 gate repetition runs the Stage 1 harness under a
+        streamed lease, so it has no Stage 1 completion to publish, but its
+        Q1 authority must hold the same way."""
+        raw = canonical_json(context)
+        _require(len(raw) <= MAX_RECORD_BYTES, "host context exceeds size limit")
+        self._check_materialization(Q1HostContext.model_validate_json(raw))
+
     def _prepare(self, context: Q1HostContext) -> Q1ReceiptPublication:
         # JSON round-trip revalidates even nested model_copy/model_construct values.
         raw = canonical_json(context)
