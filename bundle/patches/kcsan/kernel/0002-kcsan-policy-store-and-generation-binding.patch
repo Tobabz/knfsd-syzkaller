@@ -16,8 +16,8 @@ Subject: [PATCH 2/2] kcsan: register candidate policies and bind them to
  kernel/kcsan/debugfs.c       |  64 +++++++
  kernel/kcsan/kcsan.h         |   9 +-
  kernel/kcsan/policy.c        | 316 +++++++++++++++++++++++++++++++++++
- kernel/kcsan/policy.h        |  86 ++++++++++
- 12 files changed, 741 insertions(+), 19 deletions(-)
+ kernel/kcsan/policy.h        |  87 ++++++++++
+ 12 files changed, 742 insertions(+), 19 deletions(-)
  create mode 100644 include/linux/kcsan_policy.h
  create mode 100644 kernel/kcsan/policy.c
  create mode 100644 kernel/kcsan/policy.h
@@ -443,7 +443,7 @@ index 824f30c93..6f8da88e8 100644
  KCSAN_INSTRUMENT_BARRIERS_selftest.o := y
  obj-$(CONFIG_KCSAN_SELFTEST) += selftest.o
 diff --git a/kernel/kcsan/core.c b/kernel/kcsan/core.c
-index 338a177d4..8074d6a54 100644
+index 338a177d4..28847724d 100644
 --- a/kernel/kcsan/core.c
 +++ b/kernel/kcsan/core.c
 @@ -25,11 +25,13 @@
@@ -548,7 +548,7 @@ index 338a177d4..8074d6a54 100644
 -	unsigned int delay = in_task() ? kcsan_udelay_task : kcsan_udelay_interrupt;
 +	unsigned int delay = in_task() ?
 +		(decision ? decision->task_delay_us : kcsan_udelay_task) :
-+		kcsan_udelay_interrupt;
++		(decision ? decision->interrupt_delay_us : kcsan_udelay_interrupt);
  	/* For certain access types, skew the random delay to be longer. */
  	unsigned int skew_delay_order =
  		(type & (KCSAN_ACCESS_COMPOUND | KCSAN_ACCESS_ASSERT)) ? 1 : 0;
@@ -1091,7 +1091,7 @@ new file mode 100644
 index 000000000..b17144a3a
 --- /dev/null
 +++ b/kernel/kcsan/policy.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,87 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _KERNEL_KCSAN_POLICY_H
 +#define _KERNEL_KCSAN_POLICY_H
@@ -1140,6 +1140,7 @@ index 000000000..b17144a3a
 +struct kcsan_policy_decision {
 +	u8 weight;
 +	u32 task_delay_us;
++	u32 interrupt_delay_us;
 +	bool matched;
 +	bool weighted;
 +	struct kcsan_policy_rule *rule;
