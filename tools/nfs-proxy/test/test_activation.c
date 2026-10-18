@@ -819,6 +819,149 @@ static void test_connection_close_accounting(void)
 	nfsp_activation_free(&activation);
 }
 
+static void test_durable_retirement_reuses_bounded_slots(void)
+{
+	struct nfsp_activation activation;
+	struct gate_script gate;
+	struct nfsp_activation_generation_snapshot generation;
+	struct nfsp_activation_snapshot s;
+	size_t count = 0;
+	uint64_t id;
+
+	script_init(&gate, NFSP_ACTIVATION_GATE_ACCEPTED);
+	init_activation(&activation, &gate, 2, 1);
+	install(&activation);
+	CHECK(nfsp_activation_activate(&activation, "rules-A", 1, NULL) ==
+	      NFSP_ACTIVATION_OK, "retirement fixture activates G1");
+	CHECK(nfsp_activation_retire_generation(&activation, 1) ==
+	      NFSP_ACTIVATION_CLOSURE_NOT_READY,
+	      "an admitting generation cannot be retired early");
+	CHECK(nfsp_activation_deactivate(&activation, "rules-A", 1, NULL) ==
+	      NFSP_ACTIVATION_OK, "G1 closes before durable retirement");
+	s = snapshot(&activation, &generation, 1, &count);
+	CHECK(count == 1 && s.closed_generation_count == 1 &&
+	      generation.state == NFSP_GENERATION_CLOSED,
+	      "closed detail remains resident before owner retirement");
+	CHECK(nfsp_activation_retire_generation(&activation, 1) ==
+	      NFSP_ACTIVATION_OK, "durable owner retires closed G1");
+	s = snapshot(&activation, NULL, 0, &count);
+	CHECK(count == 0 && s.generation_count == 0 &&
+	      s.state == NFSP_ACTIVATION_INACTIVE,
+	      "retirement releases the bounded generation slot");
+	CHECK(nfsp_activation_retire_generation(&activation, 1) ==
+	      NFSP_ACTIVATION_IDEMPOTENT,
+	      "duplicate durable retirement is idempotent");
+	CHECK(nfsp_activation_activate(&activation, "rules-A", 1, NULL) ==
+	      NFSP_ACTIVATION_GENERATION_REUSED,
+	      "retired generation cannot reopen after its tombstone is compacted");
+	CHECK(nfsp_activation_deactivate(&activation, "rules-A", 1, NULL) ==
+	      NFSP_ACTIVATION_IDEMPOTENT &&
+	      nfsp_activation_force_close(&activation, 1,
+					  NFSP_FORCE_ABORTED) ==
+		NFSP_ACTIVATION_IDEMPOTENT,
+	      "late release operations recognize a durably retired generation");
+	CHECK(nfsp_activation_account_reply(&activation, 1,
+					    NFSP_ACTIVATION_REPLY_RESOLVED) ==
+	      NFSP_ACTIVATION_OUTSIDE_WINDOW,
+	      "a reply after durable retirement remains fail-closed");
+	s = snapshot(&activation, NULL, 0, &count);
+	CHECK(s.stats.late_after_close == 1 &&
+	      s.stats.unknown_generation_replies == 0,
+	      "retired reply is still classified as late-after-close");
+
+	/* The production default used to stop at generation 257.  Exercise more
+	 * than twice that lifetime with only two resident slots. */
+	for (id = 2; id <= 600; id++) {
+		CHECK(nfsp_activation_activate(&activation, "rules-A", id, NULL) ==
+		      NFSP_ACTIVATION_OK, "activate generation %llu",
+		      (unsigned long long)id);
+		CHECK(nfsp_activation_retire_generation(&activation, id) ==
+		      NFSP_ACTIVATION_CLOSURE_NOT_READY,
+		      "generation %llu cannot retire before closure",
+		      (unsigned long long)id);
+		CHECK(nfsp_activation_deactivate(&activation, "rules-A", id,
+						 NULL) == NFSP_ACTIVATION_OK,
+		      "deactivate generation %llu", (unsigned long long)id);
+		CHECK(nfsp_activation_retire_generation(&activation, id) ==
+		      NFSP_ACTIVATION_OK, "retire generation %llu",
+		      (unsigned long long)id);
+	}
+	s = snapshot(&activation, NULL, 0, &count);
+	CHECK(count == 0 && s.generation_count == 0 && !s.quarantined,
+	      "599 retired generations leave no resident slot or quarantine");
+	CHECK(nfsp_activation_activate(&activation, "rules-A", 599, NULL) ==
+	      NFSP_ACTIVATION_GENERATION_REUSED,
+	      "watermark rejects a compacted stale generation");
+	CHECK(nfsp_activation_activate(&activation, "rules-A", 601, NULL) ==
+	      NFSP_ACTIVATION_OK &&
+	      nfsp_activation_deactivate(&activation, "rules-A", 601, NULL) ==
+		NFSP_ACTIVATION_OK &&
+	      nfsp_activation_retire_generation(&activation, 601) ==
+		NFSP_ACTIVATION_OK,
+	      "new monotonic generation still progresses after long retirement");
+	nfsp_activation_free(&activation);
+}
+
+static void test_retirement_compacts_live_indices(void)
+{
+	struct nfsp_activation activation;
+	struct gate_script gate;
+	struct nfsp_activation_barrier open;
+	struct nfsp_activation_call_ticket ticket;
+	struct nfsp_activation_snapshot s;
+	uint64_t generation = 0;
+	size_t count = 0;
+
+	script_init(&gate, NFSP_ACTIVATION_GATE_ACCEPTED);
+	/* G10 OPEN/DRAIN, G15 OPEN/DRAIN, then a pending G20 OPEN. */
+	for (unsigned i = 0; i < 4; i++)
+		script_add(&gate, NFSP_ACTIVATION_GATE_ACCEPTED);
+	script_add(&gate, NFSP_ACTIVATION_GATE_PENDING);
+	init_activation(&activation, &gate, 4, 2);
+	install(&activation);
+	CHECK(nfsp_activation_activate(&activation, "rules-A", 10, NULL) ==
+	      NFSP_ACTIVATION_OK &&
+	      nfsp_activation_deactivate(&activation, "rules-A", 10, NULL) ==
+		NFSP_ACTIVATION_OK &&
+	      nfsp_activation_activate(&activation, "rules-A", 15, NULL) ==
+		NFSP_ACTIVATION_OK &&
+	      nfsp_activation_deactivate(&activation, "rules-A", 15, NULL) ==
+		NFSP_ACTIVATION_OK,
+	      "two closed slots precede the live-index fixtures");
+	CHECK(nfsp_activation_activate(&activation, "rules-A", 20, &open) ==
+	      NFSP_ACTIVATION_BARRIER_PENDING && open.id != 0,
+	      "G20 OPEN waits in the third slot");
+	CHECK(nfsp_activation_retire_generation(&activation, 10) ==
+	      NFSP_ACTIVATION_OK,
+	      "retiring a lower slot compacts a pending barrier");
+	CHECK(nfsp_activation_barrier_complete(&activation, open.id,
+					       NFSP_ACTIVATION_GATE_ACCEPTED) ==
+	      NFSP_ACTIVATION_OK,
+	      "compacted barrier index still completes the exact G20 OPEN");
+	CHECK(nfsp_activation_call_generation(&activation, &generation, &ticket) ==
+	      NFSP_ACTIVATION_OK && generation == 20,
+	      "compacted admitting index still issues a G20 ticket");
+	CHECK(nfsp_activation_deactivate(&activation, "rules-A", 20, NULL) ==
+	      NFSP_ACTIVATION_CALL_ACCOUNT_PENDING,
+	      "G20 enters CALL accounting with its ticket outstanding");
+	CHECK(nfsp_activation_retire_generation(&activation, 15) ==
+	      NFSP_ACTIVATION_OK,
+	      "retiring another lower slot preserves CALL-account state");
+	CHECK(nfsp_activation_account_call(&activation, &ticket,
+					   NFSP_ACTIVATION_CALL_NOT_INSERTED) ==
+	      NFSP_ACTIVATION_OK &&
+	      nfsp_activation_deactivate(&activation, "rules-A", 20, NULL) ==
+		NFSP_ACTIVATION_OK,
+	      "compacted CALL ticket resolves and G20 drains normally");
+	CHECK(nfsp_activation_retire_generation(&activation, 20) ==
+	      NFSP_ACTIVATION_OK, "G20 retires after closure");
+	s = snapshot(&activation, NULL, 0, &count);
+	CHECK(count == 0 && s.pending_barrier.id == 0 &&
+	      s.pending_call_account_count == 0 && !s.quarantined,
+	      "compaction leaves barrier and CALL-account invariants clear");
+	nfsp_activation_free(&activation);
+}
+
 static void test_capacity_and_snapshot_preflight(void)
 {
 	struct nfsp_activation activation;
@@ -849,7 +992,7 @@ static void test_capacity_and_snapshot_preflight(void)
 	      NFSP_ACTIVATION_OK, "free draining allowance");
 	CHECK(nfsp_activation_activate(&activation, "rules-A", 3, NULL) ==
 	      NFSP_ACTIVATION_GENERATION_CAPACITY,
-	      "closed ids are retained, so lifetime capacity is exact");
+	      "closed slot remains occupied until durable owner retirement");
 	CHECK(nfsp_activation_activate(&activation, "rules-A", 1, NULL) ==
 	      NFSP_ACTIVATION_GENERATION_REUSED, "old failed id not reusable");
 
@@ -1013,6 +1156,8 @@ int main(void)
 	test_call_account_tickets();
 	test_forced_abort_cannot_bypass_barrier();
 	test_connection_close_accounting();
+	test_durable_retirement_reuses_bounded_slots();
+	test_retirement_compacts_live_indices();
 	test_capacity_and_snapshot_preflight();
 	test_permutation_determinism();
 	test_typed_results();

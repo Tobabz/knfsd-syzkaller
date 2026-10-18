@@ -128,6 +128,7 @@ struct nfsp_target {
 
 	struct tgen *gens;
 	size_t ngens, gens_cap;
+	uint64_t generations_started;
 	struct tbatch *batches;
 	size_t nbatches, batches_cap;
 	struct thold holds[MAX_HOLDS];
@@ -182,6 +183,35 @@ static struct tgen *find_gen(struct nfsp_target *t, uint64_t generation)
 		if (t->gens[i].generation == generation)
 			return &t->gens[i];
 	return NULL;
+}
+
+/* GENERATION_COMPLETE's host ACK is the terminal durability point: no later
+ * target event may name G, the host owns the closed binding/tombstone, and the
+ * activation component may finally release its detailed slot. */
+static int retire_gen(struct nfsp_target *t, uint64_t generation)
+{
+	enum nfsp_activation_result result;
+	size_t i;
+
+	for (i = 0; i < t->ngens; i++) {
+		if (t->gens[i].generation == generation)
+			break;
+	}
+	if (i == t->ngens)
+		return -1;
+	result = nfsp_activation_retire_generation(&t->act, generation);
+	if (result != NFSP_ACTIVATION_OK)
+		return -1;
+	free(t->gens[i].counts);
+	free(t->gens[i].refusal);
+	free(t->gens[i].refusal_seq);
+	if (i + 1u < t->ngens) {
+		memmove(&t->gens[i], &t->gens[i + 1u],
+			(t->ngens - i - 1u) * sizeof(*t->gens));
+	}
+	t->ngens--;
+	memset(&t->gens[t->ngens], 0, sizeof(*t->gens));
+	return 0;
 }
 
 static int rule_index(const struct nfsp_target *t, const char *rule_id)
@@ -461,13 +491,31 @@ static void on_journal(void *arg, uint64_t seq, uint64_t cookie,
 	}
 	case CK_REFUSAL:
 	case CK_FORWARD:
-	case CK_COMPLETE:
 		if (outcome != NFSP_JOURNAL_ACKED)
 			gen_failure(t, id);
-		if (COOKIE_KIND(cookie) == CK_COMPLETE &&
-		    outcome == NFSP_JOURNAL_ACKED)
-			t->stats.generations_complete++;
 		break;
+	case CK_COMPLETE: {
+		uint64_t generation = 0;
+
+		/* Cookies reserve their top byte for the kind.  Recover the full
+		 * 64-bit generation from the unique event sequence rather than the
+		 * cookie's truncated payload. */
+		for (size_t i = 0; i < t->ngens; i++) {
+			if (t->gens[i].complete_sent &&
+			    t->gens[i].complete_seq == seq) {
+				generation = t->gens[i].generation;
+				break;
+			}
+		}
+		if (outcome != NFSP_JOURNAL_ACKED || generation == 0) {
+			gen_failure(t, generation != 0 ? generation : id);
+		} else {
+			t->stats.generations_complete++;
+			if (retire_gen(t, generation) != 0)
+				gen_failure(t, generation);
+		}
+		break;
+	}
 	case CK_RUN:
 		break;
 	default:
@@ -483,6 +531,8 @@ static struct tgen *add_gen(struct nfsp_target *t, uint64_t generation,
 	struct tgen *g;
 	size_t n = t->ruleset.nrules ? t->ruleset.nrules : 1u;
 
+	if (t->generations_started == UINT64_MAX)
+		return NULL;
 	if (t->ngens == t->gens_cap) {
 		size_t cap = t->gens_cap ? t->gens_cap * 2u : 8u;
 		struct tgen *grown = realloc(t->gens, cap * sizeof(*grown));
@@ -506,6 +556,7 @@ static struct tgen *add_gen(struct nfsp_target *t, uint64_t generation,
 		return NULL;
 	}
 	t->ngens++;
+	t->generations_started++;
 	return g;
 }
 
@@ -2059,7 +2110,8 @@ static int clean(const struct nfsp_target *t)
 	if (nfsp_journal_failed(t->journal) ||
 	    nfsp_journal_pending(t->journal) != 0 ||
 	    t->stats.ruleset_state != 1 || t->stats.evidence_path_degraded ||
-	    t->stats.evidence_path_failures != 0)
+	    t->stats.evidence_path_failures != 0 ||
+	    t->stats.generations_complete != t->generations_started)
 		return 0;
 	for (size_t i = 0; i < t->ngens; i++) {
 		const struct tgen *g = &t->gens[i];
@@ -2103,7 +2155,7 @@ void nfsp_target_finish(struct nfsp_target *t, uint32_t wait_ms)
 	nfsp_jb_key(&b, "forward_failed_count", 0);
 	nfsp_jb_u64(&b, t->stats.forward_failed);
 	nfsp_jb_key(&b, "generations", 0);
-	nfsp_jb_u64(&b, t->ngens);
+	nfsp_jb_u64(&b, t->stats.generations_complete);
 	nfsp_jb_key(&b, "outside_activation_window", 0);
 	nfsp_jb_u64(&b, outside_window(t));
 	nfsp_jb_raw(&b, "}");
@@ -2166,7 +2218,7 @@ void nfsp_target_report(const struct nfsp_target *t, FILE *out)
 		"forward_complete=%llu forward_failed=%llu held_dropped=%llu "
 		"evidence_path_failures=%llu evidence_path_degraded=%d "
 		"outside_activation_window=%llu late_after_close=%llu "
-		"generations=%zu generations_complete=%llu run_complete=%s\n",
+		"generations=%llu generations_complete=%llu run_complete=%s\n",
 		s->ruleset_state > 0 ? "acked" :
 		s->ruleset_state < 0 ? "failed" : "pending",
 		(unsigned long long)s->records,
@@ -2183,7 +2235,7 @@ void nfsp_target_report(const struct nfsp_target *t, FILE *out)
 		s->evidence_path_degraded,
 		(unsigned long long)outside_window(t),
 		(unsigned long long)t->act.stats.late_after_close,
-		t->ngens,
+		(unsigned long long)t->generations_started,
 		(unsigned long long)s->generations_complete,
 		t->run_state == RUN_SKIPPED ? "skipped" :
 		t->run_state == RUN_NOT_SENT ? "not_sent" :

@@ -77,6 +77,7 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_nfs3_decode:$TEST/test_nfs3_decode.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/schema_nfs3.c:$SRC/schema_nfs4.c\
        test_txn:$TEST/test_txn.c:$SRC/txn.c\
        test_activation:$TEST/test_activation.c:$SRC/activation.c\
+       test_target:$TEST/test_target.c:$SRC/framing.c:$SRC/rpc_record.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c:$SRC/semantic.c:$SRC/resolver.c:$SRC/mutation_apply.c:$SRC/txn.c:$SRC/activation.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/schema_nfs4.c:$SRC/schema_nfs3.c:$SRC/rpc_decode.c:$SRC/rule.c:$SRC/journal.c:$SRC/jsonw.c:$SRC/sha256.c\
        test_rule:$TEST/test_rule.c:$SRC/rule.c:$SRC/schema.c:$SRC/schema_nfs4.c:$TEST/schema_tproto.c:$TEST/schema_tflat.c:$TEST/schema_tedge.c\
        test_resolver:$TEST/test_resolver.c:$SRC/resolver.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$TEST/schema_tproto.c\
        test_mutation_apply:$TEST/test_mutation_apply.c:$SRC/mutation_apply.c:$SRC/resolver.c:$SRC/edit.c:$SRC/nfs_decode.c:$SRC/schema.c:$SRC/rpc_decode.c:$SRC/rpc_record.c:$SRC/walk.c:$SRC/framing.c:$TEST/schema_tproto.c\
