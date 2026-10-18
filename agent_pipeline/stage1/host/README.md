@@ -119,11 +119,12 @@ guest. Read `probe-1/probe.json`:
 ## How the pieces bind
 
 - **Pins.** The descriptor names each host file (vmlinux as `kernel`,
-  `bzimage`, `vm-image`, `lane-script`, `syz-executor`, `syz-execprog`) by
-  the digest of a small `HostFilePin` record holding the file's SHA-256 and
-  size. This keeps multi-GB files out of the CAS. `collect`, `probe` and
-  `target-pcs` refuse a file that does not match its pin. `pins.json` caches
-  digests by inode, size and mtime.
+  `bzimage`, `vm-image`, `lane-script`, `syz-executor`, `syz-execprog`,
+  `syz-manager`) by the digest of a small `HostFilePin` record holding the
+  file's SHA-256 and size. This keeps multi-GB files out of the CAS.
+  `collect`, `probe` and `target-pcs` refuse a file that does not match its
+  pin. `pins.json` caches digests by inode, size and mtime. Stage 2 preflight
+  uses the manager pin to bind a campaign to the approved syzkaller build.
 - **Build records.** `generate` refuses a kernel or syzkaller build whose
   bootstrap record (`images/<variant>/build.json`,
   `syzkaller/bin/build.json`) names another patch series than the checked-in

@@ -7,12 +7,16 @@ candidate or write pipeline state.
 
 Run it with::
 
-    python -m agent_pipeline.stage2.host preflight --stage1 stage1.json
+    python -m agent_pipeline.stage2.host preflight
+        --stage1 stage1.json --manager manager.json
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import fcntl
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -28,7 +32,8 @@ from ..contracts import JobPolicy, Record
 from ..data import load_record, parse_json
 from ..hcap import ArtifactHcapChecker
 from ..m1 import M1JudgeProfile
-from ..materializer import ExecutionHarnessApproval, descriptor_id
+from ..materializer import (ExecutionHarnessApproval,
+                            ExecutionHarnessDescriptor, descriptor_id)
 from ..q2 import Q2JudgeProfile
 from ..registry import HarnessCatalog
 from ..semantic_promotion import (BuildRegistry,
@@ -38,7 +43,7 @@ from ..semantic_promotion import (BuildRegistry,
 from ..semantic_replay import ReplayJudgeProfile
 from ..stage1.config import Stage1Config
 from ..stage1.host.collector import CollectorConfig, verify_pins
-from ..stage1.host.pins import file_sha256
+from ..stage1.host.pins import HostFilePin, file_sha256, verify_file
 
 
 class PreflightCheck(Record):
@@ -56,6 +61,20 @@ class PreflightReport(Record):
 
 class PreflightError(RuntimeError):
     """One readiness invariant is not met."""
+
+
+@dataclass(frozen=True)
+class _ApprovedHarness:
+    harness_id: str
+    command_line: tuple[str, ...]
+    pins: tuple[tuple[str, HostFilePin], ...]
+
+    def pin(self, name: str) -> HostFilePin:
+        try:
+            return dict(self.pins)[name]
+        except KeyError as exc:
+            raise PreflightError(
+                f"approved harness {self.harness_id[:12]} lacks {name}") from exc
 
 
 class _Checks:
@@ -92,13 +111,28 @@ def _executable(path: Path | str, *, which: Callable[[str], str | None]
     return found
 
 
-def _check_kvm(path: Path) -> str:
+KVM_GET_API_VERSION = 0xAE00
+KVM_API_VERSION = 12
+
+
+def _check_kvm(
+    path: Path, *,
+    opener: Callable[[Path, int], int] = os.open,
+    ioctl: Callable[[int, int], int] = fcntl.ioctl,
+    closer: Callable[[int], None] = os.close,
+) -> str:
     info = path.stat()
     if not stat.S_ISCHR(info.st_mode):
         raise PreflightError(f"not a character device: {path}")
-    if not os.access(path, os.R_OK | os.W_OK):
-        raise PreflightError(f"current user cannot read and write {path}")
-    return f"{path} is accessible"
+    fd = opener(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+    try:
+        version = ioctl(fd, KVM_GET_API_VERSION)
+    finally:
+        closer(fd)
+    if version != KVM_API_VERSION:
+        raise PreflightError(
+            f"{path} reported KVM API {version}, expected {KVM_API_VERSION}")
+    return f"{path} opened successfully with KVM API {version}"
 
 
 def _check_command(config, *, which: Callable[[str], str | None]) -> str:
@@ -128,9 +162,36 @@ def _verify_pins_read_only(collector: CollectorConfig, descriptor) -> None:
     verify_pins(collector.model_copy(update={"pin_cache": None}), descriptor)
 
 
+_MANAGER_PIN_NAMES = ("bzimage", "kernel", "vm-image", "syz-execprog",
+                      "syz-executor", "syz-manager")
+
+
+def _approved_harness(
+    store: ArtifactStore, harness_id: str,
+    descriptor: ExecutionHarnessDescriptor,
+) -> _ApprovedHarness:
+    builds = {item.name: item.artifact_ref
+              for item in descriptor.build_artifacts}
+    pins: list[tuple[str, HostFilePin]] = []
+    for name in _MANAGER_PIN_NAMES:
+        ref = builds.get(name)
+        if ref is None:
+            raise PreflightError(
+                f"approved harness {harness_id[:12]} lacks {name}")
+        pin = load_record(store, ref, HostFilePin)
+        if pin.name != name:
+            raise PreflightError(f"pin for {name} names {pin.name}")
+        pins.append((name, pin))
+    return _ApprovedHarness(
+        harness_id=harness_id,
+        command_line=tuple(descriptor.guest_kernel_command_line.split()),
+        pins=tuple(pins))
+
+
 def _check_harnesses(
     store: ArtifactStore, config: Stage1Config, collector: CollectorConfig,
-) -> tuple[PromotedSemanticCapabilityRegistry, ...]:
+) -> tuple[tuple[PromotedSemanticCapabilityRegistry, ...],
+           tuple[_ApprovedHarness, ...]]:
     approvals = [load_record(store, ref, ExecutionHarnessApproval)
                  for ref in config.execution_harness_approvals]
     by_descriptor = {descriptor_id(item.descriptor): item
@@ -142,6 +203,7 @@ def _check_harnesses(
         raise PreflightError("harness catalog has no registrations")
     checker = ArtifactHcapChecker(store)
     promoted: list[PromotedSemanticCapabilityRegistry] = []
+    harnesses: list[_ApprovedHarness] = []
     checked_descriptors: set[str] = set()
     for registration in catalog.registrations:
         binding = registration.binding
@@ -163,12 +225,14 @@ def _check_harnesses(
         promoted.append(registry)
         if binding.execution_harness_id not in checked_descriptors:
             _verify_pins_read_only(collector, descriptor)
+            harnesses.append(_approved_harness(
+                store, binding.execution_harness_id, descriptor))
             checked_descriptors.add(binding.execution_harness_id)
         tokens = descriptor.guest_kernel_command_line.split()
         if "nokaslr" not in tokens or "nfs.localio_enabled=N" not in tokens:
             raise PreflightError(
                 "Stage 2 harness requires nokaslr and nfs.localio_enabled=N")
-    return tuple(promoted)
+    return tuple(promoted), tuple(harnesses)
 
 
 def _check_runtime(
@@ -235,7 +299,99 @@ def _check_policies(policies: tuple[JobPolicy, ...], checks: _Checks) -> None:
                    "Stage 2 thresholds differ from repository placeholders")
 
 
-def _check_manager(path: Path, crash_window_bound: int) -> str:
+def _required_path(value: dict, name: str, *, parent: str = "manager") -> Path:
+    raw = value.get(name)
+    if not isinstance(raw, str) or not raw:
+        raise PreflightError(f"{parent} config lacks {name}")
+    return Path(raw)
+
+
+def _bind_manager_command(path: Path, command) -> None:
+    expected = path.resolve(strict=True)
+    cwd = Path(command.cwd)
+    for argument in command.argv[1:]:
+        if "{" in argument or "}" in argument:
+            continue
+        candidate = Path(argument)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        try:
+            if candidate.resolve(strict=True) == expected:
+                return
+        except OSError:
+            continue
+    raise PreflightError(
+        "manager config must be an explicit Stage 2 command argument")
+
+
+def _check_approved_command_line(
+    actual: list[str], harnesses: tuple[_ApprovedHarness, ...],
+) -> None:
+    for harness in harnesses:
+        for approved in harness.command_line:
+            if "=" in approved:
+                key = approved.split("=", 1)[0]
+                matches = [token for token in actual
+                           if token.split("=", 1)[0] == key]
+                if matches != [approved]:
+                    raise PreflightError(
+                        f"manager VM cmdline differs from approved {key}")
+            elif actual.count(approved) != 1:
+                raise PreflightError(
+                    f"manager VM cmdline lacks approved {approved}")
+
+
+def _check_manager_assets(
+    value: dict, vm: dict, collector: CollectorConfig,
+    harnesses: tuple[_ApprovedHarness, ...],
+    *, expected_target: str, which: Callable[[str], str | None],
+) -> None:
+    if not harnesses:
+        raise PreflightError("no approved harness is available")
+    kernel_obj = _required_path(value, "kernel_obj")
+    syzkaller = _required_path(value, "syzkaller")
+    if value.get("target") != expected_target:
+        raise PreflightError(
+            f"manager target must be the approved {expected_target}")
+    os_name, separator, arch = expected_target.partition("/")
+    if not separator or not os_name or not arch:
+        raise PreflightError(f"unsupported approved target: {expected_target}")
+    target_bin = syzkaller / "bin" / f"{os_name}_{arch}"
+    files = {
+        "bzimage": _required_path(vm, "kernel", parent="manager VM"),
+        "kernel": kernel_obj / "vmlinux",
+        "vm-image": _required_path(value, "image"),
+        "syz-execprog": target_bin / "syz-execprog",
+        "syz-executor": target_bin / "syz-executor",
+        "syz-manager": syzkaller / "bin/syz-manager",
+    }
+    for name, manager_file in files.items():
+        pins = [harness.pin(name) for harness in harnesses]
+        identities = {(pin.sha256, pin.size) for pin in pins}
+        if len(identities) != 1:
+            raise PreflightError(
+                f"approved harnesses disagree on the {name} identity")
+        verify_file(pins[0], manager_file)
+    _executable(files["syz-manager"], which=which)
+
+    manager_key = _required_path(value, "sshkey")
+    if not manager_key.is_file() or not collector.ssh_key.is_file():
+        raise PreflightError("manager and collector SSH keys must be files")
+    if manager_key.resolve(strict=True) != collector.ssh_key.resolve(strict=True):
+        raise PreflightError("manager SSH key differs from the collector SSH key")
+
+    collector_qemu = _executable(collector.qemu, which=which).resolve(strict=True)
+    manager_qemu = _executable(vm.get("qemu", collector.qemu),
+                               which=which).resolve(strict=True)
+    if manager_qemu != collector_qemu:
+        raise PreflightError("manager QEMU differs from the collector QEMU")
+
+
+def _check_manager(
+    path: Path, crash_window_bound: int, *, command,
+    collector: CollectorConfig, harnesses: tuple[_ApprovedHarness, ...],
+    expected_target: str, which: Callable[[str], str | None],
+) -> str:
     raw = path.read_bytes()
     value = parse_json(raw)
     if not isinstance(value, dict):
@@ -254,10 +410,14 @@ def _check_manager(path: Path, crash_window_bound: int) -> str:
     vm = value.get("vm")
     if not isinstance(vm, dict) or vm.get("count", 1) != 1:
         raise PreflightError("target-mode campaign requires vm.count 1")
+    procs = value.get("procs")
+    if type(procs) is not int or not 1 <= procs <= 64:
+        raise PreflightError("target-mode campaign requires procs in [1, 64]")
     cmdline = str(vm.get("cmdline", "")).split()
-    if "nfs.localio_enabled=N" not in cmdline:
-        raise PreflightError("manager VM cmdline lacks nfs.localio_enabled=N")
-    if "koov.nfs_target=1" not in cmdline:
+    _check_approved_command_line(cmdline, harnesses)
+    target_tokens = [token for token in cmdline
+                     if token.startswith("koov.nfs_target=")]
+    if target_tokens != ["koov.nfs_target=1"]:
         raise PreflightError("manager VM cmdline lacks koov.nfs_target=1")
     template_value = value.get("workdir_template")
     if not isinstance(template_value, str) or not template_value:
@@ -275,9 +435,24 @@ def _check_manager(path: Path, crash_window_bound: int) -> str:
     qemu_args = str(vm.get("qemu_args", ""))
     if "-enable-kvm" not in qemu_args.split():
         raise PreflightError("manager QEMU args lack -enable-kvm")
-    if "nfsp-journal-0" not in qemu_args:
-        raise PreflightError("manager QEMU args lack journal channels")
-    return f"manager window={window}, target mode and journal channels enabled"
+    journal_names = {
+        part.removeprefix("name=")
+        for token in qemu_args.split()
+        for part in token.split(",")
+        if part.startswith("name=")
+    }
+    missing = [str(lane) for lane in range(procs)
+               if f"nfsp-journal-{lane}" not in journal_names]
+    if missing:
+        raise PreflightError(
+            "manager QEMU args lack journal channels for lanes: "
+            + ", ".join(missing))
+    _bind_manager_command(path, command)
+    _check_manager_assets(value, vm, collector, harnesses,
+                          expected_target=expected_target, which=which)
+    digest = hashlib.sha256(raw).hexdigest()
+    return (f"manager sha256={digest}, window={window}, {procs} proc(s), "
+            "approved assets, target mode and journal channels enabled")
 
 
 def preflight(
@@ -317,6 +492,7 @@ def preflight(
     checks.attempt("kernel_repo", lambda: _check_kernel_repo(config))
 
     promoted: tuple[PromotedSemanticCapabilityRegistry, ...] = ()
+    harnesses: tuple[_ApprovedHarness, ...] = ()
     try:
         if not config.artifact_root.is_dir():
             raise PreflightError(f"artifact root is absent: {config.artifact_root}")
@@ -325,7 +501,7 @@ def preflight(
                 f"collector artifact root is absent: {collector.artifact_root}")
         store = ArtifactStore(config.artifact_root)
         _check_profiles(store, stage2)
-        promoted = _check_harnesses(store, config, collector)
+        promoted, harnesses = _check_harnesses(store, config, collector)
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         checks.add("authority", "error", f"{type(exc).__name__}: {exc}")
     else:
@@ -376,12 +552,18 @@ def preflight(
                    "Stage 1 and Stage 2 use different resource keys")
     _check_policies(config.policies, checks)
     if manager_path is None:
-        checks.add("manager_config", "warning",
-                   "manager config not supplied; campaign window and target mode unchecked")
+        checks.add("manager_config", "error",
+                   "manager config is required for Stage 2 readiness")
     else:
         checks.attempt("manager_config",
                        lambda: _check_manager(manager_path,
-                                              stage2.crash_window_bound))
+                                              stage2.crash_window_bound,
+                                              command=stage2,
+                                              collector=collector,
+                                              harnesses=harnesses,
+                                              expected_target=(
+                                                  config.syzkaller_identity.target),
+                                              which=which))
     ready = not any(item.status == "error" for item in checks.items)
     return PreflightReport(ready=ready, checks=tuple(checks.items))
 
@@ -402,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
     check = sub.add_parser("preflight")
     check.add_argument("--stage1", type=Path, required=True)
     check.add_argument("--collector", type=Path)
-    check.add_argument("--manager", type=Path)
+    check.add_argument("--manager", type=Path, required=True)
     check.add_argument("--kvm", type=Path, default=Path("/dev/kvm"))
     check.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)

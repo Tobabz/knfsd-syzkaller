@@ -19,10 +19,11 @@ from agent_pipeline.semantic_promotion import (
 )
 from agent_pipeline.stage1.config import EngineConfig, Stage1Config
 from agent_pipeline.stage1.host.collector import CollectorConfig
+from agent_pipeline.stage1.host.pins import pin_file
 from agent_pipeline.stage2.host import (
-    PreflightError, _Checks, _check_command, _check_kernel_repo,
-    _check_manager, _check_policies, _check_runtime,
-    _verify_pins_read_only, preflight,
+    KVM_API_VERSION, PreflightError, _ApprovedHarness, _Checks,
+    _check_command, _check_kernel_repo, _check_kvm, _check_manager,
+    _check_policies, _check_runtime, _verify_pins_read_only, preflight,
 )
 
 from .fakes import policy, sha
@@ -108,6 +109,22 @@ def test_host_command_requires_input_and_output_placeholders(tmp_path):
         _check_command(bad, which=lambda _: None)
 
 
+def test_kvm_device_is_opened_and_reports_the_supported_api():
+    closed = []
+    detail = _check_kvm(
+        Path("/dev/null"), opener=lambda path, flags: 17,
+        ioctl=lambda fd, request: KVM_API_VERSION,
+        closer=closed.append)
+    assert "KVM API 12" in detail
+    assert closed == [17]
+    closed.clear()
+    with pytest.raises(PreflightError, match="reported KVM API 11"):
+        _check_kvm(
+            Path("/dev/null"), opener=lambda path, flags: 18,
+            ioctl=lambda fd, request: 11, closer=closed.append)
+    assert closed == [18]
+
+
 def test_kernel_check_does_not_create_an_absent_artifact_root(
         tmp_path, monkeypatch):
     config = _config(tmp_path)
@@ -134,32 +151,112 @@ def test_pin_verification_does_not_update_the_collector_cache(
     assert not cache.exists()
 
 
-def test_manager_config_binds_window_target_mode_and_journal(tmp_path):
+def _manager_config(tmp_path: Path):
     path = tmp_path / "manager.json"
     template = tmp_path / "template"
     template.mkdir()
     lane = template / "lane.sh"
     lane.write_bytes(b"#!/bin/sh\n")
     lane_digest = hashlib.sha256(lane.read_bytes()).hexdigest()
+
+    kernel_obj = tmp_path / "kernel-obj"
+    kernel_obj.mkdir()
+    syzkaller = tmp_path / "syzkaller"
+    syz_bin = syzkaller / "bin/linux_amd64"
+    syz_bin.mkdir(parents=True)
+    assets = {
+        "bzimage": tmp_path / "bzImage",
+        "kernel": kernel_obj / "vmlinux",
+        "vm-image": tmp_path / "guest.qcow2",
+        "syz-execprog": syz_bin / "syz-execprog",
+        "syz-executor": syz_bin / "syz-executor",
+        "syz-manager": syzkaller / "bin/syz-manager",
+    }
+    for name, asset in assets.items():
+        asset.write_bytes((name + "\n").encode())
+    assets["syz-manager"].chmod(0o755)
+    ssh_key = tmp_path / "id"
+    ssh_key.write_text("key\n")
+    collector = CollectorConfig(
+        artifact_root=tmp_path, files=assets, ssh_key=ssh_key,
+        qemu="/bin/true")
+    harness = _ApprovedHarness(
+        harness_id="a" * 64,
+        command_line=("root=/dev/sda", "console=ttyS0", "nokaslr",
+                      "nfs.localio_enabled=N"),
+        pins=tuple((name, pin_file(name, asset))
+                   for name, asset in assets.items()))
     manager = {
-        "type": "qemu", "workdir_template": str(template),
+        "type": "qemu", "target": "linux/amd64", "procs": 1,
+        "workdir_template": str(template),
+        "kernel_obj": str(kernel_obj), "syzkaller": str(syzkaller),
+        "image": str(assets["vm-image"]), "sshkey": str(ssh_key),
         "experimental": {"remote_cover": True, "nfs_proxy_window": 8},
-        "vm": {"count": 1,
-               "cmdline": ("nokaslr nfs.localio_enabled=N "
+        "vm": {"count": 1, "kernel": str(assets["bzimage"]),
+               "cmdline": ("root=/dev/sda console=ttyS0 nokaslr "
+                           "nfs.localio_enabled=N "
                            f"koov.nfs_target=1 koov.lane_sha256={lane_digest}"),
                "qemu_args": ("-enable-kvm "
                              "-device virtserialport,name=nfsp-journal-0")},
     }
     path.write_text(json.dumps(manager))
-    assert "window=8" in _check_manager(path, 4)
+    command = SimpleNamespace(
+        argv=("/bin/true", "--manager", str(path), "{input}", "{output}"),
+        cwd=tmp_path)
+    return path, manager, lane, collector, (harness,), command
+
+
+def _manager_check(path, collector, harnesses, command):
+    return _check_manager(
+        path, 4, command=command, collector=collector,
+        harnesses=harnesses, expected_target="linux/amd64",
+        which=lambda _: None)
+
+
+def test_manager_config_binds_approved_assets_and_command(tmp_path):
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    assert "approved assets" in _manager_check(
+        path, collector, harnesses, command)
+    image = Path(manager["image"])
+    image.write_bytes(b"wrong image\n")
+    with pytest.raises(RuntimeError, match="does not match its pin"):
+        _manager_check(path, collector, harnesses, command)
+    image.write_bytes(b"vm-image\n")
+    unbound = SimpleNamespace(argv=("/bin/true", "{input}", "{output}"),
+                              cwd=tmp_path)
+    with pytest.raises(PreflightError, match="explicit Stage 2 command"):
+        _manager_check(path, collector, harnesses, unbound)
+    manager["target"] = "linux/arm64"
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="approved linux/amd64"):
+        _manager_check(path, collector, harnesses, command)
+    manager["target"] = "linux/amd64"
+    manager["vm"]["cmdline"] = manager["vm"]["cmdline"].replace(
+        "nokaslr ", "")
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="approved nokaslr"):
+        _manager_check(path, collector, harnesses, command)
+
+
+def test_manager_config_binds_window_lane_script_and_all_proc_journals(
+        tmp_path):
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    assert "window=8" in _manager_check(path, collector, harnesses, command)
     lane.write_bytes(b"changed\n")
     with pytest.raises(PreflightError, match="differs from koov.lane_sha256"):
-        _check_manager(path, 4)
+        _manager_check(path, collector, harnesses, command)
     lane.write_bytes(b"#!/bin/sh\n")
+    manager["procs"] = 2
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="lanes: 1"):
+        _manager_check(path, collector, harnesses, command)
+    manager["procs"] = 1
     manager["experimental"]["nfs_proxy_window"] = 3
     path.write_text(json.dumps(manager))
     with pytest.raises(PreflightError, match="at least 4"):
-        _check_manager(path, 4)
+        _manager_check(path, collector, harnesses, command)
 
 
 def test_promoted_runtime_must_match_every_harness():
