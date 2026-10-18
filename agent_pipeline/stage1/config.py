@@ -59,6 +59,10 @@ class Stage1Config(_Config):
     lease_duration_s: float = Field(default=120, gt=0)
     agent_workers: int = Field(default=2, ge=1, le=16)
     engine: EngineConfig
+    #: The Proxy binary of the promoted semantic build, for the Mutation Rule
+    #: Compiler (08 §12).  Unset, a Stage 2 rule set waits in
+    #: blocked_operator(stage2_compiler_unavailable).
+    nfs_proxy: Path | None = None
 
     @classmethod
     def load(cls, path: Path) -> Stage1Config:

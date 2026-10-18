@@ -27,7 +27,8 @@ from ..agent_tasks.executor import PinnedToolboxFactory, ToolboxFactory
 from ..agent_tasks.queued import QueuedAgentExecutor
 from ..agent_tasks.runtime import AgentRuntime
 from ..artifacts import ArtifactStore
-from ..components import HarnessRegistry, IssueTracker, Materializer
+from ..components import (HarnessRegistry, IssueTracker, Materializer,
+                          MutationRuleCompiler)
 from ..contracts import JudgeVersions
 from ..controller.machine import Env
 from ..controller.records import Job
@@ -78,6 +79,9 @@ class Stage1Parts:
     #: False for one-shot commands: Agent Tasks are recorded but not run,
     #: and the service loop (``run``) sends them.
     run_agents: bool = True
+    #: None until a Proxy build is configured: a Stage 2 rule set then waits
+    #: in blocked_operator(stage2_compiler_unavailable).
+    compiler: MutationRuleCompiler | None = None
 
 
 class AgentDispatchDeferred(RuntimeError):
@@ -138,7 +142,8 @@ class Stage1Service:
         else:
             self.agents = _DeferredAgents()
         env = Env(policy=self.store.policy, hcap=hcap,
-                  materializer=parts.materializer, judge=self.judge)
+                  materializer=parts.materializer, judge=self.judge,
+                  compiler=parts.compiler)
         extra = {} if parts.new_id is None else {"new_id": parts.new_id}
         self.controller = Controller(
             self.store, env, self.runner, self.agents, self.issues,

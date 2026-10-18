@@ -460,7 +460,9 @@ The gate writes a `PromotedSemanticCapabilityRegistry` and a new HCAP revision w
 (`usable_by: [agent_stage2]`) references it by digest. Only that entry makes the registry Agent scope,
 and only for the subsets in its `validated_scope`; a registry digest elsewhere in the catalog does not. A new Proxy build is promoted afresh. The
 Agent reads the subsets with its `lookup_semantic_scope` tool, and `rule_set_scope` tells the
-Compiler which subset a `MutationRuleSet` fits. Nothing is promoted until the KVM runs below exist.
+Compiler which subset a `MutationRuleSet` fits. The Compiler (`agent_pipeline/rule_compiler.py`) checks
+every rule it writes with `--check-rules` of the promoted binary itself, so point `Stage1Config.nfs_proxy`
+at the same guest binary the promotion recorded. Nothing is promoted until the KVM runs below exist.
 
 **KVM step (by hand), once per subset.** Use the guest binary from `build-guest.sh` everywhere; the
 host runs the same binary for `--capability-registry` and `--describe-rules`.
