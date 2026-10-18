@@ -60,6 +60,7 @@ class ExposureDelta:
     message_type: str
     signature: tuple[SignatureItem, ...]
     terminal: str | None = None  # complete | failed
+    terminal_seq: int | None = None
     #: (rule_id, semantic_path, SHA-256 of original_value) per application:
     #: what M7 compares to show replay ran on other dynamic originals.
     originals: tuple[tuple[str, str, str], ...] = ()
@@ -75,6 +76,9 @@ class GenerationDelta:
     exposures: list[ExposureDelta] = field(default_factory=list)
     refusals: list[ApplyRefusalPayload] = field(default_factory=list)
     summary: GenerationCompletePayload | None = None
+    summary_seq: int | None = None
+    #: The last event of this generation in the journal, of any type.
+    last_seq: int = 0
 
 
 @dataclass
@@ -175,9 +179,10 @@ class SealedJournal:
                 assert isinstance(payload, GenerationOpenPayload)
                 session.generations[g] = GenerationDelta(
                     g, payload.correlation.lane_id, payload.correlation.program_digest,
-                    request.event_seq)
+                    request.event_seq, last_seq=request.event_seq)
                 continue
             gen = session.generations[g]
+            gen.last_seq = max(gen.last_seq, request.event_seq)
             if request.event_type == "GENERATION_DRAINING":
                 gen.draining_seq = request.event_seq
             elif request.event_type == "EXPOSURE_INTENT":
@@ -197,12 +202,14 @@ class SealedJournal:
                     if exposure.batch_id == payload.batch_id:
                         exposure.terminal = ("complete" if request.event_type ==
                                              "FORWARD_COMPLETE" else "failed")
+                        exposure.terminal_seq = request.event_seq
             elif request.event_type == "APPLY_REFUSAL":
                 assert isinstance(payload, ApplyRefusalPayload)
                 gen.refusals.append(payload)
             elif request.event_type == "GENERATION_COMPLETE":
                 assert isinstance(payload, GenerationCompletePayload)
                 gen.summary = payload
+                gen.summary_seq = request.event_seq
         return sessions
 
     # -- views --

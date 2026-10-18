@@ -17,9 +17,11 @@ from agent_pipeline.controller.records import (BlockedReason, JobState,
 from .fakes import COMMIT, VERSIONS, binding, policy, sha
 
 
-def test_stage2_cannot_be_switched_on():
+def test_stage2_is_opt_in():
+    assert policy().run_stage2 is False
+    assert policy(run_stage2=True).run_stage2 is True
     with pytest.raises(ValidationError):
-        policy(run_stage2=True)
+        policy(run_stage2="maybe")
 
 
 @pytest.mark.parametrize("status,reason", [

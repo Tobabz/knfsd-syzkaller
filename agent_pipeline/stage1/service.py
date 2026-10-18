@@ -3,15 +3,18 @@
 One process owns the Controller and its SQLite Store on the calling thread.
 Agent Tasks run on ``QueuedAgentExecutor`` workers and come back through
 ``deliver()``.  A Runner worker thread claims leases from ``DurableRunner``
-and runs them through ``EvidenceSealingBackend``.  After a task seals, the
-service publishes its Q1 host authority and installs the new Judge
-snapshot before the Controller polls, so the verdict is consumed on the
-next ``step``.
+and runs them through ``EvidenceSealingBackend``, or, for a Stage 2 step
+when ``Stage1Parts.stage2`` is configured, through
+``StreamingSealingBackend`` with the Stage 2 engine.  After a task seals
+(a Stage 2 one: after each bundle), the service publishes its host
+authority and installs the new Judge snapshot before the Controller
+polls, so the verdict is consumed on the next ``step``.
 
 Each ``step``:
 
 1. deliver finished Agent results to the Controller;
-2. publish Q1 authority for sealed Runner tasks;
+2. publish Q1 authority for sealed Runner tasks and Stage 2 authority
+   for every bundle a Stage 2 task added;
 3. ``Controller.poll()``: take Runner statuses, resend lost calls.
 """
 
@@ -21,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from ..agent_tasks.executor import PinnedToolboxFactory, ToolboxFactory
 from ..agent_tasks.queued import QueuedAgentExecutor
@@ -38,13 +41,19 @@ from ..evidence import EvidenceStore
 from ..hcap import ArtifactHcapChecker
 from ..intake import SourceTree
 from ..runner.evidence_backend import (EvidenceSealingBackend, ExecutionEngine,
-                                       RunnerEvidenceReceiptStore)
+                                       RunnerEvidenceReceiptStore,
+                                       StepRoutingBackend,
+                                       StreamingExecutionEngine,
+                                       StreamingSealingBackend)
 from ..runner.q1_receipts import RunnerQ1ReceiptBridge
 from ..runner.service import DurableRunner
 from ..runner.worker import RunnerWorker, WorkerRun
 from .authority import (DescriptorKernelIdentity, MappingCatalog, Publication,
                         PublishedQ1Judge, Q1AuthorityPublisher)
 from .issues import SqliteIssueTracker
+
+if TYPE_CHECKING:
+    from ..stage2.authority import Stage2Profiles
 
 
 @dataclass
@@ -53,6 +62,16 @@ class StepReport:
     publications: list[Publication] = field(default_factory=list)
     failures: list[EffectFailure] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Stage2Parts:
+    """The Stage 2 execution backend: the engine that runs gate, campaign
+    and replay leases, and the profiles its bundles are judged with."""
+
+    engine_factory: Callable[[ArtifactStore, RunnerEvidenceReceiptStore,
+                              EvidenceStore], StreamingExecutionEngine]
+    profiles: Stage2Profiles
 
 
 @dataclass(frozen=True)
@@ -82,6 +101,9 @@ class Stage1Parts:
     #: None until a Proxy build is configured: a Stage 2 rule set then waits
     #: in blocked_operator(stage2_compiler_unavailable).
     compiler: MutationRuleCompiler | None = None
+    #: None until a Stage 2 engine and profiles are configured: a compiled
+    #: rule set then waits in blocked_operator(stage2_gate_unavailable).
+    stage2: Stage2Parts | None = None
 
 
 class AgentDispatchDeferred(RuntimeError):
@@ -130,6 +152,15 @@ class Stage1Service:
         self._own_issues = parts.issues is None
         self.issues = parts.issues or SqliteIssueTracker(state / "issues.sqlite")
         self.judge = PublishedQ1Judge(self.bridge.snapshot())
+        # stage2.authority builds on stage1.authority: import it here.
+        from ..stage2.authority import (PublishedStage2Judge,
+                                        Stage2AuthorityPublisher,
+                                        Stage2AuthorityStore)
+        self.stage2_store = Stage2AuthorityStore(
+            state / "stage2-publications.sqlite", artifacts=self.artifacts,
+            evidence=self.evidence)
+        self.stage2_judge = None if parts.stage2 is None else \
+            PublishedStage2Judge(self.stage2_store.snapshot())
         hcap = ArtifactHcapChecker(self.artifacts)
         # The Controller is the executor's sink, and the executor is the
         # Controller's Agent executor: bind the sink after both exist.
@@ -143,7 +174,7 @@ class Stage1Service:
             self.agents = _DeferredAgents()
         env = Env(policy=self.store.policy, hcap=hcap,
                   materializer=parts.materializer, judge=self.judge,
-                  compiler=parts.compiler)
+                  compiler=parts.compiler, stage2=self.stage2_judge)
         extra = {} if parts.new_id is None else {"new_id": parts.new_id}
         self.controller = Controller(
             self.store, env, self.runner, self.agents, self.issues,
@@ -153,9 +184,21 @@ class Stage1Service:
         self.publisher = Q1AuthorityPublisher(
             self.store, self.runner, self.receipts, self.bridge,
             self.artifacts, parts.identities, self.mappings, self.judge)
-        self.backend = EvidenceSealingBackend(
+        self.stage2_publisher = None
+        stage2_backend = None
+        if parts.stage2 is not None:
+            self.stage2_publisher = Stage2AuthorityPublisher(
+                self.store, self.runner, self.receipts, self.stage2_store,
+                self.bridge, self.artifacts, parts.identities, self.mappings,
+                parts.stage2.profiles, self.stage2_judge)
+            stage2_backend = StreamingSealingBackend(
+                parts.stage2.engine_factory(self.artifacts, self.receipts,
+                                            self.evidence),
+                self.evidence, self.receipts, self.runner,
+                sealer_id=parts.sealer_id)
+        self.backend = StepRoutingBackend(EvidenceSealingBackend(
             parts.engine_factory(self.artifacts), self.evidence, self.receipts,
-            sealer_id=parts.sealer_id)
+            sealer_id=parts.sealer_id), stage2_backend)
         self.worker = RunnerWorker(self.runner, self.backend,
                                    worker_id=parts.worker_id)
         self.worker_runs: list[WorkerRun] = []
@@ -205,6 +248,8 @@ class Stage1Service:
             report.errors.append(f"deliver: {type(exc).__name__}: {exc}")
         report.errors.extend(self.deliver_issue_events())
         report.publications = self.publisher.publish_ready()
+        if self.stage2_publisher is not None:
+            report.publications += self.stage2_publisher.publish_ready()
         report.failures = self.controller.poll()
         return report
 
@@ -269,6 +314,7 @@ class Stage1Service:
         except Exception as exc:     # the next recover() sends it again
             self.worker_errors.append(f"deliver on close: {exc}")
         self.bridge.close()
+        self.stage2_store.close()
         if worker_done:
             self.receipts.close()
             self.runner.close()

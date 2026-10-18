@@ -134,7 +134,8 @@ class Ids:
 
 
 def make_service(tmp_path, build, *, pcs="4096", ids=None, command=COMMAND,
-                 run_agents=True, registry=None, engine_factory=None):
+                 run_agents=True, registry=None, engine_factory=None,
+                 runtime=None, policies=None, **extra):
     b = build
     if registry is None:
         registry = InMemoryRegistry()
@@ -157,13 +158,13 @@ def make_service(tmp_path, build, *, pcs="4096", ids=None, command=COMMAND,
     parts = Stage1Parts(
         state_dir=tmp_path / "state", artifacts=b.store,
         tree=FakeTree({b.binding.kernel_commit: SOURCE}), registry=registry,
-        materializer=b.materializer, runtime=ScriptedRuntime(b),
+        materializer=b.materializer, runtime=runtime or ScriptedRuntime(b),
         tools=lambda request: toolbox(),
         engine_factory=engine_factory or engine,
         judge_versions=versions(b),
         identities=DescriptorKernelIdentity("kernel", "instrumentation"),
-        policies=(policy(),), new_id=ids or Ids(),
-        lease_duration_ns=30_000_000_000, run_agents=run_agents)
+        policies=policies or (policy(),), new_id=ids or Ids(),
+        lease_duration_ns=30_000_000_000, run_agents=run_agents, **extra)
     return Stage1Service(parts)
 
 

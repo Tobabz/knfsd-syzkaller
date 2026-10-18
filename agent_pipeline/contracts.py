@@ -123,16 +123,20 @@ class JobPolicy(Record):
 
     Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
     Agent retries, three Runner reruns, no human approval before a run.
-    run_stage2 becomes true by default once Stage 2 is implemented; until
-    then it only accepts false, and an operator starts Stage 2 of a reached
-    job.  The Stage 2 repair budget follows the Stage 1 default."""
+    run_stage2 becomes true by default once Stage 2 is implemented.  The
+    backend and judges are in, but no gate, campaign or replay has run on a
+    real VM and the campaign thresholds below are placeholders, so it
+    stays false by default: a policy may opt in, and otherwise an operator
+    starts Stage 2 of a reached job.  The Stage 2 repair budget follows the
+    Stage 1 default."""
 
     policy_id: str
     sanitizer: Sanitizer
     approval_required: bool = False
-    # Stage 2 is not implemented yet (decision record, decision 1); a
-    # REACHED job waits in s1_reached (09 rationale 11).
-    run_stage2: Literal[False] = False
+    # False: a REACHED job waits in s1_reached (09 rationale 11).  True on
+    # a host without a Stage 2 backend leaves the job in
+    # blocked_operator(stage2_gate_unavailable) after compiling.
+    run_stage2: bool = False
     stage1_agents: Stage1AgentPolicy = Field(default_factory=Stage1AgentPolicy)
     stage2_agents: Stage2AgentPolicy = Field(default_factory=Stage2AgentPolicy)
     stage1_repair_budget: int = Field(default=3, ge=1)

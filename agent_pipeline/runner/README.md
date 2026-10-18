@@ -66,8 +66,13 @@ expiry and is not safe for production use.
 The raw token is a bearer credential. It is retained in SQLite and returned in
 `WorkLease`; audit views expose only its SHA-256 digest.
 
-This first slice stores one final bundle reference. Streaming campaign bundles
-remain future work.
+A Stage 2 lease can also add bundles while it runs (`append_bundle`, fenced
+like a completion): they appear in `status().bundles` at once, in order, and
+a sealed completion must name the last one. If the lease ends unsealed, the
+bundles it added stay the task's. `StreamingSealingBackend` seals each
+capture of a `StreamingExecutionEngine` this way, and `StepRoutingBackend`
+sends Stage 1 leases to `EvidenceSealingBackend` and Stage 2 ones (their
+input names a step) to it. `bundles(task_id)` is the audit view.
 
 ## Evidence backend boundary
 

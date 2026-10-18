@@ -676,6 +676,8 @@ bundle fixture로 대신한다.
   3회, 실행 전 사람 승인 불필요다.
   `run_stage2`는 Stage 2 구현 전까지 거짓만 받고, 구현 뒤 기본값을 참으로 바꾼다
   (`agent_pipeline/contracts.py`의 `JobPolicy`).
+  **현재(2026-10-18, 구현 기본값):** Stage 2 backend가 들어와 `run_stage2`는 참도 받는다. 실제 VM 실행과 campaign
+  임계값 결정 전이라 기본값은 거짓으로 두었다. 기본값을 참으로 바꾸는 시점은 저장소 소유자가 정한다.
 - **결정됨(2026-10-13, 저장소 소유자):** `agent_retry`는 요청 단위로 센다. 새 요청이 시작되면 0에서 센다.
 - **결정됨(2026-10-13, 저장소 소유자):** candidate 하나에 job 여러 개(예: sanitizer별)를 둘 수 있다. 같은
   target(commit, location)은 같은 `candidate_id`다(`02` §7).
@@ -687,6 +689,9 @@ bundle fixture로 대신한다.
 - **결정됨(2026-10-18, Controller 쪽):** campaign evidence의 이벤트 단위는 campaign task가 실행 중에 봉인한 bundle
   하나다(§4). bundle 하나가 무엇을 담는지(fuzz VM instance의 실행 구간)와 Runner 쪽 봉인 구현은 `01` §14 14번이
   정한다.
+- **구현 기본값(2026-10-18, Runner 쪽):** Runner lease는 실행 중에 bundle을 더할 수 있다(`DurableRunner.append_bundle`).
+  Stage 2 host command가 끝낸 segment 하나가 bundle 하나이고, 더한 즉시 `status().bundles`에 순서대로 보인다. lease가
+  봉인 없이 끝나도 이미 더한 bundle은 task에 남는다(`agent_pipeline/stage2/README.md`).
 - **미결:** campaign 임계값과 fuzz budget의 기본값(`JobPolicy`의 `campaign_*_generations`, `fuzz_budget_executions`).
   지금 값은 loop를 끝내기 위한 자리값이며 저장소 소유자 결정이 아니다.
 - **미결:** `RepairInput.findings`에 넣을 coverage 요약의 형식(예: target 파일에서 관측된 함수). 첫 Stage 1 repair
@@ -695,7 +700,7 @@ bundle fixture로 대신한다.
   닫는 동작.
 - **미결:** Stage 2 실행 전 사람 승인. 기존 계약의 approval binding은 Stage 1 review manifest뿐이다(`05` §11).
 - **구현 범위(#46):** `s1_reached`·`s2_strategy` 행과 Compiler 결과 행은 `tests/agent_pipeline/test_stage2_strategy.py`가
-  가짜 model과 가짜 Compiler로 확인한다. `run_stage2`가 거짓만 받는 동안 Stage 2는 operator 동작
+  가짜 model과 가짜 Compiler로 확인한다. `run_stage2`가 거짓이면 Stage 2는 operator 동작
   `start_stage2`로 시작한다. Compiler는 `rule_compiler.ArtifactMutationRuleCompiler`이고, host 설정에 promotion된
   Proxy build(`Stage1Config.nfs_proxy`)가 없으면 rule set은 `blocked_operator(stage2_compiler_unavailable)`에서
   기다린다. `agent_repair[stage2]`의 한도(`stage2_repair_budget`)는 Stage 1과 같은 3회로 두었다(저장소 소유자 결정
@@ -703,17 +708,21 @@ bundle fixture로 대신한다.
 - **구현 범위(gate 이후):** `s2_gate`, `s2_campaign`, `s2_replaying`, `crash_review` 행, §5의 Stage 2 부분(binding
   변경, `route(to)`), §4의 반복·집계·늦은 evidence 규칙은 `tests/agent_pipeline/test_stage2_gate.py`가 가짜 Stage 2
   Judge와 가짜 Runner로 확인한다. Judge는 `components.Stage2Judge`(Q1·M1 gate, Q2·M1 campaign, replay comparator)로
-  주입한다. 그 artifact 기반 구현과 gate·campaign·replay를 실제로 실행하는 Runner backend는 아직 없다. 그래서 Stage 2
-  backend가 설정되지 않은 host(지금의 Stage 1 service)에서는 compile한 rule set이
+  주입한다. artifact 기반 구현은 `stage2.judge.ArtifactStage2Judge`이고, gate·campaign·replay를 실행하는 Runner
+  backend는 `stage2.engine.Stage2CommandEngine`이다(`agent_pipeline/stage2/README.md`). 둘 다
+  `tests/agent_pipeline/test_stage2_service.py`가 합성 host command로 `s1_reached`부터 `crash_review`까지 확인한다.
+  Stage 2 backend가 설정되지 않은 host(`Stage1Config.stage2` 없음)에서는 compile한 rule set이
   `blocked_operator(stage2_gate_unavailable)`에서 기다리고, `resume`은 그 rule set을 다시 compile한다. 이 reason과
   `stage2_compiler_unavailable`은 host 설정 사유라 표에 넣지 않는다. 표에 없는 reason `campaign_evidence`(campaign
   bundle의 host provenance 불일치)는 §4 표에 더했다.
-- `run_stage2`는 Stage 2 backend가 없는 동안 거짓만 받는다. 참이 되면 실행할 수 없는 Stage 2로 job이 자동으로
-  들어가기 때문이다.
+- `run_stage2`는 Stage 2 backend가 없는 동안 거짓만 받았다. 참이 되면 실행할 수 없는 Stage 2로 job이 자동으로
+  들어가기 때문이다. backend가 들어온 뒤로는 참도 받지만 기본값은 거짓이다. backend를 설정하지 않은 host에서 참인
+  policy의 job은 compile 뒤 `blocked_operator(stage2_gate_unavailable)`에서 기다린다.
 - **미구현:** gate verdict의 JudgeProfile 재판정(§5). 재평가는 Stage 1 Q1 verdict만 다시 판정한다. Stage 2 실행 전
   사람 승인도 없다(미결 그대로).
-- **미검증:** 검증 오라클 1–5는 `tests/agent_pipeline/`이 가짜 component로 확인한다(LLM과 VM 없음). 실제 Runner와
-  Agent provider, 실제 Stage 2 evidence로는 확인하지 않았다.
+- **미검증:** 검증 오라클 1–5는 `tests/agent_pipeline/`이 가짜 component로 확인한다(LLM과 VM 없음). Stage 2 backend는
+  실제 Runner, 봉인, judge kernel로 확인했지만 host command와 evidence는 합성이다. 실제 VM, Agent provider, 실제
+  Stage 2 evidence로는 확인하지 않았다.
 
 ## Agent 사용 지침
 

@@ -23,6 +23,7 @@ from .models import (
     BackendResult,
     CompletionReceipt,
     RecoverableTask,
+    SealedBundleFact,
     TaskBinding,
     TaskFacts,
     WorkLease,
@@ -102,6 +103,20 @@ CREATE TABLE IF NOT EXISTS runner_cleanup_reports (
     reported_at_ns INTEGER NOT NULL,
     acknowledged_at_ns INTEGER,
     PRIMARY KEY (task_id, generation),
+    FOREIGN KEY (task_id, generation)
+        REFERENCES runner_attempts(task_id, generation)
+);
+-- Bundles a task sealed while its lease ran (09 §8): a gate seals one per
+-- repetition, a campaign one per fuzz VM instance span.  Ordered by idx;
+-- a sealed task's final bundle is the last of them.
+CREATE TABLE IF NOT EXISTS runner_task_bundles (
+    task_id TEXT NOT NULL,
+    idx INTEGER NOT NULL CHECK (idx >= 0),
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    bundle_ref TEXT NOT NULL,
+    sealed_at_ns INTEGER NOT NULL,
+    PRIMARY KEY (task_id, idx),
+    UNIQUE (task_id, bundle_ref),
     FOREIGN KEY (task_id, generation)
         REFERENCES runner_attempts(task_id, generation)
 );
@@ -220,23 +235,32 @@ class DurableRunner:
             raise RunnerDataError("stored task input binding mismatch")
         return value
 
-    @staticmethod
-    def _status(row: sqlite3.Row | None) -> RunnerStatus:
+    def _bundle_refs(self, task_id: str) -> tuple[str, ...]:
+        rows = self._db.execute(
+            """SELECT bundle_ref FROM runner_task_bundles WHERE task_id = ?
+               ORDER BY idx""", (task_id,)).fetchall()
+        return tuple(row["bundle_ref"] for row in rows)
+
+    def _status(self, row: sqlite3.Row | None) -> RunnerStatus:
         if row is None:
             return RunnerStatus(state="unknown")
         lifecycle = row["lifecycle"]
+        streamed = self._bundle_refs(row["task_id"])
         if lifecycle in ("queued", "leased"):
-            return RunnerStatus(state="running")
+            return RunnerStatus(state="running", bundles=streamed)
         if lifecycle == "sealed":
             bundle = row["final_bundle_ref"]
             if not bundle:
                 raise RunnerDataError("sealed task has no bundle reference")
-            return RunnerStatus(state="sealed", bundles=(bundle,))
+            if streamed and streamed[-1] != bundle:
+                raise RunnerDataError("final bundle is not the last sealed one")
+            return RunnerStatus(state="sealed", bundles=streamed or (bundle,))
         if lifecycle == "ended_unsealed":
             reason = row["final_reason"]
             if not reason:
                 raise RunnerDataError("unsealed task has no reason")
-            return RunnerStatus(state="ended_unsealed", reason=reason)
+            return RunnerStatus(state="ended_unsealed", reason=reason,
+                                bundles=streamed)
         raise RunnerDataError(f"unknown task lifecycle: {lifecycle!r}")
 
     @staticmethod
@@ -551,6 +575,33 @@ class DurableRunner:
                 return True
             return False
 
+    def append_bundle(self, lease: WorkLease, bundle_ref: str) -> RunnerStatus:
+        """Record a bundle this lease sealed while it still runs (09 §8).
+
+        The bundle becomes part of ``status().bundles`` at once, in order,
+        so the Controller can take it before the task ends.  Fenced like a
+        completion: only the current lease generation may add one.  A
+        cancel requested meanwhile does not refuse it; the execution sealed
+        it before it stopped, and the Controller decides what it is worth.
+        Adding the same bundle twice is a no-op."""
+
+        lease = WorkLease.model_validate(lease)
+        bundle_ref = BackendResult(bundle_ref=bundle_ref).bundle_ref
+        task_id = lease.binding.task_id
+        with self._transaction():
+            now = self._now()
+            row = self._row(task_id)
+            self._require_current_lease(row, lease, now, allow_cancel=True)
+            known = self._bundle_refs(task_id)
+            if bundle_ref not in known:
+                self._db.execute(
+                    """INSERT INTO runner_task_bundles (task_id, idx,
+                        generation, bundle_ref, sealed_at_ns)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (task_id, len(known), lease.generation, bundle_ref, now))
+            status = self._status(self._row(task_id))
+        return status
+
     def complete(self, lease: WorkLease, result: BackendResult) -> RunnerStatus:
         lease = WorkLease.model_validate(lease)
         result = BackendResult.model_validate(result)
@@ -558,6 +609,11 @@ class DurableRunner:
             now = self._now()
             row = self._row(lease.binding.task_id)
             self._require_current_lease(row, lease, now, allow_cancel=True)
+            streamed = self._bundle_refs(lease.binding.task_id)
+            if result.bundle_ref is not None and streamed and \
+                    streamed[-1] != result.bundle_ref:
+                raise ValueError("a sealed result must name the last bundle "
+                                 "the lease added")
             if row["cancel_requested_at_ns"] is not None:
                 # The execution stopped after cancel(): settle the cancel.
                 self._end_unsealed(row, CANCELLED, now)
@@ -737,6 +793,19 @@ class DurableRunner:
             ):
                 raise RunnerDataError("completion receipt conflicts with task state")
             return receipt
+
+    def bundles(self, task_id: str) -> tuple[SealedBundleFact, ...]:
+        """Every bundle the task's lease added, in order.  A Stage 1 task
+        that sealed through ``complete`` alone has none here."""
+        task_id = self._task_id(task_id)
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT * FROM runner_task_bundles WHERE task_id = ?
+                   ORDER BY idx""", (task_id,)).fetchall()
+        return tuple(SealedBundleFact(
+            task_id=row["task_id"], index=row["idx"],
+            generation=row["generation"], bundle_ref=row["bundle_ref"],
+            sealed_at_ns=row["sealed_at_ns"]) for row in rows)
 
     def attempts(self, task_id: str) -> tuple[AttemptFact, ...]:
         task_id = self._task_id(task_id)
