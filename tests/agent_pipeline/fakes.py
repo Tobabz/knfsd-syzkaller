@@ -201,6 +201,8 @@ class FakeStage2:
         self.gates: dict[str, dict] = {}
         self.segments: dict[str, dict] = {}
         self.replays: dict[str, tuple[str, str | None]] = {}
+        #: Bundles whose verdict wrongly names another bundle.
+        self.misnamed: dict[str, str] = {}
 
     def matches_execution(self, bundle_ref, *, job_id, task_id) -> bool:
         return bundle_ref in self.gates or bundle_ref in self.segments or \
@@ -218,7 +220,7 @@ class FakeStage2:
             evidence_manifest_sha256=sha("manifest", bundle_ref),
             status=g["status"], reason=g["reason"], gap_signal=g["gap"])
         return GateRun(
-            bundle_ref=bundle_ref, q1=q1, m1_verdict_id=f"m1-{bundle_ref}",
+            bundle_ref=self.misnamed.get(bundle_ref, bundle_ref), q1=q1, m1_verdict_id=f"m1-{bundle_ref}",
             rules=tuple(RuleM1(rule_id=f"r{n:03d}", intent_id=i, status=st)
                         for n, (i, st, _) in enumerate(g["intents"])),
             intents=tuple(IntentM1(intent_id=i, status=st,
@@ -228,7 +230,8 @@ class FakeStage2:
 
     def judge_campaign(self, bundle_ref, *, candidate_id,
                        compiled) -> CampaignSegment:
-        return CampaignSegment(bundle_ref=bundle_ref,
+        return CampaignSegment(bundle_ref=self.misnamed.get(bundle_ref,
+                                                            bundle_ref),
                                q2_verdict_id=f"q2-{bundle_ref}",
                                m1_verdict_id=f"m1-{bundle_ref}",
                                **self.segments[bundle_ref])

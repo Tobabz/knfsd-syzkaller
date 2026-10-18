@@ -1173,6 +1173,12 @@ class Machine:
                 bundle, plan_ref=j.plan_ref,
                 candidate_id=j.candidate.candidate_id,
                 compiled=j.compiled, versions=j.judge_versions)
+            if run.bundle_ref != bundle:
+                # A verdict is used only for the bundle whose provenance
+                # was just checked.
+                c.reason = "gate_judge_bundle_mismatch"
+                self._block(c, BlockedReason.Q1_EVIDENCE, gate)
+                return True
             runs.append(run)
             c.verdicts.append(run.q1)
             c.consumed.extend((run.q1.verdict_id, run.m1_verdict_id))
@@ -1318,6 +1324,14 @@ class Machine:
         seg = self.env.stage2.judge_campaign(
             e.bundle_ref, candidate_id=j.candidate.candidate_id,
             compiled=cursor.compiled)
+        if seg.bundle_ref != e.bundle_ref:
+            # Never replay or triage a bundle other than the one whose
+            # provenance was just checked.
+            c.reason = "campaign_judge_bundle_mismatch"
+            if live:
+                self._block(c, BlockedReason.CAMPAIGN_EVIDENCE,
+                            Target(kind=TargetKind.CAMPAIGN))
+            return True
         c.consumed.extend((seg.q2_verdict_id, seg.m1_verdict_id))
         if live:
             self._campaign_segment(c, cursor, e.task_id, seg)

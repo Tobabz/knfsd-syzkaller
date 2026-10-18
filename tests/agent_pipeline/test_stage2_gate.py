@@ -337,6 +337,18 @@ def test_gate_bundle_of_another_task_is_q1_evidence(world):
     assert j.resume_point.kind is TargetKind.GATE
 
 
+def test_gate_verdict_for_another_bundle_is_q1_evidence(world):
+    job_id = in_gate(world)
+    task = pending(world, job_id).task_id
+    world.stage2.misnamed[f"gate-{task}-0"] = "stale-bundle"
+    gate(world, job_id, (Q1Status.REACHED, None, [BASE]))
+    j = world.job(job_id)
+    assert (j.state_reason, j.resume_point.kind) == (
+        BlockedReason.Q1_EVIDENCE.value, TargetKind.GATE)
+    assert j.campaign is None and not j.gate_runs
+    same(world, job_id)
+
+
 # ---------------------------------------------------------------- campaign
 
 
@@ -384,6 +396,19 @@ def test_unknown_q2_status_is_unexpected(world):
     j = world.job(job_id)
     assert j.state_reason == "unexpected_event"
     assert j.resume_point.kind is TargetKind.CAMPAIGN
+
+
+def test_campaign_verdict_for_another_bundle_is_never_replayed(world):
+    job_id = in_campaign(world)
+    task = pending(world, job_id).task_id
+    world.stage2.misnamed[f"seg-{task}-0"] = "stale-bundle"
+    segment(world, job_id, q2="observed", applied=("r000",))
+    j = world.job(job_id)
+    assert (j.state_reason, j.resume_point.kind) == (
+        BlockedReason.CAMPAIGN_EVIDENCE.value, TargetKind.CAMPAIGN)
+    assert j.replay is None and not j.triage
+    assert j.campaign.tally.segments == 0
+    same(world, job_id)
 
 
 def test_applied_crash_replays_and_waits_for_review(world):

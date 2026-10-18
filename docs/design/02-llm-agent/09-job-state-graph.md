@@ -244,7 +244,7 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s2_gate` | gate Q1 `INCONCLUSIVE(unsupported_attribution)` | `blocked_harness_gap(remote_kcov_attribution, remote_kcov.context.<expected_context>)` | — | `01` §3, `06` §13 |
 | `s2_gate` | Q1 `REACHED`, 평가한 rule 중 M1 `INCONCLUSIVE`가 있음 | `s2_gate` 재실행 | runtime_retry | `01` §3 |
 | `s2_gate` | Q1 `REACHED`, `targets_baseline_traffic=true`인 intent의 M1이 `NOT_APPLIED` | `s2_strategy` (repair, `gate_not_applied`) | agent_repair | `01` §3, `08` §16 |
-| `s2_gate` | 봉인 bundle이 이 task의 것이라는 host provenance가 없음 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
+| `s2_gate` | 봉인 bundle이 이 task의 것이라는 host provenance가 없거나, Judge 결과가 그 bundle이 아닌 다른 bundle을 가리킴 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
 | `s2_gate` | 그 밖 | `s2_campaign` (새 campaign) | — | `01` §3 |
 | `s2_campaign` | Q2 `OBSERVED`, `CrashContextWindow`에 `APPLIED` rule이 있음 | campaign 정지, `s2_replaying` | — | `01` §3, §12 |
 | `s2_campaign` | Q2 `OBSERVED`이고 window에 `APPLIED` rule이 없음, 또는 Q2 `INCONCLUSIVE` | 상태 유지. crash evidence를 보존하고 triage 항목을 만든다 | — | `01` §3, §12 |
@@ -253,7 +253,7 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation에서 `APPLIED`, Q2 미관측 | campaign 정지, `s2_strategy` (repair, `campaign_no_signal`) | agent_repair | `01` §12 |
 | `s2_campaign` | JobPolicy 임계값: 도달한 generation의 M1 `INCONCLUSIVE` 반복 | campaign 정지, `blocked_operator(evidence_path)` | — | `01` §3 |
 | `s2_campaign` | fuzz budget 소진 | campaign 정지, `blocked_operator(campaign_budget_exhausted)` | — | `01` §11.1 |
-| `s2_campaign` | 봉인 bundle이 이 task의 것이라는 host provenance가 없음 | campaign 정지, `blocked_operator(campaign_evidence)` | — | `01` §11.1 |
+| `s2_campaign` | 봉인 bundle이 이 task의 것이라는 host provenance가 없거나, Judge 결과가 그 bundle이 아닌 다른 bundle을 가리킴 | campaign 정지, `blocked_operator(campaign_evidence)` | — | `01` §11.1 |
 | `s2_campaign` | 봉인 bundle 없는 Runner 종료. 그 전에 봉인한 bundle은 위 행대로 처리한다 | `s2_campaign` (같은 rule set으로 campaign을 이어 가는 새 task) | runtime_retry | `01` §11.2 |
 | `s2_campaign` | campaign task가 마지막 bundle을 봉인하고 끝남(`sealed`). 그 bundle을 위 행대로 먼저 처리하고, campaign이 정지하지 않았을 때 | fuzz budget이 남았으면 `s2_campaign` (campaign을 이어 가는 새 task), 아니면 위의 fuzz budget 소진 행 | — | `01` §11.1 |
 | `s2_replaying` | 비교 verdict(`REPLAY_EQUIVALENT`, `REPLAY_DIVERGED`, `REPLAY_INCONCLUSIVE`, `REPLAY_INVALID`) | `crash_review`. `resume_point`는 `s2_campaign`이다. campaign의 binding(identity, `hcap_revision`)이 job의 지금 binding과 다르면 `s2_campaign`에 §5의 해당 변경 행을 적용한 지점이다 | — | `../03-nfs-proxy/05` §29, `01` §11.2 |
