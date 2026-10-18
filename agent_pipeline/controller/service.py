@@ -254,6 +254,11 @@ class Controller:
             rematerialize_authority=True,
             harness_authority_current=self._authority_current(job, binding)))
 
+    def route(self, job_id: str, to: str) -> Outcome | None:
+        """09 §5 route(to) on blocked_operator(gate_regression): `to` is
+        "gate" or "strategy"."""
+        return self.operator(job_id, f"route_{to}")
+
     def start_stage2(self, job_id: str) -> Outcome | None:
         """09 §4: an operator starts Stage 2 of a job in s1_reached.  Until
         JobPolicy.run_stage2 may be true this is the only way in."""
@@ -328,9 +333,12 @@ class Controller:
         if st.state in FINAL:
             self._confirm_cancel(job_id, task_id, st)
         else:
+            self._take_bundles(job_id, task_id, st)
             self._cancel(job_id, task_id)
 
     def _confirm_cancel(self, job_id: str, task_id: str, st) -> None:
+        # Bundles sealed before the task ended are taken first (09 §4).
+        self._take_bundles(job_id, task_id, st)
         self._apply(job_id, ev.CancelConfirmed(
             task_id=task_id,
             cleanup_unconfirmed=st.reason == CLEANUP_UNCONFIRMED))
@@ -588,10 +596,11 @@ class Controller:
             job = self.store.job(job_id)
             p = job.pending_task
             # Idempotent by task_id: sending it again never starts a second
-            # run (09 §8).
-            st = self.runner.submit(p.task_id, RunnerInput(
-                job_id=job_id, harness_ref=job.harness.harness_ref,
-                execution_harness_id=job.harness.execution_harness_id))
+            # run (09 §8).  A Stage 2 task carries its own input.
+            st = self.runner.submit(
+                p.task_id, p.runner_input or RunnerInput(
+                    job_id=job_id, harness_ref=job.harness.harness_ref,
+                    execution_harness_id=job.harness.execution_harness_id))
             self._take_status(job_id, p.task_id, st)
 
     @staticmethod
@@ -612,7 +621,8 @@ class Controller:
         """
 
         pending = job.pending_task
-        if pending is None or pending.kind is not TaskKind.RUNNER:
+        if pending is None or pending.kind is not TaskKind.RUNNER or \
+                pending.runner_input is not None:
             return False
         task_input = self._runner_input(job)
         canonical = runner_input_digest(task_input)
@@ -748,11 +758,30 @@ class Controller:
             self._confirm_cancel(job_id, task_id, st)
 
     def _take_status(self, job_id: str, task_id: str, st) -> None:
+        self._take_bundles(job_id, task_id, st)
         if st.state in FINAL:
+            job = self.store.job(job_id)
+            stage2 = job.state in (JobState.S2_GATE, JobState.S2_CAMPAIGN)
             self._apply(job_id, ev.RunnerFinished(
                 task_id=task_id, state=st.state,
                 bundle_ref=st.bundles[-1] if st.bundles and
-                st.state == "sealed" else None, reason=st.reason))
+                st.state == "sealed" else None, reason=st.reason,
+                bundle_refs=tuple(st.bundles) if stage2 else ()))
+
+    def _take_bundles(self, job_id: str, task_id: str, st) -> None:
+        """Hand a campaign task's bundles to the job in order, each once
+        (09 §8).  A transition can stop the campaign and settle the task
+        in between; the job's cursor says what is still to take."""
+        while True:
+            job = self.store.job(job_id)
+            cursor = next((x for x in job.bundle_cursors
+                           if x.task_id == task_id), None)
+            if cursor is None or cursor.delivered >= len(st.bundles):
+                return
+            if self._apply(job_id, ev.RunnerBundleSealed(
+                    task_id=task_id, index=cursor.delivered,
+                    bundle_ref=st.bundles[cursor.delivered])) is None:
+                return
 
 
 def job_of(task_id: str) -> str:

@@ -1,5 +1,4 @@
-"""The job state machine (09 §2-§6): Stage 1 and Stage 2 up to the
-Mutation Rule Compiler.
+"""The job state machine (09 §2-§6): Stage 1 and Stage 2.
 
 handle(job, event) is a function of the job, the event, the job's JobPolicy
 and the deterministic components.  It returns the next job and what the
@@ -18,19 +17,22 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from ..components import (HcapChecker, Materializer, MutationRuleCompiler,
-                          Q1Judge)
+                          Q1Judge, Stage2Judge)
 from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
-                         HOST_AUTHORITY_UNAVAILABLE, CompiledRuleSet,
-                         HcapCheck,
+                         HOST_AUTHORITY_UNAVAILABLE, M1_STATUSES,
+                         Q2_STATUSES, REPLAY_EVIDENCE_REJECTED,
+                         REPLAY_STATUSES, CampaignSegment, CompiledRuleSet,
+                         GateRun, HcapCheck,
                          NEUTRAL_CONTROL_UNAVAILABLE, TASK_VARIANTS, AgentTask,
                          GapClass, GapRef, HarnessBinding, JobPolicy,
                          MaterializationHcapAuthority, MaterializeRejected,
                          Q1Result, Q1Status, kernel_revision_gap)
 from . import events as ev
 from .records import (STAGE2_CAUSES, TERMINAL, WAITING, BlockedReason,
-                      ConsumedVerdict, Job, JobState, PendingTask,
-                      RepairCause, RepairInput, Stage2Input, Target,
-                      TargetKind, TaskKind)
+                      BundleCursor, Campaign, CampaignTally, ConsumedVerdict,
+                      CrashRef, Job, JobState, PendingTask, RepairCause,
+                      RepairInput, Replay, Stage2Input, Target, TargetKind,
+                      TaskKind, TriageItem)
 from .tasks import (CLEANUP_UNCONFIRMED, RunnerInput, agent_input_digest,
                     legacy_runner_input_digest, runner_input_digest)
 
@@ -43,6 +45,16 @@ AGENT_KINDS = {AgentTask.CANDIDATE_ANALYSIS: TargetKind.ANALYSIS,
 TASK_OF_KIND = {k: t for t, k in AGENT_KINDS.items()}
 STATE_OF_TASK = {t: s for s, t in AGENT_STATES.items()}
 WAITING_KINDS = {TargetKind.BLOCKED_OPERATOR, TargetKind.BLOCKED_HARNESS_GAP}
+#: States that wait on a Runner task, and the target that re-enters each.
+RUNNER_STATES = {JobState.S1_RUNNING: TargetKind.RUNNING,
+                 JobState.S2_GATE: TargetKind.GATE,
+                 JobState.S2_CAMPAIGN: TargetKind.CAMPAIGN,
+                 JobState.S2_REPLAYING: TargetKind.REPLAY}
+RERUN_KINDS = frozenset(RUNNER_STATES.values())
+#: Mutation Strategy repairs a campaign stop starts; a late APPLIED crash of
+#: that campaign stops them for review (01 §12).
+CAMPAIGN_REPAIRS = frozenset({RepairCause.CAMPAIGN_NOT_APPLIED,
+                              RepairCause.CAMPAIGN_NO_SIGNAL})
 
 #: Counter an operator `resume` puts back to 0 (09 §5, §6).
 RESET_ON_RESUME = {
@@ -50,6 +62,12 @@ RESET_ON_RESUME = {
     BlockedReason.STAGE2_REPAIR_BUDGET: "agent_repair_stage2",
     BlockedReason.AGENT_FAILURE: "agent_retry",
     BlockedReason.RUNTIME_RETRY_EXHAUSTED: "runtime_retry",
+}
+#: Campaign tally counts an operator `resume` puts back to 0: the count
+#: that stopped the campaign would otherwise stop it again at once.
+TALLY_RESET_ON_RESUME = {
+    BlockedReason.EVIDENCE_PATH: "hypothesis_inconclusive",
+    BlockedReason.CAMPAIGN_BUDGET_EXHAUSTED: "executions",
 }
 
 
@@ -83,6 +101,10 @@ class Env:
     #: None until a Mutation Rule Compiler is configured; a rule set then
     #: waits in blocked_operator(stage2_compiler_unavailable).
     compiler: MutationRuleCompiler | None = None
+    #: None until a Stage 2 execution backend (Runner steps and their
+    #: judges) is configured; a compiled rule set then waits in
+    #: blocked_operator(stage2_gate_unavailable).
+    stage2: Stage2Judge | None = None
 
 
 @dataclass
@@ -114,7 +136,7 @@ class Machine:
         j = job.model_copy(deep=True)
         if j.state in TERMINAL and not isinstance(
                 event, (ev.RunnerFinished, ev.CancelConfirmed,
-                        ev.CleanupUnconfirmed)):
+                        ev.CleanupUnconfirmed, ev.RunnerBundleSealed)):
             return None
         c = _Call(j, self.env.policy(j.job_policy_id))
         if not getattr(self, "_on_" + event.type)(c, event):
@@ -249,19 +271,27 @@ class Machine:
         if e.task_id in j.cancelling_tasks:
             j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
                                        if t != e.task_id)
+            self._end_stream(j, e.task_id)
             c.reason = "cancel_settled"
             if e.reason == CLEANUP_UNCONFIRMED:
                 self._cleanup_unconfirmed(c, e.task_id)
             return True
         p = j.pending_task
         if not self._is_pending(p, TaskKind.RUNNER, e.task_id) or \
-                j.state is not JobState.S1_RUNNING:
+                j.state not in RUNNER_STATES:
             return False
         j.pending_task = None
+        cursor = self._end_stream(j, e.task_id)
         if e.reason == CLEANUP_UNCONFIRMED:
             # Not a runtime failure to retry: the execution may still run.
             self._cleanup_unconfirmed(c, e.task_id)
             return True
+        if j.state is JobState.S2_GATE:
+            return self._gate_finished(c, p, e)
+        if j.state is JobState.S2_CAMPAIGN:
+            return self._campaign_finished(c, cursor, e)
+        if j.state is JobState.S2_REPLAYING:
+            return self._replay_finished(c, e)
         if e.state == "ended_unsealed" or not e.bundle_ref:
             c.reason = f"runner_ended_unsealed:{e.reason or ''}"
             self._goto(c, Target(kind=TargetKind.RUNNING, rerun=True))
@@ -375,6 +405,19 @@ class Machine:
         if new == j.binding and (not rematerialize_authority or
                                  not harness_authority_stale(j, new)):
             return False
+        base = self._waiting_base(j) if j.state in WAITING else None
+        if j.state is JobState.S2_REPLAYING or (
+                j.replay is not None and base is not None and
+                base.kind is TargetKind.REPLAY):
+            # 09 §5: the replay finishes on the crash's identity and its
+            # recorded rule set; the new binding only moves where the
+            # job goes after crash_review.
+            j.replay = j.replay.model_copy(update={"resume": self._rebind(
+                c, new, j.replay.resume,
+                rematerialize_authority=rematerialize_authority,
+                authority_current=authority_current)})
+            c.reason = "binding_changed"
+            return True
         if j.state in WAITING:
             base = self._waiting_base(j)
             self._set_resume(c, self._rebind(
@@ -492,7 +535,11 @@ class Machine:
         # 09 §5, §6: a rerun this event asks for spends no budget, also
         # when it waits in a resume point first.
         t = self._external(t)
-        if j.state in WAITING or j.state is JobState.RETRY_PENDING:
+        if j.state is JobState.S2_REPLAYING:
+            # The replay finishes; the re-judge decides where the job
+            # goes after crash_review (09 §5).
+            j.replay = j.replay.model_copy(update={"resume": t})
+        elif j.state in WAITING or j.state is JobState.RETRY_PENDING:
             self._set_resume(c, t, self._waiting_base(j))
         else:
             self._goto(c, t)
@@ -500,7 +547,7 @@ class Machine:
 
     @classmethod
     def _external(cls, t: Target) -> Target:
-        if t.kind is TargetKind.RUNNING and t.rerun:
+        if t.kind in RERUN_KINDS and t.rerun:
             return t.model_copy(update={"external": True})
         if t.inner is not None:
             return t.model_copy(update={"inner": cls._external(t.inner)})
@@ -542,13 +589,36 @@ class Machine:
                 return False
             self._start_stage2(c)
             return True
+        if e.action in ("route_gate", "route_strategy"):
+            return self._route(c, e.action)
+        if e.action == "resume" and j.state is JobState.CRASH_REVIEW:
+            t = j.resume_point
+            if t is None:
+                return False
+            j.resume_point = None
+            j.state_reason = None
+            c.reason = "operator_resume"
+            if j.crash_queue:
+                # 09 §4: an APPLIED crash that arrived during the review is
+                # replayed and reviewed before the campaign goes on.
+                crash, j.crash_queue = j.crash_queue[0], j.crash_queue[1:]
+                self._enter_replay(c, crash, t)
+            else:
+                self._goto(c, t)
+            return True
         if e.action == "resume":
             if j.state is not JobState.BLOCKED_OPERATOR:
                 return False
-            counter = RESET_ON_RESUME.get(BlockedReason(j.state_reason))
+            blocked = BlockedReason(j.state_reason)
+            counter = RESET_ON_RESUME.get(blocked)
             if counter:
                 j.counters = j.counters.model_copy(update={counter: 0})
-            if j.state_reason == BlockedReason.EXECUTION_CLEANUP.value:
+            tally = TALLY_RESET_ON_RESUME.get(blocked)
+            if tally and j.campaign is not None:
+                j.campaign = j.campaign.model_copy(update={
+                    "tally": j.campaign.tally.model_copy(
+                        update={tally: 0})})
+            if blocked is BlockedReason.EXECUTION_CLEANUP:
                 # The operator confirmed the executions are gone.
                 j.uncleaned_tasks = ()
             t = j.resume_point
@@ -559,10 +629,13 @@ class Machine:
             c.reason = "operator_resume"
             self._goto(c, t)
             return True
+        if e.action not in ("close", "cancel"):
+            return False
+        reviewed = j.state is JobState.CRASH_REVIEW and e.action == "close"
         self._drop_task(c)
         j.state = JobState.CLOSED
-        j.state_reason = "operator_closed" if e.action == "close" \
-            else "cancelled"
+        j.state_reason = "crash_reported" if reviewed else \
+            "operator_closed" if e.action == "close" else "cancelled"
         j.resume_point = None
         c.reason = j.state_reason
         return True
@@ -573,6 +646,7 @@ class Machine:
             return False
         j.cancelling_tasks = tuple(t for t in j.cancelling_tasks
                                    if t != e.task_id)
+        self._end_stream(j, e.task_id)
         c.reason = "cancel_settled"
         if e.cleanup_unconfirmed:
             self._cleanup_unconfirmed(c, e.task_id)
@@ -609,7 +683,7 @@ class Machine:
 
     def _goto(self, c: _Call, t: Target, external: bool = False) -> None:
         j = c.job
-        if not (t.kind is TargetKind.RUNNING and t.rerun):
+        if not (t.kind in RERUN_KINDS and t.rerun):
             # 09 §6: runtime_retry ends with any row that is not a rerun.
             j.counters = j.counters.model_copy(update={"runtime_retry": 0})
         if t.kind in TASK_OF_KIND:
@@ -635,7 +709,7 @@ class Machine:
                         "agent_repair_stage2", c.policy.stage2_repair_budget,
                         BlockedReason.STAGE2_REPAIR_BUDGET)
                     previous = (j.analysis_ref, j.plan_ref, j.rule_set_ref)
-                    evidence = (j.stage2_basis.bundle_ref,)
+                    evidence = (j.stage2_basis.bundle_ref,) + t.evidence
                 else:
                     counter, budget, exhausted = (
                         "agent_repair_stage1", c.policy.stage1_repair_budget,
@@ -664,6 +738,16 @@ class Machine:
             self._goto(c, self._materialize(c), external)
         elif t.kind is TargetKind.RUNNING:
             self._enter_running(c, t.rerun, external or t.external)
+        elif t.kind is TargetKind.GATE:
+            self._enter_gate(c, t.rerun, external or t.external)
+        elif t.kind is TargetKind.CAMPAIGN:
+            self._enter_campaign(c, t.rerun, external or t.external)
+        elif t.kind is TargetKind.REPLAY:
+            if j.replay is None:
+                self._unexpected(c, Target(kind=TargetKind.COMPILE))
+                return
+            self._enter_replay(c, j.replay.crash, j.replay.resume, t.rerun,
+                               external or t.external)
         elif t.kind is TargetKind.REACHED:
             self._drop_task(c)
             lv = j.last_verdict
@@ -773,6 +857,10 @@ class Machine:
         j.stage2_basis = None
         j.rule_set_ref = None
         j.compiled = None
+        j.gate_runs = ()
+        j.campaign = None
+        j.replay = None
+        j.crash_queue = ()
 
     def _compile(self, c: _Call) -> Target:
         """The Mutation Rule Compiler on the stored rule set (09 §4, the
@@ -795,10 +883,12 @@ class Machine:
                 return self._unexpected_target(TargetKind.COMPILE)
             j.compiled = r
             c.consumed.append(r.compiled_ref)
-            # s2_gate is the next state (09 §4); it is not built yet.
-            return Target(kind=TargetKind.BLOCKED_OPERATOR,
-                          reason=BlockedReason.STAGE2_GATE_UNAVAILABLE,
-                          inner=here)
+            if self.env.stage2 is None:
+                # No Stage 2 execution backend on this host.
+                return Target(kind=TargetKind.BLOCKED_OPERATOR,
+                              reason=BlockedReason.STAGE2_GATE_UNAVAILABLE,
+                              inner=here)
+            return Target(kind=TargetKind.GATE)
         if r.reason in COMPILER_AGENT_FIXABLE:
             return Target(kind=TargetKind.STRATEGY,
                           cause=RepairCause.COMPILER_REJECTED,
@@ -895,11 +985,11 @@ class Machine:
                 return _plan_check_target(chk, RepairCause.HCAP_CHANGED)
             if rematerialize_authority and keep:
                 self._keep_harness(j, new)
-                return base
+                return self._recompile(base)
             if rematerialize_authority:
                 j.harness = None
                 return self._materialize(c, RepairCause.HCAP_CHANGED)
-            return base
+            return self._recompile(base)
         if rematerialize_authority and stale and base.kind in (
                 TargetKind.ANALYSIS, TargetKind.PLANNING):
             # The active Agent task will replace this inert harness.
@@ -919,6 +1009,14 @@ class Machine:
         if rematerialize_authority and stale:
             j.harness = None
             return self._unexpected_target(TargetKind.MATERIALIZE)
+        return base
+
+    @staticmethod
+    def _recompile(base: Target) -> Target:
+        """09 §5: after an HCAP change a point that runs the compiled rule
+        set compiles the stored rule set again and goes through the gate."""
+        if base.kind in (TargetKind.GATE, TargetKind.CAMPAIGN):
+            return Target(kind=TargetKind.COMPILE)
         return base
 
     @staticmethod
@@ -943,6 +1041,8 @@ class Machine:
         if j.state is JobState.BLOCKED_OPERATOR:
             here = Target(kind=TargetKind.BLOCKED_OPERATOR,
                           reason=BlockedReason(j.state_reason))
+        elif j.state is JobState.CRASH_REVIEW:
+            here = None
         else:
             here = Target(kind=TargetKind.BLOCKED_HARNESS_GAP, gap=j.gap)
         place = t.model_copy(update={"inner": None})
@@ -954,6 +1054,469 @@ class Machine:
             j.resume_point = t.inner
         else:
             j.resume_point = t
+
+
+    # ------------------------------------------------------------ Stage 2
+
+    def _route(self, c: _Call, action: str) -> bool:
+        """09 §5 operator route(to) on blocked_operator(gate_regression).
+        Refused, and recorded, once a re-evaluation event moved the resume
+        point away from the gate it blocked at."""
+        j = c.job
+        if j.state is not JobState.BLOCKED_OPERATOR or \
+                j.state_reason != BlockedReason.GATE_REGRESSION.value:
+            return False
+        if j.resume_point != Target(kind=TargetKind.GATE):
+            c.reason = "route_refused"
+            return True
+        j.resume_point = None
+        j.state_reason = None
+        c.reason = action
+        self._goto(c, Target(kind=TargetKind.GATE if action == "route_gate"
+                             else TargetKind.STRATEGY))
+        return True
+
+    @staticmethod
+    def _end_stream(j: Job, task_id: str) -> BundleCursor | None:
+        """The task's bundle list is final: stop tracking it."""
+        found = None
+        rest = []
+        for cur in j.bundle_cursors:
+            if cur.task_id == task_id:
+                found = cur
+            else:
+                rest.append(cur)
+        j.bundle_cursors = tuple(rest)
+        return found
+
+    def _runner_free(self, c: _Call, resume: Target) -> bool:
+        """09 §8: no Runner work while an earlier execution may still run,
+        however the job got here."""
+        if c.job.uncleaned_tasks:
+            self._block(c, BlockedReason.EXECUTION_CLEANUP, resume)
+            return False
+        return True
+
+    def _charge_rerun(self, c: _Call, rerun: bool, external: bool,
+                      resume: Target) -> bool:
+        """09 §6 runtime_retry for a rerun row; False when exhausted."""
+        j = c.job
+        if not rerun or external:
+            return True
+        n = j.counters.runtime_retry
+        if n >= c.policy.runtime_retry_limit:
+            self._block(c, BlockedReason.RUNTIME_RETRY_EXHAUSTED, resume)
+            return False
+        j.counters = j.counters.model_copy(update={"runtime_retry": n + 1})
+        return True
+
+    def _runner_task(self, c: _Call, task_input: RunnerInput,
+                     state: JobState, rerun: bool) -> str:
+        j = c.job
+        self._drop_task(c)
+        task_id = self._mint(j)
+        j.pending_task = PendingTask(
+            task_id=task_id, kind=TaskKind.RUNNER,
+            input_digest=runner_input_digest(task_input),
+            runner_input=task_input)
+        j.state = state
+        j.state_reason = "rerun" if rerun else None
+        j.resume_point = None
+        j.gap = None
+        return task_id
+
+    def _enter_gate(self, c: _Call, rerun: bool, external: bool) -> None:
+        """09 §4 s2_gate: the Stage 1 scenario and its neutral run with the
+        compiled rule set installed (01 §3)."""
+        j = c.job
+        again = Target(kind=TargetKind.GATE, rerun=rerun, external=external)
+        if j.compiled is None or j.harness is None or \
+                j.stage2_basis is None:
+            self._unexpected(c, Target(kind=TargetKind.COMPILE))
+            return
+        if not self._runner_free(c, again) or \
+                not self._charge_rerun(c, rerun, external, again):
+            return
+        if not rerun:
+            j.gate_runs = ()
+        j.campaign = None
+        j.replay = None
+        j.crash_queue = ()
+        self._runner_task(c, RunnerInput(
+            job_id=j.job_id, harness_ref=j.harness.harness_ref,
+            execution_harness_id=j.harness.execution_harness_id,
+            step="gate", compiled_ref=j.compiled.compiled_ref,
+            gate_repetitions=c.policy.gate_repetitions),
+            JobState.S2_GATE, rerun)
+
+    def _gate_finished(self, c: _Call, p: PendingTask,
+                       e: ev.RunnerFinished) -> bool:
+        """09 §4, the s2_gate rows, over every repetition (01 §3)."""
+        j = c.job
+        gate = Target(kind=TargetKind.GATE)
+        bundles = e.bundle_refs
+        if e.state == "ended_unsealed" or not bundles:
+            c.reason = f"runner_ended_unsealed:{e.reason or ''}"
+            self._goto(c, Target(kind=TargetKind.GATE, rerun=True))
+            return True
+        wanted = p.runner_input.gate_repetitions if p.runner_input else None
+        if len(bundles) != wanted:
+            return self._unexpected(c, gate)
+        runs = []
+        for bundle in bundles:
+            if not self.env.stage2.matches_execution(
+                    bundle, job_id=j.job_id, task_id=e.task_id):
+                c.reason = "gate_execution_mismatch"
+                self._block(c, BlockedReason.Q1_EVIDENCE, gate)
+                return True
+            run = self.env.stage2.judge_gate(
+                bundle, plan_ref=j.plan_ref,
+                candidate_id=j.candidate.candidate_id,
+                compiled=j.compiled, versions=j.judge_versions)
+            if run.bundle_ref != bundle:
+                # A verdict is used only for the bundle whose provenance
+                # was just checked.
+                c.reason = "gate_judge_bundle_mismatch"
+                self._block(c, BlockedReason.Q1_EVIDENCE, gate)
+                return True
+            runs.append(run)
+            c.verdicts.append(run.q1)
+            c.consumed.extend((run.q1.verdict_id, run.m1_verdict_id))
+        j.gate_runs = tuple(runs)
+        t = None
+        rank = None
+        for run in runs:
+            r, row = self._gate_row(c, run)
+            if rank is None or r < rank:
+                rank, t = r, row
+        if rank < 0:
+            c.reason = "unexpected_event"
+        if t is None:
+            c.reason = "gate_passed"
+            self._start_campaign(c)
+        else:
+            self._goto(c, t)
+        return True
+
+    def _gate_row(self, c: _Call, run: GateRun
+                  ) -> tuple[int, Target | None]:
+        """The 01 §3 gate table for one repetition: its rank (the topmost
+        row of all repetitions decides) and where it sends the job; None
+        starts the campaign."""
+        j = c.job
+        gate = Target(kind=TargetKind.GATE)
+        q = run.q1
+        if q.candidate_id != j.candidate.candidate_id or \
+                q.execution_harness_id != j.binding.execution_harness_id:
+            return 0, Target(kind=TargetKind.BLOCKED_OPERATOR,
+                             reason=BlockedReason.Q1_EVIDENCE, inner=gate)
+        if q.status is Q1Status.NOT_REACHED:
+            return 1, Target(kind=TargetKind.BLOCKED_OPERATOR,
+                             reason=BlockedReason.GATE_REGRESSION, inner=gate)
+        if q.status is Q1Status.INCONCLUSIVE:
+            if q.reason in ("infra", "loss"):
+                return 2, Target(kind=TargetKind.GATE, rerun=True)
+            if q.reason in ("evidence", "mapping"):
+                return 2, Target(kind=TargetKind.BLOCKED_OPERATOR,
+                                 reason=BlockedReason("q1_" + q.reason),
+                                 inner=gate)
+            g = q.gap_signal
+            if q.reason == "unsupported_attribution" and g is not None and \
+                    g.gap_class is GapClass.REMOTE_KCOV_ATTRIBUTION and \
+                    g.missing_capability_id.startswith(
+                        "remote_kcov.context."):
+                return 2, Target(kind=TargetKind.BLOCKED_HARNESS_GAP, gap=g,
+                                 inner=gate)
+            return -1, self._unexpected_target(TargetKind.GATE)
+        statuses = [r.status for r in run.rules] + \
+            [i.status for i in run.intents]
+        if any(st not in M1_STATUSES for st in statuses):
+            return -1, self._unexpected_target(TargetKind.GATE)
+        if any(r.status == "inconclusive" for r in run.rules):
+            return 3, Target(kind=TargetKind.GATE, rerun=True)
+        if any(i.targets_baseline_traffic and i.status == "not_applied"
+               for i in run.intents):
+            return 4, Target(kind=TargetKind.STRATEGY,
+                             cause=RepairCause.GATE_NOT_APPLIED,
+                             findings=(run.model_dump_json(),),
+                             evidence=(run.bundle_ref,))
+        return 5, None
+
+    def _start_campaign(self, c: _Call) -> None:
+        """The gate passed: a new Stage2Campaign on the job's harness and
+        compiled rule set (01 §3)."""
+        j = c.job
+        j.task_seq += 1
+        j.campaign = Campaign(
+            campaign_id=f"{j.job_id}.c{j.task_seq}",
+            compiled_ref=j.compiled.compiled_ref,
+            rule_set_ref=j.compiled.rule_set_ref, binding=j.binding,
+            harness_ref=j.harness.harness_ref,
+            execution_harness_id=j.harness.execution_harness_id,
+            gate_consumed=tuple(c.consumed))
+        self._goto(c, Target(kind=TargetKind.CAMPAIGN))
+
+    def _enter_campaign(self, c: _Call, rerun: bool, external: bool) -> None:
+        """A new Runner task of the job's campaign (09 §4): its first, or
+        one that continues it."""
+        j = c.job
+        again = Target(kind=TargetKind.CAMPAIGN, rerun=rerun,
+                       external=external)
+        k = j.campaign
+        if k is None or j.compiled is None or \
+                j.compiled.compiled_ref != k.compiled_ref:
+            self._unexpected(c, Target(kind=TargetKind.COMPILE))
+            return
+        if not self._runner_free(c, again) or \
+                not self._charge_rerun(c, rerun, external, again):
+            return
+        task_id = self._runner_task(c, RunnerInput(
+            job_id=j.job_id, harness_ref=k.harness_ref,
+            execution_harness_id=k.execution_harness_id, step="campaign",
+            compiled_ref=k.compiled_ref, campaign_id=k.campaign_id),
+            JobState.S2_CAMPAIGN, rerun)
+        j.bundle_cursors = j.bundle_cursors + (BundleCursor(
+            task_id=task_id, campaign_id=k.campaign_id,
+            compiled=j.compiled),)
+
+    def _campaign_finished(self, c: _Call, cursor: BundleCursor | None,
+                           e: ev.RunnerFinished) -> bool:
+        """09 §4: the task's bundles were taken as they were sealed; its
+        end continues the campaign."""
+        j = c.job
+        if cursor is None or cursor.delivered != len(e.bundle_refs):
+            return self._unexpected(c, Target(kind=TargetKind.CAMPAIGN))
+        if e.state == "ended_unsealed" or not e.bundle_refs:
+            c.reason = f"runner_ended_unsealed:{e.reason or ''}"
+            self._goto(c, Target(kind=TargetKind.CAMPAIGN, rerun=True))
+            return True
+        c.reason = "campaign_task_sealed"
+        if j.campaign.tally.executions >= c.policy.fuzz_budget_executions:
+            self._block(c, BlockedReason.CAMPAIGN_BUDGET_EXHAUSTED,
+                        Target(kind=TargetKind.CAMPAIGN))
+        else:
+            self._goto(c, Target(kind=TargetKind.CAMPAIGN))
+        return True
+
+    def _on_runner_bundle_sealed(self, c: _Call,
+                                 e: ev.RunnerBundleSealed) -> bool:
+        """A campaign bundle (09 §4).  The live campaign's bundles route
+        the job; a bundle of a campaign task the job no longer takes is
+        judged and kept as a triage item, and its APPLIED crash is routed
+        as the late-crash rule says (09 §4)."""
+        j = c.job
+        cursor = next((x for x in j.bundle_cursors
+                       if x.task_id == e.task_id), None)
+        if cursor is None or e.index != cursor.delivered:
+            return False
+        j.bundle_cursors = tuple(
+            x.model_copy(update={"delivered": x.delivered + 1})
+            if x.task_id == e.task_id else x for x in j.bundle_cursors)
+        live = j.state is JobState.S2_CAMPAIGN and \
+            self._is_pending(j.pending_task, TaskKind.RUNNER, e.task_id)
+        if not self.env.stage2.matches_execution(
+                e.bundle_ref, job_id=j.job_id, task_id=e.task_id):
+            c.reason = "campaign_execution_mismatch"
+            if live:
+                self._block(c, BlockedReason.CAMPAIGN_EVIDENCE,
+                            Target(kind=TargetKind.CAMPAIGN))
+            return True
+        seg = self.env.stage2.judge_campaign(
+            e.bundle_ref, candidate_id=j.candidate.candidate_id,
+            compiled=cursor.compiled)
+        if seg.bundle_ref != e.bundle_ref:
+            # Never replay or triage a bundle other than the one whose
+            # provenance was just checked.
+            c.reason = "campaign_judge_bundle_mismatch"
+            if live:
+                self._block(c, BlockedReason.CAMPAIGN_EVIDENCE,
+                            Target(kind=TargetKind.CAMPAIGN))
+            return True
+        c.consumed.extend((seg.q2_verdict_id, seg.m1_verdict_id))
+        if live:
+            self._campaign_segment(c, cursor, e.task_id, seg)
+        else:
+            self._late_segment(c, cursor, e.task_id, seg)
+        return True
+
+    @staticmethod
+    def _triage(cursor: BundleCursor, task_id: str, seg: CampaignSegment,
+                late: bool, routing: str) -> TriageItem:
+        return TriageItem(
+            campaign_id=cursor.campaign_id, task_id=task_id,
+            bundle_ref=seg.bundle_ref, q2_verdict_id=seg.q2_verdict_id,
+            q2_status=seg.q2_status, q2_reason=seg.q2_reason,
+            m1_verdict_id=seg.m1_verdict_id,
+            crash_window_applied=seg.crash_window_applied, late=late,
+            routing=routing)
+
+    @staticmethod
+    def _crash(k: Campaign, compiled: CompiledRuleSet,
+               seg: CampaignSegment) -> CrashRef:
+        return CrashRef(
+            bundle_ref=seg.bundle_ref, campaign_id=k.campaign_id,
+            compiled=compiled, binding=k.binding, harness_ref=k.harness_ref,
+            execution_harness_id=k.execution_harness_id,
+            q2_verdict_id=seg.q2_verdict_id, m1_verdict_id=seg.m1_verdict_id)
+
+    def _campaign_segment(self, c: _Call, cursor: BundleCursor,
+                          task_id: str, seg: CampaignSegment) -> None:
+        """09 §4, the s2_campaign rows, for one sealed bundle of the
+        running campaign.  The rows apply in table order."""
+        j = c.job
+        p = c.policy
+        here = Target(kind=TargetKind.CAMPAIGN)
+        if seg.q2_status not in Q2_STATUSES:
+            self._unexpected(c, here)
+            return
+        signal = seg.q2_status == "observed"
+        applied = signal and bool(seg.crash_window_applied)
+        t = j.campaign.tally
+        t = t.model_copy(update={
+            "segments": t.segments + 1,
+            "executions": t.executions + seg.executions,
+            "reached_generations":
+                t.reached_generations + seg.reached_generations,
+            "hypothesis_applied":
+                t.hypothesis_applied + seg.hypothesis_applied,
+            "hypothesis_not_applied":
+                t.hypothesis_not_applied + seg.hypothesis_not_applied,
+            "hypothesis_inconclusive":
+                t.hypothesis_inconclusive + seg.hypothesis_inconclusive,
+            "applied_crashes": t.applied_crashes + int(applied)})
+        j.campaign = j.campaign.model_copy(update={"tally": t})
+        # 09 §6: a continued campaign that seals a bundle ends the reruns.
+        j.counters = j.counters.model_copy(update={"runtime_retry": 0})
+        if applied:
+            j.triage = j.triage + (self._triage(cursor, task_id, seg, False,
+                                                "replayed"),)
+            c.reason = "campaign_applied_crash"
+            self._enter_replay(c, self._crash(j.campaign, cursor.compiled,
+                                              seg), here)
+            return
+        if seg.q2_status != "not_observed":
+            j.triage = j.triage + (self._triage(cursor, task_id, seg, False,
+                                                "none"),)
+        findings = (t.model_dump_json(),)
+        evidence = (seg.bundle_ref,)
+        if t.hypothesis_applied == 0 and \
+                t.hypothesis_not_applied >= p.campaign_not_applied_generations:
+            c.reason = "campaign_not_applied"
+            self._goto(c, Target(kind=TargetKind.STRATEGY,
+                                 cause=RepairCause.CAMPAIGN_NOT_APPLIED,
+                                 findings=findings, evidence=evidence))
+        elif t.applied_crashes == 0 and \
+                t.hypothesis_applied >= p.campaign_no_signal_generations:
+            c.reason = "campaign_no_signal"
+            self._goto(c, Target(kind=TargetKind.STRATEGY,
+                                 cause=RepairCause.CAMPAIGN_NO_SIGNAL,
+                                 findings=findings, evidence=evidence))
+        elif t.hypothesis_inconclusive >= \
+                p.campaign_inconclusive_generations:
+            c.reason = "campaign_evidence_path"
+            self._block(c, BlockedReason.EVIDENCE_PATH, here)
+        elif t.executions >= p.fuzz_budget_executions:
+            c.reason = "campaign_budget_exhausted"
+            self._block(c, BlockedReason.CAMPAIGN_BUDGET_EXHAUSTED, here)
+        else:
+            c.reason = "campaign_segment"
+
+    def _late_segment(self, c: _Call, cursor: BundleCursor, task_id: str,
+                      seg: CampaignSegment) -> None:
+        """09 §4 late campaign evidence: a bundle of a campaign task the job
+        no longer takes.  It is a triage item and moves no counter.  An
+        APPLIED crash still goes to replay and review (01 §12) when the
+        job can take it without overriding a person's decision:
+
+        - its campaign is under replay or review: queued, replayed after
+          the current review;
+        - its campaign is still the job's and the job is in s2_campaign,
+          or runs the Mutation Strategy repair that stopped it: that work
+          stops and the crash is replayed;
+        - otherwise (a waiting state, Stage 1, another rule set, a closed
+          job): unrouted, for a person to take further."""
+        j = c.job
+        c.reason = "late_campaign_bundle"
+        applied = seg.q2_status == "observed" and \
+            bool(seg.crash_window_applied)
+        routing = "none"
+        k = j.campaign
+        own = k is not None and k.campaign_id == cursor.campaign_id
+        p = j.pending_task
+        if applied:
+            routing = "unrouted"
+            if j.state in (JobState.S2_REPLAYING, JobState.CRASH_REVIEW) \
+                    and j.replay is not None and \
+                    j.replay.crash.campaign_id == cursor.campaign_id:
+                routing = "queued"
+                j.crash_queue = j.crash_queue + (
+                    j.replay.crash.model_copy(update={
+                        "bundle_ref": seg.bundle_ref,
+                        "q2_verdict_id": seg.q2_verdict_id,
+                        "m1_verdict_id": seg.m1_verdict_id}),)
+            elif own and j.state is JobState.S2_CAMPAIGN:
+                routing = "replayed"
+            elif own and j.state is JobState.S2_STRATEGY and \
+                    p is not None and p.repair is not None and \
+                    p.repair.cause in CAMPAIGN_REPAIRS:
+                routing = "replayed"
+        j.triage = j.triage + (self._triage(cursor, task_id, seg, True,
+                                            routing),)
+        if routing == "replayed":
+            c.reason = "late_applied_crash"
+            resume = Target(kind=TargetKind.CAMPAIGN) \
+                if j.state is JobState.S2_CAMPAIGN else \
+                self._agent_target(p, charged=True)
+            self._enter_replay(c, self._crash(k, cursor.compiled, seg),
+                               resume)
+
+    def _enter_replay(self, c: _Call, crash: CrashRef, resume: Target,
+                      rerun: bool = False, external: bool = False) -> None:
+        """09 §4 s2_replaying: the crash's CrashContextWindow, replayed on
+        the identity and rule set it ran with (03-nfs-proxy/05 §25-§29)."""
+        j = c.job
+        j.replay = Replay(crash=crash, resume=resume)
+        again = Target(kind=TargetKind.REPLAY, rerun=rerun,
+                       external=external)
+        if not self._runner_free(c, again) or \
+                not self._charge_rerun(c, rerun, external, again):
+            return
+        self._runner_task(c, RunnerInput(
+            job_id=j.job_id, harness_ref=crash.harness_ref,
+            execution_harness_id=crash.execution_harness_id, step="replay",
+            compiled_ref=crash.compiled.compiled_ref,
+            campaign_id=crash.campaign_id, crash_bundle_ref=crash.bundle_ref),
+            JobState.S2_REPLAYING, rerun)
+
+    def _replay_finished(self, c: _Call, e: ev.RunnerFinished) -> bool:
+        """09 §4, the s2_replaying rows."""
+        j = c.job
+        again = Target(kind=TargetKind.REPLAY)
+        if e.state == "ended_unsealed" or not e.bundle_ref:
+            c.reason = f"runner_ended_unsealed:{e.reason or ''}"
+            self._goto(c, Target(kind=TargetKind.REPLAY, rerun=True))
+            return True
+        crash = j.replay.crash
+        if not self.env.stage2.matches_execution(
+                e.bundle_ref, job_id=j.job_id, task_id=e.task_id):
+            c.reason = "replay_execution_mismatch"
+            self._block(c, BlockedReason.REPLAY_EVIDENCE, again)
+            return True
+        r = self.env.stage2.judge_replay(
+            e.bundle_ref, crash_bundle_ref=crash.bundle_ref,
+            compiled=crash.compiled)
+        c.consumed.append(r.verdict_id)
+        j.replay = j.replay.model_copy(update={"outcome": r})
+        if r.status == REPLAY_EVIDENCE_REJECTED:
+            self._block(c, BlockedReason.REPLAY_EVIDENCE, again)
+        elif r.status in REPLAY_STATUSES:
+            j.state = JobState.CRASH_REVIEW
+            j.state_reason = r.status
+            j.resume_point = j.replay.resume
+            j.gap = None
+        else:
+            self._unexpected(c, again)
+        return True
 
     # ------------------------------------------------------------ tasks
 
@@ -1077,8 +1640,12 @@ class Machine:
         kind = AGENT_KINDS[p.agent_task]
         if p.repair is None:
             return Target(kind=kind)
+        # A Stage 2 repair names the Stage 1 bundle first, then its own.
+        evidence = p.repair.evidence_refs[1:] if \
+            p.agent_task is AgentTask.MUTATION_STRATEGY else ()
         return Target(kind=kind, cause=p.repair.cause,
-                      findings=p.repair.findings, charged=charged)
+                      findings=p.repair.findings, evidence=evidence,
+                      charged=charged)
 
     def _here(self, j: Job) -> Target:
         """The job's present place as a target, for a resume point."""
@@ -1092,4 +1659,6 @@ class Machine:
             return Target(kind=TargetKind.REACHED)
         if j.state is JobState.S2_STRATEGY:
             return Target(kind=TargetKind.STRATEGY)
+        if j.state in RUNNER_STATES:
+            return Target(kind=RUNNER_STATES[j.state])
         return Target(kind=TargetKind.RUNNING)

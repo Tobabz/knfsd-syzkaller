@@ -253,7 +253,8 @@ fatal sanitizer report로 VM이 죽은 generation은 FINISH 전에 끝나 remote
 
 **baseline-with-rules gate.** fuzz campaign 전에 Stage 1 시나리오를 rule set을 설치한 상태로 실행한다.
 같은 조건의 neutral program도 실행한다(아래 ambient control).
-반복 횟수는 job policy가 정한다.
+반복 횟수는 job policy가 정한다. 여러 번 반복하면 반복마다 아래 표를 적용하고, 가장 위의 행을 gate 결과로 한다
+(`09` §4).
 
 | Q1 (target mode/rules) | rule별 M1 | 경로 |
 |---|---|---|
