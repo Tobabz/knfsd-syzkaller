@@ -124,15 +124,16 @@ The check does not boot a VM or change pipeline state. It verifies access to
 placeholders, every pinned harness file, the three judge profiles, each
 binding's approved HCAP and promoted semantic subset, and that the Compiler
 and replay Proxy report the promoted build. The required syz-manager config
-must be an explicit Stage 2 command argument. Its kernel, image and syzkaller
-binaries must match the approved harness pins; its SSH key and QEMU must match
-the collector. It also requires remote coverage, a crash-context window at
-least as large as `crash_window_bound`, one KVM target-mode VM, a lane script
-that matches `koov.lane_sha256`, the approved kernel command line and one
-journal channel per active proc. The report records the manager config's
-SHA-256. Regenerate older Stage 1 harness configs so their descriptor also
-pins `syz-manager`; a Stage 2 preflight intentionally rejects descriptors
-that pin only the executor binaries.
+must be an explicit Stage 2 command argument. Its kernel, image, lane script
+and syzkaller binaries must match the approved harness pins; its SSH key and
+QEMU must match the collector. It also requires remote coverage, program
+snapshot mode disabled, a crash-context window at least as large as
+`crash_window_bound`, one KVM target-mode VM, the exact approved base kernel
+command line plus bounded `koov.*` fixture arguments, and one journal channel
+per active proc. The report records the manager config's SHA-256. Regenerate
+older Stage 1 harness configs so their descriptor also pins `syz-manager`; a
+Stage 2 preflight intentionally rejects descriptors that pin only the
+executor binaries.
 
 Warnings identify an operator-start policy, repository placeholder campaign
 thresholds or separate Stage 1/Stage 2 resource keys. Any failed check exits

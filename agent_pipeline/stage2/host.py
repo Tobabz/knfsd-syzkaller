@@ -162,8 +162,8 @@ def _verify_pins_read_only(collector: CollectorConfig, descriptor) -> None:
     verify_pins(collector.model_copy(update={"pin_cache": None}), descriptor)
 
 
-_MANAGER_PIN_NAMES = ("bzimage", "kernel", "vm-image", "syz-execprog",
-                      "syz-executor", "syz-manager")
+_MANAGER_PIN_NAMES = ("bzimage", "kernel", "lane-script", "vm-image",
+                      "syz-execprog", "syz-executor", "syz-manager")
 
 
 def _approved_harness(
@@ -324,21 +324,46 @@ def _bind_manager_command(path: Path, command) -> None:
         "manager config must be an explicit Stage 2 command argument")
 
 
+_DYNAMIC_CMDLINE_VALUES = {
+    "koov.nfs_fixture": {"broad-knfsd"},
+    "koov.nfs_target": {"1"},
+    "koov.nfs_trace": {"0", "1"},
+    "koov.nfs_version": {"3", "4.0", "4.1", "4.2"},
+}
+
+
 def _check_approved_command_line(
     actual: list[str], harnesses: tuple[_ApprovedHarness, ...],
 ) -> None:
+    base: list[str] = []
+    dynamic: dict[str, str] = {}
+    for token in actual:
+        key, separator, value = token.partition("=")
+        if not key.startswith("koov."):
+            base.append(token)
+            continue
+        if key == "koov.lane_sha256":
+            allowed = bool(separator and len(value) == 64
+                           and all(c in "0123456789abcdef" for c in value))
+        else:
+            allowed = separator == "=" and \
+                value in _DYNAMIC_CMDLINE_VALUES.get(key, set())
+        if not allowed or key in dynamic:
+            raise PreflightError(
+                f"manager VM cmdline has unapproved dynamic argument {token}")
+        dynamic[key] = value
+    selection = set(dynamic) & {"koov.nfs_fixture", "koov.nfs_version"}
+    if selection not in ({"koov.nfs_fixture"}, {"koov.nfs_version"}):
+        raise PreflightError(
+            "manager VM cmdline must select one approved NFS fixture")
+    for required in ("koov.lane_sha256", "koov.nfs_target"):
+        if required not in dynamic:
+            raise PreflightError(
+                f"manager VM cmdline lacks approved {required}")
     for harness in harnesses:
-        for approved in harness.command_line:
-            if "=" in approved:
-                key = approved.split("=", 1)[0]
-                matches = [token for token in actual
-                           if token.split("=", 1)[0] == key]
-                if matches != [approved]:
-                    raise PreflightError(
-                        f"manager VM cmdline differs from approved {key}")
-            elif actual.count(approved) != 1:
-                raise PreflightError(
-                    f"manager VM cmdline lacks approved {approved}")
+        if tuple(base) != harness.command_line:
+            raise PreflightError(
+                "manager VM base cmdline differs from the approved command line")
 
 
 def _check_manager_assets(
@@ -360,6 +385,7 @@ def _check_manager_assets(
     files = {
         "bzimage": _required_path(vm, "kernel", parent="manager VM"),
         "kernel": kernel_obj / "vmlinux",
+        "lane-script": _required_path(value, "workdir_template") / "lane.sh",
         "vm-image": _required_path(value, "image"),
         "syz-execprog": target_bin / "syz-execprog",
         "syz-executor": target_bin / "syz-executor",
@@ -398,6 +424,8 @@ def _check_manager(
         raise PreflightError("manager config is not a JSON object")
     if value.get("type") != "qemu":
         raise PreflightError("manager config type must be qemu")
+    if "snapshot" in value and value["snapshot"] is not False:
+        raise PreflightError("manager program snapshot mode must be false")
     experimental = value.get("experimental")
     if not isinstance(experimental, dict):
         raise PreflightError("manager config lacks experimental settings")
@@ -415,10 +443,6 @@ def _check_manager(
         raise PreflightError("target-mode campaign requires procs in [1, 64]")
     cmdline = str(vm.get("cmdline", "")).split()
     _check_approved_command_line(cmdline, harnesses)
-    target_tokens = [token for token in cmdline
-                     if token.startswith("koov.nfs_target=")]
-    if target_tokens != ["koov.nfs_target=1"]:
-        raise PreflightError("manager VM cmdline lacks koov.nfs_target=1")
     template_value = value.get("workdir_template")
     if not isinstance(template_value, str) or not template_value:
         raise PreflightError("manager config lacks workdir_template")

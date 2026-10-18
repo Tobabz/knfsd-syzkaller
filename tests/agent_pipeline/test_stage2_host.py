@@ -167,12 +167,15 @@ def _manager_config(tmp_path: Path):
     assets = {
         "bzimage": tmp_path / "bzImage",
         "kernel": kernel_obj / "vmlinux",
+        "lane-script": lane,
         "vm-image": tmp_path / "guest.qcow2",
         "syz-execprog": syz_bin / "syz-execprog",
         "syz-executor": syz_bin / "syz-executor",
         "syz-manager": syzkaller / "bin/syz-manager",
     }
     for name, asset in assets.items():
+        if name == "lane-script":
+            continue
         asset.write_bytes((name + "\n").encode())
     assets["syz-manager"].chmod(0o755)
     ssh_key = tmp_path / "id"
@@ -195,7 +198,8 @@ def _manager_config(tmp_path: Path):
         "vm": {"count": 1, "kernel": str(assets["bzimage"]),
                "cmdline": ("root=/dev/sda console=ttyS0 nokaslr "
                            "nfs.localio_enabled=N "
-                           f"koov.nfs_target=1 koov.lane_sha256={lane_digest}"),
+                           "koov.nfs_version=4.1 koov.nfs_target=1 "
+                           f"koov.lane_sha256={lane_digest}"),
                "qemu_args": ("-enable-kvm "
                              "-device virtserialport,name=nfsp-journal-0")},
     }
@@ -232,10 +236,16 @@ def test_manager_config_binds_approved_assets_and_command(tmp_path):
     with pytest.raises(PreflightError, match="approved linux/amd64"):
         _manager_check(path, collector, harnesses, command)
     manager["target"] = "linux/amd64"
+    approved_cmdline = manager["vm"]["cmdline"]
+    manager["vm"]["cmdline"] += " sunrpc.lane_attribution=0"
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="approved command line"):
+        _manager_check(path, collector, harnesses, command)
+    manager["vm"]["cmdline"] = approved_cmdline
     manager["vm"]["cmdline"] = manager["vm"]["cmdline"].replace(
         "nokaslr ", "")
     path.write_text(json.dumps(manager))
-    with pytest.raises(PreflightError, match="approved nokaslr"):
+    with pytest.raises(PreflightError, match="approved command line"):
         _manager_check(path, collector, harnesses, command)
 
 
@@ -244,10 +254,25 @@ def test_manager_config_binds_window_lane_script_and_all_proc_journals(
     path, manager, lane, collector, harnesses, command = \
         _manager_config(tmp_path)
     assert "window=8" in _manager_check(path, collector, harnesses, command)
+    manager["snapshot"] = True
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="snapshot mode must be false"):
+        _manager_check(path, collector, harnesses, command)
+    del manager["snapshot"]
+    path.write_text(json.dumps(manager))
     lane.write_bytes(b"changed\n")
     with pytest.raises(PreflightError, match="differs from koov.lane_sha256"):
         _manager_check(path, collector, harnesses, command)
+    old_digest = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
+    new_digest = hashlib.sha256(b"changed\n").hexdigest()
+    manager["vm"]["cmdline"] = manager["vm"]["cmdline"].replace(
+        old_digest, new_digest)
+    path.write_text(json.dumps(manager))
+    with pytest.raises(RuntimeError, match="lane-script.*does not match its pin"):
+        _manager_check(path, collector, harnesses, command)
     lane.write_bytes(b"#!/bin/sh\n")
+    manager["vm"]["cmdline"] = manager["vm"]["cmdline"].replace(
+        new_digest, old_digest)
     manager["procs"] = 2
     path.write_text(json.dumps(manager))
     with pytest.raises(PreflightError, match="lanes: 1"):
