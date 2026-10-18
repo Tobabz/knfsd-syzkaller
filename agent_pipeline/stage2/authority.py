@@ -145,6 +145,15 @@ class Stage2AuthorityStore:
                     _require(self._decode(row) == entry,
                              "published Stage 2 authority is immutable")
                 else:
+                    # A row snapshot() cannot load would stop every later
+                    # install and a restart: refuse it before it is stored.
+                    count, size = self._db.execute(
+                        "SELECT COUNT(*), COALESCE(SUM(LENGTH(body)), 0) "
+                        "FROM runner_stage2_publications").fetchone()
+                    _require(count < MAX_SNAPSHOT_RECORDS,
+                             "Stage 2 snapshot capacity exceeded")
+                    _require(size + len(raw) <= MAX_SNAPSHOT_BYTES,
+                             "Stage 2 snapshot byte limit exceeded")
                     self._db.execute(
                         "INSERT INTO runner_stage2_publications "
                         "VALUES (?, ?, ?, ?, ?)",
