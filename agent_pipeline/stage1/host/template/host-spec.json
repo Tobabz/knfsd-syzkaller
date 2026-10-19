@@ -125,7 +125,7 @@
       },
       "constraints": [
         "single NFSv4.1 fixture with SERVER_IMPL=both and the lifecycle broker enabled",
-        "client0 is the only admitted client selector; invoke exactly one syz_nfsd_client_ctl$expire_client0(0x0) before acquiring the client0 profile",
+        "client0 is the only admitted client selector; invoke exactly one syz_nfsd_client_ctl$expire_client0(0x0), acquire the client0 profile exactly once, then perform at least one parser-proven client0-origin NFS I/O operation",
         "broker resolves exactly one confirmed minor-version-1 owner named Linux NFSv4.1 frozen-phase9-lane0-client0/<UTS hostname>",
         "broker alone selects /proc/fs/nfsd/clients/<client>/ctl and writes literal expire",
         "validated recovery pairs one expiry with ordinary client0 profile I/O and observes EXCHANGE_ID then CREATE_SESSION"

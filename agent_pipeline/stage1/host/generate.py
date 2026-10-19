@@ -29,8 +29,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ...admission import (NeutralControlCatalog, NeutralControlEntry,
                           SyzkallerBuildManifest, SyzkallerCallTable,
@@ -39,13 +40,15 @@ from ...admission_generation import (AdmissionProfileSource,
                                      PinnedSyzkallerInputs,
                                      generate_call_admission_profile)
 from ...artifacts import ArtifactStore
-from ...contracts import (HarnessBinding, JobPolicy, JudgeVersions, Sanitizer)
+from ...contracts import (HarnessBinding, JobPolicy, JudgeVersions, Sanitizer,
+                          Sha256)
 from ...data import canonical_json, put_record
 from ...hcap import (AuthorityRef, Capability, HcapCatalog, RuntimeSelection)
 from ...materializer import (ExecutionHarnessApproval,
                              ExecutionHarnessDescriptor, HarnessBuildArtifact,
                              _runtime_key, descriptor_id)
-from ...q1 import Q1AdmissibilityProfile, RemoteKcovSupportBoundary
+from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
+                   RemoteKcovSupportBoundary)
 from ...registry import HarnessCatalog, HarnessRegistration
 from ..config import EngineConfig, Stage1Config
 from .collector import CollectorConfig
@@ -92,6 +95,74 @@ class CollectorSpec(_Spec):
     exec_timeout_s: float = 600
 
 
+class Hcap11RunEvidence(_Spec):
+    completed: int = Field(ge=1, le=999)
+    target_hit_counts: tuple[int, ...]
+
+    @model_validator(mode="after")
+    def _count(self) -> Self:
+        if len(self.target_hit_counts) != self.completed:
+            raise ValueError("target_hit_counts length differs from completed")
+        return self
+
+
+class Hcap11RunsEvidence(_Spec):
+    control: Hcap11RunEvidence
+    stimulus: Hcap11RunEvidence
+
+
+class Hcap11GenerationEvidence(_Spec):
+    generation_begin_each: Literal[1]
+    aggregate_published_each: Literal[1]
+    generation_aborted_each: Literal[0]
+    scratch_overflow_each: Literal[0]
+    merge_truncation_each: Literal[0]
+    outstanding_tokens_after_each: Literal[0]
+    remote_refs_after_each: Literal[0]
+    minimum_remote_start_ok: int = Field(ge=1)
+
+
+HCAP11_RECOVERY_ORDER = (
+    "nfsd_clid_admin_expired", "nfsd_clid_fresh", "OP_EXCHANGE_ID",
+    "nfsd_slot_seqid_unconf", "nfsd_clid_confirmed", "OP_CREATE_SESSION",
+)
+
+
+class Hcap11KvmEvidence(_Spec):
+    schema_version: Literal["hcap-kvm-evidence.v1"]
+    capability_id: Literal["HCAP-11"]
+    observed_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    scenario: Literal["v41-client-expiry"]
+    execution_harness_id: Sha256
+    mapping_identity: KernelIdentity
+    target_mapping_sha256: Sha256
+    campaign_result_sha256: Sha256
+    guest_lane_script_sha256: Sha256
+    guest_nfs_proxy_sha256: Sha256
+    runs: Hcap11RunsEvidence
+    generation_contract: Hcap11GenerationEvidence
+    recovery_order: tuple[str, ...]
+    crash_signature_count: int = Field(ge=0)
+    raw_artifact_error_count: int = Field(ge=0)
+    shareable_result_contains_target_metadata_or_addresses: bool
+
+    @model_validator(mode="after")
+    def _validated_campaign(self) -> Self:
+        if self.execution_harness_id != self.mapping_identity.execution_harness_id:
+            raise ValueError("mapping and campaign harness identities differ")
+        if any(self.runs.control.target_hit_counts):
+            raise ValueError("control run reached the target mapping")
+        if not all(count > 0 for count in self.runs.stimulus.target_hit_counts):
+            raise ValueError("stimulus run missed the target mapping")
+        if self.recovery_order != HCAP11_RECOVERY_ORDER:
+            raise ValueError("recovery order differs from the validated contract")
+        if self.crash_signature_count != 0 or self.raw_artifact_error_count != 0:
+            raise ValueError("campaign contains a crash or artifact error")
+        if self.shareable_result_contains_target_metadata_or_addresses:
+            raise ValueError("shareable campaign evidence contains private target data")
+        return self
+
+
 class HostSpec(_Spec):
     """``host-spec.json``; relative paths are relative to the spec file."""
 
@@ -129,6 +200,33 @@ class HostSpec(_Spec):
 
 def _resolve(base: Path, path: Path) -> Path:
     return (path if path.is_absolute() else base / path).resolve()
+
+
+def _validated_capability_evidence(
+        capability_id: str, path: Path, *,
+        expected_mapping_identity: KernelIdentity,
+        lane_script_sha256: str) -> bytes:
+    """Validate identity-sensitive evidence before it can promote HCAP-11."""
+    contents = path.read_bytes()
+    if capability_id != "HCAP-11":
+        return contents
+    try:
+        evidence = Hcap11KvmEvidence.model_validate_json(contents)
+    except ValidationError as error:
+        raise GenerationError(
+            f"invalid HCAP-11 KVM evidence {path}: {error}") from error
+    if evidence.mapping_identity != expected_mapping_identity:
+        raise GenerationError(
+            "HCAP-11 evidence mapping identity differs from the generated "
+            "execution harness")
+    if evidence.execution_harness_id != \
+            expected_mapping_identity.execution_harness_id:
+        raise GenerationError(
+            "HCAP-11 evidence names another execution harness")
+    if evidence.guest_lane_script_sha256 != lane_script_sha256:
+        raise GenerationError(
+            "HCAP-11 evidence names another guest lane script")
+    return contents
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -228,8 +326,11 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         "syz-manager": env / "syzkaller" / "bin" / "syz-manager",
     }
     builds: list[HarnessBuildArtifact] = []
+    file_pins = {}
     for name, path in sorted(files.items()):
-        ref = put_record(store, pin_file(name, path))
+        pin = pin_file(name, path)
+        ref = put_record(store, pin)
+        file_pins[name] = pin
         builds.append(HarnessBuildArtifact(name=name, artifact_ref=ref))
         digests[f"pin:{name}"] = ref
     patches = REPO / "bundle" / "patches" / "kernel"
@@ -297,18 +398,6 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         if not paths:
             raise GenerationError(
                 f"capability_evidence for {capability_id} is empty")
-        refs = []
-        for path in paths:
-            resolved = _resolve(base, path)
-            if not resolved.is_file():
-                raise GenerationError(
-                    f"capability evidence is not a file: {resolved}")
-            refs.append(store.put(resolved.read_bytes()))
-        index = capability_indexes[capability_id]
-        capability = capabilities[index]
-        capabilities[index] = capability.model_copy(update={
-            "evidence_refs": tuple(sorted(set(capability.evidence_refs) |
-                                          set(refs)))})
     if spec.runtime_selection_capability is not None:
         index = next((i for i, c in enumerate(capabilities)
                       if c.id == spec.runtime_selection_capability), None)
@@ -322,14 +411,14 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         cap = capabilities[index]
         capabilities[index] = cap.model_copy(update={
             "constraints": (*cap.constraints, *listed)})
-    draft = HcapCatalog(capabilities=tuple(capabilities),
-                        missing_capability_ids=tuple(
-                            sorted(spec.missing_capability_ids)))
+    admission_draft = HcapCatalog(
+        capabilities=tuple(capabilities),
+        missing_capability_ids=tuple(sorted(spec.missing_capability_ids)))
     with tempfile.TemporaryDirectory() as tmp:
         source_path = Path(tmp) / "source.json"
         hcap_path = Path(tmp) / "hcap.json"
         source_path.write_bytes(canonical_json(spec.admission_source))
-        hcap_path.write_bytes(canonical_json(draft))
+        hcap_path.write_bytes(canonical_json(admission_draft))
         profile = generate_call_admission_profile(PinnedSyzkallerInputs(
             checkout=checkout, expected_commit=identity.syzkaller_commit,
             patch_series=bundle / "patch-series.bin", build_root=bundle,
@@ -376,6 +465,50 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     neutral_ref = put_record(store, neutral)
     digests["neutral_control_catalog"] = neutral_ref
 
+    # The descriptor must exist before identity-sensitive capability evidence
+    # can promote a validated HCAP.  This prevents a stale KVM campaign from a
+    # different lane, kernel, image, syzkaller build, or runtime selection from
+    # being rebound to the newly generated harness.
+    descriptor = ExecutionHarnessDescriptor(
+        kernel_commit=kernel_commit, sanitizer=spec.variant,
+        syzkaller_identity=identity, build_artifacts=tuple(builds),
+        guest_kernel_command_line=spec.guest_kernel_command_line,
+        allowed_runtime_selections=_sorted_selections(
+            entry.runtime_selection for entry in neutral_entries))
+    if "nokaslr" not in descriptor.guest_kernel_command_line.split():
+        raise GenerationError("guest_kernel_command_line must contain "
+                              "nokaslr (the Q1 identity assumes no KASLR)")
+    harness_id = put_record(store, descriptor)
+    assert harness_id == descriptor_id(descriptor)
+    build_refs = {item.name: item.artifact_ref
+                  for item in descriptor.build_artifacts}
+    expected_mapping_identity = KernelIdentity(
+        execution_harness_id=harness_id, kernel_commit=kernel_commit,
+        instrumentation_sha256=build_refs["instrumentation"],
+        vmlinux_sha256=build_refs["kernel"],
+        kaslr_enabled=False, kaslr_offset=0)
+
+    for capability_id, paths in sorted(spec.capability_evidence.items()):
+        refs = []
+        for path in paths:
+            resolved = _resolve(base, path)
+            if not resolved.is_file():
+                raise GenerationError(
+                    f"capability evidence is not a file: {resolved}")
+            contents = _validated_capability_evidence(
+                capability_id, resolved,
+                expected_mapping_identity=expected_mapping_identity,
+                lane_script_sha256=file_pins["lane-script"].sha256)
+            refs.append(store.put(contents))
+        index = capability_indexes[capability_id]
+        capability = capabilities[index]
+        capabilities[index] = capability.model_copy(update={
+            "evidence_refs": tuple(sorted(set(capability.evidence_refs) |
+                                          set(refs)))})
+    draft = HcapCatalog(
+        capabilities=tuple(capabilities),
+        missing_capability_ids=tuple(sorted(spec.missing_capability_ids)))
+
     judge_profile_ref = put_record(store, spec.judge_profile)
     boundary = RemoteKcovSupportBoundary(
         name=spec.support_boundary.name,
@@ -398,17 +531,6 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     digests["hcap"] = hcap_ref
 
     # ---------------------------------------------------- harness
-    descriptor = ExecutionHarnessDescriptor(
-        kernel_commit=kernel_commit, sanitizer=spec.variant,
-        syzkaller_identity=identity, build_artifacts=tuple(builds),
-        guest_kernel_command_line=spec.guest_kernel_command_line,
-        allowed_runtime_selections=_sorted_selections(
-            e.runtime_selection for e in neutral_entries))
-    if "nokaslr" not in descriptor.guest_kernel_command_line.split():
-        raise GenerationError("guest_kernel_command_line must contain "
-                              "nokaslr (the Q1 identity assumes no KASLR)")
-    harness_id = put_record(store, descriptor)
-    assert harness_id == descriptor_id(descriptor)
     approval = ExecutionHarnessApproval(descriptor=descriptor,
                                         approved_hcap_revisions=(hcap_ref,))
     approval_ref = put_record(store, approval)

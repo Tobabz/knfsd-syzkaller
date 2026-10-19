@@ -89,6 +89,7 @@ LIFECYCLE_RE = re.compile(
     r"^lifecycle request lane=0 op=1 client=0 status=0 "
     r"clientid=0x([0-9a-fA-F]{16}) minor=1 sessions=([1-9][0-9]*)$",
     re.MULTILINE)
+SHAREABLE_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
 ADMIN_REQUIRED_INTERFACES = frozenset((
     "remote_cover",
     "syz_nfsd_client_ctl$expire_client0",
@@ -339,17 +340,25 @@ def generation_evidence(before_text, after_text):
 
 def parse_cover(text):
     pcs = set()
-    for raw in text.splitlines():
+    for line_number, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line:
             continue
         if not re.fullmatch(r"0x[0-9a-fA-F]+", line):
-            raise RuntimeError("malformed remote coverage PC: %r" % line[:80])
+            raise RuntimeError(
+                "malformed remote coverage PC at line %d" % line_number)
         value = int(line, 16)
         if value <= 0 or value >= 2 ** 64:
-            raise RuntimeError("remote coverage PC out of range: %s" % line)
+            raise RuntimeError(
+                "remote coverage PC out of range at line %d" % line_number)
         pcs.add(value)
     return pcs
+
+
+def shareable_error(error):
+    """Keep result.json diagnostic without reflecting kernel addresses."""
+    message = SHAREABLE_HEX_RE.sub("<redacted-hex>", str(error))
+    return "%s: %s" % (type(error).__name__, message)
 
 
 def wait_admin_exec(vm, gate, timeout=300):
@@ -972,7 +981,7 @@ def main():
                        "trace_root": tracing, "cycles": cycles,
                        "crash_signatures": crashes})
     except Exception as error:
-        result["error"] = "%s: %s" % (type(error).__name__, error)
+        result["error"] = shareable_error(error)
         if tracing:
             try:
                 (output / "failure-trace.txt").write_text(

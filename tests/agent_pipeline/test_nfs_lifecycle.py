@@ -131,6 +131,25 @@ def test_admin_context_refuses_mapping_from_another_harness(tmp_path):
         runner.load_admin_context(config, descriptor, mapping_path)
 
 
+@pytest.mark.parametrize("raw", (
+    "private-coverage-sentinel\n",
+    "0x10000000000000000\n",
+))
+def test_coverage_parse_errors_do_not_reflect_private_input(raw):
+    runner = load_runner()
+    with pytest.raises(RuntimeError) as caught:
+        runner.parse_cover(raw)
+    assert raw.strip() not in str(caught.value)
+
+
+def test_shareable_error_redacts_hex_addresses():
+    runner = load_runner()
+    rendered = runner.shareable_error(
+        RuntimeError("coverage failed at 0xffffffff81001234"))
+    assert "0xffffffff81001234" not in rendered
+    assert rendered == "RuntimeError: coverage failed at <redacted-hex>"
+
+
 class FailedExecGuest:
     def __init__(self, runner):
         self.runner = runner

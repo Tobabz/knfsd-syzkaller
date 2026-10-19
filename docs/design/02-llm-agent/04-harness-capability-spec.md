@@ -568,7 +568,9 @@ constraints:
     syz 호출은 client selector만 전달하며 client path, owner, ctl payload를 전달하지 않음
     broker만 /proc/fs/nfsd/clients/<client>/ctl을 선택하고 literal expire를 기록
     broker reply의 clientid, minorversion=1, session_count>0을 executor가 검사
-    한 번의 expiry 뒤 ordinary client0 profile I/O를 수행
+    한 번의 expiry 뒤 client0 profile도 정확히 한 번 획득하고,
+    parser가 client0 FD origin을 증명한 ordinary profile I/O를 수행
+    profile 획득만 하거나 close/lseek만 수행한 프로그램은 recovery I/O로 인정하지 않음
 ```
 
 executor ABI에는 lane 1용 `syz_nfsd_client_ctl$expire_client1`도 존재하지만, HCAP-11과
@@ -577,7 +579,11 @@ Agent가 사용할 수 없다. 2026-10-19 실 KVM 검증에서는 neutral contro
 않았고, expiry stimulus 3회는 모두 그 mapping을 실행했다. 각 실행은 remote-KCOV generation begin/publish 1회,
 abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록했다. HCAP-03은 이 실행의
 generation attribution을 계속 담당하며 HCAP-11이 이를 대체하지 않는다. 공유 증거는 실행 descriptor와
-target mapping의 digest만 기록하고 후보 source metadata와 target 주소는 포함하지 않는다.
+target mapping의 digest 및 전체 mapping identity를 기록하고 후보 source metadata와 target 주소는 포함하지
+않는다. Host generator는 이 typed evidence의 execution harness, kernel/instrumentation/vmlinux/KASLR identity와
+guest lane script digest를 새 descriptor에 대해 다시 검사한 뒤에만 HCAP-11을 promotion한다. fixture status는
+lifecycle broker의 PID start time, server mount/net namespace, 명령행과 정확한 UNIX socket inode 소유권을 함께
+검사하여 stale pathname이나 재사용된 PID를 broker로 인정하지 않는다.
 
 source refs:
 

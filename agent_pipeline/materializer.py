@@ -236,6 +236,10 @@ HCAP11_ID = "HCAP-11"
 HCAP11_EXPIRE = "syz_nfsd_client_ctl$expire_client0"
 HCAP11_ACQUIRE = "syz_open_nfs_lane_profile$client0_knfsd_v41"
 HCAP11_ORIGIN = "nfs-profile:knfsd-v41:client0"
+HCAP11_RECOVERY_IO = frozenset({
+    "flock", "fsync", "getdents64", "openat", "read", "renameat2",
+    "statx", "unlinkat", "write",
+})
 
 
 def _hcap11_program_error(parsed: ParsedProgram) -> str | None:
@@ -256,6 +260,8 @@ def _hcap11_program_error(parsed: ParsedProgram) -> str | None:
                     if call.call == HCAP11_ACQUIRE]
     if not acquisitions:
         return "client0_recovery_missing"
+    if len(acquisitions) != 1:
+        return "client0_acquisition_count"
     if any(index <= expiry[0] for index in acquisitions):
         return "client0_recovery_precedes_expiry"
 
@@ -268,6 +274,21 @@ def _hcap11_program_error(parsed: ParsedProgram) -> str | None:
     if any(call.call.startswith("syz_open_nfs_lane_profile$")
            and call.call != HCAP11_ACQUIRE for call in parsed.calls):
         return "non_client0_profile_call"
+
+    # Acquiring the profile alone does not establish the validated recovery
+    # path.  Require a later ordinary operation whose FD provenance still
+    # names client0.  close and lseek are deliberately excluded because they
+    # need not drive an NFS request.
+    first_acquisition = acquisitions[0]
+    recovery_io = [
+        call.index for call in parsed.calls
+        if (call.index > first_acquisition
+            and call.call in HCAP11_RECOVERY_IO
+            and any(fact.origin == HCAP11_ORIGIN
+                    for fact in call.resource_facts.origins))
+    ]
+    if not recovery_io:
+        return "client0_recovery_io_missing"
     return None
 
 

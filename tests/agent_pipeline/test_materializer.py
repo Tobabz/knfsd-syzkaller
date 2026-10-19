@@ -57,6 +57,8 @@ from agent_pipeline.materializer import (
     ArtifactHarnessMaterializer,
     ExecutionHarnessApproval,
     ExecutionHarnessDescriptor,
+    HCAP11_ORIGIN,
+    HCAP11_RECOVERY_IO,
     HarnessBuildArtifact,
     MaterializationReviewManifest,
     NfsAcquisition,
@@ -134,7 +136,8 @@ def hcap11_parsed(identity, calls, origins):
         identity=identity, program_sha256=digest(program),
         calls=tuple(ParsedCall(
             index=index, call=call, availability="available",
-            resource_facts=empty_facts())
+            resource_facts=(lane_facts(HCAP11_ORIGIN)
+                            if call in HCAP11_RECOVERY_IO else empty_facts()))
             for index, call in enumerate(calls)),
         usage=ProgramResourceUsage(
             program_bytes=len(program), call_count=len(calls),
@@ -389,6 +392,19 @@ def test_hcap11_program_contract_accepts_expiry_then_client0_recovery(world):
       "syz_nfsd_client_ctl$expire_client0",
       "syz_open_nfs_lane_profile$client0_knfsd_v41"),
      ("nfs-profile:knfsd-v41:client0",), "expiry_count"),
+    (("syz_nfsd_client_ctl$expire_client0",
+      "syz_open_nfs_lane_profile$client0_knfsd_v41"),
+     ("nfs-profile:knfsd-v41:client0",), "client0_recovery_io_missing"),
+    (("syz_nfsd_client_ctl$expire_client0",
+      "syz_open_nfs_lane_profile$client0_knfsd_v41", "close"),
+     ("nfs-profile:knfsd-v41:client0",), "client0_recovery_io_missing"),
+    (("syz_nfsd_client_ctl$expire_client0",
+      "syz_open_nfs_lane_profile$client0_knfsd_v41", "lseek"),
+     ("nfs-profile:knfsd-v41:client0",), "client0_recovery_io_missing"),
+    (("syz_nfsd_client_ctl$expire_client0",
+      "syz_open_nfs_lane_profile$client0_knfsd_v41",
+      "syz_open_nfs_lane_profile$client0_knfsd_v41", "fsync"),
+     ("nfs-profile:knfsd-v41:client0",), "client0_acquisition_count"),
 ])
 def test_hcap11_program_contract_rejects_cross_client_order_and_count(
         world, calls, origins, reason):

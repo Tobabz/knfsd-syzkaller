@@ -3,10 +3,18 @@
   "capability_id": "HCAP-11",
   "observed_at": "2026-10-19",
   "scenario": "v41-client-expiry",
-  "execution_harness_id": "036b2f9c7d6036a95baced88a63d9df79a71c74fa5339a74abcc4f6c4fac11f6",
-  "target_mapping_sha256": "eaf21ea686ecd3697d9d3521d22f19f056b2aafc7aa8609567bbf10f96130bee",
-  "campaign_result_sha256": "61476e7d3b3cd13906c86bf4ac87a0ddb4de8a80eeb4c5d6d31a83c04d90c896",
-  "guest_lane_script_sha256": "a35a4ecd041bd815d4481de15ba07bbb04e32c81c9e5a889bff72709fceb4085",
+  "execution_harness_id": "fb7d3c0284c32e3f0404b6d6eff3acf56d30cfed7c70ffc947281131e116f6b2",
+  "mapping_identity": {
+    "execution_harness_id": "fb7d3c0284c32e3f0404b6d6eff3acf56d30cfed7c70ffc947281131e116f6b2",
+    "kernel_commit": "fe5c9635fea04ad68120d2dd613a1ec6c4336281",
+    "instrumentation_sha256": "39af7062908470035491b54b1fad1cb6d952a09383b120c7f79e74246627f1fb",
+    "vmlinux_sha256": "1e80a75aabb5542fa3c8fe781970ac21288cf99555edd3757154df4adcaaa34d",
+    "kaslr_enabled": false,
+    "kaslr_offset": 0
+  },
+  "target_mapping_sha256": "350abf02b49979c91ba8d9603ac4a83b60b044c00d2f9e86b29f4111bd110508",
+  "campaign_result_sha256": "3d804b619a9fe1eaf62a4971117b8630d14cf4da4bc1256b779768d8247b44d7",
+  "guest_lane_script_sha256": "0853c56138b0509dddd8811a3453c52390aeb3e2f1623aedb799452d26041fd3",
   "guest_nfs_proxy_sha256": "5f8fd358c2240866939b58edbc7929674524201310ebc134b732d2ad9d842c45",
   "runs": {
     "control": {

@@ -143,6 +143,13 @@ def test_real_parser_materializer_handoff(tmp_path, program, reason):
     (LANE + EXPIRE + b"fsync(r0)\n",
      "client0_recovery_precedes_expiry"),
     (EXPIRE + EXPIRE + LANE + b"fsync(r0)\n", "expiry_count"),
+    (EXPIRE + LANE, "client0_recovery_io_missing"),
+    (EXPIRE + LANE + b"close(r0)\n", "client0_recovery_io_missing"),
+    (EXPIRE + LANE + b"lseek(r0, 0x0, 0x0)\n",
+     "client0_recovery_io_missing"),
+    (EXPIRE + LANE +
+     b"r1 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)\n"
+     b"fsync(r0)\n", "client0_acquisition_count"),
 ])
 def test_real_parser_hcap11_program_contract(program, reason):
     value = os.environ.get("KNFSD_SYZ_BUNDLE")

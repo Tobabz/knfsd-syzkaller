@@ -346,6 +346,31 @@ pid_in_named_netns()
         "$(stat -Lc '%d:%i' "/run/netns/$pid_check_ns")"
 }
 
+pid_owns_unix_socket()
+{
+    socket_owner_pid=$1
+    socket_owner_path=$2
+    test -r "/proc/$socket_owner_pid/net/unix"
+    socket_owner_inode=$(awk -v expected="$socket_owner_path" '
+        $8 == expected { count++; inode = $7 }
+        END {
+            if (count != 1)
+                exit 1
+            print inode
+        }
+    ' "/proc/$socket_owner_pid/net/unix") || return 1
+    case "$socket_owner_inode" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    for socket_owner_fd in "/proc/$socket_owner_pid/fd/"*; do
+        socket_owner_target=$(readlink "$socket_owner_fd" 2>/dev/null || true)
+        if [ "$socket_owner_target" = "socket:[$socket_owner_inode]" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 stop_namespace()
 {
     stop_ns=$1
@@ -923,6 +948,14 @@ EOF
             lifecycle_pid=$!
             printf "%s\n" "$lifecycle_pid" > \
                 "$lane_root/server/lifecycle.pid"
+            lifecycle_starttime=$(awk "{print \$22}" "/proc/$lifecycle_pid/stat")
+            case "$lifecycle_starttime" in
+                ""|*[!0-9]*)
+                    echo "KOOV: lifecycle admin has invalid start time" >&2
+                    exit 1 ;;
+            esac
+            printf "%s\n" "$lifecycle_starttime" > \
+                "$lane_root/server/lifecycle.starttime"
             lifecycle_wait=0
             while ! grep -q "^lifecycle ready:" \
                     "$lane_root/server/lifecycle.log"; do
@@ -1450,14 +1483,26 @@ status_fixture()
         pid_in_named_netns "$status_client1_pid" "$status_client1_ns"
         if [ "$server_impl" = both ]; then
             test -s "$status_lane_root/server/lifecycle.pid"
+            test -s "$status_lane_root/server/lifecycle.starttime"
             status_lifecycle_pid=$(cat "$status_lane_root/server/lifecycle.pid")
             pid_in_named_netns "$status_lifecycle_pid" "$status_server_ns"
+            test "$(stat -Lc '%d:%i' "/proc/$status_lifecycle_pid/ns/mnt")" = \
+                "$(stat -Lc '%d:%i' "/proc/$status_server_pid/ns/mnt")"
+            status_lifecycle_starttime=$(awk '{print $22}' \
+                "/proc/$status_lifecycle_pid/stat")
+            test "$status_lifecycle_starttime" = \
+                "$(cat "$status_lane_root/server/lifecycle.starttime")"
             status_lifecycle_cmdline=$(tr '\000' ' ' < "/proc/$status_lifecycle_pid/cmdline")
             case "$status_lifecycle_cmdline" in
                 *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane"*) ;;
                 *) echo "KOOV: lifecycle admin process identity mismatch" >&2
                    return 1 ;;
             esac
+            if ! pid_owns_unix_socket "$status_lifecycle_pid" \
+                    "$executor_root/proc-$status_lane/control/lifecycle.sock"; then
+                echo "KOOV: lifecycle admin does not own its socket" >&2
+                return 1
+            fi
         fi
 
         for status_client in 0 1; do
