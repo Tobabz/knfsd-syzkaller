@@ -148,10 +148,14 @@ executor binaries.
 
 Preflight also requires the outer Stage 2 supervisor timeout to cover the
 slowdown-scaled gate and replay watchdogs and the configured campaign
-timeout. Each step enforces the evidence-sealing reserve as an inner deadline
-and publishes only an atomically complete segment before it expires. This
-keeps a storage stall distinguishable from valid sealed evidence before the
-outer supervisor cleanup reserve begins.
+timeout. Each step enforces one evidence-finalization reserve around journal
+channel shutdown, journal and artifact reads, fsyncs and atomic publication.
+The final directory rename is the irreversible publication commit point; a
+timeout can leave an unpublished dot-directory for lease cleanup, or race with
+a completed rename. In the latter case the command still fails but the engine
+keeps the atomically complete final segment. This keeps a storage stall
+distinguishable from valid sealed evidence before the outer supervisor cleanup
+reserve begins.
 
 Warnings identify an operator-start policy, repository placeholder campaign
 thresholds or separate Stage 1/Stage 2 resource keys. Any failed check exits

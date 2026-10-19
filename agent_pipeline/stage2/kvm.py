@@ -67,6 +67,17 @@ class Stage2StepError(RuntimeError):
     """The trusted host could not produce one complete Stage 2 segment."""
 
 
+class _EvidenceSealDeadline(Stage2StepError):
+    """The host exhausted the reserved evidence-finalization window."""
+
+
+@dataclass
+class _EvidenceSealState:
+    deadline: float
+    published: bool = False
+    cleanup_allowed: bool = False
+
+
 class _Execution(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -131,7 +142,13 @@ class StepOptions:
 
 MAX_JOURNAL_CHANNELS = 64
 MANAGER_SIGNAL_TIMEOUT_S = 10
-EVIDENCE_SEAL_RESERVE_S = 300
+ARTIFACT_SEAL_RESERVE_S = 300
+# One alarm covers the worst-case sequential channel joins and every
+# subsequent read, fsync and atomic publication operation.
+EVIDENCE_SEAL_RESERVE_S = (
+    MAX_JOURNAL_CHANNELS * CHANNEL_CLOSE_TIMEOUT_S
+    + ARTIFACT_SEAL_RESERVE_S
+)
 
 
 @dataclass(frozen=True)
@@ -173,9 +190,11 @@ def stage2_timeout_budget(
     direct = execprog_timeout(collector.exec_timeout_s, exec_slowdown)
     # Gate polling and the guest's GNU timeout share this one process window.
     direct_gate = direct + EXECPROG_EXIT_GRACE_S + POLL_S
-    journal_close = MAX_JOURNAL_CHANNELS * CHANNEL_CLOSE_TIMEOUT_S
     vm_close = 2 * VM_STOP_TIMEOUT_S
-    segment_close = vm_close + journal_close + EVIDENCE_SEAL_RESERVE_S
+    # Channel shutdown is part of the single evidence reserve.  Keeping a
+    # separate allowance here would let close/fsync run before the hard seal
+    # deadline starts.
+    segment_close = vm_close + EVIDENCE_SEAL_RESERVE_S
 
     # Scenario: 10 ordinary SSH commands, three evidence commands, three
     # uploads and one coverage download. Commands issued while execprog is
@@ -205,7 +224,7 @@ def stage2_timeout_budget(
     # A failure in the first manager stop can enter finally and retry cleanup.
     manager_close = 2 * (manager_stop_timeout_s
                          + 2 * MANAGER_SIGNAL_TIMEOUT_S)
-    campaign = (campaign_timeout_s + manager_close + journal_close
+    campaign = (campaign_timeout_s + manager_close
                 + EVIDENCE_SEAL_RESERVE_S)
     budget = Stage2TimeoutBudget(
         gate_repetition_s=gate_repetition,
@@ -217,46 +236,68 @@ def stage2_timeout_budget(
     return budget
 
 
-def _check_evidence_deadline(deadline: float) -> None:
+def _deadline_value(deadline: float | _EvidenceSealState) -> float:
+    return (deadline.deadline
+            if isinstance(deadline, _EvidenceSealState) else deadline)
+
+
+def _check_evidence_deadline(deadline: float | _EvidenceSealState) -> None:
     """Never publish evidence after consuming its supervisor reserve."""
-    if not math.isfinite(deadline) or time.monotonic() >= deadline:
-        raise Stage2StepError("evidence sealing deadline expired")
+    value = _deadline_value(deadline)
+    if not math.isfinite(value) or time.monotonic() >= value:
+        raise _EvidenceSealDeadline("evidence sealing deadline expired")
 
 
 @contextmanager
 def _evidence_seal_window(output: Path, index: int, *,
                           reserve_s: float = EVIDENCE_SEAL_RESERVE_S):
-    """Interrupt sealing at its reserve and remove any partial publication."""
+    """Bound channel close and sealing without revoking a publication."""
     if not math.isfinite(reserve_s) or reserve_s <= 0:
         raise ValueError("evidence sealing reserve must be finite and positive")
     previous_timer = signal.getitimer(signal.ITIMER_REAL)
     if previous_timer[0] > 0 or previous_timer[1] > 0:
         raise Stage2StepError("evidence sealing requires an unused host alarm")
+    if signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, set()):
+        raise Stage2StepError(
+            "evidence sealing requires an unblocked host alarm")
 
     segments = output / "segments"
     temporary = segments / f".{index:06d}.tmp"
     final = segments / f"{index:06d}"
-    if temporary.exists() or final.exists():
-        raise Stage2StepError("evidence segment path already exists")
 
     def expired(unused_signum, unused_frame) -> None:
-        raise Stage2StepError("evidence sealing deadline expired")
+        raise _EvidenceSealDeadline("evidence sealing deadline expired")
 
     try:
         previous_handler = signal.signal(signal.SIGALRM, expired)
     except ValueError as exc:
         raise Stage2StepError(
             "evidence sealing must run on the host main thread") from exc
-    deadline = time.monotonic() + reserve_s
+    state = _EvidenceSealState(time.monotonic() + reserve_s)
     try:
         signal.setitimer(signal.ITIMER_REAL, reserve_s)
         try:
-            yield deadline
-            _check_evidence_deadline(deadline)
+            if temporary.exists() or final.exists():
+                raise Stage2StepError("evidence segment path already exists")
+            state.cleanup_allowed = True
+            yield state
+            if not state.published:
+                _check_evidence_deadline(state)
         except BaseException:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            shutil.rmtree(temporary, ignore_errors=True)
-            shutil.rmtree(final, ignore_errors=True)
+            # A timed-out filesystem operation must not be followed by an
+            # unbounded recursive cleanup after the alarm has fired.  Before
+            # the deadline, cleanup remains protected by the same timer; after
+            # it, an uncommitted dot-directory may be left for lease cleanup.
+            # Never remove the final name: rename may have committed just
+            # before Python dispatched the deadline exception.
+            if (state.cleanup_allowed and not state.published
+                    and time.monotonic() < state.deadline):
+                try:
+                    shutil.rmtree(temporary, ignore_errors=True)
+                except _EvidenceSealDeadline:
+                    raise
+                except BaseException:
+                    pass
             raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -496,17 +537,21 @@ class _JournalChannels:
     def __init__(self, root: Path, name: str, vm: str, lanes: int,
                  rules: bytes, prefixes: tuple[str, ...]) -> None:
         self.root, self.name, self.vm = root, name, vm
-        self.socket_tmp = tempfile.TemporaryDirectory(prefix="knfsd-s2-journal-")
-        self.journal = HostJournal(root, name, fsync=True)
+        self.socket_dir = Path(tempfile.mkdtemp(prefix="knfsd-s2-journal-"))
         self.servers: list[ChannelServer] = []
         self.sockets: list[Path] = []
+        try:
+            self.journal = HostJournal(root, name, fsync=True)
+        except BaseException:
+            shutil.rmtree(self.socket_dir, ignore_errors=True)
+            raise
         try:
             for lane in range(lanes):
                 channel = f"nfsp-journal-{lane}"
                 self.journal.install_session_series(
                     vm_instance_id=vm, channel_id=channel,
                     prefix=prefixes[lane], lane_id=lane, rule_set=rules)
-                socket = Path(self.socket_tmp.name) / f"lane{lane}.sock"
+                socket = self.socket_dir / f"lane{lane}.sock"
                 self.servers.append(ChannelServer(
                     socket, self.journal, ChannelIdentity(vm, channel)))
                 self.sockets.append(socket)
@@ -530,15 +575,31 @@ class _JournalChannels:
         return sorted(self.root.glob(f"{self.name}.[0-9][0-9][0-9][0-9]{SEGMENT_SUFFIX}"))
 
     def close(self) -> None:
+        stopped = True
         for server in reversed(self.servers):
-            server.close()
+            stopped = server.close() and stopped
+        if not stopped:
+            raise Stage2StepError(
+                "journal channel did not stop before evidence sealing")
         self.servers.clear()
         self.journal.close()
-        self.socket_tmp.cleanup()
+        shutil.rmtree(self.socket_dir, ignore_errors=True)
+
+
+@contextmanager
+def _closed_evidence_channels(output: Path, index: int,
+                              channels: _JournalChannels, *,
+                              reserve_s: float = EVIDENCE_SEAL_RESERVE_S):
+    """Close journal writers inside the same reserve used for sealing."""
+    with _evidence_seal_window(
+            output, index, reserve_s=reserve_s) as deadline:
+        channels.close()
+        _check_evidence_deadline(deadline)
+        yield deadline
 
 
 def _journal_artifacts(channels: _JournalChannels, *,
-                       deadline: float) -> list[_Artifact]:
+                       deadline: float | _EvidenceSealState) -> list[_Artifact]:
     _check_evidence_deadline(deadline)
     paths = channels.paths()
     if not paths:
@@ -555,7 +616,8 @@ def _journal_artifacts(channels: _JournalChannels, *,
 
 def _seal_segment(output: Path, index: int, *, vm: str, lane: int,
                   generation: int, host: dict[str, Any],
-                  artifacts: list[_Artifact], deadline: float) -> Path:
+                  artifacts: list[_Artifact],
+                  deadline: float | _EvidenceSealState) -> Path:
     _check_evidence_deadline(deadline)
     if not artifacts or len(artifacts) > 255:
         raise Stage2StepError("segment artifact count must be in [1, 255]")
@@ -570,33 +632,32 @@ def _seal_segment(output: Path, index: int, *, vm: str, lane: int,
         raise Stage2StepError("evidence segment path already exists")
     temporary.mkdir()
     entries = []
-    try:
-        for number, artifact in enumerate(artifacts):
-            _check_evidence_deadline(deadline)
-            name = f"artifact-{number:03d}.bin"
-            path = temporary / name
-            with path.open("xb") as stream:
-                stream.write(artifact.data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            _check_evidence_deadline(deadline)
-            entries.append({"identity": artifact.identity,
-                            "type": artifact.type, "path": name})
-        capture = {"vm_instance_id": vm, "lane": lane,
-                   "generation_id": max(1, generation), "host": host,
-                   "artifacts": entries}
-        with (temporary / "capture.json").open("x") as stream:
-            json.dump(capture, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
+    for number, artifact in enumerate(artifacts):
+        _check_evidence_deadline(deadline)
+        name = f"artifact-{number:03d}.bin"
+        path = temporary / name
+        with path.open("xb") as stream:
+            stream.write(artifact.data)
             stream.flush()
             os.fsync(stream.fileno())
         _check_evidence_deadline(deadline)
-        os.rename(temporary, final)
-        _check_evidence_deadline(deadline)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        shutil.rmtree(final, ignore_errors=True)
-        raise
+        entries.append({"identity": artifact.identity,
+                        "type": artifact.type, "path": name})
+    capture = {"vm_instance_id": vm, "lane": lane,
+               "generation_id": max(1, generation), "host": host,
+               "artifacts": entries}
+    with (temporary / "capture.json").open("x") as stream:
+        json.dump(capture, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    _check_evidence_deadline(deadline)
+    # Keep the alarm interruptible across rename.  If rename commits just as
+    # the deadline fires, the exception propagates but the final name remains
+    # valid for the engine to harvest.
+    os.rename(temporary, final)
+    if isinstance(deadline, _EvidenceSealState):
+        deadline.published = True
     return final
 
 
@@ -677,19 +738,25 @@ def _gate(inputs: _Inputs, output: Path, options: StepOptions) -> None:
                               channels.qemu_args(controller=True))
         result: dict[str, Any] = {}
         try:
-            scenario = run_lane(
-                guest, inputs.files, inputs.root / "program.syz",
-                inputs.harness.runtime_selection, inputs.lane_sha256,
-                inputs.collector, work, result,
-                exec_slowdown=options.exec_slowdown)
-            scenario_output = (work / "executor.log").read_text(errors="replace")
-            neutral, neutral_output = _neutral_run(
-                guest, inputs.root / "neutral.syz", inputs.collector,
-                exec_slowdown=options.exec_slowdown)
-        finally:
-            guest.stop()
-            channels.close()
-        with _evidence_seal_window(output, repetition) as seal_deadline:
+            try:
+                scenario = run_lane(
+                    guest, inputs.files, inputs.root / "program.syz",
+                    inputs.harness.runtime_selection, inputs.lane_sha256,
+                    inputs.collector, work, result,
+                    exec_slowdown=options.exec_slowdown)
+                scenario_output = (work / "executor.log").read_text(
+                    errors="replace")
+                neutral, neutral_output = _neutral_run(
+                    guest, inputs.root / "neutral.syz", inputs.collector,
+                    exec_slowdown=options.exec_slowdown)
+            finally:
+                guest.stop()
+        except BaseException:
+            with _closed_evidence_channels(output, repetition, channels):
+                pass
+            raise
+        with _closed_evidence_channels(
+                output, repetition, channels) as seal_deadline:
             scenario_generation = _barrier_generation(scenario_output)
             neutral_generation = _barrier_generation(
                 neutral_output, scenario_generation + 1)
@@ -746,34 +813,42 @@ def _replay(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     fixture_failed = False
     returncode = -1
     try:
-        guest.start()
-        if not _fixture(guest, inputs, {}):
-            fixture_failed = True
-        else:
-            _checked(guest, f"mkdir -p {GUEST_DIR}")
-            guest.put(inputs.files["syz-executor"], f"{GUEST_DIR}/syz-executor")
-            guest.put(inputs.files["syz-execprog"], f"{GUEST_DIR}/syz-execprog")
-            guest.put(replay / "programs.log", f"{GUEST_DIR}/programs.log")
-            _checked(guest, f"chmod 0755 {GUEST_DIR}/syz-executor "
-                            f"{GUEST_DIR}/syz-execprog")
-            argv = [
-                f"{GUEST_DIR}/syz-execprog",
-                f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
-                "-arch=amd64", "-vmarch=amd64", "-sandbox=none", "-procs=1",
-                "-repeat=1", "-threaded=false", "-cover=true",
-                "-remote-cover=true", "-disable=all", "-debug", "-vv=1",
-                f"-slowdown={options.exec_slowdown}",
-                f"{GUEST_DIR}/programs.log",
-            ]
-            returncode, output_text = guest.run(
-                shlex.join(argv), timeout=execprog_timeout(
-                    inputs.collector.exec_timeout_s, options.exec_slowdown))
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        output_text += f"\nhost replay error: {type(exc).__name__}: {exc}\n"
-    finally:
-        guest.stop()
-        channels.close()
-    with _evidence_seal_window(output, 0) as seal_deadline:
+        try:
+            guest.start()
+            if not _fixture(guest, inputs, {}):
+                fixture_failed = True
+            else:
+                _checked(guest, f"mkdir -p {GUEST_DIR}")
+                guest.put(inputs.files["syz-executor"],
+                          f"{GUEST_DIR}/syz-executor")
+                guest.put(inputs.files["syz-execprog"],
+                          f"{GUEST_DIR}/syz-execprog")
+                guest.put(replay / "programs.log",
+                          f"{GUEST_DIR}/programs.log")
+                _checked(guest, f"chmod 0755 {GUEST_DIR}/syz-executor "
+                                f"{GUEST_DIR}/syz-execprog")
+                argv = [
+                    f"{GUEST_DIR}/syz-execprog",
+                    f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
+                    "-arch=amd64", "-vmarch=amd64", "-sandbox=none",
+                    "-procs=1", "-repeat=1", "-threaded=false",
+                    "-cover=true", "-remote-cover=true", "-disable=all",
+                    "-debug", "-vv=1", f"-slowdown={options.exec_slowdown}",
+                    f"{GUEST_DIR}/programs.log",
+                ]
+                returncode, output_text = guest.run(
+                    shlex.join(argv), timeout=execprog_timeout(
+                        inputs.collector.exec_timeout_s,
+                        options.exec_slowdown))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            output_text += f"\nhost replay error: {type(exc).__name__}: {exc}\n"
+        finally:
+            guest.stop()
+    except BaseException:
+        with _closed_evidence_channels(output, 0, channels):
+            pass
+        raise
+    with _closed_evidence_channels(output, 0, channels) as seal_deadline:
         console_bytes = console.read_bytes() if console.is_file() else b""
         _check_evidence_deadline(seal_deadline)
         if _CRASH.search(console_bytes):
@@ -920,31 +995,36 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     complete = False
     unexpected_exit = False
     try:
-        with manager_log.open("wb") as log:
-            process = subprocess.Popen(
-                [str(manager_binary), "-config", str(config), "-debug"],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                start_new_session=True)
-            deadline = time.monotonic() + options.campaign_timeout_s
-            while True:
-                records = _spool(spool)
-                _, campaign_records = _campaign_records(records)
-                reports, crash_log = _crash_files(workdir)
-                if (len(campaign_records) >= options.campaign_executions or
-                        reports or crash_log is not None):
-                    break
-                if process.poll() is not None:
-                    unexpected_exit = True
-                    break
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.05)
-            complete = _stop_manager(process, options.manager_stop_timeout_s)
-    finally:
-        if process is not None and process.poll() is None:
-            _stop_manager(process, options.manager_stop_timeout_s)
-        channels.close()
-    with _evidence_seal_window(output, 0) as seal_deadline:
+        try:
+            with manager_log.open("wb") as log:
+                process = subprocess.Popen(
+                    [str(manager_binary), "-config", str(config), "-debug"],
+                    stdin=subprocess.DEVNULL, stdout=log,
+                    stderr=subprocess.STDOUT, start_new_session=True)
+                deadline = time.monotonic() + options.campaign_timeout_s
+                while True:
+                    records = _spool(spool)
+                    _, campaign_records = _campaign_records(records)
+                    reports, crash_log = _crash_files(workdir)
+                    if (len(campaign_records) >= options.campaign_executions or
+                            reports or crash_log is not None):
+                        break
+                    if process.poll() is not None:
+                        unexpected_exit = True
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.05)
+                complete = _stop_manager(
+                    process, options.manager_stop_timeout_s)
+        finally:
+            if process is not None and process.poll() is None:
+                _stop_manager(process, options.manager_stop_timeout_s)
+    except BaseException:
+        with _closed_evidence_channels(output, 0, channels):
+            pass
+        raise
+    with _closed_evidence_channels(output, 0, channels) as seal_deadline:
         end_ns = time.time_ns()
         records = _spool(spool)
         _check_evidence_deadline(seal_deadline)

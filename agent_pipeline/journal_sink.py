@@ -1115,6 +1115,8 @@ class ChannelServer:
         self._sock.bind(str(self.path))
         self._sock.listen(4)
         self._stop = threading.Event()
+        self._connection_lock = threading.Lock()
+        self._connection: socket.socket | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1127,21 +1129,41 @@ class ChannelServer:
                 continue
             except OSError:
                 return
-            with conn:
-                conn.settimeout(None)
-                try:
-                    self.ended.append(serve_channel(conn, self.journal, self.channel))
-                except OSError:
-                    self.ended.append("io_error")
+            with self._connection_lock:
+                if self._stop.is_set():
+                    conn.close()
+                    return
+                self._connection = conn
+            try:
+                with conn:
+                    conn.settimeout(None)
+                    try:
+                        self.ended.append(
+                            serve_channel(conn, self.journal, self.channel))
+                    except OSError:
+                        self.ended.append("io_error")
+            finally:
+                with self._connection_lock:
+                    if self._connection is conn:
+                        self._connection = None
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        """Stop accepting and return whether the serving thread exited."""
         self._stop.set()
         self._sock.close()
+        with self._connection_lock:
+            connection = self._connection
+            if connection is not None:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
         self._thread.join(timeout=CHANNEL_CLOSE_TIMEOUT_S)
         try:
             self.path.unlink()
         except FileNotFoundError:
             pass
+        return not self._thread.is_alive()
 
 
 def main(argv: list[str] | None = None) -> int:
