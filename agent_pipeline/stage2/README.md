@@ -155,6 +155,23 @@ Syzkaller patches 0025--0026 force and durably export remote KCOV for every
 target-mode execution and mark whether each request was sent before or after
 machine check completion. The host excludes setup traffic and turns only
 campaign records into generation coverage.
+
+### Validation status
+
+PR #61 exercised each standalone host step on real `/dev/kvm` with the pinned
+KASAN guest and promoted semantic Proxy. The gate recorded 3,314 remote-KCOV
+PCs for its scenario generation and zero for its neutral generation. The
+bounded campaign excluded 17 setup executions, accepted all 25 campaign
+generations, and recorded three positive generations, including 3,278 PCs for
+the exact seed. Replay completed with acknowledged activation and deactivation
+and an intact journal. No Q2 internal error or torn journal tail was present.
+
+This validates the concrete host/runtime/evidence path. It does not claim that
+a live model and real vulnerability candidate have traversed the complete
+Controller-to-host service path; issue #57 owns that campaign. Repository
+campaign thresholds are also still placeholders, so automatic Stage 2 remains
+off by default.
+
 Run the complete service path as follows:
 
 1. Bring a job to `s1_reached` with the Stage 1 service (its README).
