@@ -107,8 +107,46 @@
       "source_refs": [
         "bundle/lane/boot-fixture.sh"
       ]
+    },
+    {
+      "id": "HCAP-11",
+      "name": "bounded NFSv4.1 client lifecycle recovery",
+      "purpose": "Expire the deterministic confirmed lane-0 client and drive protocol-valid NFSv4.1 recovery",
+      "usable_stage": [
+        "stage1"
+      ],
+      "usable_by": [
+        "agent_stage1"
+      ],
+      "interface": {
+        "syz_calls": [
+          "syz_nfsd_client_ctl$expire_client0"
+        ]
+      },
+      "constraints": [
+        "single NFSv4.1 fixture with SERVER_IMPL=both and the lifecycle broker enabled",
+        "client0 is the only admitted client selector; invoke exactly one syz_nfsd_client_ctl$expire_client0(0x0), acquire the client0 profile exactly once, then perform at least one parser-proven client0-origin NFS I/O operation",
+        "broker resolves exactly one confirmed minor-version-1 owner named Linux NFSv4.1 frozen-phase9-lane0-client0/<UTS hostname>",
+        "broker alone selects /proc/fs/nfsd/clients/<client>/ctl and writes literal expire",
+        "validated recovery pairs one expiry with ordinary client0 profile I/O and observes EXCHANGE_ID then CREATE_SESSION"
+      ],
+      "status": "validated",
+      "scope": [
+        "client0_confirmed_expiry_recovery"
+      ],
+      "source_refs": [
+        "bundle/patches/syzkaller/0027-*",
+        "bundle/lane/lane.sh",
+        "tools/nfs-proxy/src/lifecycle.c",
+        "tools/nfs-lifecycle/run.py"
+      ]
     }
   ],
+  "capability_evidence": {
+    "HCAP-11": [
+      "capability-evidence/hcap11-kvm.json"
+    ]
+  },
   "missing_capability_ids": [
     "remote_kcov.context.client",
     "remote_kcov.context.transport"
@@ -265,6 +303,12 @@
         ]
       },
       {
+        "call": "syz_nfsd_client_ctl$expire_client0",
+        "capability_ids": [
+          "HCAP-11"
+        ]
+      },
+      {
         "call": "syz_open_nfs_lane_profile$client0_knfsd_v41",
         "capability_ids": [
           "HCAP-01"
@@ -321,6 +365,7 @@
       "topology": "one-lane",
       "enabled_interfaces": [
         "remote_cover",
+        "syz_nfsd_client_ctl$expire_client0",
         "syz_open_nfs_lane_profile$client0_knfsd_v41",
         "syz_open_nfs_lane_profile$client1_knfsd_v41"
       ],
@@ -337,6 +382,7 @@
         "topology": "one-lane",
         "enabled_interfaces": [
           "remote_cover",
+          "syz_nfsd_client_ctl$expire_client0",
           "syz_open_nfs_lane_profile$client0_knfsd_v41",
           "syz_open_nfs_lane_profile$client1_knfsd_v41"
         ],

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "proxy.h"
 #include "control.h"
+#include "lifecycle.h"
 #include "semantic.h"
 #include "target.h"
 
@@ -210,6 +211,7 @@ static void usage(const char *program)
 		"       %s --check-rules RULES\n"
 		"       %s --describe-rules RULES\n"
 		"       %s --capability-registry\n"
+		"       %s --lifecycle-admin PATH --lane N\n"
 		"One listener per backend; client identity is the TCP source IP. "
 		"An arm rule is active only while its control FD remains open.\n"
 		"--semantic decodes every record and correlates each REPLY with "
@@ -225,8 +227,10 @@ static void usage(const char *program)
 		"--describe-rules prints each rule of an accepted RULES as JSON "
 		"in the capability registry's vocabulary (exit 3 when refused).\n"
 		"--capability-registry prints the semantic capability registry "
-		"this build implements (canonical JSON, one line).\n",
-		program, program, program, program, program);
+		"this build implements (canonical JSON, one line).\n"
+		"--lifecycle-admin serves the bounded knfsd NFSv4.1 client-expiry "
+		"fixture endpoint from the server mount/network namespace.\n",
+		program, program, program, program, program, program);
 }
 
 /* Semantic replay's compatibility gate: see nfsp_target_check_rules.  With
@@ -272,6 +276,27 @@ int main(int argc, char **argv)
 		return nfsp_target_capability_registry(
 			families, sizeof(families) / sizeof(families[0]),
 			stdout) == 0 ? 0 : 1;
+	if (argc == 5 && strcmp(argv[1], "--lifecycle-admin") == 0 &&
+	    strcmp(argv[3], "--lane") == 0) {
+		uint32_t lane;
+
+		if (parse_u32(argv[4], &lane) != 0 || lane > 255u) {
+			usage(argv[0]);
+			return 2;
+		}
+		if (!atomic_is_lock_free(&stop_requested)) {
+			fprintf(stderr, "signal stop flag must be lock-free on this host\n");
+			return 2;
+		}
+		signal(SIGINT, stop_signal);
+		signal(SIGTERM, stop_signal);
+		if (nfsp_lifecycle_serve(argv[2], "/proc/fs/nfsd/clients", lane,
+					 &stop_requested) != 0) {
+			perror("lifecycle admin");
+			return 1;
+		}
+		return 0;
+	}
 	if (argc < 7) {
 		usage(argv[0]); return 2;
 	}

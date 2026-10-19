@@ -346,6 +346,31 @@ pid_in_named_netns()
         "$(stat -Lc '%d:%i' "/run/netns/$pid_check_ns")"
 }
 
+pid_owns_unix_socket()
+{
+    socket_owner_pid=$1
+    socket_owner_path=$2
+    test -r "/proc/$socket_owner_pid/net/unix"
+    socket_owner_inode=$(awk -v expected="$socket_owner_path" '
+        $8 == expected { count++; inode = $7 }
+        END {
+            if (count != 1)
+                exit 1
+            print inode
+        }
+    ' "/proc/$socket_owner_pid/net/unix") || return 1
+    case "$socket_owner_inode" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    for socket_owner_fd in "/proc/$socket_owner_pid/fd/"*; do
+        socket_owner_target=$(readlink "$socket_owner_fd" 2>/dev/null || true)
+        if [ "$socket_owner_target" = "socket:[$socket_owner_inode]" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 stop_namespace()
 {
     stop_ns=$1
@@ -913,6 +938,39 @@ EOF
         fi
         if [ "$server_impl" = both ]; then
             command -v nfs-proxy >/dev/null 2>&1 || {
+                echo "KOOV: guest lifecycle admin not on PATH" >&2
+                exit 1
+            }
+            nfs-proxy --lifecycle-admin \
+                "$executor_root/proc-$lane/control/lifecycle.sock" \
+                --lane "$lane" \
+                > "$lane_root/server/lifecycle.log" 2>&1 &
+            lifecycle_pid=$!
+            printf "%s\n" "$lifecycle_pid" > \
+                "$lane_root/server/lifecycle.pid"
+            lifecycle_starttime=$(awk "{print \$22}" "/proc/$lifecycle_pid/stat")
+            case "$lifecycle_starttime" in
+                ""|*[!0-9]*)
+                    echo "KOOV: lifecycle admin has invalid start time" >&2
+                    exit 1 ;;
+            esac
+            printf "%s\n" "$lifecycle_starttime" > \
+                "$lane_root/server/lifecycle.starttime"
+            lifecycle_wait=0
+            while ! grep -q "^lifecycle ready:" \
+                    "$lane_root/server/lifecycle.log"; do
+                if ! kill -0 "$lifecycle_pid" 2>/dev/null || \
+                    test "$lifecycle_wait" -ge 100; then
+                    echo "KOOV: lifecycle admin failed to start" >&2
+                    cat "$lane_root/server/lifecycle.log" >&2
+                    exit 1
+                fi
+                lifecycle_wait=$((lifecycle_wait + 1))
+                sleep 0.1
+            done
+        fi
+        if [ "$server_impl" = both ]; then
+            command -v nfs-proxy >/dev/null 2>&1 || {
                 echo "KOOV: guest relay not on PATH" >&2
                 exit 1
             }
@@ -1061,6 +1119,9 @@ expose_lane_to_executor()
         mkdir "$expose_source/$expose_alias"
         mount --bind "$expose_mount" "$expose_source/$expose_alias"
     done
+    if [ "$server_impl" = both ]; then
+        test -S "$expose_source/control/lifecycle.sock"
+    fi
     if [ -n "$proxy_target_dir" ]; then
         test -S "$expose_source/activation/activation.sock"
     elif [ "$server_impl" = both ]; then
@@ -1306,7 +1367,8 @@ cleanup_fixture()
                 "$cleanup_source/.client0_pid" "$cleanup_source/.client1_pid" \
                 "$cleanup_source/.client0_netns" "$cleanup_source/.client1_netns" \
                 "$cleanup_source/.server0_ipv4" "$cleanup_source/.server1_ipv4"
-            rm -f "$cleanup_source/control/arm.sock"
+            rm -f "$cleanup_source/control/arm.sock" \
+                "$cleanup_source/control/lifecycle.sock"
             rmdir "$cleanup_source/control" 2>/dev/null || true
             rm -f "$cleanup_source/activation/activation.sock" \
                 "$cleanup_source/activation/rule_set_id"
@@ -1419,6 +1481,29 @@ status_fixture()
         pid_in_named_netns "$status_server_pid" "$status_server_ns"
         pid_in_named_netns "$status_client0_pid" "$status_client0_ns"
         pid_in_named_netns "$status_client1_pid" "$status_client1_ns"
+        if [ "$server_impl" = both ]; then
+            test -s "$status_lane_root/server/lifecycle.pid"
+            test -s "$status_lane_root/server/lifecycle.starttime"
+            status_lifecycle_pid=$(cat "$status_lane_root/server/lifecycle.pid")
+            pid_in_named_netns "$status_lifecycle_pid" "$status_server_ns"
+            test "$(stat -Lc '%d:%i' "/proc/$status_lifecycle_pid/ns/mnt")" = \
+                "$(stat -Lc '%d:%i' "/proc/$status_server_pid/ns/mnt")"
+            status_lifecycle_starttime=$(awk '{print $22}' \
+                "/proc/$status_lifecycle_pid/stat")
+            test "$status_lifecycle_starttime" = \
+                "$(cat "$status_lane_root/server/lifecycle.starttime")"
+            status_lifecycle_cmdline=$(tr '\000' ' ' < "/proc/$status_lifecycle_pid/cmdline")
+            case "$status_lifecycle_cmdline" in
+                *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane"*) ;;
+                *) echo "KOOV: lifecycle admin process identity mismatch" >&2
+                   return 1 ;;
+            esac
+            if ! pid_owns_unix_socket "$status_lifecycle_pid" \
+                    "$executor_root/proc-$status_lane/control/lifecycle.sock"; then
+                echo "KOOV: lifecycle admin does not own its socket" >&2
+                return 1
+            fi
+        fi
 
         for status_client in 0 1; do
             status_pid=$(cat "$status_lane_root/client$status_client.pid")
@@ -1567,6 +1652,9 @@ status_fixture()
             test "$(cat "$status_source/activation/rule_set_id")" = \
                 "$(sha256sum "$proxy_target_dir/lane$status_lane.nfsprul1" | \
                     cut -d' ' -f1)"
+        fi
+        if [ "$server_impl" = both ]; then
+            test -S "$status_source/control/lifecycle.sock"
         fi
         if [ "$server_impl" = both ] && [ -z "$proxy_target_dir" ]; then
             test -S "$status_source/control/arm.sock"

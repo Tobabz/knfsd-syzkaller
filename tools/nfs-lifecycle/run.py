@@ -2,20 +2,41 @@
 """Run versioned NFS lifecycle scenarios in a disposable fixture VM."""
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import re
+import shlex
+import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from agent_pipeline.artifacts import ArtifactStore
+from agent_pipeline.data import canonical_json, load_record
+from agent_pipeline.hcap import RuntimeSelection
+from agent_pipeline.materializer import (ExecutionHarnessDescriptor,
+                                         descriptor_id)
+from agent_pipeline.q1 import KernelIdentity, TargetPcMapping
+from agent_pipeline.stage1.host.collector import (CollectorConfig,
+                                                  guest_cmdline,
+                                                  verify_pins)
+from agent_pipeline.stage1.host.pins import HostFilePin
+from agent_pipeline.stage1.host.vm import QemuGuest, VmConfig
+
+
 CRASH_PATTERNS = (
     "BUG: KASAN:", "Kernel panic", "Oops:",
     "general protection fault", "kernel BUG at",
 )
 SCENARIOS = {
     "v40-lease-expiry": {"version": "4.0", "kind": "lease"},
+    "v41-client-expiry": {"version": "4.1", "kind": "admin"},
     "v41-control-restart": {"version": "4.1", "kind": "control"},
     "v42-control-restart": {"version": "4.2", "kind": "control"},
 }
@@ -42,11 +63,172 @@ CONTROL_ORDER = (
     "nfsd_ctl_ports_addxprt: transport=tcp port=20490",
     "nfsd_ctl_threads: newthreads=4",
 )
+ADMIN_EVENTS = (
+    "nfsd/nfsd_clid_admin_expired",
+    "nfsd/nfsd_clid_fresh",
+    "nfsd/nfsd_clid_confirmed",
+    "nfsd/nfsd_slot_seqid_unconf",
+    "nfsd/nfsd_compound_status",
+)
+ADMIN_PROGRAMS = {
+    "control": ROOT / "tools/nfs-lifecycle/programs/v41-client-io-control.prog",
+    "stimulus": ROOT / "tools/nfs-lifecycle/programs/v41-client-expire.prog",
+}
+ADMIN_GUEST = "/tmp/nfs-lifecycle-admin"
+ADMIN_GATE = ADMIN_GUEST + "/gate"
+ADMIN_RC = ADMIN_GUEST + "/exec.rc"
+ADMIN_LOG = ADMIN_GUEST + "/exec.log"
+STATS_COMMAND = ("for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do "
+                 "echo \"== $f\"; cat \"$f\"; done")
+STATE_COMMAND = "cat /sys/kernel/debug/sunrpc_fuzz/phase4_state"
 CLIENT_RE = re.compile(r"\bclient ([0-9a-fA-F]{8}:[0-9a-fA-F]{8})\b")
 EVENT_RE = re.compile(r"\s(?P<timestamp>\d+\.\d+): (?P<name>[A-Za-z0-9_]+): ")
+SECTION_RE = re.compile(r"^== .*/([A-Za-z0-9_]+)$")
+COUNTER_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*) (-?[0-9]+)$")
+LIFECYCLE_RE = re.compile(
+    r"^lifecycle request lane=0 op=1 client=0 status=0 "
+    r"clientid=0x([0-9a-fA-F]{16}) minor=1 sessions=([1-9][0-9]*)$",
+    re.MULTILINE)
+SHAREABLE_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
+ADMIN_REQUIRED_INTERFACES = frozenset((
+    "remote_cover",
+    "syz_nfsd_client_ctl$expire_client0",
+    "syz_open_nfs_lane_profile$client0_knfsd_v41",
+))
 
 
-def load_vm_class():
+class CheckedGuest:
+    """Compatibility adapter for the lifecycle helpers' checked guest API."""
+
+    def __init__(self, guest):
+        self._guest = guest
+
+    def start(self):
+        self._guest.start()
+
+    def guest(self, command, timeout=60):
+        rc, output = self._guest.run(command, timeout=timeout)
+        if rc != 0:
+            raise RuntimeError("guest rc=%d: %s: %s" %
+                               (rc, command, output[-1500:]))
+        return output
+
+    def put(self, source, destination):
+        self._guest.put(Path(source), destination)
+
+    def stop(self):
+        self._guest.stop()
+
+
+@dataclass(frozen=True)
+class AdminContext:
+    config: CollectorConfig
+    descriptor: ExecutionHarnessDescriptor
+    files: dict[str, Path]
+    target_pcs: frozenset[int]
+    selection: RuntimeSelection
+    lane_sha256: str
+    evidence_identity: dict
+
+
+def load_admin_context(collector_path, descriptor_path, mapping_path):
+    """Load one exact Stage1 harness and bind the target mapping to it."""
+    config_bytes = Path(collector_path).read_bytes()
+    descriptor_bytes = Path(descriptor_path).read_bytes()
+    mapping_bytes = Path(mapping_path).read_bytes()
+    config = CollectorConfig.model_validate_json(config_bytes)
+    descriptor = ExecutionHarnessDescriptor.model_validate_json(
+        descriptor_bytes)
+    mapping = TargetPcMapping.model_validate_json(mapping_bytes)
+    if not mapping.verified or not mapping.target_pcs:
+        raise RuntimeError("target PC mapping is empty or unverified")
+    files = verify_pins(config, descriptor)
+    builds = {item.name: item.artifact_ref
+              for item in descriptor.build_artifacts}
+    for name in (config.instrumentation_artifact_name,
+                 config.vmlinux_artifact_name):
+        if name not in builds:
+            raise RuntimeError("descriptor lacks mapping artifact %s" % name)
+    harness_id = descriptor_id(descriptor)
+    expected_identity = KernelIdentity(
+        execution_harness_id=harness_id,
+        kernel_commit=descriptor.kernel_commit,
+        instrumentation_sha256=builds[
+            config.instrumentation_artifact_name],
+        vmlinux_sha256=builds[config.vmlinux_artifact_name],
+        kaslr_enabled=False, kaslr_offset=0)
+    if "nokaslr" not in descriptor.guest_kernel_command_line.split():
+        raise RuntimeError("execution descriptor does not disable KASLR")
+    if mapping.target.kernel_commit != descriptor.kernel_commit:
+        raise RuntimeError("target mapping names another kernel commit")
+    if mapping.identity != expected_identity:
+        raise RuntimeError("target mapping identity does not match the exact "
+                           "execution harness")
+
+    selections = [
+        item for item in descriptor.allowed_runtime_selections
+        if (item.profile == "knfsd-v41" and item.nfs_version == "4.1"
+            and item.fixture_mode == "single" and item.route == "direct"
+            and item.topology == "one-lane" and item.trace_mode == "off"
+            and ADMIN_REQUIRED_INTERFACES <= set(item.enabled_interfaces))
+    ]
+    if len(selections) != 1:
+        raise RuntimeError("execution descriptor must expose one exact "
+                           "NFSv4.1 lifecycle runtime selection")
+
+    store = ArtifactStore(config.artifact_root)
+    lane_pin = load_record(store, builds["lane-script"], HostFilePin)
+    if lane_pin.name != "lane-script":
+        raise RuntimeError("lane-script build artifact has the wrong pin")
+    evidence = {
+        "schema_version": "nfs-lifecycle-evidence-identity.v1",
+        "collector_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "execution_harness_id": harness_id,
+        "kernel_commit": descriptor.kernel_commit,
+        "instrumentation_sha256": expected_identity.instrumentation_sha256,
+        "vmlinux_sha256": expected_identity.vmlinux_sha256,
+        "target_mapping_sha256": hashlib.sha256(
+            canonical_json(mapping)).hexdigest(),
+        "build_artifact_refs": dict(sorted(builds.items())),
+    }
+    return AdminContext(
+        config=config, descriptor=descriptor, files=files,
+        target_pcs=frozenset(mapping.target_pcs), selection=selections[0],
+        lane_sha256=lane_pin.sha256, evidence_identity=evidence)
+
+
+def make_admin_vm(context, output):
+    config = context.config
+    command_line = guest_cmdline(
+        context.descriptor, context.selection, context.lane_sha256)
+    guest = QemuGuest(VmConfig(
+        qemu=config.qemu, bzimage=context.files["bzimage"],
+        image=context.files["vm-image"],
+        lane_dir=context.files["lane-script"].parent,
+        ssh_key=config.ssh_key, cmdline=command_line,
+        console_log=output / "console.log", memory_mb=config.memory_mb,
+        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s))
+    return CheckedGuest(guest)
+
+
+def verify_admin_guest(vm, context):
+    lane = vm.guest("sha256sum /run/frozen-phase9/lane.sh").split()[0]
+    if lane != context.lane_sha256:
+        raise RuntimeError("guest lane script differs from the pinned file")
+    proxy_line = vm.guest(
+        "for p in /opt/kcov-nfs/deps/usr/sbin/nfs-proxy "
+        "/usr/sbin/nfs-proxy /usr/local/bin/nfs-proxy; do "
+        "test ! -x \"$p\" || { sha256sum -- \"$p\"; exit 0; }; "
+        "done; exit 1")
+    proxy = proxy_line.split()[0] if proxy_line.split() else ""
+    if re.fullmatch(r"[0-9a-f]{64}", proxy) is None:
+        raise RuntimeError("could not identify the guest nfs-proxy binary")
+    return {"guest_lane_script_sha256": lane,
+            "guest_nfs_proxy_sha256": proxy}
+
+
+def load_legacy_vm_class():
+    """Bootstrap VM used by lifecycle scenarios without target mappings."""
     path = ROOT / "tools/bootstrap-kcov-env.py"
     spec = importlib.util.spec_from_file_location("knfsd_bootstrap", path)
     module = importlib.util.module_from_spec(spec)
@@ -73,6 +255,388 @@ def set_tracing(vm, tracing, events, enabled, clear=False):
                      "echo %d > %s/tracing_on" %
                      (1 if enabled else 0, tracing)))
     vm.guest("; ".join(commands))
+
+
+def parse_stats(text):
+    stats = {}
+    current = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        section = SECTION_RE.match(line)
+        if section:
+            current = stats.setdefault(section.group(1), {})
+            continue
+        counter = COUNTER_RE.match(line)
+        if current is not None and counter:
+            current[counter.group(1)] = int(counter.group(2))
+    return stats
+
+
+def counter_delta(before, after, section, name):
+    try:
+        old = before[section][name]
+        new = after[section][name]
+    except KeyError as error:
+        raise RuntimeError("missing generation counter %s.%s" %
+                           (section, name)) from error
+    if new < old:
+        raise RuntimeError("generation counter went backwards: %s.%s" %
+                           (section, name))
+    return new - old
+
+
+def unsettled_generations(text):
+    busy = []
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        pairs = dict(zip(fields[::2], fields[1::2]))
+        if (pairs.get("state") not in ("ABORTED", "COMMITTED", "DEAD") or
+                pairs.get("outstanding_tokens") != "0" or
+                pairs.get("active_roots") != "0"):
+            busy.append(line.strip())
+    return busy
+
+
+def generation_evidence(before_text, after_text):
+    before = parse_stats(before_text)
+    after = parse_stats(after_text)
+    evidence = {
+        "generation_begin": counter_delta(
+            before, after, "phase4_stats", "generation_begin"),
+        "generation_aborted": counter_delta(
+            before, after, "phase4_stats", "generation_aborted"),
+        "remote_start_ok": counter_delta(
+            before, after, "phase5_stats", "remote_start_ok"),
+        "aggregate_published": counter_delta(
+            before, after, "phase6_stats", "aggregate_published"),
+        "scratch_overflow": counter_delta(
+            before, after, "phase6_stats", "scratch_overflow"),
+        "merge_truncation": counter_delta(
+            before, after, "phase6_stats", "aggregate_merge_truncated"),
+        "outstanding_tokens": after.get(
+            "phase4_stats", {}).get("outstanding_tokens"),
+        "remote_refs": after.get("phase6_stats", {}).get("remote_refs"),
+    }
+    expected = {
+        "generation_begin": 1,
+        "generation_aborted": 0,
+        "aggregate_published": 1,
+        "scratch_overflow": 0,
+        "merge_truncation": 0,
+        "outstanding_tokens": 0,
+        "remote_refs": 0,
+    }
+    for name, value in expected.items():
+        if evidence[name] != value:
+            raise RuntimeError("invalid generation %s=%r, want %d" %
+                               (name, evidence[name], value))
+    if evidence["remote_start_ok"] < 1:
+        raise RuntimeError("generation has no successful remote KCOV start")
+    evidence["attributed"] = True
+    return evidence
+
+
+def parse_cover(text):
+    pcs = set()
+    for line_number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if not re.fullmatch(r"0x[0-9a-fA-F]+", line):
+            raise RuntimeError(
+                "malformed remote coverage PC at line %d" % line_number)
+        value = int(line, 16)
+        if value <= 0 or value >= 2 ** 64:
+            raise RuntimeError(
+                "remote coverage PC out of range at line %d" % line_number)
+        pcs.add(value)
+    return pcs
+
+
+def shareable_error(error):
+    """Keep result.json diagnostic without reflecting kernel addresses."""
+    message = SHAREABLE_HEX_RE.sub("<redacted-hex>", str(error))
+    return "%s: %s" % (type(error).__name__, message)
+
+
+def wait_admin_exec(vm, gate, timeout=300):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = vm.guest(
+            "if test -f %s; then echo exited; "
+            "elif test -f %s.ready; then echo ready; fi" %
+            (ADMIN_RC, ADMIN_GATE)).strip()
+        if state == "exited" or (gate and state == "ready"):
+            return state
+        time.sleep(1)
+    raise RuntimeError("syz-execprog timed out %s" %
+                       ("before gate" if gate else "after gate"))
+
+
+def start_admin_exec(vm, guest_program):
+    argv = [ADMIN_GUEST + "/syz-execprog",
+            "-executor=" + ADMIN_GUEST + "/syz-executor",
+            "-os=linux", "-arch=amd64", "-vmarch=amd64",
+            "-sandbox=none", "-procs=1", "-repeat=1", "-threaded=false",
+            "-cover=true", "-coverfile=/tmp/cov/cover",
+            "-remote-cover=true", "-disable=all", "-debug", "-vv=1",
+            "-slowdown=1", "-gate=" + ADMIN_GATE, guest_program]
+    body = ("timeout 300 %s > %s 2>&1; echo $? > %s" %
+            (shlex.join(argv), ADMIN_LOG, ADMIN_RC))
+    command = (
+        "rm -rf /tmp/cov %s.ready %s.go %s; mkdir -p /tmp/cov; "
+        "setsid nohup sh -c %s < /dev/null > /dev/null 2>&1 &" %
+        (ADMIN_GATE, ADMIN_GATE, ADMIN_RC, shlex.quote(body)))
+    vm.guest(command)
+
+
+def one_trace_match(trace, pattern, description):
+    matches = list(re.finditer(pattern, trace, re.MULTILINE))
+    if len(matches) != 1:
+        raise RuntimeError("%s count=%d, want 1" % (description, len(matches)))
+    return matches[0]
+
+
+def validate_admin_trace(trace, lifecycle_log):
+    requests = list(LIFECYCLE_RE.finditer(lifecycle_log))
+    if len(requests) != 1:
+        raise RuntimeError("successful lifecycle request count=%d, want 1" %
+                           len(requests))
+    old_value = int(requests[0].group(1), 16)
+    # client_info_show() memcpy()s clientid_t into a native u64 before
+    # printing it. On this tool's fixed linux/amd64 target that reverses the
+    # two 32-bit words relative to the tracepoint's cl_boot:cl_id format.
+    old_client = "%08x:%08x" % (old_value & 0xffffffff, old_value >> 32)
+    admin = one_trace_match(
+        trace, r"nfsd_clid_admin_expired: client " + re.escape(old_client),
+        "admin-expired trace for broker clientid")
+    fresh = one_trace_match(
+        trace, r"nfsd_clid_fresh: .* client=([0-9a-f]{8}:[0-9a-f]{8})",
+        "fresh client trace")
+    new_client = fresh.group(1)
+    exchange = one_trace_match(
+        trace, r"nfsd_compound_status: .* OP_EXCHANGE_ID status=0(?:\s|$)",
+        "successful EXCHANGE_ID")
+    slot = one_trace_match(
+        trace, r"nfsd_slot_seqid_unconf: .* client " + re.escape(new_client) +
+        r"(?:\s|$)", "unconfirmed CREATE_SESSION slot")
+    confirmed = one_trace_match(
+        trace, r"nfsd_clid_confirmed: client " + re.escape(new_client) +
+        r"(?:\s|$)", "confirmed recovered client")
+    create = one_trace_match(
+        trace, r"nfsd_compound_status: .* OP_CREATE_SESSION status=0(?:\s|$)",
+        "successful CREATE_SESSION")
+    positions = [item.start() for item in
+                 (admin, fresh, exchange, slot, confirmed, create)]
+    if positions != sorted(positions):
+        raise RuntimeError("lifecycle trace events are out of order")
+    if old_client == new_client:
+        raise RuntimeError("recovery reused the expired clientid")
+    return {
+        "expired_clientid": old_client,
+        "recovered_clientid": new_client,
+        "session_count_before_expiry": int(requests[0].group(2)),
+        "ordered_events": [
+            "nfsd_clid_admin_expired", "nfsd_clid_fresh",
+            "OP_EXCHANGE_ID", "nfsd_slot_seqid_unconf",
+            "nfsd_clid_confirmed", "OP_CREATE_SESSION",
+        ],
+        "selected_trace_lines": [item.group(0).rstrip() for item in
+                                 (admin, fresh, exchange, slot,
+                                  confirmed, create)],
+    }
+
+
+def validate_admin_control(trace, lifecycle_log):
+    forbidden = ("nfsd_clid_admin_expired:", "nfsd_clid_fresh:",
+                 "OP_EXCHANGE_ID", "OP_CREATE_SESSION")
+    present = [marker for marker in forbidden if marker in trace]
+    if lifecycle_log.strip():
+        raise RuntimeError("neutral control invoked lifecycle broker")
+    if present:
+        raise RuntimeError("neutral control entered recovery: %s" % present)
+    return {"forbidden_recovery_events": present}
+
+
+def _optional_guest(vm, command, errors, *, timeout=60):
+    try:
+        return vm.guest(command, timeout=timeout)
+    except Exception as error:
+        errors.append("%s: %s" % (command.split()[0], error))
+        return None
+
+
+def _capture_admin_raw(vm, tracing, lifecycle_lines, artifacts, errors,
+                       *, execution_started):
+    """Best-effort raw capture used on success and every failure path."""
+    if not execution_started:
+        return []
+    commands = (
+        ("executor.log", "cat %s" % ADMIN_LOG, 120),
+        ("stats-after.txt", STATS_COMMAND, 60),
+        ("state-after.txt", STATE_COMMAND, 60),
+        ("trace.txt", "cat %s/trace" % tracing, 60),
+    )
+    for suffix, command, timeout in commands:
+        if suffix not in artifacts:
+            value = _optional_guest(
+                vm, command, errors, timeout=timeout)
+            if value is not None:
+                artifacts[suffix] = value
+    if "lifecycle.log" not in artifacts:
+        command = ("cat /tmp/frozen-phase9.manager/lane0/server/lifecycle.log"
+                   if lifecycle_lines is None else
+                   "tail -n +%d "
+                   "/tmp/frozen-phase9.manager/lane0/server/lifecycle.log" %
+                   (lifecycle_lines + 1))
+        value = _optional_guest(vm, command, errors)
+        if value is not None:
+            artifacts["lifecycle.log"] = value
+
+    listing = _optional_guest(
+        vm, "find /tmp/cov -maxdepth 1 -type f -printf '%f\\n' | sort",
+        errors)
+    if listing is None:
+        return artifacts.get("coverage-files.txt", "").splitlines()
+    cover_files = listing.splitlines()
+    artifacts.setdefault("coverage-files.txt", "".join(
+        name + "\n" for name in cover_files))
+    safe_files = [name for name in cover_files
+                  if re.fullmatch(r"[A-Za-z0-9_.-]+", name)]
+    for name in safe_files:
+        suffix = "coverage.raw." + name
+        if suffix not in artifacts:
+            value = _optional_guest(
+                vm, "cat /tmp/cov/" + name, errors, timeout=120)
+            if value is not None:
+                artifacts[suffix] = value
+    extra_files = [name for name in safe_files if name.endswith(".extra")]
+    meta_files = [name for name in safe_files if name.endswith(".meta")]
+    if len(extra_files) == 1:
+        value = artifacts.get("coverage.raw." + extra_files[0])
+        if value is not None:
+            artifacts["coverage.extra"] = value
+    if len(meta_files) == 1:
+        value = artifacts.get("coverage.raw." + meta_files[0])
+        if value is not None:
+            artifacts["coverage.meta"] = value
+    return cover_files
+
+
+def _write_admin_raw(output, stem, artifacts, errors):
+    if errors:
+        artifacts["artifact-errors.txt"] = "\n".join(errors) + "\n"
+    for suffix, contents in sorted(artifacts.items()):
+        (output / (stem + "." + suffix)).write_text(contents)
+
+
+def run_admin_program(vm, output, phase, iteration, tracing, target_pcs):
+    guest_program = "%s/%s.prog" % (ADMIN_GUEST, phase)
+    stem = "%s-%03d" % (phase, iteration)
+    artifacts = {}
+    errors = []
+    execution_started = False
+    lifecycle_lines = None
+    cover_files = []
+    try:
+        set_tracing(vm, tracing, ADMIN_EVENTS, False, clear=True)
+        start_admin_exec(vm, guest_program)
+        execution_started = True
+        if wait_admin_exec(vm, True) != "ready":
+            raise RuntimeError("syz-execprog exited before the program gate")
+        state_before = vm.guest(STATE_COMMAND)
+        artifacts["state-before.txt"] = state_before
+        busy = unsettled_generations(state_before)
+        if busy:
+            raise RuntimeError("unsettled generation at window start: %s" %
+                               busy[0])
+        stats_before = vm.guest(STATS_COMMAND)
+        artifacts["stats-before.txt"] = stats_before
+        lifecycle_lines = int(vm.guest(
+            "wc -l < "
+            "/tmp/frozen-phase9.manager/lane0/server/lifecycle.log").strip())
+        set_tracing(vm, tracing, ADMIN_EVENTS, True, clear=True)
+        vm.guest("touch %s.go" % ADMIN_GATE)
+        if wait_admin_exec(vm, False) != "exited":
+            raise RuntimeError("syz-execprog did not exit")
+        rc = vm.guest("cat %s" % ADMIN_RC).strip()
+        executor_log = vm.guest("cat %s" % ADMIN_LOG, timeout=120)
+        artifacts["executor.log"] = executor_log
+        if rc == "0":
+            time.sleep(10)
+        cover_files = _capture_admin_raw(
+            vm, tracing, lifecycle_lines, artifacts, errors,
+            execution_started=execution_started)
+        if rc != "0":
+            raise RuntimeError("syz-execprog rc=%s; see retained executor log" %
+                               rc)
+
+        required = ("stats-before.txt", "stats-after.txt", "trace.txt",
+                    "lifecycle.log", "coverage.extra", "coverage.meta")
+        missing = [name for name in required if name not in artifacts]
+        if missing:
+            raise RuntimeError("raw artifact capture incomplete: %s" %
+                               ", ".join(missing))
+        extra_files = [name for name in cover_files
+                       if name.endswith(".extra")]
+        meta_files = [name for name in cover_files if name.endswith(".meta")]
+        if len(extra_files) != 1 or len(meta_files) != 1:
+            raise RuntimeError("coverage file cardinality extra=%d meta=%d" %
+                               (len(extra_files), len(meta_files)))
+
+        trace = artifacts["trace.txt"]
+        lifecycle_log = artifacts["lifecycle.log"]
+        pcs = parse_cover(artifacts["coverage.extra"])
+        hits = pcs & target_pcs
+        generation = generation_evidence(
+            artifacts["stats-before.txt"], artifacts["stats-after.txt"])
+        if phase == "control":
+            lineage = validate_admin_control(trace, lifecycle_log)
+            if hits:
+                raise RuntimeError(
+                    "neutral control reached %d target PCs" % len(hits))
+        else:
+            lineage = validate_admin_trace(trace, lifecycle_log)
+            if not hits:
+                raise RuntimeError(
+                    "expiry stimulus did not reach a target PC")
+        return {
+            "phase": phase,
+            "iteration": iteration,
+            "generation": generation,
+            "coverage_pc_count": len(pcs),
+            "target_hit_count": len(hits),
+            "coverage_files": cover_files,
+            "lineage": lineage,
+        }
+    finally:
+        _capture_admin_raw(
+            vm, tracing, lifecycle_lines, artifacts, errors,
+            execution_started=execution_started)
+        try:
+            set_tracing(vm, tracing, ADMIN_EVENTS, False)
+        except Exception as error:
+            errors.append("disable-tracing: %s" % error)
+        _write_admin_raw(output, stem, artifacts, errors)
+
+
+def run_admin(vm, output, repeat, files, target_pcs):
+    tracing = trace_root(vm, ADMIN_EVENTS)
+    vm.guest("mkdir -p %s; dmesg -c >/dev/null" % ADMIN_GUEST)
+    for name in ("syz-executor", "syz-execprog"):
+        vm.put(files[name], ADMIN_GUEST + "/" + name)
+    for phase, path in ADMIN_PROGRAMS.items():
+        vm.put(path, "%s/%s.prog" % (ADMIN_GUEST, phase))
+    vm.guest("chmod 0755 %s/syz-executor %s/syz-execprog" %
+             (ADMIN_GUEST, ADMIN_GUEST))
+    cycles = {"control": [], "stimulus": []}
+    for phase in ("control", "stimulus"):
+        for iteration in range(1, repeat + 1):
+            cycles[phase].append(run_admin_program(
+                vm, output, phase, iteration, tracing, target_pcs))
+    return tracing, cycles
 
 
 def lease_guest_script(path):
@@ -321,25 +885,66 @@ def main():
                         default=ROOT / "env/images/kasan/bzImage")
     parser.add_argument("--ssh-key", type=Path,
                         default=ROOT / "artifacts/bookworm.id_rsa")
+    parser.add_argument("--collector-config", type=Path,
+                        help="Stage1 collector.json (required by client expiry)")
+    parser.add_argument("--descriptor", type=Path,
+                        help="exact Stage1 descriptor.json (required by client expiry)")
+    parser.add_argument("--target-pcs", type=Path,
+                        help="verified q1 target-PC mapping (required by client expiry)")
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args()
     if args.repeat < 1 or args.repeat > 999:
         parser.error("--repeat must be between 1 and 999")
-    for name in ("image", "kernel", "ssh_key"):
-        path = getattr(args, name).resolve()
-        if not path.is_file():
-            parser.error("missing --%s: %s" % (name.replace("_", "-"), path))
-        setattr(args, name, path)
+    definition = SCENARIOS[args.scenario]
+    admin_context = None
+    if definition["kind"] == "admin":
+        required = {
+            "--collector-config": args.collector_config,
+            "--descriptor": args.descriptor,
+            "--target-pcs": args.target_pcs,
+        }
+        for option, path in required.items():
+            if path is None:
+                parser.error("%s is required by v41-client-expiry" % option)
+            path = path.resolve()
+            if not path.is_file():
+                parser.error("missing %s: %s" % (option, path))
+        args.collector_config = args.collector_config.resolve()
+        args.descriptor = args.descriptor.resolve()
+        args.target_pcs = args.target_pcs.resolve()
+        try:
+            admin_context = load_admin_context(
+                args.collector_config, args.descriptor, args.target_pcs)
+        except Exception as error:
+            parser.error("invalid identity-bound lifecycle inputs: %s" % error)
+        for path in ADMIN_PROGRAMS.values():
+            if not path.is_file():
+                parser.error("missing lifecycle program: %s" % path)
+    else:
+        for name in ("image", "kernel", "ssh_key"):
+            path = getattr(args, name).resolve()
+            if not path.is_file():
+                parser.error("missing --%s: %s" %
+                             (name.replace("_", "-"), path))
+            setattr(args, name, path)
     output = args.output.resolve()
     if output.exists() or output.is_symlink():
         parser.error("output must not already exist: %s" % output)
-    output.mkdir(parents=True)
+    # Raw coverage intentionally remains available for private audit even
+    # though result.json omits target addresses. Keep the containing
+    # directory inaccessible to other local users.
+    output.mkdir(parents=True, mode=0o700)
 
-    definition = SCENARIOS[args.scenario]
     result = {"scenario": args.scenario, "native_version": definition["version"],
               "iterations": args.repeat, "transport": "TCP", "status": "fail"}
-    vm = load_vm_class()(args.image, args.kernel, args.ssh_key,
-                         args.boot_timeout, definition["version"])
+    if admin_context is not None:
+        result["evidence_identity"] = dict(
+            admin_context.evidence_identity)
+        vm = make_admin_vm(admin_context, output)
+    else:
+        vm = load_legacy_vm_class()(
+            args.image, args.kernel, args.ssh_key,
+            args.boot_timeout, definition["version"])
     tracing = None
     try:
         vm.start()
@@ -355,6 +960,15 @@ def main():
         if definition["kind"] == "lease":
             tracing, cycles = run_lease(vm, output, args.repeat)
             result["complete_lifecycle_chains"] = len(cycles)
+        elif definition["kind"] == "admin":
+            result["evidence_identity"].update(
+                verify_admin_guest(vm, admin_context))
+            vm.guest("test -S /syz-nfs-lanes/proc-0/control/lifecycle.sock")
+            tracing, cycles = run_admin(
+                vm, output, args.repeat, admin_context.files,
+                admin_context.target_pcs)
+            result["complete_control_runs"] = len(cycles["control"])
+            result["complete_stimulus_runs"] = len(cycles["stimulus"])
         else:
             tracing, cycles = run_control(vm, output, args.repeat)
             result["complete_control_cycles"] = len(cycles)
@@ -367,7 +981,7 @@ def main():
                        "trace_root": tracing, "cycles": cycles,
                        "crash_signatures": crashes})
     except Exception as error:
-        result["error"] = "%s: %s" % (type(error).__name__, error)
+        result["error"] = shareable_error(error)
         if tracing:
             try:
                 (output / "failure-trace.txt").write_text(

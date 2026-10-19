@@ -1,0 +1,163 @@
+From 4d2698a706b26056ea14cc57984616a477564abb Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Mon, 19 Oct 2026 13:57:02 +0900
+Subject: [PATCH] sys/linux: add bounded NFSv4 client expiry control
+
+---
+ executor/common_linux.h      | 73 +++++++++++++++++++++++++++++++++++-
+ pkg/vminfo/linux_syscalls.go |  1 +
+ sys/linux/fs_nfs_fuzz.txt    |  8 ++++
+ sys/linux/nfs_fuzz_test.go   | 18 +++++++++
+ 4 files changed, 99 insertions(+), 1 deletion(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 50024b9..3936a2c 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2827,7 +2827,8 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+ #if SYZ_EXECUTOR || __NR_syz_open_nfs_lane || __NR_syz_socket_connect_nfs || \
+     __NR_syz_open_nfs_lane_pair || __NR_syz_open_nfs_lane_profile || \
+     __NR_syz_socket_connect_nfs_pair || \
+-    __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || __NR_syz_send_nfs_fuzz
++    __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || \
++    __NR_syz_nfsd_client_ctl || __NR_syz_send_nfs_fuzz
+ #include <fcntl.h>
+ #include <sched.h>
+ #include <stdio.h>
+@@ -2949,6 +2950,76 @@ static long syz_socket_connect_nfs_pair(volatile long a0, volatile long a1)
+ 	return nfs_socket_connect_pair(a0, a1);
+ }
+ 
++static uint32 nfs_lifecycle_get32(const uint8* p)
++{
++	return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) |
++	       ((uint32)p[2] << 8) | (uint32)p[3];
++}
++
++static void nfs_lifecycle_put32(uint8* p, uint32 value)
++{
++	p[0] = (uint8)(value >> 24);
++	p[1] = (uint8)(value >> 16);
++	p[2] = (uint8)(value >> 8);
++	p[3] = (uint8)value;
++}
++
++static long syz_nfsd_client_ctl(volatile long a0)
++{
++	// The server-side broker accepts one bounded operation.  The program can
++	// select only its deterministic lane client; owner name, minor version,
++	// clientid, proc path and the literal "expire\n" command are broker-owned.
++	unsigned long client = a0;
++	if (client > 1) {
++		errno = EINVAL;
++		return -1;
++	}
++	int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++	if (fd < 0)
++		return -1;
++	struct timeval tv = {.tv_sec = 2};
++	struct sockaddr_un addr = {.sun_family = AF_UNIX};
++	strcpy(addr.sun_path, "/nfs-lane/control/lifecycle.sock");
++	uint8 request[16] = {};
++	memcpy(request, "NFSLIFE1", 8);
++	nfs_lifecycle_put32(request + 8, 1); // EXPIRE
++	nfs_lifecycle_put32(request + 12, (uint32)client);
++	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) ||
++	    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) ||
++	    connect(fd, (struct sockaddr*)&addr, sizeof(addr)) ||
++	    send(fd, request, sizeof(request), MSG_NOSIGNAL) != (ssize_t)sizeof(request)) {
++		int saved_errno = errno;
++		close(fd);
++		errno = saved_errno;
++		return -1;
++	}
++	uint8 reply[32];
++	ssize_t received = recv(fd, reply, sizeof(reply), MSG_TRUNC);
++	int saved_errno = errno;
++	close(fd);
++	if (received != (ssize_t)sizeof(reply) ||
++	    memcmp(reply, "NFSLIFR1", 8) != 0) {
++		errno = received < 0 ? saved_errno : EPROTO;
++		return -1;
++	}
++	uint32 status = nfs_lifecycle_get32(reply + 8);
++	if (status != 0) {
++		errno = status <= 4095 ? (int)status : EPROTO;
++		return -1;
++	}
++	// A successful response is also the audit contract: it must identify
++	// exactly the selected NFSv4.1 client and at least one server session.
++	if (nfs_lifecycle_get32(reply + 12) != client ||
++	    nfs_lifecycle_get32(reply + 16) != 1 ||
++	    nfs_lifecycle_get32(reply + 20) == 0 ||
++	    (nfs_lifecycle_get32(reply + 24) == 0 &&
++	     nfs_lifecycle_get32(reply + 28) == 0)) {
++		errno = EPROTO;
++		return -1;
++	}
++	return 0;
++}
++
+ // Shared by both arm wire formats: connect to the proxy's control socket,
+ // send exactly `len` bytes, and wait for the one-byte ACK.  Registration is
+ // an ACKed configuration call; the returned FD is a lifetime handle, not
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index c7564b6..5241d30 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -116,6 +116,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_open_nfs_lane_profile":     alwaysSupported,
+ 	"syz_arm_nfs_proxy":             alwaysSupported,
+ 	"syz_arm_nfs_proxy_v2":          alwaysSupported,
++	"syz_nfsd_client_ctl":           alwaysSupported,
+ 	"syz_send_nfs_fuzz":             alwaysSupported,
+ 	"syz_pidfd_open":                alwaysSupported,
+ 	"syz_create_resource":           alwaysSupported,
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+index 7fe57c8..7baef35 100644
+--- a/sys/linux/fs_nfs_fuzz.txt
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -53,6 +53,14 @@ syz_open_nfs_lane_profile$client1_knfsd_v42(profile const[3], client const[1]) f
+ syz_open_nfs_lane_profile$client0_ganesha_v41(profile const[4], client const[0]) fd_nfs_dir
+ syz_open_nfs_lane_profile$client1_ganesha_v41(profile const[4], client const[1]) fd_nfs_dir
+ 
++# Ask the server-netns broker to expire exactly the confirmed NFSv4.1 record
++# owned by this deterministic lane client.  The broker, not the program,
++# chooses /proc/fs/nfsd/clients, the owner string, minor version and ctl
++# command.  A zero return means its reply carried the selected client, minor
++# 1, a nonzero clientid and at least one pre-expiry session slot.
++syz_nfsd_client_ctl$expire_client0(client const[0])
++syz_nfsd_client_ctl$expire_client1(client const[1])
++
+ # One registration per FD.  Bytes are an explicit versioned wire packet:
+ # magic; dir, backend, client, first_opcode, anchor_off, anchor_len,
+ # patch_off, patch_w, flags; then 64 anchor, 16 original and 16 replacement
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index f58187e..0a436ad 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -265,6 +265,24 @@ func TestNFSNativeProfiles(t *testing.T) {
+ 	}
+ }
+ 
++func TestNFSv41LifecycleAdmin(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for client := uint64(0); client < 2; client++ {
++		name := fmt.Sprintf("syz_nfsd_client_ctl$expire_client%d", client)
++		call := requireNFSFuzzCall(t, target, name)
++		if call.CallName != "syz_nfsd_client_ctl" || len(call.Args) != 1 {
++			t.Fatalf("%s has wrong dispatch or arity", call.Name)
++		}
++		requireConst(t, call.Args[0].Type, client, call.Name+" client")
++		if call.Ret != nil {
++			t.Fatalf("%s returns %T, want status-only pseudo call", call.Name, call.Ret)
++		}
++	}
++}
++
+ // TestNFSProxyVariableLengthArm checks the v2 (NFSPARM2) wire packet: unlike
+ // nfs_proxy_arm, its size is NOT fixed, so this asserts shape (fields, length
+ // linkage, magic) rather than a byte count, and that it shares its lifetime FD

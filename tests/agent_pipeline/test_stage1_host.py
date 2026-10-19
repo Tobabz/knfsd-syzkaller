@@ -28,7 +28,8 @@ from agent_pipeline.contracts import (CandidateSubmission, LocationKind,
                                       LocationRequest, Q1Status)
 from agent_pipeline.controller.records import JobState
 from agent_pipeline.data import canonical_json, load_record
-from agent_pipeline.q1 import RemoteKcovObservation, TargetPcMapping
+from agent_pipeline.q1 import (KernelIdentity, RemoteKcovObservation,
+                               TargetPcMapping)
 from agent_pipeline.sealed_q1 import PublishedCoverage
 from agent_pipeline.stage1.cli import STOP_STATES, open_stage1
 from agent_pipeline.stage1.config import EngineConfig, Stage1Config
@@ -37,7 +38,10 @@ from agent_pipeline.stage1.host.__main__ import main as host_main
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
-from agent_pipeline.stage1.host.generate import generate, series_fingerprint
+from agent_pipeline.stage1.host.generate import (GenerationError,
+                                                 HCAP11_RECOVERY_ORDER,
+                                                 Hcap11KvmEvidence, generate,
+                                                 series_fingerprint)
 from agent_pipeline.stage1.host.target_pcs import (CallbackSites,
                                                    build_mapping, check_pcs,
                                                    parse_addr2line,
@@ -349,6 +353,109 @@ def test_generate_pins_files_and_writes_consistent_configs(host):
                for text in lane.constraints)
 
 
+@needs_gcc
+def test_generate_binds_declared_capability_evidence(host):
+    evidence = host.root / "capability-evidence.json"
+    evidence.write_text(
+        '{"schema_version":"test-evidence.v1","result":"pass"}\n')
+    spec = json.loads(host.spec.read_text())
+    spec["capability_evidence"] = {
+        "CAP-lane": ["capability-evidence.json"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+
+    result = generate(host.spec)
+    store = ArtifactStore(host.root / "cas")
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    capability = next(
+        item for item in ArtifactHcapChecker(store).load_catalog(
+            result.hcap_revision).capabilities
+        if item.id == "CAP-lane")
+    assert len(capability.evidence_refs) == 1
+    assert store.get(capability.evidence_refs[0]) == evidence.read_bytes()
+
+
+@needs_gcc
+def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
+    initial = generate(host.spec)
+    config = Stage1Config.load(initial.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    from agent_pipeline.materializer import ExecutionHarnessApproval
+    from agent_pipeline.stage1.host.pins import HostFilePin
+    approval = load_record(store, config.execution_harness_approvals[0],
+                           ExecutionHarnessApproval)
+    descriptor = approval.descriptor
+    builds = {item.name: item.artifact_ref
+              for item in descriptor.build_artifacts}
+    lane_pin = load_record(store, builds["lane-script"], HostFilePin)
+    identity = KernelIdentity(
+        execution_harness_id=initial.execution_harness_id,
+        kernel_commit=descriptor.kernel_commit,
+        instrumentation_sha256=builds["instrumentation"],
+        vmlinux_sha256=builds["kernel"],
+        kaslr_enabled=False, kaslr_offset=0)
+    evidence_value = {
+        "schema_version": "hcap-kvm-evidence.v1",
+        "capability_id": "HCAP-11",
+        "observed_at": "2026-10-19",
+        "scenario": "v41-client-expiry",
+        "execution_harness_id": initial.execution_harness_id,
+        "mapping_identity": identity.model_dump(mode="json"),
+        "target_mapping_sha256": "a" * 64,
+        "campaign_result_sha256": "b" * 64,
+        "guest_lane_script_sha256": lane_pin.sha256,
+        "guest_nfs_proxy_sha256": "c" * 64,
+        "runs": {
+            "control": {"completed": 1, "target_hit_counts": [0]},
+            "stimulus": {"completed": 1, "target_hit_counts": [1]},
+        },
+        "generation_contract": {
+            "generation_begin_each": 1,
+            "aggregate_published_each": 1,
+            "generation_aborted_each": 0,
+            "scratch_overflow_each": 0,
+            "merge_truncation_each": 0,
+            "outstanding_tokens_after_each": 0,
+            "remote_refs_after_each": 0,
+            "minimum_remote_start_ok": 1,
+        },
+        "recovery_order": list(HCAP11_RECOVERY_ORDER),
+        "crash_signature_count": 0,
+        "raw_artifact_error_count": 0,
+        "shareable_result_contains_target_metadata_or_addresses": False,
+    }
+    evidence = host.root / "hcap11-evidence.json"
+    evidence.write_text(json.dumps(evidence_value))
+    spec = json.loads(host.spec.read_text())
+    spec["capabilities"].append({
+        "id": "HCAP-11", "name": "lifecycle", "purpose": "test binding",
+        "usable_stage": ["stage1"], "usable_by": ["agent_stage1"],
+        "interface": {"runtime_features": ["lifecycle_recovery"]},
+        "status": "validated", "scope": ["client0_recovery"],
+    })
+    spec["capability_evidence"] = {"HCAP-11": [evidence.name]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+
+    result = generate(host.spec)
+    from agent_pipeline.hcap import HcapCatalog
+    catalog = load_record(store, result.hcap_revision, HcapCatalog)
+    lifecycle = next(item for item in catalog.capabilities
+                     if item.id == "HCAP-11")
+    assert len(lifecycle.evidence_refs) == 1
+    assert Hcap11KvmEvidence.model_validate_json(
+        store.get(lifecycle.evidence_refs[0])).mapping_identity == identity
+
+    evidence.write_text('{"proof":"not typed"}')
+    with pytest.raises(GenerationError, match="invalid HCAP-11 KVM evidence"):
+        generate(host.spec)
+
+    evidence.write_text(json.dumps(evidence_value))
+    spec["guest_kernel_command_line"] = \
+        descriptor.guest_kernel_command_line + " audit=1"
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="mapping identity differs"):
+        generate(host.spec)
+
+
 def test_template_spec_is_valid():
     from agent_pipeline.stage1.host.generate import HostSpec
     template = REPO / "agent_pipeline/stage1/host/template"
@@ -359,6 +466,29 @@ def test_template_spec_is_valid():
     calls = {e.call for e in spec.admission_source.entries}
     for selection in spec.runtime_selections:
         assert set(selection.enabled_interfaces) - {"remote_cover"} <= calls
+    lifecycle = next(c for c in spec.capabilities if c.id == "HCAP-11")
+    assert lifecycle.status == "validated"
+    assert lifecycle.scope == ("client0_confirmed_expiry_recovery",)
+    assert lifecycle.interface.syz_calls == (
+        "syz_nfsd_client_ctl$expire_client0",)
+    assert spec.capability_evidence["HCAP-11"] == (
+        Path("capability-evidence/hcap11-kvm.json"),)
+    evidence_path = template / spec.capability_evidence["HCAP-11"][0]
+    assert evidence_path.is_file()
+    evidence_json = json.loads(evidence_path.read_text())
+    evidence = Hcap11KvmEvidence.model_validate(evidence_json)
+    assert evidence.capability_id == "HCAP-11"
+    assert evidence.shareable_result_contains_target_metadata_or_addresses is False
+    assert not {"target_pcs", "candidate_id", "path", "symbol"} & set(
+        evidence_json)
+    assert any("syz_nfsd_client_ctl$expire_client0(0x0)" in item
+               for item in lifecycle.constraints)
+    expiry = next(e for e in spec.admission_source.entries
+                  if e.call == "syz_nfsd_client_ctl$expire_client0")
+    assert expiry.capability_ids == ("HCAP-11",)
+    assert all("syz_nfsd_client_ctl$expire_client1" not in
+               selection.enabled_interfaces
+               for selection in spec.runtime_selections)
 
 
 @needs_gcc

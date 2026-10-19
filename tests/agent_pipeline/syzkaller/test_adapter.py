@@ -61,6 +61,14 @@ def test_actual_parsed_arguments_and_nfs_provenance(parser, identity):
     assert facts.integers[0].value == 3
 
 
+def test_lifecycle_control_preserves_nfs_provenance(parser, identity):
+    source = (LANE + b"syz_nfsd_client_ctl$expire_client0(0x0)\n"
+              b"fsync(r0)\n")
+    result = parser.parse(source, identity=identity)
+    facts = result.calls[2].resource_facts
+    assert facts.origins[0].origin == "nfs-profile:knfsd-v41:client0"
+
+
 @pytest.mark.parametrize("program", [
     b"", b"unknown_call()\n", b"getpid(1)\n", b"clone3(0x0, 0x0)\n",
     b"fsync(r99)\n", b"getpid() (async)\n", b"# fake nfs acquisition\n",
