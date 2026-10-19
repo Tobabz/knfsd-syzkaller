@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -31,8 +32,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..artifacts import ArtifactStore
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ExecutionCorrelation as EvidenceCorrelation
-from ..journal_sink import (SEGMENT_SUFFIX, ChannelIdentity, ChannelServer,
-                            HostJournal)
+from ..journal_sink import (CHANNEL_CLOSE_TIMEOUT_S, SEGMENT_SUFFIX,
+                            ChannelIdentity, ChannelServer, HostJournal)
 from ..materializer import (ExecutionHarnessDescriptor, ReachabilityHarness,
                             descriptor_id)
 from ..q1 import ExecutionCorrelation, KernelIdentity
@@ -41,13 +42,18 @@ from ..replay_runner import PlanError, parse_execprog_barriers
 from ..sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE, PublishedCoverage
 from ..sealed_q2 import (CONSOLE_LOG_TYPE, MANAGER_REPORT_TYPE, Q2_EVIDENCE_ID,
                          Q2_EVIDENCE_TYPE, SealedArtifactRef, SealedQ2Evidence)
-from ..stage1.host.collector import (CollectorConfig, GUEST_DIR,
-                                     _checked, _collect_cover, _fixture_ready,
-                                     _wait_execprog, execprog_argv, run_lane,
+from ..stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
+                                     EXECPROG_EXIT_GRACE_S, POLL_S,
+                                     CollectorConfig, GUEST_DIR, _checked,
+                                     _collect_cover, _deadline_timeout,
+                                     _fixture_ready, _wait_execprog,
+                                     execprog_argv, execprog_timeout, run_lane,
                                      verify_pins)
 from ..stage1.host.kcov import LaneRun, capture_records
 from ..stage1.host.pins import HostFilePin, PinCache, verify_file
-from ..stage1.host.vm import Guest, QemuGuest, VmConfig
+from ..stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
+                              GUEST_TRANSFER_TIMEOUT_S, VM_STOP_TIMEOUT_S,
+                              Guest, QemuGuest, VmConfig)
 from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
                        GENERATION_COVERAGE_PREFIX, GENERATION_COVERAGE_TYPE,
                        JOURNAL_TYPE, NEUTRAL_COVERAGE_ID,
@@ -108,12 +114,106 @@ class StepOptions:
     campaign_executions: int = 128
     campaign_timeout_s: float = 1800
     manager_stop_timeout_s: float = 45
+    exec_slowdown: int = 1
 
     def __post_init__(self) -> None:
         if not 1 <= self.campaign_executions <= 192:
             raise ValueError("campaign_executions must be in [1, 192]")
-        if self.campaign_timeout_s <= 0 or self.manager_stop_timeout_s <= 0:
-            raise ValueError("campaign timeouts must be positive")
+        if (not all(math.isfinite(value) for value in (
+                self.campaign_timeout_s, self.manager_stop_timeout_s))
+                or self.campaign_timeout_s <= 0
+                or self.manager_stop_timeout_s <= 0):
+            raise ValueError("campaign timeouts must be finite and positive")
+        if not 1 <= self.exec_slowdown <= 1000:
+            raise ValueError("exec_slowdown must be in [1, 1000]")
+
+
+MAX_JOURNAL_CHANNELS = 64
+MANAGER_SIGNAL_TIMEOUT_S = 10
+EVIDENCE_SEAL_RESERVE_S = 300
+
+
+@dataclass(frozen=True)
+class Stage2TimeoutBudget:
+    """Worst-case bounded wall time for each Stage 2 lease type."""
+
+    gate_repetition_s: float
+    gate_s: float
+    replay_s: float
+    campaign_s: float
+
+    @property
+    def required_s(self) -> float:
+        return max(self.gate_s, self.replay_s, self.campaign_s)
+
+
+def stage2_timeout_budget(
+    collector: CollectorConfig, *, exec_slowdown: int,
+    gate_repetitions: int, campaign_timeout_s: float,
+    manager_stop_timeout_s: float,
+) -> Stage2TimeoutBudget:
+    """Mirror every explicit timeout on the gate, replay and campaign paths."""
+    if type(gate_repetitions) is not int or gate_repetitions < 1:
+        raise ValueError("gate repetitions must be a positive integer")
+    values = {
+        "boot": collector.boot_timeout_s,
+        "fixture": collector.fixture_timeout_s,
+        "grace": collector.grace_s,
+        "drain": collector.drain_s,
+        "campaign": campaign_timeout_s,
+        "manager stop": manager_stop_timeout_s,
+    }
+    if any(not math.isfinite(value) or value < 0
+           for value in values.values()):
+        raise ValueError("Stage 2 timeout inputs must be finite and non-negative")
+    if campaign_timeout_s <= 0 or manager_stop_timeout_s <= 0:
+        raise ValueError("campaign timeouts must be positive")
+
+    direct = execprog_timeout(collector.exec_timeout_s, exec_slowdown)
+    # Gate polling and the guest's GNU timeout share this one process window.
+    direct_gate = direct + EXECPROG_EXIT_GRACE_S + POLL_S
+    journal_close = MAX_JOURNAL_CHANNELS * CHANNEL_CLOSE_TIMEOUT_S
+    vm_close = 2 * VM_STOP_TIMEOUT_S
+    segment_close = vm_close + journal_close + EVIDENCE_SEAL_RESERVE_S
+
+    # Scenario: 10 ordinary SSH commands, three evidence commands, three
+    # uploads and one coverage download. Commands issued while execprog is
+    # running are capped by direct_gate and therefore are not counted twice.
+    scenario = (
+        collector.boot_timeout_s + collector.fixture_timeout_s
+        + collector.grace_s + collector.drain_s + direct_gate
+        + 10 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 4 * GUEST_TRANSFER_TIMEOUT_S
+    )
+    # Neutral: launch/result SSH, log/tar evidence, one upload/download.
+    neutral = (
+        collector.drain_s + direct_gate
+        + 2 * GUEST_COMMAND_TIMEOUT_S
+        + 2 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 2 * GUEST_TRANSFER_TIMEOUT_S
+    )
+    gate_repetition = scenario + neutral + segment_close
+
+    # Replay has mount/status/hash/mkdir/chmod SSH and three uploads.
+    replay = (
+        collector.boot_timeout_s + collector.fixture_timeout_s + direct
+        + 5 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * GUEST_TRANSFER_TIMEOUT_S + segment_close
+    )
+    # A failure in the first manager stop can enter finally and retry cleanup.
+    manager_close = 2 * (manager_stop_timeout_s
+                         + 2 * MANAGER_SIGNAL_TIMEOUT_S)
+    campaign = (campaign_timeout_s + manager_close + journal_close
+                + EVIDENCE_SEAL_RESERVE_S)
+    budget = Stage2TimeoutBudget(
+        gate_repetition_s=gate_repetition,
+        gate_s=gate_repetition * gate_repetitions,
+        replay_s=replay, campaign_s=campaign)
+    if not all(math.isfinite(value) for value in (
+            budget.gate_s, budget.replay_s, budget.campaign_s)):
+        raise ValueError("Stage 2 timeout budget is too large")
+    return budget
 
 
 @dataclass(frozen=True)
@@ -448,22 +548,28 @@ def _barrier_generation(output: str, fallback: int = 1) -> int:
     return barriers[0].kcov_generation if barriers else fallback
 
 
-def _neutral_run(guest: Guest, source: Path, config: CollectorConfig) -> tuple[LaneRun, str]:
+def _neutral_run(guest: Guest, source: Path, config: CollectorConfig, *,
+                 exec_slowdown: int = 1) -> tuple[LaneRun, str]:
     run = LaneRun(boot_ok=True, fixture_ok=True, lane_ok=True)
     guest.put(source, f"{GUEST_DIR}/program.syz")
-    _checked(guest, execprog_argv(config.exec_timeout_s))
-    gate = _wait_execprog(guest, True, config.exec_timeout_s, time.sleep)
+    timeout_s = execprog_timeout(config.exec_timeout_s, exec_slowdown)
+    _checked(guest, execprog_argv(config.exec_timeout_s, exec_slowdown))
+    exec_deadline = (time.monotonic() + timeout_s
+                     + EXECPROG_EXIT_GRACE_S)
+    gate = _wait_execprog(guest, True, exec_deadline, time.sleep)
     if gate == "ready":
         run.collection_started = True
-        _checked(guest, f"touch {GUEST_DIR}/gate.go")
-        done = _wait_execprog(guest, False, config.exec_timeout_s + 60, time.sleep)
+        _checked(guest, f"touch {GUEST_DIR}/gate.go",
+                 timeout=_deadline_timeout(exec_deadline))
+        done = _wait_execprog(guest, False, exec_deadline, time.sleep)
     else:
         done = gate
     rc_text = _checked(guest, f"cat {GUEST_DIR}/exec.rc 2>/dev/null || true").strip()
     run.runner_completed = gate == "ready" and done == "exited" and rc_text == "0"
     if not run.runner_completed:
         run.runtime_errors.append(f"neutral_execprog_failed:{done}:rc={rc_text}")
-    _, output = guest.run(f"cat {GUEST_DIR}/exec.log", timeout=120)
+    _, output = guest.run(f"cat {GUEST_DIR}/exec.log",
+                          timeout=EVIDENCE_COMMAND_TIMEOUT_S)
     time.sleep(config.drain_s)
     _collect_cover(guest, run, {})
     return run, output
@@ -480,7 +586,7 @@ def _direct_guest(inputs: _Inputs, lane_dir: Path, console: Path,
         extra_args=extra_args))
 
 
-def _gate(inputs: _Inputs, output: Path) -> None:
+def _gate(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     repetitions = inputs.execution.gate_repetitions
     if repetitions is None or repetitions < 1:
         raise Stage2StepError("gate execution lacks gate_repetitions")
@@ -511,10 +617,12 @@ def _gate(inputs: _Inputs, output: Path) -> None:
             scenario = run_lane(
                 guest, inputs.files, inputs.root / "program.syz",
                 inputs.harness.runtime_selection, inputs.lane_sha256,
-                inputs.collector, work, result)
+                inputs.collector, work, result,
+                exec_slowdown=options.exec_slowdown)
             scenario_output = (work / "executor.log").read_text(errors="replace")
             neutral, neutral_output = _neutral_run(
-                guest, inputs.root / "neutral.syz", inputs.collector)
+                guest, inputs.root / "neutral.syz", inputs.collector,
+                exec_slowdown=options.exec_slowdown)
         finally:
             guest.stop()
             channels.close()
@@ -554,7 +662,7 @@ def _fixture(guest: Guest, inputs: _Inputs, result: dict[str, Any]) -> bool:
         inputs.collector.fixture_timeout_s, result)
 
 
-def _replay(inputs: _Inputs, output: Path) -> None:
+def _replay(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     replay = inputs.root / "replay"
     rules = (replay / "rules.bin").read_bytes()
     work = output / "work"
@@ -589,10 +697,12 @@ def _replay(inputs: _Inputs, output: Path) -> None:
                 "-arch=amd64", "-vmarch=amd64", "-sandbox=none", "-procs=1",
                 "-repeat=1", "-threaded=false", "-cover=true",
                 "-remote-cover=true", "-disable=all", "-debug", "-vv=1",
-                "-slowdown=1", f"{GUEST_DIR}/programs.log",
+                f"-slowdown={options.exec_slowdown}",
+                f"{GUEST_DIR}/programs.log",
             ]
             returncode, output_text = guest.run(
-                shlex.join(argv), timeout=inputs.collector.exec_timeout_s)
+                shlex.join(argv), timeout=execprog_timeout(
+                    inputs.collector.exec_timeout_s, options.exec_slowdown))
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         output_text += f"\nhost replay error: {type(exc).__name__}: {exc}\n"
     finally:
@@ -688,7 +798,7 @@ def _stop_manager(process: subprocess.Popen, timeout_s: float) -> bool:
     try:
         os.killpg(process.pid, signal.SIGINT)
     except ProcessLookupError:
-        process.wait(timeout=10)
+        process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
         return True
     try:
         process.wait(timeout=timeout_s)
@@ -697,16 +807,16 @@ def _stop_manager(process: subprocess.Popen, timeout_s: float) -> bool:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            process.wait(timeout=10)
+            process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
             return True
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.wait(timeout=10)
+            process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
         return False
 
 
@@ -869,11 +979,11 @@ def run_step(options: StepOptions, input_dir: Path, output_dir: Path) -> None:
     if any((output / "segments").iterdir()):
         raise Stage2StepError("output/segments is not empty")
     if inputs.execution.step == "gate":
-        _gate(inputs, output)
+        _gate(inputs, output, options)
     elif inputs.execution.step == "campaign":
         _campaign(inputs, output, options)
     else:
-        _replay(inputs, output)
+        _replay(inputs, output, options)
 
 
 __all__ = ["NfsProxyExecution", "Stage2StepError", "StepOptions", "run_step"]

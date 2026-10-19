@@ -13,15 +13,23 @@ import pytest
 from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.data import put_record
-from agent_pipeline.stage1.host.collector import CollectorConfig
+from agent_pipeline.journal_sink import CHANNEL_CLOSE_TIMEOUT_S
+from agent_pipeline.stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
+                                                  EXECPROG_EXIT_GRACE_S, POLL_S,
+                                                  CollectorConfig, execprog_argv,
+                                                  execprog_timeout)
 from agent_pipeline.stage1.host.pins import PinError, pin_file
-from agent_pipeline.stage1.host.vm import QemuGuest, VmConfig
+from agent_pipeline.stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
+                                           GUEST_TRANSFER_TIMEOUT_S,
+                                           VM_STOP_TIMEOUT_S, QemuGuest,
+                                           VmConfig)
 from agent_pipeline.stage2.kvm import (
+    EVIDENCE_SEAL_RESERVE_S, MANAGER_SIGNAL_TIMEOUT_S, MAX_JOURNAL_CHANNELS,
     NfsProxyExecution, Stage2StepError, _Artifact,
     _barrier_generation, _campaign_records, _corpus, _correlated,
     _journal_artifacts, _journal_lane_count, _lane_template,
     _manager_assets, _manager_cmdline, _manager_qemu_args,
-    _seal_segment, _spool, _stop_manager,
+    _seal_segment, _spool, _stop_manager, StepOptions, stage2_timeout_budget,
 )
 
 from .stage2_host import rules_bytes
@@ -41,6 +49,63 @@ def execution_record(**updates) -> dict:
     }
     value.update(updates)
     return value
+
+
+def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):
+    assert "-slowdown=1" in execprog_argv(60)
+    assert "-slowdown=10" in execprog_argv(60, 10)
+    assert "timeout --kill-after=60 600 " in execprog_argv(60, 10)
+    assert execprog_timeout(60, 10) == 600
+    with pytest.raises(ValueError, match="slowdown"):
+        execprog_argv(60, 0)
+    assert StepOptions(
+        manager=tmp_path / "manager.json",
+        collector=tmp_path / "collector.json",
+        exec_slowdown=10,
+    ).exec_slowdown == 10
+    with pytest.raises(ValueError, match="exec_slowdown"):
+        StepOptions(
+            manager=tmp_path / "manager.json",
+            collector=tmp_path / "collector.json",
+            exec_slowdown=0,
+        )
+
+
+def test_stage2_timeout_budget_accounts_for_every_bounded_operation(tmp_path):
+    collector = CollectorConfig(
+        artifact_root=tmp_path, files={}, ssh_key=tmp_path / "id",
+        boot_timeout_s=2, fixture_timeout_s=3, grace_s=4, drain_s=5,
+        exec_timeout_s=6)
+    budget = stage2_timeout_budget(
+        collector, exec_slowdown=10, gate_repetitions=3,
+        campaign_timeout_s=7, manager_stop_timeout_s=8)
+    direct = execprog_timeout(collector.exec_timeout_s, 10)
+    direct_gate = direct + EXECPROG_EXIT_GRACE_S + POLL_S
+    close = (2 * VM_STOP_TIMEOUT_S
+             + MAX_JOURNAL_CHANNELS * CHANNEL_CLOSE_TIMEOUT_S
+             + EVIDENCE_SEAL_RESERVE_S)
+    scenario = (
+        collector.boot_timeout_s + collector.fixture_timeout_s
+        + collector.grace_s + collector.drain_s + direct_gate
+        + 10 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 4 * GUEST_TRANSFER_TIMEOUT_S)
+    neutral = (
+        collector.drain_s + direct_gate
+        + 2 * GUEST_COMMAND_TIMEOUT_S
+        + 2 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 2 * GUEST_TRANSFER_TIMEOUT_S)
+    assert budget.gate_repetition_s == scenario + neutral + close
+    assert budget.gate_s == 3 * budget.gate_repetition_s
+    assert budget.replay_s == (
+        collector.boot_timeout_s + collector.fixture_timeout_s + direct
+        + 5 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * GUEST_TRANSFER_TIMEOUT_S + close)
+    assert budget.campaign_s == (
+        7 + 2 * (8 + 2 * MANAGER_SIGNAL_TIMEOUT_S)
+        + MAX_JOURNAL_CHANNELS * CHANNEL_CLOSE_TIMEOUT_S
+        + EVIDENCE_SEAL_RESERVE_S)
+    assert budget.required_s == budget.gate_s
 
 
 def test_spool_records_are_strict_and_ordered(tmp_path):

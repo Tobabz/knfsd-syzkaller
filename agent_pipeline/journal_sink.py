@@ -63,6 +63,7 @@ SESSION_END_SCHEMA = "nfs-proxy-journal-session-end.v1"
 # still fit one frame; this much of the frame is kept for that envelope.
 ENVELOPE_RESERVE_BYTES = 64 * 1024
 MAX_REQUEST_BYTES = MAX_PAYLOAD_BYTES - ENVELOPE_RESERVE_BYTES
+CHANNEL_CLOSE_TIMEOUT_S = 5
 
 RULESET_MAGIC = b"NFSPRUL1"
 RULESET_MAX_BYTES = 1 << 20
@@ -1136,7 +1137,7 @@ class ChannelServer:
     def close(self) -> None:
         self._stop.set()
         self._sock.close()
-        self._thread.join(timeout=5)
+        self._thread.join(timeout=CHANNEL_CLOSE_TIMEOUT_S)
         try:
             self.path.unlink()
         except FileNotFoundError:

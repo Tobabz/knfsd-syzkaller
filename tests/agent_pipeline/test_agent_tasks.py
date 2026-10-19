@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 import json
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -17,7 +18,7 @@ from agent_pipeline.agent_tasks.runtime import RuntimeResult
 from agent_pipeline.agent_tasks.tools import (MAX_SOURCE_BYTES, IndexedMatch,
                                               IndexedSource,
                                               TOOL_DEFINITIONS, Stage1Toolbox,
-                                              ToolBoundaryError)
+                                              ToolBoundaryError, _schema_paths)
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.contracts import (AgentModelPolicy, AgentTask,
                                       AnalysisOutput, CandidateLocation,
@@ -29,6 +30,7 @@ from agent_pipeline.controller.tasks import (AgentRequest,
 from agent_pipeline.data import load_record, put_record
 from agent_pipeline.hcap import (Capability, CapabilityInterface, HcapCatalog,
                                  ReachabilityPlan)
+from agent_pipeline.protocol_schema import load_schemas
 
 from .fakes import COMMIT
 
@@ -254,7 +256,8 @@ def test_invalid_structured_output_is_repaired_without_provider_access(tmp_path)
         "test-provider:requested-model"
     assert runtime.requests[0].tools.names == (
         "read_kernel_source", "search_kernel_source", "find_callers",
-        "find_callees", "lookup_hcap", "lookup_semantic_scope")
+        "find_callees", "lookup_hcap", "lookup_semantic_scope",
+        "lookup_semantic_paths")
     assert not sink.failures
     _, _, output, actual_model = sink.results[0]
     assert isinstance(output, AnalysisOutput)
@@ -466,7 +469,8 @@ def test_tool_dispatch_rejects_unregistered_and_unconfined_access():
     tools = toolbox()
     assert set(tools.names) == {
         "read_kernel_source", "search_kernel_source", "find_callers",
-        "find_callees", "lookup_hcap", "lookup_semantic_scope"}
+        "find_callees", "lookup_hcap", "lookup_semantic_scope",
+        "lookup_semantic_paths"}
     with pytest.raises(ToolBoundaryError, match="not registered"):
         tools.invoke("shell", {"command": "id"})
     for path in ("/etc/passwd", "../fs/nfsd/file.c", "drivers/block/x.c"):
@@ -480,6 +484,85 @@ def test_tool_dispatch_rejects_unregistered_and_unconfined_access():
     # The revision is pinned in the toolbox and is not an accepted argument.
     with pytest.raises(ValidationError):
         tools.invoke("lookup_hcap", {"revision": "other"})
+
+
+def test_semantic_path_lookup_is_promoted_bounded_and_canonical():
+    schema = next(s for s in load_schemas().values() if s.minor == 1)
+
+    class SemanticHcap(FakeHcap):
+        def load_semantic_scope(self, revision):
+            assert revision == HCAP_REVISION
+            return SimpleNamespace(subsets=(SimpleNamespace(
+                subset=SimpleNamespace(schema_ids=(schema.schema_id,))),))
+
+    tools = Stage1Toolbox(
+        FakeSource(), SemanticHcap(), kernel_commit=COMMIT,
+        hcap_revision=HCAP_REVISION)
+    result = tools.invoke("lookup_semantic_paths", {
+        "schema_id": schema.schema_id, "message_type": "call",
+        "operation": "CREATE_SESSION", "query": "clientid"})
+    assert (result.family, result.rpc_program, result.rpc_version,
+            result.minor_version) == ("nfs4", 100003, 4, 1)
+    assert [item.path for item in result.paths] == [
+        "nfs4.request.CREATE_SESSION.args.csa_clientid"]
+    assert result.paths[0].value_kind == "uhyper"
+    assert result.paths[0].enum_literals_truncated is False
+    with pytest.raises(ToolBoundaryError, match="outside the pinned HCAP"):
+        tools.invoke("lookup_semantic_paths", {
+            "schema_id": "nfs3/sha256:" + "0" * 64,
+            "message_type": "call", "operation": "WRITE"})
+    with pytest.raises(ToolBoundaryError, match="absent from the schema"):
+        tools.invoke("lookup_semantic_paths", {
+            "schema_id": schema.schema_id, "message_type": "call",
+            "operation": "NOT_AN_OPERATION"})
+
+
+def test_semantic_path_lookup_separates_enum_and_path_truncation():
+    schema = next(s for s in load_schemas().values() if s.minor == 2)
+
+    class SemanticHcap(FakeHcap):
+        def load_semantic_scope(self, revision):
+            assert revision == HCAP_REVISION
+            return SimpleNamespace(subsets=(SimpleNamespace(
+                subset=SimpleNamespace(schema_ids=(schema.schema_id,))),))
+
+    tools = Stage1Toolbox(
+        FakeSource(), SemanticHcap(), kernel_commit=COMMIT,
+        hcap_revision=HCAP_REVISION)
+    path = "nfs4.response.WRITE.result.status"
+    result = tools.invoke("lookup_semantic_paths", {
+        "schema_id": schema.schema_id, "message_type": "reply",
+        "operation": "WRITE", "query": path})
+
+    assert [item.path for item in result.paths] == [path]
+    assert result.truncated is False
+    assert len(result.paths[0].enum_literals) == 32
+    assert result.paths[0].enum_literals_truncated is True
+
+
+def test_semantic_path_enumerator_handles_compound_and_resolves_every_path():
+    for schema in load_schemas().values():
+        for response in (False, True):
+            mine = "response" if response else "request"
+            operations = {
+                procedure["name"] for procedure in schema.procedures
+                if procedure["res" if response else "arg"] is not None
+            }
+            operations.update(
+                arm["branch"]
+                for ty in schema.types
+                if schema._is_ops_union(ty) and ty["operations"] == mine
+                for arm in schema._arms(ty) if arm.get("branch"))
+            for operation in operations:
+                values, unused = _schema_paths(
+                    schema, response=response, operation=operation)
+                assert values, (schema.schema_id, mine, operation)
+                assert all(schema.resolve(response, path)[0].value == "found"
+                           for path, node in values)
+            if schema.minor is not None:
+                compound, unused = _schema_paths(
+                    schema, response=response, operation="COMPOUND")
+                assert any(node.flags & 0x10 for path, node in compound)
 
 
 @pytest.mark.parametrize("prefix", ["fs/nfsd", "fs/nfsd/", "fs/read_write.c",

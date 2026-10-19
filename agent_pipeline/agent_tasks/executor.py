@@ -83,12 +83,18 @@ semantic mutation capability the pinned HCAP lists as promoted: call
 lookup_semantic_scope and fit the whole rule set inside one promoted subset
 (its ProtocolSchema, direction, message type, part, mutation kind,
 transform, structure policy, value sources and comparisons). Never lower an
-intent to legacy NFSPARM capabilities. If the change needs a value from an
-earlier transaction, return the unsupported variant with gap_class
-mutation_engine and missing_capability_id state_lineage; if no promoted
-subset can express it, use semantic_mutation.unpromoted when the HCAP
-vocabulary lists it. Leave the id empty when none fits and name the
-capability in the reason.\
+intent to legacy NFSPARM capabilities. For every target and predicate path,
+call lookup_semantic_paths with the promoted schema id, message type and
+operation. Copy its family, RPC program/version and minor_version into the
+selector exactly and use only a canonical path it returns. A schema id prefix
+such as nfs4.1 is not ProtocolSelector.family: the lookup returns family nfs4
+and minor_version 1 separately. If a path lookup is truncated, narrow its
+query until the result is complete before choosing a path; never infer an
+omitted path. If the change needs a value from an earlier
+transaction, return the unsupported variant with gap_class mutation_engine
+and missing_capability_id state_lineage; if no promoted subset can express
+it, use semantic_mutation.unpromoted when the HCAP vocabulary lists it. Leave
+the id empty when none fits and name the capability in the reason.\
 """
 
 

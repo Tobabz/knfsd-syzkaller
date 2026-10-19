@@ -16,7 +16,9 @@ import struct
 import pytest
 
 from agent_pipeline.agent_tasks.mutation import MutationRuleSet
-from agent_pipeline.agent_tasks.tools import ArtifactHcapSource, Stage1Toolbox
+from agent_pipeline.agent_tasks.tools import (ArtifactHcapSource,
+                                              Stage1Toolbox,
+                                              ToolBoundaryError)
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.data import canonical_json, load_record, put_record
 from agent_pipeline.hcap import (ArtifactHcapChecker, AuthorityRef, Capability,
@@ -366,11 +368,29 @@ def test_promotion_becomes_a_new_hcap_revision_the_agent_reads(build, run, store
     assert [s.subset_id for s in scope.subsets] == [subset().subset_id]
     assert scope.subsets[0].predicate_ops == ("gt",)
     assert scope.registry_digest == build.registry_digest
+    paths = tools.invoke("lookup_semantic_paths", {
+        "schema_id": _schema_id(), "message_type": "call",
+        "operation": "CREATE_SESSION", "query": "clientid"})
+    assert (paths.family, paths.rpc_program, paths.rpc_version,
+            paths.minor_version) == ("nfs4", 100003, 4, 1)
+    assert [p.path for p in paths.paths] == [
+        "nfs4.request.CREATE_SESSION.args.csa_clientid"]
+    assert paths.paths[0].value_kind == "uhyper"
 
     bare = put_record(store, _catalog())
-    empty = Stage1Toolbox(None, ArtifactHcapSource(checker), kernel_commit=KERNEL,
-                          hcap_revision=bare).invoke("lookup_semantic_scope", {})
+    bare_tools = Stage1Toolbox(
+        None, ArtifactHcapSource(checker), kernel_commit=KERNEL,
+        hcap_revision=bare)
+    empty = bare_tools.invoke("lookup_semantic_scope", {})
     assert empty.subsets == () and empty.registry_digest is None
+    with pytest.raises(ToolBoundaryError, match="promotes no semantic"):
+        bare_tools.invoke("lookup_semantic_paths", {
+            "schema_id": _schema_id(), "message_type": "call",
+            "operation": "CREATE_SESSION"})
+    with pytest.raises(ToolBoundaryError, match="outside the pinned HCAP"):
+        tools.invoke("lookup_semantic_paths", {
+            "schema_id": "nfs3/sha256:" + "0" * 64,
+            "message_type": "call", "operation": "WRITE"})
 
 
 def test_only_the_semantic_entry_exposes_a_scope(build, run, store):
