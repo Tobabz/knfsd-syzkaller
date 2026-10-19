@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
+import time
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +30,8 @@ from agent_pipeline.stage2.kvm import (
     _barrier_generation, _campaign_records, _corpus, _correlated,
     _journal_artifacts, _journal_lane_count, _lane_template,
     _manager_assets, _manager_cmdline, _manager_qemu_args,
-    _seal_segment, _spool, _stop_manager, StepOptions, stage2_timeout_budget,
+    _evidence_seal_window, _seal_segment, _spool, _stop_manager, StepOptions,
+    stage2_timeout_budget,
 )
 
 from .stage2_host import rules_bytes
@@ -56,6 +58,8 @@ def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):
     assert "-slowdown=10" in execprog_argv(60, 10)
     assert "timeout --kill-after=60 600 " in execprog_argv(60, 10)
     assert execprog_timeout(60, 10) == 600
+    assert "timeout --kill-after=60 1 " in execprog_argv(0.25, 3)
+    assert execprog_timeout(0.25, 3) == 1
     with pytest.raises(ValueError, match="slowdown"):
         execprog_argv(60, 0)
     assert StepOptions(
@@ -309,7 +313,8 @@ def test_segment_is_published_only_at_final_name(tmp_path):
     final = _seal_segment(
         output, 0, vm="vm-1", lane=0, generation=3,
         host={"journal_name": "gate"},
-        artifacts=[_Artifact("execprog.scenario", "text/plain", b"run\n")])
+        artifacts=[_Artifact("execprog.scenario", "text/plain", b"run\n")],
+        deadline=time.monotonic() + 5)
     assert final == output / "segments/000000"
     assert not (output / "segments/.000000.tmp").exists()
     capture = json.loads((final / "capture.json").read_text())
@@ -318,10 +323,34 @@ def test_segment_is_published_only_at_final_name(tmp_path):
     assert (final / capture["artifacts"][0]["path"]).read_bytes() == b"run\n"
 
 
+def test_expired_seal_deadline_publishes_no_segment(tmp_path):
+    output = tmp_path / "output"
+    (output / "segments").mkdir(parents=True)
+    with pytest.raises(Stage2StepError, match="sealing deadline expired"):
+        _seal_segment(
+            output, 0, vm="vm-1", lane=0, generation=3,
+            host={"journal_name": "gate"},
+            artifacts=[_Artifact("execprog.scenario", "text/plain",
+                                 b"run\n")],
+            deadline=time.monotonic() - 1)
+    assert not any((output / "segments").iterdir())
+
+
+def test_seal_window_interrupts_and_removes_published_segment(tmp_path):
+    output = tmp_path / "output"
+    segments = output / "segments"
+    segments.mkdir(parents=True)
+    with pytest.raises(Stage2StepError, match="sealing deadline expired"):
+        with _evidence_seal_window(output, 0, reserve_s=0.01):
+            (segments / "000000").mkdir()
+            time.sleep(1)
+    assert not any(segments.iterdir())
+
+
 def test_empty_journal_cannot_be_sealed(tmp_path):
     channels = SimpleNamespace(paths=lambda: [])
     with pytest.raises(Stage2StepError, match="no host journal"):
-        _journal_artifacts(channels)
+        _journal_artifacts(channels, deadline=time.monotonic() + 5)
 
 
 def test_direct_qemu_appends_trusted_journal_arguments(tmp_path):

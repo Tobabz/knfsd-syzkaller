@@ -23,6 +23,7 @@ import tempfile
 import time
 import uuid
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -214,6 +215,52 @@ def stage2_timeout_budget(
             budget.gate_s, budget.replay_s, budget.campaign_s)):
         raise ValueError("Stage 2 timeout budget is too large")
     return budget
+
+
+def _check_evidence_deadline(deadline: float) -> None:
+    """Never publish evidence after consuming its supervisor reserve."""
+    if not math.isfinite(deadline) or time.monotonic() >= deadline:
+        raise Stage2StepError("evidence sealing deadline expired")
+
+
+@contextmanager
+def _evidence_seal_window(output: Path, index: int, *,
+                          reserve_s: float = EVIDENCE_SEAL_RESERVE_S):
+    """Interrupt sealing at its reserve and remove any partial publication."""
+    if not math.isfinite(reserve_s) or reserve_s <= 0:
+        raise ValueError("evidence sealing reserve must be finite and positive")
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0 or previous_timer[1] > 0:
+        raise Stage2StepError("evidence sealing requires an unused host alarm")
+
+    segments = output / "segments"
+    temporary = segments / f".{index:06d}.tmp"
+    final = segments / f"{index:06d}"
+    if temporary.exists() or final.exists():
+        raise Stage2StepError("evidence segment path already exists")
+
+    def expired(unused_signum, unused_frame) -> None:
+        raise Stage2StepError("evidence sealing deadline expired")
+
+    try:
+        previous_handler = signal.signal(signal.SIGALRM, expired)
+    except ValueError as exc:
+        raise Stage2StepError(
+            "evidence sealing must run on the host main thread") from exc
+    deadline = time.monotonic() + reserve_s
+    try:
+        signal.setitimer(signal.ITIMER_REAL, reserve_s)
+        try:
+            yield deadline
+            _check_evidence_deadline(deadline)
+        except BaseException:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            shutil.rmtree(temporary, ignore_errors=True)
+            shutil.rmtree(final, ignore_errors=True)
+            raise
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 @dataclass(frozen=True)
@@ -490,17 +537,26 @@ class _JournalChannels:
         self.socket_tmp.cleanup()
 
 
-def _journal_artifacts(channels: _JournalChannels) -> list[_Artifact]:
+def _journal_artifacts(channels: _JournalChannels, *,
+                       deadline: float) -> list[_Artifact]:
+    _check_evidence_deadline(deadline)
     paths = channels.paths()
     if not paths:
         raise Stage2StepError("target-mode VM produced no host journal segment")
-    return [_Artifact(journal_identity(path.name), JOURNAL_TYPE, path.read_bytes())
-            for path in paths]
+    artifacts = []
+    for path in paths:
+        _check_evidence_deadline(deadline)
+        data = path.read_bytes()
+        _check_evidence_deadline(deadline)
+        artifacts.append(_Artifact(
+            journal_identity(path.name), JOURNAL_TYPE, data))
+    return artifacts
 
 
 def _seal_segment(output: Path, index: int, *, vm: str, lane: int,
                   generation: int, host: dict[str, Any],
-                  artifacts: list[_Artifact]) -> Path:
+                  artifacts: list[_Artifact], deadline: float) -> Path:
+    _check_evidence_deadline(deadline)
     if not artifacts or len(artifacts) > 255:
         raise Stage2StepError("segment artifact count must be in [1, 255]")
     identities = [artifact.identity for artifact in artifacts]
@@ -510,16 +566,20 @@ def _seal_segment(output: Path, index: int, *, vm: str, lane: int,
     segments.mkdir(parents=True, exist_ok=True)
     temporary = segments / f".{index:06d}.tmp"
     final = segments / f"{index:06d}"
+    if temporary.exists() or final.exists():
+        raise Stage2StepError("evidence segment path already exists")
     temporary.mkdir()
     entries = []
     try:
         for number, artifact in enumerate(artifacts):
+            _check_evidence_deadline(deadline)
             name = f"artifact-{number:03d}.bin"
             path = temporary / name
             with path.open("xb") as stream:
                 stream.write(artifact.data)
                 stream.flush()
                 os.fsync(stream.fileno())
+            _check_evidence_deadline(deadline)
             entries.append({"identity": artifact.identity,
                             "type": artifact.type, "path": name})
         capture = {"vm_instance_id": vm, "lane": lane,
@@ -530,9 +590,12 @@ def _seal_segment(output: Path, index: int, *, vm: str, lane: int,
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        _check_evidence_deadline(deadline)
         os.rename(temporary, final)
+        _check_evidence_deadline(deadline)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
+        shutil.rmtree(final, ignore_errors=True)
         raise
     return final
 
@@ -626,32 +689,34 @@ def _gate(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         finally:
             guest.stop()
             channels.close()
-        scenario_generation = _barrier_generation(scenario_output)
-        neutral_generation = _barrier_generation(
-            neutral_output, scenario_generation + 1)
-        correlation = inputs.correlation(vm, 0, scenario_generation)
-        observation, coverage = capture_records(
-            scenario, candidate_id=inputs.harness.candidate_id,
-            identity=identity, correlation=correlation,
-            trace_mode=inputs.harness.runtime_selection.trace_mode)
-        neutral_coverage = canonical_json(PublishedCoverage(
-            correlation=inputs.correlation(vm, 0, neutral_generation),
-            pcs=tuple(sorted(neutral.pcs))))
-        artifacts = [
-            _Artifact(OBSERVATION_ID, OBSERVATION_TYPE, observation),
-            _Artifact("coverage", COVERAGE_TYPE, coverage),
-            _Artifact(NEUTRAL_COVERAGE_ID, NEUTRAL_COVERAGE_TYPE,
-                      neutral_coverage),
-            _Artifact(SCENARIO_EXECPROG_ID, EXECPROG_TYPE,
-                      scenario_output.encode("utf-8", "replace")),
-            _Artifact(NEUTRAL_EXECPROG_ID, EXECPROG_TYPE,
-                      neutral_output.encode("utf-8", "replace")),
-            *_journal_artifacts(channels),
-        ]
-        _seal_segment(
-            output, repetition, vm=vm, lane=0,
-            generation=scenario_generation,
-            host={"journal_name": channels.name}, artifacts=artifacts)
+        with _evidence_seal_window(output, repetition) as seal_deadline:
+            scenario_generation = _barrier_generation(scenario_output)
+            neutral_generation = _barrier_generation(
+                neutral_output, scenario_generation + 1)
+            correlation = inputs.correlation(vm, 0, scenario_generation)
+            observation, coverage = capture_records(
+                scenario, candidate_id=inputs.harness.candidate_id,
+                identity=identity, correlation=correlation,
+                trace_mode=inputs.harness.runtime_selection.trace_mode)
+            neutral_coverage = canonical_json(PublishedCoverage(
+                correlation=inputs.correlation(vm, 0, neutral_generation),
+                pcs=tuple(sorted(neutral.pcs))))
+            artifacts = [
+                _Artifact(OBSERVATION_ID, OBSERVATION_TYPE, observation),
+                _Artifact("coverage", COVERAGE_TYPE, coverage),
+                _Artifact(NEUTRAL_COVERAGE_ID, NEUTRAL_COVERAGE_TYPE,
+                          neutral_coverage),
+                _Artifact(SCENARIO_EXECPROG_ID, EXECPROG_TYPE,
+                          scenario_output.encode("utf-8", "replace")),
+                _Artifact(NEUTRAL_EXECPROG_ID, EXECPROG_TYPE,
+                          neutral_output.encode("utf-8", "replace")),
+                *_journal_artifacts(channels, deadline=seal_deadline),
+            ]
+            _seal_segment(
+                output, repetition, vm=vm, lane=0,
+                generation=scenario_generation,
+                host={"journal_name": channels.name}, artifacts=artifacts,
+                deadline=seal_deadline)
 
 
 def _fixture(guest: Guest, inputs: _Inputs, result: dict[str, Any]) -> bool:
@@ -708,25 +773,28 @@ def _replay(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     finally:
         guest.stop()
         channels.close()
-    console_bytes = console.read_bytes() if console.is_file() else b""
-    if _CRASH.search(console_bytes):
-        replay_end = "guest_crash"
-    elif fixture_failed:
-        replay_end = "unknown"
-    elif returncode == 0:
-        replay_end = "clean"
-    else:
-        replay_end = "unknown"
-    artifacts = [
-        _Artifact(REPLAY_EXECPROG_ID, EXECPROG_TYPE,
-                  output_text.encode("utf-8", "replace")),
-        *_journal_artifacts(channels),
-    ]
-    generation = _barrier_generation(output_text)
-    _seal_segment(
-        output, 0, vm=vm, lane=0, generation=generation,
-        host={"journal_name": channels.name, "replay_end": replay_end,
-              "fixture_failed": fixture_failed}, artifacts=artifacts)
+    with _evidence_seal_window(output, 0) as seal_deadline:
+        console_bytes = console.read_bytes() if console.is_file() else b""
+        _check_evidence_deadline(seal_deadline)
+        if _CRASH.search(console_bytes):
+            replay_end = "guest_crash"
+        elif fixture_failed:
+            replay_end = "unknown"
+        elif returncode == 0:
+            replay_end = "clean"
+        else:
+            replay_end = "unknown"
+        artifacts = [
+            _Artifact(REPLAY_EXECPROG_ID, EXECPROG_TYPE,
+                      output_text.encode("utf-8", "replace")),
+            *_journal_artifacts(channels, deadline=seal_deadline),
+        ]
+        generation = _barrier_generation(output_text)
+        _seal_segment(
+            output, 0, vm=vm, lane=0, generation=generation,
+            host={"journal_name": channels.name, "replay_end": replay_end,
+                  "fixture_failed": fixture_failed}, artifacts=artifacts,
+            deadline=seal_deadline)
 
 
 def _corpus(path: Path, program: bytes) -> None:
@@ -876,99 +944,108 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         if process is not None and process.poll() is None:
             _stop_manager(process, options.manager_stop_timeout_s)
         channels.close()
-    end_ns = time.time_ns()
-    records = _spool(spool)
-    if not records:
-        raise Stage2StepError("syz-manager produced no program evidence")
-    reports, crash_log = _crash_files(workdir)
-    console = manager_log.read_bytes()
-    if b"failed to store NFS proxy evidence" in console:
-        raise Stage2StepError("syz-manager reported an evidence spool failure")
-    crashed = bool(reports or crash_log or _CRASH.search(console))
-    campaign_span, correlated = _campaign_records(records)
-    if any(record.vm != 0 or record.lane >= inputs.lanes for record in records):
-        raise Stage2StepError("syz-manager evidence has an invalid VM or lane")
-    execution_ids = [record.execution_id for record in records]
-    if len(execution_ids) != len(set(execution_ids)):
-        raise Stage2StepError("syz-manager evidence reuses an execution ID")
-    if not correlated and not crashed:
-        raise Stage2StepError(
-            "syz-manager produced no generation-attributed campaign execution")
-    seen: set[tuple[int, int]] = set()
-    coverage_artifacts: list[_Artifact] = []
-    for record in correlated:
-        key = (record.lane, record.generation)
-        if key in seen:
+    with _evidence_seal_window(output, 0) as seal_deadline:
+        end_ns = time.time_ns()
+        records = _spool(spool)
+        _check_evidence_deadline(seal_deadline)
+        if not records:
+            raise Stage2StepError("syz-manager produced no program evidence")
+        reports, crash_log = _crash_files(workdir)
+        console = manager_log.read_bytes()
+        _check_evidence_deadline(seal_deadline)
+        if b"failed to store NFS proxy evidence" in console:
+            raise Stage2StepError("syz-manager reported an evidence spool failure")
+        crashed = bool(reports or crash_log or _CRASH.search(console))
+        campaign_span, correlated = _campaign_records(records)
+        if any(record.vm != 0 or record.lane >= inputs.lanes for record in records):
+            raise Stage2StepError("syz-manager evidence has an invalid VM or lane")
+        execution_ids = [record.execution_id for record in records]
+        if len(execution_ids) != len(set(execution_ids)):
+            raise Stage2StepError("syz-manager evidence reuses an execution ID")
+        if not correlated and not crashed:
             raise Stage2StepError(
-                "campaign VM restarted and reused a lane generation")
-        seen.add(key)
-        coverage = PublishedCoverage(
-            correlation=inputs.correlation(vm, record.lane, record.generation),
-            pcs=record.pcs)
-        coverage_artifacts.append(_Artifact(
-            f"{GENERATION_COVERAGE_PREFIX}{record.lane}.{record.generation}",
-            GENERATION_COVERAGE_TYPE, canonical_json(coverage)))
-    report_artifacts: list[_Artifact] = []
-    report_refs: list[SealedArtifactRef] = []
-    for number, path in enumerate(reports):
-        data = path.read_bytes()
-        identity = f"manager-report-{number:04d}"
-        report_artifacts.append(_Artifact(identity, MANAGER_REPORT_TYPE, data))
-        report_refs.append(SealedArtifactRef(
-            identity=identity, sha256=hashlib.sha256(data).hexdigest()))
-    console_identity = "console"
-    correlation = (inputs.correlation(vm, correlated[0].lane,
-                                      correlated[0].generation)
-                   if correlated else inputs.correlation(vm, 0, 1))
-    window = Q2CollectionWindow(
-        start_marker=f"host-ns:{start_ns}", end_marker=f"host-ns:{end_ns}")
-    internal = []
-    if unexpected_exit and not crashed:
-        returncode = process.returncode if process is not None else None
-        internal.append(f"manager_exited_unexpectedly:{returncode}")
-    if not correlated:
-        internal.append("crash_before_generation_attributed_campaign_execution")
-    uncorrelated = len(campaign_span) - len(correlated)
-    if uncorrelated:
-        internal.append(f"uncorrelated_program_results:{uncorrelated}")
-    completeness = "complete" if complete else "truncated"
-    termination = "guest_crashed" if crashed else (
-        "lost" if unexpected_exit else
-        ("runner_stopped" if complete else "lost"))
-    q2_correlation = EvidenceCorrelation.model_validate(
-        correlation.model_dump(mode="python"))
-    q2 = SealedQ2Evidence(
-        execution_harness_id=inputs.execution.execution_harness_id,
-        correlation=q2_correlation,
-        console_log_identity=console_identity,
-        console_log_ref=hashlib.sha256(console).hexdigest(),
-        console_log_completeness=completeness,
-        manager_crash_reports=tuple(report_refs),
-        vm_termination=termination, collection_window=window,
-        internal_errors=tuple(internal))
-    artifacts = [
-        _Artifact(Q2_EVIDENCE_ID, Q2_EVIDENCE_TYPE, canonical_json(q2)),
-        _Artifact(console_identity, CONSOLE_LOG_TYPE, console),
-        *report_artifacts,
-        *coverage_artifacts,
-    ]
-    if crash_log is not None:
-        artifacts.append(_Artifact(CRASH_LOG_ID, CRASH_LOG_TYPE,
-                                   crash_log.read_bytes()))
-    artifacts.extend(_journal_artifacts(channels))
-    _seal_segment(
-        output, 0, vm=vm, lane=correlation.lane,
-        generation=correlation.generation_id,
-        host={
-            "journal_name": channels.name,
-            "executions": len(correlated),
-            "console_log_identity": console_identity,
-            "console_log_completeness": completeness,
-            "manager_crash_report_identities": [item.identity
-                                                  for item in report_refs],
-            "vm_termination": termination,
-            "collection_window": window.model_dump(mode="json"),
-        }, artifacts=artifacts)
+                "syz-manager produced no generation-attributed campaign execution")
+        seen: set[tuple[int, int]] = set()
+        coverage_artifacts: list[_Artifact] = []
+        for record in correlated:
+            _check_evidence_deadline(seal_deadline)
+            key = (record.lane, record.generation)
+            if key in seen:
+                raise Stage2StepError(
+                    "campaign VM restarted and reused a lane generation")
+            seen.add(key)
+            coverage = PublishedCoverage(
+                correlation=inputs.correlation(vm, record.lane, record.generation),
+                pcs=record.pcs)
+            coverage_artifacts.append(_Artifact(
+                f"{GENERATION_COVERAGE_PREFIX}{record.lane}.{record.generation}",
+                GENERATION_COVERAGE_TYPE, canonical_json(coverage)))
+        report_artifacts: list[_Artifact] = []
+        report_refs: list[SealedArtifactRef] = []
+        for number, path in enumerate(reports):
+            _check_evidence_deadline(seal_deadline)
+            data = path.read_bytes()
+            _check_evidence_deadline(seal_deadline)
+            identity = f"manager-report-{number:04d}"
+            report_artifacts.append(_Artifact(identity, MANAGER_REPORT_TYPE, data))
+            report_refs.append(SealedArtifactRef(
+                identity=identity, sha256=hashlib.sha256(data).hexdigest()))
+        console_identity = "console"
+        correlation = (inputs.correlation(vm, correlated[0].lane,
+                                          correlated[0].generation)
+                       if correlated else inputs.correlation(vm, 0, 1))
+        window = Q2CollectionWindow(
+            start_marker=f"host-ns:{start_ns}", end_marker=f"host-ns:{end_ns}")
+        internal = []
+        if unexpected_exit and not crashed:
+            returncode = process.returncode if process is not None else None
+            internal.append(f"manager_exited_unexpectedly:{returncode}")
+        if not correlated:
+            internal.append("crash_before_generation_attributed_campaign_execution")
+        uncorrelated = len(campaign_span) - len(correlated)
+        if uncorrelated:
+            internal.append(f"uncorrelated_program_results:{uncorrelated}")
+        completeness = "complete" if complete else "truncated"
+        termination = "guest_crashed" if crashed else (
+            "lost" if unexpected_exit else
+            ("runner_stopped" if complete else "lost"))
+        q2_correlation = EvidenceCorrelation.model_validate(
+            correlation.model_dump(mode="python"))
+        q2 = SealedQ2Evidence(
+            execution_harness_id=inputs.execution.execution_harness_id,
+            correlation=q2_correlation,
+            console_log_identity=console_identity,
+            console_log_ref=hashlib.sha256(console).hexdigest(),
+            console_log_completeness=completeness,
+            manager_crash_reports=tuple(report_refs),
+            vm_termination=termination, collection_window=window,
+            internal_errors=tuple(internal))
+        artifacts = [
+            _Artifact(Q2_EVIDENCE_ID, Q2_EVIDENCE_TYPE, canonical_json(q2)),
+            _Artifact(console_identity, CONSOLE_LOG_TYPE, console),
+            *report_artifacts,
+            *coverage_artifacts,
+        ]
+        if crash_log is not None:
+            _check_evidence_deadline(seal_deadline)
+            artifacts.append(_Artifact(CRASH_LOG_ID, CRASH_LOG_TYPE,
+                                       crash_log.read_bytes()))
+            _check_evidence_deadline(seal_deadline)
+        artifacts.extend(_journal_artifacts(
+            channels, deadline=seal_deadline))
+        _seal_segment(
+            output, 0, vm=vm, lane=correlation.lane,
+            generation=correlation.generation_id,
+            host={
+                "journal_name": channels.name,
+                "executions": len(correlated),
+                "console_log_identity": console_identity,
+                "console_log_completeness": completeness,
+                "manager_crash_report_identities": [item.identity
+                                                      for item in report_refs],
+                "vm_termination": termination,
+                "collection_window": window.model_dump(mode="json"),
+            }, artifacts=artifacts, deadline=seal_deadline)
 
 
 def run_step(options: StepOptions, input_dir: Path, output_dir: Path) -> None:

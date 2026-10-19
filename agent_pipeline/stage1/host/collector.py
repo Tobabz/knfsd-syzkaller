@@ -188,13 +188,15 @@ def _lane_state(guest: Guest) -> str:
     return out.strip() if rc == 0 else ""
 
 
-def execprog_timeout(timeout_s: float, slowdown: int = 1) -> float:
-    """Scale the host watchdog with syzkaller's internal slowdown."""
+def execprog_timeout(timeout_s: float, slowdown: int = 1) -> int:
+    """Return the shared whole-second guest and host watchdog."""
     if not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError("execprog timeout must be finite and positive")
     if not 1 <= slowdown <= 1000:
         raise ValueError("execprog slowdown must be in [1, 1000]")
-    return timeout_s * slowdown
+    # GNU timeout accepts fractions, but rounding once keeps the guest process
+    # watchdog and every host-side wait on exactly the same deadline.
+    return math.ceil(timeout_s * slowdown)
 
 
 def execprog_argv(timeout_s: float, slowdown: int = 1) -> str:
@@ -209,7 +211,7 @@ def execprog_argv(timeout_s: float, slowdown: int = 1) -> str:
             "-disable=all", "-debug", "-vv=1", f"-slowdown={slowdown}",
             f"-gate={GATE}", f"{GUEST_DIR}/program.syz"]
     body = (f"timeout --kill-after={EXECPROG_EXIT_GRACE_S} "
-            f"{math.ceil(watchdog_s)} {shlex.join(argv)} > {EXEC_LOG} 2>&1; "
+            f"{watchdog_s} {shlex.join(argv)} > {EXEC_LOG} 2>&1; "
             f"echo $? > {EXEC_RC}")
     return (f"rm -rf /tmp/cov {GATE}.ready {GATE}.go {EXEC_RC}; "
             f"mkdir -p /tmp/cov; setsid nohup sh -c {shlex.quote(body)} "

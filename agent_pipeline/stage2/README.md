@@ -148,8 +148,10 @@ executor binaries.
 
 Preflight also requires the outer Stage 2 supervisor timeout to cover the
 slowdown-scaled gate and replay watchdogs and the configured campaign
-timeout. This prevents the supervisor from truncating a valid run before it
-can seal its evidence.
+timeout. Each step enforces the evidence-sealing reserve as an inner deadline
+and publishes only an atomically complete segment before it expires. This
+keeps a storage stall distinguishable from valid sealed evidence before the
+outer supervisor cleanup reserve begins.
 
 Warnings identify an operator-start policy, repository placeholder campaign
 thresholds or separate Stage 1/Stage 2 resource keys. Any failed check exits
