@@ -672,12 +672,25 @@ class Stage1Toolbox:
                 "a promoted ProtocolSchema is absent from the pinned source") \
                 from None
         response = args.message_type == "reply"
-        values, traversal_cut = _schema_paths(
-            schema, response=response, operation=args.operation)
+        values: tuple[tuple[str, Node], ...]
+        traversal_cut = False
+        exact = None
+        if args.query is not None:
+            resolution, node = schema.resolve(response, args.query)
+            if (resolution is Resolution.FOUND and node is not None
+                    and node.root == args.operation):
+                exact = (args.query, node)
+        if exact is not None:
+            # An exact canonical path is complete independently of a bounded
+            # traversal of recursive siblings elsewhere in the operation.
+            values = (exact,)
+        else:
+            values, traversal_cut = _schema_paths(
+                schema, response=response, operation=args.operation)
         if not values:
             raise ToolBoundaryError(
                 "operation or procedure is absent from the schema")
-        if args.query is not None:
+        if args.query is not None and exact is None:
             query = args.query.casefold()
             values = tuple((path, node) for path, node in values
                            if query in path.casefold())

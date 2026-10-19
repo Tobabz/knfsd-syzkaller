@@ -540,6 +540,33 @@ def test_semantic_path_lookup_separates_enum_and_path_truncation():
     assert result.paths[0].enum_literals_truncated is True
 
 
+def test_semantic_path_lookup_exact_query_avoids_unrelated_truncation(
+        monkeypatch):
+    schema = next(s for s in load_schemas().values() if s.minor == 1)
+
+    class SemanticHcap(FakeHcap):
+        def load_semantic_scope(self, revision):
+            assert revision == HCAP_REVISION
+            return SimpleNamespace(subsets=(SimpleNamespace(
+                subset=SimpleNamespace(schema_ids=(schema.schema_id,))),))
+
+    def bounded_traversal(*args, **kwargs):
+        raise AssertionError("exact canonical queries must not enumerate")
+
+    monkeypatch.setattr(
+        "agent_pipeline.agent_tasks.tools._schema_paths", bounded_traversal)
+    tools = Stage1Toolbox(
+        FakeSource(), SemanticHcap(), kernel_commit=COMMIT,
+        hcap_revision=HCAP_REVISION)
+    path = "nfs4.response.WRITE.result.status"
+    result = tools.invoke("lookup_semantic_paths", {
+        "schema_id": schema.schema_id, "message_type": "reply",
+        "operation": "WRITE", "query": path})
+
+    assert [item.path for item in result.paths] == [path]
+    assert result.truncated is False
+
+
 def test_semantic_path_enumerator_handles_compound_and_resolves_every_path():
     for schema in load_schemas().values():
         for response in (False, True):
