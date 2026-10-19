@@ -913,6 +913,31 @@ EOF
         fi
         if [ "$server_impl" = both ]; then
             command -v nfs-proxy >/dev/null 2>&1 || {
+                echo "KOOV: guest lifecycle admin not on PATH" >&2
+                exit 1
+            }
+            nfs-proxy --lifecycle-admin \
+                "$executor_root/proc-$lane/control/lifecycle.sock" \
+                --lane "$lane" \
+                > "$lane_root/server/lifecycle.log" 2>&1 &
+            lifecycle_pid=$!
+            printf "%s\n" "$lifecycle_pid" > \
+                "$lane_root/server/lifecycle.pid"
+            lifecycle_wait=0
+            while ! grep -q "^lifecycle ready:" \
+                    "$lane_root/server/lifecycle.log"; do
+                if ! kill -0 "$lifecycle_pid" 2>/dev/null || \
+                    test "$lifecycle_wait" -ge 100; then
+                    echo "KOOV: lifecycle admin failed to start" >&2
+                    cat "$lane_root/server/lifecycle.log" >&2
+                    exit 1
+                fi
+                lifecycle_wait=$((lifecycle_wait + 1))
+                sleep 0.1
+            done
+        fi
+        if [ "$server_impl" = both ]; then
+            command -v nfs-proxy >/dev/null 2>&1 || {
                 echo "KOOV: guest relay not on PATH" >&2
                 exit 1
             }
@@ -1061,6 +1086,9 @@ expose_lane_to_executor()
         mkdir "$expose_source/$expose_alias"
         mount --bind "$expose_mount" "$expose_source/$expose_alias"
     done
+    if [ "$server_impl" = both ]; then
+        test -S "$expose_source/control/lifecycle.sock"
+    fi
     if [ -n "$proxy_target_dir" ]; then
         test -S "$expose_source/activation/activation.sock"
     elif [ "$server_impl" = both ]; then
@@ -1306,7 +1334,8 @@ cleanup_fixture()
                 "$cleanup_source/.client0_pid" "$cleanup_source/.client1_pid" \
                 "$cleanup_source/.client0_netns" "$cleanup_source/.client1_netns" \
                 "$cleanup_source/.server0_ipv4" "$cleanup_source/.server1_ipv4"
-            rm -f "$cleanup_source/control/arm.sock"
+            rm -f "$cleanup_source/control/arm.sock" \
+                "$cleanup_source/control/lifecycle.sock"
             rmdir "$cleanup_source/control" 2>/dev/null || true
             rm -f "$cleanup_source/activation/activation.sock" \
                 "$cleanup_source/activation/rule_set_id"
@@ -1567,6 +1596,9 @@ status_fixture()
             test "$(cat "$status_source/activation/rule_set_id")" = \
                 "$(sha256sum "$proxy_target_dir/lane$status_lane.nfsprul1" | \
                     cut -d' ' -f1)"
+        fi
+        if [ "$server_impl" = both ]; then
+            test -S "$status_source/control/lifecycle.sock"
         fi
         if [ "$server_impl" = both ] && [ -z "$proxy_target_dir" ]; then
             test -S "$status_source/control/arm.sock"

@@ -542,6 +542,50 @@ tools/nfs-proxy/src/delta.h
 tools/nfs-proxy/README.md
 ```
 
+### HCAP-11 — Bounded NFSv4.1 client lifecycle recovery
+
+```text
+id: HCAP-11
+name: bounded NFSv4.1 client lifecycle recovery
+usable_stage: [stage1]
+usable_by: [agent_stage1]
+status: validated
+scope: [client0_confirmed_expiry_recovery]
+
+interface:
+    syz_nfsd_client_ctl$expire_client0(0x0)  # exact admitted invocation
+
+purpose:
+    lane 0의 확정된 NFSv4.1 클라이언트 하나를 만료시키고
+    일반 client0 profile I/O로 EXCHANGE_ID -> CREATE_SESSION 복구를 유도
+
+constraints:
+    single NFSv4.1 fixture와 SERVER_IMPL=both를 사용
+    client0 selector 인자는 반드시 고정값 0x0을 사용
+    lifecycle broker가 정확히 하나의 confirmed minor-version-1 owner를 해석
+    owner는 Linux NFSv4.1 frozen-phase9-lane0-client0/<UTS hostname>과 정확히 일치
+    syz 호출은 client selector만 전달하며 client path, owner, ctl payload를 전달하지 않음
+    broker만 /proc/fs/nfsd/clients/<client>/ctl을 선택하고 literal expire를 기록
+    broker reply의 clientid, minorversion=1, session_count>0을 executor가 검사
+    한 번의 expiry 뒤 ordinary client0 profile I/O를 수행
+```
+
+executor ABI에는 lane 1용 `syz_nfsd_client_ctl$expire_client1`도 존재하지만, HCAP-11과
+CallAdmissionProfile은 실제 KVM에서 검증된 client0만 공개한다. client1은 별도의 runtime 증거가 생기기 전까지
+Agent가 사용할 수 없다. 2026-10-19 실 KVM 검증에서는 neutral control 3회가 대상 PC를 0회 실행했고,
+expiry stimulus 3회는 모두 같은 대상 PC 8개를 실행했다. 각 실행은 remote-KCOV generation begin/publish 1회,
+abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록했다. HCAP-03은 이 실행의
+generation attribution을 계속 담당하며 HCAP-11이 이를 대체하지 않는다.
+
+source refs:
+
+```text
+bundle/patches/syzkaller/0027-*
+bundle/lane/lane.sh
+tools/nfs-proxy/src/lifecycle.c
+tools/nfs-lifecycle/run.py
+```
+
 ### Target Proxy Architecture와의 관계
 
 HCAP-07/08/09는 현재 `tools/nfs-proxy`에서 검증된 concrete capability를 기록한다.
@@ -599,6 +643,7 @@ STAGE 1
     HCAP-04 lane topology
     HCAP-05 normal-flow seeds
     HCAP-06 flow tracing
+    HCAP-11 bounded NFSv4.1 client lifecycle recovery
 
 STAGE 2
     Stage 1에서 선택된 scenario

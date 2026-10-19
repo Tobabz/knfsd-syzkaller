@@ -359,6 +359,19 @@ def test_template_spec_is_valid():
     calls = {e.call for e in spec.admission_source.entries}
     for selection in spec.runtime_selections:
         assert set(selection.enabled_interfaces) - {"remote_cover"} <= calls
+    lifecycle = next(c for c in spec.capabilities if c.id == "HCAP-11")
+    assert lifecycle.status == "validated"
+    assert lifecycle.scope == ("client0_confirmed_expiry_recovery",)
+    assert lifecycle.interface.syz_calls == (
+        "syz_nfsd_client_ctl$expire_client0",)
+    assert any("syz_nfsd_client_ctl$expire_client0(0x0)" in item
+               for item in lifecycle.constraints)
+    expiry = next(e for e in spec.admission_source.entries
+                  if e.call == "syz_nfsd_client_ctl$expire_client0")
+    assert expiry.capability_ids == ("HCAP-11",)
+    assert all("syz_nfsd_client_ctl$expire_client1" not in
+               selection.enabled_interfaces
+               for selection in spec.runtime_selections)
 
 
 @needs_gcc
