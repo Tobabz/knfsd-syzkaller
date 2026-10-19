@@ -1164,4 +1164,5 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
 14. Runner task 실행 — Controller task 계약([`09`](09-job-state-graph.md) §8)의 Runner 쪽 구현. task·cancel 기록의
     durable 저장, Runner 재시작 뒤 실행 복원, campaign evidence의 봉인 단위
     (구현 기본값, 2026-10-18: host command가 끝낸 segment 하나, 곧 fuzz VM instance의 실행 구간 하나가 bundle
-    하나다. `agent_pipeline/stage2/README.md`. 실제 VM으로는 확인하지 않았다.)
+    하나다. `agent_pipeline/stage2/README.md`. PR #61에서 gate, bounded campaign, replay의 standalone host 경로를
+    실제 KVM으로 확인했다. live Agent와 실제 candidate가 Controller부터 이 경로 전체를 지난 검증은 #57 범위다.)

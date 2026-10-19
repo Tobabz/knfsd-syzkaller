@@ -252,10 +252,13 @@ compiled rule set waits in `blocked_operator(stage2_gate_unavailable)`. Campaign
 stopped becomes a triage item (`Job.triage`); 09 §4 says when its APPLIED
 crash is still replayed and reviewed.
 
-Also not here yet: broader NFS resource-provenance extraction,
-and a Stage 2 run on a real VM: the Stage 2 backend is tested end to end
-with a synthetic host command only. The standalone M1 and Q2 gates use
-synthetic fixtures only; no VM/LLM run or end-to-end runtime validation is
-claimed. `JobPolicy.run_stage2` is false by default (a policy may opt in)
-until a KVM run and the owner's campaign thresholds are in. The nfs-proxy semantic runtime remains a separate component
-until its Runner and durable journal paths are wired.
+Also not here yet: broader NFS resource-provenance extraction and a live
+provider-backed candidate traversing the complete service path. The Stage 2
+host command itself has run gate, bounded campaign and replay steps on real
+`/dev/kvm`; those runs exercised the semantic Proxy, durable journal,
+generation barriers and remote-KCOV evidence path. The synthetic service test
+still owns the complete `s1_reached` through `crash_review` assertion, so the
+real-host result is not a claim that an actual candidate or live Agent has run
+end to end. `JobPolicy.run_stage2` remains false by default (a policy may opt
+in) while the campaign thresholds await an owner decision. See the Stage 2
+README's validation status and real-host runbook.

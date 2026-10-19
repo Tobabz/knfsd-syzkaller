@@ -668,16 +668,20 @@ bundle fixture로 대신한다.
 
 - **결정됨:** 상태 목록, 전이 규칙(§2), Stage 1 전이(§3), 대기 상태와 재평가 이벤트 규칙(§5), budget counter의
   종류와 되돌리는 조건(§6), 기록과 재시작 규칙, Controller가 요구하는 Runner task 계약(§8).
-- **미결:** Runner task 계약의 Runner 쪽 구현. task와 cancel 기록을 어디에 durable하게 두는지, Runner가 재시작한
-  뒤 어떤 실행을 이어 갈 수 있는지는 `01` §14 14번에서 정한다.
+- **구현됨(2026-10-18):** `DurableRunner`가 task, cancel, lease, completion과 streaming bundle을 SQLite에
+  durable하게 기록한다. 재시작 뒤 이어 갈 수 없는 실행은 `ended_unsealed(runner_restart)`로 끝내며, Controller는
+  같은 `task_id`의 상태를 다시 소비한다. Stage 2의 segment 단위 bundle과 host 연결은
+  `agent_pipeline/stage2/README.md`가 기록한다.
 - **결정됨(2026-10-18, 구현 기본값. 저장소 소유자 결정 아님):** 정지 중인 campaign에서 늦게 온 `APPLIED` crash는
   §4의 "늦게 온 campaign evidence" 규칙(queue, repair 중단, `unrouted` triage)을 따른다(근거 17).
 - **결정됨(2026-10-13, 저장소 소유자):** JobPolicy 기본값은 Stage 1 repair 한도 3회, `agent_retry` 한도 3회, `runtime_retry` 한도
   3회, 실행 전 사람 승인 불필요다.
   `run_stage2`는 Stage 2 구현 전까지 거짓만 받고, 구현 뒤 기본값을 참으로 바꾼다
   (`agent_pipeline/contracts.py`의 `JobPolicy`).
-  **현재(2026-10-18, 구현 기본값):** Stage 2 backend가 들어와 `run_stage2`는 참도 받는다. 실제 VM 실행과 campaign
-  임계값 결정 전이라 기본값은 거짓으로 두었다. 기본값을 참으로 바꾸는 시점은 저장소 소유자가 정한다.
+  **현재(2026-10-19, 구현 기본값):** Stage 2 backend가 들어와 `run_stage2`는 참도 받고, PR #61에서 gate,
+  bounded campaign, replay의 standalone host 경로를 실제 KVM으로 확인했다. campaign 임계값은 아직 저장소 소유자
+  결정이 아니며 실제 candidate의 전체 service 경로도 #57에서 검증해야 하므로 기본값은 거짓이다. 기본값을 참으로
+  바꾸는 시점은 저장소 소유자가 정한다.
 - **결정됨(2026-10-13, 저장소 소유자):** `agent_retry`는 요청 단위로 센다. 새 요청이 시작되면 0에서 센다.
 - **결정됨(2026-10-13, 저장소 소유자):** candidate 하나에 job 여러 개(예: sanitizer별)를 둘 수 있다. 같은
   target(commit, location)은 같은 `candidate_id`다(`02` §7).
@@ -720,9 +724,10 @@ bundle fixture로 대신한다.
   policy의 job은 compile 뒤 `blocked_operator(stage2_gate_unavailable)`에서 기다린다.
 - **미구현:** gate verdict의 JudgeProfile 재판정(§5). 재평가는 Stage 1 Q1 verdict만 다시 판정한다. Stage 2 실행 전
   사람 승인도 없다(미결 그대로).
-- **미검증:** 검증 오라클 1–5는 `tests/agent_pipeline/`이 가짜 component로 확인한다(LLM과 VM 없음). Stage 2 backend는
-  실제 Runner, 봉인, judge kernel로 확인했지만 host command와 evidence는 합성이다. 실제 VM, Agent provider, 실제
-  Stage 2 evidence로는 확인하지 않았다.
+- **부분 검증:** 검증 오라클 1–5와 `s1_reached`부터 `crash_review`까지의 전체 service 전이는
+  `tests/agent_pipeline/`이 가짜 component와 합성 host command로 확인한다. PR #61은 gate, bounded campaign,
+  replay host command와 그 Stage 2 evidence를 실제 KVM에서 별도로 확인했다. live Agent provider와 실제 candidate가
+  Controller부터 real host까지 전체 경로를 지난 검증은 아직 없으며 #57 범위다.
 
 ## Agent 사용 지침
 

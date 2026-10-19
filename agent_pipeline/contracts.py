@@ -124,11 +124,12 @@ class JobPolicy(Record):
     Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
     Agent retries, three Runner reruns, no human approval before a run.
     run_stage2 becomes true by default once Stage 2 is implemented.  The
-    backend and judges are in, but no gate, campaign or replay has run on a
-    real VM and the campaign thresholds below are placeholders, so it
-    stays false by default: a policy may opt in, and otherwise an operator
-    starts Stage 2 of a reached job.  The Stage 2 repair budget follows the
-    Stage 1 default."""
+    backend, judges and real-KVM host paths for gate, campaign and replay are
+    in.  A provider-backed real candidate has not yet traversed the complete
+    service path, however, and the campaign thresholds below are still
+    placeholders.  It therefore stays false by default: a policy may opt in,
+    and otherwise an operator starts Stage 2 of a reached job.  The Stage 2
+    repair budget follows the Stage 1 default."""
 
     policy_id: str
     sanitizer: Sanitizer
