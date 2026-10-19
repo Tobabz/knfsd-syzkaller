@@ -1448,6 +1448,17 @@ status_fixture()
         pid_in_named_netns "$status_server_pid" "$status_server_ns"
         pid_in_named_netns "$status_client0_pid" "$status_client0_ns"
         pid_in_named_netns "$status_client1_pid" "$status_client1_ns"
+        if [ "$server_impl" = both ]; then
+            test -s "$status_lane_root/server/lifecycle.pid"
+            status_lifecycle_pid=$(cat "$status_lane_root/server/lifecycle.pid")
+            pid_in_named_netns "$status_lifecycle_pid" "$status_server_ns"
+            status_lifecycle_cmdline=$(tr '\000' ' ' < "/proc/$status_lifecycle_pid/cmdline")
+            case "$status_lifecycle_cmdline" in
+                *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane"*) ;;
+                *) echo "KOOV: lifecycle admin process identity mismatch" >&2
+                   return 1 ;;
+            esac
+        fi
 
         for status_client in 0 1; do
             status_pid=$(cat "$status_lane_root/client$status_client.pid")

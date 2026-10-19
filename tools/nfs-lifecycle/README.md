@@ -31,18 +31,24 @@ tools/nfs-lifecycle/run.py \
 about asynchronous stability; it does not change a scenario into a corpus seed
 and is not the default acceptance policy.
 
-The client-expiry scenario additionally needs the patched syzkaller binaries
-and a verified target-PC mapping:
+The client-expiry scenario additionally needs one generated Stage1 collector
+configuration, its exact execution descriptor and a verified target-PC mapping
+with the same complete kernel identity:
 
 ```sh
 tools/nfs-lifecycle/run.py \
   --scenario v41-client-expiry \
   --repeat 3 \
-  --syzkaller env/syzkaller \
+  --collector-config /path/to/stage1-state/collector.json \
+  --descriptor /path/to/run/input/descriptor.json \
   --target-pcs /path/to/mapping-job.json \
   --output /tmp/nfs-v41-client-expiry
 ```
 
-Its output keeps the trace, lifecycle broker audit line, executor log, remote
-coverage, metadata, generation counters and pre-window generation state for
-every control and stimulus execution.
+The runner verifies every pinned kernel, image, lane and syzkaller artifact
+before boot and refuses a mapping from another execution harness. Its
+shareable `result.json` contains identity/evidence digests and hit counts, not
+candidate source metadata or target addresses. Per-run local files retain the
+trace, lifecycle broker audit line, executor log, raw coverage, metadata,
+generation counters and pre-window generation state, including on executor or
+coverage-cardinality failures.

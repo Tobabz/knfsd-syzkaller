@@ -561,7 +561,8 @@ purpose:
 
 constraints:
     single NFSv4.1 fixture와 SERVER_IMPL=both를 사용
-    client0 selector 인자는 반드시 고정값 0x0을 사용
+    client0 selector 인자는 반드시 고정값 0x0을 사용하며 expiry는 정확히 한 번 수행
+    expiry 뒤에 client0 profile을 획득하고 client1 획득이나 선행 client0 획득은 거부
     lifecycle broker가 정확히 하나의 confirmed minor-version-1 owner를 해석
     owner는 Linux NFSv4.1 frozen-phase9-lane0-client0/<UTS hostname>과 정확히 일치
     syz 호출은 client selector만 전달하며 client path, owner, ctl payload를 전달하지 않음
@@ -572,10 +573,11 @@ constraints:
 
 executor ABI에는 lane 1용 `syz_nfsd_client_ctl$expire_client1`도 존재하지만, HCAP-11과
 CallAdmissionProfile은 실제 KVM에서 검증된 client0만 공개한다. client1은 별도의 runtime 증거가 생기기 전까지
-Agent가 사용할 수 없다. 2026-10-19 실 KVM 검증에서는 neutral control 3회가 대상 PC를 0회 실행했고,
-expiry stimulus 3회는 모두 같은 대상 PC 8개를 실행했다. 각 실행은 remote-KCOV generation begin/publish 1회,
+Agent가 사용할 수 없다. 2026-10-19 실 KVM 검증에서는 neutral control 3회가 승인된 target mapping을 실행하지
+않았고, expiry stimulus 3회는 모두 그 mapping을 실행했다. 각 실행은 remote-KCOV generation begin/publish 1회,
 abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록했다. HCAP-03은 이 실행의
-generation attribution을 계속 담당하며 HCAP-11이 이를 대체하지 않는다.
+generation attribution을 계속 담당하며 HCAP-11이 이를 대체하지 않는다. 공유 증거는 실행 descriptor와
+target mapping의 digest만 기록하고 후보 source metadata와 target 주소는 포함하지 않는다.
 
 source refs:
 
@@ -584,6 +586,7 @@ bundle/patches/syzkaller/0027-*
 bundle/lane/lane.sh
 tools/nfs-proxy/src/lifecycle.c
 tools/nfs-lifecycle/run.py
+agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
 ```
 
 ### Target Proxy Architecture와의 관계

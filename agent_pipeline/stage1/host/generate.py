@@ -108,6 +108,10 @@ class HostSpec(_Spec):
     syzkaller_bundle: Path
     guest_kernel_command_line: str = DEFAULT_CMDLINE
     capabilities: tuple[Capability, ...] = Field(min_length=1)
+    #: Capability ID -> repository evidence files to store and bind into the
+    #: generated HCAP catalog. Paths are relative to this spec.
+    capability_evidence: dict[str, tuple[Path, ...]] = Field(
+        default_factory=dict)
     #: The capability whose constraints list the allowed runtime selections.
     #: The Agent reads capabilities through its HCAP lookup tool and must
     #: plan with one of these selections exactly.
@@ -282,6 +286,29 @@ def generate(spec_path: Path, *, python: str = sys.executable,
 
     # ---------------------------------------------------- authorities
     capabilities = list(spec.capabilities)
+    capability_indexes = {capability.id: index
+                          for index, capability in enumerate(capabilities)}
+    unknown_evidence = sorted(set(spec.capability_evidence) -
+                              set(capability_indexes))
+    if unknown_evidence:
+        raise GenerationError("capability_evidence names no capability: "
+                              + unknown_evidence[0])
+    for capability_id, paths in sorted(spec.capability_evidence.items()):
+        if not paths:
+            raise GenerationError(
+                f"capability_evidence for {capability_id} is empty")
+        refs = []
+        for path in paths:
+            resolved = _resolve(base, path)
+            if not resolved.is_file():
+                raise GenerationError(
+                    f"capability evidence is not a file: {resolved}")
+            refs.append(store.put(resolved.read_bytes()))
+        index = capability_indexes[capability_id]
+        capability = capabilities[index]
+        capabilities[index] = capability.model_copy(update={
+            "evidence_refs": tuple(sorted(set(capability.evidence_refs) |
+                                          set(refs)))})
     if spec.runtime_selection_capability is not None:
         index = next((i for i, c in enumerate(capabilities)
                       if c.id == spec.runtime_selection_capability), None)

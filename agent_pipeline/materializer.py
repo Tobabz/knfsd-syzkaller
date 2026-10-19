@@ -232,6 +232,45 @@ class ParsedProgram(MaterializerRecord):
         return self
 
 
+HCAP11_ID = "HCAP-11"
+HCAP11_EXPIRE = "syz_nfsd_client_ctl$expire_client0"
+HCAP11_ACQUIRE = "syz_open_nfs_lane_profile$client0_knfsd_v41"
+HCAP11_ORIGIN = "nfs-profile:knfsd-v41:client0"
+
+
+def _hcap11_program_error(parsed: ParsedProgram) -> str | None:
+    """Return why a program is outside HCAP-11's validated sequence.
+
+    Per-call admission proves that each individual pseudo-syscall and fd use
+    is allowed.  It cannot prove the cross-call contract validated by the KVM
+    campaign: one client0 expiry, followed by a fresh client0 profile
+    acquisition.  Keep that small temporal/client constraint at the
+    Materializer trust boundary.
+    """
+    expiry = [call.index for call in parsed.calls
+              if call.call == HCAP11_EXPIRE]
+    if len(expiry) != 1:
+        return "expiry_count"
+
+    acquisitions = [call.index for call in parsed.calls
+                    if call.call == HCAP11_ACQUIRE]
+    if not acquisitions:
+        return "client0_recovery_missing"
+    if any(index <= expiry[0] for index in acquisitions):
+        return "client0_recovery_precedes_expiry"
+
+    origins = {item.resource_origin for item in parsed.nfs_acquisitions}
+    if origins != {HCAP11_ORIGIN}:
+        return "non_client0_acquisition"
+
+    # Reject another lane-profile selector even if a future admission profile
+    # happens to grant it through a different capability.
+    if any(call.call.startswith("syz_open_nfs_lane_profile$")
+           and call.call != HCAP11_ACQUIRE for call in parsed.calls):
+        return "non_client0_profile_call"
+    return None
+
+
 class SyzParseFailure(ValueError):
     """A deterministic strict-parse refusal from the injected parser.
 
@@ -619,6 +658,11 @@ class ArtifactHarnessMaterializer:
                for item in parsed.nfs_acquisitions):
             self._fail(PROFILE_FIXTURE_ROUTE_MISMATCH,
                        f"{role}_nfs_profile_mismatch")
+        if role == "scenario" and HCAP11_ID in required_capabilities:
+            error = _hcap11_program_error(parsed)
+            if error is not None:
+                self._fail(CALL_NOT_ADMITTED,
+                           f"{role}_hcap11_program_contract:{error}")
 
         resolved_calls = set(call_table.calls)
         selected: set[str] = set()

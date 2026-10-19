@@ -67,6 +67,8 @@ from agent_pipeline.materializer import (
     ReachabilityHarness,
     StaticExecutionHarnessAuthority,
     SyzParseFailure,
+    _Failure,
+    _hcap11_program_error,
     descriptor_id,
 )
 
@@ -124,6 +126,23 @@ def parsed(program: bytes, identity: SyzkallerTargetIdentity, calls,
             program_bytes=len(program), call_count=len(calls),
             resource_count=resource_count),
         nfs_acquisitions=acquisitions)
+
+
+def hcap11_parsed(identity, calls, origins):
+    program = b"hcap11 contract fixture"
+    return ParsedProgram(
+        identity=identity, program_sha256=digest(program),
+        calls=tuple(ParsedCall(
+            index=index, call=call, availability="available",
+            resource_facts=empty_facts())
+            for index, call in enumerate(calls)),
+        usage=ProgramResourceUsage(
+            program_bytes=len(program), call_count=len(calls),
+            resource_count=len(origins)),
+        nfs_acquisitions=tuple(sorted((
+            NfsAcquisition(profile="knfsd-v41", resource_origin=origin)
+            for origin in origins),
+            key=lambda item: (item.profile, item.resource_origin))))
 
 
 class SyntheticParser:
@@ -342,6 +361,59 @@ def plan_with_extra_capability(world):
             "capability_uses": (extra_use, *world.plan.capability_uses),
         })))
     return plan, put_record(world.store, plan)
+
+
+def test_hcap11_program_contract_accepts_expiry_then_client0_recovery(world):
+    parsed_program = hcap11_parsed(
+        world.identity,
+        ("syz_nfsd_client_ctl$expire_client0",
+         "syz_open_nfs_lane_profile$client0_knfsd_v41", "fsync"),
+        ("nfs-profile:knfsd-v41:client0",))
+    assert _hcap11_program_error(parsed_program) is None
+
+
+@pytest.mark.parametrize(("calls", "origins", "reason"), [
+    (("syz_nfsd_client_ctl$expire_client0",
+      "syz_open_nfs_lane_profile$client1_knfsd_v41", "fsync"),
+     ("nfs-profile:knfsd-v41:client1",), "client0_recovery_missing"),
+    (("syz_nfsd_client_ctl$expire_client0",
+      "syz_open_nfs_lane_profile$client0_knfsd_v41",
+      "syz_open_nfs_lane_profile$client1_knfsd_v41"),
+     ("nfs-profile:knfsd-v41:client0",
+      "nfs-profile:knfsd-v41:client1"), "non_client0_acquisition"),
+    (("syz_open_nfs_lane_profile$client0_knfsd_v41",
+      "syz_nfsd_client_ctl$expire_client0"),
+     ("nfs-profile:knfsd-v41:client0",),
+     "client0_recovery_precedes_expiry"),
+    (("syz_nfsd_client_ctl$expire_client0",
+      "syz_nfsd_client_ctl$expire_client0",
+      "syz_open_nfs_lane_profile$client0_knfsd_v41"),
+     ("nfs-profile:knfsd-v41:client0",), "expiry_count"),
+])
+def test_hcap11_program_contract_rejects_cross_client_order_and_count(
+        world, calls, origins, reason):
+    assert _hcap11_program_error(
+        hcap11_parsed(world.identity, calls, origins)) == reason
+
+
+def test_materializer_enforces_hcap11_program_contract_before_call_grants(
+        world):
+    parsed_program = hcap11_parsed(
+        world.identity,
+        ("syz_nfsd_client_ctl$expire_client0",
+         "syz_open_nfs_lane_profile$client1_knfsd_v41", "fsync"),
+        ("nfs-profile:knfsd-v41:client1",))
+    from agent_pipeline.admission import CallAdmissionAuthority
+    authority = CallAdmissionAuthority(
+        hcap_revision=world.hcap_ref, profile_ref=world.profile_ref,
+        profile=world.profile)
+    with pytest.raises(_Failure) as caught:
+        world.materializer._admit(
+            parsed_program, role="scenario", selection=world.runtime,
+            required_capabilities=("HCAP-11",), authority=authority,
+            call_table=world.call_table)
+    assert caught.value.result().reason == CALL_NOT_ADMITTED
+    assert caught.value.result().detail.endswith("client0_recovery_missing")
 
 
 def test_program_flow_persists_and_reloads_complete_records(world):

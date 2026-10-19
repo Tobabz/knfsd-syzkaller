@@ -19,7 +19,7 @@ from agent_pipeline.materializer import (
     ArtifactHarnessMaterializer, CALL_NOT_ADMITTED, CALL_UNRESOLVED,
     DISALLOWED_OR_UNAVAILABLE_CALL, ExecutionHarnessApproval,
     MaterializationReviewManifest, ParsedProgram, PROFILE_FIXTURE_ROUTE_MISMATCH,
-    StaticExecutionHarnessAuthority, descriptor_id,
+    StaticExecutionHarnessAuthority, _hcap11_program_error, descriptor_id,
 )
 from agent_pipeline.syzkaller import PinnedSyzParser
 from tests.agent_pipeline.test_materializer import world as synthetic_world
@@ -27,6 +27,7 @@ from tests.agent_pipeline.test_materializer import world as synthetic_world
 
 LANE_CALL = "syz_open_nfs_lane_profile$client0_knfsd_v41"
 LANE = f"r0 = {LANE_CALL}(0x2, 0x0)\n".encode()
+EXPIRE = b"syz_nfsd_client_ctl$expire_client0(0x0)\n"
 
 
 @pytest.mark.parametrize("program,reason", [
@@ -132,3 +133,24 @@ def test_real_parser_materializer_handoff(tmp_path, program, reason):
     assert control.program_sha256 == neutral_ref
     assert tuple(call.call for call in scenario.calls) == (LANE_CALL, "fsync")
     assert review.selected_capability_ids == ("CAP-lane",)
+
+
+@pytest.mark.parametrize(("program", "reason"), [
+    (EXPIRE + LANE + b"fsync(r0)\n", None),
+    (EXPIRE +
+     b"r0 = syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1)\n"
+     b"fsync(r0)\n", "client0_recovery_missing"),
+    (LANE + EXPIRE + b"fsync(r0)\n",
+     "client0_recovery_precedes_expiry"),
+    (EXPIRE + EXPIRE + LANE + b"fsync(r0)\n", "expiry_count"),
+])
+def test_real_parser_hcap11_program_contract(program, reason):
+    value = os.environ.get("KNFSD_SYZ_BUNDLE")
+    if not value:
+        pytest.skip("build the pinned Go bridge and set KNFSD_SYZ_BUNDLE")
+    bundle = Path(value)
+    identity = SyzkallerTargetIdentity.model_validate_json(
+        (bundle / "identity.json").read_bytes())
+    with PinnedSyzParser(bundle, identity=identity) as parser:
+        parsed_program = parser.parse(program, identity=identity)
+    assert _hcap11_program_error(parsed_program) == reason

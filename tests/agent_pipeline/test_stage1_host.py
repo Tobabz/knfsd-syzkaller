@@ -349,6 +349,27 @@ def test_generate_pins_files_and_writes_consistent_configs(host):
                for text in lane.constraints)
 
 
+@needs_gcc
+def test_generate_binds_declared_capability_evidence(host):
+    evidence = host.root / "capability-evidence.json"
+    evidence.write_text(
+        '{"schema_version":"test-evidence.v1","result":"pass"}\n')
+    spec = json.loads(host.spec.read_text())
+    spec["capability_evidence"] = {
+        "CAP-lane": ["capability-evidence.json"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+
+    result = generate(host.spec)
+    store = ArtifactStore(host.root / "cas")
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    capability = next(
+        item for item in ArtifactHcapChecker(store).load_catalog(
+            result.hcap_revision).capabilities
+        if item.id == "CAP-lane")
+    assert len(capability.evidence_refs) == 1
+    assert store.get(capability.evidence_refs[0]) == evidence.read_bytes()
+
+
 def test_template_spec_is_valid():
     from agent_pipeline.stage1.host.generate import HostSpec
     template = REPO / "agent_pipeline/stage1/host/template"
@@ -364,6 +385,15 @@ def test_template_spec_is_valid():
     assert lifecycle.scope == ("client0_confirmed_expiry_recovery",)
     assert lifecycle.interface.syz_calls == (
         "syz_nfsd_client_ctl$expire_client0",)
+    assert spec.capability_evidence["HCAP-11"] == (
+        Path("capability-evidence/hcap11-kvm.json"),)
+    evidence_path = template / spec.capability_evidence["HCAP-11"][0]
+    assert evidence_path.is_file()
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["capability_id"] == "HCAP-11"
+    assert evidence[
+        "shareable_result_contains_target_metadata_or_addresses"] is False
+    assert not {"target_pcs", "candidate_id", "path", "symbol"} & set(evidence)
     assert any("syz_nfsd_client_ctl$expire_client0(0x0)" in item
                for item in lifecycle.constraints)
     expiry = next(e for e in spec.admission_source.entries

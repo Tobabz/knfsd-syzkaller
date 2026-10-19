@@ -83,6 +83,11 @@ with tempfile.TemporaryDirectory() as directory:
                    capture_output=True)
     prepared = json.loads(live.read_text())
     lane_bytes = (ROOT / "bundle/lane/lane.sh").read_bytes()
+    lane_text = lane_bytes.decode()
+    assert 'test -s "$status_lane_root/server/lifecycle.pid"' in lane_text
+    assert ('pid_in_named_netns "$status_lifecycle_pid" '
+            '"$status_server_ns"') in lane_text
+    assert "lifecycle admin process identity mismatch" in lane_text
     lane_sha = hashlib.sha256(lane_bytes).hexdigest()
     assert (Path(prepared["workdir_template"]) / "lane.sh").read_bytes() == lane_bytes
     assert "path={{TEMPLATE}}" in prepared["vm"]["qemu_args"]
