@@ -1,54 +1,19 @@
-From 392819000e6e07c0192af404a38d841d69c95961 Mon Sep 17 00:00:00 2001
+From d3c321fcce25e2bcfe75b588d22b0c8539d83ed9 Mon Sep 17 00:00:00 2001
 From: knfsd-fuzz <knfsd-fuzz@localhost>
-Date: Tue, 20 Oct 2026 23:30:00 +0900
+Date: Tue, 20 Oct 2026 23:32:22 +0900
 Subject: [PATCH] lockd: attribute blocked-lock grants, NLM async calls and UDP
  NLM
 
-Remote KCOV attributes the lane lockd only while it serves a TCP NLM
-request.  Three kinds of lockd work ran outside that section, so a missing
-PC there could not be read as "not executed":
+Carry the blocked LOCK owner through the lockd grant and GRANTED_MSG callback, inherit the active request owner for async NLM replies, and attribute complete UDP records.
 
- - the lockd thread grants a blocked lock in nlmsvc_retry_blocked(), before
-   svc_recv(), outside any request;
- - the GRANTED_MSG callback and the *_RES replies to *_MSG requests run in
-   rpciod;
- - svc_udp_recvfrom() never attributed a datagram, so UDP NLM requests had
-   no owner.
-
-Reuse the callback owner of the NFSv4.1 callback patch.
-
-lockd: an nlm_rqst carries the program behind its calls (a_fuzz_owner).
-nlmsvc_create_block() stores the program whose LOCK created the block; a
-later LOCK for the same block replaces it only when that program has ended,
-so the first program still running wins.  nlmsvc_retry_blocked() runs
-nlmsvc_grant_blocked() in a section for the block's owner.
-__nlm_async_call() gives the RPC task the owner stored on the request, or
-else the owner of the section the caller runs, so rpciod runs the
-GRANTED_MSG and the *_RES replies for that program.  An owner whose
-generation is closing, committed or aborted is refused by the section
-helpers as before: a grant after its program ended is counted, not
-attributed to the program open at that moment.
-
-sunrpc: sunrpc_fuzz_cb_owner_refresh() fills or replaces an owner slot from
-the current section.  svc_udp_recvfrom() attributes a datagram that it
-hands to svc_process() through sunrpc_fuzz_svc_record_received(), as
-svc_tcp_recvfrom() does for a complete record.  This applies to every UDP
-service in a lane netns, NFS included.
-
-Not covered: async NLM calls the kernel NFS client makes from a syscall
-(UNLOCK and CANCEL through nlmclnt_async_call()).  The executor runs no
-remote section there, so those rpciod steps stay unattributed.
-
-debugfs sunrpc_fuzz/saved_work_stats gains cb_owner_replaced.
+Keep the owner immutable for the lifetime of the blocked lock. This avoids racing a lockd grant with replacement and refcount release while preserving the creator-program attribution.
 ---
- fs/lockd/clntproc.c         | 18 +++++++++++++++++-
- fs/lockd/lockd.h            |  3 +++
- fs/lockd/svclock.c          | 25 +++++++++++++++++++++++--
- fs/lockd/svcproc.c          |  1 +
- include/linux/sunrpc/fuzz.h |  2 ++
- net/sunrpc/fuzz.c           | 31 +++++++++++++++++++++++++++++++
- net/sunrpc/svcsock.c        |  2 ++
- 7 files changed, 79 insertions(+), 3 deletions(-)
+ fs/lockd/clntproc.c  | 18 +++++++++++++++++-
+ fs/lockd/lockd.h     |  3 +++
+ fs/lockd/svclock.c   | 19 ++++++++++++++++++-
+ fs/lockd/svcproc.c   |  1 +
+ net/sunrpc/svcsock.c |  2 ++
+ 5 files changed, 41 insertions(+), 2 deletions(-)
 
 diff --git a/fs/lockd/clntproc.c b/fs/lockd/clntproc.c
 index f8018bfe9..f01e2f304 100644
@@ -116,34 +81,20 @@ index 14cc952fe..ca8890b28 100644
  
  struct lockd_share;
 diff --git a/fs/lockd/svclock.c b/fs/lockd/svclock.c
-index e628b5d35..f57802c44 100644
+index e628b5d35..715f0324e 100644
 --- a/fs/lockd/svclock.c
 +++ b/fs/lockd/svclock.c
 @@ -230,6 +230,9 @@ nlmsvc_create_block(struct svc_rqst *rqstp, struct nlm_host *host,
  	block->b_call = call;
  	call->a_flags   = RPC_TASK_ASYNC;
  	call->a_block = block;
-+	/* The program that sent this LOCK owns the grant and its callback. */
-+	sunrpc_fuzz_cb_owner_refresh(&call->a_fuzz_owner, SVC_NET(rqstp),
-+				     GFP_KERNEL);
++	/* The program that created this block owns its grant and callback. */
++	call->a_fuzz_owner = sunrpc_fuzz_cb_owner_save_current(SVC_NET(rqstp),
++							      GFP_KERNEL);
  
  	return block;
  
-@@ -482,8 +485,12 @@ nlmsvc_lock(struct svc_rqst *rqstp, struct nlm_file *file,
- 		if (block == NULL)
- 			goto out;
- 		lock = &block->b_call->a_args.lock;
--	} else
-+	} else {
- 		lock->fl.c.flc_flags &= ~FL_SLEEP;
-+		/* A block whose program has ended goes to this one. */
-+		sunrpc_fuzz_cb_owner_refresh(&block->b_call->a_fuzz_owner,
-+					     SVC_NET(rqstp), GFP_KERNEL);
-+	}
- 
- 	if (block->b_flags & B_QUEUED) {
- 		dprintk("lockd: nlmsvc_lock deferred block %p flags %d\n",
-@@ -1011,6 +1018,8 @@ void
+@@ -1011,6 +1014,8 @@ void
  nlmsvc_retry_blocked(struct svc_rqst *rqstp)
  {
  	unsigned long	timeout = MAX_SCHEDULE_TIMEOUT;
@@ -152,7 +103,7 @@ index e628b5d35..f57802c44 100644
  	struct nlm_block *block;
  
  	spin_lock(&nlm_blocked_lock);
-@@ -1031,8 +1040,20 @@ nlmsvc_retry_blocked(struct svc_rqst *rqstp)
+@@ -1031,8 +1036,20 @@ nlmsvc_retry_blocked(struct svc_rqst *rqstp)
  			dprintk("nlmsvc_retry_blocked delete block (%p, granted=%d, flags=%d)\n",
  				block, block->b_granted, block->b_flags);
  			retry_deferred_block(block);
@@ -186,75 +137,6 @@ index a8b5195c2..f7fc10063 100644
  	kfree(call);
  }
  
-diff --git a/include/linux/sunrpc/fuzz.h b/include/linux/sunrpc/fuzz.h
-index 4469556e1..b3ed7374e 100755
---- a/include/linux/sunrpc/fuzz.h
-+++ b/include/linux/sunrpc/fuzz.h
-@@ -68,6 +68,8 @@ struct sunrpc_fuzz_cb_owner *sunrpc_fuzz_cb_owner_save_current(
- struct sunrpc_fuzz_cb_owner *sunrpc_fuzz_cb_owner_get(
- 		struct sunrpc_fuzz_cb_owner *owner);
- void sunrpc_fuzz_cb_owner_put(struct sunrpc_fuzz_cb_owner *owner);
-+void sunrpc_fuzz_cb_owner_refresh(struct sunrpc_fuzz_cb_owner **slot,
-+		struct net *net, gfp_t gfp);
- enum sunrpc_fuzz_saved_start_result sunrpc_fuzz_cb_section_start(
- 		struct sunrpc_fuzz_cb_owner *owner,
- 		struct sunrpc_fuzz_cb_section *section);
-diff --git a/net/sunrpc/fuzz.c b/net/sunrpc/fuzz.c
-index 208999149..af5430895 100644
---- a/net/sunrpc/fuzz.c
-+++ b/net/sunrpc/fuzz.c
-@@ -94,6 +94,7 @@ enum sunrpc_fuzz_saved_stat {
- 	SAVED_CB_SECTION_START_INCOMPLETE,
- 	SAVED_CB_SECTION_START_NESTED,
- 	SAVED_CB_SECTION_COMPLETED,
-+	SAVED_CB_OWNER_REPLACED,
- 	SAVED_STAT_COUNT,
- };
- 
-@@ -130,6 +131,7 @@ static const char *const saved_stat_names[SAVED_STAT_COUNT] = {
- 	[SAVED_CB_SECTION_START_INCOMPLETE] = "cb_section_start_incomplete",
- 	[SAVED_CB_SECTION_START_NESTED] = "cb_section_start_nested",
- 	[SAVED_CB_SECTION_COMPLETED] = "cb_section_completed",
-+	[SAVED_CB_OWNER_REPLACED] = "cb_owner_replaced",
- };
- 
- struct sunrpc_fuzz_net {
-@@ -610,6 +612,35 @@ void sunrpc_fuzz_cb_owner_put(struct sunrpc_fuzz_cb_owner *owner)
- }
- EXPORT_SYMBOL_GPL(sunrpc_fuzz_cb_owner_put);
- 
-+/*
-+ * Store the program behind the current section in @slot when @slot is empty
-+ * or its program has ended, for an object that outlives one request (a
-+ * blocked NLM lock).  A live owner is kept, so the first program that is
-+ * still running wins.  Without a running section @slot is left unchanged.
-+ */
-+void sunrpc_fuzz_cb_owner_refresh(struct sunrpc_fuzz_cb_owner **slot,
-+		struct net *net, gfp_t gfp)
-+{
-+	struct sunrpc_fuzz_cb_owner *old, *owner;
-+
-+	if (!slot)
-+		return;
-+	old = READ_ONCE(*slot);
-+	if (old && !kcov_request_generation_is_terminal(old->generation))
-+		return;
-+	owner = sunrpc_fuzz_cb_owner_save_current(net, gfp);
-+	if (!owner)
-+		return;
-+	if (cmpxchg(slot, old, owner) != old) {
-+		sunrpc_fuzz_cb_owner_put(owner);
-+		return;
-+	}
-+	if (old)
-+		saved_stat_inc(SAVED_CB_OWNER_REPLACED);
-+	sunrpc_fuzz_cb_owner_put(old);
-+}
-+EXPORT_SYMBOL_GPL(sunrpc_fuzz_cb_owner_refresh);
-+
- /*
-  * Start one execution section for @owner.  Nothing here may sleep on the
-  * callback's behalf beyond what the Ticket grant already does, and a failure
 diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
 index 4b26d8038..dae0b3624 100644
 --- a/net/sunrpc/svcsock.c
@@ -269,5 +151,5 @@ index 4b26d8038..dae0b3624 100644
  	svc_xprt_received(rqstp->rq_xprt);
  	return len;
 -- 
-2.43.0
+2.34.1
 
