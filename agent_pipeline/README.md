@@ -1,7 +1,8 @@
 # agent_pipeline
 
-The Agent pipeline Stage 1 Controller, its deterministic host components, and
-independent M1/Q2 decision kernels. The Controller owns the candidate job:
+The Agent pipeline Controller (Stage 1 and Stage 2), its deterministic
+host components, and independent M1/Q2 decision
+kernels. The Controller owns the candidate job:
 intake, harness binding, the job state machine, and the record of every
 transition.
 The design is [09-job-state-graph.md](../docs/design/02-llm-agent/09-job-state-graph.md).
@@ -32,13 +33,17 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `sealed_q2.py` | Controller-side Q2 adapter; binds raw reports and console capture to a trusted host receipt and complete artifact inventory |
 | `agent_tasks/analysis.py` | bounded structured `CandidateAnalysis` output contract (03 §5–§10) |
 | `agent_tasks/planning.py` | structured planning variants and host-side conversion of bounded inline program text to a content-addressed `ReachabilityPlan` |
-| `agent_tasks/tools.py` | the complete Agent tool allowlist: pinned kernel read/search, caller/callee index lookup and pinned HCAP lookup; paths and outputs are bounded |
+| `agent_tasks/mutation.py` | the typed `MutationRuleSet` (08 §5–§11) and the Mutation Strategy variants `rule_set` / `unsupported(mutation_engine)` (08 §15) |
+| `agent_tasks/tools.py` | the complete Agent tool allowlist: pinned kernel read/search, caller/callee index lookup, pinned HCAP lookup and promoted ProtocolSchema path lookup; paths and outputs are bounded |
 | `agent_tasks/source_index.py` | immutable Git-object implementation of the source-index protocol; full commit OIDs, trusted roots and process/output/time bounds are enforced |
 | `agent_tasks/runtime.py` | injectable structured-output runtime protocol; task policy selects provider/model and output-repair allowance |
 | `agent_tasks/pydantic_ai_runtime.py` | optional PydanticAI driver with typed output, the pinned toolbox, bounded requests and output repairs, and response-derived model identity |
-| `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis and Reachability Planning; records the runtime's actual `provider:model` id through existing Controller callbacks |
+| `agent_tasks/executor.py` | `AgentExecutor` adapter for Candidate Analysis, Reachability Planning and Mutation Strategy; records the runtime's actual `provider:model` id through existing Controller callbacks |
 | `runner/` | restart-safe SQLite leases/completion, evidence sealing, accepted-receipt Q1 publication and lease-aware Linux process supervision |
 | `journal_framing.py` | bounded M5 journal frame recovery and canonical ACK codec; persistence and event admission remain separate |
+| `semantic_delta.py` | M6 semantic Delta reader: opens a sealed host journal read only, re-admits every frame with the sink's rules, reports torn tails, refuses corruption, and projects one generation for the replay comparator |
+| `semantic_replay.py` | pure M6 replay comparator: per-position batch-signature multisets, JudgeProfile(Replay) v1 refusal classes, refusal-evidence completeness and the 05 §29 verdict order |
+| `replay_runner.py` | M6/S1c Runner side: CrashContextWindow from a syz-manager crash log, join to the production journal, recorded rule set and `--check-rules` gate, replay inputs for `syz-execprog`, judge input |
 | `controller/machine.py` | the state machine: `handle(job, event)`, no I/O |
 | `controller/store.py` | SQLite: one transaction per transition |
 | `controller/service.py` | events in, tasks out after commit; `poll()` and `recover()` send a failed or unanswered call again (each failure is recorded per job in `effect_failures`, and the other jobs go on); `replay()` |
@@ -200,9 +205,62 @@ target-PC mapping for a real run, tested without a guest; its runbook is
 it generates from the template are operator statements, not approved
 production data.
 
-Also not here yet: broader NFS resource-provenance extraction,
-Runner-receipt integration for Q2 and Stage 2 Controller/Runner
-integration. The standalone M1 and Q2 gates use synthetic fixtures only; no
-VM/LLM run or end-to-end runtime validation is claimed. `JobPolicy.run_stage2`
-remains false-only. The nfs-proxy semantic runtime remains a separate component
-until its Runner and durable journal paths are wired.
+Stage 2 starts when an operator calls `Controller.start_stage2(job_id)` on
+a job in `s1_reached` whose Q1 evidence ran on the job's bound identity. The
+Mutation Strategy Agent Task returns a typed `MutationRuleSet` or a
+`mutation_engine` gap. The Controller routes Compiler results through an
+injected `MutationRuleCompiler` (`Env.compiler`, 08 §12): an Agent-fixable
+refusal is a Stage 2 repair (`compiler_rejected`, counted against
+`stage2_repair_budget`), `unsupported_capability` and
+`requires_state_lineage` wait on a `mutation_engine` gap and compile the same
+rule set again once it closes. The Mutation Strategy Agent reads the
+promoted semantic subsets of its pinned HCAP with `lookup_semantic_scope`
+and obtains exact selector values and canonical operation paths only through
+the bounded `lookup_semantic_paths` view of those promoted schemas.
+`semantic_promotion.py` is the M7 gate that promotes them from KVM
+validation runs (`tools/nfs-proxy/README.md` "Capability registry and
+promotion"), and its `rule_set_scope` is the Compiler's scope check.
+
+`rule_compiler.py` is the Mutation Rule Compiler (08 §12 "구현"). It reads
+the HCAP revision's promoted registry, requires the configured Proxy binary
+(`Stage1Config.nfs_proxy`) to be the promoted build, binds each intent to a
+route the Stage 1 harness opens and to the harness's ProtocolSchema
+(`protocol_schema.py` resolves paths the way `src/schema.c` does), and
+lowers it to an NFSPRUL1 rule that the Proxy's own loader
+(`nfs-proxy --check-rules`) must accept. Its refusals are the 08 §12
+reasons; a rule set outside every promoted subset, or anything the runtime
+cannot apply, is `unsupported_capability` with the
+`semantic_mutation.unpromoted` gap id. The stored
+`CompiledMutationRuleSet` names the NFSPRUL1 bytes the Runner installs.
+Without `nfs_proxy` a rule set waits in
+`blocked_operator(stage2_compiler_unavailable)`.
+
+After the Compiler the Controller runs the rest of 09 §4: `s2_gate` (the
+baseline-with-rules gate, one Runner task sealing one bundle per
+`JobPolicy.gate_repetitions`; the topmost 01 §3 row of any repetition
+decides), `s2_campaign` (a Stage2Campaign whose Runner tasks seal bundles
+while they run; the Controller takes each once, in order, as a
+`runner_bundle_sealed` event, and adds it to the campaign tally the
+JobPolicy thresholds read), `s2_replaying` and `crash_review`. Stage 2
+Runner tasks carry their step and compiled rule set in `RunnerInput`; a
+Stage 1 input keeps its encoding. The judges are the injected
+`components.Stage2Judge` (`Env.stage2`). `agent_pipeline/stage2` is the
+backend (see its README): a host command per gate, campaign or replay
+lease whose segments are sealed as bundles while it runs, append-only
+host authority for each bundle, and `ArtifactStage2Judge` over the
+existing Q1, M1, Q2 and replay kernels. The wired service uses it when
+`Stage1Config.stage2` is set; otherwise `Env.stage2` stays unset and a
+compiled rule set waits in `blocked_operator(stage2_gate_unavailable)`. Campaign evidence that arrives after the campaign
+stopped becomes a triage item (`Job.triage`); 09 §4 says when its APPLIED
+crash is still replayed and reviewed.
+
+Also not here yet: broader NFS resource-provenance extraction and a live
+provider-backed candidate traversing the complete service path. The Stage 2
+host command itself has run gate, bounded campaign and replay steps on real
+`/dev/kvm`; those runs exercised the semantic Proxy, durable journal,
+generation barriers and remote-KCOV evidence path. The synthetic service test
+still owns the complete `s1_reached` through `crash_review` assertion, so the
+real-host result is not a claim that an actual candidate or live Agent has run
+end to end. `JobPolicy.run_stage2` remains false by default (a policy may opt
+in) while the campaign thresholds await an owner decision. See the Stage 2
+README's validation status and real-host runbook.

@@ -51,13 +51,27 @@ class AgentAttemptRestarted(Record):
 
 class RunnerFinished(Record):
     """status(task_id) reached `sealed` or `ended_unsealed` (09 §8).  A
-    Stage 1 run seals at most one bundle."""
+    Stage 1 run seals at most one bundle.  For a Stage 2 gate or campaign
+    task `bundle_refs` is the task's whole bundle list, in order."""
 
     type: Literal["runner_finished"] = "runner_finished"
     task_id: str
     state: Literal["sealed", "ended_unsealed"]
     bundle_ref: str | None = None
     reason: str | None = None
+    bundle_refs: tuple[str, ...] = ()
+
+
+class RunnerBundleSealed(Record):
+    """status(task_id) lists a bundle the job has not taken yet, of a task
+    that seals bundles while it runs (a campaign task, 09 §8).  `index` is
+    its position in the task's list; bundles are taken in order, each
+    once, also after the job stopped taking the task's result."""
+
+    type: Literal["runner_bundle_sealed"] = "runner_bundle_sealed"
+    task_id: str
+    index: int
+    bundle_ref: str
 
 
 class RunnerInputDigestMigrated(Record):
@@ -137,7 +151,11 @@ class PolicyChanged(Record):
 
 class OperatorAction(Record):
     type: Literal["operator"] = "operator"
-    action: Literal["resume", "close", "cancel"]
+    #: start_stage2 is the 09 §4 "Stage 2 start by operator" on s1_reached;
+    #: route_gate / route_strategy are 09 §5 route(to) on
+    #: blocked_operator(gate_regression).
+    action: Literal["resume", "close", "cancel", "start_stage2",
+                    "route_gate", "route_strategy"]
     action_id: str
 
 
@@ -162,8 +180,9 @@ class CleanupUnconfirmed(Record):
 
 Event = Annotated[
     Union[IntakeChecked, AgentSucceeded, AgentFailed, AgentAttemptRestarted,
-          RunnerFinished, RunnerInputDigestMigrated, ApprovalGiven,
-          ApprovalDenied, IssueChanged, BindingChanged, JudgeVersionsChanged,
+          RunnerFinished, RunnerBundleSealed, RunnerInputDigestMigrated,
+          ApprovalGiven, ApprovalDenied, IssueChanged, BindingChanged,
+          JudgeVersionsChanged,
           PolicyChanged, OperatorAction, CancelConfirmed,
           CleanupUnconfirmed],
     Field(discriminator="type"),

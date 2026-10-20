@@ -51,7 +51,7 @@ DRIVER = r"""
 /* The executor's two sides: the program process (a thread here) asks over
  * its pair, the fork server (main) brokers the barrier on the endpoint.
  *
- * argv: SOCKET RULE_SET_ID TIMEOUT_MS.  stdin, one command per line:
+ * argv: SOCKET RULE_SET_ID PROGRAM_TIMEOUT_MS.  stdin, one command per line:
  *   activate GEN PROGRAM_HEX   the program asks for its window
  *   release                    DONE if it ran; the fork server then closes
  *                              the window (the executor first stops the
@@ -104,7 +104,7 @@ int main(int argc, char **argv)
 	if (!nfsp_act_valid_rule_set_id(argv[2], strlen(argv[2])))
 		return 5;
 	memcpy(ep.rule_set_id, argv[2], NFSP_ACT_RULE_SET_ID_LEN);
-	ep.timeout_ms = strtoull(argv[3], NULL, 10);
+	ep.timeout_ms = nfsp_act_timeout_ms(strtoull(argv[3], NULL, 10));
 	while (fgets(line, sizeof(line), stdin)) {
 		if (sscanf(line, "activate %llu %4095s", &gen, hex) == 2) {
 			size_t n = strlen(hex) / 2;
@@ -179,9 +179,10 @@ def driver(tmp_path_factory) -> Path:
 class Executor:
     """The driver, connected to `live`'s activation endpoint like an executor."""
 
-    def __init__(self, binary: Path, live: Live, timeout_ms: int = 2000) -> None:
+    def __init__(self, binary: Path, live: Live, program_timeout_ms: int = 5000) -> None:
         self.proc = subprocess.Popen(
-            [str(binary), str(live.activation_path), live.rule_set_id, str(timeout_ms)],
+            [str(binary), str(live.activation_path), live.rule_set_id,
+             str(program_timeout_ms)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 
     def run(self, command: str) -> dict[str, str]:
@@ -294,13 +295,55 @@ class _StallsOpen(HostJournal):
         return super().submit(channel, raw)
 
 
+class _DelaysFirstOpen(HostJournal):
+    """A sink whose first durable OPEN takes longer than the old 500ms bound."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.delayed = False
+
+    def submit(self, channel, raw):  # type: ignore[override]
+        if parse_request(raw).event_type == "GENERATION_OPEN" and not self.delayed:
+            self.delayed = True
+            time.sleep(0.7)
+        return super().submit(channel, raw)
+
+
+def test_durable_open_over_the_old_bound_keeps_the_lane_usable(
+        proxy_binary, driver, tmp_path):
+    """The default 5s program budget gives the host barrier 2s.  A valid
+    durable ACK after 700ms must open normally instead of racing an ABORT and
+    quarantining the next generation."""
+    journal = _journal(tmp_path, cls=_DelaysFirstOpen)
+    live = Live(proxy_binary, tmp_path, journal)
+    executor = Executor(driver, live)
+    try:
+        got = executor.activate(7, b"delayed durable open")
+        assert got["activation"] == f"{ACKED}/0" and got["lease"] == str(HELD)
+        assert executor.release() == {"deactivation": f"{ACKED}/0", "lease": str(CLEAR)}
+
+        got = executor.activate(8, b"next program")
+        assert got["activation"] == f"{ACKED}/0" and got["lease"] == str(HELD)
+        assert executor.release() == {"deactivation": f"{ACKED}/0", "lease": str(CLEAR)}
+        executor.close()
+        _stop(live)
+    finally:
+        if executor.proc.poll() is None:
+            executor.proc.kill()
+        if live.proc.poll() is None:
+            live.proc.kill()
+    summaries = [e.request.payload for e in journal.events(SESSION)
+                 if e.request.event_type == "GENERATION_COMPLETE"]
+    assert [summary.closure.reason for summary in summaries] == ["drained", "drained"]
+
+
 def test_lost_activation_ack_ends_in_an_uncleared_lane(proxy_binary, driver, tmp_path):
     """No ACK is not "not active": the executor aborts, the Proxy quarantines
     the session, and the next program finds the lane unusable -- the runner's
     cue to recreate it instead of running programs outside their window."""
     journal = _journal(tmp_path, cls=_StallsOpen)
     live = Live(proxy_binary, tmp_path, journal)
-    executor = Executor(driver, live, timeout_ms=300)
+    executor = Executor(driver, live, program_timeout_ms=750)
     try:
         got = executor.activate(7, b"program")
         assert got["ok"] == "0" and got["activation"] == f"{NO_ANSWER}/{0xffffffff}"

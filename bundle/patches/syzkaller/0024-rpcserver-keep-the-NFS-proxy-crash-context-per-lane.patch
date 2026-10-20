@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: idealinsane <idealinsane@localhost>
+Date: Sat, 17 Oct 2026 18:23:46 +0000
+Subject: [PATCH] rpcserver: keep the NFS proxy crash context per lane
+
+knfsd-syzkaller S1c: a crash in an NFS lane may depend on mutations the
+proxy applied to earlier programs of the same lane, because the lane's
+knfsd state (clients, sessions, open and lock state) survives between
+programs.  The Runner replays the lane's recent programs in order and
+joins each one to its MutationDelta on the host journal, by the lane
+and the KCOV generation the activation barrier was keyed to.
+
+LastExecuting now keeps, for every record:
+
+- Lane: the proc the program was started on.  Hanged() replaces Proc
+  with a synthetic value so pkg/repro keeps hung programs, which loses
+  the lane; Lane keeps it.
+- NfsProxy: the activation barrier the executor reported in ProgInfo
+  (0023), attached when the program's result arrives.  A program still
+  running at the crash has none; its generation is the next one its
+  lane opened on the host journal.
+
+The crash log prints both on one extra line after the program header,
+only for records that have a barrier or a rewritten Proc:
+
+  nfs-proxy: lane=L generation=G program_digest=HEX activation=Acked/0 ...
+
+prog.ParseLog skips the line and none of its keys contains "id=", so
+pkg/repro reads the same entries as before; logs without NFS proxy
+records are unchanged.
+
+The window bound is job policy; the ring that backs it holds
+experimental.nfs_proxy_window programs per proc (1-64, never fewer than
+the previous 6).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013uedukxZ18By3FSydgpCRs
+---
+ pkg/mgrconfig/config.go                |  4 ++
+ pkg/rpcserver/last_executing.go        | 77 ++++++++++++++++++++--
+ pkg/rpcserver/last_executing_test.go   | 36 +++++------
+ pkg/rpcserver/nfs_proxy_window_test.go | 89 ++++++++++++++++++++++++++
+ pkg/rpcserver/rpcserver.go             | 14 +++-
+ pkg/rpcserver/runner.go                | 14 +++-
+ 6 files changed, 209 insertions(+), 25 deletions(-)
+ create mode 100644 pkg/rpcserver/nfs_proxy_window_test.go
+
+diff --git a/pkg/mgrconfig/config.go b/pkg/mgrconfig/config.go
+index 2bc36f517..00557c06a 100644
+--- a/pkg/mgrconfig/config.go
++++ b/pkg/mgrconfig/config.go
+@@ -262,6 +262,10 @@ type Experimental struct {
+ 
+ 	// Enable dynamic discovery and fuzzing of KFuzzTest targets.
+ 	EnableKFuzzTest bool `json:"enable_kfuzztest"`
++
++	// Programs kept per proc for the crash log, at least this many (1-64; default 6).
++	// knfsd-syzkaller: the bound of the NFS proxy CrashContextWindow may not exceed it.
++	NfsProxyWindow int `json:"nfs_proxy_window"`
+ }
+ 
+ type FocusArea struct {
+diff --git a/pkg/rpcserver/last_executing.go b/pkg/rpcserver/last_executing.go
+index 296bc2709..0ed975a8c 100644
+--- a/pkg/rpcserver/last_executing.go
++++ b/pkg/rpcserver/last_executing.go
+@@ -10,10 +10,18 @@ import (
+ 	"slices"
+ 	"time"
+ 
++	"github.com/google/syzkaller/pkg/flatrpc"
+ 	"github.com/google/syzkaller/pkg/report"
+ 	"github.com/google/syzkaller/prog"
+ )
+ 
++const (
++	// DefaultLastExecuting programs are kept per proc unless the NFS proxy
++	// CrashContextWindow needs more (mgrconfig experimental.nfs_proxy_window).
++	DefaultLastExecuting = 6
++	MaxLastExecuting     = 64
++)
++
+ // LastExecuting keeps the given number of last executed programs
+ // for each proc in a VM, and allows to query this set after a crash.
+ type LastExecuting struct {
+@@ -28,6 +36,15 @@ type ExecRecord struct {
+ 	Proc int
+ 	Prog []byte
+ 	Time time.Duration
++	// Lane is the proc the program was started on.  Hanged replaces Proc
++	// with a synthetic value; the proc's NFS lane (and with it the lane's
++	// knfsd state a crash may depend on) is the one the program ran in.
++	Lane int
++	// NfsProxy is the NFS proxy activation barrier the executor reported
++	// for this program's KCOV generation (knfsd-syzkaller S1a), when the
++	// program finished.  A program still running at a crash has none: its
++	// generation is the next one its lane opened on the host journal.
++	NfsProxy *flatrpc.NfsProxyActivation
+ }
+ 
+ func MakeLastExecuting(procs, count int) *LastExecuting {
+@@ -46,6 +63,7 @@ func (last *LastExecuting) Note(id, proc int, progData []byte, now time.Duration
+ 		Proc: proc,
+ 		Prog: progData,
+ 		Time: now,
++		Lane: proc,
+ 	}
+ 	*pos++
+ 	if *pos == last.count {
+@@ -53,15 +71,39 @@ func (last *LastExecuting) Note(id, proc int, progData []byte, now time.Duration
+ 	}
+ }
+ 
++// Finished attaches the NFS proxy barrier of a finished program to its
++// record, if the record is still in its proc's ring.
++func (last *LastExecuting) Finished(id, proc int, nfsProxy *flatrpc.NfsProxyActivation) {
++	if nfsProxy == nil || proc < 0 || proc >= len(last.positions) {
++		return
++	}
++	for i := proc * last.count; i < (proc+1)*last.count; i++ {
++		if rec := &last.procs[i]; rec.ID == id && rec.Lane == proc && rec.Prog != nil {
++			clone := *nfsProxy
++			clone.ProgramDigest = slices.Clone(nfsProxy.ProgramDigest)
++			rec.NfsProxy = &clone
++			return
++		}
++	}
++}
++
+ // Hanged notes a hung program.
+-func (last *LastExecuting) Hanged(id, proc int, progData []byte, now time.Duration) {
++func (last *LastExecuting) Hanged(id, proc int, progData []byte, now time.Duration,
++	nfsProxy *flatrpc.NfsProxyActivation) {
++	if nfsProxy != nil {
++		clone := *nfsProxy
++		clone.ProgramDigest = slices.Clone(nfsProxy.ProgramDigest)
++		nfsProxy = &clone
++	}
+ 	last.hanged = append(last.hanged, ExecRecord{
+ 		ID: id,
+ 		// Use unique proc for these programs b/c pkg/repro will either use the program with matching ID,
+ 		// of take the last program from each proc, and we want the hanged programs to be included.
+-		Proc: prog.MaxPids + len(last.hanged),
+-		Prog: progData,
+-		Time: now,
++		Proc:     prog.MaxPids + len(last.hanged),
++		Prog:     progData,
++		Time:     now,
++		Lane:     proc,
++		NfsProxy: nfsProxy,
+ 	})
+ }
+ 
+@@ -91,7 +133,11 @@ func PrependExecuting(rep *report.Report, lastExec []ExecRecord) {
+ 	buf := new(bytes.Buffer)
+ 	fmt.Fprintf(buf, "last executing test programs:\n\n")
+ 	for _, exec := range lastExec {
+-		fmt.Fprintf(buf, "%v ago: executing program %v (id=%v):\n%s\n", exec.Time, exec.Proc, exec.ID, exec.Prog)
++		fmt.Fprintf(buf, "%v ago: executing program %v (id=%v):\n", exec.Time, exec.Proc, exec.ID)
++		if line := NfsProxyContextLine(exec); line != "" {
++			fmt.Fprintf(buf, "%s\n", line)
++		}
++		fmt.Fprintf(buf, "%s\n", exec.Prog)
+ 	}
+ 	fmt.Fprintf(buf, "kernel console output (not intermixed with test programs):\n\n")
+ 	rep.Output = append(buf.Bytes(), rep.Output...)
+@@ -100,3 +146,24 @@ func PrependExecuting(rep *report.Report, lastExec []ExecRecord) {
+ 	rep.EndPos += n
+ 	rep.SkipPos += n
+ }
++
++// NfsProxyContextLine describes the CrashContextWindow facts of one record
++// (knfsd-syzkaller S1c): the lane it ran in and, once it finished, the NFS
++// proxy barrier of its KCOV generation.  The Runner joins a crash's window
++// to the host journal with these values.  Records with neither (no NFS
++// proxy, and a lane equal to the printed proc) print nothing, so other
++// crash logs are unchanged.  The line is not a program: prog.ParseLog skips
++// it, and none of its keys contains "id=".
++func NfsProxyContextLine(exec ExecRecord) string {
++	if exec.NfsProxy == nil {
++		if exec.Lane == exec.Proc {
++			return ""
++		}
++		return fmt.Sprintf("nfs-proxy: lane=%d", exec.Lane)
++	}
++	b := exec.NfsProxy
++	return fmt.Sprintf("nfs-proxy: lane=%d generation=%d program_digest=%x"+
++		" activation=%s/%d deactivation=%s/%d executed=%v lease_cleared=%v",
++		exec.Lane, b.Generation, b.ProgramDigest, b.Activation, b.ActivationStatus,
++		b.Deactivation, b.DeactivationStatus, b.Executed, b.LeaseCleared)
++}
+diff --git a/pkg/rpcserver/last_executing_test.go b/pkg/rpcserver/last_executing_test.go
+index 4384e9a2b..1f5abeb03 100644
+--- a/pkg/rpcserver/last_executing_test.go
++++ b/pkg/rpcserver/last_executing_test.go
+@@ -36,22 +36,22 @@ func TestLastExecuting(t *testing.T) {
+ 	last.Note(13, 8, []byte("prog13"), 13)
+ 
+ 	assert.Equal(t, last.Collect(), []ExecRecord{
+-		{ID: 1, Proc: 0, Prog: []byte("prog1"), Time: 12},
++		{ID: 1, Proc: 0, Prog: []byte("prog1"), Time: 12, Lane: 0},
+ 
+-		{ID: 2, Proc: 1, Prog: []byte("prog2"), Time: 11},
+-		{ID: 3, Proc: 1, Prog: []byte("prog3"), Time: 10},
++		{ID: 2, Proc: 1, Prog: []byte("prog2"), Time: 11, Lane: 1},
++		{ID: 3, Proc: 1, Prog: []byte("prog3"), Time: 10, Lane: 1},
+ 
+-		{ID: 4, Proc: 3, Prog: []byte("prog4"), Time: 9},
+-		{ID: 5, Proc: 3, Prog: []byte("prog5"), Time: 8},
+-		{ID: 6, Proc: 3, Prog: []byte("prog6"), Time: 7},
++		{ID: 4, Proc: 3, Prog: []byte("prog4"), Time: 9, Lane: 3},
++		{ID: 5, Proc: 3, Prog: []byte("prog5"), Time: 8, Lane: 3},
++		{ID: 6, Proc: 3, Prog: []byte("prog6"), Time: 7, Lane: 3},
+ 
+-		{ID: 9, Proc: 7, Prog: []byte("prog9"), Time: 4},
+-		{ID: 10, Proc: 7, Prog: []byte("prog10"), Time: 3},
+-		{ID: 11, Proc: 7, Prog: []byte("prog11"), Time: 2},
++		{ID: 9, Proc: 7, Prog: []byte("prog9"), Time: 4, Lane: 7},
++		{ID: 10, Proc: 7, Prog: []byte("prog10"), Time: 3, Lane: 7},
++		{ID: 11, Proc: 7, Prog: []byte("prog11"), Time: 2, Lane: 7},
+ 
+-		{ID: 12, Proc: 9, Prog: []byte("prog12"), Time: 1},
++		{ID: 12, Proc: 9, Prog: []byte("prog12"), Time: 1, Lane: 9},
+ 
+-		{ID: 13, Proc: 8, Prog: []byte("prog13"), Time: 0},
++		{ID: 13, Proc: 8, Prog: []byte("prog13"), Time: 0, Lane: 8},
+ 	})
+ }
+ 
+@@ -59,20 +59,20 @@ func TestLastExecutingHanged(t *testing.T) {
+ 	last := MakeLastExecuting(1, 3)
+ 	last.Note(1, 0, []byte("prog1"), 10)
+ 	last.Note(2, 0, []byte("prog2"), 20)
+-	last.Hanged(2, 0, []byte("prog2"), 25)
++	last.Hanged(2, 0, []byte("prog2"), 25, nil)
+ 	last.Note(3, 0, []byte("prog3"), 30)
+ 	last.Note(4, 0, []byte("prog4"), 40)
+ 	last.Note(5, 0, []byte("prog5"), 50)
+-	last.Hanged(5, 0, []byte("prog5"), 55)
++	last.Hanged(5, 0, []byte("prog5"), 55, nil)
+ 	last.Note(6, 0, []byte("prog6"), 60)
+ 	last.Note(7, 0, []byte("prog7"), 70)
+ 	last.Note(8, 0, []byte("prog8"), 80)
+ 	last.Note(9, 0, []byte("prog9"), 90)
+ 	assert.Equal(t, last.Collect(), []ExecRecord{
+-		{ID: 2, Proc: 32, Prog: []byte("prog2"), Time: 65},
+-		{ID: 5, Proc: 33, Prog: []byte("prog5"), Time: 35},
+-		{ID: 7, Proc: 0, Prog: []byte("prog7"), Time: 20},
+-		{ID: 8, Proc: 0, Prog: []byte("prog8"), Time: 10},
+-		{ID: 9, Proc: 0, Prog: []byte("prog9"), Time: 0},
++		{ID: 2, Proc: 32, Prog: []byte("prog2"), Time: 65, Lane: 0},
++		{ID: 5, Proc: 33, Prog: []byte("prog5"), Time: 35, Lane: 0},
++		{ID: 7, Proc: 0, Prog: []byte("prog7"), Time: 20, Lane: 0},
++		{ID: 8, Proc: 0, Prog: []byte("prog8"), Time: 10, Lane: 0},
++		{ID: 9, Proc: 0, Prog: []byte("prog9"), Time: 0, Lane: 0},
+ 	})
+ }
+diff --git a/pkg/rpcserver/nfs_proxy_window_test.go b/pkg/rpcserver/nfs_proxy_window_test.go
+new file mode 100644
+index 000000000..f5971b28f
+--- /dev/null
++++ b/pkg/rpcserver/nfs_proxy_window_test.go
+@@ -0,0 +1,89 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package rpcserver
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/google/syzkaller/pkg/flatrpc"
++	"github.com/google/syzkaller/pkg/report"
++	"github.com/google/syzkaller/prog"
++	_ "github.com/google/syzkaller/sys"
++	"github.com/google/syzkaller/sys/targets"
++	"github.com/stretchr/testify/assert"
++)
++
++func barrier(generation uint64) *flatrpc.NfsProxyActivation {
++	return &flatrpc.NfsProxyActivation{
++		Generation:    generation,
++		ProgramDigest: []byte{0xab, 0xcd},
++		Activation:    flatrpc.NfsProxyBarrierRawAcked,
++		Deactivation:  flatrpc.NfsProxyBarrierRawAcked,
++		Executed:      true,
++		LeaseCleared:  true,
++	}
++}
++
++// A finished program keeps its barrier; the one still running at the crash
++// has none, and a hung one keeps its lane although Proc is rewritten.
++func TestLastExecutingNfsProxyWindow(t *testing.T) {
++	last := MakeLastExecuting(prog.MaxPids, 3)
++	last.Note(1, 2, []byte("prog1"), 10)
++	b := barrier(7)
++	last.Finished(1, 2, b)
++	b.ProgramDigest[0] = 0           // the record holds its own copy
++	last.Finished(1, 3, barrier(99)) // another proc's id is not this record
++	last.Note(2, 2, []byte("prog2"), 20)
++	last.Hanged(2, 2, []byte("prog2"), 25, barrier(8))
++	last.Note(3, 2, []byte("prog3"), 30)
++	last.Finished(4, 2, barrier(9)) // not in the ring: ignored
++	records := last.Collect()
++	assert.Len(t, records, 4)
++	assert.Equal(t, 2, records[0].Lane)
++	assert.Equal(t, uint64(7), records[0].NfsProxy.Generation)
++	assert.Equal(t, []byte{0xab, 0xcd}, records[0].NfsProxy.ProgramDigest)
++	assert.Nil(t, records[1].NfsProxy) // prog2 as started; its result never came
++	assert.Equal(t, prog.MaxPids, records[2].Proc)
++	assert.Equal(t, 2, records[2].Lane)
++	assert.Equal(t, uint64(8), records[2].NfsProxy.Generation)
++	assert.Equal(t, 3, records[3].ID)
++	assert.Nil(t, records[3].NfsProxy)
++}
++
++func TestNfsProxyContextLine(t *testing.T) {
++	assert.Equal(t, "", NfsProxyContextLine(ExecRecord{Proc: 1, Lane: 1}))
++	assert.Equal(t, "nfs-proxy: lane=1", NfsProxyContextLine(ExecRecord{Proc: 33, Lane: 1}))
++	assert.Equal(t, "nfs-proxy: lane=1 generation=7 program_digest=abcd"+
++		" activation=Acked/0 deactivation=Acked/0 executed=true lease_cleared=true",
++		NfsProxyContextLine(ExecRecord{Proc: 1, Lane: 1, NfsProxy: barrier(7)}))
++	assert.NotContains(t, NfsProxyContextLine(ExecRecord{Lane: 1, NfsProxy: barrier(7)}), "id=")
++}
++
++// The context lines do not change what pkg/repro reads back from a crash log.
++func TestPrependExecutingKeepsParseLog(t *testing.T) {
++	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
++	if err != nil {
++		t.Fatal(err)
++	}
++	progs := []string{"getpid()\n", "getuid()\n", "gettid()\n"}
++	records := []ExecRecord{
++		{ID: 5, Proc: 1, Lane: 1, Prog: []byte(progs[0]), NfsProxy: barrier(3)},
++		{ID: 6, Proc: 32, Lane: 1, Prog: []byte(progs[1]), NfsProxy: barrier(4)},
++		{ID: 7, Proc: 1, Lane: 1, Prog: []byte(progs[2])},
++	}
++	rep := &report.Report{Output: []byte("crash\n")}
++	PrependExecuting(rep, records)
++	out := string(rep.Output)
++	assert.Contains(t, out, "executing program 1 (id=5):\nnfs-proxy: lane=1 generation=3 ")
++	assert.Contains(t, out, "executing program 32 (id=6):\nnfs-proxy: lane=1 generation=4 ")
++	assert.Contains(t, out, "executing program 1 (id=7):\ngettid()\n")
++	entries := target.ParseLog(rep.Output, prog.NonStrict)
++	assert.Len(t, entries, 3)
++	for i, ent := range entries {
++		assert.Equal(t, records[i].ID, ent.ID)
++		assert.Equal(t, records[i].Proc, ent.Proc)
++		assert.Equal(t, strings.TrimSpace(progs[i]), strings.TrimSpace(string(ent.P.Serialize())))
++	}
++}
+diff --git a/pkg/rpcserver/rpcserver.go b/pkg/rpcserver/rpcserver.go
+index cc9d2e6fa..4f7f5ea62 100644
+--- a/pkg/rpcserver/rpcserver.go
++++ b/pkg/rpcserver/rpcserver.go
+@@ -6,6 +6,7 @@ package rpcserver
+ 
+ import (
+ 	"bytes"
++	"cmp"
+ 	"context"
+ 	"errors"
+ 	"fmt"
+@@ -70,6 +71,9 @@ type Config struct {
+ 	PrintMachineCheck bool
+ 	// Abort early on syz-executor not replying to requests and print extra debugging information.
+ 	DebugTimeouts bool
++	// Programs kept per proc for the crash log (and the NFS proxy
++	// CrashContextWindow, whose job-policy bound may not exceed it).
++	LastExecuting int
+ 	Procs         int
+ 	Slowdown      int
+ 	ExecutorBin   string
+@@ -178,6 +182,13 @@ func New(cfg *RemoteConfig) (Server, error) {
+ 	if !cfg.MemoryDump {
+ 		features &= ^flatrpc.FeatureMemoryDump
+ 	}
++	lastExecuting := DefaultLastExecuting
++	if cfg.Experimental.NfsProxyWindow != 0 {
++		if cfg.Experimental.NfsProxyWindow < 0 || cfg.Experimental.NfsProxyWindow > MaxLastExecuting {
++			return nil, fmt.Errorf("experimental.nfs_proxy_window must be in [1, %v]", MaxLastExecuting)
++		}
++		lastExecuting = max(lastExecuting, cfg.Experimental.NfsProxyWindow)
++	}
+ 	return newImpl(&Config{
+ 		Config: vminfo.Config{
+ 			Target:     cfg.Target,
+@@ -200,6 +211,7 @@ func New(cfg *RemoteConfig) (Server, error) {
+ 		FilterSignal:      cfg.Type != targets.GVisor && cfg.Type != targets.Starnix,
+ 		PrintMachineCheck: true,
+ 		DebugTimeouts:     cfg.Debug,
++		LastExecuting:     lastExecuting,
+ 		Procs:             cfg.Procs,
+ 		Slowdown:          cfg.Timeouts.Slowdown,
+ 		ExecutorBin:       cfg.ExecutorBin,
+@@ -580,7 +592,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo Updat
+ 		executing:     make(map[int64]bool),
+ 		hanged:        make(map[int64]bool),
+ 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
+-		lastExec: MakeLastExecuting(prog.MaxPids, 6),
++		lastExec: MakeLastExecuting(prog.MaxPids, cmp.Or(serv.cfg.LastExecuting, DefaultLastExecuting)),
+ 		stats:    serv.runnerStats,
+ 		procs:    serv.cfg.Procs,
+ 		updInfo:  updInfo,
+diff --git a/pkg/rpcserver/runner.go b/pkg/rpcserver/runner.go
+index 5f80d5d01..01f4809dd 100644
+--- a/pkg/rpcserver/runner.go
++++ b/pkg/rpcserver/runner.go
+@@ -469,6 +469,9 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
+ 			addFallbackSignal(req.Prog, msg.Info)
+ 		}
+ 	}
++	if req.Type == flatrpc.RequestTypeProgram && !msg.Hanged {
++		runner.lastExec.Finished(int(msg.Id), int(msg.Proc), nfsProxyOf(msg.Info))
++	}
+ 	status := queue.Success
+ 	var resErr error
+ 	if msg.Error != "" {
+@@ -478,7 +481,8 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
+ 		status = queue.Hanged
+ 		if req.Type == flatrpc.RequestTypeProgram {
+ 			// We only track the latest executed programs.
+-			runner.lastExec.Hanged(int(msg.Id), int(msg.Proc), req.Prog.Serialize(), osutil.MonotonicNano())
++			runner.lastExec.Hanged(int(msg.Id), int(msg.Proc), req.Prog.Serialize(), osutil.MonotonicNano(),
++				nfsProxyOf(msg.Info))
+ 		}
+ 		runner.hanged[msg.Id] = true
+ 	}
+@@ -598,6 +602,7 @@ func (runner *Runner) Shutdown(crashed bool, extraExecs ...report.ExecutorInfo)
+ 				ID:   info.ExecID,
+ 				Proc: info.ProcID,
+ 				Prog: req.Prog.Serialize(),
++				Lane: info.ProcID,
+ 			})
+ 		}
+ 	}
+@@ -661,3 +666,10 @@ func addFallbackSignal(p *prog.Prog, info *flatrpc.ProgInfo) {
+ 		info.Calls[i].Signal = inf.Signal
+ 	}
+ }
++
++func nfsProxyOf(info *flatrpc.ProgInfo) *flatrpc.NfsProxyActivation {
++	if info == nil {
++		return nil
++	}
++	return info.NfsProxy
++}
+-- 
+2.43.0
+

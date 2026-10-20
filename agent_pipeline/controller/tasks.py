@@ -10,7 +10,10 @@ from typing import Literal, Protocol
 from ..contracts import (AgentModelPolicy, AgentTask, Record,
                          VulnerabilityCandidate)
 from ..data import canonical_json
-from .records import RepairInput
+# RunnerInput lives with the job records, which store a Stage 2 task's
+# input; it stays importable from here, where the task contract is.
+from .records import (STAGE2_STEPS, RepairInput,  # noqa: F401
+                      RunnerInput, Stage2Input)
 
 #: A Runner final reason: the lease ended while the backend could not
 #: confirm its execution stopped (09 §8).  Neither a confirmed cancel nor a
@@ -24,12 +27,6 @@ class RunnerStatus(Record):
     state: Literal["unknown", "running", "sealed", "ended_unsealed"]
     reason: str | None = None
     bundles: tuple[str, ...] = ()
-
-
-class RunnerInput(Record):
-    job_id: str
-    harness_ref: str
-    execution_harness_id: str
 
 
 def runner_input_digest(task_input: RunnerInput) -> str:
@@ -64,11 +61,15 @@ def agent_input_payload(*, agent_task: AgentTask,
                         analysis_ref: str | None,
                         plan_ref: str | None,
                         repair: RepairInput | None,
-                        include_model_policy: bool = True) -> dict:
+                        include_model_policy: bool = True,
+                        stage2_input: Stage2Input | None = None,
+                        rule_set_ref: str | None = None) -> dict:
     """Canonical logical Agent input, including the selected model policy.
 
     ``include_model_policy=False`` exists only to authenticate tasks written
-    before model policy was part of the durable input contract.
+    before model policy was part of the durable input contract.  Only a
+    Mutation Strategy input carries the Stage 2 keys, so a Stage 1 digest
+    keeps its encoding.
     """
 
     payload = {
@@ -80,6 +81,13 @@ def agent_input_payload(*, agent_task: AgentTask,
         AgentTask.REACHABILITY_PLANNING else None,
         "repair": repair.model_dump(mode="json") if repair else None,
     }
+    if agent_task is AgentTask.MUTATION_STRATEGY:
+        if stage2_input is None:
+            raise ValueError("Mutation Strategy requires a Stage2Input")
+        payload["stage2_input"] = stage2_input.model_dump(mode="json")
+        payload["rule_set_ref"] = rule_set_ref
+    elif stage2_input is not None or rule_set_ref is not None:
+        raise ValueError(f"{agent_task.value} takes no Stage 2 input")
     if include_model_policy:
         payload["model_policy"] = model_policy.model_dump(mode="json")
     return payload
@@ -132,6 +140,10 @@ class AgentRequest(Record):
     analysis_ref: str | None = None
     plan_ref: str | None = None
     repair: RepairInput | None = None
+    #: Mutation Strategy only: the Q1 package (01 §5.1) and, in a repair,
+    #: the rule set it replaces.
+    stage2_input: Stage2Input | None = None
+    rule_set_ref: str | None = None
 
 
 class AgentExecutor(Protocol):

@@ -253,7 +253,8 @@ fatal sanitizer report로 VM이 죽은 generation은 FINISH 전에 끝나 remote
 
 **baseline-with-rules gate.** fuzz campaign 전에 Stage 1 시나리오를 rule set을 설치한 상태로 실행한다.
 같은 조건의 neutral program도 실행한다(아래 ambient control).
-반복 횟수는 job policy가 정한다.
+반복 횟수는 job policy가 정한다. 여러 번 반복하면 반복마다 아래 표를 적용하고, 가장 위의 행을 gate 결과로 한다
+(`09` §4).
 
 | Q1 (target mode/rules) | rule별 M1 | 경로 |
 |---|---|---|
@@ -1162,3 +1163,6 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
     기록했다(PydanticAI). agent/tool definitions는 첫 Stage 1 구현에서 정한다
 14. Runner task 실행 — Controller task 계약([`09`](09-job-state-graph.md) §8)의 Runner 쪽 구현. task·cancel 기록의
     durable 저장, Runner 재시작 뒤 실행 복원, campaign evidence의 봉인 단위
+    (구현 기본값, 2026-10-18: host command가 끝낸 segment 하나, 곧 fuzz VM instance의 실행 구간 하나가 bundle
+    하나다. `agent_pipeline/stage2/README.md`. PR #61에서 gate, bounded campaign, replay의 standalone host 경로를
+    실제 KVM으로 확인했다. live Agent와 실제 candidate가 Controller부터 이 경로 전체를 지난 검증은 #57 범위다.)

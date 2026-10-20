@@ -3,7 +3,9 @@
  * This is a single-threaded component for the proxy event loop.  It owns one
  * immutable rule_set_id for one proxy session, admits CALL records only while
  * one generation is active, and keeps deactivated generations eligible for
- * their transaction-correlated REPLY records until closure.
+ * their transaction-correlated REPLY records until closure.  Closed detail is
+ * retained until its owner confirms that the terminal summary is durable and
+ * explicitly retires it.
  *
  * The gate callback is named a test gate because a component test can
  * answer it directly; such an ACCEPTED models a host acknowledgement and has
@@ -224,6 +226,10 @@ struct nfsp_activation {
 	struct nfsp_activation_barrier pending_barrier;
 	uint64_t next_barrier_id;
 	uint64_t next_call_ticket_id;
+	/* Highest generation whose closed detail was durably retired.  The
+	 * kernel source allocates generation ids monotonically, so this bounded
+	 * watermark rejects every stale/reused id without retaining tombstones. */
+	uint64_t retired_generation_high_water;
 	char rule_set_id[NFSP_ACTIVATION_RULE_SET_ID_MAX + 1u];
 	int rule_set_installed;
 	int legacy_active;
@@ -300,6 +306,15 @@ enum nfsp_activation_result
 nfsp_activation_force_close(struct nfsp_activation *activation,
 			    uint64_t generation,
 			    enum nfsp_activation_force_reason reason);
+
+/* Release one CLOSED generation's bounded in-memory slot.  The caller must
+ * invoke this only after the generation's terminal summary has reached its
+ * external durability point.  A live, draining, or barrier-pending generation
+ * is never retired.  Retired ids remain fail-closed for ACTIVATE through the
+ * monotonic watermark; late DEACTIVATE/ABORT operations remain idempotent. */
+enum nfsp_activation_result
+nfsp_activation_retire_generation(struct nfsp_activation *activation,
+				  uint64_t generation);
 
 /* Generation snapshots are sorted by generation id, independent of internal
  * allocation and reply order.  If capacity is short, no generation element

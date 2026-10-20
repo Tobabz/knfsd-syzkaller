@@ -109,6 +109,13 @@ class Stage1AgentPolicy(Record):
         AgentModelPolicy(provider="openai", model="gpt-5"))
 
 
+class Stage2AgentPolicy(Record):
+    """Model policy of the Stage 2 Agent Task (08 §1)."""
+
+    mutation_strategy: AgentModelPolicy = Field(default_factory=lambda:
+        AgentModelPolicy(provider="openai", model="gpt-5"))
+
+
 class JobPolicy(Record):
     """01 §11.1, 09 §6.  Limits count retries: how many times the counted
     thing may happen after the first try.  With a limit of 1 one repair runs
@@ -116,19 +123,42 @@ class JobPolicy(Record):
 
     Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
     Agent retries, three Runner reruns, no human approval before a run.
-    run_stage2 becomes true by default once Stage 2 is implemented; until
-    then it only accepts false."""
+    run_stage2 becomes true by default once Stage 2 is implemented.  The
+    backend, judges and real-KVM host paths for gate, campaign and replay are
+    in.  A provider-backed real candidate has not yet traversed the complete
+    service path, however, and the campaign thresholds below are still
+    placeholders.  It therefore stays false by default: a policy may opt in,
+    and otherwise an operator starts Stage 2 of a reached job.  The Stage 2
+    repair budget follows the Stage 1 default."""
 
     policy_id: str
     sanitizer: Sanitizer
     approval_required: bool = False
-    # Stage 2 is not implemented yet (decision record, decision 1); a
-    # REACHED job waits in s1_reached (09 rationale 11).
-    run_stage2: Literal[False] = False
+    # False: a REACHED job waits in s1_reached (09 rationale 11).  True on
+    # a host without a Stage 2 backend leaves the job in
+    # blocked_operator(stage2_gate_unavailable) after compiling.
+    run_stage2: bool = False
     stage1_agents: Stage1AgentPolicy = Field(default_factory=Stage1AgentPolicy)
+    stage2_agents: Stage2AgentPolicy = Field(default_factory=Stage2AgentPolicy)
     stage1_repair_budget: int = Field(default=3, ge=1)
+    stage2_repair_budget: int = Field(default=3, ge=1)
     agent_retry_limit: int = Field(default=3, ge=1)
     runtime_retry_limit: int = Field(default=3, ge=1)
+    # Stage 2 execution policy (01 §3, §11.1, §12).  The values are not
+    # owner decisions; they only bound the loop until someone sets them.
+    #: Repetitions of the baseline-with-rules gate in one gate task.
+    gate_repetitions: int = Field(default=1, ge=1)
+    #: Reached generations with no hypothesis APPLIED after which the
+    #: campaign goes back to Mutation Strategy (campaign_not_applied).
+    campaign_not_applied_generations: int = Field(default=1000, ge=1)
+    #: Reached generations with a hypothesis APPLIED, and no APPLIED crash
+    #: in the campaign, after which it is refined (campaign_no_signal).
+    campaign_no_signal_generations: int = Field(default=10000, ge=1)
+    #: Reached generations whose hypothesis M1 is INCONCLUSIVE after which
+    #: the evidence path goes to an operator (evidence_path).
+    campaign_inconclusive_generations: int = Field(default=100, ge=1)
+    #: Program executions a campaign may run before an operator decides.
+    fuzz_budget_executions: int = Field(default=100000, ge=1)
 
 
 # ---------------------------------------------------------------- binding
@@ -207,6 +237,7 @@ class JudgeVersions(Record):
 class AgentTask(str, enum.Enum):
     CANDIDATE_ANALYSIS = "candidate_analysis"
     REACHABILITY_PLANNING = "reachability_planning"
+    MUTATION_STRATEGY = "mutation_strategy"
 
 
 class AnalysisOutput(Record):
@@ -221,6 +252,13 @@ class PlanOutput(Record):
 
     variant: Literal["plan"] = "plan"
     plan_ref: Sha256
+
+
+class RuleSetOutput(Record):
+    """08 §5, a MutationRuleSet stored as an artifact."""
+
+    variant: Literal["rule_set"] = "rule_set"
+    rule_set_ref: Sha256
 
 
 class UnsupportedOutput(Record):
@@ -241,7 +279,8 @@ class ReanalysisRequired(Record):
 
 
 AgentOutput = Annotated[
-    Union[AnalysisOutput, PlanOutput, UnsupportedOutput, ReanalysisRequired],
+    Union[AnalysisOutput, PlanOutput, RuleSetOutput, UnsupportedOutput,
+          ReanalysisRequired],
     Field(discriminator="variant"),
 ]
 
@@ -251,6 +290,7 @@ TASK_VARIANTS = {
     AgentTask.CANDIDATE_ANALYSIS: {"analysis"},
     AgentTask.REACHABILITY_PLANNING: {"plan", "unsupported",
                                       "reanalysis_required"},
+    AgentTask.MUTATION_STRATEGY: {"rule_set", "unsupported"},
 }
 
 
@@ -317,3 +357,112 @@ class MaterializeRejected(Record):
     detail: str = ""
     profile: str | None = None
 
+
+
+# ---------------------------------------------------------------- Stage 2
+
+#: Mutation Rule Compiler refusals (08 §12).  The Agent can fix these.
+COMPILER_AGENT_FIXABLE = frozenset({
+    "unknown_path", "type_mismatch", "message_type_inconsistent",
+    "selector_mismatch", "missing_required_field"})
+#: Schema-valid, but the runtime cannot do it: a mutation_engine gap.
+COMPILER_GAP = frozenset({"unsupported_capability", "requires_state_lineage"})
+
+
+class CompiledRuleSet(Record):
+    """08 §12: the CompiledMutationRule[] artifact of one rule set."""
+
+    rule_set_ref: Sha256
+    compiled_ref: Sha256
+    hcap_revision: str
+
+
+class CompileRejected(Record):
+    """08 §12: a typed refusal.  ``reason`` stays a string so a value 08
+    does not name reaches the Controller and routes to unexpected_event.
+    A gap reason names the HCAP vocabulary id it lacks."""
+
+    reason: str
+    intent_id: str | None = None
+    detail: str = ""
+    missing_capability_id: str | None = None
+
+
+# ---------------------------------------------------------------- Stage 2
+# execution verdicts.  Statuses stay strings, like Q1Result.reason: a value
+# the contracts do not name reaches the Controller and routes to
+# unexpected_event (09 §2) instead of failing to parse.
+
+M1_STATUSES = frozenset({"applied", "not_applied", "inconclusive"})
+Q2_STATUSES = frozenset({"observed", "not_observed", "inconclusive"})
+REPLAY_STATUSES = frozenset({"replay_equivalent", "replay_diverged",
+                             "replay_inconclusive", "replay_invalid"})
+#: The replay bundle failed manifest or correlation checks: no comparison
+#: verdict is made from it (01 §11.1, 03-nfs-proxy/05 §29).
+REPLAY_EVIDENCE_REJECTED = "evidence_rejected"
+
+
+class RuleM1(Record):
+    """01 §7.1, one rule in one gate execution."""
+
+    rule_id: str
+    intent_id: str
+    status: str
+
+
+class IntentM1(Record):
+    """01 §7.1 intent aggregate.  ``targets_baseline_traffic`` comes from
+    the MutationRuleSet the Judge read (08 §16)."""
+
+    intent_id: str
+    status: str
+    targets_baseline_traffic: bool
+
+
+class GateRun(Record):
+    """One judged repetition of the baseline-with-rules gate (01 §3): the
+    Stage 1 scenario with the rule set installed, and its neutral run.
+
+    ``ambient`` holds the control flags (``q1_preservation_unverifiable``,
+    ``ambient_applied:<rule>``, ``ambient_control_unavailable``).  They are
+    recorded and never change the route."""
+
+    bundle_ref: str
+    q1: Q1Result
+    m1_verdict_id: str
+    rules: tuple[RuleM1, ...]
+    intents: tuple[IntentM1, ...]
+    ambient: tuple[str, ...] = ()
+
+
+class CampaignSegment(Record):
+    """One sealed campaign bundle (a fuzz VM instance's execution span),
+    judged (01 §3, §8.2, §12).
+
+    The generation counts are over generations whose Stage 2 Q1 was
+    REACHED: ``hypothesis_applied`` counts those where some hypothesis was
+    APPLIED, ``hypothesis_not_applied`` those where every hypothesis was
+    NOT_APPLIED, and ``hypothesis_inconclusive`` the rest.
+    ``crash_window_applied`` names the rules APPLIED in the
+    CrashContextWindow of an observed signal (01 §8.1)."""
+
+    bundle_ref: str
+    q2_verdict_id: str
+    q2_status: str
+    q2_reason: str | None = None
+    m1_verdict_id: str
+    crash_window_applied: tuple[str, ...] = ()
+    executions: int = Field(ge=0)
+    reached_generations: int = Field(ge=0)
+    hypothesis_applied: int = Field(ge=0)
+    hypothesis_not_applied: int = Field(ge=0)
+    hypothesis_inconclusive: int = Field(ge=0)
+
+
+class ReplayOutcome(Record):
+    """The replay comparator's verdict on a sealed replay bundle
+    (03-nfs-proxy/05 §29), or ``evidence_rejected``."""
+
+    verdict_id: str
+    status: str
+    reason: str | None = None

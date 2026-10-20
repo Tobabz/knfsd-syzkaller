@@ -108,6 +108,16 @@ class CompletionReceipt(HostRecord):
         return self
 
 
+class SealedBundleFact(HostRecord):
+    """One bundle a task's lease sealed while it ran, in task order."""
+
+    task_id: Identifier
+    index: int = Field(ge=0)
+    generation: int = Field(ge=1, le=2**63 - 1)
+    bundle_ref: Digest
+    sealed_at_ns: Timestamp
+
+
 class RecoverableTask(HostRecord):
     """A deterministic view of work that can be claimed now."""
 

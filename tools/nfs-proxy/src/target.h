@@ -92,6 +92,41 @@ struct nfsp_target_stats {
 
 struct nfsp_target;
 
+/* Semantic replay's compatibility gate (design 05 §26, §39): load a
+ * recorded rule set exactly as nfsp_target_open would, against these
+ * schemas, and print one line to out:
+ *
+ *   rules ok rule_set_id=HEX semantic_runtime_version=N schema_id=S rules=N
+ *   rules refused rule_set_id=HEX status=STATUS [rule=N] [predicate=N]
+ *
+ * STATUS is nfsp_rule_strstatus.  Nothing is served or recorded.  The
+ * Runner runs this before a replay, so a recorded set this runtime cannot
+ * run becomes REPLAY_INVALID with the runtime's own reason, never a remap.
+ * 0 when accepted, -1 when refused. */
+int nfsp_target_check_rules(const uint8_t *rule_set, size_t len,
+			    const struct nfsp_schema_family *const *families,
+			    size_t nfamilies, FILE *out);
+
+/* M7 (design 06 §21, §30; HCAP 04 §4): the semantic capability registry
+ * this build implements, as one line of canonical JSON on out.  It names
+ * every ProtocolSchema here and, in the rule vocabulary, every mutation
+ * kind, part, transform, structure policy, value source and comparison
+ * nfsp_ruleset_validate accepts, plus the constraints between them.  What
+ * it lists is implemented, not promoted: only the host's promotion gate
+ * makes a subset of it usable.  0, or -1 when out fails. */
+int nfsp_target_capability_registry(
+	const struct nfsp_schema_family *const *families, size_t nfamilies,
+	FILE *out);
+
+/* Load a rule set as nfsp_target_check_rules does and, when accepted,
+ * describe each rule on one line of canonical JSON in the registry's
+ * vocabulary, so the promotion gate classifies evidence with this
+ * runtime's own parser.  A refusal prints the check_rules line.  0 when
+ * accepted, -1 when refused or out fails. */
+int nfsp_target_describe_rules(const uint8_t *rule_set, size_t len,
+			       const struct nfsp_schema_family *const *families,
+			       size_t nfamilies, FILE *out);
+
 /* 0, or -1 with a message in err. */
 int nfsp_target_open(struct nfsp_target **out,
 		     const struct nfsp_target_cfg *cfg, char *err,

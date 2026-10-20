@@ -5,7 +5,9 @@ import contextlib
 import hashlib
 import json
 import io
+import os
 import runpy
+import socket
 import subprocess
 import sys
 import tarfile
@@ -83,6 +85,60 @@ with tempfile.TemporaryDirectory() as directory:
                    capture_output=True)
     prepared = json.loads(live.read_text())
     lane_bytes = (ROOT / "bundle/lane/lane.sh").read_bytes()
+    lane_text = lane_bytes.decode()
+    assert 'test -s "$status_lane_root/server/lifecycle.pid"' in lane_text
+    assert ('pid_in_named_netns "$status_lifecycle_pid" '
+            '"$status_server_ns"') in lane_text
+    assert "lifecycle admin process identity mismatch" in lane_text
+    assert 'pid_owns_unix_socket "$status_lifecycle_pid"' in lane_text
+    assert "lifecycle admin does not own its socket" in lane_text
+    assert 'server/lifecycle.starttime' in lane_text
+
+    # Exercise the exact shell ownership helper when the environment permits
+    # AF_UNIX binds. A stale pathname and a socket owned by another live PID
+    # must not satisfy the expected broker PID.
+    function_start = lane_text.index("pid_owns_unix_socket()\n{")
+    function_end = lane_text.index("\n}\n", function_start) + 3
+    owner_function = lane_text[function_start:function_end]
+
+    def owns_socket(pid, path):
+        script = owner_function + '\npid_owns_unix_socket "$1" "$2"\n'
+        return subprocess.run(
+            ["sh", "-c", script, "socket-owner-test", str(pid), str(path)],
+            capture_output=True).returncode == 0
+
+    owned_path = work / "owned.sock"
+    owned = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        owned.bind(str(owned_path))
+    except PermissionError:
+        owned.close()
+    else:
+        owned.listen(1)
+        assert owns_socket(os.getpid(), owned_path)
+
+        stale_path = work / "stale.sock"
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        stale.bind(str(stale_path))
+        stale.close()
+        assert not owns_socket(os.getpid(), stale_path)
+
+        foreign_path = work / "foreign.sock"
+        holder = subprocess.Popen(
+            [sys.executable, "-u", "-c",
+             "import socket,sys,time; "
+             "s=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET); "
+             "s.bind(sys.argv[1]); s.listen(1); print('ready'); time.sleep(30)",
+             str(foreign_path)], stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "ready"
+            assert not owns_socket(os.getpid(), foreign_path)
+            assert owns_socket(holder.pid, foreign_path)
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
+            owned.close()
+
     lane_sha = hashlib.sha256(lane_bytes).hexdigest()
     assert (Path(prepared["workdir_template"]) / "lane.sh").read_bytes() == lane_bytes
     assert "path={{TEMPLATE}}" in prepared["vm"]["qemu_args"]
@@ -327,8 +383,8 @@ assert manifest["purpose"] == "mutation_seed"
 assert Path(ROOT / manifest["required_syzkaller_patch"]).is_file()
 assert Path(ROOT / manifest["required_syzkaller_validator_patch"]).is_file()
 syzkaller_patches = sorted((ROOT / "bundle/patches/syzkaller").glob("*.patch"))
-assert len(syzkaller_patches) == 23
-assert syzkaller_patches[-1].name.startswith("0023-")
+assert len(syzkaller_patches) == 27
+assert syzkaller_patches[-1].name.startswith("0027-")
 programs = {entry["path"]: entry for entry in manifest["programs"]}
 assert len(programs) == len(manifest["programs"]) == 12
 for entry in manifest["programs"]:

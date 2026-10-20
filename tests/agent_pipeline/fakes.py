@@ -14,7 +14,10 @@ from pathlib import Path
 
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.components import InMemoryIssues, InMemoryRegistry
-from agent_pipeline.contracts import (AnalysisOutput, CandidateSubmission,
+from agent_pipeline.contracts import (AnalysisOutput, CampaignSegment,
+                                      CandidateSubmission, CompileRejected,
+                                      CompiledRuleSet, GateRun, IntentM1,
+                                      ReplayOutcome, RuleM1,
                                       GapRef, HarnessBinding, HcapCheck,
                                       JobPolicy, JudgeVersions,
                                       LocationKind, LocationRequest,
@@ -169,6 +172,77 @@ class FakeJudge:
         return (bundle_ref, versions.judge_profile_id) not in self.missing
 
 
+class FakeCompiler:
+    """Mutation Rule Compiler: a pure function of the rule set, harness and
+    binding.  A refusal is registered per (rule set, HCAP revision), as a
+    promotion changes the HCAP revision."""
+
+    def __init__(self) -> None:
+        self.refusals: dict[tuple[str, str], CompileRejected] = {}
+        self.calls: list[tuple[str, str, str]] = []
+
+    def compile(self, rule_set_ref, harness_ref, binding):
+        self.calls.append((rule_set_ref, harness_ref, binding.hcap_revision))
+        r = self.refusals.get((rule_set_ref, binding.hcap_revision))
+        if r is not None:
+            return r
+        return CompiledRuleSet(
+            rule_set_ref=rule_set_ref,
+            compiled_ref=sha("compiled", rule_set_ref, harness_ref,
+                             binding.hcap_revision),
+            hcap_revision=binding.hcap_revision)
+
+
+class FakeStage2:
+    """Stage2Judge over registered bundles: a pure function of the bundle,
+    like the real judges.  Unregistered bundles do not match their task."""
+
+    def __init__(self) -> None:
+        self.gates: dict[str, dict] = {}
+        self.segments: dict[str, dict] = {}
+        self.replays: dict[str, tuple[str, str | None]] = {}
+        #: Bundles whose verdict wrongly names another bundle.
+        self.misnamed: dict[str, str] = {}
+
+    def matches_execution(self, bundle_ref, *, job_id, task_id) -> bool:
+        return bundle_ref in self.gates or bundle_ref in self.segments or \
+            bundle_ref in self.replays
+
+    def judge_gate(self, bundle_ref, *, plan_ref, candidate_id, compiled,
+                   versions) -> GateRun:
+        g = self.gates[bundle_ref]
+        q1 = Q1Result(
+            verdict_id=f"q1-{bundle_ref}-{versions.judge_profile_id}",
+            candidate_id=g["candidate_id"],
+            execution_harness_id=g["harness_id"],
+            judge_profile_id=versions.judge_profile_id,
+            support_boundary_id=versions.support_boundary_id,
+            evidence_manifest_sha256=sha("manifest", bundle_ref),
+            status=g["status"], reason=g["reason"], gap_signal=g["gap"])
+        return GateRun(
+            bundle_ref=self.misnamed.get(bundle_ref, bundle_ref), q1=q1, m1_verdict_id=f"m1-{bundle_ref}",
+            rules=tuple(RuleM1(rule_id=f"r{n:03d}", intent_id=i, status=st)
+                        for n, (i, st, _) in enumerate(g["intents"])),
+            intents=tuple(IntentM1(intent_id=i, status=st,
+                                   targets_baseline_traffic=base)
+                          for i, st, base in g["intents"]),
+            ambient=g["ambient"])
+
+    def judge_campaign(self, bundle_ref, *, candidate_id,
+                       compiled) -> CampaignSegment:
+        return CampaignSegment(bundle_ref=self.misnamed.get(bundle_ref,
+                                                            bundle_ref),
+                               q2_verdict_id=f"q2-{bundle_ref}",
+                               m1_verdict_id=f"m1-{bundle_ref}",
+                               **self.segments[bundle_ref])
+
+    def judge_replay(self, bundle_ref, *, crash_bundle_ref,
+                     compiled) -> ReplayOutcome:
+        status, reason = self.replays[bundle_ref]
+        return ReplayOutcome(verdict_id=f"replay-{bundle_ref}",
+                             status=status, reason=reason)
+
+
 class FakeRunner:
     """09 §8.  A task runs until finish(); cancel() of a task in
     `slow_cancel` does not end it until a later cancel()."""
@@ -239,6 +313,10 @@ class FakeRunner:
             raise OSError("synthetic acknowledgement failure")
         self.late_reports.discard((task_id, generation))
 
+    def seal(self, task_id: str, bundle: str) -> None:
+        """A running task seals a bundle and keeps running (a campaign)."""
+        self.tasks[task_id]["bundles"].append(bundle)
+
     def finish(self, task_id: str, bundle: str | None = None,
                reason: str | None = None) -> None:
         t = self.tasks[task_id]
@@ -294,6 +372,10 @@ class World:
         self.judge = FakeJudge()
         self.runner = FakeRunner()
         self.agents = FakeAgents()
+        #: None: no Mutation Rule Compiler is configured.
+        self.compiler: FakeCompiler | None = None
+        #: None: no Stage 2 execution backend is configured.
+        self.stage2: FakeStage2 | None = None
         self.issues = InMemoryIssues()
         self.registry = InMemoryRegistry()
         if bound:
@@ -311,7 +393,8 @@ class World:
 
     def _controller(self) -> Controller:
         env = Env(policy=self.store.policy, hcap=self.hcap,
-                  materializer=self.materializer, judge=self.judge)
+                  materializer=self.materializer, judge=self.judge,
+                  compiler=self.compiler, stage2=self.stage2)
         return Controller(self.store, env, self.runner, self.agents,
                           self.issues, self.registry, self.tree,
                           self.artifacts, VERSIONS,

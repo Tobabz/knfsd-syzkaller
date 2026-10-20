@@ -1,6 +1,6 @@
 # NFS Proxy Target-vs-Current Implementation Gap Analysis
 
-> 상태: draft · 최종 확인: 2026-10-14
+> 상태: draft · 최종 확인: 2026-10-17
 > 기준: kernel v7.3-rc5 / syzkaller 801f0966669a37e048adabf9e5f38ce52825ea82
 > 대상 구현: `tools/nfs-proxy`
 > 상위 설계: `01-architecture.md`
@@ -11,7 +11,8 @@
 > 구현 갱신(2026-10-14): 아래 요약·Gap Matrix와 §3-§22의 `Current`/`Gap` 서술은
 > 별도 구현 갱신 문단이 없는 한 구현 시작 시점의 baseline이다. 현재 상태는 §24-§27을 따른다.
 > M1/M3, M2의 NFSv4·NFSv3 schema, M4a-M4d component까지 구현됐다.
-> live `main`/relay 및 S1a 연결, M5-M7은 아직 남아 있다.
+> M5/S1a/S1b는 §28, M6/S1c의 host 구현은 §29와 §34 S1c, M7 promotion gate는 §30을 따른다. guest replay 실행과
+> 그것으로 하는 첫 subset promotion은 남아 있다.
 
 ## 요약
 
@@ -1025,6 +1026,35 @@ Required:
 
 Legacy NFSPDLT1/2 replay는 compatibility path로 계속 regression test한다.
 
+구현 상태(2026-10-17, issue #48): M6는 host에서 production → replay → 판정까지 연결됐다.
+
+- semantic Delta reader(`agent_pipeline/semantic_delta.py`): 봉인된 host journal을 읽기 전용으로 열고, 완전한
+  frame을 sink의 admission 규칙으로 다시 검증한다. segment별 torn tail은 커밋되지 않은 꼬리로 보고하고, 완전한
+  frame의 손상이나 재검증 실패는 journal 전체를 거부한다(`05` §24). segment digest가 immutability 검사의 기준이다.
+- recorded rule set 등록과 호환성 gate: replay는 production session에 설치됐던 NFSPRUL1 bytes를 그대로 쓴다.
+  `nfs-proxy --check-rules`가 replay할 runtime에서 그 bytes를 `--target`과 같은 경로로 load해 받아들일지 말한다.
+  거부(`unknown_schema`, `unsupported_version`, `unsupported_capability`, `malformed` 등)는 `REPLAY_INVALID`다.
+- 별도 replay journal: replay는 다른 host journal에 새 Proxy session으로 기록한다. 실행 경로는 target mode 그대로이며
+  replay 전용 byte engine은 없다. `judge`는 production journal manifest가 plan 때와 같지 않으면 거부한다.
+- 순서 있는 window 실행(S1c): `agent_pipeline/replay_runner.py`가 crash log에서 window를 만들고(§34 S1c), 각 entry를
+  production generation에 join하고, `rules.bin`과 window 순서의 `programs.log`를 만든다. guest에서는
+  `syz-execprog -procs=1 -repeat=1`이 한 lane에서 순서대로 실행한다.
+- comparator(`agent_pipeline/semantic_replay.py`): 위치별 batch-signature multiset, JudgeProfile(Replay) v1 분류,
+  refusal evidence 완전성(`complete`/`prefix_complete`/`unknown`), `05` §29 판정 순서. 검증되지 않았거나 상관관계가
+  맞지 않거나 내부 불일치인 evidence에는 verdict를 내지 않는다(row 1). window entry의 MutationDelta가 없거나 replay가
+  그 위치까지 가지 못하면 `REPLAY_INCONCLUSIVE`이며 짧은 비교로 대신하지 않는다. delivery 차이는 verdict에 쓰지 않는다.
+- 검증: comparator 단위 test(`05` 오라클 §3-§6, §12, §20의 판정 규칙), crash-log parser test, 그리고
+  `tests/agent_pipeline/test_semantic_replay_live.py`(빌드한 Proxy와 실제 sink로 production 두 generation(두 번째는
+  crash cut)을 만든 뒤, plan이 읽은 recorded bytes로 replay: 다른 generation 번호와 다른 dynamic 값에서
+  `REPLAY_EQUIVALENT`(오라클 §1), extra match와 replay 쪽 hard refusal은 `REPLAY_DIVERGED`, replay가 window 끝 전에
+  끊기면 `REPLAY_INCONCLUSIVE`, 호환되지 않는 recorded set은 `REPLAY_INVALID`, production journal bytes 불변(§13),
+  torn tail과 중간 손상(§11, §12)).
+
+남은 것: guest에서 실제 executor와 knfsd로 window를 replay하는 KVM 실행(사람이 KVM host에서 한다,
+`tools/nfs-proxy/README.md` "Semantic replay"), Controller의 replay evidence 봉인·manifest 검증과
+`CrashEvidence.replay result` 연결, replay lane 선택을 job policy로 고정하는 일. M6 replay limits는 window 64,
+위치당 batch 4096이다.
+
 ### 30. M7 — Guest/runtime validation / capability promotion
 
 Host unit tests만으로 target semantic capability를 current HCAP으로 올리지 않는다. M4/S1a의 test double 결과도
@@ -1042,6 +1072,37 @@ semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능�
 
 Validation evidence를 HCAP `evidence_refs`에 추가하고 subset의 registry digest와 scope를 promotion한 뒤에만
 Harness Capability Specification을 갱신한다(§21).
+
+구현 상태(2026-10-17, issue #51): gate는 host에 있고, promotion된 subset은 아직 없다.
+
+- build registry: `nfs-proxy --capability-registry`가 그 build가 구현한 범위(ProtocolSchema id, mutation kind,
+  WireRef part, transform, structure policy, ValueRef source, predicate operator, 그 사이 제약과 limit)를 canonical
+  JSON으로 낸다. registry digest와 guest Proxy binary의 SHA-256이 build identity다. `nfs-proxy --describe-rules`는
+  받아들인 NFSPRUL1 set의 각 rule을 같은 어휘로 기술하므로 gate는 runtime 자신의 parser로 evidence를 분류한다.
+- subset: scope label 하나와 차원별 허용 값 집합(`agent_pipeline/semantic_promotion.py` `SemanticSubset`).
+- gate(`promote`): subset이 registry 안에 있고, 같은 binary의 KVM validation run이 subset의 모든 원소를 덮을 때만
+  promotion한다. run은 sealed judge input을 다시 판정한 `ReplayResult`가 `REPLAY_EQUIVALENT`이고, production이 guest
+  crash로 끝나 crash cut 위치의 MutationDelta가 남았고(semantic Delta crash survival), rule set의 모든 rule이 subset
+  안일 때 센다. 원소는 그것을 쓰는 rule의 batch가 같은 window 위치에서 production과 replay 모두 FORWARD_COMPLETE일
+  때 덮인다. dynamic-original replay는 그런 rule이 같은 위치에서 production에 없던 original value만 replay에서
+  바꿨을 때만 덮인다(`record`가 두 journal의 EXPOSURE_INTENT `original_value` digest를 기록한다). 위 검증 항목은
+  subset 내용에서 정해진다(request/response mutation, dynamic value, `S2C` CALL이면
+  backchannel, preserve/raw, 그리고 항상 crash survival과 dynamic-original replay). host test와 test double 결과는
+  run으로 기록하지 않는다. run이 KVM guest에서 왔다는 것은 기록하는 operator의 진술이다.
+- 결과: `PromotedSemanticCapabilityRegistry`(registry, build identity, subset별 evidence)와, 그것을
+  `authority_refs`로 참조하는 HCAP-10(`usable_by: [agent_stage2]`, `validated_subset`, scope = promoted subset id)을
+  가진 새 HCAP revision. Agent scope는 그 HCAP-10 entry(`agent_stage2`, validated)가 참조하는 registry의
+  `validated_scope` 안 subset뿐이며, catalog의 다른 곳에 있는 registry digest는 scope가 아니다. 다른 build는
+  처음부터 다시 promotion한다. Agent는 `lookup_semantic_scope` 도구로 pin된
+  revision의 subset을 읽고, `rule_set_scope`는 Compiler가 MutationRuleSet이 맞는 subset을 고르게 한다. 맞는 subset이
+  없으면 gap id는 `semantic_mutation.unpromoted`다.
+- 검증: `tests/agent_pipeline/test_semantic_promotion.py`(빌드한 Proxy의 registry가 rule validation과 일치하는지,
+  M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI).
+
+남은 것: subset마다 KVM에서 production crash window와 replay를 실행하고 `semantic_promotion record`/`promote`로
+promotion하는 일(사람이 한다, `tools/nfs-proxy/README.md` "Capability registry and promotion"). Mutation Rule
+Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
+한 subset에 맞는지 확인한다(`../02-llm-agent/08-mutation-rule-set.md` §12 "구현").
 
 ### 31. Compatibility / cutover strategy
 
@@ -1135,6 +1196,14 @@ syzkaller patch series와 Runner에 속한다.
   `Hanged()`가 `ExecRecord.Proc`를 synthetic 값으로 바꾸므로 lane을 그 필드에서 유도하지 않는다.
 - window bound는 job policy로 명시하고 evidence에 기록한다. window는 VM instance를 넘지 않는다.
 - replay는 window의 program을 순서대로 실행한다.
+
+구현 상태(2026-10-17, issue #48): syzkaller patch 0024가 `ExecRecord`에 `Lane`(시작한 proc, `Hanged()` 뒤에도 유지)과
+`NfsProxy`(결과가 오면 붙는 0023의 barrier)를 더하고, crash log의 각 program header 다음에
+`nfs-proxy: lane=L generation=G program_digest=HEX ...` 줄을 쓴다. `prog.ParseLog`는 이 줄을 건너뛰므로 pkg/repro가
+읽는 entry는 그대로다. ring 크기는 `experimental.nfs_proxy_window`(기본 6, 최대 64)이고 job policy의 bound는 그보다
+클 수 없다. MutationDelta 참조는 ring에 두지 않고 Runner가 (VM, lane, generation, program digest)로 host journal에서
+찾는다. crash 때 실행 중이던 program은 barrier가 없으므로 그 lane이 journal에 마지막으로 연 generation과 순서로
+맞춘다. 맞출 수 없으면 비워 두고 추측하지 않는다.
 
 S1 변경은 syzkaller patch family로 들어가며 AGENTS.md의 pseudo-syscall/executor 규칙(executor,
 `pkg/vminfo`, syzlang, test를 한 patch family로 조정하고 `series`를 갱신)을 따른다.
@@ -1342,7 +1411,7 @@ Host tests 뒤 실제 lane/guest에서 semantic request/response mutation과 rep
 - **결정됨:** M1 판정 계약은 M4/M5의 선행 조건이며 `../02-llm-agent/01-two-stage-agent-architecture.md`
   §7에 고정됐다(issue #4).
 - **부분 해결:** NFSv4 ProtocolSchema source/artifact path는 고정됐다. NFSv3 source는 남았다.
-- **부분 해결:** M1-M4 source/API 이름은 고정됐다. M5-M6 source/API는 남았다.
+- **해결:** M1-M6 source/API 이름은 고정됐다(M5 §28, M6 §29).
 - **해결:** semantic rule serialization은 canonical binary `NFSPRUL1`로 고정됐다.
 - **부분 해결:** host framing `NFSPJNL1`과 ACK envelope은 `05` §45에 고정했다.
   bounded codec/prefix reader는 구현됐으며 event payload encoding/admission, durable sink와 transport는 남았다.
@@ -1350,7 +1419,7 @@ Host tests 뒤 실제 lane/guest에서 semantic request/response mutation과 rep
 - **부분 해결:** initial NFSv4.0/4.1/4.2 component subset은 고정됐다. NFSv3와 promotion
   subset은 남았다.
 - **부분 해결:** context/rules/resolved-edit/activation 및 journal frame/segment limits는 고정됐다.
-  M5 session 전체 저장량·회전과 M6 replay limits는 남았다.
+  M5 session 전체 저장량·회전은 남았다. M6 replay limits는 §29에 고정했다.
 - **미결:** v4.0 separate callback routing을 initial implementation에 포함할지 별도 milestone로 둘지.
 - **미결:** guest-to-host journal transport, rule set 설치 경로, activation 메시지 형식.
 - **미검증:** current source refactor 후 syz-manager workload performance.

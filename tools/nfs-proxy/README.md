@@ -230,11 +230,12 @@ format in [04 §35](../../docs/design/03-nfs-proxy/04-semantic-mutation-runtime.
   claiming a resolved REPLY. Other missing replies block normal closure and require an explicit
   `reply_unresolved` or `aborted` forced-closure reason, which freezes the unresolved count.
 - Generation snapshots are sorted by id and retain barrier, admission, reply and closure facts
-  for future `GENERATION_COMPLETE` input. Defaults are 256 generation ids retained for the
-  session, 16 simultaneous draining generations and 64 pending CALL-account tickets;
-  configuration may lower these or raise either lifetime ids or pending tickets to 4096, with
-  `max_draining <= max_generations`. Exhaustion refuses the operation rather than recycling a
-  generation or ticket id.
+  until target mode receives the durable `GENERATION_COMPLETE` ACK. It then retires the closed
+  detail while keeping a monotonic high-watermark, so stale generation ids still cannot reopen.
+  Defaults allow 256 simultaneously resident generation slots, 16 simultaneous draining
+  generations and 64 pending CALL-account tickets; configuration may lower these or raise either
+  resident generations or pending tickets to 4096, with `max_draining <= max_generations`.
+  Exhaustion refuses the operation rather than recycling a live generation or ticket id.
 - On its own the test gate satisfies none of the durability requirements. Target mode (next
   section) replaces it with the host sink and connects these components to `main`/`proxy`.
 
@@ -279,10 +280,11 @@ Run the same command again after a restart: it resumes the recovered session (an
 retransmitted event without storing it twice), and refuses to start if the binding, lane or rule
 set differ.
 
-`--fsync` makes every stored entry durable before the sink answers. An activation ACK then waits
-on that fsync, and the executor gives a barrier only `syscall_timeout_ms * 10`. On the #45 KVM run a
-slow fsync made the generation 186 open ACK miss that bound: the lane was quarantined and the VM
-restarted. Leave `--fsync` off for fuzzing unless the host's storage answers well inside the bound.
+`--fsync` makes every stored entry durable before the sink answers. An activation ACK therefore
+waits on that fsync. The executor reserves 2/5 of the scaled program timeout for each barrier
+(2 seconds with syzkaller's default 5-second program timeout), below the fork-server watchdog's
+initial 3/5 grace period. If storage does not answer inside that bound, the executor aborts the
+uncertain generation and the Proxy quarantines the session so the VM recreates the lane.
 
 `tests/agent_pipeline/test_journal_live.py` runs the built Proxy (with ASan when the compiler has
 it) against this sink on loopback; `tools/nfs-proxy/build.sh` covers `test_journal` and the relay
@@ -352,9 +354,11 @@ it as `nfs proxy barrier: ...`.
 Each Proxy start uses a new session `PREFIX.<random UUID>`, where `PREFIX` is
 `TARGET/laneN.session`. The host sink is started for that series (`--session-prefix`). It installs
 each new session, with the binding fixed on its command line, when that session's `RULESET`
-arrives, and ends the series' earlier session (`superseded`). A Proxy session has 256 generation
-slots; a full session is treated like a quarantine, and the restarted VM continues in a fresh
-session.
+arrives, and ends the series' earlier session (`superseded`). A Proxy session has 256 resident
+generation slots. A closed slot is reclaimed only after the host durably ACKs its
+`GENERATION_COMPLETE`; the monotonic retired-id watermark still rejects stale activation. If all
+slots are concurrently occupied, the executor treats the capacity refusal like quarantine and
+the restarted VM continues in a fresh session.
 
 To boot a target-mode lane (KVM host, by hand):
 
@@ -373,6 +377,138 @@ tools/prepare-live-lane-config.py ... \
 `koov.nfs_target=1`. The ports' reconnect option follows the QEMU version, read from `vm.qemu`
 (default `qemu-system-x86_64`) `--version`: `reconnect-ms=1000` from 9.2 on, `reconnect=1`
 before. Pass `--qemu-version X.Y` when the preparing host cannot run that QEMU.
+
+## Semantic replay (M6, S1c)
+
+[06 §29, §34 S1c](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+verdict rules in [05 §25-§39](../../docs/design/03-nfs-proxy/05-mutation-delta-replay.md).
+
+Replay is target mode again, with the rule set read back from the production journal, a separate
+host journal and the crash's window of programs run in order. There is no replay-only mutation
+path: the same Decoder, Transaction Context, Resolver and Edit Applier run, and every replay
+mutation is written ahead to the replay journal like in production.
+
+```sh
+nfs-proxy --check-rules RULES.nfsprul1
+# rules ok rule_set_id=HEX semantic_runtime_version=1 schema_id=nfs4.1/sha256:... rules=2
+# rules refused rule_set_id=HEX status=unknown_schema        (exit 3)
+```
+
+`--check-rules` loads a rule set exactly as `--target` would and serves nothing. The Runner asks
+the Proxy that will replay before it starts: a refusal makes the replay `REPLAY_INVALID`
+(`unknown_schema` is `schema_unavailable`, `unsupported_version` is `runtime_incompatible`,
+`unsupported_capability` is `transform_unsupported`), never a remap.
+
+Syzkaller patch 0024 keeps, for every program in the crash log's "last executing test programs",
+the lane it ran in and, once it finished, its barrier:
+
+```text
+1.2s ago: executing program 0 (id=10):
+nfs-proxy: lane=0 generation=186 program_digest=HEX activation=Acked/0 deactivation=Acked/0 executed=true lease_cleared=true
+```
+
+The ring behind it holds `experimental.nfs_proxy_window` programs per proc (default 6, at most 64);
+the window bound is job policy and may not exceed it. The program still running at the crash has
+no barrier line: its generation is the next one its lane opened on the journal.
+
+**KVM step (by hand).** After a crash in a target-mode lane:
+
+```sh
+python -m agent_pipeline.replay_runner plan --journal-dir JOURNAL_DIR --journal-name lane0 \
+    --vm vm-0 --crash-log CRASH_LOG --bound 4 --proxy GUEST_OR_HOST_PROXY --out REPLAY
+```
+
+writes `REPLAY/rules.bin` (the recorded bytes), `REPLAY/programs.log` (the window, in order) and
+`REPLAY/plan.json`, and prints the gate's line. Boot a fresh VM with a sink on a *different*
+journal directory, installed with `REPLAY/rules.bin` for the replay lane, and run
+`syz-execprog -procs=1 -repeat=1 ... REPLAY/programs.log` in that lane, keeping its output. Then:
+
+```sh
+python -m agent_pipeline.replay_runner judge --plan REPLAY/plan.json \
+    --journal-dir JOURNAL_DIR --replay-dir REPLAY_JOURNAL_DIR --replay-name lane0 \
+    --replay-vm vm-1 --replay-lane 0 --execprog-output EXECPROG_OUT \
+    --proxy GUEST_OR_HOST_PROXY --production-end guest_crash --replay-end guest_crash
+```
+
+prints the `ReplayResult`. The production journal is only read; `judge` refuses it if it changed
+since the plan. `tests/agent_pipeline/test_semantic_replay_live.py` runs plan, replay and judge
+against the built Proxy and the real sink on the host.
+
+## Capability registry and promotion (M7)
+
+[06 §21, §30](../../docs/design/03-nfs-proxy/06-implementation-gap-analysis.md),
+[HCAP 04 §4](../../docs/design/02-llm-agent/04-harness-capability-spec.md).
+
+```sh
+nfs-proxy --capability-registry          # one line of canonical JSON
+nfs-proxy --describe-rules RULES.nfsprul1  # each rule in the same vocabulary (exit 3 when refused)
+```
+
+The registry is what this build implements: its ProtocolSchema ids, and the mutation kinds, parts,
+transforms, structure policies, value sources and comparisons `src/rule.c` accepts, with the
+constraints between them. Implemented is not usable. The Agent uses only a *promoted* subset, and
+`agent_pipeline/semantic_promotion.py` promotes a subset only when KVM validation runs on the same
+Proxy binary cover every element of it:
+
+- the run's `ReplayResult` is `REPLAY_EQUIVALENT` and is the judgment of its own sealed input;
+- production ended in a guest crash and the crash-cut position's MutationDelta was read back;
+- every rule of the run's rule set is inside the subset, and an element counts once a rule using it
+  completed forwarding in production and in replay at the same window position;
+- dynamic-original replay counts only when such a rule replaced, at one position, original values in
+  replay that production never had (`record` reads them from both journals): replay the window on
+  other dynamic state, not a copy of production's;
+- the 06 §30 items the subset calls for are covered (request or response mutation, dynamic value,
+  backchannel, preserve or raw, plus crash survival and replay always).
+
+The gate writes a `PromotedSemanticCapabilityRegistry` and a new HCAP revision whose `HCAP-10` entry
+(`usable_by: [agent_stage2]`) references it by digest. Only that entry makes the registry Agent scope,
+and only for the subsets in its `validated_scope`; a registry digest elsewhere in the catalog does not. A new Proxy build is promoted afresh. The
+Agent reads the subsets with its `lookup_semantic_scope` tool, and `rule_set_scope` tells the
+Compiler which subset a `MutationRuleSet` fits. The Compiler (`agent_pipeline/rule_compiler.py`) checks
+every rule it writes with `--check-rules` of the promoted binary itself, so point `Stage1Config.nfs_proxy`
+at the same guest binary the promotion recorded. Nothing is promoted until the KVM runs below exist.
+
+**KVM step (by hand), once per subset.** Use the guest binary from `build-guest.sh` everywhere; the
+host runs the same binary for `--capability-registry` and `--describe-rules`.
+
+1. Record the build: `python -m agent_pipeline.semantic_promotion registry --proxy GUEST_PROXY
+   --store ARTIFACTS` prints `build=REF`.
+2. Write the subset, for example:
+
+   ```json
+   {"subset_id": "semantic.nfs4_1.call_value_literal_preserve",
+    "description": "NFSv4.1 CALL leaf values replaced by a literal, preserve",
+    "schema_ids": ["nfs4.1/sha256:..."], "directions": ["C2S"], "message_types": ["call"],
+    "target_kinds": ["field"], "parts": ["value"], "mutation_kinds": ["replace"],
+    "transforms": ["literal"], "structure_policies": ["preserve"],
+    "value_sources": ["target"], "predicate_ops": ["gt"]}
+   ```
+
+   Every rule of the production rule set must fit it (`--describe-rules` shows each rule), and
+   every listed element must be used by a rule that fires in the window.
+3. Production: boot a target-mode lane with that rule set ("Target mode" above) and run until the
+   guest crashes with those rules firing in the crash window. A deliberate panic after the programs
+   is enough; the crash-cut program must have a mutation recorded.
+4. Replay: `replay_runner plan`, then boot a fresh VM on another journal directory and run
+   `syz-execprog -procs=1 -repeat=1` over `REPLAY/programs.log` ("Semantic replay" above).
+5. Record the run instead of `replay_runner judge`:
+
+   ```sh
+   python -m agent_pipeline.semantic_promotion record --store ARTIFACTS --subset SUBSET.json \
+       --proxy GUEST_PROXY --kernel-commit KERNEL_SHA --environment kvm_guest \
+       --plan REPLAY/plan.json --journal-dir JOURNAL_DIR --production-vm vm-0 \
+       --replay-dir REPLAY_JOURNAL_DIR --replay-name lane0 --replay-vm vm-1 --replay-lane 0 \
+       --execprog-output EXECPROG_OUT --production-end guest_crash --replay-end guest_crash
+   ```
+
+   It prints `run=REF` and the verdict, and exits 3 with the reasons when the run does not count.
+6. Promote: `python -m agent_pipeline.semantic_promotion promote --store ARTIFACTS --build REF
+   --subset SUBSET.json --run REF [--run REF ...] --hcap HCAP_REVISION [--previous PROMOTED_REF]`
+   prints `promoted=REF hcap_revision=REF`, or every reason it refuses. Bind the new revision in the
+   harness registry for Stage 2 to use it.
+
+`tests/agent_pipeline/test_semantic_promotion.py` runs this with the M6 host run standing in for the
+KVM run; that is a test of the gate, not evidence.
 
 ## Building
 

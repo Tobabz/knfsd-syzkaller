@@ -3,8 +3,10 @@
 Commands:
 
 ``submit``       register a candidate and start a job
-``run``          run the service loop (Agent Tasks, Runner worker, Q1)
-``status``       print a job, its pending task and last verdict
+``run``          run the service loop (Agent Tasks, Runner worker, host
+                 authority for Q1 and the Stage 2 steps)
+``status``       print a job, its pending task, last verdict and Stage 2
+                 results (gate runs, campaign tally, triage, replay)
 ``approve`` / ``deny``  answer an ``s1_approval`` review
 ``operator``     send an operator action to a job
 ``add-mapping``  register a verified ``TargetPcMapping`` JSON file
@@ -30,17 +32,21 @@ from ..materializer import (ArtifactHarnessMaterializer, ExecutionHarnessApprova
                             StaticExecutionHarnessAuthority)
 from ..q1 import TargetPcMapping
 from ..registry import ArtifactHarnessRegistry
+from ..rule_compiler import ArtifactMutationRuleCompiler
 from ..runner.process_supervisor import ProcessLimits, ProcessSupervisor
 from .authority import DescriptorKernelIdentity
 from .config import Stage1Config
 from .engine import CommandEngineConfig, CommandExecutionEngine
-from .service import Stage1Parts, Stage1Service
+from ..stage2.authority import Stage2Profiles
+from ..stage2.engine import Stage2CommandEngine, Stage2EngineConfig
+from .service import Stage1Parts, Stage1Service, Stage2Parts
 from kcsan_pipeline import ProgramPolicyPipeline
 
 #: States where the loop has nothing to do until a person acts.
 STOP_STATES = TERMINAL | {JobState.S1_REACHED, JobState.S1_APPROVAL,
                           JobState.BLOCKED_OPERATOR,
-                          JobState.BLOCKED_HARNESS_GAP, JobState.PARKED}
+                          JobState.BLOCKED_HARNESS_GAP, JobState.PARKED,
+                          JobState.CRASH_REVIEW}
 
 
 def open_stage1(config: Stage1Config, stack: ExitStack, *,
@@ -72,6 +78,31 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         return CommandExecutionEngine(
             engine_config, store, ProcessSupervisor(state / "processes"))
 
+    stage2 = None
+    if config.stage2 is not None:
+        c = config.stage2
+        stage2_config = Stage2EngineConfig(
+            argv=c.argv, cwd=c.cwd, work_root=state / "stage2-runs",
+            resource_key=c.resource_key, collector_id=c.collector_id,
+            replay_proxy=c.replay_proxy,
+            crash_window_bound=c.crash_window_bound, env=c.env,
+            limits=ProcessLimits(timeout_s=c.timeout_s,
+                                 max_output_bytes=c.max_output_bytes),
+            poll_interval_s=c.poll_interval_s)
+
+        def stage2_engine(store, receipts, evidence) -> Stage2CommandEngine:
+            return Stage2CommandEngine(
+                stage2_config, store, ProcessSupervisor(state / "processes"),
+                receipts=receipts, evidence=evidence)
+
+        stage2 = Stage2Parts(
+            engine_factory=stage2_engine,
+            profiles=Stage2Profiles(
+                m1_profile_ref=c.m1_profile_ref,
+                q2_profile_ref=c.q2_profile_ref,
+                replay_profile_ref=c.replay_profile_ref,
+                crash_window_bound=c.crash_window_bound))
+
     tree = GitSourceTree(config.kernel_repo)
 
     def preparer(store, root):
@@ -90,7 +121,10 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         worker_id=config.worker_id,
         lease_duration_ns=int(config.lease_duration_s * 1e9),
         agent_workers=config.agent_workers, run_agents=run_agents,
-        prepare_candidate=preparer)
+        compiler=None if config.nfs_proxy is None else
+        ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
+                                     state / "compile"),
+        stage2=stage2, prepare_candidate=preparer)
     return stack.enter_context(Stage1Service(parts))
 
 
@@ -111,6 +145,21 @@ def _job_summary(service: Stage1Service, job_id: str) -> dict:
         out["last_verdict"] = {"status": v.result.status.value,
                                "reason": v.result.reason,
                                "bundle_ref": v.bundle_ref}
+    if job.gate_runs:
+        out["gate_runs"] = [{"bundle_ref": r.bundle_ref,
+                             "q1": r.q1.status.value,
+                             "rules": {x.rule_id: x.status for x in r.rules},
+                             "ambient": list(r.ambient)}
+                            for r in job.gate_runs]
+    if job.campaign is not None:
+        out["campaign"] = {"campaign_id": job.campaign.campaign_id,
+                           **job.campaign.tally.model_dump(mode="json")}
+    if job.triage:
+        out["triage"] = [t.model_dump(mode="json") for t in job.triage]
+    if job.replay is not None:
+        out["replay"] = {"crash_bundle_ref": job.replay.crash.bundle_ref,
+                         "outcome": None if job.replay.outcome is None else
+                         job.replay.outcome.model_dump(mode="json")}
     failures = service.store.effect_failures(job_id)
     if failures:
         out["last_effect_failure"] = list(failures[-1])
@@ -200,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
             def show(report) -> None:
                 for p in report.publications:
                     if p.outcome != "published":
-                        print(f"q1 authority {p.outcome} for {p.task_id}: "
+                        print(f"host authority {p.outcome} for {p.task_id}: "
                               f"{p.detail}", file=sys.stderr)
                 for err in report.errors + service.worker_errors:
                     print(f"error: {err}", file=sys.stderr)

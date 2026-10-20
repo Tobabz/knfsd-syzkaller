@@ -38,6 +38,37 @@ class EngineConfig(_Config):
         return argv
 
 
+class Stage2Config(_Config):
+    """The Stage 2 backend: the host command that runs one gate, campaign
+    or replay lease (see ``stage2.engine`` for its contract), the replay
+    Proxy for the ``--check-rules`` gate, and the judge profiles (CAS
+    digests of an ``M1JudgeProfile``, ``Q2JudgeProfile`` and
+    ``ReplayJudgeProfile``).  Unset, a compiled rule set waits in
+    blocked_operator(stage2_gate_unavailable)."""
+
+    argv: tuple[str, ...] = Field(min_length=1)
+    cwd: Path
+    env: dict[str, str] = Field(default_factory=lambda: {"LANG": "C.UTF-8"})
+    resource_key: str = Field(min_length=1, max_length=256)
+    collector_id: str = "stage2-command-engine"
+    #: A campaign lease runs for its whole fuzz budget.
+    timeout_s: float = Field(default=86_400, gt=0, le=86_400)
+    max_output_bytes: int = Field(default=1_048_576, ge=1)
+    poll_interval_s: float = Field(default=1.0, gt=0, le=60)
+    replay_proxy: Path
+    m1_profile_ref: Sha256
+    q2_profile_ref: Sha256
+    replay_profile_ref: Sha256
+    crash_window_bound: int = Field(default=4, ge=1, le=64)
+
+    @field_validator("argv")
+    @classmethod
+    def _absolute(cls, argv: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError("argv[0] must be an absolute path")
+        return argv
+
+
 class Stage1Config(_Config):
     state_dir: Path
     artifact_root: Path
@@ -59,6 +90,11 @@ class Stage1Config(_Config):
     lease_duration_s: float = Field(default=120, gt=0)
     agent_workers: int = Field(default=2, ge=1, le=16)
     engine: EngineConfig
+    #: The Proxy binary of the promoted semantic build, for the Mutation Rule
+    #: Compiler (08 §12).  Unset, a Stage 2 rule set waits in
+    #: blocked_operator(stage2_compiler_unavailable).
+    nfs_proxy: Path | None = None
+    stage2: Stage2Config | None = None
 
     @classmethod
     def load(cls, path: Path) -> Stage1Config:

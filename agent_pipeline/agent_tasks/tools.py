@@ -16,12 +16,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Protocol, Sequence
+from typing import Literal, Protocol, Sequence
 
 from pydantic import Field
 
 from ..contracts import Record
 from ..hcap import ArtifactHcapChecker, HcapCatalog
+from ..protocol_schema import (SN_DISCRIMINANT, SN_LIST_ELEMENT,
+                               SN_OPERATION, SN_OPS_ARRAY, SN_REPEATED,
+                               SN_ROOT, Node, ProtocolSchema, Resolution,
+                               load_schemas)
+from ..semantic_promotion import (PromotedSemanticCapabilityRegistry,
+                                  promoted_registry)
 from ..intake import ANALYSIS_ROOTS, in_analysis_roots, line_count
 
 SOURCE_PREFIXES = ANALYSIS_ROOTS
@@ -32,6 +38,9 @@ MAX_SNIPPET_BYTES = 512
 MAX_HCAP_RESULTS = 8
 MAX_HCAP_LIST_ITEMS = 32
 MAX_HCAP_TEXT_BYTES = 1024
+MAX_SEMANTIC_PATH_RESULTS = 32
+MAX_SEMANTIC_PATH_SCAN = 4096
+MAX_SEMANTIC_PATH_DEPTH = 64
 
 
 class ToolBoundaryError(ValueError):
@@ -99,6 +108,10 @@ class KernelSourceIndex(Protocol):
 class HcapSource(Protocol):
     def load_catalog(self, revision: str) -> HcapCatalog: ...
 
+    def load_semantic_scope(self, revision: str
+                            ) -> PromotedSemanticCapabilityRegistry | None:
+        """The promoted semantic registry the revision pins, or None."""
+
 
 class ArtifactHcapSource:
     """HCAP lookup over the already pinned artifact-backed checker."""
@@ -108,6 +121,11 @@ class ArtifactHcapSource:
 
     def load_catalog(self, revision: str) -> HcapCatalog:
         return self.checker.load_catalog(revision)
+
+    def load_semantic_scope(self, revision: str
+                            ) -> PromotedSemanticCapabilityRegistry | None:
+        return promoted_registry(self.checker.store,
+                                 self.checker.load_catalog(revision))
 
 
 class ToolArgs(Record):
@@ -144,6 +162,21 @@ class HcapLookupArgs(ToolArgs):
     capability_id: str | None = Field(default=None, max_length=256)
     max_results: int = Field(default=MAX_HCAP_RESULTS, ge=1,
                              le=MAX_HCAP_RESULTS)
+
+
+class SemanticScopeArgs(ToolArgs):
+    pass
+
+
+class SemanticPathLookupArgs(ToolArgs):
+    schema_id: str = Field(min_length=1, max_length=160)
+    message_type: Literal["call", "reply"]
+    operation: str = Field(min_length=1, max_length=128,
+                           pattern=r"^[\x21-\x7e]+$")
+    query: str | None = Field(default=None, min_length=1, max_length=128,
+                              pattern=r"\S")
+    max_results: int = Field(default=MAX_SEMANTIC_PATH_RESULTS, ge=1,
+                             le=MAX_SEMANTIC_PATH_RESULTS)
 
 
 class SourceExcerpt(Record):
@@ -196,6 +229,65 @@ class HcapLookup(Record):
     truncated: bool
 
 
+class SemanticScopeSubset(Record):
+    subset_id: str
+    description: str
+    schema_ids: tuple[str, ...]
+    directions: tuple[str, ...]
+    message_types: tuple[str, ...]
+    target_kinds: tuple[str, ...]
+    parts: tuple[str, ...]
+    mutation_kinds: tuple[str, ...]
+    transforms: tuple[str, ...]
+    structure_policies: tuple[str, ...]
+    value_sources: tuple[str, ...]
+    predicate_ops: tuple[str, ...]
+    validation_items: tuple[str, ...]
+
+
+class SemanticScopeLookup(Record):
+    """Empty ``subsets`` means no semantic mutation is usable: a rule set
+    would only be refused, so the Agent returns a mutation_engine gap."""
+
+    hcap_revision: str
+    proxy_sha256: str | None
+    registry_digest: str | None
+    registry_constraints: tuple[str, ...]
+    subsets: tuple[SemanticScopeSubset, ...]
+    truncated: bool
+
+
+class SemanticPath(Record):
+    """One canonical path; enum metadata has its own boundedness flag."""
+
+    path: str
+    value_kind: str
+    type_name: str
+    flags: tuple[str, ...]
+    enum_literals: tuple[str, ...]
+    enum_literals_truncated: bool
+
+
+class SemanticPathLookup(Record):
+    """Paths from one promoted ProtocolSchema operation or procedure.
+
+    The selector fields are the exact values accepted by the deterministic
+    Compiler.  In particular, an ``nfs4.1/...`` schema id still has family
+    ``nfs4`` and minor version 1. ``truncated`` applies only to path
+    traversal/results; each path reports enum literal truncation separately.
+    """
+
+    schema_id: str
+    family: str
+    rpc_program: int
+    rpc_version: int
+    minor_version: int | None
+    message_type: Literal["call", "reply"]
+    operation: str
+    paths: tuple[SemanticPath, ...]
+    truncated: bool
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
@@ -227,6 +319,18 @@ TOOL_DEFINITIONS = (
         "lookup_hcap",
         "Read bounded capability data from the task's pinned HCAP revision.",
         HcapLookupArgs),
+    ToolDefinition(
+        "lookup_semantic_scope",
+        "Read the semantic mutation subsets the pinned HCAP revision "
+        "promoted (M7). A MutationRuleSet must fit one subset; none means "
+        "no semantic mutation is supported.",
+        SemanticScopeArgs),
+    ToolDefinition(
+        "lookup_semantic_paths",
+        "List bounded canonical paths and exact protocol selector values "
+        "for one operation or procedure in a ProtocolSchema promoted by "
+        "the pinned HCAP revision. query optionally filters paths.",
+        SemanticPathLookupArgs),
 )
 
 
@@ -246,6 +350,98 @@ def _bounded_items(values: Sequence[str], *, limit: int = MAX_HCAP_LIST_ITEMS
         result.append(item)
         truncated |= cut
     return tuple(result), truncated
+
+
+_PATH_FLAGS = (
+    (SN_OPERATION, "operation"),
+    (SN_ROOT, "root"),
+    (SN_DISCRIMINANT, "discriminant"),
+    (SN_REPEATED, "repeated"),
+    (SN_OPS_ARRAY, "operation_array"),
+    (SN_LIST_ELEMENT, "list_element"),
+)
+
+
+def _schema_paths(schema: ProtocolSchema, *, response: bool,
+                  operation: str) -> tuple[tuple[tuple[str, Node], ...], bool]:
+    """Enumerate one root using the same names ``resolve`` accepts.
+
+    Normalized schemas already reject ambiguous positions.  The explicit
+    scan/depth bounds keep a future wider schema from expanding a model tool
+    response without limit; every emitted path is resolved again before it
+    crosses the boundary.
+    """
+
+    mine = "response" if response else "request"
+    leaf = schema.response_leaf if response else schema.request_leaf
+    values: list[tuple[str, Node]] = []
+    seen: set[str] = set()
+    truncated = False
+
+    def emit(path: str) -> Node | None:
+        nonlocal truncated
+        if path in seen:
+            return None
+        if len(values) >= MAX_SEMANTIC_PATH_SCAN:
+            truncated = True
+            return None
+        resolution, node = schema.resolve(response, path)
+        if resolution is not Resolution.FOUND or node is None:
+            raise BackendBoundaryError(
+                "ProtocolSchema generated a path it cannot resolve")
+        seen.add(path)
+        values.append((path, node))
+        return node
+
+    def walk(type_id: int, path: str, depth: int) -> None:
+        nonlocal truncated
+        node = emit(path)
+        if node is None:
+            return
+        # Operations are independent roots in ProtocolSchema. The enclosing
+        # COMPOUND array is queryable, but its union elements are not children.
+        if node.flags & SN_OPS_ARRAY:
+            return
+        if depth >= MAX_SEMANTIC_PATH_DEPTH:
+            truncated = True
+            return
+        ty = schema.types[type_id]
+        if schema._is_ops_union(ty):
+            return
+        kind = ty["kind"]
+        if kind == "struct":
+            for name, child in ty["fields"]:
+                walk(child, f"{path}.{name}", depth + 1)
+        elif kind == "union":
+            walk(ty["disc"][1], f"{path}.{ty['disc'][0]}", depth + 1)
+            for arm in schema._arms(ty):
+                if arm.get("type") is not None:
+                    walk(arm["type"], f"{path}.{arm['component']}",
+                         depth + 1)
+        elif kind in ("array_fixed", "array_var", "optional"):
+            walk(ty["sub"], f"{path}[]", depth + 1)
+
+    for procedure in schema.procedures:
+        if procedure["name"] != operation:
+            continue
+        type_id = procedure["res"] if response else procedure["arg"]
+        if type_id is not None:
+            walk(type_id,
+                 f"{schema.family}.{mine}.{operation}.{leaf}", 0)
+
+    for type_id, ty in enumerate(schema.types):
+        if not schema._is_ops_union(ty) or ty["operations"] != mine:
+            continue
+        for arm in schema._arms(ty):
+            if arm["branch"] != operation:
+                continue
+            base = f"{schema.family}.{mine}.{operation}"
+            emit(base)
+            emit(f"{base}.{ty['disc'][0]}")
+            if arm.get("type") is not None:
+                walk(arm["type"], f"{base}.{arm['component']}", 0)
+
+    return tuple(values), truncated
 
 
 def _source_path(path: str) -> str:
@@ -275,7 +471,7 @@ def _roots(path_prefix: str | None) -> tuple[str, ...]:
 
 
 class Stage1Toolbox:
-    """Pinned dispatcher containing exactly five read-only tools."""
+    """Pinned dispatcher containing exactly seven read-only tools."""
 
     def __init__(self, source: KernelSourceIndex, hcap: HcapSource, *,
                  kernel_commit: str, hcap_revision: str) -> None:
@@ -308,6 +504,10 @@ class Stage1Toolbox:
             return self._callees(parsed)
         if isinstance(parsed, HcapLookupArgs):
             return self._lookup_hcap(parsed)
+        if isinstance(parsed, SemanticScopeArgs):
+            return self._lookup_semantic_scope()
+        if isinstance(parsed, SemanticPathLookupArgs):
+            return self._lookup_semantic_paths(parsed)
         raise AssertionError("unhandled Stage 1 tool arguments")
 
     def _read(self, args: ReadSourceArgs) -> SourceExcerpt:
@@ -418,3 +618,102 @@ class Stage1Toolbox:
             missing_capability_ids=missing,
             authority_refs=authority_refs,
             truncated=truncated or cut_missing or cut_catalog_auth)
+
+    def _lookup_semantic_scope(self) -> SemanticScopeLookup:
+        promoted = self._hcap.load_semantic_scope(self._hcap_revision)
+        if promoted is None:
+            return SemanticScopeLookup(
+                hcap_revision=self._hcap_revision, proxy_sha256=None,
+                registry_digest=None, registry_constraints=(), subsets=(),
+                truncated=False)
+        selected = promoted.subsets[:MAX_HCAP_RESULTS]
+        truncated = len(promoted.subsets) > len(selected)
+        views = []
+        for entry in selected:
+            subset = entry.subset
+            fields = {}
+            for name in ("schema_ids", "directions", "message_types",
+                         "target_kinds", "parts", "mutation_kinds",
+                         "transforms", "structure_policies", "value_sources",
+                         "predicate_ops"):
+                fields[name], cut = _bounded_items(getattr(subset, name))
+                truncated |= cut
+            description, cut = _bounded(subset.description,
+                                        MAX_HCAP_TEXT_BYTES)
+            truncated |= cut
+            views.append(SemanticScopeSubset(
+                subset_id=subset.subset_id, description=description,
+                validation_items=tuple(i.value
+                                       for i in entry.validation_items),
+                **fields))
+        constraints, cut = _bounded_items(promoted.registry.constraints)
+        return SemanticScopeLookup(
+            hcap_revision=self._hcap_revision,
+            proxy_sha256=promoted.proxy_sha256,
+            registry_digest=promoted.registry_digest,
+            registry_constraints=constraints, subsets=tuple(views),
+            truncated=truncated or cut)
+
+    def _lookup_semantic_paths(self, args: SemanticPathLookupArgs
+                               ) -> SemanticPathLookup:
+        promoted = self._hcap.load_semantic_scope(self._hcap_revision)
+        if promoted is None:
+            raise ToolBoundaryError(
+                "the pinned HCAP promotes no semantic ProtocolSchema")
+        allowed = {schema_id for entry in promoted.subsets
+                   for schema_id in entry.subset.schema_ids}
+        if args.schema_id not in allowed:
+            raise ToolBoundaryError(
+                "schema_id is outside the pinned HCAP's promoted subsets")
+        try:
+            schema = load_schemas()[args.schema_id]
+        except KeyError:
+            raise BackendBoundaryError(
+                "a promoted ProtocolSchema is absent from the pinned source") \
+                from None
+        response = args.message_type == "reply"
+        values: tuple[tuple[str, Node], ...]
+        traversal_cut = False
+        exact = None
+        if args.query is not None:
+            resolution, node = schema.resolve(response, args.query)
+            if (resolution is Resolution.FOUND and node is not None
+                    and node.root == args.operation):
+                exact = (args.query, node)
+        if exact is not None:
+            # An exact canonical path is complete independently of a bounded
+            # traversal of recursive siblings elsewhere in the operation.
+            values = (exact,)
+        else:
+            values, traversal_cut = _schema_paths(
+                schema, response=response, operation=args.operation)
+        if not values:
+            raise ToolBoundaryError(
+                "operation or procedure is absent from the schema")
+        if args.query is not None and exact is None:
+            query = args.query.casefold()
+            values = tuple((path, node) for path, node in values
+                           if query in path.casefold())
+        selected = values[:args.max_results]
+        truncated = traversal_cut or len(values) > len(selected)
+        paths = []
+        for path, node in selected:
+            enum_literals = ()
+            enum_literals_truncated = False
+            if schema.kind(node.type) == "enum":
+                enum_literals, enum_literals_truncated = _bounded_items(tuple(
+                    label for label, unused in schema.types[node.type]["values"]
+                ))
+            paths.append(SemanticPath(
+                path=path, value_kind=schema.kind(node.type),
+                type_name=schema.type_name(node.type),
+                flags=tuple(name for flag, name in _PATH_FLAGS
+                            if node.flags & flag),
+                enum_literals=enum_literals,
+                enum_literals_truncated=enum_literals_truncated))
+        return SemanticPathLookup(
+            schema_id=schema.schema_id, family=schema.family,
+            rpc_program=schema.program, rpc_version=schema.version,
+            minor_version=schema.minor, message_type=args.message_type,
+            operation=args.operation, paths=tuple(paths),
+            truncated=truncated)

@@ -542,6 +542,59 @@ tools/nfs-proxy/src/delta.h
 tools/nfs-proxy/README.md
 ```
 
+### HCAP-11 — Bounded NFSv4.1 client lifecycle recovery
+
+```text
+id: HCAP-11
+name: bounded NFSv4.1 client lifecycle recovery
+usable_stage: [stage1]
+usable_by: [agent_stage1]
+status: validated
+scope: [client0_confirmed_expiry_recovery]
+
+interface:
+    syz_nfsd_client_ctl$expire_client0(0x0)  # exact admitted invocation
+
+purpose:
+    lane 0의 확정된 NFSv4.1 클라이언트 하나를 만료시키고
+    일반 client0 profile I/O로 EXCHANGE_ID -> CREATE_SESSION 복구를 유도
+
+constraints:
+    single NFSv4.1 fixture와 SERVER_IMPL=both를 사용
+    client0 selector 인자는 반드시 고정값 0x0을 사용하며 expiry는 정확히 한 번 수행
+    expiry 뒤에 client0 profile을 획득하고 client1 획득이나 선행 client0 획득은 거부
+    lifecycle broker가 정확히 하나의 confirmed minor-version-1 owner를 해석
+    owner는 Linux NFSv4.1 frozen-phase9-lane0-client0/<UTS hostname>과 정확히 일치
+    syz 호출은 client selector만 전달하며 client path, owner, ctl payload를 전달하지 않음
+    broker만 /proc/fs/nfsd/clients/<client>/ctl을 선택하고 literal expire를 기록
+    broker reply의 clientid, minorversion=1, session_count>0을 executor가 검사
+    한 번의 expiry 뒤 client0 profile도 정확히 한 번 획득하고,
+    parser가 client0 FD origin을 증명한 ordinary profile I/O를 수행
+    profile 획득만 하거나 close/lseek만 수행한 프로그램은 recovery I/O로 인정하지 않음
+```
+
+executor ABI에는 lane 1용 `syz_nfsd_client_ctl$expire_client1`도 존재하지만, HCAP-11과
+CallAdmissionProfile은 실제 KVM에서 검증된 client0만 공개한다. client1은 별도의 runtime 증거가 생기기 전까지
+Agent가 사용할 수 없다. 2026-10-19 실 KVM 검증에서는 neutral control 3회가 승인된 target mapping을 실행하지
+않았고, expiry stimulus 3회는 모두 그 mapping을 실행했다. 각 실행은 remote-KCOV generation begin/publish 1회,
+abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록했다. HCAP-03은 이 실행의
+generation attribution을 계속 담당하며 HCAP-11이 이를 대체하지 않는다. 공유 증거는 실행 descriptor와
+target mapping의 digest 및 전체 mapping identity를 기록하고 후보 source metadata와 target 주소는 포함하지
+않는다. Host generator는 이 typed evidence의 execution harness, kernel/instrumentation/vmlinux/KASLR identity와
+guest lane script digest를 새 descriptor에 대해 다시 검사한 뒤에만 HCAP-11을 promotion한다. fixture status는
+lifecycle broker의 PID start time, server mount/net namespace, 명령행과 정확한 UNIX socket inode 소유권을 함께
+검사하여 stale pathname이나 재사용된 PID를 broker로 인정하지 않는다.
+
+source refs:
+
+```text
+bundle/patches/syzkaller/0027-*
+bundle/lane/lane.sh
+tools/nfs-proxy/src/lifecycle.c
+tools/nfs-lifecycle/run.py
+agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
+```
+
 ### Target Proxy Architecture와의 관계
 
 HCAP-07/08/09는 현재 `tools/nfs-proxy`에서 검증된 concrete capability를 기록한다.
@@ -582,7 +635,12 @@ semantic capability registry
   쓰지 않는다(§7.1).
 - path, operator, transform 목록을 이 문서나 Agent·Proxy 설계 문서에 복제하지 않는다.
 
-promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다.
+promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다. registry 생성과 promotion gate는
+구현됐다(`../03-nfs-proxy/06-implementation-gap-analysis.md` §30, issue #51). 첫 subset이 gate를 통과하면 gate가
+HCAP-10 entry를 가진 새 revision을 만든다. 그 entry는 `usable_by: [agent_stage2]`, `status: validated_subset`,
+`validated_scope`에 promoted subset id, `authority_refs`에 `PromotedSemanticCapabilityRegistry` digest를 둔다.
+subset 내용은 그 authority에만 있고 Agent는 `lookup_semantic_scope` 도구로 읽는다. vocabulary에는 어느 promoted
+subset에도 맞지 않는 intent의 gap id `semantic_mutation.unpromoted`가 더해진다.
 
 ## 5. Stage별 사용 범위
 
@@ -594,6 +652,7 @@ STAGE 1
     HCAP-04 lane topology
     HCAP-05 normal-flow seeds
     HCAP-06 flow tracing
+    HCAP-11 bounded NFSv4.1 client lifecycle recovery
 
 STAGE 2
     Stage 1에서 선택된 scenario
