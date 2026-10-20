@@ -88,7 +88,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
             crash_window_bound=c.crash_window_bound, env=c.env,
             limits=ProcessLimits(timeout_s=c.timeout_s,
                                  max_output_bytes=c.max_output_bytes),
-            poll_interval_s=c.poll_interval_s)
+            poll_interval_s=c.poll_interval_s, state_dir=state.resolve())
 
         def stage2_engine(store, receipts, evidence) -> Stage2CommandEngine:
             return Stage2CommandEngine(

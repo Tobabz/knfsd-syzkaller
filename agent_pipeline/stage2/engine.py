@@ -105,6 +105,7 @@ class Stage2EngineConfig:
     limits: ProcessLimits = ProcessLimits()
     #: How often a running command's finished segments are taken.
     poll_interval_s: float = 1.0
+    state_dir: Path | None = None
 
 
 class _SegmentControl:
@@ -188,7 +189,8 @@ class Stage2CommandEngine:
             "rule_set_id": compiled.nfsprul1_ref,
             "gate_repetitions": t.gate_repetitions,
             "campaign_id": t.campaign_id,
-            "crash_bundle_ref": t.crash_bundle_ref}))
+            "crash_bundle_ref": t.crash_bundle_ref,
+            "state_dir": str(self.config.state_dir) if self.config.state_dir else None}))
         _write(inp / "harness.json", canonical_json(harness))
         _write(inp / "descriptor.json", canonical_json(descriptor))
         _write(inp / "program.syz", self.artifacts.get(harness.program_ref))

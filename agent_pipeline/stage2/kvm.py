@@ -31,6 +31,8 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..artifacts import ArtifactStore
+from ..contracts import Sanitizer
+from ..controller.store import Store
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ExecutionCorrelation as EvidenceCorrelation
 from ..journal_sink import (CHANNEL_CLOSE_TIMEOUT_S, SEGMENT_SUFFIX,
@@ -61,6 +63,7 @@ from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
                        NEUTRAL_COVERAGE_TYPE, NEUTRAL_EXECPROG_ID,
                        REPLAY_EXECPROG_ID, SCENARIO_EXECPROG_ID,
                        journal_identity)
+from kcsan_pipeline import ProgramPolicyPipeline
 
 
 class Stage2StepError(RuntimeError):
@@ -92,6 +95,7 @@ class _Execution(BaseModel):
     gate_repetitions: int | None
     campaign_id: str | None
     crash_bundle_ref: str | None
+    state_dir: str | None = None
 
 
 class NfsProxyExecution(BaseModel):
@@ -963,7 +967,37 @@ def _stop_manager(process: subprocess.Popen, timeout_s: float) -> bool:
         return False
 
 
+def _campaign_manager(inputs: _Inputs) -> dict[str, Any]:
+    manager = json.loads(json.dumps(inputs.manager))
+    state_dir = inputs.execution.state_dir
+    if state_dir is None:
+        if inputs.descriptor.sanitizer is Sanitizer.KCSAN:
+            raise Stage2StepError("KCSAN campaign lacks Controller state")
+        if "kcsan_policy_file" in manager:
+            raise Stage2StepError("non-KCSAN campaign selects a KCSAN policy")
+        return manager
+
+    state = Path(state_dir)
+    database = state / "controller.sqlite"
+    if not database.is_file():
+        raise Stage2StepError(f"Controller job store is absent: {database}")
+    store = Store(database)
+    try:
+        job = store.job(inputs.execution.job_id)
+        if job.candidate is None or job.candidate.candidate_id != inputs.harness.candidate_id:
+            raise Stage2StepError("campaign job and harness select different candidates")
+        if job.candidate.kernel_commit != inputs.descriptor.kernel_commit:
+            raise Stage2StepError("campaign candidate and kernel commit differ")
+        if store.policy(job.job_policy_id).sanitizer is not inputs.descriptor.sanitizer:
+            raise Stage2StepError("campaign job and harness sanitizer differ")
+        return ProgramPolicyPipeline(
+            store, state / "kcsan-policies").manager_config(job.job_id, manager)
+    finally:
+        store.close()
+
+
 def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
+    manager = _campaign_manager(inputs)
     work = output / "work"
     work.mkdir()
     workdir, spool = work / "manager-workdir", work / "executions"
@@ -979,7 +1013,6 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
                               prefixes)
     channels = _JournalChannels(work / "journal", "campaign", vm,
                                 inputs.lanes, inputs.rules, prefixes)
-    manager = json.loads(json.dumps(inputs.manager))
     manager["workdir"] = str(workdir)
     manager["workdir_template"] = str(lane_dir)
     manager["http"] = ""

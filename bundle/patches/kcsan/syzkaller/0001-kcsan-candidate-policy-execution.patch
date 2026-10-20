@@ -1,4 +1,4 @@
-From dcb7ec0f887da0d1f42a1e7987fcd2d58bb97926 Mon Sep 17 00:00:00 2001
+From 3f791e53e366c968fe680d1b518aa85834da1541 Mon Sep 17 00:00:00 2001
 From: HYUNSOL MUN <muumthf@gmail.com>
 Date: Fri, 16 Oct 2026 19:41:06 +0900
 Subject: [PATCH] kcsan: execute candidate policy per campaign
@@ -10,7 +10,7 @@ Leave ordinary programs on the original generation path.
 
 Co-authored-by: Codex <codex@openai.com>
 ---
- executor/executor.cc        |  25 +++++++-
+ executor/executor.cc        |  21 +++++-
  executor/executor_linux.h   | 123 +++++++++++++++++++++++++++++++++---
  executor/executor_runner.h  |   3 +
  executor/snapshot.h         |   6 ++
@@ -22,12 +22,12 @@ Co-authored-by: Codex <codex@openai.com>
  pkg/flatrpc/helpers.go      |  12 ++++
  pkg/mgrconfig/config.go     |   2 +
  pkg/mgrconfig/load.go       |  49 +++++++++++++-
- pkg/rpcserver/rpcserver.go  |  31 +++++----
+ pkg/rpcserver/rpcserver.go  |   7 ++
  pkg/rpcserver/runner.go     |  18 ++++--
- 14 files changed, 374 insertions(+), 53 deletions(-)
+ 14 files changed, 358 insertions(+), 41 deletions(-)
 
 diff --git a/executor/executor.cc b/executor/executor.cc
-index d8c452b75..0475a6004 100644
+index 0eb9f544e..d85ca2e8f 100644
 --- a/executor/executor.cc
 +++ b/executor/executor.cc
 @@ -333,6 +333,7 @@ static bool flag_threaded;
@@ -75,21 +75,7 @@ index d8c452b75..0475a6004 100644
  	request_type = req.type;
  	flag_collect_signal = req.exec_flags & (uint64)rpc::ExecFlag::CollectSignal;
  	flag_collect_cover = req.exec_flags & (uint64)rpc::ExecFlag::CollectCover;
-@@ -985,9 +1002,13 @@ static uint32 request_output_size()
- 	 * shared-memory region the manager maps, currently 14 MiB) must stay at
- 	 * or above the result, otherwise the executor's own coverage probe fails.
- 	 */
-+#if GOOS_linux
- 	const int kRemoteCoverCallHeadroom = 256 << 10;  /* entries, ~2 MiB of PCs */
- 	const int kMaxOutputCoverage =
- 		(kExtraCoverSize + kRemoteCoverCallHeadroom) * (int)sizeof(uint64_t);
-+#else
-+	const int kMaxOutputCoverage = kMaxOutput;
-+#endif
- 
- 	if (flag_comparisons)
- 		return kMaxOutputComparisons;
-@@ -1363,6 +1384,8 @@ void execute_one()
+@@ -1366,6 +1383,8 @@ void execute_one()
  	remote_generation_published = false;
  	remote_generation.store(0, std::memory_order_relaxed);
  	output_data->kcov_generation.store(0, std::memory_order_relaxed);
@@ -98,7 +84,7 @@ index d8c452b75..0475a6004 100644
  
  	if (cover_collection_required()) {
  		if (!flag_threaded)
-@@ -1377,7 +1400,7 @@ void execute_one()
+@@ -1380,7 +1399,7 @@ void execute_one()
  			remote_generation_published = false;
  			remote_generation_bind_failed.store(false, std::memory_order_relaxed);
  #if GOOS_linux
@@ -805,7 +791,7 @@ index e4734fe02..63d0cf4a6 100644
  	atomic.StoreUint64((*uint64)(unsafe.Pointer(&hdr.State)), uint64(state))
  }
 diff --git a/pkg/mgrconfig/config.go b/pkg/mgrconfig/config.go
-index 2bc36f517..7a95ea5b8 100644
+index 841128df4..58149a3da 100644
 --- a/pkg/mgrconfig/config.go
 +++ b/pkg/mgrconfig/config.go
 @@ -109,6 +109,8 @@ type Config struct {
@@ -892,32 +878,18 @@ index 3191b8e23..df126c417 100644
  	if cfg.HubClient != "" {
  		if err := checkNonEmpty(
 diff --git a/pkg/rpcserver/rpcserver.go b/pkg/rpcserver/rpcserver.go
-index cc9d2e6fa..da5c96cc4 100644
+index 5c3d225f2..1f74c1419 100644
 --- a/pkg/rpcserver/rpcserver.go
 +++ b/pkg/rpcserver/rpcserver.go
-@@ -69,13 +69,14 @@ type Config struct {
- 	FilterSignal      bool
- 	PrintMachineCheck bool
- 	// Abort early on syz-executor not replying to requests and print extra debugging information.
--	DebugTimeouts bool
--	Procs         int
--	Slowdown      int
--	ExecutorBin   string
--	Timeouts      targets.Timeouts
--	pcBase        uint64
--	localModules  []*vminfo.KernelModule
-+	DebugTimeouts    bool
-+	Procs            int
-+	Slowdown         int
-+	ExecutorBin      string
-+	Timeouts         targets.Timeouts
+@@ -80,6 +80,7 @@ type Config struct {
+ 	Slowdown         int
+ 	ExecutorBin      string
+ 	Timeouts         targets.Timeouts
 +	KCSANCandidateID string
-+	pcBase           uint64
-+	localModules     []*vminfo.KernelModule
+ 	pcBase           uint64
+ 	localModules     []*vminfo.KernelModule
  
- 	// RPCServer closes the channel once the machine check has begun. Used for fault injection during testing.
- 	machineCheckStarted chan struct{}
-@@ -204,6 +205,7 @@ func New(cfg *RemoteConfig) (Server, error) {
+@@ -223,6 +224,7 @@ func New(cfg *RemoteConfig) (Server, error) {
  		Slowdown:          cfg.Timeouts.Slowdown,
  		ExecutorBin:       cfg.ExecutorBin,
  		Timeouts:          cfg.Timeouts,
@@ -925,7 +897,7 @@ index cc9d2e6fa..da5c96cc4 100644
  		pcBase:            pcBase,
  		localModules:      cfg.LocalModules,
  	}, cfg.Manager), nil
-@@ -503,6 +505,10 @@ func (serv *server) runCheck(ctx context.Context, info *handshakeResult) error {
+@@ -522,6 +524,10 @@ func (serv *server) runCheck(ctx context.Context, info *handshakeResult) error {
  		return checkErr
  	}
  	enabledFeatures := features.Enabled()
@@ -936,38 +908,28 @@ index cc9d2e6fa..da5c96cc4 100644
  	serv.enabledFeatures = enabledFeatures
  	serv.setupFeatures = features.NeedSetup()
  	err := serv.mgr.MachineChecked(enabledFeatures, enabledCalls)
-@@ -580,11 +586,12 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo Updat
- 		executing:     make(map[int64]bool),
- 		hanged:        make(map[int64]bool),
- 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
--		lastExec: MakeLastExecuting(prog.MaxPids, 6),
--		stats:    serv.runnerStats,
--		procs:    serv.cfg.Procs,
--		updInfo:  updInfo,
--		resultCh: make(chan error, 1),
-+		lastExec:    MakeLastExecuting(prog.MaxPids, 6),
-+		stats:       serv.runnerStats,
-+		procs:       serv.cfg.Procs,
-+		updInfo:     updInfo,
-+		resultCh:    make(chan error, 1),
-+		candidateID: serv.cfg.KCSANCandidateID,
+@@ -607,6 +613,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo Updat
+ 		procs:            serv.cfg.Procs,
+ 		updInfo:          updInfo,
+ 		resultCh:         make(chan error, 1),
++		candidateID:      serv.cfg.KCSANCandidateID,
  	}
  	serv.mu.Lock()
  	defer serv.mu.Unlock()
 diff --git a/pkg/rpcserver/runner.go b/pkg/rpcserver/runner.go
-index 5f80d5d01..78414b529 100644
+index 25dec6984..6d5d8ddf1 100644
 --- a/pkg/rpcserver/runner.go
 +++ b/pkg/rpcserver/runner.go
-@@ -32,6 +32,7 @@ type Runner struct {
- 	filterSignal    bool
- 	debug           bool
- 	debugTimeouts   bool
-+	candidateID     string
- 	progTarget      *prog.Target
- 	sysTarget       *targets.Target
- 	stats           *runnerStats
-@@ -325,8 +326,10 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
- 		opts.EnvFlags |= flatrpc.ExecEnvDebug
+@@ -50,6 +50,7 @@ type Runner struct {
+ 	updInfo          UpdateInfo
+ 	resultCh         chan error
+ 	lastRequestTime  time.Time
++	candidateID      string
+ 
+ 	// The mutex protects all the fields below.
+ 	mu          sync.Mutex
+@@ -333,8 +334,10 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
+ 		opts.ExecFlags |= flatrpc.ExecFlagCollectCover
  	}
  	var data []byte
 +	var candidateID string
@@ -977,7 +939,7 @@ index 5f80d5d01..78414b529 100644
  		progData, err := req.Prog.SerializeForExec()
  		if err != nil {
  			// It's bad if we systematically fail to serialize programs,
-@@ -366,13 +369,14 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
+@@ -374,13 +377,14 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
  		Msg: &flatrpc.HostMessages{
  			Type: flatrpc.HostMessagesRawExecRequest,
  			Value: &flatrpc.ExecRequest{
