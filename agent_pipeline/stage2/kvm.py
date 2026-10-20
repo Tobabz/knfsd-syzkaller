@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -22,6 +23,7 @@ import tempfile
 import time
 import uuid
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -31,8 +33,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..artifacts import ArtifactStore
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ExecutionCorrelation as EvidenceCorrelation
-from ..journal_sink import (SEGMENT_SUFFIX, ChannelIdentity, ChannelServer,
-                            HostJournal)
+from ..journal_sink import (CHANNEL_CLOSE_TIMEOUT_S, SEGMENT_SUFFIX,
+                            ChannelIdentity, ChannelServer, HostJournal)
 from ..materializer import (ExecutionHarnessDescriptor, ReachabilityHarness,
                             descriptor_id)
 from ..q1 import ExecutionCorrelation, KernelIdentity
@@ -41,13 +43,18 @@ from ..replay_runner import PlanError, parse_execprog_barriers
 from ..sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE, PublishedCoverage
 from ..sealed_q2 import (CONSOLE_LOG_TYPE, MANAGER_REPORT_TYPE, Q2_EVIDENCE_ID,
                          Q2_EVIDENCE_TYPE, SealedArtifactRef, SealedQ2Evidence)
-from ..stage1.host.collector import (CollectorConfig, GUEST_DIR,
-                                     _checked, _collect_cover, _fixture_ready,
-                                     _wait_execprog, execprog_argv, run_lane,
+from ..stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
+                                     EXECPROG_EXIT_GRACE_S, POLL_S,
+                                     CollectorConfig, GUEST_DIR, _checked,
+                                     _collect_cover, _deadline_timeout,
+                                     _fixture_ready, _wait_execprog,
+                                     execprog_argv, execprog_timeout, run_lane,
                                      verify_pins)
 from ..stage1.host.kcov import LaneRun, capture_records
 from ..stage1.host.pins import HostFilePin, PinCache, verify_file
-from ..stage1.host.vm import Guest, QemuGuest, VmConfig
+from ..stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
+                              GUEST_TRANSFER_TIMEOUT_S, VM_STOP_TIMEOUT_S,
+                              Guest, QemuGuest, VmConfig)
 from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
                        GENERATION_COVERAGE_PREFIX, GENERATION_COVERAGE_TYPE,
                        JOURNAL_TYPE, NEUTRAL_COVERAGE_ID,
@@ -58,6 +65,17 @@ from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
 
 class Stage2StepError(RuntimeError):
     """The trusted host could not produce one complete Stage 2 segment."""
+
+
+class _EvidenceSealDeadline(Stage2StepError):
+    """The host exhausted the reserved evidence-finalization window."""
+
+
+@dataclass
+class _EvidenceSealState:
+    deadline: float
+    published: bool = False
+    cleanup_allowed: bool = False
 
 
 class _Execution(BaseModel):
@@ -108,12 +126,182 @@ class StepOptions:
     campaign_executions: int = 128
     campaign_timeout_s: float = 1800
     manager_stop_timeout_s: float = 45
+    exec_slowdown: int = 1
 
     def __post_init__(self) -> None:
         if not 1 <= self.campaign_executions <= 192:
             raise ValueError("campaign_executions must be in [1, 192]")
-        if self.campaign_timeout_s <= 0 or self.manager_stop_timeout_s <= 0:
-            raise ValueError("campaign timeouts must be positive")
+        if (not all(math.isfinite(value) for value in (
+                self.campaign_timeout_s, self.manager_stop_timeout_s))
+                or self.campaign_timeout_s <= 0
+                or self.manager_stop_timeout_s <= 0):
+            raise ValueError("campaign timeouts must be finite and positive")
+        if not 1 <= self.exec_slowdown <= 1000:
+            raise ValueError("exec_slowdown must be in [1, 1000]")
+
+
+MAX_JOURNAL_CHANNELS = 64
+MANAGER_SIGNAL_TIMEOUT_S = 10
+ARTIFACT_SEAL_RESERVE_S = 300
+# One alarm covers the worst-case sequential channel joins and every
+# subsequent read, fsync and atomic publication operation.
+EVIDENCE_SEAL_RESERVE_S = (
+    MAX_JOURNAL_CHANNELS * CHANNEL_CLOSE_TIMEOUT_S
+    + ARTIFACT_SEAL_RESERVE_S
+)
+
+
+@dataclass(frozen=True)
+class Stage2TimeoutBudget:
+    """Worst-case bounded wall time for each Stage 2 lease type."""
+
+    gate_repetition_s: float
+    gate_s: float
+    replay_s: float
+    campaign_s: float
+
+    @property
+    def required_s(self) -> float:
+        return max(self.gate_s, self.replay_s, self.campaign_s)
+
+
+def stage2_timeout_budget(
+    collector: CollectorConfig, *, exec_slowdown: int,
+    gate_repetitions: int, campaign_timeout_s: float,
+    manager_stop_timeout_s: float,
+) -> Stage2TimeoutBudget:
+    """Mirror every explicit timeout on the gate, replay and campaign paths."""
+    if type(gate_repetitions) is not int or gate_repetitions < 1:
+        raise ValueError("gate repetitions must be a positive integer")
+    values = {
+        "boot": collector.boot_timeout_s,
+        "fixture": collector.fixture_timeout_s,
+        "grace": collector.grace_s,
+        "drain": collector.drain_s,
+        "campaign": campaign_timeout_s,
+        "manager stop": manager_stop_timeout_s,
+    }
+    if any(not math.isfinite(value) or value < 0
+           for value in values.values()):
+        raise ValueError("Stage 2 timeout inputs must be finite and non-negative")
+    if campaign_timeout_s <= 0 or manager_stop_timeout_s <= 0:
+        raise ValueError("campaign timeouts must be positive")
+
+    direct = execprog_timeout(collector.exec_timeout_s, exec_slowdown)
+    # Gate polling and the guest's GNU timeout share this one process window.
+    direct_gate = direct + EXECPROG_EXIT_GRACE_S + POLL_S
+    vm_close = 2 * VM_STOP_TIMEOUT_S
+    # Channel shutdown is part of the single evidence reserve.  Keeping a
+    # separate allowance here would let close/fsync run before the hard seal
+    # deadline starts.
+    segment_close = vm_close + EVIDENCE_SEAL_RESERVE_S
+
+    # Scenario: 10 ordinary SSH commands, three evidence commands, three
+    # uploads and one coverage download. Commands issued while execprog is
+    # running are capped by direct_gate and therefore are not counted twice.
+    scenario = (
+        collector.boot_timeout_s + collector.fixture_timeout_s
+        + collector.grace_s + collector.drain_s + direct_gate
+        + 10 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 4 * GUEST_TRANSFER_TIMEOUT_S
+    )
+    # Neutral: launch/result SSH, log/tar evidence, one upload/download.
+    neutral = (
+        collector.drain_s + direct_gate
+        + 2 * GUEST_COMMAND_TIMEOUT_S
+        + 2 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 2 * GUEST_TRANSFER_TIMEOUT_S
+    )
+    gate_repetition = scenario + neutral + segment_close
+
+    # Replay has mount/status/hash/mkdir/chmod SSH and three uploads.
+    replay = (
+        collector.boot_timeout_s + collector.fixture_timeout_s + direct
+        + 5 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * GUEST_TRANSFER_TIMEOUT_S + segment_close
+    )
+    # A failure in the first manager stop can enter finally and retry cleanup.
+    manager_close = 2 * (manager_stop_timeout_s
+                         + 2 * MANAGER_SIGNAL_TIMEOUT_S)
+    campaign = (campaign_timeout_s + manager_close
+                + EVIDENCE_SEAL_RESERVE_S)
+    budget = Stage2TimeoutBudget(
+        gate_repetition_s=gate_repetition,
+        gate_s=gate_repetition * gate_repetitions,
+        replay_s=replay, campaign_s=campaign)
+    if not all(math.isfinite(value) for value in (
+            budget.gate_s, budget.replay_s, budget.campaign_s)):
+        raise ValueError("Stage 2 timeout budget is too large")
+    return budget
+
+
+def _deadline_value(deadline: float | _EvidenceSealState) -> float:
+    return (deadline.deadline
+            if isinstance(deadline, _EvidenceSealState) else deadline)
+
+
+def _check_evidence_deadline(deadline: float | _EvidenceSealState) -> None:
+    """Never publish evidence after consuming its supervisor reserve."""
+    value = _deadline_value(deadline)
+    if not math.isfinite(value) or time.monotonic() >= value:
+        raise _EvidenceSealDeadline("evidence sealing deadline expired")
+
+
+@contextmanager
+def _evidence_seal_window(output: Path, index: int, *,
+                          reserve_s: float = EVIDENCE_SEAL_RESERVE_S):
+    """Bound channel close and sealing without revoking a publication."""
+    if not math.isfinite(reserve_s) or reserve_s <= 0:
+        raise ValueError("evidence sealing reserve must be finite and positive")
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0 or previous_timer[1] > 0:
+        raise Stage2StepError("evidence sealing requires an unused host alarm")
+    if signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, set()):
+        raise Stage2StepError(
+            "evidence sealing requires an unblocked host alarm")
+
+    segments = output / "segments"
+    temporary = segments / f".{index:06d}.tmp"
+    final = segments / f"{index:06d}"
+
+    def expired(unused_signum, unused_frame) -> None:
+        raise _EvidenceSealDeadline("evidence sealing deadline expired")
+
+    try:
+        previous_handler = signal.signal(signal.SIGALRM, expired)
+    except ValueError as exc:
+        raise Stage2StepError(
+            "evidence sealing must run on the host main thread") from exc
+    state = _EvidenceSealState(time.monotonic() + reserve_s)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, reserve_s)
+        try:
+            if temporary.exists() or final.exists():
+                raise Stage2StepError("evidence segment path already exists")
+            state.cleanup_allowed = True
+            yield state
+            if not state.published:
+                _check_evidence_deadline(state)
+        except BaseException:
+            # A timed-out filesystem operation must not be followed by an
+            # unbounded recursive cleanup after the alarm has fired.  Before
+            # the deadline, cleanup remains protected by the same timer; after
+            # it, an uncommitted dot-directory may be left for lease cleanup.
+            # Never remove the final name: rename may have committed just
+            # before Python dispatched the deadline exception.
+            if (state.cleanup_allowed and not state.published
+                    and time.monotonic() < state.deadline):
+                try:
+                    shutil.rmtree(temporary, ignore_errors=True)
+                except _EvidenceSealDeadline:
+                    raise
+                except BaseException:
+                    pass
+            raise
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 @dataclass(frozen=True)
@@ -349,17 +537,21 @@ class _JournalChannels:
     def __init__(self, root: Path, name: str, vm: str, lanes: int,
                  rules: bytes, prefixes: tuple[str, ...]) -> None:
         self.root, self.name, self.vm = root, name, vm
-        self.socket_tmp = tempfile.TemporaryDirectory(prefix="knfsd-s2-journal-")
-        self.journal = HostJournal(root, name, fsync=True)
+        self.socket_dir = Path(tempfile.mkdtemp(prefix="knfsd-s2-journal-"))
         self.servers: list[ChannelServer] = []
         self.sockets: list[Path] = []
+        try:
+            self.journal = HostJournal(root, name, fsync=True)
+        except BaseException:
+            shutil.rmtree(self.socket_dir, ignore_errors=True)
+            raise
         try:
             for lane in range(lanes):
                 channel = f"nfsp-journal-{lane}"
                 self.journal.install_session_series(
                     vm_instance_id=vm, channel_id=channel,
                     prefix=prefixes[lane], lane_id=lane, rule_set=rules)
-                socket = Path(self.socket_tmp.name) / f"lane{lane}.sock"
+                socket = self.socket_dir / f"lane{lane}.sock"
                 self.servers.append(ChannelServer(
                     socket, self.journal, ChannelIdentity(vm, channel)))
                 self.sockets.append(socket)
@@ -383,24 +575,50 @@ class _JournalChannels:
         return sorted(self.root.glob(f"{self.name}.[0-9][0-9][0-9][0-9]{SEGMENT_SUFFIX}"))
 
     def close(self) -> None:
+        stopped = True
         for server in reversed(self.servers):
-            server.close()
+            stopped = server.close() and stopped
+        if not stopped:
+            raise Stage2StepError(
+                "journal channel did not stop before evidence sealing")
         self.servers.clear()
         self.journal.close()
-        self.socket_tmp.cleanup()
+        shutil.rmtree(self.socket_dir, ignore_errors=True)
 
 
-def _journal_artifacts(channels: _JournalChannels) -> list[_Artifact]:
+@contextmanager
+def _closed_evidence_channels(output: Path, index: int,
+                              channels: _JournalChannels, *,
+                              reserve_s: float = EVIDENCE_SEAL_RESERVE_S):
+    """Close journal writers inside the same reserve used for sealing."""
+    with _evidence_seal_window(
+            output, index, reserve_s=reserve_s) as deadline:
+        channels.close()
+        _check_evidence_deadline(deadline)
+        yield deadline
+
+
+def _journal_artifacts(channels: _JournalChannels, *,
+                       deadline: float | _EvidenceSealState) -> list[_Artifact]:
+    _check_evidence_deadline(deadline)
     paths = channels.paths()
     if not paths:
         raise Stage2StepError("target-mode VM produced no host journal segment")
-    return [_Artifact(journal_identity(path.name), JOURNAL_TYPE, path.read_bytes())
-            for path in paths]
+    artifacts = []
+    for path in paths:
+        _check_evidence_deadline(deadline)
+        data = path.read_bytes()
+        _check_evidence_deadline(deadline)
+        artifacts.append(_Artifact(
+            journal_identity(path.name), JOURNAL_TYPE, data))
+    return artifacts
 
 
 def _seal_segment(output: Path, index: int, *, vm: str, lane: int,
                   generation: int, host: dict[str, Any],
-                  artifacts: list[_Artifact]) -> Path:
+                  artifacts: list[_Artifact],
+                  deadline: float | _EvidenceSealState) -> Path:
+    _check_evidence_deadline(deadline)
     if not artifacts or len(artifacts) > 255:
         raise Stage2StepError("segment artifact count must be in [1, 255]")
     identities = [artifact.identity for artifact in artifacts]
@@ -410,30 +628,36 @@ def _seal_segment(output: Path, index: int, *, vm: str, lane: int,
     segments.mkdir(parents=True, exist_ok=True)
     temporary = segments / f".{index:06d}.tmp"
     final = segments / f"{index:06d}"
+    if temporary.exists() or final.exists():
+        raise Stage2StepError("evidence segment path already exists")
     temporary.mkdir()
     entries = []
-    try:
-        for number, artifact in enumerate(artifacts):
-            name = f"artifact-{number:03d}.bin"
-            path = temporary / name
-            with path.open("xb") as stream:
-                stream.write(artifact.data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            entries.append({"identity": artifact.identity,
-                            "type": artifact.type, "path": name})
-        capture = {"vm_instance_id": vm, "lane": lane,
-                   "generation_id": max(1, generation), "host": host,
-                   "artifacts": entries}
-        with (temporary / "capture.json").open("x") as stream:
-            json.dump(capture, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
+    for number, artifact in enumerate(artifacts):
+        _check_evidence_deadline(deadline)
+        name = f"artifact-{number:03d}.bin"
+        path = temporary / name
+        with path.open("xb") as stream:
+            stream.write(artifact.data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.rename(temporary, final)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+        _check_evidence_deadline(deadline)
+        entries.append({"identity": artifact.identity,
+                        "type": artifact.type, "path": name})
+    capture = {"vm_instance_id": vm, "lane": lane,
+               "generation_id": max(1, generation), "host": host,
+               "artifacts": entries}
+    with (temporary / "capture.json").open("x") as stream:
+        json.dump(capture, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    _check_evidence_deadline(deadline)
+    # Keep the alarm interruptible across rename.  If rename commits just as
+    # the deadline fires, the exception propagates but the final name remains
+    # valid for the engine to harvest.
+    os.rename(temporary, final)
+    if isinstance(deadline, _EvidenceSealState):
+        deadline.published = True
     return final
 
 
@@ -448,22 +672,28 @@ def _barrier_generation(output: str, fallback: int = 1) -> int:
     return barriers[0].kcov_generation if barriers else fallback
 
 
-def _neutral_run(guest: Guest, source: Path, config: CollectorConfig) -> tuple[LaneRun, str]:
+def _neutral_run(guest: Guest, source: Path, config: CollectorConfig, *,
+                 exec_slowdown: int = 1) -> tuple[LaneRun, str]:
     run = LaneRun(boot_ok=True, fixture_ok=True, lane_ok=True)
     guest.put(source, f"{GUEST_DIR}/program.syz")
-    _checked(guest, execprog_argv(config.exec_timeout_s))
-    gate = _wait_execprog(guest, True, config.exec_timeout_s, time.sleep)
+    timeout_s = execprog_timeout(config.exec_timeout_s, exec_slowdown)
+    _checked(guest, execprog_argv(config.exec_timeout_s, exec_slowdown))
+    exec_deadline = (time.monotonic() + timeout_s
+                     + EXECPROG_EXIT_GRACE_S)
+    gate = _wait_execprog(guest, True, exec_deadline, time.sleep)
     if gate == "ready":
         run.collection_started = True
-        _checked(guest, f"touch {GUEST_DIR}/gate.go")
-        done = _wait_execprog(guest, False, config.exec_timeout_s + 60, time.sleep)
+        _checked(guest, f"touch {GUEST_DIR}/gate.go",
+                 timeout=_deadline_timeout(exec_deadline))
+        done = _wait_execprog(guest, False, exec_deadline, time.sleep)
     else:
         done = gate
     rc_text = _checked(guest, f"cat {GUEST_DIR}/exec.rc 2>/dev/null || true").strip()
     run.runner_completed = gate == "ready" and done == "exited" and rc_text == "0"
     if not run.runner_completed:
         run.runtime_errors.append(f"neutral_execprog_failed:{done}:rc={rc_text}")
-    _, output = guest.run(f"cat {GUEST_DIR}/exec.log", timeout=120)
+    _, output = guest.run(f"cat {GUEST_DIR}/exec.log",
+                          timeout=EVIDENCE_COMMAND_TIMEOUT_S)
     time.sleep(config.drain_s)
     _collect_cover(guest, run, {})
     return run, output
@@ -480,7 +710,7 @@ def _direct_guest(inputs: _Inputs, lane_dir: Path, console: Path,
         extra_args=extra_args))
 
 
-def _gate(inputs: _Inputs, output: Path) -> None:
+def _gate(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     repetitions = inputs.execution.gate_repetitions
     if repetitions is None or repetitions < 1:
         raise Stage2StepError("gate execution lacks gate_repetitions")
@@ -508,42 +738,52 @@ def _gate(inputs: _Inputs, output: Path) -> None:
                               channels.qemu_args(controller=True))
         result: dict[str, Any] = {}
         try:
-            scenario = run_lane(
-                guest, inputs.files, inputs.root / "program.syz",
-                inputs.harness.runtime_selection, inputs.lane_sha256,
-                inputs.collector, work, result)
-            scenario_output = (work / "executor.log").read_text(errors="replace")
-            neutral, neutral_output = _neutral_run(
-                guest, inputs.root / "neutral.syz", inputs.collector)
-        finally:
-            guest.stop()
-            channels.close()
-        scenario_generation = _barrier_generation(scenario_output)
-        neutral_generation = _barrier_generation(
-            neutral_output, scenario_generation + 1)
-        correlation = inputs.correlation(vm, 0, scenario_generation)
-        observation, coverage = capture_records(
-            scenario, candidate_id=inputs.harness.candidate_id,
-            identity=identity, correlation=correlation,
-            trace_mode=inputs.harness.runtime_selection.trace_mode)
-        neutral_coverage = canonical_json(PublishedCoverage(
-            correlation=inputs.correlation(vm, 0, neutral_generation),
-            pcs=tuple(sorted(neutral.pcs))))
-        artifacts = [
-            _Artifact(OBSERVATION_ID, OBSERVATION_TYPE, observation),
-            _Artifact("coverage", COVERAGE_TYPE, coverage),
-            _Artifact(NEUTRAL_COVERAGE_ID, NEUTRAL_COVERAGE_TYPE,
-                      neutral_coverage),
-            _Artifact(SCENARIO_EXECPROG_ID, EXECPROG_TYPE,
-                      scenario_output.encode("utf-8", "replace")),
-            _Artifact(NEUTRAL_EXECPROG_ID, EXECPROG_TYPE,
-                      neutral_output.encode("utf-8", "replace")),
-            *_journal_artifacts(channels),
-        ]
-        _seal_segment(
-            output, repetition, vm=vm, lane=0,
-            generation=scenario_generation,
-            host={"journal_name": channels.name}, artifacts=artifacts)
+            try:
+                scenario = run_lane(
+                    guest, inputs.files, inputs.root / "program.syz",
+                    inputs.harness.runtime_selection, inputs.lane_sha256,
+                    inputs.collector, work, result,
+                    exec_slowdown=options.exec_slowdown)
+                scenario_output = (work / "executor.log").read_text(
+                    errors="replace")
+                neutral, neutral_output = _neutral_run(
+                    guest, inputs.root / "neutral.syz", inputs.collector,
+                    exec_slowdown=options.exec_slowdown)
+            finally:
+                guest.stop()
+        except BaseException:
+            with _closed_evidence_channels(output, repetition, channels):
+                pass
+            raise
+        with _closed_evidence_channels(
+                output, repetition, channels) as seal_deadline:
+            scenario_generation = _barrier_generation(scenario_output)
+            neutral_generation = _barrier_generation(
+                neutral_output, scenario_generation + 1)
+            correlation = inputs.correlation(vm, 0, scenario_generation)
+            observation, coverage = capture_records(
+                scenario, candidate_id=inputs.harness.candidate_id,
+                identity=identity, correlation=correlation,
+                trace_mode=inputs.harness.runtime_selection.trace_mode)
+            neutral_coverage = canonical_json(PublishedCoverage(
+                correlation=inputs.correlation(vm, 0, neutral_generation),
+                pcs=tuple(sorted(neutral.pcs))))
+            artifacts = [
+                _Artifact(OBSERVATION_ID, OBSERVATION_TYPE, observation),
+                _Artifact("coverage", COVERAGE_TYPE, coverage),
+                _Artifact(NEUTRAL_COVERAGE_ID, NEUTRAL_COVERAGE_TYPE,
+                          neutral_coverage),
+                _Artifact(SCENARIO_EXECPROG_ID, EXECPROG_TYPE,
+                          scenario_output.encode("utf-8", "replace")),
+                _Artifact(NEUTRAL_EXECPROG_ID, EXECPROG_TYPE,
+                          neutral_output.encode("utf-8", "replace")),
+                *_journal_artifacts(channels, deadline=seal_deadline),
+            ]
+            _seal_segment(
+                output, repetition, vm=vm, lane=0,
+                generation=scenario_generation,
+                host={"journal_name": channels.name}, artifacts=artifacts,
+                deadline=seal_deadline)
 
 
 def _fixture(guest: Guest, inputs: _Inputs, result: dict[str, Any]) -> bool:
@@ -554,7 +794,7 @@ def _fixture(guest: Guest, inputs: _Inputs, result: dict[str, Any]) -> bool:
         inputs.collector.fixture_timeout_s, result)
 
 
-def _replay(inputs: _Inputs, output: Path) -> None:
+def _replay(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     replay = inputs.root / "replay"
     rules = (replay / "rules.bin").read_bytes()
     work = output / "work"
@@ -573,50 +813,63 @@ def _replay(inputs: _Inputs, output: Path) -> None:
     fixture_failed = False
     returncode = -1
     try:
-        guest.start()
-        if not _fixture(guest, inputs, {}):
-            fixture_failed = True
+        try:
+            guest.start()
+            if not _fixture(guest, inputs, {}):
+                fixture_failed = True
+            else:
+                _checked(guest, f"mkdir -p {GUEST_DIR}")
+                guest.put(inputs.files["syz-executor"],
+                          f"{GUEST_DIR}/syz-executor")
+                guest.put(inputs.files["syz-execprog"],
+                          f"{GUEST_DIR}/syz-execprog")
+                guest.put(replay / "programs.log",
+                          f"{GUEST_DIR}/programs.log")
+                _checked(guest, f"chmod 0755 {GUEST_DIR}/syz-executor "
+                                f"{GUEST_DIR}/syz-execprog")
+                argv = [
+                    f"{GUEST_DIR}/syz-execprog",
+                    f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
+                    "-arch=amd64", "-vmarch=amd64", "-sandbox=none",
+                    "-procs=1", "-repeat=1", "-threaded=false",
+                    "-cover=true", "-remote-cover=true", "-disable=all",
+                    "-debug", "-vv=1", f"-slowdown={options.exec_slowdown}",
+                    f"{GUEST_DIR}/programs.log",
+                ]
+                returncode, output_text = guest.run(
+                    shlex.join(argv), timeout=execprog_timeout(
+                        inputs.collector.exec_timeout_s,
+                        options.exec_slowdown))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            output_text += f"\nhost replay error: {type(exc).__name__}: {exc}\n"
+        finally:
+            guest.stop()
+    except BaseException:
+        with _closed_evidence_channels(output, 0, channels):
+            pass
+        raise
+    with _closed_evidence_channels(output, 0, channels) as seal_deadline:
+        console_bytes = console.read_bytes() if console.is_file() else b""
+        _check_evidence_deadline(seal_deadline)
+        if _CRASH.search(console_bytes):
+            replay_end = "guest_crash"
+        elif fixture_failed:
+            replay_end = "unknown"
+        elif returncode == 0:
+            replay_end = "clean"
         else:
-            _checked(guest, f"mkdir -p {GUEST_DIR}")
-            guest.put(inputs.files["syz-executor"], f"{GUEST_DIR}/syz-executor")
-            guest.put(inputs.files["syz-execprog"], f"{GUEST_DIR}/syz-execprog")
-            guest.put(replay / "programs.log", f"{GUEST_DIR}/programs.log")
-            _checked(guest, f"chmod 0755 {GUEST_DIR}/syz-executor "
-                            f"{GUEST_DIR}/syz-execprog")
-            argv = [
-                f"{GUEST_DIR}/syz-execprog",
-                f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
-                "-arch=amd64", "-vmarch=amd64", "-sandbox=none", "-procs=1",
-                "-repeat=1", "-threaded=false", "-cover=true",
-                "-remote-cover=true", "-disable=all", "-debug", "-vv=1",
-                "-slowdown=1", f"{GUEST_DIR}/programs.log",
-            ]
-            returncode, output_text = guest.run(
-                shlex.join(argv), timeout=inputs.collector.exec_timeout_s)
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        output_text += f"\nhost replay error: {type(exc).__name__}: {exc}\n"
-    finally:
-        guest.stop()
-        channels.close()
-    console_bytes = console.read_bytes() if console.is_file() else b""
-    if _CRASH.search(console_bytes):
-        replay_end = "guest_crash"
-    elif fixture_failed:
-        replay_end = "unknown"
-    elif returncode == 0:
-        replay_end = "clean"
-    else:
-        replay_end = "unknown"
-    artifacts = [
-        _Artifact(REPLAY_EXECPROG_ID, EXECPROG_TYPE,
-                  output_text.encode("utf-8", "replace")),
-        *_journal_artifacts(channels),
-    ]
-    generation = _barrier_generation(output_text)
-    _seal_segment(
-        output, 0, vm=vm, lane=0, generation=generation,
-        host={"journal_name": channels.name, "replay_end": replay_end,
-              "fixture_failed": fixture_failed}, artifacts=artifacts)
+            replay_end = "unknown"
+        artifacts = [
+            _Artifact(REPLAY_EXECPROG_ID, EXECPROG_TYPE,
+                      output_text.encode("utf-8", "replace")),
+            *_journal_artifacts(channels, deadline=seal_deadline),
+        ]
+        generation = _barrier_generation(output_text)
+        _seal_segment(
+            output, 0, vm=vm, lane=0, generation=generation,
+            host={"journal_name": channels.name, "replay_end": replay_end,
+                  "fixture_failed": fixture_failed}, artifacts=artifacts,
+            deadline=seal_deadline)
 
 
 def _corpus(path: Path, program: bytes) -> None:
@@ -688,7 +941,7 @@ def _stop_manager(process: subprocess.Popen, timeout_s: float) -> bool:
     try:
         os.killpg(process.pid, signal.SIGINT)
     except ProcessLookupError:
-        process.wait(timeout=10)
+        process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
         return True
     try:
         process.wait(timeout=timeout_s)
@@ -697,16 +950,16 @@ def _stop_manager(process: subprocess.Popen, timeout_s: float) -> bool:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            process.wait(timeout=10)
+            process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
             return True
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.wait(timeout=10)
+            process.wait(timeout=MANAGER_SIGNAL_TIMEOUT_S)
         return False
 
 
@@ -742,123 +995,137 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     complete = False
     unexpected_exit = False
     try:
-        with manager_log.open("wb") as log:
-            process = subprocess.Popen(
-                [str(manager_binary), "-config", str(config), "-debug"],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                start_new_session=True)
-            deadline = time.monotonic() + options.campaign_timeout_s
-            while True:
-                records = _spool(spool)
-                _, campaign_records = _campaign_records(records)
-                reports, crash_log = _crash_files(workdir)
-                if (len(campaign_records) >= options.campaign_executions or
-                        reports or crash_log is not None):
-                    break
-                if process.poll() is not None:
-                    unexpected_exit = True
-                    break
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.05)
-            complete = _stop_manager(process, options.manager_stop_timeout_s)
-    finally:
-        if process is not None and process.poll() is None:
-            _stop_manager(process, options.manager_stop_timeout_s)
-        channels.close()
-    end_ns = time.time_ns()
-    records = _spool(spool)
-    if not records:
-        raise Stage2StepError("syz-manager produced no program evidence")
-    reports, crash_log = _crash_files(workdir)
-    console = manager_log.read_bytes()
-    if b"failed to store NFS proxy evidence" in console:
-        raise Stage2StepError("syz-manager reported an evidence spool failure")
-    crashed = bool(reports or crash_log or _CRASH.search(console))
-    campaign_span, correlated = _campaign_records(records)
-    if any(record.vm != 0 or record.lane >= inputs.lanes for record in records):
-        raise Stage2StepError("syz-manager evidence has an invalid VM or lane")
-    execution_ids = [record.execution_id for record in records]
-    if len(execution_ids) != len(set(execution_ids)):
-        raise Stage2StepError("syz-manager evidence reuses an execution ID")
-    if not correlated and not crashed:
-        raise Stage2StepError(
-            "syz-manager produced no generation-attributed campaign execution")
-    seen: set[tuple[int, int]] = set()
-    coverage_artifacts: list[_Artifact] = []
-    for record in correlated:
-        key = (record.lane, record.generation)
-        if key in seen:
+        try:
+            with manager_log.open("wb") as log:
+                process = subprocess.Popen(
+                    [str(manager_binary), "-config", str(config), "-debug"],
+                    stdin=subprocess.DEVNULL, stdout=log,
+                    stderr=subprocess.STDOUT, start_new_session=True)
+                deadline = time.monotonic() + options.campaign_timeout_s
+                while True:
+                    records = _spool(spool)
+                    _, campaign_records = _campaign_records(records)
+                    reports, crash_log = _crash_files(workdir)
+                    if (len(campaign_records) >= options.campaign_executions or
+                            reports or crash_log is not None):
+                        break
+                    if process.poll() is not None:
+                        unexpected_exit = True
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.05)
+                complete = _stop_manager(
+                    process, options.manager_stop_timeout_s)
+        finally:
+            if process is not None and process.poll() is None:
+                _stop_manager(process, options.manager_stop_timeout_s)
+    except BaseException:
+        with _closed_evidence_channels(output, 0, channels):
+            pass
+        raise
+    with _closed_evidence_channels(output, 0, channels) as seal_deadline:
+        end_ns = time.time_ns()
+        records = _spool(spool)
+        _check_evidence_deadline(seal_deadline)
+        if not records:
+            raise Stage2StepError("syz-manager produced no program evidence")
+        reports, crash_log = _crash_files(workdir)
+        console = manager_log.read_bytes()
+        _check_evidence_deadline(seal_deadline)
+        if b"failed to store NFS proxy evidence" in console:
+            raise Stage2StepError("syz-manager reported an evidence spool failure")
+        crashed = bool(reports or crash_log or _CRASH.search(console))
+        campaign_span, correlated = _campaign_records(records)
+        if any(record.vm != 0 or record.lane >= inputs.lanes for record in records):
+            raise Stage2StepError("syz-manager evidence has an invalid VM or lane")
+        execution_ids = [record.execution_id for record in records]
+        if len(execution_ids) != len(set(execution_ids)):
+            raise Stage2StepError("syz-manager evidence reuses an execution ID")
+        if not correlated and not crashed:
             raise Stage2StepError(
-                "campaign VM restarted and reused a lane generation")
-        seen.add(key)
-        coverage = PublishedCoverage(
-            correlation=inputs.correlation(vm, record.lane, record.generation),
-            pcs=record.pcs)
-        coverage_artifacts.append(_Artifact(
-            f"{GENERATION_COVERAGE_PREFIX}{record.lane}.{record.generation}",
-            GENERATION_COVERAGE_TYPE, canonical_json(coverage)))
-    report_artifacts: list[_Artifact] = []
-    report_refs: list[SealedArtifactRef] = []
-    for number, path in enumerate(reports):
-        data = path.read_bytes()
-        identity = f"manager-report-{number:04d}"
-        report_artifacts.append(_Artifact(identity, MANAGER_REPORT_TYPE, data))
-        report_refs.append(SealedArtifactRef(
-            identity=identity, sha256=hashlib.sha256(data).hexdigest()))
-    console_identity = "console"
-    correlation = (inputs.correlation(vm, correlated[0].lane,
-                                      correlated[0].generation)
-                   if correlated else inputs.correlation(vm, 0, 1))
-    window = Q2CollectionWindow(
-        start_marker=f"host-ns:{start_ns}", end_marker=f"host-ns:{end_ns}")
-    internal = []
-    if unexpected_exit and not crashed:
-        returncode = process.returncode if process is not None else None
-        internal.append(f"manager_exited_unexpectedly:{returncode}")
-    if not correlated:
-        internal.append("crash_before_generation_attributed_campaign_execution")
-    uncorrelated = len(campaign_span) - len(correlated)
-    if uncorrelated:
-        internal.append(f"uncorrelated_program_results:{uncorrelated}")
-    completeness = "complete" if complete else "truncated"
-    termination = "guest_crashed" if crashed else (
-        "lost" if unexpected_exit else
-        ("runner_stopped" if complete else "lost"))
-    q2_correlation = EvidenceCorrelation.model_validate(
-        correlation.model_dump(mode="python"))
-    q2 = SealedQ2Evidence(
-        execution_harness_id=inputs.execution.execution_harness_id,
-        correlation=q2_correlation,
-        console_log_identity=console_identity,
-        console_log_ref=hashlib.sha256(console).hexdigest(),
-        console_log_completeness=completeness,
-        manager_crash_reports=tuple(report_refs),
-        vm_termination=termination, collection_window=window,
-        internal_errors=tuple(internal))
-    artifacts = [
-        _Artifact(Q2_EVIDENCE_ID, Q2_EVIDENCE_TYPE, canonical_json(q2)),
-        _Artifact(console_identity, CONSOLE_LOG_TYPE, console),
-        *report_artifacts,
-        *coverage_artifacts,
-    ]
-    if crash_log is not None:
-        artifacts.append(_Artifact(CRASH_LOG_ID, CRASH_LOG_TYPE,
-                                   crash_log.read_bytes()))
-    artifacts.extend(_journal_artifacts(channels))
-    _seal_segment(
-        output, 0, vm=vm, lane=correlation.lane,
-        generation=correlation.generation_id,
-        host={
-            "journal_name": channels.name,
-            "executions": len(correlated),
-            "console_log_identity": console_identity,
-            "console_log_completeness": completeness,
-            "manager_crash_report_identities": [item.identity
-                                                  for item in report_refs],
-            "vm_termination": termination,
-            "collection_window": window.model_dump(mode="json"),
-        }, artifacts=artifacts)
+                "syz-manager produced no generation-attributed campaign execution")
+        seen: set[tuple[int, int]] = set()
+        coverage_artifacts: list[_Artifact] = []
+        for record in correlated:
+            _check_evidence_deadline(seal_deadline)
+            key = (record.lane, record.generation)
+            if key in seen:
+                raise Stage2StepError(
+                    "campaign VM restarted and reused a lane generation")
+            seen.add(key)
+            coverage = PublishedCoverage(
+                correlation=inputs.correlation(vm, record.lane, record.generation),
+                pcs=record.pcs)
+            coverage_artifacts.append(_Artifact(
+                f"{GENERATION_COVERAGE_PREFIX}{record.lane}.{record.generation}",
+                GENERATION_COVERAGE_TYPE, canonical_json(coverage)))
+        report_artifacts: list[_Artifact] = []
+        report_refs: list[SealedArtifactRef] = []
+        for number, path in enumerate(reports):
+            _check_evidence_deadline(seal_deadline)
+            data = path.read_bytes()
+            _check_evidence_deadline(seal_deadline)
+            identity = f"manager-report-{number:04d}"
+            report_artifacts.append(_Artifact(identity, MANAGER_REPORT_TYPE, data))
+            report_refs.append(SealedArtifactRef(
+                identity=identity, sha256=hashlib.sha256(data).hexdigest()))
+        console_identity = "console"
+        correlation = (inputs.correlation(vm, correlated[0].lane,
+                                          correlated[0].generation)
+                       if correlated else inputs.correlation(vm, 0, 1))
+        window = Q2CollectionWindow(
+            start_marker=f"host-ns:{start_ns}", end_marker=f"host-ns:{end_ns}")
+        internal = []
+        if unexpected_exit and not crashed:
+            returncode = process.returncode if process is not None else None
+            internal.append(f"manager_exited_unexpectedly:{returncode}")
+        if not correlated:
+            internal.append("crash_before_generation_attributed_campaign_execution")
+        uncorrelated = len(campaign_span) - len(correlated)
+        if uncorrelated:
+            internal.append(f"uncorrelated_program_results:{uncorrelated}")
+        completeness = "complete" if complete else "truncated"
+        termination = "guest_crashed" if crashed else (
+            "lost" if unexpected_exit else
+            ("runner_stopped" if complete else "lost"))
+        q2_correlation = EvidenceCorrelation.model_validate(
+            correlation.model_dump(mode="python"))
+        q2 = SealedQ2Evidence(
+            execution_harness_id=inputs.execution.execution_harness_id,
+            correlation=q2_correlation,
+            console_log_identity=console_identity,
+            console_log_ref=hashlib.sha256(console).hexdigest(),
+            console_log_completeness=completeness,
+            manager_crash_reports=tuple(report_refs),
+            vm_termination=termination, collection_window=window,
+            internal_errors=tuple(internal))
+        artifacts = [
+            _Artifact(Q2_EVIDENCE_ID, Q2_EVIDENCE_TYPE, canonical_json(q2)),
+            _Artifact(console_identity, CONSOLE_LOG_TYPE, console),
+            *report_artifacts,
+            *coverage_artifacts,
+        ]
+        if crash_log is not None:
+            _check_evidence_deadline(seal_deadline)
+            artifacts.append(_Artifact(CRASH_LOG_ID, CRASH_LOG_TYPE,
+                                       crash_log.read_bytes()))
+            _check_evidence_deadline(seal_deadline)
+        artifacts.extend(_journal_artifacts(
+            channels, deadline=seal_deadline))
+        _seal_segment(
+            output, 0, vm=vm, lane=correlation.lane,
+            generation=correlation.generation_id,
+            host={
+                "journal_name": channels.name,
+                "executions": len(correlated),
+                "console_log_identity": console_identity,
+                "console_log_completeness": completeness,
+                "manager_crash_report_identities": [item.identity
+                                                      for item in report_refs],
+                "vm_termination": termination,
+                "collection_window": window.model_dump(mode="json"),
+            }, artifacts=artifacts, deadline=seal_deadline)
 
 
 def run_step(options: StepOptions, input_dir: Path, output_dir: Path) -> None:
@@ -869,11 +1136,11 @@ def run_step(options: StepOptions, input_dir: Path, output_dir: Path) -> None:
     if any((output / "segments").iterdir()):
         raise Stage2StepError("output/segments is not empty")
     if inputs.execution.step == "gate":
-        _gate(inputs, output)
+        _gate(inputs, output, options)
     elif inputs.execution.step == "campaign":
         _campaign(inputs, output, options)
     else:
-        _replay(inputs, output)
+        _replay(inputs, output, options)
 
 
 __all__ = ["NfsProxyExecution", "Stage2StepError", "StepOptions", "run_step"]

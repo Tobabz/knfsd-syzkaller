@@ -85,6 +85,12 @@ class ProcessLimits:
     max_output_bytes: int = 1_048_576
     max_attempts: int = 10_000
 
+    @property
+    def stop_reserve_s(self) -> float:
+        """Maximum supervisor wait after it asks the guardian to stop."""
+        return (self.term_grace_s + self.kill_grace_s
+                + self.heartbeat_timeout_s + 1)
+
     def __post_init__(self) -> None:
         for name in ("timeout_s", "term_grace_s", "kill_grace_s",
                      "poll_interval_s", "renew_interval_s", "heartbeat_timeout_s"):
@@ -291,8 +297,7 @@ class ProcessSupervisor:
             nonlocal stopping, stop_deadline
             if stopping is None:
                 stopping = reason
-                stop_deadline = (time.monotonic() + limits.term_grace_s
-                                 + limits.kill_grace_s + limits.heartbeat_timeout_s + 1)
+                stop_deadline = time.monotonic() + limits.stop_reserve_s
                 send(dict(type="stop", reason=reason))
 
         try:

@@ -15,7 +15,7 @@ from agent_pipeline.journal_framing import (
     FrameKind, JournalFrame, decode_ack, encode_frame, read_journal,
 )
 from agent_pipeline.journal_sink import (
-    ChannelIdentity, HostJournal, JournalSinkError, decode_reject,
+    ChannelIdentity, ChannelServer, HostJournal, JournalSinkError, decode_reject,
     delivery_state, serve_channel,
 )
 
@@ -378,6 +378,22 @@ def test_serve_channel_answers_frames_in_order(journal):
     guest.close()
     host.close()
     assert ended == ["bad_frame"]
+
+
+def test_channel_server_close_interrupts_connected_reader(tmp_path, journal):
+    path = tmp_path / "channel.sock"
+    server = ChannelServer(path, journal, CHANNEL)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as guest:
+        guest.connect(str(path))
+        for _ in range(100):
+            with server._connection_lock:
+                if server._connection is not None:
+                    break
+            threading.Event().wait(0.01)
+        else:
+            pytest.fail("server did not accept the test connection")
+        assert server.close()
+    assert not server._thread.is_alive()
 
 
 def test_cli_serves_an_installed_session(tmp_path):

@@ -18,7 +18,9 @@ Failures are split the same way the Controller splits them:
 from __future__ import annotations
 
 import json
+import math
 import shlex
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -38,7 +40,7 @@ from .kcov import (STATE_COMMAND, STATS_COMMAND, LaneRun, capture_records,
                    fatal_dmesg, lane_state_ok, parse_cover_pcs, parse_stats,
                    unsettled_generations)
 from .pins import HostFilePin, PinCache, verify_file
-from .vm import Guest, QemuGuest, VmConfig
+from .vm import GUEST_COMMAND_TIMEOUT_S, Guest, QemuGuest, VmConfig
 
 #: Descriptor build-artifact names the collector boots from.
 RUN_FILES = ("bzimage", "vm-image", "lane-script", "syz-executor",
@@ -50,9 +52,12 @@ GATE = f"{GUEST_DIR}/gate"
 EXEC_LOG = f"{GUEST_DIR}/exec.log"
 EXEC_RC = f"{GUEST_DIR}/exec.rc"
 POLL_S = 1.0
+FIXTURE_POLL_S = 3.0
 #: execprog runs one proc, which the executor binds to lane 0.
 LANE = 0
 LOG_LIMIT = 4 * 1024 * 1024
+EXECPROG_EXIT_GRACE_S = 60
+EVIDENCE_COMMAND_TIMEOUT_S = 120
 RESULT_TYPE = "application/vnd.knfsd.collector-result+json"
 LOG_TYPE = "text/plain"
 
@@ -130,7 +135,8 @@ def guest_cmdline(descriptor: ExecutionHarnessDescriptor,
     return " ".join([*base, *extra])
 
 
-def _checked(guest: Guest, command: str, timeout: float = 60) -> str:
+def _checked(guest: Guest, command: str,
+             timeout: float = GUEST_COMMAND_TIMEOUT_S) -> str:
     rc, out = guest.run(command, timeout=timeout)
     if rc != 0:
         raise RuntimeError(f"guest rc={rc}: {command}: {out[-500:]}")
@@ -142,14 +148,24 @@ def _fixture_ready(guest: Guest, selection: RuntimeSelection,
                    result: dict) -> bool:
     deadline = time.monotonic() + timeout_s
     while True:
-        rc, active = guest.run(
-            "systemctl is-active frozen-phase9-fixture.service")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            result["fixture_service"] = "timeout"
+            return False
+        try:
+            rc, active = guest.run(
+                "systemctl is-active frozen-phase9-fixture.service",
+                timeout=min(GUEST_COMMAND_TIMEOUT_S, remaining))
+        except subprocess.TimeoutExpired:
+            result["fixture_service"] = "timeout"
+            return False
         if active.strip() == "active":
             break
-        if active.strip() == "failed" or time.monotonic() >= deadline:
+        if active.strip() == "failed":
             result["fixture_service"] = active.strip()
             return False
-        time.sleep(3)
+        time.sleep(min(FIXTURE_POLL_S, max(
+            0, deadline - time.monotonic())))
     status = json.loads(_checked(
         guest, "/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager"))
     result["fixture_status"] = status
@@ -172,43 +188,68 @@ def _lane_state(guest: Guest) -> str:
     return out.strip() if rc == 0 else ""
 
 
-def execprog_argv(timeout_s: float) -> str:
+def execprog_timeout(timeout_s: float, slowdown: int = 1) -> int:
+    """Return the shared whole-second guest and host watchdog."""
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError("execprog timeout must be finite and positive")
+    if not 1 <= slowdown <= 1000:
+        raise ValueError("execprog slowdown must be in [1, 1000]")
+    # GNU timeout accepts fractions, but rounding once keeps the guest process
+    # watchdog and every host-side wait on exactly the same deadline.
+    return math.ceil(timeout_s * slowdown)
+
+
+def execprog_argv(timeout_s: float, slowdown: int = 1) -> str:
     """Start execprog in the background.  It stops at the gate after the
     machine check; ``EXEC_RC`` holds its exit status once it is done."""
+    watchdog_s = execprog_timeout(timeout_s, slowdown)
     argv = [f"{GUEST_DIR}/syz-execprog",
             f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
             "-arch=amd64", "-vmarch=amd64", "-sandbox=none", "-procs=1",
             "-repeat=1", "-threaded=false", "-cover=true",
             "-coverfile=/tmp/cov/cover", "-remote-cover=true",
-            "-disable=all", "-debug", "-vv=1", "-slowdown=1",
+            "-disable=all", "-debug", "-vv=1", f"-slowdown={slowdown}",
             f"-gate={GATE}", f"{GUEST_DIR}/program.syz"]
-    body = (f"timeout {int(timeout_s)} {shlex.join(argv)} > {EXEC_LOG} 2>&1; "
+    body = (f"timeout --kill-after={EXECPROG_EXIT_GRACE_S} "
+            f"{watchdog_s} {shlex.join(argv)} > {EXEC_LOG} 2>&1; "
             f"echo $? > {EXEC_RC}")
     return (f"rm -rf /tmp/cov {GATE}.ready {GATE}.go {EXEC_RC}; "
             f"mkdir -p /tmp/cov; setsid nohup sh -c {shlex.quote(body)} "
             "< /dev/null > /dev/null 2>&1 &")
 
 
-def _wait_execprog(guest: Guest, want_ready: bool, timeout_s: float,
+def _wait_execprog(guest: Guest, want_ready: bool, deadline: float,
                    sleep: Callable[[float], None]) -> str:
-    """``ready`` (stopped at the gate), ``exited`` or ``timeout``."""
-    deadline = time.monotonic() + timeout_s
+    """Wait against one deadline shared by both sides of the gate."""
     probe = (f"if [ -e {EXEC_RC} ]; then echo exited; "
              + (f"elif [ -e {GATE}.ready ]; then echo ready; " if want_ready
                 else "") + "fi")
     while True:
-        _, out = guest.run(probe)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
+        try:
+            _, out = guest.run(
+                probe, timeout=min(GUEST_COMMAND_TIMEOUT_S, remaining))
+        except subprocess.TimeoutExpired:
+            return "timeout"
         if out.strip() in ("ready", "exited"):
             return out.strip()
-        if time.monotonic() >= deadline:
-            return "timeout"
-        sleep(POLL_S)
+        sleep(min(POLL_S, max(0, deadline - time.monotonic())))
+
+
+def _deadline_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("execprog watchdog expired")
+    return min(GUEST_COMMAND_TIMEOUT_S, remaining)
 
 
 def run_lane(guest: Guest, files: dict[str, Path], program: Path,
              selection: RuntimeSelection, lane_sha256: str,
              config: CollectorConfig, out: Path,
-             result: dict, sleep: Callable[[float], None] = time.sleep
+             result: dict, sleep: Callable[[float], None] = time.sleep,
+             exec_slowdown: int = 1,
              ) -> LaneRun:
     """Boot, check the fixture and lane, run the program, collect.  Each
     fact is set only after its step succeeded; an exception stops the run
@@ -237,16 +278,21 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
         _checked(guest, f"chmod 0755 {GUEST_DIR}/syz-executor "
                         f"{GUEST_DIR}/syz-execprog")
         sleep(config.grace_s)
-        _checked(guest, execprog_argv(config.exec_timeout_s))
-        gate = _wait_execprog(guest, True, config.exec_timeout_s, sleep)
+        timeout_s = execprog_timeout(config.exec_timeout_s, exec_slowdown)
+        _checked(guest, execprog_argv(config.exec_timeout_s, exec_slowdown))
+        exec_deadline = (time.monotonic() + timeout_s
+                         + EXECPROG_EXIT_GRACE_S)
+        gate = _wait_execprog(guest, True, exec_deadline, sleep)
         result["execprog_gate"] = gate
         if gate == "ready":
             # execprog has finished the machine check and waits: the
             # window opens here, so only the program's generation is in it.
-            state = _checked(guest, STATE_COMMAND)
+            state = _checked(guest, STATE_COMMAND,
+                             timeout=_deadline_timeout(exec_deadline))
             result["generations_before"] = state
             busy = unsettled_generations(state)
-            raw_before = _checked(guest, STATS_COMMAND)
+            raw_before = _checked(guest, STATS_COMMAND,
+                                  timeout=_deadline_timeout(exec_deadline))
             result["stats_before"] = raw_before
             if busy:
                 run.runtime_errors.append(
@@ -254,9 +300,9 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
             else:
                 run.stats_before = parse_stats(raw_before)
                 run.collection_started = bool(run.stats_before)
-            _checked(guest, f"touch {GATE}.go")
-            done = _wait_execprog(guest, False, config.exec_timeout_s + 60,
-                                  sleep)
+            _checked(guest, f"touch {GATE}.go",
+                     timeout=_deadline_timeout(exec_deadline))
+            done = _wait_execprog(guest, False, exec_deadline, sleep)
         else:
             done = gate
         rc_text = _checked(guest, f"cat {EXEC_RC} 2>/dev/null || true").strip()
@@ -267,7 +313,8 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
             stage = "before_gate" if gate != "ready" else "after_gate"
             run.runtime_errors.append(
                 f"execprog_failed_{stage}:{done}:rc={rc_text}")
-        _, log = guest.run(f"cat {EXEC_LOG}", timeout=120)
+        _, log = guest.run(
+            f"cat {EXEC_LOG}", timeout=EVIDENCE_COMMAND_TIMEOUT_S)
         _write_log(out / "executor.log", log)
         sleep(config.drain_s)
         raw_after = _checked(guest, STATS_COMMAND)
@@ -277,7 +324,8 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
         result["lane_state_after"] = state
         if not lane_state_ok(state):
             run.runtime_errors.append("lane_unhealthy_after_program")
-        _, dmesg = guest.run("dmesg", timeout=120)
+        _, dmesg = guest.run(
+            "dmesg", timeout=EVIDENCE_COMMAND_TIMEOUT_S)
         _write_log(out / "dmesg.log", dmesg)
         for line in fatal_dmesg(dmesg)[:16]:
             run.runtime_errors.append(f"guest: {line.strip()[:200]}")
@@ -288,7 +336,8 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
 
 
 def _collect_cover(guest: Guest, run: LaneRun, result: dict) -> None:
-    _checked(guest, "tar -C /tmp/cov -cf /tmp/cov.tar .", timeout=120)
+    _checked(guest, "tar -C /tmp/cov -cf /tmp/cov.tar .",
+             timeout=EVIDENCE_COMMAND_TIMEOUT_S)
     with tempfile.TemporaryDirectory() as tmp:
         local = Path(tmp) / "cov.tar"
         guest.get("/tmp/cov.tar", local)

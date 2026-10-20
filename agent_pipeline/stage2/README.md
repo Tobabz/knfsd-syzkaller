@@ -91,7 +91,8 @@ judged REPLAY_INVALID instead of retried.
            "agent_pipeline.stage2.host", "step", "--manager",
            "/var/lib/knfsd/stage2/manager.json", "--collector",
            "/var/lib/knfsd/stage1/collector.json",
-           "--campaign-executions", "128", "{input}", "{output}"],
+           "--campaign-executions", "128", "--exec-slowdown", "1",
+           "{input}", "{output}"],
   "cwd": "/var/lib/knfsd/stage2",
   "resource_key": "host-a/kvm",
   "replay_proxy": "/opt/knfsd/bin/nfs-proxy",
@@ -108,6 +109,10 @@ must not exceed syzkaller's `experimental.nfs_proxy_window`.
 The step command limits one syz-manager invocation to 128 completed programs
 by default so its generation artifacts fit the 255-artifact segment bound.
 The Controller starts further campaign tasks until policy routes the job.
+`--exec-slowdown` is the bounded syz-execprog slowdown for direct gate and
+replay guests. Keep the default unless the durable host journal's measured
+fsync latency requires a larger executor timeout; record any override in the
+trusted Stage 2 argv. It does not alter syz-manager campaign timeouts.
 
 `JobPolicy.run_stage2` is false by default. With it false an operator
 starts Stage 2 of a reached job (`operator JOB start_stage2`); a policy may
@@ -140,6 +145,17 @@ per active proc. The report records the manager config's SHA-256. Regenerate
 older Stage 1 harness configs so their descriptor also pins `syz-manager`; a
 Stage 2 preflight intentionally rejects descriptors that pin only the
 executor binaries.
+
+Preflight also requires the outer Stage 2 supervisor timeout to cover the
+slowdown-scaled gate and replay watchdogs and the configured campaign
+timeout. Each step enforces one evidence-finalization reserve around journal
+channel shutdown, journal and artifact reads, fsyncs and atomic publication.
+The final directory rename is the irreversible publication commit point; a
+timeout can leave an unpublished dot-directory for lease cleanup, or race with
+a completed rename. In the latter case the command still fails but the engine
+keeps the atomically complete final segment. This keeps a storage stall
+distinguishable from valid sealed evidence before the outer supervisor cleanup
+reserve begins.
 
 Warnings identify an operator-start policy, repository placeholder campaign
 thresholds or separate Stage 1/Stage 2 resource keys. Any failed check exits

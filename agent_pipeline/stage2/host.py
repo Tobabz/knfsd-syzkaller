@@ -36,6 +36,7 @@ from ..materializer import (ExecutionHarnessApproval,
                             ExecutionHarnessDescriptor, descriptor_id)
 from ..q2 import Q2JudgeProfile
 from ..registry import HarnessCatalog
+from ..runner.process_supervisor import ProcessLimits
 from ..semantic_promotion import (BuildRegistry,
                                   PromotedSemanticCapabilityRegistry,
                                   check_runtime, promoted_registry,
@@ -44,6 +45,7 @@ from ..semantic_replay import ReplayJudgeProfile
 from ..stage1.config import Stage1Config
 from ..stage1.host.collector import CollectorConfig, verify_pins
 from ..stage1.host.pins import HostFilePin, file_sha256, verify_file
+from .kvm import stage2_timeout_budget
 
 
 class PreflightCheck(Record):
@@ -147,6 +149,62 @@ def _check_command(config, *, which: Callable[[str], str | None]) -> str:
     if missing:
         raise PreflightError("command argv lacks " + ", ".join(missing))
     return f"command={binary} cwd={config.cwd}"
+
+
+def _command_option(argv: tuple[str, ...], name: str, default: str) -> str:
+    """Read one trusted step option without executing the command parser."""
+    values: list[str] = []
+    for index, argument in enumerate(argv):
+        if argument == name:
+            if index + 1 >= len(argv):
+                raise PreflightError(f"Stage 2 command {name} lacks a value")
+            values.append(argv[index + 1])
+        elif argument.startswith(name + "="):
+            values.append(argument.removeprefix(name + "="))
+    if len(values) > 1:
+        raise PreflightError(f"Stage 2 command repeats {name}")
+    return values[0] if values else default
+
+
+def _check_stage2_timeout(config, collector: CollectorConfig,
+                          policies: tuple[JobPolicy, ...]) -> str:
+    """Ensure the outer supervisor cannot preempt an inner step watchdog."""
+    try:
+        slowdown = int(_command_option(config.argv, "--exec-slowdown", "1"))
+        campaign = float(_command_option(
+            config.argv, "--campaign-timeout", "1800"))
+        manager_stop = float(_command_option(
+            config.argv, "--manager-stop-timeout", "45"))
+    except ValueError as exc:
+        raise PreflightError(
+            "Stage 2 command has a non-numeric timeout option"
+        ) from exc
+    if not 1 <= slowdown <= 1000:
+        raise PreflightError("Stage 2 command exec slowdown must be in [1, 1000]")
+    repetitions = max(policy.gate_repetitions for policy in policies)
+    try:
+        budget = stage2_timeout_budget(
+            collector, exec_slowdown=slowdown,
+            gate_repetitions=repetitions, campaign_timeout_s=campaign,
+            manager_stop_timeout_s=manager_stop)
+    except (OverflowError, ValueError) as exc:
+        raise PreflightError(str(exc)) from exc
+    supervisor_reserve = ProcessLimits().stop_reserve_s
+    required = budget.required_s + supervisor_reserve
+    if config.timeout_s < required:
+        raise PreflightError(
+            f"Stage 2 supervisor timeout {config.timeout_s:g}s is below the "
+            f"configured lease budget {budget.required_s:g}s plus "
+            f"supervisor stop reserve {supervisor_reserve:g}s "
+            f"(gate={budget.gate_s:g}s, replay={budget.replay_s:g}s, "
+            f"campaign={budget.campaign_s:g}s, slowdown={slowdown}, "
+            f"gate_repetitions={repetitions})")
+    return (f"supervisor timeout {config.timeout_s:g}s covers lease budget "
+            f"{budget.required_s:g}s plus stop reserve "
+            f"{supervisor_reserve:g}s (gate={budget.gate_s:g}s, "
+            f"replay={budget.replay_s:g}s, campaign={budget.campaign_s:g}s, "
+            f"slowdown={slowdown}, "
+            f"gate_repetitions={repetitions})")
 
 
 def _check_profiles(store: ArtifactStore, config) -> str:
@@ -510,6 +568,9 @@ def preflight(
     checks.attempt("kvm", lambda: _check_kvm(kvm_path))
     checks.attempt("stage2_command",
                    lambda: _check_command(stage2, which=which))
+    checks.attempt("stage2_timeout",
+                   lambda: _check_stage2_timeout(
+                       stage2, collector, config.policies))
     checks.attempt("qemu", lambda: f"qemu={_executable(collector.qemu, which=which)}")
     checks.attempt("ssh", lambda: f"ssh={_executable('ssh', which=which)}")
     checks.attempt("scp", lambda: f"scp={_executable('scp', which=which)}")
@@ -617,6 +678,8 @@ def main(argv: list[str] | None = None) -> int:
     step.add_argument("--campaign-executions", type=int, default=128)
     step.add_argument("--campaign-timeout", type=float, default=1800)
     step.add_argument("--manager-stop-timeout", type=float, default=45)
+    step.add_argument("--exec-slowdown", type=int, default=1,
+                      help="syz-execprog slowdown for direct gate/replay VMs")
     step.add_argument("input", type=Path)
     step.add_argument("output", type=Path)
     args = parser.parse_args(argv)
@@ -626,7 +689,8 @@ def main(argv: list[str] | None = None) -> int:
             manager=args.manager, collector=args.collector,
             campaign_executions=args.campaign_executions,
             campaign_timeout_s=args.campaign_timeout,
-            manager_stop_timeout_s=args.manager_stop_timeout),
+            manager_stop_timeout_s=args.manager_stop_timeout,
+            exec_slowdown=args.exec_slowdown),
             args.input, args.output)
         return 0
     report = preflight(args.stage1, collector_path=args.collector,

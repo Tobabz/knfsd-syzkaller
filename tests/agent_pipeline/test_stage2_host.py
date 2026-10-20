@@ -12,6 +12,7 @@ import pytest
 import agent_pipeline.stage2.host as stage2_host
 from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.contracts import JudgeVersions
+from agent_pipeline.runner.process_supervisor import ProcessLimits
 from agent_pipeline.semantic_promotion import (
     BuildRegistry, CapabilityRegistry, PromotedSemanticCapabilityRegistry,
     PromotedSubset, RegistryLimits, RegistrySchema, SemanticSubset,
@@ -23,8 +24,10 @@ from agent_pipeline.stage1.host.pins import pin_file
 from agent_pipeline.stage2.host import (
     KVM_API_VERSION, PreflightError, _ApprovedHarness, _Checks,
     _check_command, _check_kernel_repo, _check_kvm, _check_manager,
-    _check_policies, _check_runtime, _verify_pins_read_only, preflight,
+    _check_policies, _check_runtime, _check_stage2_timeout,
+    _verify_pins_read_only, preflight,
 )
+from agent_pipeline.stage2.kvm import stage2_timeout_budget
 
 from .fakes import policy, sha
 
@@ -107,6 +110,49 @@ def test_host_command_requires_input_and_output_placeholders(tmp_path):
     bad = SimpleNamespace(argv=(str(executable), "{input}"), cwd=tmp_path)
     with pytest.raises(PreflightError, match=r"\{output\}"):
         _check_command(bad, which=lambda _: None)
+
+
+def test_stage2_supervisor_covers_slowdown_scaled_step_budgets(tmp_path):
+    collector = CollectorConfig(
+        artifact_root=tmp_path, files={}, ssh_key=tmp_path / "id",
+        exec_timeout_s=600)
+    argv = ("/bin/true", "--campaign-timeout", "1800",
+            "--manager-stop-timeout=45", "--exec-slowdown", "10",
+            "{input}", "{output}")
+    policies = (policy(gate_repetitions=3),)
+    budget = stage2_timeout_budget(
+        collector, exec_slowdown=10, gate_repetitions=3,
+        campaign_timeout_s=1800, manager_stop_timeout_s=45)
+    boundary = SimpleNamespace(argv=argv, timeout_s=budget.required_s)
+    with pytest.raises(PreflightError, match="supervisor stop reserve"):
+        _check_stage2_timeout(boundary, collector, policies)
+    reserve = ProcessLimits().stop_reserve_s
+    exact = SimpleNamespace(
+        argv=argv, timeout_s=budget.required_s + reserve)
+    assert "stop reserve" in _check_stage2_timeout(
+        exact, collector, policies)
+    short = SimpleNamespace(argv=argv, timeout_s=3600)
+    with pytest.raises(PreflightError, match="configured lease budget"):
+        _check_stage2_timeout(short, collector, policies)
+    enough = SimpleNamespace(argv=argv, timeout_s=86_400)
+    detail = _check_stage2_timeout(enough, collector, policies)
+    assert all(value in detail for value in (
+        "gate=", "replay=", "campaign=", "slowdown=10",
+        "gate_repetitions=3"))
+
+
+@pytest.mark.parametrize("argv, message", [
+    (("/bin/true", "--exec-slowdown", "0"), "slowdown"),
+    (("/bin/true", "--campaign-timeout", "nan"), "finite"),
+    (("/bin/true", "--exec-slowdown", "2", "--exec-slowdown=3"),
+     "repeats"),
+])
+def test_stage2_timeout_rejects_invalid_command_options(tmp_path, argv, message):
+    collector = CollectorConfig(
+        artifact_root=tmp_path, files={}, ssh_key=tmp_path / "id")
+    command = SimpleNamespace(argv=argv, timeout_s=86_400)
+    with pytest.raises(PreflightError, match=message):
+        _check_stage2_timeout(command, collector, (policy(),))
 
 
 def test_kvm_device_is_opened_and_reports_the_supported_api():

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import signal
 import struct
+import time
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,15 +15,26 @@ import pytest
 from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.data import put_record
-from agent_pipeline.stage1.host.collector import CollectorConfig
+from agent_pipeline.journal_sink import CHANNEL_CLOSE_TIMEOUT_S
+from agent_pipeline.stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
+                                                  EXECPROG_EXIT_GRACE_S, POLL_S,
+                                                  CollectorConfig, execprog_argv,
+                                                  execprog_timeout)
 from agent_pipeline.stage1.host.pins import PinError, pin_file
-from agent_pipeline.stage1.host.vm import QemuGuest, VmConfig
+from agent_pipeline.stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
+                                           GUEST_TRANSFER_TIMEOUT_S,
+                                           VM_STOP_TIMEOUT_S, QemuGuest,
+                                           VmConfig)
 from agent_pipeline.stage2.kvm import (
-    NfsProxyExecution, Stage2StepError, _Artifact,
+    ARTIFACT_SEAL_RESERVE_S, EVIDENCE_SEAL_RESERVE_S,
+    MANAGER_SIGNAL_TIMEOUT_S, MAX_JOURNAL_CHANNELS, NfsProxyExecution,
+    Stage2StepError, _Artifact,
     _barrier_generation, _campaign_records, _corpus, _correlated,
-    _journal_artifacts, _journal_lane_count, _lane_template,
+    _closed_evidence_channels, _JournalChannels, _journal_artifacts,
+    _journal_lane_count, _lane_template,
     _manager_assets, _manager_cmdline, _manager_qemu_args,
-    _seal_segment, _spool, _stop_manager,
+    _evidence_seal_window, _seal_segment, _spool, _stop_manager, StepOptions,
+    stage2_timeout_budget,
 )
 
 from .stage2_host import rules_bytes
@@ -41,6 +54,65 @@ def execution_record(**updates) -> dict:
     }
     value.update(updates)
     return value
+
+
+def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):
+    assert "-slowdown=1" in execprog_argv(60)
+    assert "-slowdown=10" in execprog_argv(60, 10)
+    assert "timeout --kill-after=60 600 " in execprog_argv(60, 10)
+    assert execprog_timeout(60, 10) == 600
+    assert "timeout --kill-after=60 1 " in execprog_argv(0.25, 3)
+    assert execprog_timeout(0.25, 3) == 1
+    with pytest.raises(ValueError, match="slowdown"):
+        execprog_argv(60, 0)
+    assert StepOptions(
+        manager=tmp_path / "manager.json",
+        collector=tmp_path / "collector.json",
+        exec_slowdown=10,
+    ).exec_slowdown == 10
+    with pytest.raises(ValueError, match="exec_slowdown"):
+        StepOptions(
+            manager=tmp_path / "manager.json",
+            collector=tmp_path / "collector.json",
+            exec_slowdown=0,
+        )
+
+
+def test_stage2_timeout_budget_accounts_for_every_bounded_operation(tmp_path):
+    collector = CollectorConfig(
+        artifact_root=tmp_path, files={}, ssh_key=tmp_path / "id",
+        boot_timeout_s=2, fixture_timeout_s=3, grace_s=4, drain_s=5,
+        exec_timeout_s=6)
+    budget = stage2_timeout_budget(
+        collector, exec_slowdown=10, gate_repetitions=3,
+        campaign_timeout_s=7, manager_stop_timeout_s=8)
+    direct = execprog_timeout(collector.exec_timeout_s, 10)
+    direct_gate = direct + EXECPROG_EXIT_GRACE_S + POLL_S
+    assert EVIDENCE_SEAL_RESERVE_S == (
+        MAX_JOURNAL_CHANNELS * CHANNEL_CLOSE_TIMEOUT_S
+        + ARTIFACT_SEAL_RESERVE_S)
+    close = 2 * VM_STOP_TIMEOUT_S + EVIDENCE_SEAL_RESERVE_S
+    scenario = (
+        collector.boot_timeout_s + collector.fixture_timeout_s
+        + collector.grace_s + collector.drain_s + direct_gate
+        + 10 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 4 * GUEST_TRANSFER_TIMEOUT_S)
+    neutral = (
+        collector.drain_s + direct_gate
+        + 2 * GUEST_COMMAND_TIMEOUT_S
+        + 2 * EVIDENCE_COMMAND_TIMEOUT_S
+        + 2 * GUEST_TRANSFER_TIMEOUT_S)
+    assert budget.gate_repetition_s == scenario + neutral + close
+    assert budget.gate_s == 3 * budget.gate_repetition_s
+    assert budget.replay_s == (
+        collector.boot_timeout_s + collector.fixture_timeout_s + direct
+        + 5 * GUEST_COMMAND_TIMEOUT_S
+        + 3 * GUEST_TRANSFER_TIMEOUT_S + close)
+    assert budget.campaign_s == (
+        7 + 2 * (8 + 2 * MANAGER_SIGNAL_TIMEOUT_S)
+        + EVIDENCE_SEAL_RESERVE_S)
+    assert budget.required_s == budget.gate_s
 
 
 def test_spool_records_are_strict_and_ordered(tmp_path):
@@ -244,7 +316,8 @@ def test_segment_is_published_only_at_final_name(tmp_path):
     final = _seal_segment(
         output, 0, vm="vm-1", lane=0, generation=3,
         host={"journal_name": "gate"},
-        artifacts=[_Artifact("execprog.scenario", "text/plain", b"run\n")])
+        artifacts=[_Artifact("execprog.scenario", "text/plain", b"run\n")],
+        deadline=time.monotonic() + 5)
     assert final == output / "segments/000000"
     assert not (output / "segments/.000000.tmp").exists()
     capture = json.loads((final / "capture.json").read_text())
@@ -253,10 +326,130 @@ def test_segment_is_published_only_at_final_name(tmp_path):
     assert (final / capture["artifacts"][0]["path"]).read_bytes() == b"run\n"
 
 
+def test_expired_seal_deadline_publishes_no_segment(tmp_path):
+    output = tmp_path / "output"
+    (output / "segments").mkdir(parents=True)
+    with pytest.raises(Stage2StepError, match="sealing deadline expired"):
+        _seal_segment(
+            output, 0, vm="vm-1", lane=0, generation=3,
+            host={"journal_name": "gate"},
+            artifacts=[_Artifact("execprog.scenario", "text/plain",
+                                 b"run\n")],
+            deadline=time.monotonic() - 1)
+    assert not any((output / "segments").iterdir())
+
+
+def test_seal_deadline_after_rename_keeps_segment_and_fails(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    segments = output / "segments"
+    segments.mkdir(parents=True)
+    real_rename = __import__("os").rename
+
+    def rename_then_cross_deadline(source, target):
+        real_rename(source, target)
+        time.sleep(0.05)
+
+    monkeypatch.setattr(
+        "agent_pipeline.stage2.kvm.os.rename", rename_then_cross_deadline)
+    monkeypatch.setattr("agent_pipeline.stage2.kvm.os.fsync", lambda fd: None)
+    start = time.monotonic()
+    with pytest.raises(Stage2StepError, match="sealing deadline expired"):
+        with _evidence_seal_window(output, 0, reserve_s=0.02) as deadline:
+            _seal_segment(
+                output, 0, vm="vm-1", lane=0, generation=3,
+                host={"journal_name": "gate"}, artifacts=[_Artifact(
+                    "execprog.scenario", "text/plain", b"run\n")],
+                deadline=deadline)
+    assert time.monotonic() - start < 0.5
+    assert [path.name for path in segments.iterdir()] == ["000000"]
+
+
+def test_seal_window_does_not_hide_errors_after_publication(tmp_path):
+    output = tmp_path / "output"
+    segments = output / "segments"
+    segments.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="after commit"):
+        with _evidence_seal_window(output, 0, reserve_s=1) as deadline:
+            _seal_segment(
+                output, 0, vm="vm-1", lane=0, generation=3,
+                host={"journal_name": "gate"},
+                artifacts=[_Artifact(
+                    "execprog.scenario", "text/plain", b"run\n")],
+                deadline=deadline)
+            raise RuntimeError("after commit")
+    assert (segments / "000000").is_dir()
+
+
+def test_seal_timeout_leaves_partial_segment_unpublished(tmp_path):
+    output = tmp_path / "output"
+    segments = output / "segments"
+    segments.mkdir(parents=True)
+    with pytest.raises(Stage2StepError, match="sealing deadline expired"):
+        with _evidence_seal_window(output, 0, reserve_s=0.01):
+            (segments / ".000000.tmp").mkdir()
+            time.sleep(1)
+    assert not (segments / "000000").exists()
+    assert (segments / ".000000.tmp").is_dir()
+
+
+def test_seal_window_rejects_an_inherited_blocked_alarm(tmp_path):
+    output = tmp_path / "output"
+    (output / "segments").mkdir(parents=True)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+        with pytest.raises(Stage2StepError, match="unblocked host alarm"):
+            with _evidence_seal_window(output, 0, reserve_s=1):
+                pytest.fail("blocked alarm must prevent sealing")
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def test_channel_close_is_inside_seal_deadline(tmp_path):
+    output = tmp_path / "output"
+    (output / "segments").mkdir(parents=True)
+    channels = SimpleNamespace(close=lambda: time.sleep(1))
+    with pytest.raises(Stage2StepError, match="sealing deadline expired"):
+        with _closed_evidence_channels(
+                output, 0, channels, reserve_s=0.01):
+            pytest.fail("timed-out close must not enter sealing")
+
+
+def test_channel_close_refuses_to_seal_with_live_writer(tmp_path):
+    channels = object.__new__(_JournalChannels)
+    channels.servers = [SimpleNamespace(close=lambda: False)]
+    channels.journal = SimpleNamespace(close=lambda: pytest.fail(
+        "journal must remain open while its writer thread is alive"))
+    channels.socket_dir = tmp_path / "socket"
+    channels.socket_dir.mkdir()
+    with pytest.raises(Stage2StepError, match="journal channel did not stop"):
+        channels.close()
+    assert channels.socket_dir.is_dir()
+
+
+def test_channel_init_failure_removes_socket_directory(tmp_path, monkeypatch):
+    socket_dir = tmp_path / "socket"
+
+    def make_socket_dir(*, prefix):
+        assert prefix == "knfsd-s2-journal-"
+        socket_dir.mkdir()
+        return str(socket_dir)
+
+    def fail_journal(*args, **kwargs):
+        raise OSError("journal init failed")
+
+    monkeypatch.setattr(
+        "agent_pipeline.stage2.kvm.tempfile.mkdtemp", make_socket_dir)
+    monkeypatch.setattr("agent_pipeline.stage2.kvm.HostJournal", fail_journal)
+    with pytest.raises(OSError, match="journal init failed"):
+        _JournalChannels(tmp_path / "journal", "gate", "vm-1", 1,
+                         rules_bytes("candidate"), ("prefix",))
+    assert not socket_dir.exists()
+
+
 def test_empty_journal_cannot_be_sealed(tmp_path):
     channels = SimpleNamespace(paths=lambda: [])
     with pytest.raises(Stage2StepError, match="no host journal"):
-        _journal_artifacts(channels)
+        _journal_artifacts(channels, deadline=time.monotonic() + 5)
 
 
 def test_direct_qemu_appends_trusted_journal_arguments(tmp_path):

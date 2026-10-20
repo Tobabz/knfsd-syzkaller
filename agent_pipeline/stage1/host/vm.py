@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+GUEST_COMMAND_TIMEOUT_S = 60
+GUEST_TRANSFER_TIMEOUT_S = 300
+VM_BOOT_PROBE_TIMEOUT_S = 10
+VM_BOOT_POLL_S = 3
+VM_STOP_TIMEOUT_S = 15
+
 
 class GuestError(RuntimeError):
     pass
@@ -22,7 +28,8 @@ class GuestError(RuntimeError):
 
 class Guest(Protocol):
     def start(self) -> None: ...
-    def run(self, command: str, *, timeout: float = 60) -> tuple[int, str]: ...
+    def run(self, command: str, *,
+            timeout: float = GUEST_COMMAND_TIMEOUT_S) -> tuple[int, str]: ...
     def put(self, source: Path, destination: str) -> None: ...
     def get(self, source: str, destination: Path) -> None: ...
     def stop(self) -> None: ...
@@ -80,12 +87,16 @@ class QemuGuest:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + self.config.boot_timeout_s
         last = ""
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             if self.process.poll() is not None:
                 raise GuestError("QEMU exited before SSH became ready")
             try:
                 r = subprocess.run([*self.ssh, "true"], capture_output=True,
-                                   text=True, timeout=10)
+                                   text=True, timeout=min(
+                                       VM_BOOT_PROBE_TIMEOUT_S, remaining))
             except subprocess.TimeoutExpired:
                 continue
             if r.returncode == 0:
@@ -93,10 +104,12 @@ class QemuGuest:
             last = r.stderr.strip()
             if "Permission denied" in last:
                 raise GuestError(f"guest SSH rejected the key: {last}")
-            time.sleep(3)
+            time.sleep(min(VM_BOOT_POLL_S, max(
+                0, deadline - time.monotonic())))
         raise GuestError(f"timed out waiting for guest SSH: {last or 'none'}")
 
-    def run(self, command: str, *, timeout: float = 60) -> tuple[int, str]:
+    def run(self, command: str, *,
+            timeout: float = GUEST_COMMAND_TIMEOUT_S) -> tuple[int, str]:
         r = subprocess.run([*self.ssh, command], capture_output=True,
                            text=True, timeout=timeout)
         return r.returncode, r.stdout + r.stderr
@@ -104,18 +117,20 @@ class QemuGuest:
     def put(self, source: Path, destination: str) -> None:
         subprocess.run([*self.scp, str(source),
                         "root@127.0.0.1:" + destination],
-                       capture_output=True, timeout=300, check=True)
+                       capture_output=True, timeout=GUEST_TRANSFER_TIMEOUT_S,
+                       check=True)
 
     def get(self, source: str, destination: Path) -> None:
         subprocess.run([*self.scp, "root@127.0.0.1:" + source,
                         str(destination)],
-                       capture_output=True, timeout=300, check=True)
+                       capture_output=True, timeout=GUEST_TRANSFER_TIMEOUT_S,
+                       check=True)
 
     def stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
-                self.process.wait(timeout=15)
+                self.process.wait(timeout=VM_STOP_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-                self.process.wait(timeout=15)
+                self.process.wait(timeout=VM_STOP_TIMEOUT_S)

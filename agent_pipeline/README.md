@@ -34,7 +34,7 @@ uv run pytest -W error   # Controller, intake, and artifact-backed components
 | `agent_tasks/analysis.py` | bounded structured `CandidateAnalysis` output contract (03 §5–§10) |
 | `agent_tasks/planning.py` | structured planning variants and host-side conversion of bounded inline program text to a content-addressed `ReachabilityPlan` |
 | `agent_tasks/mutation.py` | the typed `MutationRuleSet` (08 §5–§11) and the Mutation Strategy variants `rule_set` / `unsupported(mutation_engine)` (08 §15) |
-| `agent_tasks/tools.py` | the complete Agent tool allowlist: pinned kernel read/search, caller/callee index lookup and pinned HCAP lookup; paths and outputs are bounded |
+| `agent_tasks/tools.py` | the complete Agent tool allowlist: pinned kernel read/search, caller/callee index lookup, pinned HCAP lookup and promoted ProtocolSchema path lookup; paths and outputs are bounded |
 | `agent_tasks/source_index.py` | immutable Git-object implementation of the source-index protocol; full commit OIDs, trusted roots and process/output/time bounds are enforced |
 | `agent_tasks/runtime.py` | injectable structured-output runtime protocol; task policy selects provider/model and output-repair allowance |
 | `agent_tasks/pydantic_ai_runtime.py` | optional PydanticAI driver with typed output, the pinned toolbox, bounded requests and output repairs, and response-derived model identity |
@@ -214,7 +214,9 @@ refusal is a Stage 2 repair (`compiler_rejected`, counted against
 `stage2_repair_budget`), `unsupported_capability` and
 `requires_state_lineage` wait on a `mutation_engine` gap and compile the same
 rule set again once it closes. The Mutation Strategy Agent reads the
-promoted semantic subsets of its pinned HCAP with `lookup_semantic_scope`.
+promoted semantic subsets of its pinned HCAP with `lookup_semantic_scope`
+and obtains exact selector values and canonical operation paths only through
+the bounded `lookup_semantic_paths` view of those promoted schemas.
 `semantic_promotion.py` is the M7 gate that promotes them from KVM
 validation runs (`tools/nfs-proxy/README.md` "Capability registry and
 promotion"), and its `rule_set_scope` is the Compiler's scope check.
