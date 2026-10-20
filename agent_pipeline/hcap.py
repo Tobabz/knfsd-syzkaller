@@ -221,7 +221,7 @@ class RuntimeSelection(HcapRecord):
 
     profile: Identifier
     nfs_version: NfsVersion
-    fixture_mode: Literal["single", "broad-knfsd"]
+    fixture_mode: Literal["single", "broad-knfsd", "nlm-knfsd"]
     route: Identifier
     topology: Identifier
     enabled_interfaces: tuple[Text, ...]

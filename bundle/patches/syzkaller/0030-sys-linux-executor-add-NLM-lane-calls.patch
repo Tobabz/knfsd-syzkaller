@@ -1,0 +1,589 @@
+From 3dd3ef9b1e57e19df13ce1321dc4d4feed1a78b0 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Tue, 20 Oct 2026 18:00:00 +0900
+Subject: [PATCH] sys/linux, executor: add NLM lane calls
+
+Give Stage 1 programs the lane lockd of the nlm-knfsd fixture, where the
+knfsd NFSv3 mounts lock through the kernel lockd and lockd listens on TCP
+port 4045 in every lane namespace.
+
+- syz_open_nlm_lane_file opens a regular file strictly beneath a lane
+  directory (openat2 RESOLVE_BENEATH|NO_XDEV|NO_SYMLINKS|NO_MAGICLINKS,
+  NFS superblock), so kernel client byte-range locks on it (fcntl$lock)
+  become NLM calls.
+- syz_nlm_lane_fh reads the knfsd file handle of such a file through the
+  NFS client, checks every constant word of the lane export handle and
+  returns the two variable words as nlm_lane_fh_id.
+- syz_socket_connect_nlm$client0/1 connects from a lane client namespace
+  to the server lockd; syz_send_nlm_rpc sends one record-marked NLM call
+  (program 100021, versions 1, 3 and 4, procedures 0-15 and 20-23) whose
+  @lane file handle takes nlm_lane_fh_id.  recvfrom$inet_nlm_tcp reads the
+  reply.
+---
+ executor/common_linux.h       | 165 ++++++++++++++++++++---
+ pkg/vminfo/linux_syscalls.go  |   4 +
+ sys/linux/nfs_fuzz_test.go    |  62 +++++++++
+ sys/linux/socket_inet_nlm.txt | 246 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 462 insertions(+), 15 deletions(-)
+ create mode 100644 sys/linux/socket_inet_nlm.txt
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index bf7cbd0..1321802 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2828,11 +2828,16 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+     __NR_syz_open_nfs_lane_pair || __NR_syz_open_nfs_lane_profile || \
+     __NR_syz_socket_connect_nfs_pair || \
+     __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || \
+-    __NR_syz_nfsd_client_ctl || __NR_syz_nfsd_cld_ctl || __NR_syz_send_nfs_fuzz
++    __NR_syz_nfsd_client_ctl || __NR_syz_nfsd_cld_ctl || __NR_syz_send_nfs_fuzz || \
++    __NR_syz_socket_connect_nlm || __NR_syz_open_nlm_lane_file || \
++    __NR_syz_nlm_lane_fh || __NR_syz_send_nlm_rpc
+ #include <fcntl.h>
+ #include <sched.h>
+ #include <stdio.h>
+ #include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/statfs.h>
++#include <sys/syscall.h>
+ #include <sys/time.h>
+ #include <sys/un.h>
+ 
+@@ -2899,7 +2904,8 @@ static long syz_open_nfs_lane_profile(volatile long a0, volatile long a1)
+ 	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+ }
+ 
+-static long nfs_socket_connect_pair(unsigned long client, unsigned long backend)
++static long nfs_socket_connect_port(unsigned long client, unsigned long backend,
++				    uint16 port)
+ {
+ 	if (client > 1 || backend > 1 || nfs_fuzz_netns_fds[client] < 0 ||
+ 	    !nfs_fuzz_server_addrs[backend]) {
+@@ -2924,7 +2930,7 @@ static long nfs_socket_connect_pair(unsigned long client, unsigned long backend)
+ 	if (fd >= 0) {
+ 		struct sockaddr_in addr = {};
+ 		addr.sin_family = AF_INET;
+-		addr.sin_port = htons(2049);
++		addr.sin_port = htons(port);
+ 		addr.sin_addr.s_addr = nfs_fuzz_server_addrs[backend];
+ 		if (connect(fd, (struct sockaddr*)&addr, sizeof(addr))) {
+ 			saved_errno = errno;
+@@ -2939,6 +2945,11 @@ static long nfs_socket_connect_pair(unsigned long client, unsigned long backend)
+ 	return fd;
+ }
+ 
++static long nfs_socket_connect_pair(unsigned long client, unsigned long backend)
++{
++	return nfs_socket_connect_port(client, backend, 2049);
++}
++
+ static long syz_socket_connect_nfs(volatile long a0)
+ {
+ 	// Backward-compatible primary alias; use the pair form for four routes.
+@@ -2950,6 +2961,121 @@ static long syz_socket_connect_nfs_pair(volatile long a0, volatile long a1)
+ 	return nfs_socket_connect_pair(a0, a1);
+ }
+ 
++// The NLM lane fixture pins the kernel lockd to this TCP port in every lane
++// namespace.  Both clients reach the server's lockd at the .1 address.
++#define NFS_LANE_NLM_PORT 4045
++
++static long syz_socket_connect_nlm(volatile long a0)
++{
++	// syz_socket_connect_nlm(client const[0:1]) sock_nlm_tcp
++	unsigned long client = a0;
++	if (client > 1) {
++		errno = EINVAL;
++		return -1;
++	}
++	return nfs_socket_connect_port(client, 0, NFS_LANE_NLM_PORT);
++}
++
++#ifndef __NR_openat2
++#define __NR_openat2 437
++#endif
++
++struct nfs_lane_open_how {
++	uint64 flags;
++	uint64 mode;
++	uint64 resolve;
++};
++
++// Open a regular file of the NFS lane strictly beneath dirfd: no symlink,
++// magic link, mount crossing or "..".  mode: 0 read-only, 1 read-write,
++// 2 read-write and create; 3 (internal) an O_PATH reference.
++static int nfs_lane_open_file(int dirfd, const char* file, unsigned long mode)
++{
++	if (!file || mode > 3) {
++		errno = EINVAL;
++		return -1;
++	}
++	static const uint64 flags[] = {O_RDONLY, O_RDWR, O_RDWR | O_CREAT, O_PATH};
++	struct nfs_lane_open_how how = {};
++	how.flags = flags[mode] | O_CLOEXEC | O_NOFOLLOW;
++	how.mode = mode == 2 ? 0644 : 0;
++	// RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS |
++	// RESOLVE_BENEATH
++	how.resolve = 0x01 | 0x02 | 0x04 | 0x08;
++	int fd = syscall(__NR_openat2, dirfd, file, &how, sizeof(how));
++	if (fd < 0)
++		return -1;
++	struct stat st;
++	struct statfs sfs;
++	if (fstat(fd, &st) || fstatfs(fd, &sfs)) {
++		int saved_errno = errno;
++		close(fd);
++		errno = saved_errno;
++		return -1;
++	}
++	if (!S_ISREG(st.st_mode) || sfs.f_type != 0x6969) {
++		close(fd);
++		errno = EINVAL;
++		return -1;
++	}
++	return fd;
++}
++
++static long syz_open_nlm_lane_file(volatile long a0, volatile long a1, volatile long a2)
++{
++	// syz_open_nlm_lane_file(dir fd_nfs_dir, file ptr[in, string],
++	//                        mode int32[0:2]) fd
++	if ((unsigned long)a2 > 2) {
++		errno = EINVAL;
++		return -1;
++	}
++	return nfs_lane_open_file(a0, (const char*)a1, a2);
++}
++
++static long syz_nlm_lane_fh(volatile long a0, volatile long a1)
++{
++	// syz_nlm_lane_fh(dir fd_nfs_dir, file ptr[in, string]) nlm_lane_fh_id
++	// Return the variable words of a lane file's knfsd file handle: the NFS
++	// client embeds the server handle (u16 size, then the bytes) after three
++	// words of its own.  Every constant word must match the lane layout that
++	// nlm_lane_fh encodes (version 1, AUTH 0, FSID_NUM fsid 0, tmpfs FILEID
++	// type 1 with a zero high inode word); anything else fails with EPROTO.
++	int fd = nfs_lane_open_file(a0, (const char*)a1, 3);
++	if (fd < 0)
++		return -1;
++	union {
++		struct file_handle fh;
++		uint8 raw[sizeof(struct file_handle) + 128];
++	} handle = {};
++	handle.fh.handle_bytes = 128;
++	int mount_id = 0;
++	int ret = name_to_handle_at(fd, "", &handle.fh, &mount_id, AT_EMPTY_PATH);
++	int saved_errno = errno;
++	close(fd);
++	if (ret) {
++		errno = saved_errno;
++		return -1;
++	}
++	const uint8* embedded = handle.fh.f_handle + 12;
++	uint16 size = 0;
++	if (handle.fh.handle_bytes < 12 + 2 + 20) {
++		errno = EPROTO;
++		return -1;
++	}
++	memcpy(&size, embedded, sizeof(size));
++	const uint8* fh = embedded + 2;
++	static const uint8 lane_prefix[8] = {1, 0, 1, 1, 0, 0, 0, 0};
++	static const uint8 zero_word[4] = {};
++	if (size != 20 || memcmp(fh, lane_prefix, sizeof(lane_prefix)) ||
++	    memcmp(fh + 16, zero_word, sizeof(zero_word))) {
++		errno = EPROTO;
++		return -1;
++	}
++	uint64 gen_ino = 0;
++	memcpy(&gen_ino, fh + 8, sizeof(gen_ino));
++	return gen_ino;
++}
++
+ static uint32 nfs_lifecycle_get32(const uint8* p)
+ {
+ 	return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) |
+@@ -3134,19 +3260,8 @@ static long syz_arm_nfs_proxy_v2(volatile long a0, volatile long a1)
+ 	return nfs_proxy_arm_send(rule, len);
+ }
+ 
+-static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
+-			      volatile long a2, volatile long a3,
+-			      volatile long a4)
++static long nfs_send_record(int fd, void* payload, size_t payload_len)
+ {
+-	// syz_send_nfs_fuzz(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call],
+-	//                    msglen len[msg], flags const[...], user_tag proc[...])
+-	// Sends one record-marked RPC call.  Server coverage is attributed by
+-	// lane, so flags and user_tag are accepted for compatibility and ignored.
+-	int fd = a0;
+-	void* payload = (void*)a1;
+-	size_t payload_len = a2;
+-	(void)a3;
+-	(void)a4;
+ 	if (!payload || payload_len < 8 || payload_len > 0x7fffffff) {
+ 		errno = EINVAL;
+ 		return -1;
+@@ -3162,6 +3277,26 @@ static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
+ 	msg.msg_iovlen = 2;
+ 	return sendmsg(fd, &msg, MSG_NOSIGNAL);
+ }
++
++static long syz_send_nlm_rpc(volatile long a0, volatile long a1, volatile long a2)
++{
++	// syz_send_nlm_rpc(fd sock_nlm_tcp, msg ptr[in, rpc_nlm_call],
++	//                  msglen len[msg])
++	return nfs_send_record(a0, (void*)a1, a2);
++}
++
++static long syz_send_nfs_fuzz(volatile long a0, volatile long a1,
++			      volatile long a2, volatile long a3,
++			      volatile long a4)
++{
++	// syz_send_nfs_fuzz(fd sock_nfs_fuzz_tcp, msg ptr[in, rpc_nfs_call],
++	//                    msglen len[msg], flags const[...], user_tag proc[...])
++	// Sends one record-marked RPC call.  Server coverage is attributed by
++	// lane, so flags and user_tag are accepted for compatibility and ignored.
++	(void)a3;
++	(void)a4;
++	return nfs_send_record(a0, (void*)a1, a2);
++}
+ #endif
+ 
+ #if SYZ_EXECUTOR || __NR_syz_open_dev
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index 822bbb9..e33729a 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -119,6 +119,10 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_nfsd_client_ctl":           alwaysSupported,
+ 	"syz_nfsd_cld_ctl":              alwaysSupported,
+ 	"syz_send_nfs_fuzz":             alwaysSupported,
++	"syz_socket_connect_nlm":        alwaysSupported,
++	"syz_open_nlm_lane_file":        alwaysSupported,
++	"syz_nlm_lane_fh":               alwaysSupported,
++	"syz_send_nlm_rpc":              alwaysSupported,
+ 	"syz_pidfd_open":                alwaysSupported,
+ 	"syz_create_resource":           alwaysSupported,
+ 	"syz_kfuzztest_run":             alwaysSupported,
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index e404840..2685542 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -370,3 +370,65 @@ func TestNFSProxyVariableLengthArm(t *testing.T) {
+ func pathIs(path []string, want string) bool {
+ 	return len(path) == 1 && path[0] == want
+ }
++
++func TestNLMLaneCalls(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for client := uint64(0); client < 2; client++ {
++		call := requireNFSFuzzCall(t, target, fmt.Sprintf("syz_socket_connect_nlm$client%d", client))
++		if call.CallName != "syz_socket_connect_nlm" || len(call.Args) != 1 {
++			t.Fatalf("%s has wrong dispatch or arity", call.Name)
++		}
++		requireConst(t, call.Args[0].Type, client, call.Name+" client")
++		if res, ok := call.Ret.(*prog.ResourceType); !ok || res.Desc.Name != "sock_nlm_tcp" {
++			t.Fatalf("%s returns %v, want sock_nlm_tcp", call.Name, call.Ret)
++		}
++	}
++	open := requireNFSFuzzCall(t, target, "syz_open_nlm_lane_file")
++	if len(open.Args) != 3 {
++		t.Fatalf("%s has arity %d", open.Name, len(open.Args))
++	}
++	if res, ok := open.Args[0].Type.(*prog.ResourceType); !ok || res.Desc.Name != "fd_nfs_dir" {
++		t.Fatalf("%s dir is %v, want fd_nfs_dir", open.Name, open.Args[0].Type)
++	}
++	if mode, ok := open.Args[2].Type.(*prog.IntType); !ok || mode.RangeBegin != 0 || mode.RangeEnd != 2 {
++		t.Fatalf("%s mode is %v, want int32[0:2]", open.Name, open.Args[2].Type)
++	}
++	fh := requireNFSFuzzCall(t, target, "syz_nlm_lane_fh")
++	if res, ok := fh.Ret.(*prog.ResourceType); !ok || res.Desc.Name != "nlm_lane_fh_id" {
++		t.Fatalf("%s returns %v, want nlm_lane_fh_id", fh.Name, fh.Ret)
++	}
++	send := requireNFSFuzzCall(t, target, "syz_send_nlm_rpc")
++	if len(send.Args) != 3 {
++		t.Fatalf("%s has arity %d", send.Name, len(send.Args))
++	}
++	// The lane file handle is 20 bytes on the wire after its length word.
++	lane := requireStruct(t, send, "nlm_lane_fh")
++	if lane.Size() != 24 {
++		t.Fatalf("nlm_lane_fh is %d bytes, want 24", lane.Size())
++	}
++}
++
++func TestNLMLaneProgramsParse(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	const text = `r0 = syz_open_nfs_lane_profile$client0_knfsd_v3(0x0, 0x0)
++r1 = syz_open_nlm_lane_file(r0, &(0x7f0000000000)='lock0\x00', 0x2)
++fcntl$lock(r1, 0x6, &(0x7f0000000040)={0x1, 0x0, 0x0, 0x0, 0x0})
++r2 = syz_nlm_lane_fh(r0, &(0x7f0000000080)='lock0\x00')
++r3 = syz_socket_connect_nlm$client0(0x0)
++syz_send_nlm_rpc(r3, &(0x7f0000000100)=@v4={0x1, 0x0, 0x2, 0x186b5, 0x4, @lock={0x2, @sys={0x1, 0x20, {0x0, {0x9, 'syzkaller'}, 0x0, 0x0, 0x0, []}}, @none={0x0, 0x0}, {@empty=0x0, 0x0, 0x1, {{0x9, 'syzkaller'}, @lane={0x14, 0x1000101, 0x0, r2, 0x0}, {0x4, "01020304"}, 0x4a4c, 0x0, 0x0}, 0x0, 0x1}}}, 0xa0)
++recvfrom$inet_nlm_tcp(r3, &(0x7f0000000200)=""/128, 0x80, 0x0, 0x0, 0x0)
++`
++	p, err := target.Deserialize([]byte(text), prog.Strict)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(p.Calls) != 7 {
++		t.Fatalf("parsed %d calls", len(p.Calls))
++	}
++}
+diff --git a/sys/linux/socket_inet_nlm.txt b/sys/linux/socket_inet_nlm.txt
+new file mode 100644
+index 0000000..e47378e
+--- /dev/null
++++ b/sys/linux/socket_inet_nlm.txt
+@@ -0,0 +1,246 @@
++# Copyright 2026 syzkaller project authors. All rights reserved.
++# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++# NLM (Network Lock Manager, RPC program 100021) calls to the fixed lane's
++# kernel lockd.  Only the NLM lane fixture (NFS_FIXTURE=nlm-knfsd) runs lockd
++# with locking clients; elsewhere the connect fails.  The fixture pins lockd
++# to TCP port 4045 in every lane namespace, so the destination is fixture
++# metadata, not fuzzed input; the RPC/XDR body remains mutable.  Coverage of
++# the lockd request is attributed by lane like any other lane server record.
++
++resource sock_nlm_tcp[sock]
++
++# A knfsd NFSv3 file handle of the lane export holds only two variable words:
++# the tmpfs inode generation and the low inode number.  The executor reads the
++# handle of a lane file through the NFS client, checks every constant word
++# against nlm_lane_fh, and returns the two variable words in their wire order.
++resource nlm_lane_fh_id[int64]: 0
++
++# Connect a plain TCP socket from the chosen lane client network namespace to
++# the server's lockd at 10.89.N.1:4045.
++syz_socket_connect_nlm$client0(client const[0]) sock_nlm_tcp
++syz_socket_connect_nlm$client1(client const[1]) sock_nlm_tcp
++
++# Open a regular file strictly beneath a lane directory: no symlinks, no
++# mount crossing, no "..".  The returned fd keeps the directory's lane origin,
++# so kernel NFS client byte-range locks on it (fcntl$lock) become NLM calls.
++# mode is an executor ABI value: 0 read-only, 1 read-write, 2 read-write and
++# create.
++syz_open_nlm_lane_file(dir fd_nfs_dir, file ptr[in, string[nlm_lane_file_names]], mode int32[0:2]) fd
++
++# Resolve a regular file beneath a lane directory the same way to the variable
++# part of its server file handle.
++syz_nlm_lane_fh(dir fd_nfs_dir, file ptr[in, string[nlm_lane_file_names]]) nlm_lane_fh_id
++
++# Send one record-marked NLM call; the record marker is added by the executor.
++syz_send_nlm_rpc(fd sock_nlm_tcp, msg ptr[in, rpc_nlm_call], msglen len[msg])
++recvfrom$inet_nlm_tcp(fd sock_nlm_tcp, buf buffer[out], len len[buf], f flags[recv_flags], addr const[0], addrlen const[0])
++
++nlm_lane_file_names = "lock0", "lock1", "lock2", "shared/fixture"
++
++rpc_nlm_call [
++	v4	rpc_nlm4_call
++	v3	rpc_nlm3_call
++] [varlen]
++
++rpc_nlm4_call {
++	xid	int32be
++	mtype	const[0, int32be]
++	rpcvers	const[2, int32be]
++	prog	const[100021, int32be]
++	vers	const[4, int32be]
++	body	nlm4_call_bodies
++} [packed]
++
++# Versions 1 and 3 share 32-bit offsets; version 1 has no share procedures.
++nlm_v13_versions = 1, 3
++
++rpc_nlm3_call {
++	xid	int32be
++	mtype	const[0, int32be]
++	rpcvers	const[2, int32be]
++	prog	const[100021, int32be]
++	vers	flags[nlm_v13_versions, int32be]
++	body	nlm3_call_bodies
++} [packed]
++
++type nlm_call_t[PROC, ARGS] {
++	proc	const[PROC, int32be]
++	cred	rpc_auth
++	verf	rpc_auth
++	args	ARGS
++} [packed]
++
++type nlm_void_call_t[PROC] {
++	proc	const[PROC, int32be]
++	cred	rpc_auth
++	verf	rpc_auth
++} [packed]
++
++nlm4_call_bodies [
++	null		nlm_void_call_t[0]
++	test		nlm_call_t[1, nlm_testargs[int64be]]
++	lock		nlm_call_t[2, nlm_lockargs[int64be]]
++	cancel		nlm_call_t[3, nlm_cancargs[int64be]]
++	unlock		nlm_call_t[4, nlm_unlockargs[int64be]]
++	granted		nlm_call_t[5, nlm_testargs[int64be]]
++	test_msg	nlm_call_t[6, nlm_testargs[int64be]]
++	lock_msg	nlm_call_t[7, nlm_lockargs[int64be]]
++	cancel_msg	nlm_call_t[8, nlm_cancargs[int64be]]
++	unlock_msg	nlm_call_t[9, nlm_unlockargs[int64be]]
++	granted_msg	nlm_call_t[10, nlm_testargs[int64be]]
++	test_res	nlm_call_t[11, nlm_testres[int64be]]
++	lock_res	nlm_call_t[12, nlm_res]
++	cancel_res	nlm_call_t[13, nlm_res]
++	unlock_res	nlm_call_t[14, nlm_res]
++	granted_res	nlm_call_t[15, nlm_res]
++	share		nlm_call_t[20, nlm_shareargs]
++	unshare		nlm_call_t[21, nlm_shareargs]
++	nm_lock		nlm_call_t[22, nlm_lockargs[int64be]]
++	free_all	nlm_call_t[23, nlm_notify]
++] [varlen]
++
++nlm3_call_bodies [
++	null		nlm_void_call_t[0]
++	test		nlm_call_t[1, nlm_testargs[int32be]]
++	lock		nlm_call_t[2, nlm_lockargs[int32be]]
++	cancel		nlm_call_t[3, nlm_cancargs[int32be]]
++	unlock		nlm_call_t[4, nlm_unlockargs[int32be]]
++	granted		nlm_call_t[5, nlm_testargs[int32be]]
++	test_msg	nlm_call_t[6, nlm_testargs[int32be]]
++	lock_msg	nlm_call_t[7, nlm_lockargs[int32be]]
++	cancel_msg	nlm_call_t[8, nlm_cancargs[int32be]]
++	unlock_msg	nlm_call_t[9, nlm_unlockargs[int32be]]
++	granted_msg	nlm_call_t[10, nlm_testargs[int32be]]
++	test_res	nlm_call_t[11, nlm_testres[int32be]]
++	lock_res	nlm_call_t[12, nlm_res]
++	cancel_res	nlm_call_t[13, nlm_res]
++	unlock_res	nlm_call_t[14, nlm_res]
++	granted_res	nlm_call_t[15, nlm_res]
++	share		nlm_call_t[20, nlm_shareargs]
++	unshare		nlm_call_t[21, nlm_shareargs]
++	nm_lock		nlm_call_t[22, nlm_lockargs[int32be]]
++	free_all	nlm_call_t[23, nlm_notify]
++] [varlen]
++
++# XDR opaque<1024> (netobj) and string<1024>, padded to four bytes.
++nlm_netobj {
++	len	len[data, int32be]
++	data	array[int8, 0:32]
++} [packed, align[4]]
++
++nlm_cookie [
++	empty	const[0, int32be]
++	value	nlm_netobj
++] [varlen]
++
++nlm_caller_names = "frozen-phase9-lane0-client0", "frozen-phase9-lane0-client1", "localhost", "syzkaller"
++
++nlm_caller_name {
++	len	len[data, int32be]
++	data	stringnoz[nlm_caller_names]
++} [packed, align[4]]
++
++# The lane file handle: version 1, AUTH 0, FSID_NUM fsid 0, tmpfs FILEID type
++# 1 (generation, low inode, high inode 0).
++nlm_lane_fh {
++	len		const[20, int32be]
++	header		const[0x01000101, int32be]
++	fsid		const[0, int32]
++	gen_ino		nlm_lane_fh_id
++	ino_high	const[0, int32]
++} [packed]
++
++nlm_fh [
++	lane	nlm_lane_fh
++	raw	nlm_netobj
++] [varlen]
++
++type nlm_lock_t[OFF] {
++	caller_name	nlm_caller_name
++	fh		nlm_fh
++	oh		nlm_netobj
++	svid		int32be
++	l_offset	OFF
++	l_len		OFF
++} [packed]
++
++type nlm_testargs[OFF] {
++	cookie		nlm_cookie
++	exclusive	int32be[0:1]
++	alock		nlm_lock_t[OFF]
++} [packed]
++
++type nlm_lockargs[OFF] {
++	cookie		nlm_cookie
++	block		int32be[0:1]
++	exclusive	int32be[0:1]
++	alock		nlm_lock_t[OFF]
++	reclaim		int32be[0:1]
++	state		int32be
++} [packed]
++
++type nlm_cancargs[OFF] {
++	cookie		nlm_cookie
++	block		int32be[0:1]
++	exclusive	int32be[0:1]
++	alock		nlm_lock_t[OFF]
++} [packed]
++
++type nlm_unlockargs[OFF] {
++	cookie	nlm_cookie
++	alock	nlm_lock_t[OFF]
++} [packed]
++
++nlm_stats = 0, 1, 2, 3, 4, 5, 6, 7, 8
++
++nlm_res {
++	cookie	nlm_cookie
++	stat	flags[nlm_stats, int32be]
++} [packed]
++
++type nlm_holder[OFF] {
++	exclusive	int32be[0:1]
++	svid		int32be
++	oh		nlm_netobj
++	l_offset	OFF
++	l_len		OFF
++} [packed]
++
++type nlm_testrply[OFF] [
++	granted	const[0, int32be]
++	denied	nlm_testrply_denied[OFF]
++	other	flags[nlm_stats, int32be]
++] [varlen]
++
++type nlm_testrply_denied[OFF] {
++	stat	const[1, int32be]
++	holder	nlm_holder[OFF]
++} [packed]
++
++type nlm_testres[OFF] {
++	cookie	nlm_cookie
++	stat	nlm_testrply[OFF]
++} [packed]
++
++nlm_share_modes = 0, 1, 2, 3
++nlm_share_access = 0, 1, 2, 3
++
++nlm_share {
++	caller_name	nlm_caller_name
++	fh		nlm_fh
++	oh		nlm_netobj
++	mode		flags[nlm_share_modes, int32be]
++	access		flags[nlm_share_access, int32be]
++} [packed]
++
++nlm_shareargs {
++	cookie	nlm_cookie
++	share	nlm_share
++	reclaim	int32be[0:1]
++} [packed]
++
++nlm_notify {
++	name	nlm_caller_name
++	state	int32be
++} [packed]

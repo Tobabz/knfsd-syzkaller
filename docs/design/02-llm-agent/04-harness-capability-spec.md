@@ -668,6 +668,90 @@ tools/nfs-lifecycle/run.py
 agent_pipeline/stage1/host/template/capability-evidence/hcap12-kvm.json
 ```
 
+### HCAP-13 — NLM lane locking and raw NLM RPC
+
+```text
+id: HCAP-13
+name: NLM lane locking and raw NLM RPC
+usable_stage: [stage1]
+usable_by: [agent_stage1]
+status: validated (KVM evidence 전까지 generator가 template을 거부)
+scope: [nlm_lane_lock_rpc]
+
+interface:
+    syz_open_nlm_lane_file(lane fd, name, mode)       # lane 아래 regular file
+    fcntl$lock(fd, 0x5 F_GETLK | 0x6 F_SETLK, flock)  # kernel NFS client의 NLM 호출
+    syz_nlm_lane_fh(lane fd, name) -> nlm_lane_fh_id   # server file handle의 가변 word
+    syz_socket_connect_nlm$client0/1                    # lane client netns -> server lockd TCP 4045
+    syz_send_nlm_rpc(sock, rpc_nlm_call, len)           # record-marked raw NLM call
+    recvfrom$inet_nlm_tcp(sock, ...)                    # reply
+
+purpose:
+    nlm-knfsd fixture(NFSv3 single lane)에서 server lane lockd의 LOCK/TEST/UNLOCK/CANCEL/SHARE와
+    blocked lock의 GRANTED callback을 Stage 1 program으로 실행
+```
+
+Fixture (`NFS_FIXTURE=nlm-knfsd`, `koov.nfs_fixture=nlm-knfsd`):
+
+- single NFSv3 fixture에 `SERVER_IMPL=both`가 필요하고, Ganesha mount는 계속 `nolock`이다.
+- root namespace rpcbind를 멈추고, lane마다 server와 두 client network namespace에 각자의 rpcbind와
+  `rpc.statd`(고정 port 662/2020, `/run`과 `/var/lib/nfs`는 namespace별)를 실행한다. kernel lockd의
+  rpcbind 등록은 mount한 namespace의 `127.0.0.1:111`로 간다.
+- `fs.nfs.nlm_tcpport`/`nlm_udpport`는 4045, `nlm_grace_period`는 10초다. setup은 두 knfsd mount에서
+  공유 lock을 한 번 잡아 grace 종료와 lockd·statd 응답을 확인한다.
+- lane status는 세 namespace의 nlockmgr v4와 status v1 등록, server의 4045 listen, knfsd mount에
+  `nolock`이 없음을 확인한다.
+
+Program 제약과 Materializer 계약:
+
+- NLM 호출(`syz_socket_connect_nlm$*`, `syz_send_nlm_rpc`, `recvfrom$inet_nlm_tcp`,
+  `syz_open_nlm_lane_file`, `syz_nlm_lane_fh`)은 HCAP-13을 요구한 scenario에서만 admit되고, neutral
+  control은 이를 가질 수 없다(`nlm_without_hcap13`). HCAP-13 scenario는 `nlm-knfsd` selection을 써야
+  한다(`fixture_not_nlm`).
+- `fcntl$lock`은 knfsd-v3 lane origin FD와 cmd 5..6만 admit한다. collector는 non-threaded로 한
+  program을 실행하므로 F_SETLKW와 OFD lock은 admit되지 않는다. blocked lock은 raw `LOCK`(block=1)으로
+  만든다.
+- `syz_open_nlm_lane_file`의 결과 FD는 lane directory 인자의 origin을 이어받는다(openat2
+  RESOLVE_BENEATH/NO_XDEV/NO_SYMLINKS/NO_MAGICLINKS와 NFS superblock 확인).
+- raw NLM 메시지의 `len` field는 정확해야 한다. 파일 핸들은 `@lane` 형태로 `syz_nlm_lane_fh` 결과를
+  쓰며, executor가 lane export handle의 상수 word를 모두 확인한다.
+
+NLM 작업의 실행 context와 귀속:
+
+| NLM 작업 | 실행 context | remote-KCOV |
+|---|---|---|
+| server lockd가 TCP NLM 요청을 처리 (`nlmsvc_lock/testlock/unlock/cancel_blocked`, `nlmsvc_share_file`, GRANTED_RES의 `nlmsvc_grant_reply`) | lockd `svc_recv` (server lane netns) | 귀속됨 (`request`) |
+| client0 lockd가 GRANTED_MSG callback을 처리 (`nlmclnt_grant`) | lockd `svc_recv` (client lane netns) | 귀속됨 (`request`) |
+| blocked lock 재시도와 grant (`nlmsvc_retry_blocked`, `nlmsvc_grant_blocked`) | lockd thread 자체 | 귀속 안 됨 |
+| `*_MSG`의 async reply와 GRANTED_MSG 송신, NSM upcall | rpciod / lockd | 귀속 안 됨 |
+| UDP NLM 요청 | lockd `svc_udp_recvfrom` | 귀속 안 됨 |
+| kernel client의 동기 NLM 호출 | executor 프로세스 | executor 자체 KCOV |
+
+귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.lockd` gap으로 남는다. 그 context를
+귀속하려면 커널 패치가 필요하며 owner 승인 전에는 적용하지 않는다.
+
+KVM 증거(`capability-evidence/hcap13-kvm.json`, `Hcap13KvmEvidence`)는 `v3-nlm-lock` campaign의 run마다
+하나의 귀속 generation과 공개 lockd probe(`svc_lock`, `svc_unlock`, `svc_testlock`, `svc_share`,
+`clnt_grant`) hit 수를 담는다. promotion 조건은 다음과 같다.
+
+- neutral control은 모든 probe를 miss한다.
+- lock(kernel client F_SETLK/F_GETLK/unlock)은 `svc_lock`, `svc_unlock`을 hit하고 `clnt_grant`는 miss한다.
+- rpc(raw LOCK/TEST/UNLOCK/SHARE/UNSHARE)는 `svc_lock`, `svc_unlock`, `svc_testlock`, `svc_share`를 hit한다.
+- blocked(client1 lock 뒤의 raw blocking LOCK, client1 unlock)는 `svc_lock`, `svc_unlock`, `clnt_grant`를
+  hit한다.
+- 모든 run 뒤에 lane status가 통과하고 crash와 artifact 오류가 없어야 한다.
+
+`nlmsvc_grant_blocked`와 `nlmsvc_grant_reply`는 진단으로만 기록한다.
+
+source refs:
+
+```text
+bundle/patches/syzkaller/0030-*
+bundle/lane/lane.sh
+tools/nfs-lifecycle/run.py
+agent_pipeline/stage1/host/template/capability-evidence/hcap13-kvm.json
+```
+
 ### Target Proxy Architecture와의 관계
 
 HCAP-07/08/09는 현재 `tools/nfs-proxy`에서 검증된 concrete capability를 기록한다.
@@ -727,6 +811,7 @@ STAGE 1
     HCAP-06 flow tracing
     HCAP-11 bounded NFSv4.1 client lifecycle recovery
     HCAP-12 bounded nfsdcld reconnect during NFSv4.1 client recovery
+    HCAP-13 NLM lane locking and raw NLM RPC
 
 STAGE 2
     Stage 1에서 선택된 scenario

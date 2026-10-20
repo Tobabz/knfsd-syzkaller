@@ -382,6 +382,8 @@ def _bind_manager_command(path: Path, command) -> None:
         "manager config must be an explicit Stage 2 command argument")
 
 
+# nlm-knfsd is a Stage 1 reachability fixture (HCAP-13); a Stage 2 manager
+# command line selecting it is refused here.
 _DYNAMIC_CMDLINE_VALUES = {
     "koov.nfs_fixture": {"broad-knfsd"},
     "koov.nfs_target": {"1"},

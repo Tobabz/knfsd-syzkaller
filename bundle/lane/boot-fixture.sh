@@ -43,12 +43,12 @@ case "$fixture_mode" in
 		NFS_VERSION=$version
 		export NFS_VERSION
 		;;
-	broad-knfsd)
+	broad-knfsd|nlm-knfsd)
 		test -z "$version" || {
-			echo "koov.nfs_version cannot be combined with broad-knfsd" >&2
+			echo "koov.nfs_version cannot be combined with $fixture_mode" >&2
 			exit 2
 		}
-		NFS_FIXTURE=broad-knfsd
+		NFS_FIXTURE=$fixture_mode
 		export NFS_FIXTURE
 		;;
 	*) echo "unsupported NFS fixture: $fixture_mode" >&2; exit 2 ;;

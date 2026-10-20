@@ -107,6 +107,33 @@ func TestCldControlPreservesDirectFD(t *testing.T) {
 	}
 }
 
+func TestNLMLaneFileKeepsLaneOrigin(t *testing.T) {
+	source := "r0 = syz_open_nfs_lane_profile$client1_knfsd_v3(0x0, 0x1)\n" +
+		"r1 = syz_open_nlm_lane_file(r0, &(0x7f0000000000)='lock0\\x00', 0x2)\n" +
+		"r2 = syz_nlm_lane_fh(r0, &(0x7f0000000100)='lock0\\x00')\n" +
+		"r3 = syz_socket_connect_nlm$client0(0x0)\n" +
+		"recvfrom$inet_nlm_tcp(r3, &(0x7f0000000200)=\"\"/16, 0x10, 0x0, 0x0, 0x0)\n" +
+		"fcntl$lock(r1, 0x6, &(0x7f0000000300)={0x1, 0x0, 0x0, 0x1, 0x0})\n" +
+		"fsync(r0)\n"
+	r := mustParse(t, source)
+	origin := "nfs-profile:knfsd-v3:client1"
+	for _, index := range []int{1, 2, 5, 6} {
+		if len(r.Calls[index].Facts.Origins) != 1 || r.Calls[index].Facts.Origins[0].Origin != origin {
+			t.Fatalf("call %d lost the lane origin: %+v", index, r.Calls[index].Facts)
+		}
+	}
+	if len(r.Calls[4].Facts.Origins) != 0 {
+		t.Fatal("NLM socket gained a lane origin")
+	}
+	// A file opened beneath an unrooted descriptor stays unrooted.
+	r = mustParse(t, "r0 = openat(0xffffffffffffff9c, &(0x7f0000000000)='./file0\\x00', 0x0, 0x0)\n"+
+		"r1 = syz_open_nlm_lane_file(r0, &(0x7f0000000100)='lock0\\x00', 0x0)\n"+
+		"fcntl$lock(r1, 0x6, &(0x7f0000000300)={0x1, 0x0, 0x0, 0x1, 0x0})\n")
+	if len(r.Calls[2].Facts.Origins) != 0 {
+		t.Fatal("unrooted NLM lane file gained an origin")
+	}
+}
+
 func TestAllExplicitProfiles(t *testing.T) {
 	for p, suffix := range []string{"knfsd_v3", "knfsd_v40", "knfsd_v41", "knfsd_v42", "ganesha_v41"} {
 		for client := 0; client < 2; client++ {

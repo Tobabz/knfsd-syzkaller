@@ -72,6 +72,7 @@ from agent_pipeline.materializer import (
     _Failure,
     _hcap11_program_error,
     _hcap12_program_error,
+    _hcap13_program_error,
     descriptor_id,
 )
 
@@ -498,6 +499,50 @@ def test_materializer_enforces_hcap12_program_contract_before_call_grants(
     assert caught.value.result().reason == CALL_NOT_ADMITTED
     assert caught.value.result().detail == (
         f"{role}_hcap12_program_contract:{detail}")
+
+
+HCAP13_CALLS = ("syz_open_nfs_lane_profile$client0_knfsd_v3",
+                "syz_socket_connect_nlm$client0", "syz_send_nlm_rpc",
+                "recvfrom$inet_nlm_tcp", "fsync")
+NLM_RUNTIME = dict(profile="knfsd-v3", nfs_version="3",
+                   fixture_mode="nlm-knfsd")
+
+
+def test_hcap13_program_contract_accepts_nlm_calls_on_nlm_fixture(world):
+    parsed_program = hcap11_parsed(world.identity, HCAP13_CALLS, ())
+    assert _hcap13_program_error(
+        parsed_program, role="scenario", selection=runtime(**NLM_RUNTIME),
+        required_capabilities=("HCAP-01", "HCAP-13")) is None
+    # Ordinary lane I/O on the NLM fixture needs no HCAP-13 contract.
+    assert _hcap13_program_error(
+        hcap11_parsed(world.identity, ("fsync",), ()), role="neutral",
+        selection=runtime(**NLM_RUNTIME),
+        required_capabilities=("HCAP-01",)) is None
+
+
+@pytest.mark.parametrize(("role", "required", "calls", "reason", "detail"), [
+    ("scenario", ("HCAP-13",), ("fsync",),
+     PROFILE_FIXTURE_ROUTE_MISMATCH, "fixture_not_nlm"),
+    ("scenario", ("HCAP-01",), HCAP13_CALLS, CALL_NOT_ADMITTED,
+     "nlm_without_hcap13"),
+    ("neutral", ("HCAP-01", "HCAP-13"), ("syz_nlm_lane_fh", "fsync"),
+     CALL_NOT_ADMITTED, "nlm_without_hcap13"),
+])
+def test_materializer_enforces_hcap13_program_contract_before_call_grants(
+        world, role, required, calls, reason, detail):
+    from agent_pipeline.admission import CallAdmissionAuthority
+    authority = CallAdmissionAuthority(
+        hcap_revision=world.hcap_ref, profile_ref=world.profile_ref,
+        profile=world.profile)
+    with pytest.raises(_Failure) as caught:
+        world.materializer._admit(
+            hcap11_parsed(world.identity, calls, HCAP12_CLIENT0),
+            role=role, selection=world.runtime,
+            required_capabilities=required, authority=authority,
+            call_table=world.call_table)
+    assert caught.value.result().reason == reason
+    assert caught.value.result().detail == (
+        f"{role}_hcap13_program_contract:{detail}")
 
 
 def test_program_flow_persists_and_reloads_complete_records(world):

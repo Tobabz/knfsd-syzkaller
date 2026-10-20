@@ -43,6 +43,7 @@ from agent_pipeline.stage1.host.collector import (CollectorConfig,
 from agent_pipeline.stage1.host.generate import (GenerationError,
                                                  HCAP11_RECOVERY_ORDER,
                                                  Hcap11KvmEvidence, Hcap12KvmEvidence,
+                                                 Hcap13KvmEvidence,
                                                  generate,
                                                  series_fingerprint)
 from agent_pipeline.stage1.host.target_pcs import (CallbackSites,
@@ -673,14 +674,115 @@ def test_template_spec_is_valid():
                selection.enabled_interfaces
                for selection in spec.runtime_selections)
     # The HCAP-11 selection is unchanged; reconnect has its own selection.
-    with_cld = [s for s in spec.runtime_selections
+    v41 = [s for s in spec.runtime_selections if s.profile == "knfsd-v41"]
+    with_cld = [s for s in v41
                 if "syz_nfsd_cld_ctl$reconnect" in s.enabled_interfaces]
-    without = [s for s in spec.runtime_selections
+    without = [s for s in v41
                if "syz_nfsd_cld_ctl$reconnect" not in s.enabled_interfaces]
     assert len(with_cld) == len(without) == 1
     assert set(with_cld[0].enabled_interfaces) - set(
         without[0].enabled_interfaces) == {"syz_nfsd_cld_ctl$reconnect"}
     assert "remote_kcov.context.cld" in spec.missing_capability_ids
+
+    # HCAP-13 has its own nlm-knfsd NFSv3 selection, a neutral control on
+    # it, and is promoted only by capability-evidence/hcap13-kvm.json.
+    nlm = next(c for c in spec.capabilities if c.id == "HCAP-13")
+    assert nlm.scope == ("nlm_lane_lock_rpc",)
+    assert spec.capability_evidence["HCAP-13"] == (
+        Path("capability-evidence/hcap13-kvm.json"),)
+    nlm_evidence = template / spec.capability_evidence["HCAP-13"][0]
+    if nlm_evidence.is_file():
+        evidence_json = json.loads(nlm_evidence.read_text())
+        assert Hcap13KvmEvidence.model_validate(
+            evidence_json).capability_id == "HCAP-13"
+    nlm_selections = [s for s in spec.runtime_selections
+                      if s.fixture_mode == "nlm-knfsd"]
+    assert len(nlm_selections) == 1
+    assert (nlm_selections[0].profile, nlm_selections[0].nfs_version) == (
+        "knfsd-v3", "3")
+    assert any(item.runtime_selection == nlm_selections[0]
+               for item in spec.neutral_controls)
+    entries = {e.call: e for e in spec.admission_source.entries}
+    for call in nlm.interface.syz_calls:
+        assert entries[call].capability_ids == ("HCAP-13",)
+    lock = entries["fcntl$lock"]
+    assert [(c.kind, getattr(c, "minimum", None), getattr(c, "maximum", None))
+            for c in lock.resource_constraints] == [
+        ("resource_origin", None, None), ("integer_range", 5, 6)]
+    assert "remote_kcov.context.lockd" in spec.missing_capability_ids
+
+
+def _hcap13_run(completed=3, **hits):
+    probes = dict.fromkeys(("clnt_grant", "svc_lock", "svc_share",
+                            "svc_testlock", "svc_unlock"), 0)
+    probes.update(hits)
+    return {
+        "completed": completed,
+        "probe_hits": {name: [count] * completed
+                       for name, count in probes.items()},
+        "status_checks_passed": completed,
+        "attributed_generations": completed,
+    }
+
+
+def _hcap13_evidence(identity, lane_sha256):
+    value = _hcap12_evidence(identity, lane_sha256)
+    value.update({
+        "capability_id": "HCAP-13",
+        "scenario": "v3-nlm-lock",
+        "probe_mapping_sha256": {name: "1" * 64 for name in (
+            "clnt_grant", "svc_lock", "svc_share", "svc_testlock",
+            "svc_unlock")},
+        "runs": {
+            "control": _hcap13_run(),
+            "lock": _hcap13_run(svc_lock=2, svc_unlock=1, svc_testlock=1),
+            "rpc": _hcap13_run(svc_lock=2, svc_unlock=1, svc_testlock=1,
+                               svc_share=3),
+            "blocked": _hcap13_run(svc_lock=2, svc_unlock=1, clnt_grant=1),
+        },
+    })
+    return value
+
+
+def test_hcap13_evidence_accepts_the_validated_campaign_shape():
+    evidence = Hcap13KvmEvidence.model_validate(
+        _hcap13_evidence(HCAP12_IDENTITY, "8" * 64))
+    assert evidence.runs.blocked.probe_hits.clnt_grant == (1, 1, 1)
+
+
+@pytest.mark.parametrize(("path", "value", "message"), [
+    (("runs", "control", "probe_hits", "svc_lock"), [0, 1, 0],
+     "control run reached a lockd probe"),
+    (("runs", "lock", "probe_hits", "svc_unlock"), [1, 0, 1],
+     "lock run missed svc_unlock"),
+    (("runs", "lock", "probe_hits", "clnt_grant"), [0, 1, 0],
+     "lock run reached a grant callback"),
+    (("runs", "rpc", "probe_hits", "svc_share"), [1, 1, 0],
+     "rpc run missed svc_share"),
+    (("runs", "rpc", "probe_hits", "svc_testlock"), [0, 1, 1],
+     "rpc run missed svc_testlock"),
+    (("runs", "blocked", "probe_hits", "clnt_grant"), [1, 0, 1],
+     "blocked run missed clnt_grant"),
+    (("runs", "blocked", "attributed_generations"), 2,
+     "lacks one attributed generation"),
+    (("runs", "rpc", "status_checks_passed"), 2,
+     "left the lane fixture unhealthy"),
+    (("runs", "rpc", "completed"), 2, "greater than or equal to 3"),
+    (("probe_mapping_sha256",), {"svc_lock": "1" * 64},
+     "probe mappings differ"),
+    (("raw_artifact_error_count",), 1, "crash or artifact error"),
+    (("shareable_result_contains_target_metadata_or_addresses",), True,
+     "private target data"),
+    (("scenario",), "v41-cld-lifecycle", "v3-nlm-lock"),
+])
+def test_hcap13_evidence_rejects_unvalidated_campaigns(path, value, message):
+    evidence = _hcap13_evidence(HCAP12_IDENTITY, "8" * 64)
+    target = evidence
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=message):
+        Hcap13KvmEvidence.model_validate(evidence)
 
 
 @needs_gcc
@@ -832,6 +934,10 @@ def test_collector_records_guest_failures_as_facts(host, tmp_path):
     run = _collect(host, tmp_path / "b", pcs=["0x401000"],
                    dmesg="BUG: KASAN: slab-out-of-bounds in nfsd4_open\n")
     assert any("KASAN" in e for e in run.observation.runtime_errors)
+    # A fixture of another mode is not the selection's fixture.
+    run = _collect(host, tmp_path / "d", pcs=["0x401000"],
+                   fixture_mode="nlm-knfsd")
+    assert "fixture_not_ready" in run.observation.runtime_errors
     run = _collect(host, tmp_path / "c", boot_error="no ssh")
     assert not run.observation.boot_ok
     assert run.observation.generation.generation_begin is None
@@ -876,6 +982,15 @@ def test_guest_cmdline_requires_nokaslr():
     d.guest_kernel_command_line = "nokaslr koov.nfs_version=3"
     with pytest.raises(CollectorError, match="koov"):
         guest_cmdline(d, runtime(), "0" * 64)
+
+
+def test_guest_cmdline_selects_the_nlm_fixture_by_name():
+    d = SimpleNamespace(guest_kernel_command_line="root=/dev/sda nokaslr")
+    cmdline = guest_cmdline(d, runtime(
+        profile="knfsd-v3", nfs_version="3", fixture_mode="nlm-knfsd"),
+        "0" * 64).split()
+    assert "koov.nfs_fixture=nlm-knfsd" in cmdline
+    assert not any(t.startswith("koov.nfs_version=") for t in cmdline)
 
 
 # ------------------------------------------------------------ end to end

@@ -397,8 +397,8 @@ assert manifest["purpose"] == "mutation_seed"
 assert Path(ROOT / manifest["required_syzkaller_patch"]).is_file()
 assert Path(ROOT / manifest["required_syzkaller_validator_patch"]).is_file()
 syzkaller_patches = sorted((ROOT / "bundle/patches/syzkaller").glob("*.patch"))
-assert len(syzkaller_patches) == 29
-assert syzkaller_patches[-1].name.startswith("0029-")
+assert len(syzkaller_patches) == 30
+assert syzkaller_patches[-1].name.startswith("0030-")
 programs = {entry["path"]: entry for entry in manifest["programs"]}
 assert len(programs) == len(manifest["programs"]) == 12
 for entry in manifest["programs"]:
@@ -433,6 +433,31 @@ assert lane_source.index('if [ "$nfs_trace" = 1 ]; then') < lane_source.index(
     "for trace_group in nfsd lockd sunrpc rpcgss")
 assert '"nfs_trace":%s' in lane_source
 boot_source = (ROOT / "bundle/lane/boot-fixture.sh").read_text()
+# nlm-knfsd is the NFSv3 single fixture with kernel lockd locking: it is
+# selected by name, records its own mode and refuses other versions and a
+# missing Ganesha side before touching the host.
+assert "broad-knfsd|nlm-knfsd)" in boot_source
+assert "NFS_FIXTURE=$fixture_mode" in boot_source
+assert 'printf \'%s\\n\' "$fixture_label" > "$root/fixture.mode"' in lane_source
+assert "nlm_prepare_host" in lane_source
+assert lane_source.index('printf \'%s\\n\' "$fixture_label" > "$root/fixture.mode"') < \
+    lane_source.index("        nlm_prepare_host\n")
+assert "mount_lock=nolock" in lane_source and "$mount_lock,sec=sys" in lane_source
+assert 'nlm_start_client_daemons "$setup_lane_id" 0 "$setup_client0_ns"' in lane_source
+assert 'nlm_probe_mount "$setup_lane_root/client1/knfsd"' in lane_source
+assert '"nlm_port":%s' in lane_source
+for nlm_env, nlm_message in (
+        ({"NFS_FIXTURE": "nlm-knfsd", "NFS_VERSION": "4.1"},
+         "nlm-knfsd is an NFSv3 fixture"),
+        ({"NFS_FIXTURE": "nlm-knfsd", "SERVER_IMPL": "knfsd"},
+         "nlm-knfsd requires SERVER_IMPL=both"),
+        ({"NFS_FIXTURE": "other"}, "single, broad-knfsd or nlm-knfsd")):
+    nlm_result = subprocess.run(
+        ["sh", str(ROOT / "bundle/lane/lane.sh"), "status",
+         "/tmp/frozen-phase9.nlminputs"],
+        env={**os.environ, **nlm_env}, capture_output=True, text=True)
+    assert nlm_result.returncode == 2, nlm_result
+    assert nlm_message in nlm_result.stderr, nlm_result.stderr
 assert "koov.nfs_trace=*) trace=${arg#koov.nfs_trace=} ;;" in boot_source
 assert "trace=0\n" in boot_source
 # Proxy target mode is opt-in: koov.nfs_target=1 maps the share's target/

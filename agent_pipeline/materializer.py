@@ -325,6 +325,38 @@ def _hcap12_program_error(parsed: ParsedProgram) -> str | None:
     return None
 
 
+HCAP13_ID = "HCAP-13"
+HCAP13_FIXTURE = "nlm-knfsd"
+HCAP13_CALLS = frozenset({
+    "recvfrom$inet_nlm_tcp", "syz_nlm_lane_fh", "syz_open_nlm_lane_file",
+    "syz_send_nlm_rpc",
+})
+HCAP13_CALL_PREFIXES = ("syz_socket_connect_nlm$",)
+
+
+def _is_hcap13_call(name: str) -> bool:
+    return name in HCAP13_CALLS or name.startswith(HCAP13_CALL_PREFIXES)
+
+
+def _hcap13_program_error(parsed: ParsedProgram, *, role: str,
+                          selection: RuntimeSelection,
+                          required_capabilities: tuple[str, ...]
+                          ) -> str | None:
+    """Return why NLM lane calls are outside HCAP-13's validated fixture.
+
+    The NLM calls reach the lane lockd only on the nlm-knfsd fixture; on any
+    other fixture lockd is not listening on the pinned port and the knfsd
+    mounts use nolock.  A neutral control never carries them.
+    """
+    hcap13 = role == "scenario" and HCAP13_ID in required_capabilities
+    if hcap13 and selection.fixture_mode != HCAP13_FIXTURE:
+        return "fixture_not_nlm"
+    if not hcap13 and any(_is_hcap13_call(call.call)
+                          for call in parsed.calls):
+        return "nlm_without_hcap13"
+    return None
+
+
 class SyzParseFailure(ValueError):
     """A deterministic strict-parse refusal from the injected parser.
 
@@ -724,6 +756,13 @@ class ArtifactHarnessMaterializer:
             # HCAP-12 scenario contract may carry it, never a neutral control.
             self._fail(CALL_NOT_ADMITTED,
                        f"{role}_hcap12_program_contract:cld_without_hcap12")
+        error = _hcap13_program_error(
+            parsed, role=role, selection=selection,
+            required_capabilities=required_capabilities)
+        if error is not None:
+            self._fail(PROFILE_FIXTURE_ROUTE_MISMATCH
+                       if error == "fixture_not_nlm" else CALL_NOT_ADMITTED,
+                       f"{role}_hcap13_program_contract:{error}")
         if role == "scenario" and HCAP11_ID in required_capabilities:
             error = _hcap11_program_error(parsed)
             if error is not None:
