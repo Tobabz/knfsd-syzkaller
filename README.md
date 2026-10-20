@@ -195,6 +195,9 @@ Re-running bootstrap with `--update` rebuilds syzkaller and any selected kernel 
 into the same `env/`, so only the latest kernel images are kept. A kernel whose pinned base, series
 fingerprint, kconfig and clean patched tree all match its `images/<variant>/build.json` is kept as
 it is, so its kernel commit (which harness descriptors and target PC mappings bind) does not move.
+A record written before records carried the kconfig digest is backfilled only after the last passing
+`manifest.json` matches its tree, record, kconfig and images; otherwise `--update` stops without
+removing anything. A tree with local changes is also refused rather than rebuilt.
 `tools/fport-apply.sh` applies each series with a fixed committer and committer date = author date,
 so a rebuild from the same base and series reproduces the same commits. `--skip-build` reuses existing build
 outputs only when the series fingerprint recorded with them (`images/<variant>/build.json`,

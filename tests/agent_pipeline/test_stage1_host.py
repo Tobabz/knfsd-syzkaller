@@ -1006,8 +1006,10 @@ def _load_bootstrap():
     return module
 
 
-def _patched_kernel_env(tmp_path, bootstrap, *, kconfig=True):
-    """A target with a committed patched tree and recorded variant images."""
+def _patched_kernel_env(tmp_path, bootstrap, *, legacy=False):
+    """A target with a committed patched tree, recorded variant images and
+    the passing manifest of the bootstrap that built them.  ``legacy``
+    writes records in the pre-#66 four-field form, without kconfig_sha256."""
     linux = tmp_path / "linux"
     (linux / "include/linux/sunrpc").mkdir(parents=True)
     (linux / "include/linux/sunrpc/fuzz.h").write_text(
@@ -1018,50 +1020,121 @@ def _patched_kernel_env(tmp_path, bootstrap, *, kconfig=True):
     subprocess.run([*git, "-c", "user.name=t", "-c", "user.email=t@t",
                     "commit", "-q", "-m", "patched"], check=True)
     head = bootstrap.git_head(linux)
+    base = {"series_sha256": bootstrap.series_fingerprint("kernel"),
+            "base": bootstrap.KERNEL_COMMIT, "head": head, "commits": 5}
+    variants = {}
     for variant in bootstrap.VARIANTS:
         images = tmp_path / "images" / variant
         images.mkdir(parents=True)
-        (images / "bzImage").write_bytes(b"bz")
+        (images / "bzImage").write_bytes(b"bz-" + variant.encode())
+        (images / "vmlinux").write_bytes(b"vmlinux-" + variant.encode())
         (images / ".config").write_text("CONFIG_KCOV=y\n")
-        record = {"series_sha256": bootstrap.series_fingerprint("kernel"),
-                  "base": bootstrap.KERNEL_COMMIT, "head": head,
-                  "commits": 1}
-        if kconfig:
+        record = dict(base)
+        if not legacy:
             record["kconfig_sha256"] = bootstrap.sha256(
                 bootstrap.KCONFIGS[variant])
         (images / bootstrap.BUILD_RECORD).write_text(json.dumps(record))
+        variants[variant] = {
+            "config_sha256": bootstrap.sha256(bootstrap.KCONFIGS[variant]),
+            "bzImage_sha256": bootstrap.sha256(images / "bzImage"),
+            "vmlinux_sha256": bootstrap.sha256(images / "vmlinux"),
+        }
+    (tmp_path / "manifest.json").write_text(json.dumps({
+        "status": "pass", "kernel": {
+            "ref": bootstrap.KERNEL_TAG, **base, "variants": variants}}))
     return SimpleNamespace(
         target=tmp_path, variants=list(bootstrap.VARIANTS), update=True,
         skip_build=False, kernel_ref=bootstrap.KERNEL_TAG,
         kernel_repo="unused"), head
 
 
-def test_bootstrap_update_keeps_an_unchanged_kernel_commit(
-        tmp_path, monkeypatch):
-    bootstrap = _load_bootstrap()
-    args, head = _patched_kernel_env(tmp_path, bootstrap)
+def _no_rebuild(*_args, **_kwargs):
+    raise AssertionError("an unchanged kernel must not be re-applied")
 
-    def no_rebuild(*_args, **_kwargs):
-        raise AssertionError("an unchanged kernel must not be re-applied")
-    monkeypatch.setattr(bootstrap, "run", no_rebuild)
+
+@pytest.mark.parametrize("legacy", (False, True))
+def test_bootstrap_update_keeps_an_unchanged_kernel_commit(
+        tmp_path, monkeypatch, legacy):
+    bootstrap = _load_bootstrap()
+    args, head = _patched_kernel_env(tmp_path, bootstrap, legacy=legacy)
+    monkeypatch.setattr(bootstrap, "run", _no_rebuild)
     manifest = {}
     _, rebuilt = bootstrap.stage_kernel(args, manifest, False)
     assert rebuilt is False
     assert manifest["kernel"]["head"] == head
     assert bootstrap.git_head(tmp_path / "linux") == head
+    for variant in bootstrap.VARIANTS:
+        record = json.loads(
+            (tmp_path / "images" / variant / "build.json").read_text())
+        # A legacy record is backfilled once, from the verified manifest.
+        assert record["kconfig_sha256"] == bootstrap.sha256(
+            bootstrap.KCONFIGS[variant])
+        assert record["head"] == head
+    # The backfilled record is then reused as is.
+    assert bootstrap.stage_kernel(args, {}, False)[1] is False
 
 
-@pytest.mark.parametrize("change", ("kconfig", "series", "dirty", "base"))
+@pytest.mark.parametrize("break_", (
+    "no_manifest", "failed_manifest", "kconfig", "bzImage", "vmlinux",
+    "head", "series"))
+def test_bootstrap_update_refuses_an_unverifiable_legacy_record(
+        tmp_path, monkeypatch, break_):
+    bootstrap = _load_bootstrap()
+    args, head = _patched_kernel_env(tmp_path, bootstrap, legacy=True)
+    manifest_path = tmp_path / "manifest.json"
+    previous = json.loads(manifest_path.read_text())
+    kasan = previous["kernel"]["variants"]["kasan"]
+    images = tmp_path / "images" / "kasan"
+    if break_ == "no_manifest":
+        manifest_path.unlink()
+    elif break_ == "failed_manifest":
+        previous["status"] = "fail"
+    elif break_ == "kconfig":
+        kasan["config_sha256"] = "0" * 64
+    elif break_ == "bzImage":
+        (images / "bzImage").write_bytes(b"other image")
+    elif break_ == "vmlinux":
+        (images / "vmlinux").unlink()
+    elif break_ == "head":
+        previous["kernel"]["head"] = "0" * 40
+    elif break_ == "series":
+        previous["kernel"]["series_sha256"] = "0" * 64
+    if manifest_path.exists():
+        manifest_path.write_text(json.dumps(previous))
+    record_before = (images / "build.json").read_text()
+    monkeypatch.setattr(bootstrap, "run", _no_rebuild)
+    with pytest.raises(RuntimeError, match="cannot migrate the kasan"):
+        bootstrap.stage_kernel(args, {}, False)
+    # Fail closed: nothing was rebuilt, removed or rewritten.
+    assert bootstrap.git_head(tmp_path / "linux") == head
+    assert (images / "build.json").read_text() == record_before
+
+
+def test_bootstrap_update_refuses_a_dirty_kernel_tree(tmp_path, monkeypatch):
+    bootstrap = _load_bootstrap()
+    args, head = _patched_kernel_env(tmp_path, bootstrap, legacy=True)
+    (tmp_path / "linux" / "stray").write_text("x\n")
+    monkeypatch.setattr(bootstrap, "run", _no_rebuild)
+    with pytest.raises(RuntimeError, match="local changes"):
+        bootstrap.stage_kernel(args, {}, False)
+    assert bootstrap.git_head(tmp_path / "linux") == head
+
+
+@pytest.mark.parametrize("change", ("kconfig", "series", "base"))
 def test_bootstrap_update_rebuilds_a_changed_kernel(
         tmp_path, monkeypatch, change):
     bootstrap = _load_bootstrap()
-    args, _ = _patched_kernel_env(tmp_path, bootstrap,
-                                  kconfig=change != "kconfig")
-    if change == "series":
+    args, _ = _patched_kernel_env(tmp_path, bootstrap)
+    if change == "kconfig":
+        # The checked-in kconfig no longer matches the one recorded.
+        for variant in bootstrap.VARIANTS:
+            path = tmp_path / "images" / variant / "build.json"
+            record = json.loads(path.read_text())
+            record["kconfig_sha256"] = "0" * 64
+            path.write_text(json.dumps(record))
+    elif change == "series":
         monkeypatch.setattr(bootstrap, "series_fingerprint",
                             lambda kind: "0" * 64)
-    elif change == "dirty":
-        (tmp_path / "linux" / "stray").write_text("x\n")
     elif change == "base":
         args.kernel_ref = "v0.0"
 
