@@ -390,7 +390,45 @@ static void reply_packet(uint8_t reply[NFSP_LIFECYCLE_REPLY_LEN],
 	put64(reply + 24, result->clientid);
 }
 
-static void serve_one(int listener, const char *clients_dir, uint32_t lane)
+static void cld_reply_packet(uint8_t reply[NFSP_LIFECYCLE_REPLY_LEN],
+			     uint32_t status, uint32_t operation, uint64_t seq,
+			     const struct nfsp_cld_identity *identity)
+{
+	memset(reply, 0, NFSP_LIFECYCLE_REPLY_LEN);
+	memcpy(reply, NFSP_LIFECYCLE_REPLY_MAGIC, 8);
+	put32(reply + 8, status);
+	put32(reply + 12, operation);
+	put32(reply + 16, (uint32_t)seq);
+	put32(reply + 20, (uint32_t)identity->pid);
+	put64(reply + 24, identity->starttime);
+}
+
+static void serve_cld(int fd, uint32_t lane, uint32_t operation,
+		      uint32_t client, struct nfsp_cld *cld)
+{
+	uint8_t reply[NFSP_LIFECYCLE_REPLY_LEN];
+	struct nfsp_cld_identity identity = {0};
+	uint32_t status;
+
+	/* The CLD operations take no selector; a nonzero one is malformed. */
+	if (client != 0u)
+		status = EINVAL;
+	else if (cld == NULL)
+		status = EOPNOTSUPP;
+	else
+		status = nfsp_cld_begin(cld, operation, &identity);
+	cld_reply_packet(reply, status, operation, cld != NULL ? cld->seq : 0u,
+			 &identity);
+	(void)send(fd, reply, sizeof(reply), MSG_NOSIGNAL);
+	printf("cld request lane=%" PRIu32 " op=%" PRIu32 " status=%" PRIu32
+	       " seq=%" PRIu64 " pid=%ld starttime=%" PRIu64 "\n", lane,
+	       operation, status, cld != NULL ? cld->seq : 0u,
+	       (long)identity.pid, identity.starttime);
+	fflush(stdout);
+}
+
+static void serve_one(int listener, const char *clients_dir, uint32_t lane,
+		      struct nfsp_cld *cld)
 {
 	uint8_t request[NFSP_LIFECYCLE_REQUEST_LEN + 1u];
 	uint8_t reply[NFSP_LIFECYCLE_REPLY_LEN];
@@ -410,8 +448,17 @@ static void serve_one(int listener, const char *clients_dir, uint32_t lane)
 	    memcmp(request, NFSP_LIFECYCLE_REQUEST_MAGIC, 8) == 0) {
 		operation = get32(request + 8);
 		result.client = get32(request + 12);
+		if (cld != NULL && (operation == NFSP_LIFECYCLE_OP_CLD_RECONNECT ||
+				    operation == NFSP_LIFECYCLE_OP_CLD_DOWN)) {
+			serve_cld(fd, lane, operation, result.client, cld);
+			close(fd);
+			return;
+		}
 		if (operation != NFSP_LIFECYCLE_OP_EXPIRE) {
 			status = EOPNOTSUPP;
+		} else if (cld != NULL && nfsp_cld_pending(cld)) {
+			cld->counters.refused_busy++;
+			status = EBUSY;
 		} else if (result.client > 1u) {
 			status = EINVAL;
 		} else if (nfsp_lifecycle_expire(clients_dir, lane, result.client,
@@ -435,6 +482,14 @@ static void serve_one(int listener, const char *clients_dir, uint32_t lane)
 int nfsp_lifecycle_serve(const char *socket_path, const char *clients_dir,
 			 uint32_t lane, const _Atomic int *stop)
 {
+	return nfsp_lifecycle_serve_cld(socket_path, clients_dir, lane, NULL,
+					stop);
+}
+
+int nfsp_lifecycle_serve_cld(const char *socket_path, const char *clients_dir,
+			     uint32_t lane, struct nfsp_cld *cld,
+			     const _Atomic int *stop)
+{
 	struct pollfd pollfd;
 	int listener, rc = 0, saved;
 
@@ -450,7 +505,14 @@ int nfsp_lifecycle_serve(const char *socket_path, const char *clients_dir,
 	pollfd.fd = listener;
 	pollfd.events = POLLIN;
 	while (!atomic_load(stop)) {
-		int polled = poll(&pollfd, 1, 200);
+		int wait_ms = 200, due = cld != NULL ? nfsp_cld_due_in_ms(cld) : -1;
+		int polled;
+
+		if (due >= 0 && due < wait_ms)
+			wait_ms = due;
+		polled = poll(&pollfd, 1, wait_ms);
+		if (cld != NULL)
+			nfsp_cld_tick(cld, 0);
 
 		if (polled < 0) {
 			if (errno == EINTR)
@@ -459,7 +521,7 @@ int nfsp_lifecycle_serve(const char *socket_path, const char *clients_dir,
 			break;
 		}
 		if (polled > 0 && (pollfd.revents & POLLIN) != 0)
-			serve_one(listener, clients_dir, lane);
+			serve_one(listener, clients_dir, lane, cld);
 		if ((pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
 			errno = EIO;
 			rc = -1;
@@ -469,6 +531,9 @@ int nfsp_lifecycle_serve(const char *socket_path, const char *clients_dir,
 	saved = errno;
 	close(listener);
 	unlink(socket_path);
+	/* Deterministic cleanup: never exit with nfsdcld held or down. */
+	if (cld != NULL)
+		nfsp_cld_close(cld);
 	errno = saved;
 	return rc;
 }

@@ -1,0 +1,422 @@
+From cffc8accc67d3593682dfed9a512b679c8c174fc Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Tue, 20 Oct 2026 14:30:00 +0900
+Subject: [PATCH] tools/execprog: raise the program budget for long upcall
+ waits
+
+The per-program budget is 5s scaled by min(slowdown, 3), so no
+slowdown lets a program wait out a 30s kernel upcall timeout: the fork
+server kills it and aborts its remote coverage generation.
+
+Add rpcserver.Config.ProgramTimeout, which raises the budget sent to the
+executor, and syz-execprog -program-timeout to set it.  A budget that
+the default already covers or that reaches the no-output timeout is
+rejected.  Record unfinished calls in the coverage .meta so a program
+stopped at its budget is distinguishable from one whose generation
+published no remote coverage.
+---
+ pkg/rpcserver/program_timeout_test.go | 43 +++++++++++++++
+ pkg/rpcserver/rpcserver.go            | 37 +++++++++++--
+ pkg/runtest/program_timeout_test.go   | 78 +++++++++++++++++++++++++++
+ pkg/runtest/run_test.go               | 15 ++++--
+ tools/syz-execprog/coverage_test.go   | 58 ++++++++++++++++++++
+ tools/syz-execprog/execprog.go        | 55 ++++++++++++-------
+ 6 files changed, 257 insertions(+), 29 deletions(-)
+ create mode 100644 pkg/rpcserver/program_timeout_test.go
+ create mode 100644 pkg/runtest/program_timeout_test.go
+ create mode 100644 tools/syz-execprog/coverage_test.go
+
+diff --git a/pkg/rpcserver/program_timeout_test.go b/pkg/rpcserver/program_timeout_test.go
+new file mode 100644
+index 0000000..202c877
+--- /dev/null
++++ b/pkg/rpcserver/program_timeout_test.go
+@@ -0,0 +1,43 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package rpcserver
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/syzkaller/prog"
++	"github.com/google/syzkaller/sys/targets"
++	"github.com/stretchr/testify/require"
++)
++
++func TestProgramTimeoutRaisesBudget(t *testing.T) {
++	sysTarget := targets.Get(targets.Linux, targets.AMD64)
++	def := sysTarget.Timeouts(10)
++	// Slowdown alone cannot exceed the capped default.
++	require.Equal(t, 15*time.Second, def.Program)
++
++	got := ProgramTimeouts(sysTarget, 1, 90*time.Second)
++	require.Equal(t, 90*time.Second, got.Program)
++	require.Equal(t, sysTarget.Timeouts(1).Syscall, got.Syscall)
++	require.Equal(t, sysTarget.Timeouts(1).NoOutput, got.NoOutput)
++	require.Equal(t, sysTarget.Timeouts(1), ProgramTimeouts(sysTarget, 1, 0))
++	require.Equal(t, def, ProgramTimeouts(sysTarget, 10, time.Second))
++
++	require.NoError(t, CheckProgramTimeout(sysTarget, 1, 0))
++	require.NoError(t, CheckProgramTimeout(sysTarget, 1, 90*time.Second))
++	require.Error(t, CheckProgramTimeout(sysTarget, 1, 5*time.Second))
++	require.Error(t, CheckProgramTimeout(sysTarget, 1, 5*time.Minute))
++}
++
++func TestProgramTimeoutReachesServer(t *testing.T) {
++	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64Fork)
++	require.NoError(t, err)
++	cfg := &Config{Slowdown: 1, ProgramTimeout: 90 * time.Second}
++	cfg.Target = target
++	cfg.VMArch = target.Arch
++	serv := newImpl(cfg, nil)
++	// serv.timeouts is what the handshake sends as ProgramTimeoutMs.
++	require.Equal(t, 90*time.Second, serv.timeouts.Program)
++}
+diff --git a/pkg/rpcserver/rpcserver.go b/pkg/rpcserver/rpcserver.go
+index 5c3d225..960fb14 100644
+--- a/pkg/rpcserver/rpcserver.go
++++ b/pkg/rpcserver/rpcserver.go
+@@ -17,6 +17,7 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++	"time"
+ 
+ 	"github.com/google/syzkaller/pkg/cover"
+ 	"github.com/google/syzkaller/pkg/cover/backend"
+@@ -78,10 +79,14 @@ type Config struct {
+ 	nfsProxyEvidence *nfsProxyEvidenceWriter
+ 	Procs            int
+ 	Slowdown         int
+-	ExecutorBin      string
+-	Timeouts         targets.Timeouts
+-	pcBase           uint64
+-	localModules     []*vminfo.KernelModule
++	// ProgramTimeout raises the per-program execution budget above the
++	// slowdown-derived default, for programs that must wait out a kernel
++	// timeout.  Zero (or a shorter value) keeps the default.
++	ProgramTimeout time.Duration
++	ExecutorBin    string
++	Timeouts       targets.Timeouts
++	pcBase         uint64
++	localModules   []*vminfo.KernelModule
+ 
+ 	// RPCServer closes the channel once the machine check has begun. Used for fault injection during testing.
+ 	machineCheckStarted chan struct{}
+@@ -239,7 +244,7 @@ func newImpl(cfg *Config, mgr Manager) *server {
+ 		mgr:         mgr,
+ 		target:      cfg.Target,
+ 		sysTarget:   sysTarget,
+-		timeouts:    sysTarget.Timeouts(cfg.Slowdown),
++		timeouts:    ProgramTimeouts(sysTarget, cfg.Slowdown, cfg.ProgramTimeout),
+ 		runners:     make(map[int]*Runner),
+ 		checker:     checker,
+ 		baseSource:  baseSource,
+@@ -260,6 +265,28 @@ func newImpl(cfg *Config, mgr Manager) *server {
+ 	}
+ }
+ 
++// ProgramTimeouts returns the target's timeouts for slowdown with the
++// per-program budget raised to program when that is longer.
++func ProgramTimeouts(sysTarget *targets.Target, slowdown int, program time.Duration) targets.Timeouts {
++	timeouts := sysTarget.Timeouts(slowdown)
++	timeouts.Program = max(timeouts.Program, program)
++	return timeouts
++}
++
++// CheckProgramTimeout rejects a requested program budget that the default
++// already covers or that reaches the no-output hang detector.
++func CheckProgramTimeout(sysTarget *targets.Target, slowdown int, program time.Duration) error {
++	if program == 0 {
++		return nil
++	}
++	timeouts := sysTarget.Timeouts(slowdown)
++	if program <= timeouts.Program || program >= timeouts.NoOutput {
++		return fmt.Errorf("program timeout %v must be above the default %v and below the no-output timeout %v",
++			program, timeouts.Program, timeouts.NoOutput)
++	}
++	return nil
++}
++
+ func (serv *server) Close() error {
+ 	// Unset the source so that we don't hold references to it (allowing GC)
+ 	// and don't serve any new requests from lingering connections.
+diff --git a/pkg/runtest/program_timeout_test.go b/pkg/runtest/program_timeout_test.go
+new file mode 100644
+index 0000000..85a2a5c
+--- /dev/null
++++ b/pkg/runtest/program_timeout_test.go
+@@ -0,0 +1,78 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package runtest
++
++import (
++	"encoding/hex"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/google/syzkaller/pkg/csource"
++	"github.com/google/syzkaller/pkg/flatrpc"
++	"github.com/google/syzkaller/pkg/fuzzer/queue"
++	"github.com/google/syzkaller/prog"
++	"github.com/google/syzkaller/sys/targets"
++	"github.com/stretchr/testify/require"
++)
++
++// A program that blocks past the default budget (as one waiting out a kernel
++// upcall timeout does) keeps its remote coverage only with a longer
++// ProgramTimeout; at the default budget the fork server kills it first.
++func TestProgramTimeoutKeepsLongProgramExtraCoverage(t *testing.T) {
++	t.Parallel()
++	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64Fork)
++	require.NoError(t, err)
++	sysTarget := targets.Get(target.OS, target.Arch)
++	if sysTarget.BrokenCompiler != "" {
++		t.Skipf("skipping, broken cross-compiler: %v", sysTarget.BrokenCompiler)
++	}
++	// Default budget at slowdown 1 is 5s; the program sleeps 7s inline.
++	require.Equal(t, 5*time.Second, sysTarget.Timeouts(1).Program)
++	pcs := []uint64{0xc0dec0dec0000001, 0xc0dec0dec0000010}
++	text := fmt.Sprintf("syz_sleep_ms(0x1b58)\nsyz_inject_remote_cover(&AUTO=\"%s\", AUTO)\n",
++		hex.EncodeToString(makeCover64(pcs...)))
++	executor := csource.BuildExecutor(t, target, "../..")
++	for _, test := range []struct {
++		name     string
++		timeout  time.Duration
++		finished bool
++	}{
++		{"raised", 30 * time.Second, true},
++		{"default", 0, false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			t.Parallel()
++			source := queue.Plain()
++			ctx := startRPCServer(t, target, executor, source, rpcParams{
++				slowdown:       1,
++				programTimeout: test.timeout,
++			})
++			p, err := target.Deserialize([]byte(text), prog.Strict)
++			require.NoError(t, err)
++			req := &queue.Request{
++				Prog: p,
++				ExecOpts: flatrpc.ExecOpts{
++					EnvFlags:  flatrpc.ExecEnvSignal | flatrpc.ExecEnvExtraCover | flatrpc.ExecEnvSandboxNone,
++					ExecFlags: flatrpc.ExecFlagCollectSignal | flatrpc.ExecFlagCollectCover,
++				},
++			}
++			source.Submit(req)
++			res := req.Wait(ctx)
++			require.NoError(t, res.Err, "execution failed:\n%s", res.Output)
++			require.Equal(t, queue.Success, res.Status)
++			require.Len(t, res.Info.Calls, len(p.Calls))
++			for i, call := range res.Info.Calls {
++				require.Equal(t, test.finished, call.Flags&flatrpc.CallFlagFinished != 0, "call %v", i)
++			}
++			if !test.finished {
++				// The killed program never reached the remote coverage.
++				require.True(t, res.Info.Extra == nil || len(res.Info.Extra.Cover) == 0)
++				return
++			}
++			require.NotNil(t, res.Info.Extra)
++			require.Equal(t, pcs, res.Info.Extra.Cover)
++		})
++	}
++}
+diff --git a/pkg/runtest/run_test.go b/pkg/runtest/run_test.go
+index b8eb5c1..2e257d8 100644
+--- a/pkg/runtest/run_test.go
++++ b/pkg/runtest/run_test.go
+@@ -472,6 +472,8 @@ type rpcParams struct {
+ 	maxSignal      []uint64
+ 	coverFilter    []uint64
+ 	machineChecked func(features flatrpc.Feature)
++	slowdown       int
++	programTimeout time.Duration
+ }
+ 
+ func startRPCServer(t *testing.T, target *prog.Target, executor string,
+@@ -487,6 +489,10 @@ func startRPCServer(t *testing.T, target *prog.Target, executor string,
+ 		// We don't need many procs for this test.
+ 		procs = min(procs, 4)
+ 	}
++	slowdown := extra.slowdown
++	if slowdown == 0 {
++		slowdown = 10 // to deflake slower tests
++	}
+ 	var output bytes.Buffer
+ 	cfg := &rpcserver.LocalConfig{
+ 		Config: rpcserver.Config{
+@@ -498,10 +504,11 @@ func startRPCServer(t *testing.T, target *prog.Target, executor string,
+ 				Features: flatrpc.AllFeatures,
+ 				Sandbox:  flatrpc.ExecEnvSandboxNone,
+ 			},
+-			VMArch:        extra.vmArch,
+-			Procs:         procs,
+-			Slowdown:      10, // to deflake slower tests
+-			DebugTimeouts: true,
++			VMArch:         extra.vmArch,
++			Procs:          procs,
++			Slowdown:       slowdown,
++			ProgramTimeout: extra.programTimeout,
++			DebugTimeouts:  true,
+ 		},
+ 		Executor:    executor,
+ 		Dir:         dir,
+diff --git a/tools/syz-execprog/coverage_test.go b/tools/syz-execprog/coverage_test.go
+new file mode 100644
+index 0000000..d9874aa
+--- /dev/null
++++ b/tools/syz-execprog/coverage_test.go
+@@ -0,0 +1,58 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/google/syzkaller/pkg/flatrpc"
++	"github.com/google/syzkaller/prog"
++	_ "github.com/google/syzkaller/sys"
++	"github.com/google/syzkaller/sys/targets"
++	"github.com/stretchr/testify/require"
++)
++
++func dumpedFiles(t *testing.T, dir, suffix string) []string {
++	matches, err := filepath.Glob(filepath.Join(dir, "*"+suffix))
++	require.NoError(t, err)
++	return matches
++}
++
++// Each program exports exactly one .meta, and one .extra iff the executor
++// published remote coverage.  A program stopped at its budget publishes none,
++// and its .meta says so.
++func TestDumpCoverageExportsOnePerProgram(t *testing.T) {
++	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
++	require.NoError(t, err)
++	finished := flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished
++	for _, test := range []struct {
++		name       string
++		info       *flatrpc.ProgInfo
++		extra      int
++		unfinished string
++	}{
++		{"published", &flatrpc.ProgInfo{
++			Calls: []*flatrpc.CallInfo{{Flags: finished}, {Flags: finished}},
++			Extra: &flatrpc.CallInfo{Cover: []uint64{0xffffffff81000010}},
++		}, 1, "unfinished_calls 0\n"},
++		{"stopped at budget", &flatrpc.ProgInfo{
++			Calls: []*flatrpc.CallInfo{{Flags: flatrpc.CallFlagExecuted}, {Error: 999}},
++		}, 0, "unfinished_calls 2\n"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			dir := t.TempDir()
++			ctx := &Context{target: target, coverFile: filepath.Join(dir, "cover")}
++			ctx.dumpCoverage(test.info)
++			require.Len(t, dumpedFiles(t, dir, ".extra"), test.extra)
++			meta := dumpedFiles(t, dir, ".meta")
++			require.Len(t, meta, 1)
++			data, err := os.ReadFile(meta[0])
++			require.NoError(t, err)
++			require.True(t, strings.Contains(string(data), test.unfinished), "%s", data)
++		})
++	}
++}
+diff --git a/tools/syz-execprog/execprog.go b/tools/syz-execprog/execprog.go
+index f20705a..4f4a4a3 100644
+--- a/tools/syz-execprog/execprog.go
++++ b/tools/syz-execprog/execprog.go
+@@ -47,21 +47,23 @@ var (
+ 		"collect extra/remote coverage (equivalent to experimental.remote_cover)")
+ 	flagGate = flag.String("gate", "",
+ 		"after the machine check, create <gate>.ready and wait for <gate>.go before running programs")
+-	flagRepeat     = flag.Int("repeat", 1, "repeat execution that many times (0 for infinite loop)")
+-	flagProcs      = flag.Int("procs", 2*runtime.NumCPU(), "number of parallel processes to execute programs")
+-	flagOutput     = flag.Bool("output", false, "write programs and results to stdout")
+-	flagHints      = flag.Bool("hints", false, "do a hints-generation run")
+-	flagEnable     = flag.String("enable", "none", "enable only listed additional features")
+-	flagDisable    = flag.String("disable", "none", "enable all additional features except listed")
+-	flagExecutor   = flag.String("executor", "./syz-executor", "path to executor binary")
+-	flagThreaded   = flag.Bool("threaded", true, "use threaded mode in executor")
+-	flagSignal     = flag.Bool("cover", false, "collect feedback signals (coverage)")
+-	flagSandbox    = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace/android)")
+-	flagSandboxArg = flag.Int("sandbox_arg", 0, "argument for sandbox runner to adjust it via config")
+-	flagDebug      = flag.Bool("debug", false, "debug output from executor")
+-	flagSlowdown   = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
+-	flagUnsafe     = flag.Bool("unsafe", false, "use unsafe program deserialization mode")
+-	flagGlob       = flag.String("glob", "", "run glob expansion request")
++	flagRepeat      = flag.Int("repeat", 1, "repeat execution that many times (0 for infinite loop)")
++	flagProcs       = flag.Int("procs", 2*runtime.NumCPU(), "number of parallel processes to execute programs")
++	flagOutput      = flag.Bool("output", false, "write programs and results to stdout")
++	flagHints       = flag.Bool("hints", false, "do a hints-generation run")
++	flagEnable      = flag.String("enable", "none", "enable only listed additional features")
++	flagDisable     = flag.String("disable", "none", "enable all additional features except listed")
++	flagExecutor    = flag.String("executor", "./syz-executor", "path to executor binary")
++	flagThreaded    = flag.Bool("threaded", true, "use threaded mode in executor")
++	flagSignal      = flag.Bool("cover", false, "collect feedback signals (coverage)")
++	flagSandbox     = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace/android)")
++	flagSandboxArg  = flag.Int("sandbox_arg", 0, "argument for sandbox runner to adjust it via config")
++	flagDebug       = flag.Bool("debug", false, "debug output from executor")
++	flagSlowdown    = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
++	flagProgTimeout = flag.Duration("program-timeout", 0,
++		"per-program execution budget when it must exceed the slowdown default (0: default)")
++	flagUnsafe = flag.Bool("unsafe", false, "use unsafe program deserialization mode")
++	flagGlob   = flag.String("glob", "", "run glob expansion request")
+ 
+ 	// The in the stress mode resembles simple unguided fuzzer.
+ 	// This mode can be used as an intermediate step when porting syzkaller to a new OS,
+@@ -179,6 +181,10 @@ func main() {
+ 	if vmArch == "" {
+ 		vmArch = target.Arch
+ 	}
++	if err := rpcserver.CheckProgramTimeout(targets.Get(target.OS, vmArch),
++		*flagSlowdown, *flagProgTimeout); err != nil {
++		tool.Fail(err)
++	}
+ 
+ 	cfg := &rpcserver.LocalConfig{
+ 		Config: rpcserver.Config{
+@@ -192,9 +198,10 @@ func main() {
+ 				Sandbox:    sandbox,
+ 				SandboxArg: int64(*flagSandboxArg),
+ 			},
+-			VMArch:   vmArch,
+-			Procs:    *flagProcs,
+-			Slowdown: *flagSlowdown,
++			VMArch:         vmArch,
++			Procs:          *flagProcs,
++			Slowdown:       *flagSlowdown,
++			ProgramTimeout: *flagProgTimeout,
+ 		},
+ 		Executor:         *flagExecutor,
+ 		HandleInterrupts: true,
+@@ -423,9 +430,17 @@ func (ctx *Context) dumpCoverage(info *flatrpc.ProgInfo) {
+ 		log.Logf(0, "extra: signal %v, coverage %v", len(info.Extra.Signal), len(info.Extra.Cover))
+ 		ctx.dumpCallCoverage(fmt.Sprintf("%v.extra", coverFile), info.Extra)
+ 	}
++	// A program the executor stopped at its budget leaves calls unfinished,
++	// and its remote coverage generation is aborted rather than published.
++	unfinished := 0
++	for _, inf := range info.Calls {
++		if inf.Flags&flatrpc.CallFlagFinished == 0 {
++			unfinished++
++		}
++	}
+ 	now := time.Now()
+-	metadata := fmt.Sprintf("completed_unix_nano %d\nelapsed_nano %d\n",
+-		now.UnixNano(), now.Sub(ctx.startedAt).Nanoseconds())
++	metadata := fmt.Sprintf("completed_unix_nano %d\nelapsed_nano %d\nunfinished_calls %d\n",
++		now.UnixNano(), now.Sub(ctx.startedAt).Nanoseconds(), unfinished)
+ 	if info.NfsProxy != nil {
+ 		metadata += fmt.Sprintf("nfs_proxy_barrier %s\n", nfsProxyBarrier(info.NfsProxy))
+ 	}

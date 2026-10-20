@@ -371,6 +371,56 @@ pid_owns_unix_socket()
     return 1
 }
 
+# The broker records the nfsdcld it last validated in cld.state.  Status
+# accepts the fixture only when no CLD transaction is pending and that exact
+# daemon (PID and start time) is the only nfsdcld of the server network
+# namespace, shares the server mount namespace, runs with argv "nfsdcld",
+# is not stopped, and holds the server namespace CLD pipe inode open.
+cld_daemon_valid()
+{
+    cld_state_file=$1
+    cld_server_pid=$2
+    cld_server_ns=$3
+    test -s "$cld_state_file" || return 1
+    test "$(sed -n 's/^state=//p' "$cld_state_file")" = idle || return 1
+    cld_pid=$(sed -n 's/^pid=//p' "$cld_state_file")
+    cld_starttime=$(sed -n 's/^starttime=//p' "$cld_state_file")
+    cld_pipe=$(sed -n 's/^pipe=//p' "$cld_state_file")
+    case "$cld_pid:$cld_starttime" in
+        *[!0-9:]*|:*|*:) return 1 ;;
+    esac
+    test "$cld_pid" -gt 0 || return 1
+    pid_in_named_netns "$cld_pid" "$cld_server_ns" || return 1
+    test "$(stat -Lc '%d:%i' "/proc/$cld_pid/ns/mnt")" = \
+        "$(stat -Lc '%d:%i' "/proc/$cld_server_pid/ns/mnt")" || return 1
+    test "$(awk '{print $22}' "/proc/$cld_pid/stat")" = "$cld_starttime" || \
+        return 1
+    case "$(sed 's/.*) //' "/proc/$cld_pid/stat" | cut -c1)" in
+        R|S|D) ;;
+        *) return 1 ;;
+    esac
+    test "$(cat "/proc/$cld_pid/comm")" = nfsdcld || return 1
+    test "$(tr '\000' ' ' < "/proc/$cld_pid/cmdline")" = "nfsdcld " || return 1
+    cld_live_pipe=$(stat -Lc '%d:%i' \
+        "/proc/$cld_server_pid/root/var/lib/nfs/rpc_pipefs/nfsd/cld") || \
+        return 1
+    test "$cld_live_pipe" = "$cld_pipe" || return 1
+    cld_owner=0
+    for cld_fd in "/proc/$cld_pid/fd/"*; do
+        if [ "$(stat -Lc '%d:%i' "$cld_fd" 2>/dev/null)" = "$cld_live_pipe" ]; then
+            cld_owner=1
+        fi
+    done
+    test "$cld_owner" -eq 1 || return 1
+    cld_count=0
+    for cld_other in $(pgrep -x nfsdcld); do
+        if pid_in_named_netns "$cld_other" "$cld_server_ns" 2>/dev/null; then
+            cld_count=$((cld_count + 1))
+        fi
+    done
+    test "$cld_count" -eq 1
+}
+
 stop_namespace()
 {
     stop_ns=$1
@@ -941,9 +991,21 @@ EOF
                 echo "KOOV: guest lifecycle admin not on PATH" >&2
                 exit 1
             }
+            # The broker also owns the bounded nfsdcld control.  It
+            # validates the daemon started above (namespaces, executable,
+            # argv, CLD pipe inode) before it reports ready, and replaces it
+            # only with this same executable and argv.
+            cld_daemon=$(command -v nfsdcld)
+            case "$cld_daemon" in
+                /*) ;;
+                *) echo "KOOV: nfsdcld has no absolute path: $cld_daemon" >&2
+                   exit 1 ;;
+            esac
             nfs-proxy --lifecycle-admin \
                 "$executor_root/proc-$lane/control/lifecycle.sock" \
                 --lane "$lane" \
+                --cld-daemon "$cld_daemon" \
+                --cld-state "$lane_root/server/cld.state" \
                 > "$lane_root/server/lifecycle.log" 2>&1 &
             lifecycle_pid=$!
             printf "%s\n" "$lifecycle_pid" > \
@@ -1494,13 +1556,18 @@ status_fixture()
                 "$(cat "$status_lane_root/server/lifecycle.starttime")"
             status_lifecycle_cmdline=$(tr '\000' ' ' < "/proc/$status_lifecycle_pid/cmdline")
             case "$status_lifecycle_cmdline" in
-                *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane"*) ;;
+                *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane --cld-daemon /"*" --cld-state $status_lane_root/server/cld.state "*) ;;
                 *) echo "KOOV: lifecycle admin process identity mismatch" >&2
                    return 1 ;;
             esac
             if ! pid_owns_unix_socket "$status_lifecycle_pid" \
                     "$executor_root/proc-$status_lane/control/lifecycle.sock"; then
                 echo "KOOV: lifecycle admin does not own its socket" >&2
+                return 1
+            fi
+            if ! cld_daemon_valid "$status_lane_root/server/cld.state" \
+                    "$status_server_pid" "$status_server_ns"; then
+                echo "KOOV: nfsdcld is not the broker-validated idle daemon" >&2
                 return 1
             fi
         fi
