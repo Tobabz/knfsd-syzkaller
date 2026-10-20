@@ -287,14 +287,20 @@ class Hcap12KvmEvidence(_Spec):
         return self
 
 
-HCAP13_PROBES = ("clnt_grant", "svc_lock", "svc_share", "svc_testlock",
-                 "svc_unlock")
+HCAP13_PROBES = ("clnt_grant", "svc_grant_blocked", "svc_grant_callback",
+                 "svc_lock", "svc_share", "svc_testlock", "svc_unlock")
+#: Probes that only a granted blocked lock reaches.
+HCAP13_GRANT_PROBES = ("clnt_grant", "svc_grant_blocked", "svc_grant_callback")
 
 
 class Hcap13ProbeHits(_Spec):
     """Per-run counts of attributed PCs in each public lockd probe range."""
 
     clnt_grant: tuple[int, ...]
+    #: The server lockd thread grants the blocked lock (lockd context).
+    svc_grant_blocked: tuple[int, ...]
+    #: rpciod completes the GRANTED_MSG callback (lockd context).
+    svc_grant_callback: tuple[int, ...]
     svc_lock: tuple[int, ...]
     svc_share: tuple[int, ...]
     svc_testlock: tuple[int, ...]
@@ -333,7 +339,8 @@ class Hcap13RunsEvidence(_Spec):
     #: Raw NLM LOCK, TEST, UNLOCK, SHARE and UNSHARE (syz_send_nlm_rpc).
     rpc: Hcap13RunEvidence
     #: Raw blocking LOCK behind a client1 lock; its release makes the server
-    #: grant it with a GRANTED_MSG callback to the client0 lockd.
+    #: lockd thread grant it with a GRANTED_MSG callback, run by rpciod, to
+    #: the client0 lockd.
     blocked: Hcap13RunEvidence
 
 
@@ -341,7 +348,8 @@ class Hcap13RunsEvidence(_Spec):
 HCAP13_REQUIRED_PROBES = {
     "lock": ("svc_lock", "svc_unlock"),
     "rpc": ("svc_lock", "svc_share", "svc_testlock", "svc_unlock"),
-    "blocked": ("clnt_grant", "svc_lock", "svc_unlock"),
+    "blocked": ("clnt_grant", "svc_grant_blocked", "svc_grant_callback",
+                "svc_lock", "svc_unlock"),
 }
 
 
@@ -377,7 +385,8 @@ class Hcap13KvmEvidence(_Spec):
             for name in names:
                 if not all(run.probe_hits.each(name)):
                     raise ValueError(f"{phase} run missed {name}")
-        if any(self.runs.lock.probe_hits.clnt_grant):
+        if any(any(self.runs.lock.probe_hits.each(name))
+               for name in HCAP13_GRANT_PROBES):
             raise ValueError("lock run reached a grant callback")
         if self.crash_signature_count != 0 or self.raw_artifact_error_count != 0:
             raise ValueError("campaign contains a crash or artifact error")

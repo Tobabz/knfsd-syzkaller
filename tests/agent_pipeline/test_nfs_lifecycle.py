@@ -559,7 +559,8 @@ NLM_GOOD = {
     "control": nlm_run(),
     "lock": nlm_run(svc_lock=1, svc_unlock=1),
     "rpc": nlm_run(svc_lock=1, svc_unlock=1, svc_testlock=1, svc_share=1),
-    "blocked": nlm_run(svc_lock=1, svc_unlock=1, clnt_grant=1),
+    "blocked": nlm_run(svc_lock=1, svc_unlock=1, clnt_grant=1,
+                       svc_grant_blocked=1, svc_grant_callback=1),
 }
 
 
@@ -570,7 +571,14 @@ NLM_GOOD = {
      "grant callback"),
     ("rpc", nlm_run(svc_lock=1, svc_unlock=1, svc_testlock=1),
      "rpc run missed svc_share"),
-    ("blocked", nlm_run(svc_lock=1, svc_unlock=1), "missed clnt_grant"),
+    ("lock", nlm_run(svc_lock=1, svc_unlock=1, svc_grant_blocked=1),
+     "grant callback"),
+    ("blocked", nlm_run(svc_lock=1, svc_unlock=1, svc_grant_blocked=1,
+                        svc_grant_callback=1), "missed clnt_grant"),
+    ("blocked", nlm_run(svc_lock=1, svc_unlock=1, clnt_grant=1,
+                        svc_grant_callback=1), "missed svc_grant_blocked"),
+    ("blocked", nlm_run(svc_lock=1, svc_unlock=1, clnt_grant=1,
+                        svc_grant_blocked=1), "missed svc_grant_callback"),
 ])
 def test_nlm_runs_fail_closed(phase, run, message):
     runner = load_runner()

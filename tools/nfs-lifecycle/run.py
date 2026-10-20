@@ -164,22 +164,26 @@ NLM_PROGRAMS = {
     phase: ROOT / ("tools/nfs-lifecycle/programs/v3-nlm-%s.prog" % phase)
     for phase in ("control", "lock", "rpc", "blocked")
 }
-# Public lockd probes, same form as CLD_PROBES.  svc_* run in the server
-# lane lockd while it serves a request; clnt_grant in the client0 lockd while
-# it serves the server's GRANTED_MSG callback.
+# Public lockd probes, same form as CLD_PROBES.  svc_lock, svc_unlock,
+# svc_testlock and svc_share run in the server lane lockd while it serves a
+# request; clnt_grant in the client0 lockd while it serves the server's
+# GRANTED_MSG callback.  svc_grant_blocked runs in the server lockd thread
+# outside any request and svc_grant_callback in rpciod; kernel patch 0006
+# attributes both to the program whose LOCK created the block.
 NLM_PROBES = {
     "clnt_grant": (("fs/lockd/clntlock.c", "nlmclnt_grant", "function"),),
+    "svc_grant_blocked": (
+        ("fs/lockd/svclock.c", "nlmsvc_grant_blocked", "function"),),
+    "svc_grant_callback": (
+        ("fs/lockd/svclock.c", "nlmsvc_grant_callback", "function"),),
     "svc_lock": (("fs/lockd/svclock.c", "nlmsvc_lock", "function"),),
     "svc_share": (("fs/lockd/svcshare.c", "nlmsvc_share_file", "function"),),
     "svc_testlock": (("fs/lockd/svclock.c", "nlmsvc_testlock", "function"),),
     "svc_unlock": (("fs/lockd/svclock.c", "nlmsvc_unlock", "function"),),
 }
-# Diagnostics only: the server lockd thread grants a blocked lock outside
-# any request (remote_kcov.context.lockd), and the GRANTED_RES it receives
-# back depends on the client's rpciod.  They never decide reach.
+# Diagnostic only: the GRANTED_RES the server receives back depends on the
+# client's rpciod timing.  It never decides reach.
 NLM_DIAGNOSTIC_PROBES = {
-    "svc_grant_blocked": (
-        ("fs/lockd/svclock.c", "nlmsvc_grant_blocked", "function"),),
     "svc_grant_reply": (
         ("fs/lockd/svclock.c", "nlmsvc_grant_reply", "function"),),
 }
@@ -1190,7 +1194,8 @@ def run_nlm_program(vm, output, phase, iteration, tracing, probes,
 
 def check_nlm_run(phase, run):
     """Fail closed on a run outside the phase's validated lockd reach."""
-    from agent_pipeline.stage1.host.generate import HCAP13_REQUIRED_PROBES
+    from agent_pipeline.stage1.host.generate import (HCAP13_GRANT_PROBES,
+                                                     HCAP13_REQUIRED_PROBES)
 
     hits = run["probe_hits"]
     if phase == "control":
@@ -1202,7 +1207,7 @@ def check_nlm_run(phase, run):
     for name in HCAP13_REQUIRED_PROBES[phase]:
         if not hits[name]:
             raise RuntimeError("%s run missed %s" % (phase, name))
-    if phase == "lock" and hits["clnt_grant"]:
+    if phase == "lock" and any(hits[name] for name in HCAP13_GRANT_PROBES):
         raise RuntimeError("lock run reached a grant callback")
 
 

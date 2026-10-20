@@ -722,26 +722,31 @@ NLM 작업의 실행 context와 귀속:
 |---|---|---|
 | server lockd가 TCP NLM 요청을 처리 (`nlmsvc_lock/testlock/unlock/cancel_blocked`, `nlmsvc_share_file`, GRANTED_RES의 `nlmsvc_grant_reply`) | lockd `svc_recv` (server lane netns) | 귀속됨 (`request`) |
 | client0 lockd가 GRANTED_MSG callback을 처리 (`nlmclnt_grant`) | lockd `svc_recv` (client lane netns) | 귀속됨 (`request`) |
-| blocked lock 재시도와 grant (`nlmsvc_retry_blocked`, `nlmsvc_grant_blocked`) | lockd thread 자체 | 귀속 안 됨 |
-| `*_MSG`의 async reply와 GRANTED_MSG 송신, NSM upcall | rpciod / lockd | 귀속 안 됨 |
-| UDP NLM 요청 | lockd `svc_udp_recvfrom` | 귀속 안 됨 |
+| UDP NLM 요청 | lockd `svc_udp_recvfrom` 뒤 `svc_process` | 귀속됨 (`request`, 0006). Stage 1에는 UDP NLM을 보내는 호출이 없다 |
+| blocked lock grant (`nlmsvc_grant_blocked`) | lockd thread 자체 (`nlmsvc_retry_blocked`) | 귀속됨 (`lockd`, 0006). LOCK으로 block을 만든 program |
+| GRANTED_MSG 송신과 완료 (`nlmsvc_grant_callback`), `*_MSG` 처리 중 보낸 `*_RES` reply | rpciod | 귀속됨 (`lockd`, 0006). grant는 block의 program, reply는 그 요청의 program |
+| kernel client가 syscall에서 보내는 async UNLOCK/CANCEL (`nlmclnt_async_call`) | rpciod | 귀속 안 됨 |
 | kernel client의 동기 NLM 호출 | executor 프로세스 | executor 자체 KCOV |
 
-귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.lockd` gap으로 남는다. 그 context를
-귀속하려면 커널 패치가 필요하며 owner 승인 전에는 적용하지 않는다.
+kernel patch 0006은 0004의 callback owner를 lockd에 쓴다. block의 owner는 그 block을 만든 LOCK 요청의
+program이며, 같은 block에 대한 뒤 LOCK은 그 program이 끝난 경우에만 owner를 바꾼다. owner의
+generation이 closing, committed, aborted이면 section은 거부되고 `cb_section_owner_none`으로 센다. 이
+lockd 작업을 요구하는 Q1 target의 `expected_context`는 `lockd`이고, Q1 profile은 `callback_v41`과 같은
+counter를 본다. 위 표에서 귀속 안 됨으로 남은 작업을 요구하는 target은 이 boundary 밖이다.
 
 KVM 증거(`capability-evidence/hcap13-kvm.json`, `Hcap13KvmEvidence`)는 `v3-nlm-lock` campaign의 run마다
 하나의 귀속 generation과 공개 lockd probe(`svc_lock`, `svc_unlock`, `svc_testlock`, `svc_share`,
-`clnt_grant`) hit 수를 담는다. promotion 조건은 다음과 같다.
+`clnt_grant`, `svc_grant_blocked`, `svc_grant_callback`) hit 수를 담는다. promotion 조건은 다음과 같다.
 
 - neutral control은 모든 probe를 miss한다.
-- lock(kernel client F_SETLK/F_GETLK/unlock)은 `svc_lock`, `svc_unlock`을 hit하고 `clnt_grant`는 miss한다.
+- lock(kernel client F_SETLK/F_GETLK/unlock)은 `svc_lock`, `svc_unlock`을 hit하고 grant probe
+  (`clnt_grant`, `svc_grant_blocked`, `svc_grant_callback`)는 miss한다.
 - rpc(raw LOCK/TEST/UNLOCK/SHARE/UNSHARE)는 `svc_lock`, `svc_unlock`, `svc_testlock`, `svc_share`를 hit한다.
-- blocked(client1 lock 뒤의 raw blocking LOCK, client1 unlock)는 `svc_lock`, `svc_unlock`, `clnt_grant`를
-  hit한다.
+- blocked(client1 lock 뒤의 raw blocking LOCK, client1 unlock)는 `svc_lock`, `svc_unlock`, `clnt_grant`,
+  `svc_grant_blocked`, `svc_grant_callback`을 hit한다. 마지막 둘은 0006의 `lockd` context 귀속을 보인다.
 - 모든 run 뒤에 lane status가 통과하고 crash와 artifact 오류가 없어야 한다.
 
-`nlmsvc_grant_blocked`와 `nlmsvc_grant_reply`는 진단으로만 기록한다.
+`nlmsvc_grant_reply`는 진단으로만 기록한다.
 
 source refs:
 

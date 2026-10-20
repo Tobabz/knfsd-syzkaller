@@ -130,18 +130,21 @@ commit to coverage call sites of the pinned vmlinux:
 | `svc_testlock` | `nlmsvc_testlock` | required |
 | `svc_share` | `nlmsvc_share_file` | required |
 | `clnt_grant` | `nlmclnt_grant` | required |
-| `svc_grant_blocked` | `nlmsvc_grant_blocked` | diagnostic |
+| `svc_grant_blocked` | `nlmsvc_grant_blocked` | required |
+| `svc_grant_callback` | `nlmsvc_grant_callback` | required |
 | `svc_grant_reply` | `nlmsvc_grant_reply` | diagnostic |
 
 | phase | program | must reach in every run |
 |---|---|---|
 | `control` | lane `getdents64` only | no lockd probe |
-| `lock` | kernel client F_SETLK, F_GETLK, unlock on `lock0` | `svc_lock`, `svc_unlock`; never `clnt_grant` |
+| `lock` | kernel client F_SETLK, F_GETLK, unlock on `lock0` | `svc_lock`, `svc_unlock`; never `clnt_grant`, `svc_grant_blocked` or `svc_grant_callback` |
 | `rpc` | raw NLMv4 LOCK, TEST, UNLOCK, SHARE, UNSHARE on `lock1` | `svc_lock`, `svc_unlock`, `svc_testlock`, `svc_share` |
-| `blocked` | client1 locks `lock2`; client0 raw blocking LOCK; client1 unlocks; 1 s sleep; raw CANCEL and UNLOCK | `svc_lock`, `svc_unlock`, `clnt_grant` |
+| `blocked` | client1 locks `lock2`; client0 raw blocking LOCK; client1 unlocks; 1 s sleep; raw CANCEL and UNLOCK | `svc_lock`, `svc_unlock`, `clnt_grant`, `svc_grant_blocked`, `svc_grant_callback` |
 
-`clnt_grant` is the client0 lockd serving the server's GRANTED_MSG callback;
-the grant itself runs in the server lockd thread and is recorded only as the
-`svc_grant_blocked` diagnostic (`remote_kcov.context.lockd`). On success the
+`clnt_grant` is the client0 lockd serving the server's GRANTED_MSG callback.
+The grant itself runs in the server lockd thread (`svc_grant_blocked`) and
+the callback's completion in rpciod (`svc_grant_callback`); kernel patch 0006
+attributes both to the program whose LOCK created the block (context
+`lockd`). On success the
 output holds `result.json`, `hcap13-kvm.json` (typed `Hcap13KvmEvidence`),
 `probe-*.json` and the raw per-run artifacts, including each run's dmesg.

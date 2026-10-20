@@ -76,7 +76,7 @@
       },
       "constraints": [
         "Q1 uses generation-attributed remote coverage only",
-        "attributed contexts: request, async_copy, callback_v41"
+        "attributed contexts: request, async_copy, callback_v41, lockd"
       ],
       "status": "validated",
       "scope": [
@@ -84,7 +84,8 @@
       ],
       "source_refs": [
         "bundle/patches/kernel/0001-*",
-        "bundle/patches/kernel/0002-*"
+        "bundle/patches/kernel/0002-*",
+        "bundle/patches/kernel/0006-*"
       ]
     },
     {
@@ -201,7 +202,7 @@
         "nlm-knfsd fixture only: the single NFSv3 knfsd lane with SERVER_IMPL=both, rpcbind and rpc.statd in every lane namespace, both knfsd mounts locking and lockd on TCP port 4045",
         "lock files: r1 = syz_open_nlm_lane_file(r0, name, mode) beneath a knfsd-v3 lane fd (names lock0, lock1, lock2, shared/fixture; mode 0 read-only, 1 read-write, 2 read-write and create), then fcntl$lock(r1, 0x5 F_GETLK or 0x6 F_SETLK, flock); F_SETLKW and OFD locks are never admitted because the collector runs one non-threaded program",
         "raw NLM: r3 = syz_socket_connect_nlm$client0(0x0) or $client1(0x1), then syz_send_nlm_rpc(r3, rpc_nlm_call, len) with exact len fields; the @lane file handle takes r2 = syz_nlm_lane_fh(r0, name) of an existing lane file; read each reply with recvfrom$inet_nlm_tcp before the next call; rpc_nlm_call covers every NLM procedure on version 4 (nlm4) and versions 1/3 (nlm3): null, test, lock, cancel, unlock, granted, the *_msg and *_res forms, and on versions 3 and 4 also share and unshare (nlm_shareargs: cookie, nlm_share {caller, @lane fh, owner, mode, access}, reclaim), nm_lock and free_all (nlm_notify: name, state), so share, unshare, nm_lock and free_all need no new call or constructor",
-        "attributed: the server lane lockd serving a TCP NLM request and the client lane lockd serving a TCP callback; the server lockd thread granting a blocked lock, rpciod NLM callbacks and UDP NLM are remote_kcov.context.lockd"
+        "attributed: the server lane lockd serving a TCP or UDP NLM request and the client lane lockd serving a callback are context request; the server lockd thread granting a blocked lock and the rpciod steps of the GRANTED_MSG callback and of *_RES replies are context lockd, owned by the program whose LOCK created the block or whose request sent the reply; a grant after that program ended is not attributed; async UNLOCK/CANCEL that the kernel NFS client sends from a syscall run in rpciod unattributed; no Stage 1 call sends UDP NLM"
       ],
       "status": "validated",
       "scope": [
@@ -210,7 +211,8 @@
       "source_refs": [
         "bundle/patches/syzkaller/0030-*",
         "bundle/lane/lane.sh",
-        "tools/nfs-lifecycle/run.py"
+        "tools/nfs-lifecycle/run.py",
+        "bundle/patches/kernel/0006-*"
       ]
     }
   ],
@@ -228,7 +230,6 @@
   "missing_capability_ids": [
     "remote_kcov.context.cld",
     "remote_kcov.context.client",
-    "remote_kcov.context.lockd",
     "remote_kcov.context.transport"
   ],
   "admission_source": {
@@ -679,7 +680,7 @@
   ],
   "judge_profile": {
     "name": "knfsd-remote-kcov",
-    "revision": "1",
+    "revision": "2",
     "minimum_remote_start_ok": 1,
     "allowed_trace_modes": [
       "off"
@@ -770,6 +771,48 @@
         ]
       },
       {
+        "context": "lockd",
+        "window": "generation-plus-drain",
+        "counters": [
+          {
+            "counter": "new_root_rejected_aborted",
+            "max_delta": 0
+          },
+          {
+            "counter": "new_root_rejected_closing",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_generation",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_root",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_token",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_epoch_mismatch",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_lane_unhealthy",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_owner_none",
+            "max_delta": 0
+          }
+        ],
+        "normal_counters": [
+          "lane_owner_failed",
+          "lane_owner_no_generation"
+        ]
+      },
+      {
         "context": "request",
         "window": "generation-plus-drain",
         "counters": [
@@ -803,10 +846,11 @@
   },
   "support_boundary": {
     "name": "knfsd-remote-kcov",
-    "revision": "1",
+    "revision": "2",
     "supported_contexts": [
       "async_copy",
       "callback_v41",
+      "lockd",
       "request"
     ]
   },
