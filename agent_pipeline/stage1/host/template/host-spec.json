@@ -140,14 +140,50 @@
         "tools/nfs-proxy/src/lifecycle.c",
         "tools/nfs-lifecycle/run.py"
       ]
+    },
+    {
+      "id": "HCAP-12",
+      "name": "bounded nfsdcld reconnect during NFSv4.1 client recovery",
+      "purpose": "Replace the lane nfsdcld pipe reader while a recovered client0 records itself through the CLD upcall",
+      "usable_stage": [
+        "stage1"
+      ],
+      "usable_by": [
+        "agent_stage1"
+      ],
+      "interface": {
+        "syz_calls": [
+          "syz_nfsd_cld_ctl$reconnect"
+        ]
+      },
+      "constraints": [
+        "single NFSv4.1 fixture with the lifecycle broker managing the lane nfsdcld",
+        "within the HCAP-11 sequence invoke exactly one syz_nfsd_cld_ctl$reconnect(0x2) after syz_nfsd_client_ctl$expire_client0(0x0) and before the client0 profile acquisition; syz_nfsd_cld_ctl$daemon_down is never admitted",
+        "the broker alone selects the daemon by namespace, start time, command, executable and owned rpc_pipefs CLD pipe, holds it stopped for a bounded time, then replaces it and refuses overlapping operations",
+        "only nfsd request-context CLD work is attributed; daemon, rpciod and broker-process CLD work is remote_kcov.context.cld"
+      ],
+      "status": "validated",
+      "scope": [
+        "client0_recovery_cld_reconnect"
+      ],
+      "source_refs": [
+        "bundle/patches/syzkaller/0028-*",
+        "bundle/lane/lane.sh",
+        "tools/nfs-proxy/src/cld.c",
+        "tools/nfs-lifecycle/run.py"
+      ]
     }
   ],
   "capability_evidence": {
     "HCAP-11": [
       "capability-evidence/hcap11-kvm.json"
+    ],
+    "HCAP-12": [
+      "capability-evidence/hcap12-kvm.json"
     ]
   },
   "missing_capability_ids": [
+    "remote_kcov.context.cld",
     "remote_kcov.context.client",
     "remote_kcov.context.transport"
   ],
@@ -303,6 +339,12 @@
         ]
       },
       {
+        "call": "syz_nfsd_cld_ctl$reconnect",
+        "capability_ids": [
+          "HCAP-12"
+        ]
+      },
+      {
         "call": "syz_nfsd_client_ctl$expire_client0",
         "capability_ids": [
           "HCAP-11"
@@ -370,6 +412,21 @@
         "syz_open_nfs_lane_profile$client1_knfsd_v41"
       ],
       "trace_mode": "off"
+    },
+    {
+      "profile": "knfsd-v41",
+      "nfs_version": "4.1",
+      "fixture_mode": "single",
+      "route": "direct",
+      "topology": "one-lane",
+      "enabled_interfaces": [
+        "remote_cover",
+        "syz_nfsd_cld_ctl$reconnect",
+        "syz_nfsd_client_ctl$expire_client0",
+        "syz_open_nfs_lane_profile$client0_knfsd_v41",
+        "syz_open_nfs_lane_profile$client1_knfsd_v41"
+      ],
+      "trace_mode": "off"
     }
   ],
   "neutral_controls": [
@@ -382,6 +439,27 @@
         "topology": "one-lane",
         "enabled_interfaces": [
           "remote_cover",
+          "syz_nfsd_client_ctl$expire_client0",
+          "syz_open_nfs_lane_profile$client0_knfsd_v41",
+          "syz_open_nfs_lane_profile$client1_knfsd_v41"
+        ],
+        "trace_mode": "off"
+      },
+      "program": "neutral-knfsd-v41.syz",
+      "required_capability_ids": [
+        "HCAP-01"
+      ]
+    },
+    {
+      "runtime_selection": {
+        "profile": "knfsd-v41",
+        "nfs_version": "4.1",
+        "fixture_mode": "single",
+        "route": "direct",
+        "topology": "one-lane",
+        "enabled_interfaces": [
+          "remote_cover",
+          "syz_nfsd_cld_ctl$reconnect",
           "syz_nfsd_client_ctl$expire_client0",
           "syz_open_nfs_lane_profile$client0_knfsd_v41",
           "syz_open_nfs_lane_profile$client1_knfsd_v41"

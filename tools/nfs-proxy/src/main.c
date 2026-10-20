@@ -211,7 +211,8 @@ static void usage(const char *program)
 		"       %s --check-rules RULES\n"
 		"       %s --describe-rules RULES\n"
 		"       %s --capability-registry\n"
-		"       %s --lifecycle-admin PATH --lane N\n"
+		"       %s --lifecycle-admin PATH --lane N "
+		"[--cld-daemon PATH --cld-state PATH]\n"
 		"One listener per backend; client identity is the TCP source IP. "
 		"An arm rule is active only while its control FD remains open.\n"
 		"--semantic decodes every record and correlates each REPLY with "
@@ -229,7 +230,9 @@ static void usage(const char *program)
 		"--capability-registry prints the semantic capability registry "
 		"this build implements (canonical JSON, one line).\n"
 		"--lifecycle-admin serves the bounded knfsd NFSv4.1 client-expiry "
-		"fixture endpoint from the server mount/network namespace.\n",
+		"fixture endpoint from the server mount/network namespace; with "
+		"--cld-daemon it also serves the bounded nfsdcld reconnect and "
+		"down operations for that namespace's CLD pipe.\n",
 		program, program, program, program, program, program);
 }
 
@@ -276,11 +279,18 @@ int main(int argc, char **argv)
 		return nfsp_target_capability_registry(
 			families, sizeof(families) / sizeof(families[0]),
 			stdout) == 0 ? 0 : 1;
-	if (argc == 5 && strcmp(argv[1], "--lifecycle-admin") == 0 &&
+	if ((argc == 5 || argc == 9) &&
+	    strcmp(argv[1], "--lifecycle-admin") == 0 &&
 	    strcmp(argv[3], "--lane") == 0) {
+		static struct nfsp_cld cld_admin;
+		struct nfsp_cld *cld_control = NULL;
 		uint32_t lane;
+		int served;
 
-		if (parse_u32(argv[4], &lane) != 0 || lane > 255u) {
+		if (parse_u32(argv[4], &lane) != 0 || lane > 255u ||
+		    (argc == 9 && (strcmp(argv[5], "--cld-daemon") != 0 ||
+				   strcmp(argv[7], "--cld-state") != 0 ||
+				   argv[6][0] != '/' || argv[8][0] != '/'))) {
 			usage(argv[0]);
 			return 2;
 		}
@@ -288,10 +298,33 @@ int main(int argc, char **argv)
 			fprintf(stderr, "signal stop flag must be lock-free on this host\n");
 			return 2;
 		}
+		if (argc == 9) {
+			/* Paths come from lane.sh; nothing here is chosen by
+			 * a program.  The pipe is this namespace's CLD pipe. */
+			const struct nfsp_cld_config config = {
+				.proc_root = "/proc",
+				.pipe_path = NFSP_CLD_PIPE_PATH,
+				.daemon_path = argv[6],
+				.state_path = argv[8],
+				.require_pipefs = 1,
+				.hold_ms = NFSP_CLD_HOLD_MS,
+				.down_ms = NFSP_CLD_DOWN_MS,
+				.stop_timeout_ms = NFSP_CLD_STOP_TIMEOUT_MS,
+				.start_timeout_ms = NFSP_CLD_START_TIMEOUT_MS,
+			};
+
+			if (nfsp_cld_init(&cld_admin, &config) != 0) {
+				perror("cld admin");
+				return 1;
+			}
+			cld_control = &cld_admin;
+		}
 		signal(SIGINT, stop_signal);
 		signal(SIGTERM, stop_signal);
-		if (nfsp_lifecycle_serve(argv[2], "/proc/fs/nfsd/clients", lane,
-					 &stop_requested) != 0) {
+		served = nfsp_lifecycle_serve_cld(argv[2], "/proc/fs/nfsd/clients",
+						  lane, cld_control,
+						  &stop_requested);
+		if (served != 0) {
 			perror("lifecycle admin");
 			return 1;
 		}

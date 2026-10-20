@@ -292,6 +292,39 @@ def _hcap11_program_error(parsed: ParsedProgram) -> str | None:
     return None
 
 
+HCAP12_ID = "HCAP-12"
+HCAP12_CLD_PREFIX = "syz_nfsd_cld_ctl$"
+HCAP12_RECONNECT = "syz_nfsd_cld_ctl$reconnect"
+
+
+def _hcap12_program_error(parsed: ParsedProgram) -> str | None:
+    """Return why a program is outside HCAP-12's validated sequence.
+
+    HCAP-12 extends the HCAP-11 recovery sequence with exactly one bounded
+    nfsdcld reconnect between the client0 expiry and the fresh client0
+    acquisition, so the recovery's tracking create meets a pipe whose reader
+    is being replaced.  Any other nfsdcld control operation (the
+    daemon-down validation operation included) is outside the validated
+    subset and is refused here regardless of per-call grants.
+    """
+    error = _hcap11_program_error(parsed)
+    if error is not None:
+        return f"hcap11:{error}"
+    controls = [call for call in parsed.calls
+                if call.call.startswith(HCAP12_CLD_PREFIX)]
+    if any(call.call != HCAP12_RECONNECT for call in controls):
+        return "cld_operation_not_validated"
+    if len(controls) != 1:
+        return "cld_reconnect_count"
+    expiry = next(call.index for call in parsed.calls
+                  if call.call == HCAP11_EXPIRE)
+    acquisition = next(call.index for call in parsed.calls
+                       if call.call == HCAP11_ACQUIRE)
+    if not expiry < controls[0].index < acquisition:
+        return "cld_reconnect_order"
+    return None
+
+
 class SyzParseFailure(ValueError):
     """A deterministic strict-parse refusal from the injected parser.
 
@@ -679,6 +712,18 @@ class ArtifactHarnessMaterializer:
                for item in parsed.nfs_acquisitions):
             self._fail(PROFILE_FIXTURE_ROUTE_MISMATCH,
                        f"{role}_nfs_profile_mismatch")
+        hcap12 = role == "scenario" and HCAP12_ID in required_capabilities
+        if hcap12:
+            error = _hcap12_program_error(parsed)
+            if error is not None:
+                self._fail(CALL_NOT_ADMITTED,
+                           f"{role}_hcap12_program_contract:{error}")
+        elif any(call.call.startswith(HCAP12_CLD_PREFIX)
+                 for call in parsed.calls):
+            # nfsdcld control perturbs a shared lane daemon; only the
+            # HCAP-12 scenario contract may carry it, never a neutral control.
+            self._fail(CALL_NOT_ADMITTED,
+                       f"{role}_hcap12_program_contract:cld_without_hcap12")
         if role == "scenario" and HCAP11_ID in required_capabilities:
             error = _hcap11_program_error(parsed)
             if error is not None:

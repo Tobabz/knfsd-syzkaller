@@ -69,6 +69,36 @@ def test_lifecycle_control_preserves_nfs_provenance(parser, identity):
     assert facts.origins[0].origin == "nfs-profile:knfsd-v41:client0"
 
 
+def test_cld_control_preserves_nfs_provenance(parser, identity):
+    source = (LANE + b"syz_nfsd_cld_ctl$reconnect(0x2)\n"
+              b"syz_nfsd_cld_ctl$daemon_down(0x3)\n"
+              b"fsync(r0)\n")
+    result = parser.parse(source, identity=identity)
+    facts = result.calls[3].resource_facts
+    assert facts.origins[0].origin == "nfs-profile:knfsd-v41:client0"
+
+
+def test_cld_control_operation_is_fixed_by_variant(parser, identity):
+    # The operation is a const in each variant: syzkaller normalizes a
+    # mismatching literal back to the variant's operation instead of
+    # forwarding it, and the executor refuses any operation but 2 and 3.
+    for source, call in (
+            (LANE + b"syz_nfsd_cld_ctl$reconnect(0x3)\n",
+             "syz_nfsd_cld_ctl$reconnect"),
+            (LANE + b"syz_nfsd_cld_ctl$daemon_down(0x2)\n",
+             "syz_nfsd_cld_ctl$daemon_down")):
+        assert parser.parse(source, identity=identity).calls[1].call == call
+
+
+@pytest.mark.parametrize("program", [
+    LANE + b"syz_nfsd_cld_ctl$reconnect(0x2, 0x0)\n",
+    LANE + b"syz_nfsd_cld_ctl(0x2)\n",
+])
+def test_cld_control_refuses_other_operations(program, parser, identity):
+    with pytest.raises(SyzParseFailure):
+        parser.parse(program, identity=identity)
+
+
 @pytest.mark.parametrize("program", [
     b"", b"unknown_call()\n", b"getpid(1)\n", b"clone3(0x0, 0x0)\n",
     b"fsync(r99)\n", b"getpid() (async)\n", b"# fake nfs acquisition\n",

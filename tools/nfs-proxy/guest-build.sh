@@ -23,7 +23,7 @@ gcc -std=c11 -O2 -g -pthread -Wall -Wextra -Werror -Wshadow \
     /src/schema_nfs4.c /src/schema_nfs3.c /src/rpc_decode.c \
     /src/resolver.c /src/mutation_apply.c /src/activation.c /src/rule.c \
     /src/target.c /src/journal.c /src/jsonw.c /src/sha256.c \
-    /src/lifecycle.c
+    /src/lifecycle.c /src/cld.c
 gcc -std=c11 -O2 -g -Wall -Wextra -Werror -Wshadow -Wconversion \
     -Wsign-conversion -Wpointer-arith -Wcast-qual -Wwrite-strings \
     -Wmissing-prototypes -Wstrict-prototypes -Wformat=2 \
@@ -80,6 +80,7 @@ validate_binary /work/guest-delta-replay replay-probe
         /src/rule.c /src/rule.h /src/target.c /src/target.h \
         /src/journal.c /src/journal.h /src/jsonw.c /src/jsonw.h \
         /src/sha256.c /src/sha256.h /src/lifecycle.c /src/lifecycle.h \
+        /src/cld.c /src/cld.h \
         /src/concrete_edit.h \
         /test/guest-delta-replay.c
     sha256sum /work/nfs-proxy /work/guest-delta-replay

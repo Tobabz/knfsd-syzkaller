@@ -93,6 +93,20 @@ with tempfile.TemporaryDirectory() as directory:
     assert 'pid_owns_unix_socket "$status_lifecycle_pid"' in lane_text
     assert "lifecycle admin does not own its socket" in lane_text
     assert 'server/lifecycle.starttime' in lane_text
+    # The broker owns bounded nfsdcld control; status accepts only the exact
+    # daemon it last validated, idle, unstopped and holding the CLD pipe.
+    assert '--cld-daemon "$cld_daemon"' in lane_text
+    assert '--cld-state "$lane_root/server/cld.state"' in lane_text
+    assert 'cld_daemon_valid "$status_lane_root/server/cld.state"' in lane_text
+    assert "nfsdcld is not the broker-validated idle daemon" in lane_text
+    cld_start = lane_text.index("cld_daemon_valid()\n{")
+    cld_end = lane_text.index("\n}\n", cld_start) + 3
+    cld_function = lane_text[cld_start:cld_end]
+    for required in ("state=", "pid_in_named_netns", "ns/mnt", "$22",
+                     "nfsdcld ", "rpc_pipefs/nfsd/cld", '"$cld_pipe"',
+                     "pgrep -x nfsdcld", 'test "$cld_count" -eq 1',
+                     "R|S|D"):
+        assert required in cld_function, required
 
     # Exercise the exact shell ownership helper when the environment permits
     # AF_UNIX binds. A stale pathname and a socket owned by another live PID
@@ -383,8 +397,8 @@ assert manifest["purpose"] == "mutation_seed"
 assert Path(ROOT / manifest["required_syzkaller_patch"]).is_file()
 assert Path(ROOT / manifest["required_syzkaller_validator_patch"]).is_file()
 syzkaller_patches = sorted((ROOT / "bundle/patches/syzkaller").glob("*.patch"))
-assert len(syzkaller_patches) == 27
-assert syzkaller_patches[-1].name.startswith("0027-")
+assert len(syzkaller_patches) == 28
+assert syzkaller_patches[-1].name.startswith("0028-")
 programs = {entry["path"]: entry for entry in manifest["programs"]}
 assert len(programs) == len(manifest["programs"]) == 12
 for entry in manifest["programs"]:

@@ -10,6 +10,7 @@ import shlex
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -27,6 +28,9 @@ from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   guest_cmdline,
                                                   verify_pins)
 from agent_pipeline.stage1.host.pins import HostFilePin
+from agent_pipeline.stage1.host.target_pcs import (iter_addr2line,
+                                                   path_matches,
+                                                   vmlinux_callsites)
 from agent_pipeline.stage1.host.vm import QemuGuest, VmConfig
 
 
@@ -38,6 +42,7 @@ SCENARIOS = {
     "v40-lease-expiry": {"version": "4.0", "kind": "lease"},
     "v41-client-expiry": {"version": "4.1", "kind": "admin"},
     "v41-control-restart": {"version": "4.1", "kind": "control"},
+    "v41-cld-lifecycle": {"version": "4.1", "kind": "cld"},
     "v42-control-restart": {"version": "4.2", "kind": "control"},
 }
 LEASE_EVENTS = (
@@ -95,6 +100,53 @@ ADMIN_REQUIRED_INTERFACES = frozenset((
     "syz_nfsd_client_ctl$expire_client0",
     "syz_open_nfs_lane_profile$client0_knfsd_v41",
 ))
+CLD_RECONNECT = "syz_nfsd_cld_ctl$reconnect"
+CLD_REQUIRED_INTERFACES = ADMIN_REQUIRED_INTERFACES | {CLD_RECONNECT}
+# Scenario A is "normal", B "daemon_down" (fixture evidence only) and C
+# "reconnect"; "control" is the neutral HCAP-11 I/O program.
+CLD_PROGRAMS = {
+    "control": ADMIN_PROGRAMS["control"],
+    "normal": ADMIN_PROGRAMS["stimulus"],
+    "reconnect": ROOT / "tools/nfs-lifecycle/programs/v41-cld-reconnect.prog",
+    "daemon_down":
+    ROOT / "tools/nfs-lifecycle/programs/v41-cld-daemon-down.prog",
+}
+# daemon_down blocks client0 recovery for the 30 s RPC upcall timeout, so
+# its program needs a larger syzkaller program budget.
+CLD_SLOWDOWN = {"control": 1, "normal": 1, "reconnect": 1, "daemon_down": 10}
+CLD_STATE = "/tmp/frozen-phase9.manager/lane0/server/cld.state"
+CLD_STATE_TIMEOUT = 90
+CLD_DELTA_COUNTERS = (
+    "reconnect_ok", "reconnect_fail", "down_ok", "down_fail",
+    "daemon_stop_fail", "daemon_start_fail", "refused_busy",
+    "refused_identity", "restore_ok", "restore_fail",
+)
+CLD_REQUEST_RE = re.compile(
+    r"^cld request lane=0 op=(?P<op>[23]) status=(?P<status>[0-9]+) "
+    r"seq=(?P<seq>[0-9]+) pid=(?P<pid>[0-9]+) "
+    r"starttime=(?P<starttime>[0-9]+)$", re.MULTILINE)
+CLD_OPS = {"reconnect": "2", "daemon_down": "3"}
+# Public CLD probes: (kernel file, function, part).  "function" is the
+# whole function; "error_report" the statements after the error test at
+# out_err; "wait_for_open" the no-reader branch that queues for a later
+# reader.  Only PCs whose inline frame is that function and line are kept.
+CLD_PROBES = {
+    "cld_create": (
+        ("fs/nfsd/nfs4recover.c", "nfsd4_cld_create", "function"),
+        ("fs/nfsd/nfs4recover.c", "nfsd4_cld_create_v2", "function"),
+    ),
+    "cld_create_error": (
+        ("fs/nfsd/nfs4recover.c", "nfsd4_cld_create", "error_report"),
+        ("fs/nfsd/nfs4recover.c", "nfsd4_cld_create_v2", "error_report"),
+    ),
+    "pipe_wait_for_open": (
+        ("net/sunrpc/rpc_pipe.c", "rpc_queue_upcall", "wait_for_open"),
+    ),
+}
+RECLAIM_COMPLETE_RE = re.compile(
+    r"nfsd_compound_status: .* OP_RECLAIM_COMPLETE status=0(?:\s|$)",
+    re.MULTILINE)
+CLD_CREATE_FAILURE = "Unable to create client record on stable storage"
 
 
 class CheckedGuest:
@@ -129,19 +181,29 @@ class AdminContext:
     selection: RuntimeSelection
     lane_sha256: str
     evidence_identity: dict
+    identity: KernelIdentity | None = None
 
 
-def load_admin_context(collector_path, descriptor_path, mapping_path):
-    """Load one exact Stage1 harness and bind the target mapping to it."""
+def load_admin_context(collector_path, descriptor_path, mapping_path, *,
+                       required=ADMIN_REQUIRED_INTERFACES):
+    """Load one exact Stage1 harness and bind the target mapping to it.
+
+    ``required`` picks the runtime selection: the client-expiry campaign
+    uses the HCAP-11 selection without nfsdcld control, the CLD campaign the
+    one that adds it.  The CLD campaign maps public probes itself and passes
+    no target mapping.
+    """
     config_bytes = Path(collector_path).read_bytes()
     descriptor_bytes = Path(descriptor_path).read_bytes()
-    mapping_bytes = Path(mapping_path).read_bytes()
     config = CollectorConfig.model_validate_json(config_bytes)
     descriptor = ExecutionHarnessDescriptor.model_validate_json(
         descriptor_bytes)
-    mapping = TargetPcMapping.model_validate_json(mapping_bytes)
-    if not mapping.verified or not mapping.target_pcs:
-        raise RuntimeError("target PC mapping is empty or unverified")
+    mapping = None
+    if mapping_path is not None:
+        mapping = TargetPcMapping.model_validate_json(
+            Path(mapping_path).read_bytes())
+        if not mapping.verified or not mapping.target_pcs:
+            raise RuntimeError("target PC mapping is empty or unverified")
     files = verify_pins(config, descriptor)
     builds = {item.name: item.artifact_ref
               for item in descriptor.build_artifacts}
@@ -159,18 +221,21 @@ def load_admin_context(collector_path, descriptor_path, mapping_path):
         kaslr_enabled=False, kaslr_offset=0)
     if "nokaslr" not in descriptor.guest_kernel_command_line.split():
         raise RuntimeError("execution descriptor does not disable KASLR")
-    if mapping.target.kernel_commit != descriptor.kernel_commit:
-        raise RuntimeError("target mapping names another kernel commit")
-    if mapping.identity != expected_identity:
-        raise RuntimeError("target mapping identity does not match the exact "
-                           "execution harness")
+    if mapping is not None:
+        if mapping.target.kernel_commit != descriptor.kernel_commit:
+            raise RuntimeError("target mapping names another kernel commit")
+        if mapping.identity != expected_identity:
+            raise RuntimeError("target mapping identity does not match the "
+                               "exact execution harness")
 
     selections = [
         item for item in descriptor.allowed_runtime_selections
         if (item.profile == "knfsd-v41" and item.nfs_version == "4.1"
             and item.fixture_mode == "single" and item.route == "direct"
             and item.topology == "one-lane" and item.trace_mode == "off"
-            and ADMIN_REQUIRED_INTERFACES <= set(item.enabled_interfaces))
+            and required <= set(item.enabled_interfaces)
+            and (CLD_RECONNECT in required or
+                 CLD_RECONNECT not in item.enabled_interfaces))
     ]
     if len(selections) != 1:
         raise RuntimeError("execution descriptor must expose one exact "
@@ -187,14 +252,16 @@ def load_admin_context(collector_path, descriptor_path, mapping_path):
         "kernel_commit": descriptor.kernel_commit,
         "instrumentation_sha256": expected_identity.instrumentation_sha256,
         "vmlinux_sha256": expected_identity.vmlinux_sha256,
-        "target_mapping_sha256": hashlib.sha256(
-            canonical_json(mapping)).hexdigest(),
         "build_artifact_refs": dict(sorted(builds.items())),
     }
+    if mapping is not None:
+        evidence["target_mapping_sha256"] = hashlib.sha256(
+            canonical_json(mapping)).hexdigest()
     return AdminContext(
         config=config, descriptor=descriptor, files=files,
-        target_pcs=frozenset(mapping.target_pcs), selection=selections[0],
-        lane_sha256=lane_pin.sha256, evidence_identity=evidence)
+        target_pcs=frozenset(mapping.target_pcs if mapping else ()),
+        selection=selections[0], lane_sha256=lane_pin.sha256,
+        evidence_identity=evidence, identity=expected_identity)
 
 
 def make_admin_vm(context, output):
@@ -375,14 +442,15 @@ def wait_admin_exec(vm, gate, timeout=300):
                        ("before gate" if gate else "after gate"))
 
 
-def start_admin_exec(vm, guest_program):
+def start_admin_exec(vm, guest_program, slowdown=1):
     argv = [ADMIN_GUEST + "/syz-execprog",
             "-executor=" + ADMIN_GUEST + "/syz-executor",
             "-os=linux", "-arch=amd64", "-vmarch=amd64",
             "-sandbox=none", "-procs=1", "-repeat=1", "-threaded=false",
             "-cover=true", "-coverfile=/tmp/cov/cover",
             "-remote-cover=true", "-disable=all", "-debug", "-vv=1",
-            "-slowdown=1", "-gate=" + ADMIN_GATE, guest_program]
+            "-slowdown=%d" % slowdown, "-gate=" + ADMIN_GATE,
+            guest_program]
     body = ("timeout 300 %s > %s 2>&1; echo $? > %s" %
             (shlex.join(argv), ADMIN_LOG, ADMIN_RC))
     command = (
@@ -533,6 +601,37 @@ def _write_admin_raw(output, stem, artifacts, errors):
 
 
 def run_admin_program(vm, output, phase, iteration, tracing, target_pcs):
+    def evaluate(artifacts, pcs):
+        trace = artifacts["trace.txt"]
+        lifecycle_log = artifacts["lifecycle.log"]
+        hits = pcs & target_pcs
+        generation = generation_evidence(
+            artifacts["stats-before.txt"], artifacts["stats-after.txt"])
+        if phase == "control":
+            lineage = validate_admin_control(trace, lifecycle_log)
+            if hits:
+                raise RuntimeError(
+                    "neutral control reached %d target PCs" % len(hits))
+        else:
+            lineage = validate_admin_trace(trace, lifecycle_log)
+            if not hits:
+                raise RuntimeError(
+                    "expiry stimulus did not reach a target PC")
+        return {
+            "generation": generation,
+            "target_hit_count": len(hits),
+            "lineage": lineage,
+        }
+    return run_program(vm, output, phase, iteration, tracing, evaluate)
+
+
+def run_program(vm, output, phase, iteration, tracing, evaluate, *,
+                slowdown=1):
+    """Run one gated lifecycle program and evaluate its raw artifacts.
+
+    Raw artifacts are retained for every outcome; ``evaluate`` receives
+    them with the parsed remote-KCOV PCs once capture is complete.
+    """
     guest_program = "%s/%s.prog" % (ADMIN_GUEST, phase)
     stem = "%s-%03d" % (phase, iteration)
     artifacts = {}
@@ -542,7 +641,7 @@ def run_admin_program(vm, output, phase, iteration, tracing, target_pcs):
     cover_files = []
     try:
         set_tracing(vm, tracing, ADMIN_EVENTS, False, clear=True)
-        start_admin_exec(vm, guest_program)
+        start_admin_exec(vm, guest_program, slowdown)
         execution_started = True
         if wait_admin_exec(vm, True) != "ready":
             raise RuntimeError("syz-execprog exited before the program gate")
@@ -586,30 +685,13 @@ def run_admin_program(vm, output, phase, iteration, tracing, target_pcs):
             raise RuntimeError("coverage file cardinality extra=%d meta=%d" %
                                (len(extra_files), len(meta_files)))
 
-        trace = artifacts["trace.txt"]
-        lifecycle_log = artifacts["lifecycle.log"]
         pcs = parse_cover(artifacts["coverage.extra"])
-        hits = pcs & target_pcs
-        generation = generation_evidence(
-            artifacts["stats-before.txt"], artifacts["stats-after.txt"])
-        if phase == "control":
-            lineage = validate_admin_control(trace, lifecycle_log)
-            if hits:
-                raise RuntimeError(
-                    "neutral control reached %d target PCs" % len(hits))
-        else:
-            lineage = validate_admin_trace(trace, lifecycle_log)
-            if not hits:
-                raise RuntimeError(
-                    "expiry stimulus did not reach a target PC")
         return {
             "phase": phase,
             "iteration": iteration,
-            "generation": generation,
+            **evaluate(artifacts, pcs),
             "coverage_pc_count": len(pcs),
-            "target_hit_count": len(hits),
             "coverage_files": cover_files,
-            "lineage": lineage,
         }
     finally:
         _capture_admin_raw(
@@ -637,6 +719,362 @@ def run_admin(vm, output, repeat, files, target_pcs):
             cycles[phase].append(run_admin_program(
                 vm, output, phase, iteration, tracing, target_pcs))
     return tracing, cycles
+
+
+def probe_range(source, function, part):
+    """1-based inclusive line range of one public probe in kernel source."""
+    lines = source.splitlines()
+    starts = [index for index, line in enumerate(lines)
+              if re.match(re.escape(function) + r"\(", line)]
+    if len(starts) != 1:
+        raise RuntimeError("probe function %s definitions=%d, want 1" %
+                           (function, len(starts)))
+    start = starts[0]
+    end = next((index for index in range(start, len(lines))
+                if lines[index] == "}"), None)
+    if end is None:
+        raise RuntimeError("probe function %s has no end" % function)
+    if part == "function":
+        return start + 1, end + 1
+    body = range(start, end)
+    if part == "error_report":
+        labels = [index for index in body if lines[index] == "out_err:"]
+        tests = [index for index in body
+                 if labels and index > labels[0]
+                 and lines[index] == "\tif (ret)"]
+        if len(labels) != 1 or len(tests) != 1:
+            raise RuntimeError("probe %s error report not found" % function)
+        return tests[0] + 2, end
+    if part == "wait_for_open":
+        heads = [index for index in body if lines[index] ==
+                 "\t} else if (pipe->flags & RPC_PIPE_WAIT_FOR_OPEN) {"]
+        if len(heads) != 1:
+            raise RuntimeError("probe %s wait-for-open branch not found" %
+                               function)
+        close = next((index for index in range(heads[0] + 1, end)
+                      if lines[index] == "\t}"), None)
+        if close is None:
+            raise RuntimeError("probe %s branch has no end" % function)
+        return heads[0] + 1, close + 1
+    raise ValueError("unknown probe part %s" % part)
+
+
+def probe_ranges(read_source):
+    """Resolve CLD_PROBES against the exact kernel source."""
+    sources = {}
+    ranges = {}
+    for name, parts in sorted(CLD_PROBES.items()):
+        ranges[name] = []
+        for path, function, part in parts:
+            if path not in sources:
+                sources[path] = read_source(path)
+            start, end = probe_range(sources[path], function, part)
+            ranges[name].append({"path": path, "function": function,
+                                 "start_line": start, "end_line": end})
+    return ranges
+
+
+def select_probe_pcs(frames, ranges):
+    """Callsites whose inline frame is a probe function within its range."""
+    selected = {name: set() for name in ranges}
+    for pc, chain in frames:
+        for name, items in ranges.items():
+            if any(frame.function == item["function"]
+                   and frame.line is not None
+                   and path_matches(frame.path, item["path"])
+                   and item["start_line"] <= frame.line <= item["end_line"]
+                   for frame in chain for item in items):
+                selected[name].add(pc)
+    return selected
+
+
+def build_cld_probes(context, kernel_source, cache, output):
+    """Map the public CLD probes to coverage callsites of the pinned vmlinux.
+
+    Returns probe PCs and the digest of each probe record.  The records
+    name public kernel functions only and are kept beside the raw run
+    artifacts for audit.
+    """
+    import subprocess
+    import tempfile
+
+    commit = context.descriptor.kernel_commit
+
+    def read_source(path):
+        return subprocess.run(
+            ["git", "-C", str(kernel_source), "show",
+             "%s:%s" % (commit, path)],
+            check=True, capture_output=True, text=True).stdout
+
+    ranges = probe_ranges(read_source)
+    vmlinux = context.files["kernel"]
+    found = vmlinux_callsites(
+        vmlinux, cache, context.identity.vmlinux_sha256)
+    if found.tail_jumps or not found.callsites:
+        raise RuntimeError("vmlinux coverage callsites are not in call form")
+    with tempfile.TemporaryFile("w+") as addresses:
+        addresses.write("".join("%#x\n" % pc for pc in found.callsites))
+        addresses.seek(0)
+        process = subprocess.Popen(
+            ["addr2line", "-a", "-f", "-i", "-e", str(vmlinux)],
+            stdin=addresses, stdout=subprocess.PIPE, text=True,
+            bufsize=1 << 20)
+        with process.stdout:
+            selected = select_probe_pcs(iter_addr2line(process.stdout),
+                                        ranges)
+        if process.wait() != 0:
+            raise RuntimeError("addr2line failed on the pinned vmlinux")
+    probes = {}
+    digests = {}
+    for name in sorted(ranges):
+        if not selected[name]:
+            raise RuntimeError("CLD probe %s maps to no callsite" % name)
+        record = {
+            "schema_version": "cld-probe-mapping.v1",
+            "probe": name,
+            "identity": context.identity.model_dump(mode="json"),
+            "ranges": ranges[name],
+            "pcs": ["%#x" % pc for pc in sorted(selected[name])],
+        }
+        encoded = canonical_json(record)
+        (output / ("probe-%s.json" % name)).write_bytes(encoded)
+        probes[name] = frozenset(selected[name])
+        digests[name] = hashlib.sha256(encoded).hexdigest()
+    return probes, digests
+
+
+def parse_cld_state(text):
+    values = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or not re.fullmatch(r"[a-z_]+", key):
+            raise RuntimeError("malformed nfsdcld broker state")
+        values[key] = value
+    for name in CLD_DELTA_COUNTERS:
+        if not re.fullmatch(r"[0-9]+", values.get(name, "")):
+            raise RuntimeError("nfsdcld broker state lacks %s" % name)
+    return values
+
+
+def wait_cld_idle(vm, timeout=CLD_STATE_TIMEOUT):
+    """Wait for the broker to finish any transaction; a failed broker or a
+    timeout is a fixture failure, never a coverage result."""
+    deadline = time.monotonic() + timeout
+    while True:
+        state = parse_cld_state(vm.guest("cat %s" % CLD_STATE))
+        if state.get("state") == "idle":
+            return state
+        if state.get("state") == "failed":
+            raise RuntimeError("fixture: nfsdcld broker failed")
+        if time.monotonic() >= deadline:
+            raise RuntimeError("fixture: nfsdcld broker stayed %s" %
+                               state.get("state"))
+        time.sleep(1)
+
+
+def cld_delta(before, after):
+    delta = {}
+    for name in CLD_DELTA_COUNTERS:
+        old, new = int(before[name]), int(after[name])
+        if new < old:
+            raise RuntimeError("nfsdcld broker counter %s went backwards" %
+                               name)
+        delta[name] = new - old
+    return delta
+
+
+def validate_cld_request(phase, lifecycle_log):
+    """The run window holds exactly the scenario's accepted broker request."""
+    requests = list(CLD_REQUEST_RE.finditer(lifecycle_log))
+    if phase not in CLD_OPS:
+        if "cld request" in lifecycle_log:
+            raise RuntimeError("%s run invoked the nfsdcld broker" % phase)
+        return None
+    if len(requests) != 1 or lifecycle_log.count("cld request") != 1:
+        raise RuntimeError("fixture: %s nfsdcld request count=%d, want 1" %
+                           (phase, lifecycle_log.count("cld request")))
+    request = requests[0]
+    if request.group("op") != CLD_OPS[phase] or request.group("status") != "0":
+        raise RuntimeError("fixture: %s nfsdcld request was refused" % phase)
+    return {name: request.group(name) for name in ("seq", "pid", "starttime")}
+
+
+def validate_cld_completion(request, before, after):
+    """The transaction this run started is the one that completed, and it
+    replaced the daemon; without a request the daemon is unchanged."""
+    if request is None:
+        if any(after.get(key) != before.get(key)
+               for key in ("seq", "pid", "starttime", "pipe")):
+            raise RuntimeError("fixture: nfsdcld changed without a request")
+        return
+    if after.get("seq") != request["seq"]:
+        raise RuntimeError("fixture: nfsdcld broker ran another transaction")
+    if (after.get("pid"), after.get("starttime")) == (
+            request["pid"], request["starttime"]):
+        raise RuntimeError("fixture: nfsdcld was not replaced")
+
+
+def run_cld_program(vm, output, phase, iteration, tracing, probes):
+    before = wait_cld_idle(vm)
+    failures_before = vm.guest("dmesg").count(CLD_CREATE_FAILURE)
+
+    def evaluate(artifacts, pcs):
+        lifecycle_log = artifacts["lifecycle.log"]
+        trace = artifacts["trace.txt"]
+        request = validate_cld_request(phase, lifecycle_log)
+        hits = {name: len(pcs & probe) for name, probe in probes.items()}
+        attributed = True
+        try:
+            generation = generation_evidence(
+                artifacts["stats-before.txt"], artifacts["stats-after.txt"])
+        except RuntimeError:
+            # Scenario B is fixture evidence only: its blocked recovery may
+            # outlive the generation window.  Every other scenario needs one
+            # settled attributed generation.
+            if phase != "daemon_down":
+                raise
+            generation, attributed = None, False
+        if phase == "control":
+            lineage = validate_admin_control(trace, lifecycle_log)
+            if any(hits.values()):
+                raise RuntimeError("neutral control reached a CLD probe")
+        else:
+            lineage = {"ordered_events": validate_admin_trace(
+                trace, lifecycle_log)["ordered_events"]}
+        return {
+            "generation": generation,
+            "attributed_generation": attributed,
+            "probe_hits": hits,
+            "lineage": lineage,
+            "cld_request": request,
+            # Diagnostics only: they never decide reach.
+            "diagnostics": {
+                "reclaim_complete_ok":
+                len(RECLAIM_COMPLETE_RE.findall(trace)),
+            },
+        }
+
+    result = run_program(vm, output, phase, iteration, tracing, evaluate,
+                         slowdown=CLD_SLOWDOWN[phase])
+    after = wait_cld_idle(vm)
+    stem = "%s-%03d" % (phase, iteration)
+    (output / (stem + ".cld.state")).write_text(
+        "".join("%s=%s\n" % item for item in sorted(after.items())))
+    validate_cld_completion(result.pop("cld_request"), before, after)
+    try:
+        status = json.loads(vm.guest(
+            "/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager"))
+    except Exception as error:
+        raise RuntimeError("fixture: lane status failed after %s: %s" %
+                           (phase, error)) from error
+    if status.get("fixture_mode") != "single":
+        raise RuntimeError("fixture: lane status changed fixture mode")
+    dmesg = vm.guest("dmesg")
+    (output / (stem + ".dmesg.txt")).write_text(dmesg)
+    crashes = [pattern for pattern in CRASH_PATTERNS if pattern in dmesg]
+    if crashes:
+        raise RuntimeError("kernel crash signatures: %s" % crashes)
+    result["diagnostics"]["create_failure_messages"] = (
+        dmesg.count(CLD_CREATE_FAILURE) - failures_before)
+    result.update({"broker": cld_delta(before, after),
+                   "status_check": "pass"})
+    return result
+
+
+def check_cld_run(phase, run):
+    """Fail closed on a run outside the scenario's validated behavior."""
+    hits, broker = run["probe_hits"], run["broker"]
+    bad = [name for name in ("reconnect_fail", "down_fail",
+                             "daemon_stop_fail", "daemon_start_fail",
+                             "refused_busy", "refused_identity",
+                             "restore_ok", "restore_fail") if broker[name]]
+    if bad:
+        raise RuntimeError("fixture: nfsdcld broker recorded %s" % bad[0])
+    want = {"reconnect": (1, 0), "daemon_down": (0, 1)}.get(phase, (0, 0))
+    if (broker["reconnect_ok"], broker["down_ok"]) != want:
+        raise RuntimeError("fixture: %s broker transactions differ" % phase)
+    if phase in ("normal", "reconnect"):
+        if not hits["cld_create"]:
+            raise RuntimeError("%s run missed the CLD create upcall" % phase)
+        if hits["cld_create_error"]:
+            raise RuntimeError("%s run reached the create error path" % phase)
+    if phase == "normal" and hits["pipe_wait_for_open"]:
+        raise RuntimeError("normal run queued without a pipe reader")
+    if phase == "reconnect" and not hits["pipe_wait_for_open"]:
+        raise RuntimeError("reconnect run missed the reader-loss requeue")
+
+
+def run_cld(vm, output, repeat, files, probes):
+    tracing = trace_root(vm, ADMIN_EVENTS)
+    vm.guest("mkdir -p %s" % ADMIN_GUEST)
+    for name in ("syz-executor", "syz-execprog"):
+        vm.put(files[name], ADMIN_GUEST + "/" + name)
+    for phase, path in CLD_PROGRAMS.items():
+        vm.put(path, "%s/%s.prog" % (ADMIN_GUEST, phase))
+    vm.guest("chmod 0755 %s/syz-executor %s/syz-execprog" %
+             (ADMIN_GUEST, ADMIN_GUEST))
+    vm.guest("test -s %s" % CLD_STATE)
+    cycles = {phase: [] for phase in CLD_PROGRAMS}
+    for phase in CLD_PROGRAMS:
+        for iteration in range(1, repeat + 1):
+            run = run_cld_program(vm, output, phase, iteration, tracing,
+                                  probes)
+            check_cld_run(phase, run)
+            cycles[phase].append(run)
+    return tracing, cycles
+
+
+def hcap12_evidence(context, guest_identity, probe_digests, cycles,
+                    result_bytes, crash_count, artifact_errors):
+    """Assemble and type-check the HCAP-12 evidence for this campaign."""
+    from agent_pipeline.stage1.host.generate import Hcap12KvmEvidence
+
+    runs = {}
+    for phase, items in cycles.items():
+        broker = {name: sum(run["broker"][name] for run in items)
+                  for name in CLD_DELTA_COUNTERS}
+        runs[phase] = {
+            "completed": len(items),
+            "probe_hits": {name: [run["probe_hits"][name] for run in items]
+                           for name in sorted(CLD_PROBES)},
+            "broker": broker,
+            "status_checks_passed": sum(
+                run["status_check"] == "pass" for run in items),
+            "attributed_generations": sum(
+                bool(run["attributed_generation"]) for run in items),
+        }
+    attributed = [run["generation"] for phase in ("control", "normal",
+                                                  "reconnect")
+                  for run in cycles[phase]]
+    evidence = {
+        "schema_version": "hcap-kvm-evidence.v1",
+        "capability_id": "HCAP-12",
+        "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "scenario": "v41-cld-lifecycle",
+        "execution_harness_id": context.identity.execution_harness_id,
+        "mapping_identity": context.identity.model_dump(mode="json"),
+        "probe_mapping_sha256": probe_digests,
+        "campaign_result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+        "guest_lane_script_sha256": guest_identity["guest_lane_script_sha256"],
+        "guest_nfs_proxy_sha256": guest_identity["guest_nfs_proxy_sha256"],
+        "runs": runs,
+        "generation_contract": {
+            "generation_begin_each": 1,
+            "aggregate_published_each": 1,
+            "generation_aborted_each": 0,
+            "scratch_overflow_each": 0,
+            "merge_truncation_each": 0,
+            "outstanding_tokens_after_each": 0,
+            "remote_refs_after_each": 0,
+            "minimum_remote_start_ok": min(
+                item["remote_start_ok"] for item in attributed),
+        },
+        "crash_signature_count": crash_count,
+        "raw_artifact_error_count": artifact_errors,
+        "shareable_result_contains_target_metadata_or_addresses":
+        bool(SHAREABLE_HEX_RE.search(result_bytes.decode())),
+    }
+    return Hcap12KvmEvidence.model_validate(evidence)
 
 
 def lease_guest_script(path):
@@ -891,13 +1329,36 @@ def main():
                         help="exact Stage1 descriptor.json (required by client expiry)")
     parser.add_argument("--target-pcs", type=Path,
                         help="verified q1 target-PC mapping (required by client expiry)")
+    parser.add_argument("--kernel-source", type=Path,
+                        default=ROOT / "env/linux",
+                        help="kernel git tree holding the descriptor's "
+                        "kernel commit (v41-cld-lifecycle probes)")
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args()
     if args.repeat < 1 or args.repeat > 999:
         parser.error("--repeat must be between 1 and 999")
     definition = SCENARIOS[args.scenario]
     admin_context = None
-    if definition["kind"] == "admin":
+    if definition["kind"] == "cld":
+        if args.repeat < 3:
+            parser.error("v41-cld-lifecycle evidence needs --repeat >= 3")
+        for option, path in (("--collector-config", args.collector_config),
+                             ("--descriptor", args.descriptor)):
+            if path is None or not path.resolve().is_file():
+                parser.error("%s is required by v41-cld-lifecycle" % option)
+        if args.target_pcs is not None:
+            parser.error("v41-cld-lifecycle maps public probes itself; "
+                         "do not pass a candidate --target-pcs mapping")
+        try:
+            admin_context = load_admin_context(
+                args.collector_config.resolve(), args.descriptor.resolve(),
+                None, required=CLD_REQUIRED_INTERFACES)
+        except Exception as error:
+            parser.error("invalid identity-bound lifecycle inputs: %s" % error)
+        for path in CLD_PROGRAMS.values():
+            if not path.is_file():
+                parser.error("missing lifecycle program: %s" % path)
+    elif definition["kind"] == "admin":
         required = {
             "--collector-config": args.collector_config,
             "--descriptor": args.descriptor,
@@ -937,6 +1398,20 @@ def main():
 
     result = {"scenario": args.scenario, "native_version": definition["version"],
               "iterations": args.repeat, "transport": "TCP", "status": "fail"}
+    probes = probe_digests = guest_identity = None
+    cycles = None
+    if definition["kind"] == "cld":
+        # Host-only: map the public probes before booting the guest.
+        try:
+            probes, probe_digests = build_cld_probes(
+                admin_context, args.kernel_source.resolve(),
+                output / "probe-cache", output)
+        except Exception as error:
+            result["error"] = shareable_error(error)
+            (output / "result.json").write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n")
+            raise
+        result["probe_mapping_sha256"] = probe_digests
     if admin_context is not None:
         result["evidence_identity"] = dict(
             admin_context.evidence_identity)
@@ -969,6 +1444,14 @@ def main():
                 admin_context.target_pcs)
             result["complete_control_runs"] = len(cycles["control"])
             result["complete_stimulus_runs"] = len(cycles["stimulus"])
+        elif definition["kind"] == "cld":
+            guest_identity = verify_admin_guest(vm, admin_context)
+            result["evidence_identity"].update(guest_identity)
+            vm.guest("test -S /syz-nfs-lanes/proc-0/control/lifecycle.sock")
+            tracing, cycles = run_cld(
+                vm, output, args.repeat, admin_context.files, probes)
+            result["complete_runs"] = {
+                phase: len(items) for phase, items in cycles.items()}
         else:
             tracing, cycles = run_control(vm, output, args.repeat)
             result["complete_control_cycles"] = len(cycles)
@@ -992,9 +1475,18 @@ def main():
         raise
     finally:
         vm.stop()
-        (output / "result.json").write_text(
-            json.dumps(result, indent=2, sort_keys=True) + "\n")
-        print(json.dumps(result, indent=2, sort_keys=True), flush=True)
+        encoded = (json.dumps(result, indent=2, sort_keys=True) +
+                   "\n").encode()
+        (output / "result.json").write_bytes(encoded)
+        print(encoded.decode(), end="", flush=True)
+        if definition["kind"] == "cld" and result["status"] == "pass":
+            errors = sum(1 for _ in output.glob("*.artifact-errors.txt"))
+            evidence = hcap12_evidence(
+                admin_context, guest_identity, probe_digests, cycles,
+                encoded, len(result["crash_signatures"]), errors)
+            (output / "hcap12-kvm.json").write_text(
+                evidence.model_dump_json(indent=2) + "\n")
+            print("HCAP-12 evidence: %s" % (output / "hcap12-kvm.json"))
 
 
 if __name__ == "__main__":

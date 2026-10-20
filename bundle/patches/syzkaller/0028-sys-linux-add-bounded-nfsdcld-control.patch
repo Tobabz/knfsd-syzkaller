@@ -1,0 +1,151 @@
+From e02f1f27b890a9247751c529cc2e18b00fd6d606 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Tue, 20 Oct 2026 11:40:00 +0900
+Subject: [PATCH] sys/linux: add bounded nfsdcld control
+
+---
+ executor/common_linux.h      | 57 +++++++++++++++++++++++++++++++++++-
+ pkg/vminfo/linux_syscalls.go |  1 +
+ sys/linux/fs_nfs_fuzz.txt    | 10 +++++++
+ sys/linux/nfs_fuzz_test.go   | 20 +++++++++++++
+ 4 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 3936a2c..bf7cbd0 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2828,7 +2828,7 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+     __NR_syz_open_nfs_lane_pair || __NR_syz_open_nfs_lane_profile || \
+     __NR_syz_socket_connect_nfs_pair || \
+     __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || \
+-    __NR_syz_nfsd_client_ctl || __NR_syz_send_nfs_fuzz
++    __NR_syz_nfsd_client_ctl || __NR_syz_nfsd_cld_ctl || __NR_syz_send_nfs_fuzz
+ #include <fcntl.h>
+ #include <sched.h>
+ #include <stdio.h>
+@@ -3020,6 +3020,61 @@ static long syz_nfsd_client_ctl(volatile long a0)
+ 	return 0;
+ }
+ 
++static long syz_nfsd_cld_ctl(volatile long a0)
++{
++	// The same server-side broker owns one bounded nfsdcld transaction per
++	// call: 2 holds the validated daemon and, after a fixed window, replaces
++	// it so a queued CLD upcall is retried; 3 stops it for a fixed window
++	// longer than the kernel upcall timeout.  The daemon, pipe, namespaces
++	// and windows are broker-owned; the program selects only the operation.
++	unsigned long op = a0;
++	if (op != 2 && op != 3) {
++		errno = EINVAL;
++		return -1;
++	}
++	int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++	if (fd < 0)
++		return -1;
++	struct timeval tv = {.tv_sec = 15};
++	struct sockaddr_un addr = {.sun_family = AF_UNIX};
++	strcpy(addr.sun_path, "/nfs-lane/control/lifecycle.sock");
++	uint8 request[16] = {};
++	memcpy(request, "NFSLIFE1", 8);
++	nfs_lifecycle_put32(request + 8, (uint32)op);
++	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) ||
++	    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) ||
++	    connect(fd, (struct sockaddr*)&addr, sizeof(addr)) ||
++	    send(fd, request, sizeof(request), MSG_NOSIGNAL) != (ssize_t)sizeof(request)) {
++		int saved_errno = errno;
++		close(fd);
++		errno = saved_errno;
++		return -1;
++	}
++	uint8 reply[32];
++	ssize_t received = recv(fd, reply, sizeof(reply), MSG_TRUNC);
++	int saved_errno = errno;
++	close(fd);
++	if (received != (ssize_t)sizeof(reply) ||
++	    memcmp(reply, "NFSLIFR1", 8) != 0) {
++		errno = received < 0 ? saved_errno : EPROTO;
++		return -1;
++	}
++	uint32 status = nfs_lifecycle_get32(reply + 8);
++	if (status != 0) {
++		errno = status <= 4095 ? (int)status : EPROTO;
++		return -1;
++	}
++	// A successful reply names the armed operation, a transaction number
++	// and the validated daemon it acted on.
++	if (nfs_lifecycle_get32(reply + 12) != op ||
++	    nfs_lifecycle_get32(reply + 16) == 0 ||
++	    nfs_lifecycle_get32(reply + 20) == 0) {
++		errno = EPROTO;
++		return -1;
++	}
++	return 0;
++}
++
+ // Shared by both arm wire formats: connect to the proxy's control socket,
+ // send exactly `len` bytes, and wait for the one-byte ACK.  Registration is
+ // an ACKed configuration call; the returned FD is a lifetime handle, not
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index 5241d30..822bbb9 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -117,6 +117,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_arm_nfs_proxy":             alwaysSupported,
+ 	"syz_arm_nfs_proxy_v2":          alwaysSupported,
+ 	"syz_nfsd_client_ctl":           alwaysSupported,
++	"syz_nfsd_cld_ctl":              alwaysSupported,
+ 	"syz_send_nfs_fuzz":             alwaysSupported,
+ 	"syz_pidfd_open":                alwaysSupported,
+ 	"syz_create_resource":           alwaysSupported,
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+index 7baef35..8f4a666 100644
+--- a/sys/linux/fs_nfs_fuzz.txt
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -61,6 +61,16 @@ syz_open_nfs_lane_profile$client1_ganesha_v41(profile const[4], client const[1])
+ syz_nfsd_client_ctl$expire_client0(client const[0])
+ syz_nfsd_client_ctl$expire_client1(client const[1])
+ 
++# Ask the same broker for one bounded nfsdcld transaction on this lane.  The
++# broker validates the daemon (namespaces, executable, argv, start time and
++# CLD pipe inode) and owns the executable, the pipe and both fixed windows.
++# reconnect holds the daemon now and replaces it after the hold, so a CLD
++# upcall queued meanwhile is retried; daemon_down stops it now and replaces
++# it after the kernel upcall timeout.  A zero return means the broker armed
++# the transaction for the daemon it named.
++syz_nfsd_cld_ctl$reconnect(op const[2])
++syz_nfsd_cld_ctl$daemon_down(op const[3])
++
+ # One registration per FD.  Bytes are an explicit versioned wire packet:
+ # magic; dir, backend, client, first_opcode, anchor_off, anchor_len,
+ # patch_off, patch_w, flags; then 64 anchor, 16 original and 16 replacement
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 0a436ad..e404840 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -283,6 +283,26 @@ func TestNFSv41LifecycleAdmin(t *testing.T) {
+ 	}
+ }
+ 
++func TestNFSCldControl(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for name, op := range map[string]uint64{
++		"syz_nfsd_cld_ctl$reconnect":   2,
++		"syz_nfsd_cld_ctl$daemon_down": 3,
++	} {
++		call := requireNFSFuzzCall(t, target, name)
++		if call.CallName != "syz_nfsd_cld_ctl" || len(call.Args) != 1 {
++			t.Fatalf("%s has wrong dispatch or arity", call.Name)
++		}
++		requireConst(t, call.Args[0].Type, op, call.Name+" op")
++		if call.Ret != nil {
++			t.Fatalf("%s returns %T, want status-only pseudo call", call.Name, call.Ret)
++		}
++	}
++}
++
+ // TestNFSProxyVariableLengthArm checks the v2 (NFSPARM2) wire packet: unlike
+ // nfs_proxy_arm, its size is NOT fixed, so this asserts shape (fields, length
+ // linkage, magic) rather than a byte count, and that it shares its lifetime FD

@@ -38,7 +38,7 @@ SOURCES = [
     "walk.c", "edit.c", "semantic.c", "resolver.c", "mutation_apply.c",
     "txn.c", "activation.c", "nfs_decode.c", "schema.c", "schema_nfs4.c",
     "schema_nfs3.c", "rpc_decode.c", "rule.c", "target.c", "journal.c",
-    "jsonw.c", "sha256.c", "lifecycle.c",
+    "jsonw.c", "sha256.c", "lifecycle.c", "cld.c",
 ]
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),

@@ -95,6 +95,18 @@ func TestLifecycleControlPreservesDirectFD(t *testing.T) {
 	}
 }
 
+func TestCldControlPreservesDirectFD(t *testing.T) {
+	source := lane + "syz_nfsd_client_ctl$expire_client0(0x0)\n" +
+		"syz_nfsd_cld_ctl$reconnect(0x2)\nfsync(r0)\n"
+	r := mustParse(t, source)
+	if len(r.Calls) != 4 || len(r.Calls[3].Facts.Origins) != 1 {
+		t.Fatalf("CLD control lost lane provenance: %+v", r)
+	}
+	if got := r.Calls[3].Facts.Origins[0].Origin; got != "nfs-profile:knfsd-v41:client0" {
+		t.Fatalf("wrong origin after CLD control: %q", got)
+	}
+}
+
 func TestAllExplicitProfiles(t *testing.T) {
 	for p, suffix := range []string{"knfsd_v3", "knfsd_v40", "knfsd_v41", "knfsd_v42", "ganesha_v41"} {
 		for client := 0; client < 2; client++ {
