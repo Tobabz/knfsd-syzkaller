@@ -208,6 +208,82 @@ def test_admin_exec_failure_retains_all_available_raw_artifacts(tmp_path):
         tmp_path / (stem + "executor.log")).read_text()
 
 
+class CompletedExecGuest(FailedExecGuest):
+    """A program that exited cleanly and left ``cover`` in /tmp/cov."""
+
+    def __init__(self, runner, cover):
+        super().__init__(runner)
+        self.cover = cover
+        self.started = []
+
+    def guest(self, command, timeout=60):
+        if command.startswith("rm -rf /tmp/cov "):
+            self.started.append(command)
+            return ""
+        if command == "cat %s" % self.runner.ADMIN_RC:
+            return "0\n"
+        if command.startswith("find /tmp/cov "):
+            return "".join(name + "\n" for name in sorted(self.cover))
+        if command.startswith("cat /tmp/cov/"):
+            return self.cover[command[len("cat /tmp/cov/"):]]
+        return super().guest(command, timeout)
+
+
+def run_cover_program(runner, tmp_path, cover, **kwargs):
+    guest = CompletedExecGuest(runner, cover)
+    result = runner.run_program(
+        guest, tmp_path, "daemon_down", 1, "/sys/kernel/tracing",
+        lambda artifacts, pcs: {"pcs": len(pcs)}, **kwargs)
+    return guest, result
+
+
+def test_daemon_down_program_budget_covers_the_upcall_timeout(
+        tmp_path, monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    budget = runner.CLD_PROGRAM_TIMEOUT_S["daemon_down"]
+    # The executor kills an idle program only after 3/5 of its budget; that
+    # must outlast the 30 s upcall timeout and the 35 s daemon outage.
+    assert budget * 3 / 5 > 35
+    assert set(runner.CLD_PROGRAM_TIMEOUT_S) == {"daemon_down"}
+    cover = {"cover_prog1.extra": "0xffffffff81001234\n",
+             "cover_prog1.meta": "unfinished_calls 0\n"}
+    guest, result = run_cover_program(
+        runner, tmp_path, cover, program_timeout_s=budget)
+    assert "-program-timeout=90s" in guest.started[0]
+    assert result["pcs"] == 1
+    assert result["coverage_files"] == sorted(cover)
+    exported = sorted(path.name for path in tmp_path.iterdir()
+                      if path.name.endswith((".extra", ".meta")))
+    assert exported == ["daemon_down-001.coverage.extra",
+                        "daemon_down-001.coverage.meta",
+                        "daemon_down-001.coverage.raw.cover_prog1.extra",
+                        "daemon_down-001.coverage.raw.cover_prog1.meta"]
+    default = tmp_path / "default"
+    default.mkdir()
+    guest, _ = run_cover_program(runner, default, cover)
+    assert "-program-timeout" not in guest.started[0]
+
+
+@pytest.mark.parametrize(("meta", "message"), (
+    ("unfinished_calls 4\n",
+     "^execution: program stopped at its budget with 4 unfinished calls"),
+    ("unfinished_calls 0\n",
+     "^execution: remote-KCOV generation not published$"),
+    ("completed_unix_nano 1\n", "^execution: .* predates 0029$"),
+))
+def test_unpublished_generation_is_a_typed_execution_failure(
+        tmp_path, monkeypatch, meta, message):
+    runner = load_runner()
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    cover = {"cover_prog1.0": "0x1\n", "cover_prog1.meta": meta}
+    with pytest.raises(RuntimeError, match=message):
+        run_cover_program(runner, tmp_path, cover, program_timeout_s=90)
+    # The .meta is still retained as raw evidence.
+    assert (tmp_path / "daemon_down-001.coverage.meta").read_text() == meta
+    assert not (tmp_path / "daemon_down-001.coverage.extra").exists()
+
+
 def test_admin_and_cld_campaigns_pick_distinct_runtime_selections(tmp_path):
     runner, config, descriptor_path, mapping_path, _ = write_identity_inputs(
         tmp_path)

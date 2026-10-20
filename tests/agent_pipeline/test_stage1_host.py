@@ -9,7 +9,9 @@ the model responses and the syzkaller parser.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import runpy
 import shutil
 import subprocess
@@ -994,3 +996,122 @@ def _plan(hcap_revision: str):
         program_proposal=ProgramProposal(kind="program",
                                          artifact_ref=_sha(SCENARIO)),
         runtime_selection=runtime())
+
+
+def _load_bootstrap():
+    spec = importlib.util.spec_from_file_location(
+        "bootstrap_kcov_env", REPO / "tools" / "bootstrap-kcov-env.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _patched_kernel_env(tmp_path, bootstrap, *, kconfig=True):
+    """A target with a committed patched tree and recorded variant images."""
+    linux = tmp_path / "linux"
+    (linux / "include/linux/sunrpc").mkdir(parents=True)
+    (linux / "include/linux/sunrpc/fuzz.h").write_text(
+        "sunrpc_fuzz_svc_remote_grant\n")
+    git = ["git", "-C", str(linux)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "patched"], check=True)
+    head = bootstrap.git_head(linux)
+    for variant in bootstrap.VARIANTS:
+        images = tmp_path / "images" / variant
+        images.mkdir(parents=True)
+        (images / "bzImage").write_bytes(b"bz")
+        (images / ".config").write_text("CONFIG_KCOV=y\n")
+        record = {"series_sha256": bootstrap.series_fingerprint("kernel"),
+                  "base": bootstrap.KERNEL_COMMIT, "head": head,
+                  "commits": 1}
+        if kconfig:
+            record["kconfig_sha256"] = bootstrap.sha256(
+                bootstrap.KCONFIGS[variant])
+        (images / bootstrap.BUILD_RECORD).write_text(json.dumps(record))
+    return SimpleNamespace(
+        target=tmp_path, variants=list(bootstrap.VARIANTS), update=True,
+        skip_build=False, kernel_ref=bootstrap.KERNEL_TAG,
+        kernel_repo="unused"), head
+
+
+def test_bootstrap_update_keeps_an_unchanged_kernel_commit(
+        tmp_path, monkeypatch):
+    bootstrap = _load_bootstrap()
+    args, head = _patched_kernel_env(tmp_path, bootstrap)
+
+    def no_rebuild(*_args, **_kwargs):
+        raise AssertionError("an unchanged kernel must not be re-applied")
+    monkeypatch.setattr(bootstrap, "run", no_rebuild)
+    manifest = {}
+    _, rebuilt = bootstrap.stage_kernel(args, manifest, False)
+    assert rebuilt is False
+    assert manifest["kernel"]["head"] == head
+    assert bootstrap.git_head(tmp_path / "linux") == head
+
+
+@pytest.mark.parametrize("change", ("kconfig", "series", "dirty", "base"))
+def test_bootstrap_update_rebuilds_a_changed_kernel(
+        tmp_path, monkeypatch, change):
+    bootstrap = _load_bootstrap()
+    args, _ = _patched_kernel_env(tmp_path, bootstrap,
+                                  kconfig=change != "kconfig")
+    if change == "series":
+        monkeypatch.setattr(bootstrap, "series_fingerprint",
+                            lambda kind: "0" * 64)
+    elif change == "dirty":
+        (tmp_path / "linux" / "stray").write_text("x\n")
+    elif change == "base":
+        args.kernel_ref = "v0.0"
+
+    class Rebuild(Exception):
+        pass
+
+    def clone(argv, **_kwargs):
+        raise Rebuild(argv)
+    monkeypatch.setattr(bootstrap, "run", clone)
+    with pytest.raises(Rebuild, match="clone"):
+        bootstrap.stage_kernel(args, {}, False)
+
+
+def test_kernel_series_apply_is_deterministic(tmp_path):
+    """fport-apply reproduces the same commits from the same base and series."""
+    base = tmp_path / "base"
+    base.mkdir()
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "-C", str(base), "init", "-q"], check=True)
+    subprocess.run([*git, "-C", str(base), "commit", "-q", "--allow-empty",
+                    "-m", "base"], check=True)
+    commit = subprocess.run(["git", "-C", str(base), "rev-parse", "HEAD"],
+                            capture_output=True, text=True,
+                            check=True).stdout.strip()
+    (base / "f").write_text("patched\n")
+    subprocess.run(["git", "-C", str(base), "add", "f"], check=True)
+    subprocess.run([*git, "-C", str(base), "commit", "-q", "-m", "patch"],
+                   check=True,
+                   env={**os.environ,
+                        "GIT_AUTHOR_DATE": "2026-10-01T00:00:00+0900"})
+    patches = tmp_path / "patches"
+    (patches / "kernel").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(base), "format-patch", "-q", "-1",
+                    "-o", str(patches / "kernel")], check=True)
+    (patches / "BASE").write_text("kernel_commit=%s\n" % commit)
+    heads = []
+    for index, date in enumerate(("2026-10-02T00:00:00+0000",
+                                  "2027-01-01T00:00:00+0000")):
+        tree = tmp_path / ("tree%d" % index)
+        subprocess.run(["git", "clone", "-q", str(base), str(tree)],
+                       check=True)
+        subprocess.run(["git", "-C", str(tree), "checkout", "-q", commit],
+                       check=True)
+        # The applying host's clock and git identity must not matter.
+        subprocess.run([str(REPO / "tools" / "fport-apply.sh"), "kernel",
+                        str(tree)], check=True, capture_output=True,
+                       env={**os.environ, "KOOV_BUNDLE": str(patches),
+                            "GIT_COMMITTER_DATE": date,
+                            "GIT_COMMITTER_NAME": "host%d" % index})
+        heads.append(subprocess.run(
+            ["git", "-C", str(tree), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip())
+    assert heads[0] == heads[1] != commit

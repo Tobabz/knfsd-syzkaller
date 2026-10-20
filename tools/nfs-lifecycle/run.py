@@ -111,9 +111,12 @@ CLD_PROGRAMS = {
     "daemon_down":
     ROOT / "tools/nfs-lifecycle/programs/v41-cld-daemon-down.prog",
 }
-# daemon_down blocks client0 recovery for the 30 s RPC upcall timeout, so
-# its program needs a larger syzkaller program budget.
-CLD_SLOWDOWN = {"control": 1, "normal": 1, "reconnect": 1, "daemon_down": 10}
+# daemon_down blocks client0 recovery for the 30 s RPC upcall timeout.  The
+# slowdown-derived budget is capped at 15 s, so its program gets an explicit
+# syzkaller program budget (syz-execprog -program-timeout, 0029) that covers
+# the upcall, the restart and the generation drain.  The executor keeps
+# killing only after 3/5 of the budget, past the upcall.
+CLD_PROGRAM_TIMEOUT_S = {"daemon_down": 90}
 CLD_STATE = "/tmp/frozen-phase9.manager/lane0/server/cld.state"
 CLD_STATE_TIMEOUT = 90
 CLD_DELTA_COUNTERS = (
@@ -442,15 +445,17 @@ def wait_admin_exec(vm, gate, timeout=300):
                        ("before gate" if gate else "after gate"))
 
 
-def start_admin_exec(vm, guest_program, slowdown=1):
+def start_admin_exec(vm, guest_program, program_timeout_s=None):
     argv = [ADMIN_GUEST + "/syz-execprog",
             "-executor=" + ADMIN_GUEST + "/syz-executor",
             "-os=linux", "-arch=amd64", "-vmarch=amd64",
             "-sandbox=none", "-procs=1", "-repeat=1", "-threaded=false",
             "-cover=true", "-coverfile=/tmp/cov/cover",
             "-remote-cover=true", "-disable=all", "-debug", "-vv=1",
-            "-slowdown=%d" % slowdown, "-gate=" + ADMIN_GATE,
-            guest_program]
+            "-slowdown=1", "-gate=" + ADMIN_GATE]
+    if program_timeout_s is not None:
+        argv.append("-program-timeout=%ds" % program_timeout_s)
+    argv.append(guest_program)
     body = ("timeout 300 %s > %s 2>&1; echo $? > %s" %
             (shlex.join(argv), ADMIN_LOG, ADMIN_RC))
     command = (
@@ -625,8 +630,29 @@ def run_admin_program(vm, output, phase, iteration, tracing, target_pcs):
     return run_program(vm, output, phase, iteration, tracing, evaluate)
 
 
+def unpublished_generation_error(meta):
+    """Name why a program exported .meta without remote coverage.
+
+    The executor publishes a program's remote coverage only when its KCOV
+    generation finishes; a program stopped at its budget aborts it.  Either
+    way there is no .extra to export, and the run cannot be evidence.
+    """
+    match = re.search(r"^unfinished_calls ([0-9]+)$", meta, re.MULTILINE)
+    if match is None:
+        return RuntimeError(
+            "execution: coverage .meta without unfinished_calls; "
+            "syz-execprog predates 0029")
+    unfinished = int(match.group(1))
+    if unfinished:
+        return RuntimeError(
+            "execution: program stopped at its budget with %d unfinished "
+            "calls; remote-KCOV generation not published" % unfinished)
+    return RuntimeError(
+        "execution: remote-KCOV generation not published")
+
+
 def run_program(vm, output, phase, iteration, tracing, evaluate, *,
-                slowdown=1):
+                program_timeout_s=None):
     """Run one gated lifecycle program and evaluate its raw artifacts.
 
     Raw artifacts are retained for every outcome; ``evaluate`` receives
@@ -641,7 +667,7 @@ def run_program(vm, output, phase, iteration, tracing, evaluate, *,
     cover_files = []
     try:
         set_tracing(vm, tracing, ADMIN_EVENTS, False, clear=True)
-        start_admin_exec(vm, guest_program, slowdown)
+        start_admin_exec(vm, guest_program, program_timeout_s)
         execution_started = True
         if wait_admin_exec(vm, True) != "ready":
             raise RuntimeError("syz-execprog exited before the program gate")
@@ -672,6 +698,8 @@ def run_program(vm, output, phase, iteration, tracing, evaluate, *,
             raise RuntimeError("syz-execprog rc=%s; see retained executor log" %
                                rc)
 
+        if "coverage.meta" in artifacts and "coverage.extra" not in artifacts:
+            raise unpublished_generation_error(artifacts["coverage.meta"])
         required = ("stats-before.txt", "stats-after.txt", "trace.txt",
                     "lifecycle.log", "coverage.extra", "coverage.meta")
         missing = [name for name in required if name not in artifacts]
@@ -955,7 +983,7 @@ def run_cld_program(vm, output, phase, iteration, tracing, probes):
         }
 
     result = run_program(vm, output, phase, iteration, tracing, evaluate,
-                         slowdown=CLD_SLOWDOWN[phase])
+                         program_timeout_s=CLD_PROGRAM_TIMEOUT_S.get(phase))
     after = wait_cld_idle(vm)
     stem = "%s-%03d" % (phase, iteration)
     (output / (stem + ".cld.state")).write_text(

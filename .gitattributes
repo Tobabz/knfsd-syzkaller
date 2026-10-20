@@ -1,2 +1,6 @@
 # Evidence logs are kept byte-for-byte (SHA256SUMS); exempt them from whitespace checks.
 report/evidence/** -whitespace
+
+# Patch context lines start with a space (often before a tab), and a blank
+# context line is a lone space; stripping either corrupts the patch.
+bundle/patches/**/*.patch -whitespace

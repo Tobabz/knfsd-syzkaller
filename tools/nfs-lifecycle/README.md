@@ -23,6 +23,10 @@ The runner provides four native-version scenarios:
   one `syz_nfsd_cld_ctl$reconnect`, then recovery) and scenario B
   (`daemon_down`: expiry, nfsdcld held down past the 30 s upcall timeout, then
   recovery; fixture evidence only, never an admitted call). See below.
+  `daemon_down` runs with `syz-execprog -program-timeout=90s` (syzkaller
+  0029): the slowdown-derived budget stops at 15 s, before the upcall times
+  out. A program that still exports `.meta` without `.extra` fails as an
+  `execution:` error naming its unfinished calls, never as a probe miss.
 - `v42-control-restart`: the same restart contract using a native v4.2 mount.
 
 Run one iteration first:

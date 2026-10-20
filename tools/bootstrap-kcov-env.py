@@ -340,19 +340,44 @@ def export_kernel_images(args, variant, record):
     return images / "bzImage", images / "vmlinux"
 
 
+def kernel_update_stale(args, linux, variant):
+    """Why --update must rebuild this variant, or None to keep its build.
+
+    Keeping an unchanged patched tree keeps its kernel commit, which harness
+    descriptors and target PC mappings are bound to.
+    """
+    reason = stale_build("kernel", linux, image_dir(args, variant) / BUILD_RECORD)
+    if reason:
+        return reason
+    record = read_build_record(image_dir(args, variant) / BUILD_RECORD)
+    if args.kernel_ref != KERNEL_TAG or record.get("base") != KERNEL_COMMIT:
+        return "kernel base is not the pinned %s" % KERNEL_TAG
+    if record.get("kconfig_sha256") != sha256(KCONFIGS[variant]):
+        return "%s kconfig changed since the build" % variant
+    if not git_clean(linux):
+        return "linux tree not clean"
+    return None
+
+
 def stage_kernel(args, manifest, reuse):
     linux = args.target / "linux"
     rebuilt = True
-    if (reuse and kernel_sentinel(linux) and all(
-            (image_dir(args, v) / "bzImage").is_file()
-            and (image_dir(args, v) / "bzImage").stat().st_size > 0
-            and (image_dir(args, v) / ".config").is_file()
-            for v in args.variants)):
+    built = kernel_sentinel(linux) and all(
+        (image_dir(args, v) / "bzImage").is_file()
+        and (image_dir(args, v) / "bzImage").stat().st_size > 0
+        and (image_dir(args, v) / ".config").is_file()
+        for v in args.variants)
+    update_reasons = ([kernel_update_stale(args, linux, v) for v in args.variants]
+                      if built and not reuse and args.update else None)
+    if update_reasons is not None and any(update_reasons):
+        print("rebuilding kernel: %s" % next(r for r in update_reasons if r), flush=True)
+    if reuse and built:
         for variant in args.variants:
             reason = stale_build("kernel", linux, image_dir(args, variant) / BUILD_RECORD)
             if reason:
                 raise RuntimeError("--skip-build refuses the %s kernel build: %s; "
                                    "rerun without --skip-build" % (variant, reason))
+    if (reuse and built) or (update_reasons is not None and not any(update_reasons)):
         print("reusing kernel build", flush=True)
         rebuilt = False
         records = {v: read_build_record(image_dir(args, v) / BUILD_RECORD)
@@ -389,7 +414,8 @@ def stage_kernel(args, manifest, reuse):
                     build_kernel_variant(args, linux, variant)
         with timed(manifest, "kernel_export"):
             for variant in args.variants:
-                export_kernel_images(args, variant, record)
+                export_kernel_images(args, variant, {
+                    **record, "kconfig_sha256": sha256(KCONFIGS[variant])})
         records = {v: record for v in args.variants}
     # Every variant comes from the one patched tree, so their records agree.
     record = records[args.variants[0]]
