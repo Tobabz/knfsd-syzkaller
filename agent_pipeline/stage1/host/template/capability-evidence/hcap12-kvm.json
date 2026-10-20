@@ -3,9 +3,9 @@
   "capability_id": "HCAP-12",
   "observed_at": "2026-10-20",
   "scenario": "v41-cld-lifecycle",
-  "execution_harness_id": "f865a908f66fd5a99fdd6e0be0eb158e0de7d3a8d112123a3f0d1e2a9b496f00",
+  "execution_harness_id": "c409b168712e633d60595e542de91a6317d5281dfac287d464a99a975575935a",
   "mapping_identity": {
-    "execution_harness_id": "f865a908f66fd5a99fdd6e0be0eb158e0de7d3a8d112123a3f0d1e2a9b496f00",
+    "execution_harness_id": "c409b168712e633d60595e542de91a6317d5281dfac287d464a99a975575935a",
     "kernel_commit": "2466d62694543c298439fa889d3a0343ce6104b0",
     "instrumentation_sha256": "39af7062908470035491b54b1fad1cb6d952a09383b120c7f79e74246627f1fb",
     "vmlinux_sha256": "38826e7d5d4b68a5b7c2114488157d8aeaa9f93656b6d397567034805467cd46",
@@ -13,12 +13,12 @@
     "kaslr_offset": 0
   },
   "probe_mapping_sha256": {
-    "cld_create": "cdb7a44e109429f4954a7ef379f556a87a8ee8668fba8af77b4cc782ad33d317",
-    "cld_create_error": "df26c74ee42affc35576e3eaffe1f707e9782109da722224fd2b4f4d7d1ca2dd",
-    "pipe_wait_for_open": "b0b946366be36ea92923b249277d9843cbcf30f02596d2da50c4357dd63ae0a2"
+    "cld_create": "d5cf55dcb6c4d21b12a1994fd199598278ac5bbd0556b7d49bfce9468df1615c",
+    "cld_create_error": "ded5d5e300cad4186c47acccb1528f60c2867bf1e74db9ebce181e61cd0a2f65",
+    "pipe_wait_for_open": "f2009b781195118b4fea82307679538802a88fc197af2f013eb7c6b2c48718c9"
   },
-  "campaign_result_sha256": "645bfcf861991b60da104d6d491ad1683346ac456e2cafd1557df3215e9c40de",
-  "guest_lane_script_sha256": "afa6da632f593dc6622ce535cc9d88943d0220642c8f086ac39ab198c87b7779",
+  "campaign_result_sha256": "ce762bd54795615efedf71052a8d73902514e8f5375ee02ec38523cf7d4c667c",
+  "guest_lane_script_sha256": "318e79ea7d288e02efdfc357a26ddcff4f80cd6605fb50d4178e95bf2e89a104",
   "guest_nfs_proxy_sha256": "df9134f9432ae158cb4aa342925b4f5fefc12c022135744d9bb30a10d2369c36",
   "runs": {
     "control": {
