@@ -1110,13 +1110,25 @@ def test_bootstrap_update_refuses_an_unverifiable_legacy_record(
     assert (images / "build.json").read_text() == record_before
 
 
-def test_bootstrap_update_refuses_a_dirty_kernel_tree(tmp_path, monkeypatch):
+@pytest.mark.parametrize("also", ("nothing", "series", "base", "images"))
+def test_bootstrap_update_refuses_a_dirty_kernel_tree(
+        tmp_path, monkeypatch, also):
+    """Local work is kept even when the inputs also call for a rebuild."""
     bootstrap = _load_bootstrap()
     args, head = _patched_kernel_env(tmp_path, bootstrap, legacy=True)
-    (tmp_path / "linux" / "stray").write_text("x\n")
+    stray = tmp_path / "linux" / "local-change"
+    stray.write_text("x\n")
+    if also == "series":
+        monkeypatch.setattr(bootstrap, "series_fingerprint",
+                            lambda kind: "0" * 64)
+    elif also == "base":
+        args.kernel_ref = "v0.0"
+    elif also == "images":
+        (tmp_path / "images" / "kasan" / "bzImage").unlink()
     monkeypatch.setattr(bootstrap, "run", _no_rebuild)
     with pytest.raises(RuntimeError, match="local changes"):
         bootstrap.stage_kernel(args, {}, False)
+    assert stray.read_text() == "x\n"
     assert bootstrap.git_head(tmp_path / "linux") == head
 
 

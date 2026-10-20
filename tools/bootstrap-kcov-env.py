@@ -386,9 +386,6 @@ def kernel_update_plan(args, linux, variant):
     record = read_build_record(image_dir(args, variant) / BUILD_RECORD)
     if args.kernel_ref != KERNEL_TAG or record.get("base") != KERNEL_COMMIT:
         return "rebuild", "kernel base is not the pinned %s" % KERNEL_TAG
-    if not git_clean(linux):
-        raise RuntimeError("--update refuses to rebuild or reuse the kernel: "
-                           "%s has local changes" % linux)
     if "kconfig_sha256" not in record:
         return "backfill", legacy_kernel_record(args, linux, variant, record)
     if record["kconfig_sha256"] != sha256(KCONFIGS[variant]):
@@ -404,6 +401,12 @@ def stage_kernel(args, manifest, reuse):
         and (image_dir(args, v) / "bzImage").stat().st_size > 0
         and (image_dir(args, v) / ".config").is_file()
         for v in args.variants)
+    # Whatever --update decides, an existing tree with local work is neither
+    # reused nor removed.
+    if (not reuse and args.update and (linux / ".git").exists()
+            and not git_clean(linux)):
+        raise RuntimeError("--update refuses to rebuild or reuse the kernel: "
+                           "%s has local changes" % linux)
     plans = ({v: kernel_update_plan(args, linux, v) for v in args.variants}
              if built and not reuse and args.update else None)
     update_keeps = plans is not None and all(
