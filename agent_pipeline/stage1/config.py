@@ -69,6 +69,16 @@ class Stage2Config(_Config):
         return argv
 
 
+class AgentRuntimeConfig(_Config):
+    """Host limits of one Agent execution (``RuntimeLimits``); separate
+    from the Controller's retry and repair budgets."""
+
+    max_requests: int = Field(default=32, ge=1, le=256)
+    max_tool_calls: int = Field(default=96, ge=1, le=1024)
+    request_timeout_s: float = Field(default=180, gt=0, le=3600)
+    run_timeout_s: float = Field(default=1200, gt=0, le=14_400)
+
+
 class Stage1Config(_Config):
     state_dir: Path
     artifact_root: Path
@@ -89,6 +99,8 @@ class Stage1Config(_Config):
     worker_id: str = "stage1-worker"
     lease_duration_s: float = Field(default=120, gt=0)
     agent_workers: int = Field(default=2, ge=1, le=16)
+    agent_runtime: AgentRuntimeConfig = Field(
+        default_factory=AgentRuntimeConfig)
     engine: EngineConfig
     #: The Proxy binary of the promoted semantic build, for the Mutation Rule
     #: Compiler (08 §12).  Unset, a Stage 2 rule set waits in

@@ -19,7 +19,7 @@ from typing import Callable, Protocol
 
 from pydantic import BaseModel
 
-from ..contracts import AgentModelPolicy, AgentTask
+from ..contracts import AgentModelPolicy, AgentTask, AgentUsage
 from .tools import Stage1Toolbox
 
 class OutputRejected(ValueError):
@@ -43,6 +43,22 @@ class RuntimeResult:
     # Required response metadata from the provider.  It must not be filled
     # from model_policy when the provider omits it.
     model_id: str
+    #: What the run used, when the runtime counts it.
+    usage: AgentUsage | None = None
+
+
+USAGE_ATTRIBUTE = "stage1_agent_usage"
+
+
+def attach_usage(exc: BaseException, usage: AgentUsage) -> None:
+    """Keep what a failed run used on its exception, so the failure path
+    can record it like a result's usage."""
+    setattr(exc, USAGE_ATTRIBUTE, usage)
+
+
+def failure_usage(exc: BaseException) -> AgentUsage | None:
+    usage = getattr(exc, USAGE_ATTRIBUTE, None)
+    return usage if isinstance(usage, AgentUsage) else None
 
 
 class AgentRuntime(Protocol):

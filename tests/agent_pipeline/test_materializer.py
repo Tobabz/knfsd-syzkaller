@@ -195,6 +195,10 @@ def _capabilities():
 
 @pytest.fixture
 def world(tmp_path):
+    return materializer_world(tmp_path)
+
+
+def materializer_world(tmp_path):
     store = ArtifactStore(tmp_path / "cas")
     patch_ref = store.put(b"synthetic patch series\n")
     executor_ref = store.put(b"synthetic syz-executor")

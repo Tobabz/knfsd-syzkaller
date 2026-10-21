@@ -167,10 +167,12 @@ class Stage1Service:
         if parts.run_agents:
             # validate_program needs the Materializer's draft check; a
             # Materializer without one leaves the seven read-only tools.
+            from ..agent_tasks.knowledge import HarnessKnowledge
             tools = parts.tools or PinnedToolboxFactory(
                 _source_index(parts.tree), _hcap_source(hcap),
                 checker=parts.materializer
-                if hasattr(parts.materializer, "check_draft") else None)
+                if hasattr(parts.materializer, "check_draft") else None,
+                knowledge=HarnessKnowledge(self.artifacts))
             self.agents = QueuedAgentExecutor(
                 parts.runtime, self.artifacts, tools, sink=None,
                 max_workers=parts.agent_workers)

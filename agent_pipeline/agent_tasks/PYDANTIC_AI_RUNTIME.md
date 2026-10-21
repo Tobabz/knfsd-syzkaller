@@ -34,10 +34,10 @@ from agent_pipeline.agent_tasks.pydantic_ai_runtime import (
 from agent_pipeline.agent_tasks.queued import QueuedAgentExecutor
 
 runtime = PydanticAIRuntime(limits=RuntimeLimits(
-    max_requests=16,
-    max_tool_calls=32,
-    request_timeout_seconds=60,
-    run_timeout_seconds=300,
+    max_requests=32,
+    max_tool_calls=96,
+    request_timeout_seconds=180,
+    run_timeout_seconds=1200,
 ))
 agents = QueuedAgentExecutor(runtime, artifacts, pinned_toolbox_factory, sink)
 controller = Controller(..., agents=agents, ...)
@@ -56,6 +56,20 @@ called from a worker thread, because the Controller's SQLite Store belongs
 to the Controller thread. `QueuedAgentExecutor.start` hands the task to a
 worker pool and returns; `deliver()` passes finished results to the
 Controller on the thread that calls it.
+
+These are the defaults; the Stage 1 service takes them from
+`Stage1Config.agent_runtime`. A run's request, tool-call and token counts
+come back as `RuntimeResult.usage` and are kept on its `AgentAttempt`
+record, so the limits can be tuned from real runs. A run that fails (a
+request, tool-call or token limit, a deadline, a provider error) keeps what
+it used on its exception (`runtime.failure_usage`); the executor passes it
+to `on_agent_failure`, and the failed attempt keeps it too.
+
+`AgentModelPolicy.reasoning_effort`, when set, is sent to an OpenAI model as
+`openai_reasoning_effort`; unset leaves the provider default and is left out
+of the policy's encoding, so stored task digests do not change. The host
+template keeps `kasan-default` as it was and adds `kasan-agent-effort`
+(32768 output tokens; medium effort for Analysis, high for Planning).
 
 The default factory accepts only trusted `provider="openai"` policy and
 passes its model name to `OpenAIResponsesModel`. It uses the SDK's host
@@ -77,8 +91,11 @@ inside an arbitrary injected model implementation.
 
 Each execution constructs a fresh Agent, message history and tool bindings.
 Its only function tools are the seven registered `Stage1Toolbox` read-only
-definitions, plus `validate_program` when the toolbox factory binds a draft
-checker (a Reachability Planning task whose job has a binding, with the host
+definitions, plus the four harness knowledge tools for Stage 1 tasks when
+the factory binds a knowledge source (`search_syzlang`, `read_syzlang`,
+`read_harness_patch`, `lookup_reference_programs`; see `knowledge.py`: all
+of them read only artifacts the pinned HCAP revision selects), plus
+`validate_program` when the toolbox factory binds a draft checker (a Reachability Planning task whose job has a binding, with the host
 Materializer). `validate_program` runs the Materializer's checks (HCAP plan
 check, pinned parser, call admission) on a draft without storing anything
 and answers accepted or the refusing check, with the parser's own message;

@@ -18,7 +18,8 @@ from pydantic import TypeAdapter
 
 from ..artifacts import ArtifactStore
 from ..components import HarnessRegistry, IssueTracker
-from ..contracts import (AgentOutput, AgentTask, CandidateSubmission, GapRef,
+from ..contracts import (AgentOutput, AgentTask, AgentUsage,
+                         CandidateSubmission, GapRef,
                          HarnessBinding, JudgeVersions, LocationRequest,
                          VulnerabilityCandidate)
 from ..intake import IntakeRejected, SourceTree, validate
@@ -152,16 +153,18 @@ class Controller:
     # ------------------------------------------------------------ inputs
 
     def on_agent_result(self, task_id: str, attempt: int,
-                        output: AgentOutput, model_id: str) -> None:
+                        output: AgentOutput, model_id: str, *,
+                        usage: AgentUsage | None = None) -> None:
         """Every output is stored; only the job's pending attempt makes a
-        transition (09 §2)."""
+        transition (09 §2).  ``usage`` is kept on the attempt record only;
+        it never enters a transition."""
         ref = self.artifacts.put(output.model_dump_json().encode())
         job_id = job_of(task_id)
         a = self.store.attempt(task_id, attempt)
         if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
                 "status": "succeeded", "model_id": model_id,
-                "output_ref": ref}))
+                "output_ref": ref, "usage": usage}))
         # Stored first: if this transition fails, poll() applies it from
         # the stored attempt.
         self._guard(job_id, "agent_result", lambda: self._apply(
@@ -169,11 +172,13 @@ class Controller:
                                       output=output, model_id=model_id)))
 
     def on_agent_failure(self, task_id: str, attempt: int,
-                         failure: str) -> None:
+                         failure: str, *,
+                         usage: AgentUsage | None = None) -> None:
+        """``usage``, what the failed run used, is kept like a result's."""
         a = self.store.attempt(task_id, attempt)
         if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
-                "status": "failed", "failure": failure}))
+                "status": "failed", "failure": failure, "usage": usage}))
         job_id = job_of(task_id)
         self._guard(job_id, "agent_result", lambda: self._apply(
             job_id, ev.AgentFailed(task_id=task_id, attempt=attempt,

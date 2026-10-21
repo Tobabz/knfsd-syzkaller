@@ -11,7 +11,8 @@ from __future__ import annotations
 import enum
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, model_serializer,
+                      model_validator)
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Commit = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
@@ -93,11 +94,33 @@ class AgentModelPolicy(Record):
     model: str = Field(min_length=1, max_length=160,
                        pattern=r"^[^\s:]+$")
     output_retries: int = Field(default=2, ge=0, le=8)
-    max_output_tokens: int = Field(default=8192, ge=256, le=65536)
+    max_output_tokens: int = Field(default=8192, ge=256, le=131072)
+    #: The provider's reasoning effort.  Unset leaves the provider's
+    #: default, and is left out of the encoding so policies and task
+    #: digests stored before this field keep their bytes.
+    reasoning_effort: Literal["minimal", "low", "medium", "high",
+                              "xhigh"] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_effort(self, handler):
+        data = handler(self)
+        if data.get("reasoning_effort") is None:
+            data.pop("reasoning_effort", None)
+        return data
 
     @property
     def requested_model_id(self) -> str:
         return f"{self.provider}:{self.model}"
+
+
+class AgentUsage(Record):
+    """What one Agent execution used, as the runtime counted it (#75):
+    data for tuning the runtime limits, never a verdict."""
+
+    requests: int = Field(ge=0)
+    tool_calls: int = Field(ge=0)
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
 
 
 class Stage1AgentPolicy(Record):
