@@ -202,6 +202,9 @@ class Machine:
                 return self._unexpected(c, here)
             gap = GapRef(gap_class=out.gap_class,
                          missing_capability_id=out.missing_capability_id)
+            if out.proposal_ref is not None:
+                j.gap_proposal_ref = out.proposal_ref
+                c.consumed.append(out.proposal_ref)
             if not out.missing_capability_id or \
                     not self.env.hcap.knows_capability(
                         j.binding.hcap_revision, out.missing_capability_id):

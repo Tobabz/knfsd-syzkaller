@@ -292,6 +292,16 @@ class UnsupportedOutput(Record):
     gap_class: GapClass
     missing_capability_id: str
     reason: str
+    #: A stored Planning ``CapabilityProposal`` (#75), left out of the
+    #: encoding when absent so earlier outputs keep their bytes.
+    proposal_ref: Sha256 | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_proposal(self, handler):
+        data = handler(self)
+        if data.get("proposal_ref") is None:
+            data.pop("proposal_ref", None)
+        return data
 
 
 class ReanalysisRequired(Record):

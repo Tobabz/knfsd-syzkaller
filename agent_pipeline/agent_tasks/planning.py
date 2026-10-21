@@ -10,7 +10,7 @@ from ..contracts import GapClass, Record, Sha256
 from ..hcap import (CapabilityUse, ExecutionConstraint, Identifier, NfsVersion,
                     Q1Observation, ReachabilityPlan, RuntimeSelection,
                     ScenarioStep, SelectedPath)
-from .analysis import LongText, ShortText
+from .analysis import LongText, ShortText, SourcePath
 
 MAX_PROGRAM_CHARS = 256 * 1024
 
@@ -77,11 +77,62 @@ class Planned(Record):
     plan: ReachabilityPlanDraft
 
 
+class ProposalSourceEvidence(Record):
+    """Kernel source that shows the condition the plan cannot create."""
+
+    source_path: SourcePath
+    symbol: ShortText | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    note: LongText
+
+
+class InsufficientCapability(Record):
+    """Why one promoted HCAP entry cannot create the condition."""
+
+    capability_id: Identifier
+    reason: LongText
+
+
+class CapabilityProposal(Record):
+    """A typed proposal for a capability no promoted HCAP entry provides
+    (#75 step 8).  Data for a person and a coding agent with a shell; the
+    pipeline never creates or promotes HCAP entries from it.  Promotion
+    still needs typed KVM evidence and owner approval."""
+
+    schema_version: Literal["capability-proposal.v1"] = \
+        "capability-proposal.v1"
+    #: The missing layer: syzlang, pseudo-syscall/executor, fixture or
+    #: tool, or remote-KCOV attribution context.
+    layer: Literal["syzlang", "pseudo_syscall_executor", "fixture_or_tool",
+                   "remote_kcov_attribution"]
+    summary: ShortText
+    #: The condition on the selected path that must be created.
+    required_condition: LongText
+    source_evidence: tuple[ProposalSourceEvidence, ...] = Field(
+        min_length=1, max_length=16)
+    insufficient_capabilities: tuple[InsufficientCapability, ...] = Field(
+        max_length=32)
+    #: The interface to add: calls, pseudo-syscall, fixture or attribution.
+    proposed_interface: LongText
+    #: The KVM evidence that would let an owner promote it.
+    promotion_evidence: tuple[LongText, ...] = Field(
+        min_length=1, max_length=16)
+
+
 class Unsupported(Record):
     variant: Literal["unsupported"] = "unsupported"
     gap_class: GapClass
     missing_capability_id: str = Field(min_length=1, max_length=256)
     reason: LongText
+    proposal: CapabilityProposal | None = None
+
+    @model_validator(mode="after")
+    def _layer(self) -> Unsupported:
+        if self.proposal is not None and \
+                self.proposal.layer != self.gap_class.value:
+            raise ValueError("proposal layer must equal gap_class")
+        return self
 
 
 class ReanalysisRequired(Record):
