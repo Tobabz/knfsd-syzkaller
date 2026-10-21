@@ -76,8 +76,14 @@ inside an arbitrary injected model implementation.
 ## Output and tool boundary
 
 Each execution constructs a fresh Agent, message history and tool bindings.
-Its only function tools are the five registered `Stage1Toolbox` definitions;
-the pinned dispatcher validates all arguments before source/HCAP access.
+Its only function tools are the seven registered `Stage1Toolbox` read-only
+definitions, plus `validate_program` when the toolbox factory binds a draft
+checker (a Reachability Planning task whose job has a binding, with the host
+Materializer). `validate_program` runs the Materializer's checks (HCAP plan
+check, pinned parser, call admission) on a draft without storing anything
+and answers accepted or the refusing check, with the parser's own message;
+it costs no Controller repair. The pinned dispatcher validates all arguments
+before source/HCAP access.
 Tools execute sequentially. Unknown tool names fail before any tool runs,
 including unknown calls accompanying otherwise valid final output. Call
 mistakes the model can correct (invalid arguments, a path outside the

@@ -1066,3 +1066,63 @@ def test_missing_trusted_seed_program_is_a_host_failure(world):
         check = checker.check_plan(ref, world.hcap_ref)
         assert check.violations == ("seed_reference_not_found",)
         assert not check.host_authority
+
+
+def test_untyped_parse_failure_carries_the_bounded_parser_message(world):
+    world.parser.results[world.scenario_ref] = SyzParseFailure(
+        "bridge refused (2): failed to parse program\n"
+        "line 2: unknown syscall \x1b[31mfoo$bar\n" + "x" * 4000)
+    refused = world.materializer.materialize(world.plan_ref, world.binding)
+    assert (refused.reason, refused.detail) == (
+        PARSE_FAILURE, "scenario_strict_parse_failed")
+    assert refused.message.startswith(
+        "bridge refused (2): failed to parse program | line 2: unknown "
+        "syscall ?[31mfoo$bar")
+    assert len(refused.message) == 1024 and refused.message.endswith("...")
+    # A typed refusal keeps its typed detail and adds no message.
+    world.parser.results[world.scenario_ref] = SyzParseFailure(
+        "x", reason="call_disabled", call="clone3", call_index=2)
+    typed = world.materializer.materialize(world.plan_ref, world.binding)
+    assert typed.message == ""
+
+
+def _stored_files(store) -> set:
+    return {p for p in store.root.rglob("*") if p.is_file()}
+
+
+def test_check_draft_matches_materialize_and_writes_nothing(world):
+    before = _stored_files(world.store)
+    assert world.materializer.check_draft(
+        world.plan, world.scenario_bytes, world.binding) is None
+    assert _stored_files(world.store) == before
+
+    # An inline draft whose bytes were never stored is checked from memory.
+    draft = b"draft program\n"
+    world.parser.results[digest(draft)] = SyzParseFailure(
+        "line 1: unexpected token")
+    plan = world.plan.model_copy(update={"program_proposal": ProgramProposal(
+        kind="program", artifact_ref=digest(draft))})
+    refused = world.materializer.check_draft(plan, draft, world.binding)
+    assert (refused.reason, refused.detail, refused.message) == (
+        PARSE_FAILURE, "scenario_strict_parse_failed",
+        "line 1: unexpected token")
+    assert _stored_files(world.store) == before
+
+    # The same refusal materialize gives for the stored plan.
+    world.parser.results[digest(draft)] = parsed(
+        draft, world.identity,
+        (("read$extra", "available", empty_facts()),))
+    refused = world.materializer.check_draft(plan, draft, world.binding)
+    assert refused.reason == CALL_NOT_ADMITTED
+    world.store.put(draft)
+    assert world.materializer.materialize(
+        put_record(world.store, plan), world.binding) == refused
+
+
+def test_check_draft_bounds_in_memory_program_bytes(world):
+    draft = b"x" * 5000
+    plan = world.plan.model_copy(update={"program_proposal": ProgramProposal(
+        kind="program", artifact_ref=digest(draft))})
+    refused = world.materializer.check_draft(plan, draft, world.binding)
+    assert (refused.reason, refused.detail) == (
+        DISALLOWED_OR_UNAVAILABLE_CALL, "scenario_program_limit_exceeded")

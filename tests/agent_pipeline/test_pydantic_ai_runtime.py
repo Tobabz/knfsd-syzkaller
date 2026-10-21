@@ -499,3 +499,30 @@ def test_default_openai_http_mock_has_no_retries_or_model_fallback(monkeypatch, 
     assert body["background"] is False
     assert {tool["name"] for tool in body["tools"]} == set(toolbox().names) | {OUTPUT_TOOL}
     assert clients[0].is_closed()
+
+
+def test_validate_program_tool_is_registered_and_dispatched():
+    from agent_pipeline.agent_tasks.tools import ProgramValidation
+    from .test_agent_tasks import planning_data
+
+    seen = []
+
+    def validator(draft):
+        seen.append(draft)
+        return ProgramValidation(accepted=False, stage="materializer",
+                                 reason="parse_failure",
+                                 message="line 1: unknown call")
+
+    tools = Stage1Toolbox(FakeSource(), FakeHcap(), kernel_commit="a" * 40,
+                          hcap_revision="b" * 64,
+                          program_validator=validator)
+    script = Script(response(parts=[ToolCallPart(
+        "validate_program", {"plan": planning_data()["plan"]})]), response())
+    script.runtime().run(runtime_request(tools=tools))
+    assert len(seen) == 1 and seen[0].candidate_id == "VC-stage1"
+    returned = [p for m in script.calls[1][0] for p in m.parts
+                if isinstance(p, ToolReturnPart)]
+    assert returned[0].content.message == "line 1: unknown call"
+    # The model is offered the eighth tool only when it is bound.
+    assert "validate_program" in {t.name for t in
+                                  script.calls[0][1].function_tools}

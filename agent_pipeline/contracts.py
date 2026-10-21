@@ -351,11 +351,14 @@ HOST_AUTHORITY_UNAVAILABLE = "host_authority_unavailable"
 
 class MaterializeRejected(Record):
     """05 §13: a typed refusal.  `profile` names the runtime selection when
-    the reason is neutral_control_unavailable."""
+    the reason is neutral_control_unavailable.  `message` is the pinned
+    parser's own bounded diagnostic for a strict-parse failure, which the
+    Agent needs to fix its program; `detail` stays a stable code."""
 
     reason: str
     detail: str = ""
     profile: str | None = None
+    message: str = ""
 
 
 

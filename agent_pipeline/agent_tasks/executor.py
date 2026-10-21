@@ -3,6 +3,8 @@ AgentExecutor."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Protocol, Sequence
 
@@ -10,9 +12,11 @@ from pydantic import BaseModel
 
 from ..artifacts import ArtifactStore
 from ..contracts import (AgentOutput, AgentTask, AnalysisOutput, GapClass,
-                         PlanOutput,
+                         HarnessBinding, MaterializeRejected, PlanOutput,
+                         Q1Result, Q1Status,
                          ReanalysisRequired as ControllerReanalysis,
                          RuleSetOutput, UnsupportedOutput)
+from ..controller.records import RepairCause, RepairInput
 from ..controller.tasks import AgentRequest
 from ..data import canonical_json, load_record, put_record
 from ..hcap import ReachabilityPlan
@@ -20,16 +24,20 @@ from .analysis import CandidateAnalysis
 from .mutation import (MutationRuleSet, MutationStrategyOutput,
                        MutationUnsupported, RuleSetDecision)
 from .planning import (ExistingSeed, InlineProgram, Planned,
-                       ReachabilityPlanningOutput,
+                       ReachabilityPlanDraft, ReachabilityPlanningOutput,
                        ReanalysisRequired as PlanningReanalysis,
                        Unsupported as PlanningUnsupported, completed_plan)
 from .runtime import (AgentRuntime, OutputRejected, RuntimeRequest,
                       RuntimeResult)
-from .tools import (HcapSource, KernelSourceIndex, Stage1Toolbox,
-                    _source_path)
+from .tools import (HcapSource, KernelSourceIndex, ProgramValidation,
+                    ProgramValidator, Stage1Toolbox, _source_path)
 
 MAX_PROGRAM_BYTES = 256 * 1024
 MAX_FAILURE_CHARS = 2048
+#: Bounds on what a repair prompt repeats from earlier attempts (#75).
+MAX_HISTORY_ATTEMPTS = 8
+MAX_HISTORY_FINDING_CHARS = 1024
+MAX_PREVIOUS_PROGRAM_CHARS = 64 * 1024
 ACTUAL_MODEL_ID = re.compile(r"^[^\s:]+:\S+$")
 
 COMMON_INSTRUCTIONS = """\
@@ -56,7 +64,16 @@ using only capabilities in the pinned HCAP. A plan proposes either bounded
 inline syz program text or a pinned existing seed; it never contains shell
 commands. If current capability is insufficient, return the controlled
 unsupported variant. Request reanalysis only for a wrong call/state path or
-missing state dependency. Do not claim materialization or Q1 success.\
+missing state dependency. Do not claim materialization or Q1 success.
+
+Q1 accepts a plan only when one run of its single, non-threaded syz program
+puts a candidate target PC into the generation-attributed remote KCOV
+coverage of the expected context. When validate_program is registered, call
+it on your complete draft before answering and fix every refusal it
+reports; it costs no repair attempt. In a repair, the previous plan, its
+program and the earlier attempts are shown with the Controller's findings.
+Change what those findings point at; do not resubmit a program an earlier
+attempt already tried unless the finding was about something else.\
 """
 
 
@@ -110,18 +127,78 @@ class ToolboxFactory(Protocol):
     def __call__(self, request: AgentRequest) -> Stage1Toolbox: ...
 
 
-class PinnedToolboxFactory:
-    """Bind every request to its immutable commit and HCAP revision."""
+class DraftChecker(Protocol):
+    def check_draft(self, plan: ReachabilityPlan, program: bytes | None,
+                    binding: HarnessBinding) -> MaterializeRejected | None:
+        """The Materializer's checks on an unstored plan; None accepts."""
 
-    def __init__(self, source: KernelSourceIndex, hcap: HcapSource) -> None:
+
+class PinnedToolboxFactory:
+    """Bind every request to its immutable commit and HCAP revision.
+
+    With a ``checker`` (the host Materializer), a Reachability Planning
+    request whose job has a binding also gets ``validate_program``, bound
+    to that binding and the trusted request."""
+
+    def __init__(self, source: KernelSourceIndex, hcap: HcapSource, *,
+                 checker: DraftChecker | None = None) -> None:
         self.source = source
         self.hcap = hcap
+        self.checker = checker
 
     def __call__(self, request: AgentRequest) -> Stage1Toolbox:
+        validator = None
+        if self.checker is not None and request.binding is not None and \
+                request.agent_task is AgentTask.REACHABILITY_PLANNING:
+            validator = draft_validator(self.checker, request)
         return Stage1Toolbox(
             self.source, self.hcap,
             kernel_commit=request.candidate.kernel_commit,
-            hcap_revision=request.hcap_revision)
+            hcap_revision=request.hcap_revision,
+            program_validator=validator)
+
+
+def draft_validator(checker: DraftChecker, request: AgentRequest
+                    ) -> ProgramValidator:
+    """The checks a returned plan meets, as one read-only tool (#75): the
+    executor's trusted-request checks, then the Materializer's."""
+
+    binding = request.binding
+    candidate = request.candidate
+
+    def refused(stage: str, reason: str, detail: str = "",
+                message: str = "") -> ProgramValidation:
+        return ProgramValidation(accepted=False, stage=stage, reason=reason,
+                                 detail=detail, message=message)
+
+    def validate(draft: ReachabilityPlanDraft) -> ProgramValidation:
+        if draft.candidate_id != candidate.candidate_id:
+            return refused("request", "candidate_id_mismatch")
+        if draft.hcap_revision != request.hcap_revision:
+            return refused("request", "hcap_revision_mismatch")
+        if draft.q1_observation.target != candidate.location:
+            return refused("request", "q1_target_mismatch")
+        if isinstance(draft.program, InlineProgram):
+            program = draft.program.text.encode("utf-8")
+            if len(program) > MAX_PROGRAM_BYTES:
+                return refused("request", "inline_program_too_large")
+            ref = hashlib.sha256(program).hexdigest()
+        else:
+            program, ref = None, draft.program.artifact_ref
+        try:
+            plan = completed_plan(draft, ref)
+        except ValueError as exc:
+            return refused("schema", "plan_invalid", message=str(exc))
+        try:
+            result = checker.check_draft(plan, program, binding)
+        except OSError:
+            return refused("host", "validator_unavailable")
+        if result is None:
+            return ProgramValidation(accepted=True)
+        return refused("materializer", result.reason, result.detail,
+                       result.message)
+
+    return validate
 
 
 class Stage1AgentExecutor:
@@ -202,7 +279,7 @@ class Stage1AgentExecutor:
                         "candidate")
             return value
 
-        prompt = self._prompt(request)
+        prompt = self._prompt(request, extra=self._repair_context(request))
         result = self._run(
             request, tools, instructions=ANALYSIS_INSTRUCTIONS,
             prompt=prompt, output_type=CandidateAnalysis, validate=validate)
@@ -245,7 +322,8 @@ class Stage1AgentExecutor:
             return value
 
         prompt = self._prompt(
-            request, analysis=canonical_json(analysis).decode("utf-8"))
+            request, analysis=canonical_json(analysis).decode("utf-8"),
+            extra=self._repair_context(request, previous_plan=True))
         result = self._run(
             request, tools, instructions=PLANNING_INSTRUCTIONS,
             prompt=prompt, output_type=ReachabilityPlanningOutput,
@@ -331,6 +409,92 @@ class Stage1AgentExecutor:
         return result, RuleSetOutput(
             rule_set_ref=put_record(self.artifacts, decision.rule_set))
 
+    def _repair_context(self, request: AgentRequest, *,
+                        previous_plan: bool = False) -> list[str]:
+        """What a Stage 1 repair needs to build on its earlier attempts
+        (#75): the plan and program under repair, every earlier attempt's
+        cause and findings, and a reading of a Q1 not_reached finding.
+        Context only: an unreadable earlier record is left out."""
+        repair = request.repair
+        if repair is None:
+            return []
+        parts = []
+        note = q1_finding_note(repair)
+        if note:
+            parts.append("Controller reading of the Q1 finding (trusted):\n"
+                         + note)
+        if previous_plan and request.plan_ref is not None:
+            loaded = self._plan_and_program(request.plan_ref)
+            if loaded is not None:
+                plan, program = loaded
+                parts.append(
+                    "Previous ReachabilityPlan data, the plan this repair "
+                    "replaces (untrusted):\n" +
+                    canonical_json(plan).decode("utf-8"))
+                if program is not None:
+                    parts.append("Previous syz program text (untrusted):\n"
+                                 + program)
+        history = self._history(request)
+        if history:
+            parts.append(
+                "Stage 1 attempts of this job so far, oldest first, each "
+                "with the findings that rejected its plan (untrusted):\n" +
+                json.dumps(history, indent=1, sort_keys=True))
+        return parts
+
+    def _plan_and_program(self, plan_ref: str
+                          ) -> tuple[ReachabilityPlan, str | None] | None:
+        try:
+            plan = load_record(self.artifacts, plan_ref, ReachabilityPlan)
+            if plan.program_proposal.kind != "program":
+                return plan, None
+            data = self.artifacts.get(plan.program_proposal.artifact_ref,
+                                      max_bytes=MAX_PROGRAM_BYTES)
+        except (OSError, ValueError):
+            return None
+        text = data.decode("utf-8", errors="replace")
+        if len(text) > MAX_PREVIOUS_PROGRAM_CHARS:
+            text = text[:MAX_PREVIOUS_PROGRAM_CHARS] + \
+                "\n# [truncated by the host]"
+        return plan, text
+
+    def _history(self, request: AgentRequest) -> list[dict]:
+        repairs = []
+        for ref in request.prior_repairs:
+            try:
+                repairs.append(RepairInput.model_validate_json(
+                    self.artifacts.get(ref)))
+            except (OSError, ValueError):
+                continue
+        repairs.append(request.repair)
+        rows, programs = [], {}
+        for repair in repairs[-MAX_HISTORY_ATTEMPTS:]:
+            row = {
+                "repair": repair.attempt,
+                "agent_task": repair.agent_task.value,
+                "cause": repair.cause.value,
+                "findings": [_bounded_text(item, MAX_HISTORY_FINDING_CHARS)
+                             for item in repair.findings],
+            }
+            for ref in repair.previous_outputs:
+                try:
+                    plan = load_record(self.artifacts, ref, ReachabilityPlan)
+                except (OSError, ValueError):
+                    continue
+                proposal = plan.program_proposal
+                row["program_kind"] = proposal.kind
+                row["program_sha256"] = proposal.artifact_ref
+                if proposal.seed_id is not None:
+                    row["seed_id"] = proposal.seed_id
+                if proposal.artifact_ref in programs:
+                    row["same_program_as_repair"] = \
+                        programs[proposal.artifact_ref]
+                else:
+                    programs[proposal.artifact_ref] = repair.attempt
+            rows.append(row)
+        # A single row repeats the RepairInput already in the prompt.
+        return rows if len(rows) > 1 else []
+
     @staticmethod
     def _actual_model_id(result: RuntimeResult) -> str:
         if not isinstance(result.model_id, str) or ACTUAL_MODEL_ID.fullmatch(
@@ -356,3 +520,34 @@ class Stage1AgentExecutor:
                 "instructions):\n" +
                 canonical_json(request.repair).decode("utf-8"))
         return "\n\n".join(parts)
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[:limit - 3] + "..."
+
+
+_Q1_NOT_REACHED_NOTE = """\
+The previous program ran to completion, and its run produced valid
+generation-attributed remote KCOV coverage of the plan's expected context
+within the admissible loss limits. That coverage did not contain the
+candidate target. So the harness observed the run and the program did not
+drive execution to the candidate. Re-check the conditions on the selected
+path against the program: the state the calls set up beforehand, argument
+and field values, the order of calls, and which server context runs the
+target code. If the selected call/state path itself is wrong, return
+reanalysis_required; if no promoted capability can create the condition,
+return unsupported and say which condition it is."""
+
+
+def q1_finding_note(repair: RepairInput) -> str:
+    """A trusted reading of a Q1 not_reached finding.  It adds no evidence
+    beyond the Q1Result: no PC, coverage or location data (#75)."""
+    if repair.cause is not RepairCause.Q1_NOT_REACHED or not repair.findings:
+        return ""
+    try:
+        result = Q1Result.model_validate_json(repair.findings[0])
+    except ValueError:
+        return ""
+    if result.status is not Q1Status.NOT_REACHED or result.reason:
+        return ""
+    return _Q1_NOT_REACHED_NOTE
