@@ -729,7 +729,7 @@ NLM 작업의 실행 context와 귀속:
 | kernel client의 동기 NLM 호출 | executor 프로세스 | executor 자체 KCOV |
 
 kernel patch 0006은 0004의 callback owner를 lockd에 쓴다. block의 owner는 그 block을 만든 LOCK 요청의
-program이며, 같은 block에 대한 뒤 LOCK은 그 program이 끝난 경우에만 owner를 바꾼다. owner의
+program이며, block이 사라질 때까지 바뀌지 않는다. owner의
 generation이 closing, committed, aborted이면 section은 거부되고 `cb_section_owner_none`으로 센다. 이
 lockd 작업을 요구하는 Q1 target의 `expected_context`는 `lockd`이고, Q1 profile은 `callback_v41`과 같은
 counter를 본다. 위 표에서 귀속 안 됨으로 남은 작업을 요구하는 target은 이 boundary 밖이다.
