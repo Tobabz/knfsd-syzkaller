@@ -522,3 +522,112 @@ def test_cld_evidence_is_typed_and_carries_no_addresses(tmp_path):
         runner.hcap12_evidence(
             context, guest, digests, cycles,
             b'{"pc": "0xffffffff81001234"}\n', 0, 0)
+
+
+GRANT_SOURCE = """\
+__be32 nlmclnt_grant(const struct sockaddr *addr, const struct lockd_lock *lock);
+
+__be32 nlmclnt_grant(const struct sockaddr *addr, const struct lockd_lock *lock)
+{
+\tint res = 0;
+
+\ttrace_nlmclnt_grant(lock, addr, svc_addr_len(addr), res);
+\treturn res;
+}
+"""
+
+
+def test_probe_range_accepts_a_return_type_before_the_name():
+    runner = load_runner()
+    assert runner.probe_range(GRANT_SOURCE, "nlmclnt_grant", "function") == (
+        3, 9)
+    ranges = runner.probe_ranges(
+        {"fs/lockd/clntlock.c": GRANT_SOURCE}.__getitem__,
+        {"clnt_grant": runner.NLM_PROBES["clnt_grant"]})
+    assert [(item["function"], item["start_line"], item["end_line"])
+            for item in ranges["clnt_grant"]] == [("nlmclnt_grant", 3, 9)]
+
+
+def nlm_run(**hits):
+    probes = dict.fromkeys(load_runner().NLM_PROBES, 0)
+    probes.update(hits)
+    return {"probe_hits": probes, "status_check": "pass",
+            "generation": {"remote_start_ok": 2}}
+
+
+NLM_GOOD = {
+    "control": nlm_run(),
+    "lock": nlm_run(svc_lock=1, svc_unlock=1),
+    "rpc": nlm_run(svc_lock=1, svc_unlock=1, svc_testlock=1, svc_share=1),
+    "blocked": nlm_run(svc_lock=1, svc_unlock=1, clnt_grant=1),
+}
+
+
+@pytest.mark.parametrize(("phase", "run", "message"), [
+    ("control", nlm_run(svc_testlock=1), "control reached lockd probe"),
+    ("lock", nlm_run(svc_lock=1), "lock run missed svc_unlock"),
+    ("lock", nlm_run(svc_lock=1, svc_unlock=1, clnt_grant=1),
+     "grant callback"),
+    ("rpc", nlm_run(svc_lock=1, svc_unlock=1, svc_testlock=1),
+     "rpc run missed svc_share"),
+    ("blocked", nlm_run(svc_lock=1, svc_unlock=1), "missed clnt_grant"),
+])
+def test_nlm_runs_fail_closed(phase, run, message):
+    runner = load_runner()
+    with pytest.raises(RuntimeError, match=message):
+        runner.check_nlm_run(phase, run)
+
+
+def test_nlm_campaign_uses_the_nlm_selection_and_types_its_evidence(
+        tmp_path):
+    runner, config, descriptor_path, _, _ = write_identity_inputs(tmp_path)
+    descriptor = ExecutionHarnessDescriptor.model_validate_json(
+        descriptor_path.read_text())
+    admin = descriptor.allowed_runtime_selections[0]
+    nlm = RuntimeSelection(
+        profile="knfsd-v3", nfs_version="3", fixture_mode="nlm-knfsd",
+        route="direct", topology="one-lane",
+        enabled_interfaces=tuple(sorted(runner.NLM_REQUIRED_INTERFACES)),
+        trace_mode="off")
+    descriptor = descriptor.model_copy(update={
+        "allowed_runtime_selections": tuple(sorted(
+            (admin, nlm), key=lambda item: canonical_json(item)))})
+    descriptor_path.write_text(descriptor.model_dump_json(indent=2))
+    context = runner.load_admin_context(
+        config, descriptor_path, None,
+        required=runner.NLM_REQUIRED_INTERFACES, profile="knfsd-v3",
+        nfs_version="3", fixture_mode=runner.NLM_FIXTURE)
+    assert context.selection == nlm
+    with pytest.raises(RuntimeError, match="knfsd-v3 single"):
+        runner.load_admin_context(
+            config, descriptor_path, None,
+            required=runner.NLM_REQUIRED_INTERFACES, profile="knfsd-v3",
+            nfs_version="3")
+    for phase, run in NLM_GOOD.items():
+        runner.check_nlm_run(phase, run)
+    cycles = {phase: [run] * 3 for phase, run in NLM_GOOD.items()}
+    guest = {"guest_lane_script_sha256": "4" * 64,
+             "guest_nfs_proxy_sha256": "5" * 64}
+    digests = {name: "6" * 64 for name in runner.NLM_PROBES}
+    evidence = runner.hcap13_evidence(
+        context, guest, digests, cycles, b'{"status": "pass"}\n', 0, 0)
+    assert evidence.capability_id == "HCAP-13"
+    assert evidence.runs.blocked.probe_hits.clnt_grant == (1, 1, 1)
+    assert evidence.generation_contract.minimum_remote_start_ok == 2
+    with pytest.raises(ValueError, match="private target data"):
+        runner.hcap13_evidence(
+            context, guest, digests, cycles,
+            b'{"pc": "0xffffffff81001234"}\n', 0, 0)
+
+
+def test_nlm_programs_use_only_lane_profile_and_nlm_calls():
+    runner = load_runner()
+    allowed = {"close", "fcntl$lock", "getdents64", "nanosleep",
+               *runner.NLM_REQUIRED_INTERFACES} - {"remote_cover"}
+    for phase, path in runner.NLM_PROGRAMS.items():
+        calls = [line.split("(", 1)[0].split("= ")[-1]
+                 for line in path.read_text().splitlines()]
+        calls = [call.replace("recvfrom$inet_nlm_tcp", "close")
+                 for call in calls]
+        assert set(calls) <= allowed, phase
+        assert "0x7, " not in path.read_text(), "F_SETLKW in %s" % phase

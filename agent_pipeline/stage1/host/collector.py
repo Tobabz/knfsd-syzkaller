@@ -129,7 +129,7 @@ def guest_cmdline(descriptor: ExecutionHarnessDescriptor,
         raise CollectorError("descriptor command line must not set koov.*")
     extra = ([f"koov.nfs_version={selection.nfs_version}"]
              if selection.fixture_mode == "single"
-             else ["koov.nfs_fixture=broad-knfsd"])
+             else [f"koov.nfs_fixture={selection.fixture_mode}"])
     extra.append(f"koov.nfs_trace={1 if selection.trace_mode == 'on' else 0}")
     extra.append(f"koov.lane_sha256={lane_sha256}")
     return " ".join([*base, *extra])
@@ -174,7 +174,9 @@ def _fixture_ready(guest: Guest, selection: RuntimeSelection,
         return False
     if int(status.get("lane_count", 0)) <= LANE:
         return False
-    if selection.fixture_mode == "single" and \
+    if status.get("fixture_mode") != selection.fixture_mode:
+        return False
+    if selection.fixture_mode != "broad-knfsd" and \
             str(status.get("nfs_version")) != selection.nfs_version:
         return False
     return int(status.get("nfs_trace", 0)) == \

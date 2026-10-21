@@ -44,6 +44,7 @@ SCENARIOS = {
     "v41-control-restart": {"version": "4.1", "kind": "control"},
     "v41-cld-lifecycle": {"version": "4.1", "kind": "cld"},
     "v42-control-restart": {"version": "4.2", "kind": "control"},
+    "v3-nlm-lock": {"version": "3", "kind": "nlm", "fixture": "nlm-knfsd"},
 }
 LEASE_EVENTS = (
     "nfsd/nfsd_clid_confirmed",
@@ -146,6 +147,42 @@ CLD_PROBES = {
         ("net/sunrpc/rpc_pipe.c", "rpc_queue_upcall", "wait_for_open"),
     ),
 }
+NLM_REQUIRED_INTERFACES = frozenset((
+    "remote_cover",
+    "syz_nlm_lane_fh",
+    "syz_open_nfs_lane_profile$client0_knfsd_v3",
+    "syz_open_nfs_lane_profile$client1_knfsd_v3",
+    "syz_open_nlm_lane_file",
+    "syz_send_nlm_rpc",
+    "syz_socket_connect_nlm$client0",
+))
+NLM_FIXTURE = "nlm-knfsd"
+# "control" is the neutral lane I/O program, "lock" locks through the kernel
+# NFS client, "rpc" sends raw NLM calls and "blocked" queues a raw blocking
+# LOCK behind a client1 lock so its release grants it by callback.
+NLM_PROGRAMS = {
+    phase: ROOT / ("tools/nfs-lifecycle/programs/v3-nlm-%s.prog" % phase)
+    for phase in ("control", "lock", "rpc", "blocked")
+}
+# Public lockd probes, same form as CLD_PROBES.  svc_* run in the server
+# lane lockd while it serves a request; clnt_grant in the client0 lockd while
+# it serves the server's GRANTED_MSG callback.
+NLM_PROBES = {
+    "clnt_grant": (("fs/lockd/clntlock.c", "nlmclnt_grant", "function"),),
+    "svc_lock": (("fs/lockd/svclock.c", "nlmsvc_lock", "function"),),
+    "svc_share": (("fs/lockd/svcshare.c", "nlmsvc_share_file", "function"),),
+    "svc_testlock": (("fs/lockd/svclock.c", "nlmsvc_testlock", "function"),),
+    "svc_unlock": (("fs/lockd/svclock.c", "nlmsvc_unlock", "function"),),
+}
+# Diagnostics only: the server lockd thread grants a blocked lock outside
+# any request (remote_kcov.context.lockd), and the GRANTED_RES it receives
+# back depends on the client's rpciod.  They never decide reach.
+NLM_DIAGNOSTIC_PROBES = {
+    "svc_grant_blocked": (
+        ("fs/lockd/svclock.c", "nlmsvc_grant_blocked", "function"),),
+    "svc_grant_reply": (
+        ("fs/lockd/svclock.c", "nlmsvc_grant_reply", "function"),),
+}
 RECLAIM_COMPLETE_RE = re.compile(
     r"nfsd_compound_status: .* OP_RECLAIM_COMPLETE status=0(?:\s|$)",
     re.MULTILINE)
@@ -188,13 +225,16 @@ class AdminContext:
 
 
 def load_admin_context(collector_path, descriptor_path, mapping_path, *,
-                       required=ADMIN_REQUIRED_INTERFACES):
+                       required=ADMIN_REQUIRED_INTERFACES,
+                       profile="knfsd-v41", nfs_version="4.1",
+                       fixture_mode="single"):
     """Load one exact Stage1 harness and bind the target mapping to it.
 
     ``required`` picks the runtime selection: the client-expiry campaign
     uses the HCAP-11 selection without nfsdcld control, the CLD campaign the
-    one that adds it.  The CLD campaign maps public probes itself and passes
-    no target mapping.
+    one that adds it, the NLM campaign the nlm-knfsd NFSv3 selection.  The
+    CLD and NLM campaigns map public probes themselves and pass no target
+    mapping.
     """
     config_bytes = Path(collector_path).read_bytes()
     descriptor_bytes = Path(descriptor_path).read_bytes()
@@ -233,8 +273,8 @@ def load_admin_context(collector_path, descriptor_path, mapping_path, *,
 
     selections = [
         item for item in descriptor.allowed_runtime_selections
-        if (item.profile == "knfsd-v41" and item.nfs_version == "4.1"
-            and item.fixture_mode == "single" and item.route == "direct"
+        if (item.profile == profile and item.nfs_version == nfs_version
+            and item.fixture_mode == fixture_mode and item.route == "direct"
             and item.topology == "one-lane" and item.trace_mode == "off"
             and required <= set(item.enabled_interfaces)
             and (CLD_RECONNECT in required or
@@ -242,7 +282,8 @@ def load_admin_context(collector_path, descriptor_path, mapping_path, *,
     ]
     if len(selections) != 1:
         raise RuntimeError("execution descriptor must expose one exact "
-                           "NFSv4.1 lifecycle runtime selection")
+                           "%s %s lifecycle runtime selection" %
+                           (profile, fixture_mode))
 
     store = ArtifactStore(config.artifact_root)
     lane_pin = load_record(store, builds["lane-script"], HostFilePin)
@@ -752,8 +793,12 @@ def run_admin(vm, output, repeat, files, target_pcs):
 def probe_range(source, function, part):
     """1-based inclusive line range of one public probe in kernel source."""
     lines = source.splitlines()
+    # A definition starts in column 0, optionally after its return type on
+    # the same line; a prototype ends with ";".
     starts = [index for index, line in enumerate(lines)
-              if re.match(re.escape(function) + r"\(", line)]
+              if re.match(r"(?:[A-Za-z_][A-Za-z0-9_ *]*[ *])?" +
+                          re.escape(function) + r"\(", line)
+              and not line.rstrip().endswith(";")]
     if len(starts) != 1:
         raise RuntimeError("probe function %s definitions=%d, want 1" %
                            (function, len(starts)))
@@ -787,11 +832,12 @@ def probe_range(source, function, part):
     raise ValueError("unknown probe part %s" % part)
 
 
-def probe_ranges(read_source):
-    """Resolve CLD_PROBES against the exact kernel source."""
+def probe_ranges(read_source, table=None):
+    """Resolve a probe table (CLD_PROBES) against the exact kernel source."""
     sources = {}
     ranges = {}
-    for name, parts in sorted(CLD_PROBES.items()):
+    for name, parts in sorted((CLD_PROBES if table is None
+                               else table).items()):
         ranges[name] = []
         for path, function, part in parts:
             if path not in sources:
@@ -816,12 +862,14 @@ def select_probe_pcs(frames, ranges):
     return selected
 
 
-def build_cld_probes(context, kernel_source, cache, output):
+def build_cld_probes(context, kernel_source, cache, output, table=None,
+                     kind="cld"):
     """Map the public CLD probes to coverage callsites of the pinned vmlinux.
 
     Returns probe PCs and the digest of each probe record.  The records
     name public kernel functions only and are kept beside the raw run
-    artifacts for audit.
+    artifacts for audit.  ``table`` and ``kind`` select another probe set
+    (NLM_PROBES, "nlm").
     """
     import subprocess
     import tempfile
@@ -834,7 +882,7 @@ def build_cld_probes(context, kernel_source, cache, output):
              "%s:%s" % (commit, path)],
             check=True, capture_output=True, text=True).stdout
 
-    ranges = probe_ranges(read_source)
+    ranges = probe_ranges(read_source, table)
     vmlinux = context.files["kernel"]
     found = vmlinux_callsites(
         vmlinux, cache, context.identity.vmlinux_sha256)
@@ -856,9 +904,10 @@ def build_cld_probes(context, kernel_source, cache, output):
     digests = {}
     for name in sorted(ranges):
         if not selected[name]:
-            raise RuntimeError("CLD probe %s maps to no callsite" % name)
+            raise RuntimeError("%s probe %s maps to no callsite" %
+                               (kind.upper(), name))
         record = {
-            "schema_version": "cld-probe-mapping.v1",
+            "schema_version": "%s-probe-mapping.v1" % kind,
             "probe": name,
             "identity": context.identity.model_dump(mode="json"),
             "ranges": ranges[name],
@@ -1103,6 +1152,126 @@ def hcap12_evidence(context, guest_identity, probe_digests, cycles,
         bool(SHAREABLE_HEX_RE.search(result_bytes.decode())),
     }
     return Hcap12KvmEvidence.model_validate(evidence)
+
+
+def run_nlm_program(vm, output, phase, iteration, tracing, probes,
+                    diagnostics):
+    def evaluate(artifacts, pcs):
+        lineage = validate_admin_control(
+            artifacts["trace.txt"], artifacts["lifecycle.log"])
+        return {
+            "generation": generation_evidence(
+                artifacts["stats-before.txt"], artifacts["stats-after.txt"]),
+            "probe_hits": {name: len(pcs & probe)
+                           for name, probe in probes.items()},
+            "lineage": lineage,
+            "diagnostics": {name: len(pcs & probe)
+                            for name, probe in diagnostics.items()},
+        }
+
+    result = run_program(vm, output, phase, iteration, tracing, evaluate)
+    stem = "%s-%03d" % (phase, iteration)
+    try:
+        status = json.loads(vm.guest(
+            "/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager"))
+    except Exception as error:
+        raise RuntimeError("fixture: lane status failed after %s: %s" %
+                           (phase, error)) from error
+    if status.get("fixture_mode") != NLM_FIXTURE:
+        raise RuntimeError("fixture: lane status changed fixture mode")
+    dmesg = vm.guest("dmesg")
+    (output / (stem + ".dmesg.txt")).write_text(dmesg)
+    crashes = [pattern for pattern in CRASH_PATTERNS if pattern in dmesg]
+    if crashes:
+        raise RuntimeError("kernel crash signatures: %s" % crashes)
+    result["status_check"] = "pass"
+    return result
+
+
+def check_nlm_run(phase, run):
+    """Fail closed on a run outside the phase's validated lockd reach."""
+    from agent_pipeline.stage1.host.generate import HCAP13_REQUIRED_PROBES
+
+    hits = run["probe_hits"]
+    if phase == "control":
+        reached = sorted(name for name, count in hits.items() if count)
+        if reached:
+            raise RuntimeError("neutral control reached lockd probe %s" %
+                               reached[0])
+        return
+    for name in HCAP13_REQUIRED_PROBES[phase]:
+        if not hits[name]:
+            raise RuntimeError("%s run missed %s" % (phase, name))
+    if phase == "lock" and hits["clnt_grant"]:
+        raise RuntimeError("lock run reached a grant callback")
+
+
+def run_nlm(vm, output, repeat, files, probes, diagnostics):
+    tracing = trace_root(vm, ADMIN_EVENTS)
+    vm.guest("mkdir -p %s" % ADMIN_GUEST)
+    for name in ("syz-executor", "syz-execprog"):
+        vm.put(files[name], ADMIN_GUEST + "/" + name)
+    for phase, path in NLM_PROGRAMS.items():
+        vm.put(path, "%s/%s.prog" % (ADMIN_GUEST, phase))
+    vm.guest("chmod 0755 %s/syz-executor %s/syz-execprog" %
+             (ADMIN_GUEST, ADMIN_GUEST))
+    cycles = {phase: [] for phase in NLM_PROGRAMS}
+    for phase in NLM_PROGRAMS:
+        for iteration in range(1, repeat + 1):
+            run = run_nlm_program(vm, output, phase, iteration, tracing,
+                                  probes, diagnostics)
+            check_nlm_run(phase, run)
+            cycles[phase].append(run)
+    return tracing, cycles
+
+
+def hcap13_evidence(context, guest_identity, probe_digests, cycles,
+                    result_bytes, crash_count, artifact_errors):
+    """Assemble and type-check the HCAP-13 evidence for this campaign."""
+    from agent_pipeline.stage1.host.generate import Hcap13KvmEvidence
+
+    runs = {}
+    for phase, items in cycles.items():
+        runs[phase] = {
+            "completed": len(items),
+            "probe_hits": {name: [run["probe_hits"][name] for run in items]
+                           for name in sorted(NLM_PROBES)},
+            "status_checks_passed": sum(
+                run["status_check"] == "pass" for run in items),
+            "attributed_generations": sum(
+                bool(run["generation"]) for run in items),
+        }
+    generations = [run["generation"] for items in cycles.values()
+                   for run in items]
+    evidence = {
+        "schema_version": "hcap-kvm-evidence.v1",
+        "capability_id": "HCAP-13",
+        "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "scenario": "v3-nlm-lock",
+        "execution_harness_id": context.identity.execution_harness_id,
+        "mapping_identity": context.identity.model_dump(mode="json"),
+        "probe_mapping_sha256": probe_digests,
+        "campaign_result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+        "guest_lane_script_sha256": guest_identity["guest_lane_script_sha256"],
+        "guest_nfs_proxy_sha256": guest_identity["guest_nfs_proxy_sha256"],
+        "runs": runs,
+        "generation_contract": {
+            "generation_begin_each": 1,
+            "aggregate_published_each": 1,
+            "generation_aborted_each": 0,
+            "scratch_overflow_each": 0,
+            "merge_truncation_each": 0,
+            "outstanding_tokens_after_each": 0,
+            "remote_refs_after_each": 0,
+            "minimum_remote_start_ok": min(
+                item["remote_start_ok"] for item in generations),
+        },
+        "crash_signature_count": crash_count,
+        "raw_artifact_error_count": artifact_errors,
+        "shareable_result_contains_target_metadata_or_addresses":
+        bool(SHAREABLE_HEX_RE.search(result_bytes.decode())),
+    }
+    return Hcap13KvmEvidence.model_validate(evidence)
 
 
 def lease_guest_script(path):
@@ -1360,7 +1529,8 @@ def main():
     parser.add_argument("--kernel-source", type=Path,
                         default=ROOT / "env/linux",
                         help="kernel git tree holding the descriptor's "
-                        "kernel commit (v41-cld-lifecycle probes)")
+                        "kernel commit (v41-cld-lifecycle and v3-nlm-lock "
+                        "probes)")
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args()
     if args.repeat < 1 or args.repeat > 999:
@@ -1384,6 +1554,26 @@ def main():
         except Exception as error:
             parser.error("invalid identity-bound lifecycle inputs: %s" % error)
         for path in CLD_PROGRAMS.values():
+            if not path.is_file():
+                parser.error("missing lifecycle program: %s" % path)
+    elif definition["kind"] == "nlm":
+        if args.repeat < 3:
+            parser.error("v3-nlm-lock evidence needs --repeat >= 3")
+        for option, path in (("--collector-config", args.collector_config),
+                             ("--descriptor", args.descriptor)):
+            if path is None or not path.resolve().is_file():
+                parser.error("%s is required by v3-nlm-lock" % option)
+        if args.target_pcs is not None:
+            parser.error("v3-nlm-lock maps public probes itself; "
+                         "do not pass a candidate --target-pcs mapping")
+        try:
+            admin_context = load_admin_context(
+                args.collector_config.resolve(), args.descriptor.resolve(),
+                None, required=NLM_REQUIRED_INTERFACES, profile="knfsd-v3",
+                nfs_version="3", fixture_mode=NLM_FIXTURE)
+        except Exception as error:
+            parser.error("invalid identity-bound lifecycle inputs: %s" % error)
+        for path in NLM_PROGRAMS.values():
             if not path.is_file():
                 parser.error("missing lifecycle program: %s" % path)
     elif definition["kind"] == "admin":
@@ -1426,14 +1616,24 @@ def main():
 
     result = {"scenario": args.scenario, "native_version": definition["version"],
               "iterations": args.repeat, "transport": "TCP", "status": "fail"}
-    probes = probe_digests = guest_identity = None
+    probes = probe_digests = guest_identity = diagnostics = None
     cycles = None
-    if definition["kind"] == "cld":
+    if definition["kind"] in ("cld", "nlm"):
         # Host-only: map the public probes before booting the guest.
         try:
-            probes, probe_digests = build_cld_probes(
-                admin_context, args.kernel_source.resolve(),
-                output / "probe-cache", output)
+            if definition["kind"] == "cld":
+                probes, probe_digests = build_cld_probes(
+                    admin_context, args.kernel_source.resolve(),
+                    output / "probe-cache", output)
+            else:
+                mapped, digests = build_cld_probes(
+                    admin_context, args.kernel_source.resolve(),
+                    output / "probe-cache", output,
+                    {**NLM_PROBES, **NLM_DIAGNOSTIC_PROBES}, "nlm")
+                probes = {name: mapped[name] for name in NLM_PROBES}
+                probe_digests = {name: digests[name] for name in NLM_PROBES}
+                diagnostics = {name: mapped[name]
+                               for name in NLM_DIAGNOSTIC_PROBES}
         except Exception as error:
             result["error"] = shareable_error(error)
             (output / "result.json").write_text(
@@ -1457,7 +1657,8 @@ def main():
             raise RuntimeError("fixture service is " + fixture_state)
         status = json.loads(vm.guest(
             "/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager"))
-        if (status.get("fixture_mode") != "single" or
+        if (status.get("fixture_mode") !=
+                definition.get("fixture", "single") or
                 status.get("nfs_version") != definition["version"]):
             raise RuntimeError("fixture selected the wrong profile")
         if definition["kind"] == "lease":
@@ -1478,6 +1679,14 @@ def main():
             vm.guest("test -S /syz-nfs-lanes/proc-0/control/lifecycle.sock")
             tracing, cycles = run_cld(
                 vm, output, args.repeat, admin_context.files, probes)
+            result["complete_runs"] = {
+                phase: len(items) for phase, items in cycles.items()}
+        elif definition["kind"] == "nlm":
+            guest_identity = verify_admin_guest(vm, admin_context)
+            result["evidence_identity"].update(guest_identity)
+            tracing, cycles = run_nlm(
+                vm, output, args.repeat, admin_context.files, probes,
+                diagnostics)
             result["complete_runs"] = {
                 phase: len(items) for phase, items in cycles.items()}
         else:
@@ -1515,6 +1724,14 @@ def main():
             (output / "hcap12-kvm.json").write_text(
                 evidence.model_dump_json(indent=2) + "\n")
             print("HCAP-12 evidence: %s" % (output / "hcap12-kvm.json"))
+        if definition["kind"] == "nlm" and result["status"] == "pass":
+            errors = sum(1 for _ in output.glob("*.artifact-errors.txt"))
+            evidence = hcap13_evidence(
+                admin_context, guest_identity, probe_digests, cycles,
+                encoded, len(result["crash_signatures"]), errors)
+            (output / "hcap13-kvm.json").write_text(
+                evidence.model_dump_json(indent=2) + "\n")
+            print("HCAP-13 evidence: %s" % (output / "hcap13-kvm.json"))
 
 
 if __name__ == "__main__":

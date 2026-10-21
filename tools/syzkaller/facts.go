@@ -161,6 +161,14 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 		if a, ok := profileAcquisition(call); ok {
 			roots[call.Ret] = a.Origin
 			acquired[a] = true
+		} else if call.Meta.CallName == "syz_open_nlm_lane_file" {
+			// The executor opens a regular file strictly beneath the lane
+			// directory (openat2 RESOLVE_BENEATH|NO_XDEV|NO_SYMLINKS|
+			// NO_MAGICLINKS, NFS superblock), so the file keeps the
+			// directory's profile origin. Nothing else is closed.
+			if origin := argumentOrigin(roots, call, 0); origin != "" && call.Ret != nil && isFD(call.Ret) {
+				roots[call.Ret] = origin
+			}
 		} else if isNfsAcquisition(call.Meta.CallName) {
 			// Silently omitting an acquisition could hide a second, conflicting
 			// profile beside a supported acquisition in the same program.
@@ -198,6 +206,17 @@ func isNfsAcquisition(name string) bool {
 		return true
 	}
 	return false
+}
+
+func argumentOrigin(roots map[*prog.ResultArg]string, call *prog.Call, index int) string {
+	if index >= len(call.Args) {
+		return ""
+	}
+	ref, ok := call.Args[index].(*prog.ResultArg)
+	if !ok || ref.Res == nil || ref.OpDiv != 0 || ref.OpAdd != 0 || !isFD(ref) {
+		return ""
+	}
+	return roots[ref.Res]
 }
 
 func isFD(arg *prog.ResultArg) bool {
@@ -262,7 +281,10 @@ func preservesRoots(name string) bool {
 		"getdents", "getdents64", "fsync", "fdatasync", "fstat", "fstatfs", "lseek",
 		"ftruncate", "fallocate", "flock", "fchmod", "fchown", "fadvise64", "readahead",
 		"sync_file_range", "copy_file_range", "fsetxattr", "fgetxattr", "flistxattr", "fremovexattr",
-		"openat", "nanosleep", "syz_nfsd_client_ctl", "syz_nfsd_cld_ctl":
+		"openat", "nanosleep", "syz_nfsd_client_ctl", "syz_nfsd_cld_ctl",
+		// NLM lane calls (0030) and fcntl neither close nor rebind an
+		// existing descriptor; F_DUPFD returns a new, unrooted one.
+		"fcntl", "recvfrom", "syz_socket_connect_nlm", "syz_nlm_lane_fh", "syz_send_nlm_rpc":
 		return true
 	}
 	return false

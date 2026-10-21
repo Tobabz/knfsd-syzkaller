@@ -287,9 +287,109 @@ class Hcap12KvmEvidence(_Spec):
         return self
 
 
+HCAP13_PROBES = ("clnt_grant", "svc_lock", "svc_share", "svc_testlock",
+                 "svc_unlock")
+
+
+class Hcap13ProbeHits(_Spec):
+    """Per-run counts of attributed PCs in each public lockd probe range."""
+
+    clnt_grant: tuple[int, ...]
+    svc_lock: tuple[int, ...]
+    svc_share: tuple[int, ...]
+    svc_testlock: tuple[int, ...]
+    svc_unlock: tuple[int, ...]
+
+    def each(self, name: str) -> tuple[int, ...]:
+        return getattr(self, name)
+
+
+class Hcap13RunEvidence(_Spec):
+    completed: int = Field(ge=3, le=999)
+    probe_hits: Hcap13ProbeHits
+    #: lane.sh status passed (lockd and rpc.statd registered in every lane
+    #: namespace, knfsd mounts lock) after every run.
+    status_checks_passed: int = Field(ge=0)
+    #: Generation contract held for every run (HCAP-11 invariants).
+    attributed_generations: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _count(self) -> Self:
+        for name in HCAP13_PROBES:
+            if len(self.probe_hits.each(name)) != self.completed:
+                raise ValueError(f"{name} length differs from completed")
+        if self.status_checks_passed != self.completed:
+            raise ValueError("a run left the lane fixture unhealthy")
+        if self.attributed_generations != self.completed:
+            raise ValueError("a run lacks one attributed generation")
+        return self
+
+
+class Hcap13RunsEvidence(_Spec):
+    #: Neutral control: lane I/O on the NLM fixture, no lock.
+    control: Hcap13RunEvidence
+    #: Kernel NFS client byte-range lock, test and unlock (fcntl$lock).
+    lock: Hcap13RunEvidence
+    #: Raw NLM LOCK, TEST, UNLOCK, SHARE and UNSHARE (syz_send_nlm_rpc).
+    rpc: Hcap13RunEvidence
+    #: Raw blocking LOCK behind a client1 lock; its release makes the server
+    #: grant it with a GRANTED_MSG callback to the client0 lockd.
+    blocked: Hcap13RunEvidence
+
+
+#: Probes each phase must reach in every run; the control reaches none.
+HCAP13_REQUIRED_PROBES = {
+    "lock": ("svc_lock", "svc_unlock"),
+    "rpc": ("svc_lock", "svc_share", "svc_testlock", "svc_unlock"),
+    "blocked": ("clnt_grant", "svc_lock", "svc_unlock"),
+}
+
+
+class Hcap13KvmEvidence(_Spec):
+    schema_version: Literal["hcap-kvm-evidence.v1"]
+    capability_id: Literal["HCAP-13"]
+    observed_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    scenario: Literal["v3-nlm-lock"]
+    execution_harness_id: Sha256
+    mapping_identity: KernelIdentity
+    #: Digest of each public probe mapping, keyed by probe name.
+    probe_mapping_sha256: dict[str, Sha256]
+    campaign_result_sha256: Sha256
+    guest_lane_script_sha256: Sha256
+    guest_nfs_proxy_sha256: Sha256
+    runs: Hcap13RunsEvidence
+    generation_contract: Hcap11GenerationEvidence
+    crash_signature_count: int = Field(ge=0)
+    raw_artifact_error_count: int = Field(ge=0)
+    shareable_result_contains_target_metadata_or_addresses: bool
+
+    @model_validator(mode="after")
+    def _validated_campaign(self) -> Self:
+        if self.execution_harness_id != self.mapping_identity.execution_harness_id:
+            raise ValueError("mapping and campaign harness identities differ")
+        if tuple(sorted(self.probe_mapping_sha256)) != HCAP13_PROBES:
+            raise ValueError("probe mappings differ from the lockd probe set")
+        hits = self.runs.control.probe_hits
+        if any(any(hits.each(name)) for name in HCAP13_PROBES):
+            raise ValueError("control run reached a lockd probe")
+        for phase, names in HCAP13_REQUIRED_PROBES.items():
+            run = getattr(self.runs, phase)
+            for name in names:
+                if not all(run.probe_hits.each(name)):
+                    raise ValueError(f"{phase} run missed {name}")
+        if any(self.runs.lock.probe_hits.clnt_grant):
+            raise ValueError("lock run reached a grant callback")
+        if self.crash_signature_count != 0 or self.raw_artifact_error_count != 0:
+            raise ValueError("campaign contains a crash or artifact error")
+        if self.shareable_result_contains_target_metadata_or_addresses:
+            raise ValueError("shareable campaign evidence contains private target data")
+        return self
+
+
 CAPABILITY_EVIDENCE_MODELS = {
     "HCAP-11": Hcap11KvmEvidence,
     "HCAP-12": Hcap12KvmEvidence,
+    "HCAP-13": Hcap13KvmEvidence,
 }
 
 

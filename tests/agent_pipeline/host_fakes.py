@@ -51,12 +51,14 @@ GENERATIONS = ("owner 1 state COMMITTED outstanding_tokens 0 object_refs 1 "
 class FakeGuest:
     def __init__(self, config, *, pcs=None, fixture="active", lane_sha=None,
                  nfs_version="4.1", gate="ready", exec_rc="0", dmesg="",
-                 generations=GENERATIONS, boot_error=None):
+                 generations=GENERATIONS, boot_error=None,
+                 fixture_mode="single"):
         self.config = config
         self.pcs = pcs
         self.fixture = fixture
         self.lane_sha = lane_sha
         self.nfs_version = nfs_version
+        self.fixture_mode = fixture_mode
         self.gate = gate
         self.exec_rc = exec_rc
         self.generations = generations
@@ -84,6 +86,7 @@ class FakeGuest:
             return 0, self.fixture + "\n"
         if "lane.sh status" in command:
             return 0, json.dumps({"lane_count": 4,
+                                  "fixture_mode": self.fixture_mode,
                                   "nfs_version": self.nfs_version,
                                   "nfs_minor": 1, "nfs_trace": 0})
         if command.startswith("sha256sum"):
