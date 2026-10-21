@@ -172,11 +172,13 @@ class Controller:
                                       output=output, model_id=model_id)))
 
     def on_agent_failure(self, task_id: str, attempt: int,
-                         failure: str) -> None:
+                         failure: str, *,
+                         usage: AgentUsage | None = None) -> None:
+        """``usage``, what the failed run used, is kept like a result's."""
         a = self.store.attempt(task_id, attempt)
         if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
-                "status": "failed", "failure": failure}))
+                "status": "failed", "failure": failure, "usage": usage}))
         job_id = job_of(task_id)
         self._guard(job_id, "agent_result", lambda: self._apply(
             job_id, ev.AgentFailed(task_id=task_id, attempt=attempt,

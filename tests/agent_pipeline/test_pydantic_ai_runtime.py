@@ -30,7 +30,8 @@ from agent_pipeline.agent_tasks.executor import Stage1AgentExecutor
 from agent_pipeline.agent_tasks.pydantic_ai_runtime import (
     OUTPUT_TOOL, TOOL_RETRIES, PydanticAIRuntime, PydanticAIRuntimeError,
     RuntimeLimits)
-from agent_pipeline.agent_tasks.runtime import OutputRejected, RuntimeRequest
+from agent_pipeline.agent_tasks.runtime import (OutputRejected, RuntimeRequest,
+                                              failure_usage)
 from agent_pipeline.agent_tasks.tools import (BackendBoundaryError,
                                               IndexedMatch, Stage1Toolbox,
                                               ToolBoundaryError)
@@ -340,9 +341,13 @@ def test_max_output_tokens_checked_on_response(tokens, allowed):
 def test_model_loop_request_limit():
     script = Script(lambda: response(parts=[ToolCallPart("lookup_hcap", {})]))
     limits = RuntimeLimits(max_requests=2)
-    with pytest.raises(UsageLimitExceeded):
+    with pytest.raises(UsageLimitExceeded) as raised:
         script.runtime(limits=limits).run(runtime_request())
     assert len(script.calls) == 2
+    # What the failed run used stays on its exception.
+    usage = failure_usage(raised.value)
+    assert (usage.requests, usage.tool_calls) == (2, 2)
+    assert usage.output_tokens == 20
 
 
 def test_parallel_tool_batch_is_bounded_before_dispatch():
@@ -362,8 +367,20 @@ def test_stalled_model_has_a_deadline(scope):
 
     limits = RuntimeLimits(**{f"{scope}_timeout_seconds": 0.01})
     runtime = PydanticAIRuntime(lambda policy: FunctionModel(stalled), limits=limits)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError) as raised:
         runtime.run(runtime_request())
+    assert failure_usage(raised.value) is not None
+
+
+def test_failed_run_usage_reaches_the_sink(tmp_path):
+    script = Script(lambda: response(parts=[ToolCallPart("lookup_hcap", {})]))
+    sink = Sink()
+    executor = Stage1AgentExecutor(
+        script.runtime(limits=RuntimeLimits(max_requests=2)),
+        ArtifactStore(tmp_path / "artifacts"), lambda req: toolbox(), sink)
+    executor.start(request(AgentTask.CANDIDATE_ANALYSIS))
+    assert sink.failures[0][2].startswith("UsageLimitExceeded")
+    assert (sink.usage[0].requests, sink.usage[0].tool_calls) == (2, 2)
 
 
 def test_testmodel_is_usable_and_does_not_fabricate_identity():

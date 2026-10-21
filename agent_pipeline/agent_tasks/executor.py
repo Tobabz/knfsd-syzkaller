@@ -29,7 +29,7 @@ from .planning import (ExistingSeed, InlineProgram, Planned,
                        ReanalysisRequired as PlanningReanalysis,
                        Unsupported as PlanningUnsupported, completed_plan)
 from .runtime import (AgentRuntime, OutputRejected, RuntimeRequest,
-                      RuntimeResult)
+                      RuntimeResult, failure_usage)
 from .tools import (HcapSource, KernelSourceIndex, KnowledgeSource,
                     ProgramValidation, ProgramValidator, Stage1Toolbox,
                     _source_path)
@@ -129,7 +129,9 @@ class AgentResultSink(Protocol):
         """``usage`` is passed only when the runtime counted it."""
 
     def on_agent_failure(self, task_id: str, attempt: int,
-                         failure: str) -> None: ...
+                         failure: str, *,
+                         usage: AgentUsage | None = None) -> None:
+        """``usage`` is passed only when the failed run counted it."""
 
 
 class ToolboxFactory(Protocol):
@@ -247,8 +249,10 @@ class Stage1AgentExecutor:
                 raise ValueError(f"unsupported Agent Task: {request.agent_task}")
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"[:MAX_FAILURE_CHARS]
+            usage = failure_usage(exc)
+            extra = {} if usage is None else {"usage": usage}
             self.sink.on_agent_failure(request.task_id, request.attempt,
-                                       failure)
+                                       failure, **extra)
             return
         extra = {} if result.usage is None else {"usage": result.usage}
         self.sink.on_agent_result(request.task_id, request.attempt, output,

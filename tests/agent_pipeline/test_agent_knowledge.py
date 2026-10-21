@@ -144,7 +144,7 @@ class FakeKnowledge:
     def reference_programs(self, revision):
         return [ReferenceProgram(
             program_id="neutral:0", kind="neutral_control",
-            program_ref="r" * 64, runtime_selection={"profile": "p"},
+            program_ref="r" * 64, runtime_selections=({"profile": "p"},),
             required_capability_ids=("HCAP-01",))]
 
     def program_text(self, ref, max_bytes):
@@ -197,6 +197,7 @@ def test_reference_programs_list_and_read():
     tools = knowledge_toolbox()
     listed = tools.invoke("lookup_reference_programs", {})
     assert [p.program_id for p in listed.programs] == ["neutral:0"]
+    assert listed.programs[0].runtime_selections == ({"profile": "p"},)
     assert listed.text == ""
     read = tools.invoke("lookup_reference_programs",
                         {"program_id": "neutral:0"})
@@ -219,6 +220,37 @@ def test_artifact_knowledge_reads_only_hcap_selected_authorities(tmp_path):
                           hcap_revision=w.hcap_ref, knowledge=knowledge)
     with pytest.raises(BackendBoundaryError):
         tools.invoke("search_syzlang", {"query": "call"})
+
+
+def test_a_seed_lists_every_admitted_runtime_selection(tmp_path):
+    from agent_pipeline.data import load_record, put_record
+    from agent_pipeline.hcap import AuthorityRef, HcapCatalog
+    from agent_pipeline.materializer import (NormalFlowSeed,
+                                             NormalFlowSeedManifest)
+    from .test_materializer import materializer_world
+    w = materializer_world(tmp_path)
+    catalog = load_record(w.store, w.hcap_ref, HcapCatalog)
+    old_ref = next(ref.artifact_ref for ref in catalog.authority_refs
+                   if ref.kind == "NormalFlowSeedManifest")
+    manifest = load_record(w.store, old_ref, NormalFlowSeedManifest)
+    base = manifest.seeds[0].runtime_selections[0]
+    selections = tuple(sorted(
+        (base, base.model_copy(update={"nfs_version": "4.2"})),
+        key=lambda s: s.model_dump_json()))
+    seeds_ref = put_record(w.store, manifest.model_copy(update={"seeds": (
+        NormalFlowSeed(seed_id="seed-1", program_ref=w.scenario_ref,
+                       runtime_selections=selections),)}))
+    hcap_ref = put_record(w.store, catalog.model_copy(update={
+        "authority_refs": tuple(
+            AuthorityRef(kind=ref.kind, artifact_ref=seeds_ref)
+            if ref.kind == "NormalFlowSeedManifest" else ref
+            for ref in catalog.authority_refs)}))
+
+    seed = HarnessKnowledge(w.store).reference_programs(hcap_ref)[-1]
+    assert seed.program_id == "seed:seed-1"
+    assert [s["nfs_version"] for s in seed.runtime_selections] == \
+        [s.nfs_version for s in selections]
+    assert len(seed.runtime_selections) == 2
 
 
 def test_factory_binds_knowledge_to_stage1_tasks_only():
@@ -287,3 +319,41 @@ def test_controller_keeps_usage_on_the_attempt_only(world):
                             "test:fake", usage=usage)
     assert world.store.attempt(p.task_id, p.attempt).usage == usage
     assert world.c.replay(j) == world.job(j)
+
+
+def test_controller_keeps_failed_run_usage_on_the_attempt(world):
+    j = world.submit()
+    p = world.job(j).pending_task
+    usage = AgentUsage(requests=32, tool_calls=96, input_tokens=900,
+                       output_tokens=300)
+    world.c.on_agent_failure(p.task_id, p.attempt,
+                             "UsageLimitExceeded: request limit",
+                             usage=usage)
+    failed = world.store.attempt(p.task_id, p.attempt)
+    assert (failed.status, failed.usage) == ("failed", usage)
+    assert world.c.replay(j) == world.job(j)
+
+
+def test_queued_executor_delivers_failed_run_usage(tmp_path):
+    from agent_pipeline.agent_tasks.queued import QueuedAgentExecutor
+    from agent_pipeline.agent_tasks.runtime import attach_usage
+    from agent_pipeline.artifacts import ArtifactStore
+    from .test_agent_tasks import Sink, toolbox
+
+    usage = AgentUsage(requests=2, tool_calls=1, input_tokens=5,
+                       output_tokens=7)
+
+    class Failing:
+        def run(self, req):
+            exc = TimeoutError("run deadline")
+            attach_usage(exc, usage)
+            raise exc
+
+    sink = Sink()
+    agents = QueuedAgentExecutor(Failing(), ArtifactStore(tmp_path / "a"),
+                                 lambda req: toolbox(), sink)
+    agents.start(request(AgentTask.CANDIDATE_ANALYSIS))
+    assert agents.deliver(block=True, timeout=5) == 1
+    agents.close()
+    assert sink.failures[0][2] == "TimeoutError: run deadline"
+    assert sink.usage == [usage]

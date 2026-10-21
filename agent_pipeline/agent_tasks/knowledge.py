@@ -59,7 +59,8 @@ class ReferenceProgram:
     program_id: str
     kind: str
     program_ref: str
-    runtime_selection: dict
+    #: Every runtime selection the program is admitted for.
+    runtime_selections: tuple[dict, ...]
     required_capability_ids: tuple[str, ...]
 
 
@@ -247,8 +248,8 @@ class HarnessKnowledge:
                 out.append(ReferenceProgram(
                     program_id=f"neutral:{index}", kind="neutral_control",
                     program_ref=entry.program_ref,
-                    runtime_selection=entry.runtime_selection.model_dump(
-                        mode="json"),
+                    runtime_selections=(entry.runtime_selection.model_dump(
+                        mode="json"),),
                     required_capability_ids=tuple(
                         entry.required_capability_ids)))
         seeds = self._authority(catalog, "NormalFlowSeedManifest")
@@ -258,8 +259,9 @@ class HarnessKnowledge:
                 out.append(ReferenceProgram(
                     program_id=f"seed:{seed.seed_id}", kind="seed",
                     program_ref=seed.program_ref,
-                    runtime_selection=seed.runtime_selections[0].model_dump(
-                        mode="json"),
+                    runtime_selections=tuple(
+                        selection.model_dump(mode="json")
+                        for selection in seed.runtime_selections),
                     required_capability_ids=()))
         return out
 

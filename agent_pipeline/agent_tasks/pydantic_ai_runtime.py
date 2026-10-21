@@ -25,10 +25,11 @@ from pydantic_ai.messages import (ModelRequest, ModelResponse,  # noqa: E402
                                   RetryPromptPart, ToolCallPart)
 from pydantic_ai.models import Model  # noqa: E402
 from pydantic_ai.models.wrapper import WrapperModel  # noqa: E402
-from pydantic_ai.usage import UsageLimits  # noqa: E402
+from pydantic_ai.usage import RunUsage, UsageLimits  # noqa: E402
 
 from ..contracts import AgentModelPolicy, AgentUsage
-from .runtime import OutputRejected, RuntimeRequest, RuntimeResult
+from .runtime import (OutputRejected, RuntimeRequest, RuntimeResult,
+                      attach_usage)
 from .tools import (BackendBoundaryError, Stage1Toolbox, ToolBoundaryError,
                     known_tool_set)
 
@@ -61,6 +62,12 @@ class RuntimeLimits:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{name} must be finite and positive")
+
+
+def _agent_usage(usage: RunUsage) -> AgentUsage:
+    return AgentUsage(requests=usage.requests, tool_calls=usage.tool_calls,
+                      input_tokens=usage.input_tokens,
+                      output_tokens=usage.output_tokens)
 
 
 def _response_identity(response: ModelResponse) -> str:
@@ -213,26 +220,31 @@ class PydanticAIRuntime:
                     request.model_policy.provider == "openai":
                 settings["openai_reasoning_effort"] = \
                     request.model_policy.reasoning_effort
-            async with asyncio.timeout(self.limits.run_timeout_seconds):
-                result = await agent.run(
-                    request.prompt,
-                    model_settings=settings,
-                    usage_limits=UsageLimits(
-                        request_limit=self.limits.max_requests,
-                        tool_calls_limit=self.limits.max_tool_calls,
-                        output_tokens_limit=(self.limits.max_requests
-                                             * request.model_policy.max_output_tokens),
-                    ),
-                    infer_name=False,
-                )
-            usage = result.usage
+            # Caller-owned, so a run that fails (a limit, a deadline, a
+            # provider error) still reports what it used.
+            run_usage = RunUsage()
+            try:
+                async with asyncio.timeout(self.limits.run_timeout_seconds):
+                    result = await agent.run(
+                        request.prompt,
+                        model_settings=settings,
+                        usage_limits=UsageLimits(
+                            request_limit=self.limits.max_requests,
+                            tool_calls_limit=self.limits.max_tool_calls,
+                            output_tokens_limit=(
+                                self.limits.max_requests
+                                * request.model_policy.max_output_tokens),
+                        ),
+                        usage=run_usage,
+                        infer_name=False,
+                    )
+            except Exception as exc:
+                attach_usage(exc, _agent_usage(run_usage))
+                raise
             return RuntimeResult(
                 output=result.output.result,
                 model_id=_response_identity(result.response),
-                usage=AgentUsage(
-                    requests=usage.requests, tool_calls=usage.tool_calls,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens))
+                usage=_agent_usage(result.usage))
         finally:
             if client is not None:
                 await client.close()
