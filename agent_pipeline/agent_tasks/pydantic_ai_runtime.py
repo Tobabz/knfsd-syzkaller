@@ -27,10 +27,10 @@ from pydantic_ai.models import Model  # noqa: E402
 from pydantic_ai.models.wrapper import WrapperModel  # noqa: E402
 from pydantic_ai.usage import UsageLimits  # noqa: E402
 
-from ..contracts import AgentModelPolicy
+from ..contracts import AgentModelPolicy, AgentUsage
 from .runtime import OutputRejected, RuntimeRequest, RuntimeResult
-from .tools import (TOOL_DEFINITIONS, VALIDATE_PROGRAM_TOOL,
-                    BackendBoundaryError, Stage1Toolbox, ToolBoundaryError)
+from .tools import (BackendBoundaryError, Stage1Toolbox, ToolBoundaryError,
+                    known_tool_set)
 
 OUTPUT_TOOL = "stage1_result"
 ModelFactory = Callable[[AgentModelPolicy], Model]
@@ -44,10 +44,12 @@ class PydanticAIRuntimeError(RuntimeError):
 class RuntimeLimits:
     """Trusted host limits, independent of the Controller task retry budget."""
 
-    max_requests: int = 16
-    max_tool_calls: int = 32
-    request_timeout_seconds: float = 60
-    run_timeout_seconds: float = 300
+    # Sized for a Planning run that reads source and syzlang, then checks
+    # its draft with validate_program more than once (#75).
+    max_requests: int = 32
+    max_tool_calls: int = 96
+    request_timeout_seconds: float = 180
+    run_timeout_seconds: float = 1200
 
     def __post_init__(self) -> None:
         for name in ("max_requests", "max_tool_calls"):
@@ -156,8 +158,7 @@ class PydanticAIRuntime:
         return asyncio.run(self._run(request))
 
     async def _run(self, request: RuntimeRequest) -> RuntimeResult:
-        if request.tools.definitions not in (
-                TOOL_DEFINITIONS, TOOL_DEFINITIONS + (VALIDATE_PROGRAM_TOOL,)):
+        if not known_tool_set(request.tools.definitions):
             raise PydanticAIRuntimeError("unexpected Stage 1 tool definitions")
         if not isinstance(request.output_type, type) or not issubclass(
                 request.output_type, BaseModel):
@@ -203,14 +204,19 @@ class PydanticAIRuntime:
                 except (OutputRejected, ValidationError) as exc:
                     raise ModelRetry(str(exc)) from exc
 
+            settings = {
+                "max_tokens": request.model_policy.max_output_tokens,
+                "timeout": self.limits.request_timeout_seconds,
+                "parallel_tool_calls": False,
+            }
+            if request.model_policy.reasoning_effort is not None and \
+                    request.model_policy.provider == "openai":
+                settings["openai_reasoning_effort"] = \
+                    request.model_policy.reasoning_effort
             async with asyncio.timeout(self.limits.run_timeout_seconds):
                 result = await agent.run(
                     request.prompt,
-                    model_settings={
-                        "max_tokens": request.model_policy.max_output_tokens,
-                        "timeout": self.limits.request_timeout_seconds,
-                        "parallel_tool_calls": False,
-                    },
+                    model_settings=settings,
                     usage_limits=UsageLimits(
                         request_limit=self.limits.max_requests,
                         tool_calls_limit=self.limits.max_tool_calls,
@@ -219,8 +225,14 @@ class PydanticAIRuntime:
                     ),
                     infer_name=False,
                 )
-            return RuntimeResult(output=result.output.result,
-                                 model_id=_response_identity(result.response))
+            usage = result.usage
+            return RuntimeResult(
+                output=result.output.result,
+                model_id=_response_identity(result.response),
+                usage=AgentUsage(
+                    requests=usage.requests, tool_calls=usage.tool_calls,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens))
         finally:
             if client is not None:
                 await client.close()

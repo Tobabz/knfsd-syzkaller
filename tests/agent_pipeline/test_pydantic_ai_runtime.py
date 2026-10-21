@@ -526,3 +526,35 @@ def test_validate_program_tool_is_registered_and_dispatched():
     # The model is offered the eighth tool only when it is bound.
     assert "validate_program" in {t.name for t in
                                   script.calls[0][1].function_tools}
+
+
+@pytest.mark.parametrize(("provider", "effort", "expected"), [
+    ("openai", "high", "high"), ("openai", None, None),
+    ("other", "high", None)])
+def test_reasoning_effort_setting_and_usage(provider, effort, expected):
+    script = Script(response(parts=[ToolCallPart("lookup_hcap", {})]),
+                    response())
+    req = runtime_request()
+    req = replace(req, model_policy=req.model_policy.model_copy(update={
+        "provider": provider, "reasoning_effort": effort}))
+    result = script.runtime().run(req)
+    settings = script.calls[0][1].model_settings
+    assert settings.get("openai_reasoning_effort") == expected
+    assert (result.usage.requests, result.usage.tool_calls) == (2, 1)
+    assert result.usage.output_tokens == 20
+
+
+def test_knowledge_tools_are_offered_and_dispatched():
+    from .test_agent_knowledge import FakeKnowledge
+
+    tools = Stage1Toolbox(FakeSource(), FakeHcap(), kernel_commit="a" * 40,
+                          hcap_revision="b" * 64, knowledge=FakeKnowledge())
+    script = Script(response(parts=[ToolCallPart(
+        "search_syzlang", {"query": "call$two"})]), response())
+    script.runtime().run(runtime_request(tools=tools))
+    offered = {t.name for t in script.calls[0][1].function_tools}
+    assert {"search_syzlang", "read_syzlang", "read_harness_patch",
+            "lookup_reference_programs"} <= offered
+    returned = [p for m in script.calls[1][0] for p in m.parts
+                if isinstance(p, ToolReturnPart)]
+    assert returned[0].content.blocks[0].path == "sys/linux/a.txt"

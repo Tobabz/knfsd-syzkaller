@@ -19,7 +19,7 @@ from typing import Callable, Protocol
 
 from pydantic import BaseModel
 
-from ..contracts import AgentModelPolicy, AgentTask
+from ..contracts import AgentModelPolicy, AgentTask, AgentUsage
 from .tools import Stage1Toolbox
 
 class OutputRejected(ValueError):
@@ -43,6 +43,8 @@ class RuntimeResult:
     # Required response metadata from the provider.  It must not be filled
     # from model_policy when the provider omits it.
     model_id: str
+    #: What the run used, when the runtime counts it.
+    usage: AgentUsage | None = None
 
 
 class AgentRuntime(Protocol):

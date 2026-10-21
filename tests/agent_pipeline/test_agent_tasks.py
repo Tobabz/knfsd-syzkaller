@@ -220,9 +220,12 @@ class Sink:
     def __init__(self) -> None:
         self.results = []
         self.failures = []
+        self.usage = []
 
-    def on_agent_result(self, task_id, attempt, output, model_id):
+    def on_agent_result(self, task_id, attempt, output, model_id, *,
+                        usage=None):
         self.results.append((task_id, attempt, output, model_id))
+        self.usage.append(usage)
 
     def on_agent_failure(self, task_id, attempt, failure):
         self.failures.append((task_id, attempt, failure))

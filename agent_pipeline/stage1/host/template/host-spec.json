@@ -623,6 +623,28 @@
           "model": "gpt-5"
         }
       }
+    },
+    {
+      "policy_id": "kasan-agent-effort",
+      "sanitizer": "kasan",
+      "approval_required": false,
+      "stage1_repair_budget": 3,
+      "agent_retry_limit": 3,
+      "runtime_retry_limit": 3,
+      "stage1_agents": {
+        "candidate_analysis": {
+          "provider": "openai",
+          "model": "gpt-5",
+          "max_output_tokens": 32768,
+          "reasoning_effort": "medium"
+        },
+        "reachability_planning": {
+          "provider": "openai",
+          "model": "gpt-5",
+          "max_output_tokens": 32768,
+          "reasoning_effort": "high"
+        }
+      }
     }
   ],
   "engine": {

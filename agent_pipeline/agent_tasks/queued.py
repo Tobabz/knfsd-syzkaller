@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from ..artifacts import ArtifactStore
-from ..contracts import AgentOutput
+from ..contracts import AgentOutput, AgentUsage
 from ..controller.tasks import AgentRequest
 from .executor import (MAX_FAILURE_CHARS, AgentResultSink, Stage1AgentExecutor,
                        ToolboxFactory)
@@ -36,6 +36,7 @@ class _Result:
     output: AgentOutput | None = None
     model_id: str | None = None
     failure: str | None = None
+    usage: AgentUsage | None = None
 
 
 class _QueueSink:
@@ -43,9 +44,10 @@ class _QueueSink:
         self._results = results
 
     def on_agent_result(self, task_id: str, attempt: int,
-                        output: AgentOutput, model_id: str) -> None:
+                        output: AgentOutput, model_id: str, *,
+                        usage: AgentUsage | None = None) -> None:
         self._results.put(_Result(task_id, attempt, output=output,
-                                  model_id=model_id))
+                                  model_id=model_id, usage=usage))
 
     def on_agent_failure(self, task_id: str, attempt: int,
                          failure: str) -> None:
@@ -94,8 +96,9 @@ class QueuedAgentExecutor:
                     return delivered
             item = self._held
             if item.failure is None:
+                extra = {} if item.usage is None else {"usage": item.usage}
                 self.sink.on_agent_result(item.task_id, item.attempt,
-                                          item.output, item.model_id)
+                                          item.output, item.model_id, **extra)
             else:
                 self.sink.on_agent_failure(item.task_id, item.attempt,
                                            item.failure)

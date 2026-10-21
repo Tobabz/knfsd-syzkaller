@@ -11,7 +11,8 @@ from typing import Protocol, Sequence
 from pydantic import BaseModel
 
 from ..artifacts import ArtifactStore
-from ..contracts import (AgentOutput, AgentTask, AnalysisOutput, GapClass,
+from ..contracts import (AgentOutput, AgentTask, AgentUsage, AnalysisOutput,
+                         GapClass,
                          HarnessBinding, MaterializeRejected, PlanOutput,
                          Q1Result, Q1Status,
                          ReanalysisRequired as ControllerReanalysis,
@@ -29,8 +30,9 @@ from .planning import (ExistingSeed, InlineProgram, Planned,
                        Unsupported as PlanningUnsupported, completed_plan)
 from .runtime import (AgentRuntime, OutputRejected, RuntimeRequest,
                       RuntimeResult)
-from .tools import (HcapSource, KernelSourceIndex, ProgramValidation,
-                    ProgramValidator, Stage1Toolbox, _source_path)
+from .tools import (HcapSource, KernelSourceIndex, KnowledgeSource,
+                    ProgramValidation, ProgramValidator, Stage1Toolbox,
+                    _source_path)
 
 MAX_PROGRAM_BYTES = 256 * 1024
 MAX_FAILURE_CHARS = 2048
@@ -65,6 +67,11 @@ inline syz program text or a pinned existing seed; it never contains shell
 commands. If current capability is insufficient, return the controlled
 unsupported variant. Request reanalysis only for a wrong call/state path or
 missing state dependency. Do not claim materialization or Q1 success.
+
+The syzlang tools read the call descriptions of the pinned syzkaller build
+and lookup_reference_programs shows admitted programs with working lane
+setup; use them for call names, argument layout and syntax instead of
+guessing.
 
 Q1 accepts a plan only when one run of its single, non-threaded syz program
 puts a candidate target PC into the generation-attributed remote KCOV
@@ -117,7 +124,9 @@ the id empty when none fits and name the capability in the reason.\
 
 class AgentResultSink(Protocol):
     def on_agent_result(self, task_id: str, attempt: int,
-                        output: AgentOutput, model_id: str) -> None: ...
+                        output: AgentOutput, model_id: str, *,
+                        usage: AgentUsage | None = None) -> None:
+        """``usage`` is passed only when the runtime counted it."""
 
     def on_agent_failure(self, task_id: str, attempt: int,
                          failure: str) -> None: ...
@@ -138,24 +147,29 @@ class PinnedToolboxFactory:
 
     With a ``checker`` (the host Materializer), a Reachability Planning
     request whose job has a binding also gets ``validate_program``, bound
-    to that binding and the trusted request."""
+    to that binding and the trusted request.  With ``knowledge``, Stage 1
+    tasks also get the harness knowledge tools of their HCAP revision."""
 
     def __init__(self, source: KernelSourceIndex, hcap: HcapSource, *,
-                 checker: DraftChecker | None = None) -> None:
+                 checker: DraftChecker | None = None,
+                 knowledge: KnowledgeSource | None = None) -> None:
         self.source = source
         self.hcap = hcap
         self.checker = checker
+        self.knowledge = knowledge
 
     def __call__(self, request: AgentRequest) -> Stage1Toolbox:
         validator = None
         if self.checker is not None and request.binding is not None and \
                 request.agent_task is AgentTask.REACHABILITY_PLANNING:
             validator = draft_validator(self.checker, request)
+        stage1 = request.agent_task is not AgentTask.MUTATION_STRATEGY
         return Stage1Toolbox(
             self.source, self.hcap,
             kernel_commit=request.candidate.kernel_commit,
             hcap_revision=request.hcap_revision,
-            program_validator=validator)
+            program_validator=validator,
+            knowledge=self.knowledge if stage1 else None)
 
 
 def draft_validator(checker: DraftChecker, request: AgentRequest
@@ -236,8 +250,9 @@ class Stage1AgentExecutor:
             self.sink.on_agent_failure(request.task_id, request.attempt,
                                        failure)
             return
+        extra = {} if result.usage is None else {"usage": result.usage}
         self.sink.on_agent_result(request.task_id, request.attempt, output,
-                                  result.model_id)
+                                  result.model_id, **extra)
 
     def _run(self, request: AgentRequest, tools: Stage1Toolbox, *,
              instructions: str, prompt: str, output_type: type[BaseModel],
