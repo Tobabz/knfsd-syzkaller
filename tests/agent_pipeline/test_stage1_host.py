@@ -709,11 +709,16 @@ def test_template_spec_is_valid():
     assert [(c.kind, getattr(c, "minimum", None), getattr(c, "maximum", None))
             for c in lock.resource_constraints] == [
         ("resource_origin", None, None), ("integer_range", 5, 6)]
-    assert "remote_kcov.context.lockd" in spec.missing_capability_ids
+    # Kernel patch 0006 attributes the lockd thread grant and lockd rpciod
+    # calls: lockd is a supported context, not a missing capability.
+    assert "remote_kcov.context.lockd" not in spec.missing_capability_ids
+    assert "lockd" in spec.support_boundary.supported_contexts
+    assert "lockd" in {c.context for c in spec.judge_profile.contexts}
 
 
 def _hcap13_run(completed=3, **hits):
-    probes = dict.fromkeys(("clnt_grant", "svc_lock", "svc_share",
+    probes = dict.fromkeys(("clnt_grant", "svc_grant_blocked",
+                            "svc_grant_callback", "svc_lock", "svc_share",
                             "svc_testlock", "svc_unlock"), 0)
     probes.update(hits)
     return {
@@ -731,14 +736,16 @@ def _hcap13_evidence(identity, lane_sha256):
         "capability_id": "HCAP-13",
         "scenario": "v3-nlm-lock",
         "probe_mapping_sha256": {name: "1" * 64 for name in (
-            "clnt_grant", "svc_lock", "svc_share", "svc_testlock",
-            "svc_unlock")},
+            "clnt_grant", "svc_grant_blocked", "svc_grant_callback",
+            "svc_lock", "svc_share", "svc_testlock", "svc_unlock")},
         "runs": {
             "control": _hcap13_run(),
             "lock": _hcap13_run(svc_lock=2, svc_unlock=1, svc_testlock=1),
             "rpc": _hcap13_run(svc_lock=2, svc_unlock=1, svc_testlock=1,
                                svc_share=3),
-            "blocked": _hcap13_run(svc_lock=2, svc_unlock=1, clnt_grant=1),
+            "blocked": _hcap13_run(svc_lock=2, svc_unlock=1, clnt_grant=1,
+                                   svc_grant_blocked=4,
+                                   svc_grant_callback=2),
         },
     })
     return value
@@ -763,6 +770,12 @@ def test_hcap13_evidence_accepts_the_validated_campaign_shape():
      "rpc run missed svc_testlock"),
     (("runs", "blocked", "probe_hits", "clnt_grant"), [1, 0, 1],
      "blocked run missed clnt_grant"),
+    (("runs", "blocked", "probe_hits", "svc_grant_blocked"), [4, 4, 0],
+     "blocked run missed svc_grant_blocked"),
+    (("runs", "blocked", "probe_hits", "svc_grant_callback"), [0, 2, 2],
+     "blocked run missed svc_grant_callback"),
+    (("runs", "lock", "probe_hits", "svc_grant_blocked"), [0, 0, 1],
+     "lock run reached a grant callback"),
     (("runs", "blocked", "attributed_generations"), 2,
      "lacks one attributed generation"),
     (("runs", "rpc", "status_checks_passed"), 2,

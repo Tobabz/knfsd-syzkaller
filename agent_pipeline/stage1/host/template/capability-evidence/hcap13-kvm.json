@@ -3,23 +3,25 @@
   "capability_id": "HCAP-13",
   "observed_at": "2026-10-20",
   "scenario": "v3-nlm-lock",
-  "execution_harness_id": "c409b168712e633d60595e542de91a6317d5281dfac287d464a99a975575935a",
+  "execution_harness_id": "13c965c1dc8661616df0fdbc45b706383a82bab05ab79223afd5e4598827798d",
   "mapping_identity": {
-    "execution_harness_id": "c409b168712e633d60595e542de91a6317d5281dfac287d464a99a975575935a",
-    "kernel_commit": "2466d62694543c298439fa889d3a0343ce6104b0",
-    "instrumentation_sha256": "39af7062908470035491b54b1fad1cb6d952a09383b120c7f79e74246627f1fb",
-    "vmlinux_sha256": "38826e7d5d4b68a5b7c2114488157d8aeaa9f93656b6d397567034805467cd46",
+    "execution_harness_id": "13c965c1dc8661616df0fdbc45b706383a82bab05ab79223afd5e4598827798d",
+    "kernel_commit": "2add9323103abbd7f789ced96eaf7374d687fd0d",
+    "instrumentation_sha256": "e5a999b9c38ece4b9faa0a1f318735f9edb54a84acbfbfe0b44e68e468fe6ded",
+    "vmlinux_sha256": "822e7220f79a8c9fa308e1519d4545aae8fb9f7505535851849fd14c8c9fc1c2",
     "kaslr_enabled": false,
     "kaslr_offset": 0
   },
   "probe_mapping_sha256": {
-    "clnt_grant": "aaaf5ff2cbaf289e3ea01065b8768ba7c0ce08ad1d917e8e00ea214cb8fa8cdb",
-    "svc_lock": "abd5d78d939516ee31028406524cf4587c82be10586760ee089e0bcd1551f10c",
-    "svc_share": "72deac67c30ad7f0e265dfdf129a2267cb11078db0e1057af4e05655d00eb690",
-    "svc_testlock": "b71e0a5ffdab6547a624cdca1f3f473fa3d287ba088ec98b23c17ca0b9e0636b",
-    "svc_unlock": "1c49db8775e9832314f649098dadf9d1be06bcd7a5e528ee3478baac38b0e712"
+    "clnt_grant": "3cf3202372bf9647f4e49cf9969b1c90d0f2a9ea9f63c1afa54610ea6c5b676f",
+    "svc_grant_blocked": "37c2141e56246a3138bef5188631deb42d7f49f6d3d6a5e4acfab81719418199",
+    "svc_grant_callback": "3e1b3c87904bdc122baa77323ad85d5a868e88487a070c6009c6a935efca4961",
+    "svc_lock": "4c5567f2b4dc72ef0e97f0c5c7e6373c183811e914a6496f8d66237cb23d5143",
+    "svc_share": "5812944148c1f2f702b96a802c54335cc4fd5146e361f9544d7120627b1a70fb",
+    "svc_testlock": "247d780d16f5b529d772d6e6c4f089c680f6455d71c464670890b3c93aa4dd9e",
+    "svc_unlock": "794feeecf07b14d7f3f66e08c87ab15a2cc65bca07d9ca1bb2ea9839911938f4"
   },
-  "campaign_result_sha256": "ff426ccfd0d5055a4cfd19024b8eef07ddca69799727d7f93eb13535688fd6d3",
+  "campaign_result_sha256": "6ed8653ac75ce9dd863d6564dc793b9193f1c6a8a178d2867bf7bfae3dbd8034",
   "guest_lane_script_sha256": "318e79ea7d288e02efdfc357a26ddcff4f80cd6605fb50d4178e95bf2e89a104",
   "guest_nfs_proxy_sha256": "df9134f9432ae158cb4aa342925b4f5fefc12c022135744d9bb30a10d2369c36",
   "runs": {
@@ -27,6 +29,16 @@
       "completed": 3,
       "probe_hits": {
         "clnt_grant": [
+          0,
+          0,
+          0
+        ],
+        "svc_grant_blocked": [
+          0,
+          0,
+          0
+        ],
+        "svc_grant_callback": [
           0,
           0,
           0
@@ -63,10 +75,20 @@
           0,
           0
         ],
+        "svc_grant_blocked": [
+          0,
+          0,
+          0
+        ],
+        "svc_grant_callback": [
+          0,
+          0,
+          0
+        ],
         "svc_lock": [
-          26,
-          26,
-          26
+          28,
+          28,
+          28
         ],
         "svc_share": [
           0,
@@ -95,10 +117,20 @@
           0,
           0
         ],
+        "svc_grant_blocked": [
+          0,
+          0,
+          0
+        ],
+        "svc_grant_callback": [
+          0,
+          0,
+          0
+        ],
         "svc_lock": [
-          26,
-          26,
-          26
+          28,
+          28,
+          28
         ],
         "svc_share": [
           11,
@@ -127,10 +159,20 @@
           4,
           4
         ],
+        "svc_grant_blocked": [
+          8,
+          8,
+          8
+        ],
+        "svc_grant_callback": [
+          4,
+          4,
+          4
+        ],
         "svc_lock": [
-          27,
-          27,
-          27
+          29,
+          29,
+          29
         ],
         "svc_share": [
           0,

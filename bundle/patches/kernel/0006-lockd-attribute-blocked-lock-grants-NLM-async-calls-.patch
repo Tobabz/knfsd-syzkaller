@@ -1,0 +1,155 @@
+From d3c321fcce25e2bcfe75b588d22b0c8539d83ed9 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Tue, 20 Oct 2026 23:32:22 +0900
+Subject: [PATCH] lockd: attribute blocked-lock grants, NLM async calls and UDP
+ NLM
+
+Carry the blocked LOCK owner through the lockd grant and GRANTED_MSG callback, inherit the active request owner for async NLM replies, and attribute complete UDP records.
+
+Keep the owner immutable for the lifetime of the blocked lock. This avoids racing a lockd grant with replacement and refcount release while preserving the creator-program attribution.
+---
+ fs/lockd/clntproc.c  | 18 +++++++++++++++++-
+ fs/lockd/lockd.h     |  3 +++
+ fs/lockd/svclock.c   | 19 ++++++++++++++++++-
+ fs/lockd/svcproc.c   |  1 +
+ net/sunrpc/svcsock.c |  2 ++
+ 5 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/fs/lockd/clntproc.c b/fs/lockd/clntproc.c
+index f8018bfe9..f01e2f304 100644
+--- a/fs/lockd/clntproc.c
++++ b/fs/lockd/clntproc.c
+@@ -234,6 +234,7 @@ void nlmclnt_release_call(struct nlm_rqst *call)
+ 		nlmclnt_ops->nlmclnt_release_call(call->a_callback_data);
+ 	nlmclnt_release_host(call->a_host);
+ 	nlmclnt_release_lockargs(call);
++	sunrpc_fuzz_cb_owner_put(call->a_fuzz_owner);
+ 	kfree(call);
+ }
+ 
+@@ -343,6 +344,8 @@ nlmclnt_call(const struct cred *cred, struct nlm_rqst *req, u32 proc)
+ static struct rpc_task *__nlm_async_call(struct nlm_rqst *req, u32 proc, struct rpc_message *msg, const struct rpc_call_ops *tk_ops)
+ {
+ 	struct nlm_host	*host = req->a_host;
++	struct sunrpc_fuzz_cb_owner *fuzz_owner;
++	struct rpc_task *task;
+ 	struct rpc_clnt	*clnt;
+ 	struct rpc_task_setup task_setup_data = {
+ 		.rpc_message = msg,
+@@ -361,8 +364,21 @@ static struct rpc_task *__nlm_async_call(struct nlm_rqst *req, u32 proc, struct
+ 	msg->rpc_proc = &clnt->cl_procinfo[proc];
+ 	task_setup_data.rpc_client = clnt;
+ 
++	/*
++	 * rpciod runs this call for the program that caused it: the one
++	 * stored on @req (a blocked lock being granted), else the one whose
++	 * section the caller runs (a *_RES reply sent while serving *_MSG).
++	 */
++	fuzz_owner = sunrpc_fuzz_cb_owner_get(READ_ONCE(req->a_fuzz_owner));
++	if (!fuzz_owner)
++		fuzz_owner = sunrpc_fuzz_cb_owner_save_current(host->net,
++							       GFP_KERNEL);
++	task_setup_data.fuzz_owner = fuzz_owner;
++
+         /* bootstrap and kick off the async RPC call */
+-	return rpc_run_task(&task_setup_data);
++	task = rpc_run_task(&task_setup_data);
++	sunrpc_fuzz_cb_owner_put(fuzz_owner);
++	return task;
+ out_err:
+ 	tk_ops->rpc_release(req);
+ 	return ERR_PTR(-ENOLCK);
+diff --git a/fs/lockd/lockd.h b/fs/lockd/lockd.h
+index 14cc952fe..ca8890b28 100644
+--- a/fs/lockd/lockd.h
++++ b/fs/lockd/lockd.h
+@@ -19,6 +19,7 @@
+ #include "xdr.h"
+ #include <linux/sunrpc/debug.h>
+ #include <linux/sunrpc/svc.h>
++#include <linux/sunrpc/fuzz.h>
+ 
+ /*
+  * Enable lockd debugging.
+@@ -185,6 +186,8 @@ struct nlm_rqst {
+ 	unsigned int		a_retries;	/* Retry count */
+ 	u8			a_owner[NLMCLNT_OHSIZE];
+ 	void *	a_callback_data; /* sent to nlmclnt_operations callbacks */
++	/* Program behind the calls made with this request; NULL if none. */
++	struct sunrpc_fuzz_cb_owner *a_fuzz_owner;
+ };
+ 
+ struct lockd_share;
+diff --git a/fs/lockd/svclock.c b/fs/lockd/svclock.c
+index e628b5d35..715f0324e 100644
+--- a/fs/lockd/svclock.c
++++ b/fs/lockd/svclock.c
+@@ -230,6 +230,9 @@ nlmsvc_create_block(struct svc_rqst *rqstp, struct nlm_host *host,
+ 	block->b_call = call;
+ 	call->a_flags   = RPC_TASK_ASYNC;
+ 	call->a_block = block;
++	/* The program that created this block owns its grant and callback. */
++	call->a_fuzz_owner = sunrpc_fuzz_cb_owner_save_current(SVC_NET(rqstp),
++							      GFP_KERNEL);
+ 
+ 	return block;
+ 
+@@ -1011,6 +1014,8 @@ void
+ nlmsvc_retry_blocked(struct svc_rqst *rqstp)
+ {
+ 	unsigned long	timeout = MAX_SCHEDULE_TIMEOUT;
++	struct sunrpc_fuzz_cb_section fuzz_section;
++	struct sunrpc_fuzz_cb_owner *fuzz_owner;
+ 	struct nlm_block *block;
+ 
+ 	spin_lock(&nlm_blocked_lock);
+@@ -1031,8 +1036,20 @@ nlmsvc_retry_blocked(struct svc_rqst *rqstp)
+ 			dprintk("nlmsvc_retry_blocked delete block (%p, granted=%d, flags=%d)\n",
+ 				block, block->b_granted, block->b_flags);
+ 			retry_deferred_block(block);
+-		} else
++		} else {
++			/*
++			 * The grant runs in this thread outside any request:
++			 * run it for the program that sent the LOCK.  The
++			 * grant may drop the last block reference, so hold
++			 * the owner here.
++			 */
++			fuzz_owner = sunrpc_fuzz_cb_owner_get(
++				READ_ONCE(block->b_call->a_fuzz_owner));
++			sunrpc_fuzz_cb_section_start(fuzz_owner, &fuzz_section);
+ 			nlmsvc_grant_blocked(block);
++			sunrpc_fuzz_cb_section_stop(&fuzz_section);
++			sunrpc_fuzz_cb_owner_put(fuzz_owner);
++		}
+ 		spin_lock(&nlm_blocked_lock);
+ 	}
+ 	spin_unlock(&nlm_blocked_lock);
+diff --git a/fs/lockd/svcproc.c b/fs/lockd/svcproc.c
+index a8b5195c2..f7fc10063 100644
+--- a/fs/lockd/svcproc.c
++++ b/fs/lockd/svcproc.c
+@@ -555,6 +555,7 @@ void nlmsvc_release_call(struct nlm_rqst *call)
+ 	if (!refcount_dec_and_test(&call->a_count))
+ 		return;
+ 	nlmsvc_release_host(call->a_host);
++	sunrpc_fuzz_cb_owner_put(call->a_fuzz_owner);
+ 	kfree(call);
+ }
+ 
+diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
+index 4b26d8038..dae0b3624 100644
+--- a/net/sunrpc/svcsock.c
++++ b/net/sunrpc/svcsock.c
+@@ -705,6 +705,8 @@ static int svc_udp_recvfrom(struct svc_rqst *rqstp)
+ 	if (serv->sv_stats)
+ 		serv->sv_stats->netudpcnt++;
+ 
++	/* A datagram is a complete record: attribute it like a TCP record. */
++	sunrpc_fuzz_svc_record_received(&svsk->sk_xprt, rqstp);
+ 	svc_sock_secure_port(rqstp);
+ 	svc_xprt_received(rqstp->rq_xprt);
+ 	return len;
+-- 
+2.34.1
+

@@ -197,18 +197,19 @@ Q1AdmissibilityProfile               # Q1 JudgeProfile (01 §11.1)
 ~~~
 
 첫 버전의 boundary는 kernel patch 0002–0004와 `docs/design/decisions/2026-10-05-callback-attribution.md`를
-근거로 한다.
+근거로 한다. revision 2는 kernel patch 0006의 `lockd` context를 더한다(issue #72).
 
 ~~~text
 귀속 context
     request        lane server netns의 request 처리 (0002)
     async_copy     async COPY continuation (0003)
     callback_v41   NFSv4.1 server callback (0004). D6 제외: bc_close, bc_destroy, CB_NULL
+    lockd          lockd thread의 blocked lock grant, lockd async NLM 호출의 rpciod 단계 (0006)
 
 비귀속 context
     transport accept / pre-dispatch
     ownerless background work
-    client-side code
+    client-side code (kernel client가 syscall에서 보내는 async NLM 호출 포함)
     NFSv4.0 callback
 ~~~
 
