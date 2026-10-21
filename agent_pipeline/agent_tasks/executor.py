@@ -80,7 +80,15 @@ it on your complete draft before answering and fix every refusal it
 reports; it costs no repair attempt. In a repair, the previous plan, its
 program and the earlier attempts are shown with the Controller's findings.
 Change what those findings point at; do not resubmit a program an earlier
-attempt already tried unless the finding was about something else.\
+attempt already tried unless the finding was about something else.
+
+When you return unsupported, also return a proposal: the missing layer
+(equal to gap_class), the condition on the selected path that no promoted
+capability can create, kernel source evidence for it, why each promoted
+capability you considered cannot create it, the interface to add, and the
+KVM evidence that would promote it. A proposal never creates or promotes a
+capability. Return unsupported only when the source shows the condition is
+out of reach; a program that did not reach the target is not that proof.\
 """
 
 
@@ -349,10 +357,12 @@ class Stage1AgentExecutor:
             validate=validate)
         decision = validate(result.output).root
         if isinstance(decision, PlanningUnsupported):
+            proposal = None if decision.proposal is None else \
+                put_record(self.artifacts, decision.proposal)
             return result, UnsupportedOutput(
                 gap_class=decision.gap_class,
                 missing_capability_id=decision.missing_capability_id,
-                reason=decision.reason)
+                reason=decision.reason, proposal_ref=proposal)
         if isinstance(decision, PlanningReanalysis):
             return result, ControllerReanalysis(reason=decision.reason)
         if not isinstance(decision, Planned):

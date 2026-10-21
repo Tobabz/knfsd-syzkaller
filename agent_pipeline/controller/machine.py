@@ -124,6 +124,8 @@ class _Call:
     consumed: list[str] = field(default_factory=list)
     verdicts: list[Q1Result] = field(default_factory=list)
     abandoned: tuple[str, int] | None = None
+    #: The gap of this call's unsupported answer, which its proposal explains.
+    proposed_gap: GapRef | None = None
 
 
 class Machine:
@@ -202,6 +204,11 @@ class Machine:
                 return self._unexpected(c, here)
             gap = GapRef(gap_class=out.gap_class,
                          missing_capability_id=out.missing_capability_id)
+            # The latest answer's proposal, or none: never an older one.
+            j.gap_proposal_ref = out.proposal_ref
+            c.proposed_gap = gap
+            if out.proposal_ref is not None:
+                c.consumed.append(out.proposal_ref)
             if not out.missing_capability_id or \
                     not self.env.hcap.knows_capability(
                         j.binding.hcap_revision, out.missing_capability_id):
@@ -398,6 +405,7 @@ class Machine:
                 rematerialize_authority=rematerialize_authority,
                 authority_current=authority_current)
             j.gap = None
+            j.gap_proposal_ref = None
             j.resume_point = None
             c.reason = "rebind"
             self._goto(c, t)
@@ -769,6 +777,8 @@ class Machine:
             self._drop_task(c)
             j.state = JobState.BLOCKED_HARNESS_GAP
             j.state_reason = t.gap.gap_class.value
+            if t.gap != c.proposed_gap:
+                j.gap_proposal_ref = None
             j.gap = t.gap
             j.resume_point = t.inner
 
@@ -1124,6 +1134,7 @@ class Machine:
         j.state_reason = "rerun" if rerun else None
         j.resume_point = None
         j.gap = None
+        j.gap_proposal_ref = None
         return task_id
 
     def _enter_gate(self, c: _Call, rerun: bool, external: bool) -> None:
@@ -1515,6 +1526,7 @@ class Machine:
             j.state_reason = r.status
             j.resume_point = j.replay.resume
             j.gap = None
+            j.gap_proposal_ref = None
         else:
             self._unexpected(c, again)
         return True
@@ -1558,6 +1570,7 @@ class Machine:
         j.state_reason = repair.cause.value if repair else None
         j.resume_point = None
         j.gap = None
+        j.gap_proposal_ref = None
 
     def _enter_running(self, c: _Call, rerun: bool, external: bool) -> None:
         """Every entry into s1_running applies the approval policy of the
@@ -1598,6 +1611,7 @@ class Machine:
         j.state_reason = "rerun" if rerun else None
         j.resume_point = None
         j.gap = None
+        j.gap_proposal_ref = None
 
     def _drop_task(self, c: _Call) -> None:
         """The job will not take this task's result.  A Runner task is
