@@ -60,7 +60,10 @@ Controller on the thread that calls it.
 These are the defaults; the Stage 1 service takes them from
 `Stage1Config.agent_runtime`. A run's request, tool-call and token counts
 come back as `RuntimeResult.usage` and are kept on its `AgentAttempt`
-record, so the limits can be tuned from real runs.
+record, so the limits can be tuned from real runs. A run that fails (a
+request, tool-call or token limit, a deadline, a provider error) keeps what
+it used on its exception (`runtime.failure_usage`); the executor passes it
+to `on_agent_failure`, and the failed attempt keeps it too.
 
 `AgentModelPolicy.reasoning_effort`, when set, is sent to an OpenAI model as
 `openai_reasoning_effort`; unset leaves the provider default and is left out

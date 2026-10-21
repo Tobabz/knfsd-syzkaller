@@ -50,8 +50,10 @@ class _QueueSink:
                                   model_id=model_id, usage=usage))
 
     def on_agent_failure(self, task_id: str, attempt: int,
-                         failure: str) -> None:
-        self._results.put(_Result(task_id, attempt, failure=failure))
+                         failure: str, *,
+                         usage: AgentUsage | None = None) -> None:
+        self._results.put(_Result(task_id, attempt, failure=failure,
+                                  usage=usage))
 
 
 class QueuedAgentExecutor:
@@ -95,13 +97,13 @@ class QueuedAgentExecutor:
                 except queue.Empty:
                     return delivered
             item = self._held
+            extra = {} if item.usage is None else {"usage": item.usage}
             if item.failure is None:
-                extra = {} if item.usage is None else {"usage": item.usage}
                 self.sink.on_agent_result(item.task_id, item.attempt,
                                           item.output, item.model_id, **extra)
             else:
                 self.sink.on_agent_failure(item.task_id, item.attempt,
-                                           item.failure)
+                                           item.failure, **extra)
             self._held = None
             delivered += 1
 

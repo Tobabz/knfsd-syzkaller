@@ -227,8 +227,9 @@ class Sink:
         self.results.append((task_id, attempt, output, model_id))
         self.usage.append(usage)
 
-    def on_agent_failure(self, task_id, attempt, failure):
+    def on_agent_failure(self, task_id, attempt, failure, *, usage=None):
         self.failures.append((task_id, attempt, failure))
+        self.usage.append(usage)
 
 
 def request(task, *, analysis_ref=None, policy=None) -> AgentRequest:

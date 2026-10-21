@@ -17,13 +17,13 @@ class _ThreadSink(Sink):
         super().__init__()
         self.threads = []
 
-    def on_agent_result(self, *args):
+    def on_agent_result(self, *args, **kwargs):
         self.threads.append(threading.get_ident())
-        super().on_agent_result(*args)
+        super().on_agent_result(*args, **kwargs)
 
-    def on_agent_failure(self, *args):
+    def on_agent_failure(self, *args, **kwargs):
         self.threads.append(threading.get_ident())
-        super().on_agent_failure(*args)
+        super().on_agent_failure(*args, **kwargs)
 
 
 class _GatedRuntime:

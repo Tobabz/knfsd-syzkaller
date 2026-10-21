@@ -272,7 +272,7 @@ class HarnessPatch(Record):
 class ReferenceProgramInfo(Record):
     program_id: str
     kind: str
-    runtime_selection: dict
+    runtime_selections: tuple[dict, ...]
     required_capability_ids: tuple[str, ...]
 
 
@@ -791,7 +791,7 @@ class Stage1Toolbox:
             return ReferencePrograms(programs=tuple(
                 ReferenceProgramInfo(
                     program_id=item.program_id, kind=item.kind,
-                    runtime_selection=item.runtime_selection,
+                    runtime_selections=item.runtime_selections,
                     required_capability_ids=item.required_capability_ids)
                 for item in programs[:MAX_HCAP_LIST_ITEMS]),
                 truncated=len(programs) > MAX_HCAP_LIST_ITEMS)
