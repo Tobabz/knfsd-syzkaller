@@ -64,10 +64,12 @@ class RuntimeLimits:
                 raise ValueError(f"{name} must be finite and positive")
 
 
-def _agent_usage(usage: RunUsage) -> AgentUsage:
-    return AgentUsage(requests=usage.requests, tool_calls=usage.tool_calls,
-                      input_tokens=usage.input_tokens,
-                      output_tokens=usage.output_tokens)
+def _agent_usage(*usages: RunUsage) -> AgentUsage:
+    return AgentUsage(
+        requests=sum(u.requests for u in usages),
+        tool_calls=sum(u.tool_calls for u in usages),
+        input_tokens=sum(u.input_tokens for u in usages),
+        output_tokens=sum(u.output_tokens for u in usages))
 
 
 def _response_identity(response: ModelResponse) -> str:
@@ -92,6 +94,10 @@ class _ResponseGuard(WrapperModel):
         self.allowed_tools = frozenset(request.tools.names) | {OUTPUT_TOOL}
         self.limits = limits
         self.requests = 0
+        #: Responses received but refused here.  PydanticAI counts a
+        #: response only once the request returns it, so a refused one
+        #: never reaches the run's usage.
+        self.rejected = RunUsage()
 
     async def request(self, messages, model_settings, model_request_parameters):
         # PydanticAI has separate text-path and output-tool retry counters.
@@ -109,13 +115,19 @@ class _ResponseGuard(WrapperModel):
         async with asyncio.timeout(self.limits.request_timeout_seconds):
             response = await self.wrapped.request(
                 messages, model_settings, model_request_parameters)
-        _response_identity(response)
-        if response.usage.output_tokens > self.policy.max_output_tokens:
-            raise UsageLimitExceeded("response exceeds max_output_tokens")
-        for part in response.parts:
-            if isinstance(part, ToolCallPart) and part.tool_name not in self.allowed_tools:
-                raise PydanticAIRuntimeError(
-                    f"tool is not registered: {part.tool_name}")
+        try:
+            _response_identity(response)
+            if response.usage.output_tokens > self.policy.max_output_tokens:
+                raise UsageLimitExceeded("response exceeds max_output_tokens")
+            for part in response.parts:
+                if isinstance(part, ToolCallPart) and \
+                        part.tool_name not in self.allowed_tools:
+                    raise PydanticAIRuntimeError(
+                        f"tool is not registered: {part.tool_name}")
+        except Exception:
+            self.rejected.requests += 1
+            self.rejected.incr(response.usage)
+            raise
         return response
 
 
@@ -190,8 +202,9 @@ class PydanticAIRuntime:
             envelope = create_model(
                 "Stage1Response", result=(request.output_type, ...),
                 __config__=ConfigDict(extra="forbid"))
+            guard = _ResponseGuard(model, request, self.limits)
             agent = Agent(
-                _ResponseGuard(model, request, self.limits),
+                guard,
                 output_type=ToolOutput(envelope, name=OUTPUT_TOOL),
                 instructions=request.instructions, tools=tools,
                 retries={"tools": TOOL_RETRIES,
@@ -239,7 +252,7 @@ class PydanticAIRuntime:
                         infer_name=False,
                     )
             except Exception as exc:
-                attach_usage(exc, _agent_usage(run_usage))
+                attach_usage(exc, _agent_usage(run_usage, guard.rejected))
                 raise
             return RuntimeResult(
                 output=result.output.result,
