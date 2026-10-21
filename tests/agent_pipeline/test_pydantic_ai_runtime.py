@@ -338,6 +338,37 @@ def test_max_output_tokens_checked_on_response(tokens, allowed):
     assert len(script.calls) == 1
 
 
+def test_refused_response_usage_is_kept():
+    # One accepted 10-token response, then one refused at 257 tokens.
+    script = Script(response(parts=[ToolCallPart("lookup_hcap", {})]),
+                    response(tokens=257))
+    with pytest.raises(UsageLimitExceeded) as raised:
+        script.runtime().run(runtime_request(max_tokens=256))
+    usage = failure_usage(raised.value)
+    assert (usage.requests, usage.tool_calls, usage.output_tokens) == \
+        (2, 1, 267)
+
+    unknown = Script(response(parts=[ToolCallPart("not_a_tool", {})],
+                              tokens=7))
+    with pytest.raises(PydanticAIRuntimeError) as raised:
+        unknown.runtime().run(runtime_request())
+    usage = failure_usage(raised.value)
+    assert (usage.requests, usage.output_tokens) == (1, 7)
+
+
+def test_refused_response_usage_reaches_the_sink(tmp_path):
+    script = Script(response(tokens=8193))
+    sink = Sink()
+    Stage1AgentExecutor(script.runtime(), ArtifactStore(tmp_path / "a"),
+                        lambda req: toolbox(), sink).start(
+        request(AgentTask.CANDIDATE_ANALYSIS).model_copy(update={
+            "model_policy": request(AgentTask.CANDIDATE_ANALYSIS)
+            .model_policy.model_copy(update={"max_output_tokens": 8192})}))
+    assert sink.failures[0][2].startswith("UsageLimitExceeded")
+    assert (sink.usage[0].requests, sink.usage[0].output_tokens) == \
+        (1, 8193)
+
+
 def test_model_loop_request_limit():
     script = Script(lambda: response(parts=[ToolCallPart("lookup_hcap", {})]))
     limits = RuntimeLimits(max_requests=2)
