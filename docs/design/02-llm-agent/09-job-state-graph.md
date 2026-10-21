@@ -407,7 +407,8 @@ Task 입력 digest에 들어가지 않는다.
 Reachability Planning의 unsupported 출력은 `CapabilityProposal`을 함께 낼 수 있다(#75). 누락 계층(gap_class와
 같다), 선택 경로에서 만들어야 하는 조건, kernel source 근거, 검토한 promoted HCAP마다 부족한 이유, 추가할
 interface, 승격에 필요한 KVM 증거를 담는다. executor가 artifact로 저장하고 `UnsupportedOutput.proposal_ref`로
-넘기며, Controller는 `Job.gap_proposal_ref`에 남긴다(blocked_harness_gap이든 gap_id_unknown이든). 제안은 HCAP
+넘기며, Controller는 `Job.gap_proposal_ref`에 남긴다(blocked_harness_gap이든 gap_id_unknown이든). 값은 가장
+최근 unsupported 답의 제안이며(제안이 없으면 비운다), job의 gap이 지워지거나 다른 gap으로 바뀌면 함께 비운다. 제안은 HCAP
 항목을 만들거나 승격하지 않는다. 승격은 지금처럼 typed KVM 증거와 owner 승인이 필요하다.
 
 ### 8. 기록과 재시작

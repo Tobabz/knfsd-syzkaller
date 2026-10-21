@@ -327,8 +327,9 @@ class Job(BaseModel):
     state: JobState = JobState.SUBMITTED
     state_reason: str | None = None
     gap: GapRef | None = None
-    #: The CapabilityProposal of the job's last unsupported Planning
-    #: answer (#75), kept with the gap it explains.
+    #: The CapabilityProposal of the job's latest unsupported Planning
+    #: answer (#75), None when that answer had none.  Cleared with the gap
+    #: it explains, and when the job's gap becomes another one.
     gap_proposal_ref: str | None = None
     binding: HarnessBinding | None = None
     judge_versions: JudgeVersions | None = None

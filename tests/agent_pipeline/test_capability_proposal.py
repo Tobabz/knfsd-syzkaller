@@ -99,3 +99,51 @@ def test_controller_keeps_the_proposal_with_the_gap(world, capability,
     if state is JobState.BLOCKED_OPERATOR:
         assert job.state_reason == BlockedReason.GAP_ID_UNKNOWN.value
     assert world.c.replay(j) == job
+
+
+def unsupported_answer(capability, proposal_ref=None):
+    return UnsupportedOutput(
+        gap_class=GapClass.SYZLANG, missing_capability_id=capability,
+        reason="r", proposal_ref=proposal_ref)
+
+
+def test_the_proposal_follows_the_latest_answer_and_its_gap(world):
+    j = world.submit()
+    world.analysis(j)
+    world.agent_ok(j, unsupported_answer("syzlang.nfs4.op_lock",
+                                         sha("proposal-1")))
+    gap = world.job(j).gap
+    assert world.job(j).gap_proposal_ref == sha("proposal-1")
+
+    # Resolving the gap clears it and its proposal; Planning runs again.
+    world.c.on_issue(gap, "resolved")
+    job = world.job(j)
+    assert job.state is JobState.S1_PLANNING
+    assert (job.gap, job.gap_proposal_ref) == (None, None)
+
+    # A later answer without a proposal never keeps an older one.
+    world.agent_ok(j, unsupported_answer("syzlang.nfs4.op_lock",
+                                         sha("proposal-2")))
+    world.c.on_issue(world.job(j).gap, "resolved")
+    world.agent_ok(j, unsupported_answer("syzlang.new_thing"))
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.gap_proposal_ref is None
+    assert world.c.replay(j) == job
+
+
+def test_a_different_gap_answer_replaces_the_proposal(world):
+    j = world.submit()
+    world.analysis(j)
+    world.agent_ok(j, unsupported_answer("syzlang.new_thing",
+                                         sha("proposal-1")))
+    assert world.job(j).state is JobState.BLOCKED_OPERATOR
+    world.c.operator(j, "resume")
+    assert world.job(j).state is JobState.S1_PLANNING
+    assert world.job(j).gap_proposal_ref is None
+    world.agent_ok(j, unsupported_answer("syzlang.nfs4.op_lock"))
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_HARNESS_GAP
+    assert job.gap.missing_capability_id == "syzlang.nfs4.op_lock"
+    assert job.gap_proposal_ref is None
+    assert world.c.replay(j) == job
