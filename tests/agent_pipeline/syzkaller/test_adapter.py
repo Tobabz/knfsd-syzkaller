@@ -78,6 +78,41 @@ def test_cld_control_preserves_nfs_provenance(parser, identity):
     assert facts.origins[0].origin == "nfs-profile:knfsd-v41:client0"
 
 
+@pytest.mark.parametrize("scenario,call_count,field", [
+    ("lock", 7, "flock"),
+    ("rpc", 17, "nlm_rpc"),
+    ("blocked", 16, "timespec"),
+])
+def test_nlm_fixture_facts_survive_pinned_parser(parser, identity, scenario,
+                                                  call_count, field):
+    source = (Path(__file__).parents[3] / "tools" / "nfs-lifecycle" / "programs"
+              / f"v3-nlm-{scenario}.prog").read_bytes()
+    result = parser.parse(source, identity=identity)
+    assert len(result.calls) == call_count
+    assert any(getattr(call.resource_facts, field) is not None
+               for call in result.calls)
+    for call in result.calls:
+        fact = getattr(call.resource_facts, field)
+        if fact is not None:
+            assert fact.argument_index < 4096
+
+
+def test_nlm_blocked_fixture_preserves_typed_rpc_and_flock(parser, identity):
+    source = (Path(__file__).parents[3] / "tools" / "nfs-lifecycle" / "programs"
+              / "v3-nlm-blocked.prog").read_bytes()
+    result = parser.parse(source, identity=identity)
+    rpc = [call.resource_facts.nlm_rpc for call in result.calls
+           if call.resource_facts.nlm_rpc is not None]
+    locks = [call.resource_facts.flock for call in result.calls
+             if call.resource_facts.flock is not None]
+    waits = [call.resource_facts.timespec for call in result.calls
+             if call.resource_facts.timespec is not None]
+    assert any(fact.version == 4 and fact.procedure == 2 and fact.block == 1
+               for fact in rpc)
+    assert {fact.lock_type for fact in locks} == {1, 2}
+    assert [(fact.seconds, fact.nanoseconds) for fact in waits] == [(1, 0)]
+
+
 def test_cld_control_operation_is_fixed_by_variant(parser, identity):
     # The operation is a const in each variant: syzkaller normalizes a
     # mismatching literal back to the variant's operation instead of

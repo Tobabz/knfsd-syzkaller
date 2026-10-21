@@ -230,12 +230,37 @@ class ByteLengthFact(AuthorityRecord):
     length_bytes: int = Field(ge=0)
 
 
+class FlockFact(AuthorityRecord):
+    argument_index: int = Field(ge=0, le=4095)
+    lock_type: int = Field(ge=0, le=2**64 - 1)
+
+
+class NlmRpcFact(AuthorityRecord):
+    argument_index: int = Field(ge=0, le=4095)
+    version: int = Field(ge=0, le=2**64 - 1)
+    procedure: int = Field(ge=0, le=2**64 - 1)
+    block: int | None = Field(default=None, ge=0, le=2**64 - 1,
+                              exclude_if=lambda value: value is None)
+
+
+class TimespecFact(AuthorityRecord):
+    argument_index: int = Field(ge=0, le=4095)
+    seconds: int = Field(ge=0, le=2**64 - 1)
+    nanoseconds: int = Field(ge=0, le=2**64 - 1)
+
+
 class CallResourceFacts(AuthorityRecord):
     """Facts extracted by a pinned syz parser for one concrete call."""
 
     origins: tuple[ResourceOriginFact, ...] = ()
     integers: tuple[IntegerFact, ...] = ()
     byte_lengths: tuple[ByteLengthFact, ...] = ()
+    flock: FlockFact | None = Field(default=None,
+                                   exclude_if=lambda value: value is None)
+    nlm_rpc: NlmRpcFact | None = Field(default=None,
+                                      exclude_if=lambda value: value is None)
+    timespec: TimespecFact | None = Field(default=None,
+                                         exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _shape(self) -> CallResourceFacts:
