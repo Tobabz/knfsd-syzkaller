@@ -129,6 +129,21 @@ def test_optional_nlm_facts_are_strict_and_canonical():
         TimespecFact(argument_index=0, seconds=-1, nanoseconds=0)
 
 
+@pytest.mark.parametrize("field", ("flock", "nlm_rpc", "timespec"))
+def test_optional_nlm_facts_reject_explicit_null(field):
+    with pytest.raises(ValidationError, match="omitted instead of null"):
+        CallResourceFacts.model_validate_json(canonical_json({
+            "origins": [], "integers": [], "byte_lengths": [], field: None,
+        }))
+
+
+def test_nlm_rpc_block_rejects_explicit_null():
+    with pytest.raises(ValidationError, match="omitted instead of null"):
+        NlmRpcFact.model_validate_json(canonical_json({
+            "argument_index": 1, "version": 4, "procedure": 2, "block": None,
+        }))
+
+
 @pytest.fixture
 def authority(tmp_path):
     store = ArtifactStore(tmp_path / "cas")

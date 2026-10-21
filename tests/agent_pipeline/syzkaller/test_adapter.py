@@ -1,6 +1,7 @@
 """Real bridge tests: set KNFSD_SYZ_BUNDLE to build.py's bundle directory."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -21,7 +22,14 @@ def bundle():
     value = os.environ.get("KNFSD_SYZ_BUNDLE")
     if not value:
         pytest.skip("build the pinned Go bridge and set KNFSD_SYZ_BUNDLE")
-    return Path(value)
+    root = Path(value)
+    provenance = json.loads((root / "provenance.json").read_bytes())
+    sources = provenance["bridge_sources"]
+    for name in ("bridge.go", "facts.go"):
+        current = Path(__file__).parents[3] / "tools" / "syzkaller" / name
+        assert sources[name] == hashlib.sha256(current.read_bytes()).hexdigest(), (
+            f"bundle {name} differs from the checked-in source")
+    return root
 
 
 @pytest.fixture(scope="module")

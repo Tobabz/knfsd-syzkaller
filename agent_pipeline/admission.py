@@ -242,6 +242,12 @@ class NlmRpcFact(AuthorityRecord):
     block: int | None = Field(default=None, ge=0, le=2**64 - 1,
                               exclude_if=lambda value: value is None)
 
+    @model_validator(mode="after")
+    def _no_null_block(self):
+        if "block" in self.model_fields_set and self.block is None:
+            raise ValueError("block must be omitted instead of null")
+        return self
+
 
 class TimespecFact(AuthorityRecord):
     argument_index: int = Field(ge=0, le=4095)
@@ -261,6 +267,13 @@ class CallResourceFacts(AuthorityRecord):
                                       exclude_if=lambda value: value is None)
     timespec: TimespecFact | None = Field(default=None,
                                          exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def _no_null_facts(self):
+        if any(name in self.model_fields_set and getattr(self, name) is None
+                for name in ("flock", "nlm_rpc", "timespec")):
+            raise ValueError("optional fact must be omitted instead of null")
+        return self
 
     @model_validator(mode="after")
     def _shape(self) -> CallResourceFacts:
