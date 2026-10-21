@@ -165,8 +165,12 @@ class Stage1Service:
         # The Controller is the executor's sink, and the executor is the
         # Controller's Agent executor: bind the sink after both exist.
         if parts.run_agents:
+            # validate_program needs the Materializer's draft check; a
+            # Materializer without one leaves the seven read-only tools.
             tools = parts.tools or PinnedToolboxFactory(
-                _source_index(parts.tree), _hcap_source(hcap))
+                _source_index(parts.tree), _hcap_source(hcap),
+                checker=parts.materializer
+                if hasattr(parts.materializer, "check_draft") else None)
             self.agents = QueuedAgentExecutor(
                 parts.runtime, self.artifacts, tools, sink=None,
                 max_workers=parts.agent_workers)

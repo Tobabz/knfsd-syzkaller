@@ -393,6 +393,17 @@ RepairInput
 Agent는 이 입력을 받아 §2의 variant 중 하나를 출력한다. 봉인 bundle 안의 문자열(console log, program text 등)은
 guest에서 온 untrusted data이며 지시로 읽지 않는다.
 
+Materializer 거부의 findings는 `(reason, detail)`에, strict parse 실패면 pinned parser의 진단 문장(한 줄,
+1024자 이하)을 세 번째 항목으로 더한다. `detail`은 안정된 code로 남는다.
+
+Agent executor는 Stage 1 repair 프롬프트에 RepairInput 외에 다음을 함께 넣는다(#75). 모두 context이며 Agent
+Task 입력 digest에 들어가지 않는다.
+
+- 수리 대상인 직전 ReachabilityPlan과 그 syz program 원문(64 KiB까지).
+- 같은 job의 이전 Stage 1 repair마다 cause, findings, 그 계획의 program digest. 같은 program을 다시 낸 시도는
+  표시한다. Controller가 `AgentRequest.prior_repairs`로 저장된 RepairInput을 넘긴다.
+- `q1_not_reached`이면 Q1Result가 뜻하는 바를 풀어 쓴 문장. PC, coverage, 위치 정보는 더하지 않는다.
+
 ### 8. 기록과 재시작
 
 ```text

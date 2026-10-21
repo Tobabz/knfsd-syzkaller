@@ -8,17 +8,21 @@ rejected.  Result counts, snippets and source excerpts are bounded before
 they cross the runtime boundary.
 
 There is deliberately no generic filesystem, shell, process, write,
-artifact-by-path or network tool here.
+artifact-by-path or network tool here.  The one check tool,
+``validate_program``, runs the host's deterministic, side-effect-free plan
+checks (pinned parser, call admission, HCAP) on a draft; it writes nothing
+and is never a verdict.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Literal, Protocol, Sequence
+from typing import Callable, Literal, Protocol, Sequence
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from ..contracts import Record
 from ..hcap import ArtifactHcapChecker, HcapCatalog
@@ -29,6 +33,7 @@ from ..protocol_schema import (SN_DISCRIMINANT, SN_LIST_ELEMENT,
 from ..semantic_promotion import (PromotedSemanticCapabilityRegistry,
                                   promoted_registry)
 from ..intake import ANALYSIS_ROOTS, in_analysis_roots, line_count
+from .planning import ReachabilityPlanDraft
 
 SOURCE_PREFIXES = ANALYSIS_ROOTS
 MAX_SOURCE_LINES = 400
@@ -41,6 +46,7 @@ MAX_HCAP_TEXT_BYTES = 1024
 MAX_SEMANTIC_PATH_RESULTS = 32
 MAX_SEMANTIC_PATH_SCAN = 4096
 MAX_SEMANTIC_PATH_DEPTH = 64
+MAX_VALIDATION_TEXT_BYTES = 2048
 
 
 class ToolBoundaryError(ValueError):
@@ -177,6 +183,29 @@ class SemanticPathLookupArgs(ToolArgs):
                               pattern=r"\S")
     max_results: int = Field(default=MAX_SEMANTIC_PATH_RESULTS, ge=1,
                              le=MAX_SEMANTIC_PATH_RESULTS)
+
+
+class ValidateProgramArgs(ToolArgs):
+    plan: ReachabilityPlanDraft
+
+
+class ProgramValidation(Record):
+    """What the host's plan checks say about a draft.  ``accepted`` means
+    only that materialization would accept it now; Q1 decides reachability.
+    ``stage`` names the check that refused: schema (the draft itself),
+    request (it disagrees with the trusted task), materializer (HCAP, parse
+    or call admission) or host (the check could not run)."""
+
+    accepted: bool
+    stage: Literal["schema", "request", "materializer", "host"] | None = None
+    reason: str | None = None
+    detail: str = ""
+    message: str = ""
+
+
+#: Runs the host checks on a draft; bound by the toolbox factory to one
+#: task's binding and trusted request.
+ProgramValidator = Callable[[ReachabilityPlanDraft], ProgramValidation]
 
 
 class SourceExcerpt(Record):
@@ -333,6 +362,15 @@ TOOL_DEFINITIONS = (
         SemanticPathLookupArgs),
 )
 
+VALIDATE_PROGRAM_TOOL = ToolDefinition(
+    "validate_program",
+    "Check a complete ReachabilityPlanDraft with the host's pinned syz "
+    "parser, call admission and HCAP plan check, exactly as the "
+    "Materializer will after you answer. Costs no repair attempt and "
+    "stores nothing. Returns accepted, or the refusing check with its "
+    "reason, detail and parser message. Acceptance is not a Q1 verdict.",
+    ValidateProgramArgs)
+
 
 def _bounded(value: str, limit: int) -> tuple[str, bool]:
     encoded = value.encode("utf-8")
@@ -471,28 +509,35 @@ def _roots(path_prefix: str | None) -> tuple[str, ...]:
 
 
 class Stage1Toolbox:
-    """Pinned dispatcher containing exactly seven read-only tools."""
+    """Pinned dispatcher containing seven read-only tools, plus
+    ``validate_program`` when the factory binds a program validator."""
 
     def __init__(self, source: KernelSourceIndex, hcap: HcapSource, *,
-                 kernel_commit: str, hcap_revision: str) -> None:
+                 kernel_commit: str, hcap_revision: str,
+                 program_validator: ProgramValidator | None = None) -> None:
         self._source = source
         self._hcap = hcap
         self._commit = kernel_commit
         self._hcap_revision = hcap_revision
-        self._definitions = {item.name: item for item in TOOL_DEFINITIONS}
+        self._validator = program_validator
+        self._all = TOOL_DEFINITIONS if program_validator is None else \
+            TOOL_DEFINITIONS + (VALIDATE_PROGRAM_TOOL,)
+        self._definitions = {item.name: item for item in self._all}
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        return TOOL_DEFINITIONS
+        return self._all
 
     @property
     def names(self) -> tuple[str, ...]:
-        return tuple(item.name for item in TOOL_DEFINITIONS)
+        return tuple(item.name for item in self._all)
 
     def invoke(self, name: str, arguments: dict) -> Record:
         definition = self._definitions.get(name)
         if definition is None:
             raise ToolBoundaryError(f"tool is not registered: {name}")
+        if definition is VALIDATE_PROGRAM_TOOL:
+            return self._validate_program(arguments)
         parsed = definition.arguments.model_validate(arguments)
         if isinstance(parsed, ReadSourceArgs):
             return self._read(parsed)
@@ -509,6 +554,27 @@ class Stage1Toolbox:
         if isinstance(parsed, SemanticPathLookupArgs):
             return self._lookup_semantic_paths(parsed)
         raise AssertionError("unhandled Stage 1 tool arguments")
+
+    def _validate_program(self, arguments: dict) -> ProgramValidation:
+        # A draft that fails its own schema is an answer here, not a tool
+        # call mistake: the model is asking exactly that question.
+        # Records are strict in Python mode; tool arguments arrive as JSON.
+        try:
+            args = ValidateProgramArgs.model_validate_json(
+                json.dumps(arguments))
+        except (ValidationError, TypeError, ValueError) as exc:
+            text, _ = _bounded(str(exc), MAX_VALIDATION_TEXT_BYTES)
+            return ProgramValidation(accepted=False, stage="schema",
+                                     reason="draft_schema_invalid",
+                                     message=text)
+        result = self._validator(args.plan)
+        if not isinstance(result, ProgramValidation):
+            raise BackendBoundaryError("program validator answered outside "
+                                       "its contract")
+        detail, _ = _bounded(result.detail, MAX_VALIDATION_TEXT_BYTES)
+        message, _ = _bounded(result.message, MAX_VALIDATION_TEXT_BYTES)
+        return result.model_copy(update={"detail": detail,
+                                         "message": message})
 
     def _read(self, args: ReadSourceArgs) -> SourceExcerpt:
         path = _source_path(args.path)

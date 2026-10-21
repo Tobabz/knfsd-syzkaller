@@ -29,8 +29,8 @@ from pydantic_ai.usage import UsageLimits  # noqa: E402
 
 from ..contracts import AgentModelPolicy
 from .runtime import OutputRejected, RuntimeRequest, RuntimeResult
-from .tools import (TOOL_DEFINITIONS, BackendBoundaryError, Stage1Toolbox,
-                    ToolBoundaryError)
+from .tools import (TOOL_DEFINITIONS, VALIDATE_PROGRAM_TOOL,
+                    BackendBoundaryError, Stage1Toolbox, ToolBoundaryError)
 
 OUTPUT_TOOL = "stage1_result"
 ModelFactory = Callable[[AgentModelPolicy], Model]
@@ -156,7 +156,8 @@ class PydanticAIRuntime:
         return asyncio.run(self._run(request))
 
     async def _run(self, request: RuntimeRequest) -> RuntimeResult:
-        if request.tools.definitions != TOOL_DEFINITIONS:
+        if request.tools.definitions not in (
+                TOOL_DEFINITIONS, TOOL_DEFINITIONS + (VALIDATE_PROGRAM_TOOL,)):
             raise PydanticAIRuntimeError("unexpected Stage 1 tool definitions")
         if not isinstance(request.output_type, type) or not issubclass(
                 request.output_type, BaseModel):

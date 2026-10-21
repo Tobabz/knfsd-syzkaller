@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Literal, Protocol
 
-from ..contracts import (AgentModelPolicy, AgentTask, Record,
+from ..contracts import (AgentModelPolicy, AgentTask, HarnessBinding, Record,
                          VulnerabilityCandidate)
 from ..data import canonical_json
 # RunnerInput lives with the job records, which store a Stage 2 task's
@@ -144,6 +144,12 @@ class AgentRequest(Record):
     #: the rule set it replaces.
     stage2_input: Stage2Input | None = None
     rule_set_ref: str | None = None
+    #: Context only, outside the task's input digest.  The stored
+    #: RepairInputs of the job's earlier Stage 1 repairs, oldest first,
+    #: so a repair can see what was tried before; and the job's binding,
+    #: which a read-only program check during the run needs.
+    prior_repairs: tuple[str, ...] = ()
+    binding: HarnessBinding | None = None
 
 
 class AgentExecutor(Protocol):

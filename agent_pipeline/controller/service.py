@@ -24,8 +24,8 @@ from ..contracts import (AgentOutput, AgentTask, CandidateSubmission, GapRef,
 from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
 from .machine import Env, Machine, Outcome, harness_authority_stale
-from .records import (TERMINAL, AgentAttempt, Job, JobState, TaskKind,
-                      Transition)
+from .records import (TERMINAL, AgentAttempt, Job, JobState, RepairInput,
+                      TaskKind, Transition)
 from .store import StaleIssueEvent, Store
 from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
                     RunnerInput,
@@ -582,7 +582,8 @@ class Controller:
                 model_policy=model_policy,
                 hcap_revision=job.binding.hcap_revision,
                 analysis_ref=job.analysis_ref, plan_ref=job.plan_ref,
-                repair=p.repair,
+                repair=p.repair, binding=job.binding,
+                prior_repairs=self._prior_repairs(job_id, p),
                 **(dict(stage2_input=job.stage2_basis,
                         rule_set_ref=job.rule_set_ref)
                    if p.agent_task is AgentTask.MUTATION_STRATEGY else {})))
@@ -602,6 +603,27 @@ class Controller:
                     job_id=job_id, harness_ref=job.harness.harness_ref,
                     execution_harness_id=job.harness.execution_harness_id))
             self._take_status(job_id, p.task_id, st)
+
+    def _prior_repairs(self, job_id: str, p) -> tuple[str, ...]:
+        """The stored RepairInputs of the job's earlier Stage 1 repairs,
+        ordered by repair count, without the one this attempt carries.  A
+        restarted attempt of the same task stores the same RepairInput, so
+        each appears once."""
+        if p.repair is None or p.agent_task is AgentTask.MUTATION_STRATEGY:
+            return ()
+        current = self.artifacts.put(p.repair.model_dump_json().encode())
+        seen: dict[str, int] = {}
+        for a in self.store.attempts(job_id):
+            ref = a.repair_input_digest
+            if ref is None or ref == current or ref in seen or \
+                    a.agent_task is AgentTask.MUTATION_STRATEGY:
+                continue
+            try:
+                seen[ref] = RepairInput.model_validate_json(
+                    self.artifacts.get(ref)).attempt
+            except (OSError, ValueError):
+                continue        # context only: a lost record is skipped
+        return tuple(sorted(seen, key=seen.get))
 
     @staticmethod
     def _runner_input(job: Job) -> RunnerInput:
