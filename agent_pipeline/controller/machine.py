@@ -823,7 +823,8 @@ class Machine:
             return Target(kind=TargetKind.PLANNING,
                           cause=failure_cause or
                           RepairCause.MATERIALIZER_REJECTED,
-                          findings=(m.reason, m.detail))
+                          findings=(m.reason, m.detail) +
+                          ((m.message,) if m.message else ()))
         if m.execution_harness_id != j.binding.execution_harness_id or \
                 m.hcap_revision != j.binding.hcap_revision:
             return self._unexpected_target(TargetKind.MATERIALIZE)
