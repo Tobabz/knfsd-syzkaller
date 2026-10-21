@@ -86,5 +86,9 @@ jobs:
           go test ./pkg/flatrpc/
           go test ./executor/ -run 'NfsProxy|Generation|FixedLane'
           # S1c: the crash log keeps each record's lane and barrier (0024).
-          go test ./pkg/rpcserver/ -run 'LastExecuting|NfsProxy|PrependExecuting'
+          go test ./pkg/rpcserver/ -run 'LastExecuting|NfsProxy|PrependExecuting|ProgramTimeout'
+          # A program longer than the slowdown default keeps its remote
+          # coverage only with -program-timeout (0029).
+          go test ./pkg/runtest/ -run 'ProgramTimeout'
+          go test ./tools/syz-execprog/
           go test ./pkg/mgrconfig/

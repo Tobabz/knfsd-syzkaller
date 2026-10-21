@@ -9,7 +9,9 @@ the model responses and the syzkaller parser.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import runpy
 import shutil
 import subprocess
@@ -40,7 +42,8 @@ from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   guest_cmdline)
 from agent_pipeline.stage1.host.generate import (GenerationError,
                                                  HCAP11_RECOVERY_ORDER,
-                                                 Hcap11KvmEvidence, generate,
+                                                 Hcap11KvmEvidence, Hcap12KvmEvidence,
+                                                 generate,
                                                  series_fingerprint)
 from agent_pipeline.stage1.host.target_pcs import (CallbackSites,
                                                    build_mapping, check_pcs,
@@ -456,6 +459,162 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         generate(host.spec)
 
 
+def _hcap12_run(completed=3, *, create=1, error=0, wait=0, **broker):
+    counters = dict.fromkeys((
+        "reconnect_ok", "reconnect_fail", "down_ok", "down_fail",
+        "daemon_stop_fail", "daemon_start_fail", "refused_busy",
+        "refused_identity", "restore_ok", "restore_fail"), 0)
+    counters.update(broker)
+    return {
+        "completed": completed,
+        "probe_hits": {"cld_create": [create] * completed,
+                       "cld_create_error": [error] * completed,
+                       "pipe_wait_for_open": [wait] * completed},
+        "broker": counters,
+        "status_checks_passed": completed,
+        "attributed_generations": completed,
+    }
+
+
+def _hcap12_evidence(identity, lane_sha256):
+    return {
+        "schema_version": "hcap-kvm-evidence.v1",
+        "capability_id": "HCAP-12",
+        "observed_at": "2026-10-20",
+        "scenario": "v41-cld-lifecycle",
+        "execution_harness_id": identity.execution_harness_id,
+        "mapping_identity": identity.model_dump(mode="json"),
+        "probe_mapping_sha256": {"cld_create": "1" * 64,
+                                 "cld_create_error": "2" * 64,
+                                 "pipe_wait_for_open": "3" * 64},
+        "campaign_result_sha256": "b" * 64,
+        "guest_lane_script_sha256": lane_sha256,
+        "guest_nfs_proxy_sha256": "c" * 64,
+        "runs": {
+            "control": _hcap12_run(create=0),
+            "normal": _hcap12_run(),
+            "reconnect": _hcap12_run(wait=1, reconnect_ok=3),
+            "daemon_down": _hcap12_run(create=1, error=1, wait=1, down_ok=3),
+        },
+        "generation_contract": {
+            "generation_begin_each": 1,
+            "aggregate_published_each": 1,
+            "generation_aborted_each": 0,
+            "scratch_overflow_each": 0,
+            "merge_truncation_each": 0,
+            "outstanding_tokens_after_each": 0,
+            "remote_refs_after_each": 0,
+            "minimum_remote_start_ok": 1,
+        },
+        "crash_signature_count": 0,
+        "raw_artifact_error_count": 0,
+        "shareable_result_contains_target_metadata_or_addresses": False,
+    }
+
+
+HCAP12_IDENTITY = KernelIdentity(
+    execution_harness_id="d" * 64, kernel_commit="e" * 40,
+    instrumentation_sha256="f" * 64, vmlinux_sha256="9" * 64,
+    kaslr_enabled=False, kaslr_offset=0)
+
+
+def test_hcap12_evidence_accepts_the_validated_campaign_shape():
+    evidence = Hcap12KvmEvidence.model_validate(
+        _hcap12_evidence(HCAP12_IDENTITY, "8" * 64))
+    assert evidence.runs.reconnect.broker.reconnect_ok == 3
+
+
+@pytest.mark.parametrize(("path", "value", "message"), [
+    (("runs", "control", "probe_hits", "cld_create"), [0, 1, 0],
+     "control run reached a CLD probe"),
+    (("runs", "normal", "probe_hits", "cld_create"), [1, 0, 1],
+     "normal run missed the CLD create upcall"),
+    (("runs", "normal", "probe_hits", "pipe_wait_for_open"), [0, 0, 1],
+     "normal run queued without a pipe reader"),
+    (("runs", "reconnect", "probe_hits", "pipe_wait_for_open"), [1, 0, 1],
+     "reconnect run missed the reader-loss requeue"),
+    (("runs", "reconnect", "probe_hits", "cld_create_error"), [0, 1, 0],
+     "reconnect run reached the create error path"),
+    (("runs", "reconnect", "broker", "reconnect_ok"), 2,
+     "reconnect broker transactions differ"),
+    (("runs", "reconnect", "broker", "restore_ok"), 1,
+     "failed or refused transaction"),
+    (("runs", "daemon_down", "broker", "down_ok"), 2,
+     "daemon-down broker transactions differ"),
+    (("runs", "normal", "broker", "reconnect_ok"), 1,
+     "normal run invoked the nfsdcld broker"),
+    (("runs", "control", "broker", "refused_busy"), 1,
+     "failed or refused transaction"),
+    (("runs", "normal", "status_checks_passed"), 2,
+     "left the lane fixture unhealthy"),
+    (("runs", "reconnect", "attributed_generations"), 2,
+     "lacks one attributed generation"),
+    (("runs", "normal", "completed"), 2, "greater than or equal to 3"),
+    (("probe_mapping_sha256",), {"cld_create": "1" * 64},
+     "probe mappings differ"),
+    (("crash_signature_count",), 1, "crash or artifact error"),
+    (("shareable_result_contains_target_metadata_or_addresses",), True,
+     "private target data"),
+    (("capability_id",), "HCAP-11", "HCAP-12"),
+])
+def test_hcap12_evidence_rejects_unvalidated_campaigns(path, value, message):
+    evidence = _hcap12_evidence(HCAP12_IDENTITY, "8" * 64)
+    target = evidence
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=message):
+        Hcap12KvmEvidence.model_validate(evidence)
+
+
+@needs_gcc
+def test_hcap12_evidence_is_bound_to_generated_harness(host):
+    initial = generate(host.spec)
+    config = Stage1Config.load(initial.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    from agent_pipeline.materializer import ExecutionHarnessApproval
+    from agent_pipeline.stage1.host.pins import HostFilePin
+    descriptor = load_record(store, config.execution_harness_approvals[0],
+                             ExecutionHarnessApproval).descriptor
+    builds = {item.name: item.artifact_ref
+              for item in descriptor.build_artifacts}
+    lane_pin = load_record(store, builds["lane-script"], HostFilePin)
+    identity = KernelIdentity(
+        execution_harness_id=initial.execution_harness_id,
+        kernel_commit=descriptor.kernel_commit,
+        instrumentation_sha256=builds["instrumentation"],
+        vmlinux_sha256=builds["kernel"],
+        kaslr_enabled=False, kaslr_offset=0)
+    value = _hcap12_evidence(identity, lane_pin.sha256)
+    evidence = host.root / "hcap12-evidence.json"
+    evidence.write_text(json.dumps(value))
+    spec = json.loads(host.spec.read_text())
+    spec["capabilities"].append({
+        "id": "HCAP-12", "name": "cld", "purpose": "test binding",
+        "usable_stage": ["stage1"], "usable_by": ["agent_stage1"],
+        "interface": {"runtime_features": ["cld_reconnect"]},
+        "status": "validated", "scope": ["client0_recovery_cld_reconnect"],
+    })
+    spec["capability_evidence"] = {"HCAP-12": [evidence.name]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    result = generate(host.spec)
+    from agent_pipeline.hcap import HcapCatalog
+    catalog = load_record(store, result.hcap_revision, HcapCatalog)
+    cld = next(item for item in catalog.capabilities if item.id == "HCAP-12")
+    assert len(cld.evidence_refs) == 1
+
+    value["guest_lane_script_sha256"] = "7" * 64
+    evidence.write_text(json.dumps(value))
+    with pytest.raises(GenerationError, match="HCAP-12 evidence names "
+                       "another guest lane script"):
+        generate(host.spec)
+    value["guest_lane_script_sha256"] = lane_pin.sha256
+    value["runs"]["reconnect"]["probe_hits"]["pipe_wait_for_open"] = [0] * 3
+    evidence.write_text(json.dumps(value))
+    with pytest.raises(GenerationError, match="invalid HCAP-12 KVM evidence"):
+        generate(host.spec)
+
+
 def test_template_spec_is_valid():
     from agent_pipeline.stage1.host.generate import HostSpec
     template = REPO / "agent_pipeline/stage1/host/template"
@@ -489,6 +648,39 @@ def test_template_spec_is_valid():
     assert all("syz_nfsd_client_ctl$expire_client1" not in
                selection.enabled_interfaces
                for selection in spec.runtime_selections)
+
+    # HCAP-12 is promoted only by typed KVM evidence for exactly this
+    # harness: until capability-evidence/hcap12-kvm.json exists, generate()
+    # refuses the template, so the reconnect call is never admitted early.
+    cld = next(c for c in spec.capabilities if c.id == "HCAP-12")
+    assert cld.interface.syz_calls == ("syz_nfsd_cld_ctl$reconnect",)
+    assert cld.scope == ("client0_recovery_cld_reconnect",)
+    assert spec.capability_evidence["HCAP-12"] == (
+        Path("capability-evidence/hcap12-kvm.json"),)
+    cld_evidence = template / spec.capability_evidence["HCAP-12"][0]
+    if cld_evidence.is_file():
+        evidence_json = json.loads(cld_evidence.read_text())
+        assert Hcap12KvmEvidence.model_validate(
+            evidence_json).capability_id == "HCAP-12"
+        assert not {"target_pcs", "candidate_id", "path", "symbol"} & set(
+            evidence_json)
+    reconnect = next(e for e in spec.admission_source.entries
+                     if e.call == "syz_nfsd_cld_ctl$reconnect")
+    assert reconnect.capability_ids == ("HCAP-12",)
+    assert all(not e.call.startswith("syz_nfsd_cld_ctl$daemon_down")
+               for e in spec.admission_source.entries)
+    assert all("syz_nfsd_cld_ctl$daemon_down" not in
+               selection.enabled_interfaces
+               for selection in spec.runtime_selections)
+    # The HCAP-11 selection is unchanged; reconnect has its own selection.
+    with_cld = [s for s in spec.runtime_selections
+                if "syz_nfsd_cld_ctl$reconnect" in s.enabled_interfaces]
+    without = [s for s in spec.runtime_selections
+               if "syz_nfsd_cld_ctl$reconnect" not in s.enabled_interfaces]
+    assert len(with_cld) == len(without) == 1
+    assert set(with_cld[0].enabled_interfaces) - set(
+        without[0].enabled_interfaces) == {"syz_nfsd_cld_ctl$reconnect"}
+    assert "remote_kcov.context.cld" in spec.missing_capability_ids
 
 
 @needs_gcc
@@ -804,3 +996,207 @@ def _plan(hcap_revision: str):
         program_proposal=ProgramProposal(kind="program",
                                          artifact_ref=_sha(SCENARIO)),
         runtime_selection=runtime())
+
+
+def _load_bootstrap():
+    spec = importlib.util.spec_from_file_location(
+        "bootstrap_kcov_env", REPO / "tools" / "bootstrap-kcov-env.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _patched_kernel_env(tmp_path, bootstrap, *, legacy=False):
+    """A target with a committed patched tree, recorded variant images and
+    the passing manifest of the bootstrap that built them.  ``legacy``
+    writes records in the pre-#66 four-field form, without kconfig_sha256."""
+    linux = tmp_path / "linux"
+    (linux / "include/linux/sunrpc").mkdir(parents=True)
+    (linux / "include/linux/sunrpc/fuzz.h").write_text(
+        "sunrpc_fuzz_svc_remote_grant\n")
+    git = ["git", "-C", str(linux)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "patched"], check=True)
+    head = bootstrap.git_head(linux)
+    base = {"series_sha256": bootstrap.series_fingerprint("kernel"),
+            "base": bootstrap.KERNEL_COMMIT, "head": head, "commits": 5}
+    variants = {}
+    for variant in bootstrap.VARIANTS:
+        images = tmp_path / "images" / variant
+        images.mkdir(parents=True)
+        (images / "bzImage").write_bytes(b"bz-" + variant.encode())
+        (images / "vmlinux").write_bytes(b"vmlinux-" + variant.encode())
+        (images / ".config").write_text("CONFIG_KCOV=y\n")
+        record = dict(base)
+        if not legacy:
+            record["kconfig_sha256"] = bootstrap.sha256(
+                bootstrap.KCONFIGS[variant])
+        (images / bootstrap.BUILD_RECORD).write_text(json.dumps(record))
+        variants[variant] = {
+            "config_sha256": bootstrap.sha256(bootstrap.KCONFIGS[variant]),
+            "bzImage_sha256": bootstrap.sha256(images / "bzImage"),
+            "vmlinux_sha256": bootstrap.sha256(images / "vmlinux"),
+        }
+    (tmp_path / "manifest.json").write_text(json.dumps({
+        "status": "pass", "kernel": {
+            "ref": bootstrap.KERNEL_TAG, **base, "variants": variants}}))
+    return SimpleNamespace(
+        target=tmp_path, variants=list(bootstrap.VARIANTS), update=True,
+        skip_build=False, kernel_ref=bootstrap.KERNEL_TAG,
+        kernel_repo="unused"), head
+
+
+def _no_rebuild(*_args, **_kwargs):
+    raise AssertionError("an unchanged kernel must not be re-applied")
+
+
+@pytest.mark.parametrize("legacy", (False, True))
+def test_bootstrap_update_keeps_an_unchanged_kernel_commit(
+        tmp_path, monkeypatch, legacy):
+    bootstrap = _load_bootstrap()
+    args, head = _patched_kernel_env(tmp_path, bootstrap, legacy=legacy)
+    monkeypatch.setattr(bootstrap, "run", _no_rebuild)
+    manifest = {}
+    _, rebuilt = bootstrap.stage_kernel(args, manifest, False)
+    assert rebuilt is False
+    assert manifest["kernel"]["head"] == head
+    assert bootstrap.git_head(tmp_path / "linux") == head
+    for variant in bootstrap.VARIANTS:
+        record = json.loads(
+            (tmp_path / "images" / variant / "build.json").read_text())
+        # A legacy record is backfilled once, from the verified manifest.
+        assert record["kconfig_sha256"] == bootstrap.sha256(
+            bootstrap.KCONFIGS[variant])
+        assert record["head"] == head
+    # The backfilled record is then reused as is.
+    assert bootstrap.stage_kernel(args, {}, False)[1] is False
+
+
+@pytest.mark.parametrize("break_", (
+    "no_manifest", "failed_manifest", "kconfig", "bzImage", "vmlinux",
+    "head", "series"))
+def test_bootstrap_update_refuses_an_unverifiable_legacy_record(
+        tmp_path, monkeypatch, break_):
+    bootstrap = _load_bootstrap()
+    args, head = _patched_kernel_env(tmp_path, bootstrap, legacy=True)
+    manifest_path = tmp_path / "manifest.json"
+    previous = json.loads(manifest_path.read_text())
+    kasan = previous["kernel"]["variants"]["kasan"]
+    images = tmp_path / "images" / "kasan"
+    if break_ == "no_manifest":
+        manifest_path.unlink()
+    elif break_ == "failed_manifest":
+        previous["status"] = "fail"
+    elif break_ == "kconfig":
+        kasan["config_sha256"] = "0" * 64
+    elif break_ == "bzImage":
+        (images / "bzImage").write_bytes(b"other image")
+    elif break_ == "vmlinux":
+        (images / "vmlinux").unlink()
+    elif break_ == "head":
+        previous["kernel"]["head"] = "0" * 40
+    elif break_ == "series":
+        previous["kernel"]["series_sha256"] = "0" * 64
+    if manifest_path.exists():
+        manifest_path.write_text(json.dumps(previous))
+    record_before = (images / "build.json").read_text()
+    monkeypatch.setattr(bootstrap, "run", _no_rebuild)
+    with pytest.raises(RuntimeError, match="cannot migrate the kasan"):
+        bootstrap.stage_kernel(args, {}, False)
+    # Fail closed: nothing was rebuilt, removed or rewritten.
+    assert bootstrap.git_head(tmp_path / "linux") == head
+    assert (images / "build.json").read_text() == record_before
+
+
+@pytest.mark.parametrize("also", ("nothing", "series", "base", "images"))
+def test_bootstrap_update_refuses_a_dirty_kernel_tree(
+        tmp_path, monkeypatch, also):
+    """Local work is kept even when the inputs also call for a rebuild."""
+    bootstrap = _load_bootstrap()
+    args, head = _patched_kernel_env(tmp_path, bootstrap, legacy=True)
+    stray = tmp_path / "linux" / "local-change"
+    stray.write_text("x\n")
+    if also == "series":
+        monkeypatch.setattr(bootstrap, "series_fingerprint",
+                            lambda kind: "0" * 64)
+    elif also == "base":
+        args.kernel_ref = "v0.0"
+    elif also == "images":
+        (tmp_path / "images" / "kasan" / "bzImage").unlink()
+    monkeypatch.setattr(bootstrap, "run", _no_rebuild)
+    with pytest.raises(RuntimeError, match="local changes"):
+        bootstrap.stage_kernel(args, {}, False)
+    assert stray.read_text() == "x\n"
+    assert bootstrap.git_head(tmp_path / "linux") == head
+
+
+@pytest.mark.parametrize("change", ("kconfig", "series", "base"))
+def test_bootstrap_update_rebuilds_a_changed_kernel(
+        tmp_path, monkeypatch, change):
+    bootstrap = _load_bootstrap()
+    args, _ = _patched_kernel_env(tmp_path, bootstrap)
+    if change == "kconfig":
+        # The checked-in kconfig no longer matches the one recorded.
+        for variant in bootstrap.VARIANTS:
+            path = tmp_path / "images" / variant / "build.json"
+            record = json.loads(path.read_text())
+            record["kconfig_sha256"] = "0" * 64
+            path.write_text(json.dumps(record))
+    elif change == "series":
+        monkeypatch.setattr(bootstrap, "series_fingerprint",
+                            lambda kind: "0" * 64)
+    elif change == "base":
+        args.kernel_ref = "v0.0"
+
+    class Rebuild(Exception):
+        pass
+
+    def clone(argv, **_kwargs):
+        raise Rebuild(argv)
+    monkeypatch.setattr(bootstrap, "run", clone)
+    with pytest.raises(Rebuild, match="clone"):
+        bootstrap.stage_kernel(args, {}, False)
+
+
+def test_kernel_series_apply_is_deterministic(tmp_path):
+    """fport-apply reproduces the same commits from the same base and series."""
+    base = tmp_path / "base"
+    base.mkdir()
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "-C", str(base), "init", "-q"], check=True)
+    subprocess.run([*git, "-C", str(base), "commit", "-q", "--allow-empty",
+                    "-m", "base"], check=True)
+    commit = subprocess.run(["git", "-C", str(base), "rev-parse", "HEAD"],
+                            capture_output=True, text=True,
+                            check=True).stdout.strip()
+    (base / "f").write_text("patched\n")
+    subprocess.run(["git", "-C", str(base), "add", "f"], check=True)
+    subprocess.run([*git, "-C", str(base), "commit", "-q", "-m", "patch"],
+                   check=True,
+                   env={**os.environ,
+                        "GIT_AUTHOR_DATE": "2026-10-01T00:00:00+0900"})
+    patches = tmp_path / "patches"
+    (patches / "kernel").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(base), "format-patch", "-q", "-1",
+                    "-o", str(patches / "kernel")], check=True)
+    (patches / "BASE").write_text("kernel_commit=%s\n" % commit)
+    heads = []
+    for index, date in enumerate(("2026-10-02T00:00:00+0000",
+                                  "2027-01-01T00:00:00+0000")):
+        tree = tmp_path / ("tree%d" % index)
+        subprocess.run(["git", "clone", "-q", str(base), str(tree)],
+                       check=True)
+        subprocess.run(["git", "-C", str(tree), "checkout", "-q", commit],
+                       check=True)
+        # The applying host's clock and git identity must not matter.
+        subprocess.run([str(REPO / "tools" / "fport-apply.sh"), "kernel",
+                        str(tree)], check=True, capture_output=True,
+                       env={**os.environ, "KOOV_BUNDLE": str(patches),
+                            "GIT_COMMITTER_DATE": date,
+                            "GIT_COMMITTER_NAME": "host%d" % index})
+        heads.append(subprocess.run(
+            ["git", "-C", str(tree), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip())
+    assert heads[0] == heads[1] != commit

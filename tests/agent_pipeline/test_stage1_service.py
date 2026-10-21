@@ -600,3 +600,22 @@ def test_recover_applies_an_issue_event_stored_before_restart(tmp_path, build):
         assert service.recover_errors == []
         assert service.issues.pending_events() == []
         assert service.job(job_id).state is JobState.S1_ANALYSIS
+
+
+def test_resubmit_binds_an_earlier_location_to_another_commit(tmp_path, build):
+    from agent_pipeline.stage1.cli import _job_summary, resubmit
+    with make_service(tmp_path, build) as service:
+        old = submit(service, build)
+        new = resubmit(service, old, build.binding.kernel_commit)
+        assert new != old
+        before, after = service.job(old), service.job(new)
+        assert after.submission.location == before.submission.location
+        assert after.submission.kernel_commit == build.binding.kernel_commit
+        assert after.job_policy_id == before.job_policy_id
+        # The new job went through intake like any submission.
+        assert after.state is before.state
+        assert after.candidate.kernel_commit == build.binding.kernel_commit
+        # The summary names jobs and states, never the private location.
+        assert "synthetic" not in json.dumps(_job_summary(service, new))
+        missing = resubmit(service, old, "0" * 40)
+        assert service.job(missing).state is JobState.REJECTED

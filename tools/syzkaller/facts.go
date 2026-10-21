@@ -262,7 +262,7 @@ func preservesRoots(name string) bool {
 		"getdents", "getdents64", "fsync", "fdatasync", "fstat", "fstatfs", "lseek",
 		"ftruncate", "fallocate", "flock", "fchmod", "fchown", "fadvise64", "readahead",
 		"sync_file_range", "copy_file_range", "fsetxattr", "fgetxattr", "flistxattr", "fremovexattr",
-		"openat", "nanosleep", "syz_nfsd_client_ctl":
+		"openat", "nanosleep", "syz_nfsd_client_ctl", "syz_nfsd_cld_ctl":
 		return true
 	}
 	return false

@@ -340,19 +340,96 @@ def export_kernel_images(args, variant, record):
     return images / "bzImage", images / "vmlinux"
 
 
+def legacy_kernel_record(args, linux, variant, record):
+    """The build record of a kernel built before records carried its kconfig.
+
+    The last passing manifest proves which kconfig and images that build had;
+    only when it matches this tree, record and images is the kconfig digest
+    backfilled.  Anything else is refused, never rebuilt: a rebuild would move
+    the kernel commit that harness descriptors and target mappings bind.
+    """
+    previous = last_good_manifest(args.target) or {}
+    kernel = previous.get("kernel") or {}
+    entry = (kernel.get("variants") or {}).get(variant) or {}
+    images = image_dir(args, variant)
+    vmlinux = images / "vmlinux"
+    kconfig = sha256(KCONFIGS[variant])
+    mismatched = [name for name, ok in (
+        ("manifest", bool(kernel) and bool(entry)),
+        ("head", kernel.get("head") == record.get("head") == git_head(linux)),
+        ("base", kernel.get("base") == record.get("base")),
+        ("series", kernel.get("series_sha256") == record.get("series_sha256")),
+        ("commits", kernel.get("commits") == record.get("commits")),
+        ("kconfig", entry.get("config_sha256") == kconfig),
+        ("bzImage", entry.get("bzImage_sha256") == sha256(images / "bzImage")),
+        ("vmlinux", entry.get("vmlinux_sha256") == (
+            sha256(vmlinux) if vmlinux.is_file() else None)),
+    ) if not ok]
+    if mismatched:
+        raise RuntimeError(
+            "--update cannot migrate the %s kernel build record: %s do not match "
+            "the last passing manifest; refusing to rebuild a kernel whose inputs "
+            "may be unchanged (bootstrap a new --target to rebuild deliberately)"
+            % (variant, ", ".join(mismatched)))
+    return {**record, "kconfig_sha256": kconfig}
+
+
+def kernel_update_plan(args, linux, variant):
+    """("rebuild", why), ("keep", None) or ("backfill", record) for --update.
+
+    Keeping an unchanged patched tree keeps its kernel commit, which harness
+    descriptors and target PC mappings are bound to.
+    """
+    reason = stale_build("kernel", linux, image_dir(args, variant) / BUILD_RECORD)
+    if reason:
+        return "rebuild", reason
+    record = read_build_record(image_dir(args, variant) / BUILD_RECORD)
+    if args.kernel_ref != KERNEL_TAG or record.get("base") != KERNEL_COMMIT:
+        return "rebuild", "kernel base is not the pinned %s" % KERNEL_TAG
+    if "kconfig_sha256" not in record:
+        return "backfill", legacy_kernel_record(args, linux, variant, record)
+    if record["kconfig_sha256"] != sha256(KCONFIGS[variant]):
+        return "rebuild", "%s kconfig changed since the build" % variant
+    return "keep", None
+
+
 def stage_kernel(args, manifest, reuse):
     linux = args.target / "linux"
     rebuilt = True
-    if (reuse and kernel_sentinel(linux) and all(
-            (image_dir(args, v) / "bzImage").is_file()
-            and (image_dir(args, v) / "bzImage").stat().st_size > 0
-            and (image_dir(args, v) / ".config").is_file()
-            for v in args.variants)):
+    built = kernel_sentinel(linux) and all(
+        (image_dir(args, v) / "bzImage").is_file()
+        and (image_dir(args, v) / "bzImage").stat().st_size > 0
+        and (image_dir(args, v) / ".config").is_file()
+        for v in args.variants)
+    # Whatever --update decides, an existing tree with local work is neither
+    # reused nor removed.
+    if (not reuse and args.update and (linux / ".git").exists()
+            and not git_clean(linux)):
+        raise RuntimeError("--update refuses to rebuild or reuse the kernel: "
+                           "%s has local changes" % linux)
+    plans = ({v: kernel_update_plan(args, linux, v) for v in args.variants}
+             if built and not reuse and args.update else None)
+    update_keeps = plans is not None and all(
+        action != "rebuild" for action, _ in plans.values())
+    if plans is not None and not update_keeps:
+        print("rebuilding kernel: %s" % next(
+            why for action, why in plans.values() if action == "rebuild"), flush=True)
+    if update_keeps:
+        for variant, (action, record) in plans.items():
+            if action == "backfill":
+                path = image_dir(args, variant) / BUILD_RECORD
+                staged = path.with_name(BUILD_RECORD + ".new")
+                staged.write_text(json.dumps(record, indent=2) + "\n")
+                os.replace(staged, path)
+                print("backfilled the %s kernel build record from the last "
+                      "passing manifest" % variant, flush=True)
+    if reuse and built:
         for variant in args.variants:
             reason = stale_build("kernel", linux, image_dir(args, variant) / BUILD_RECORD)
             if reason:
                 raise RuntimeError("--skip-build refuses the %s kernel build: %s; "
                                    "rerun without --skip-build" % (variant, reason))
+    if (reuse and built) or update_keeps:
         print("reusing kernel build", flush=True)
         rebuilt = False
         records = {v: read_build_record(image_dir(args, v) / BUILD_RECORD)
@@ -389,7 +466,8 @@ def stage_kernel(args, manifest, reuse):
                     build_kernel_variant(args, linux, variant)
         with timed(manifest, "kernel_export"):
             for variant in args.variants:
-                export_kernel_images(args, variant, record)
+                export_kernel_images(args, variant, {
+                    **record, "kconfig_sha256": sha256(KCONFIGS[variant])})
         records = {v: record for v in args.variants}
     # Every variant comes from the one patched tree, so their records agree.
     record = records[args.variants[0]]

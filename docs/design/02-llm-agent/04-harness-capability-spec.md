@@ -595,6 +595,79 @@ tools/nfs-lifecycle/run.py
 agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
 ```
 
+### HCAP-12 — Bounded nfsdcld reconnect during NFSv4.1 client recovery
+
+```text
+id: HCAP-12
+name: bounded nfsdcld reconnect during NFSv4.1 client recovery
+usable_stage: [stage1]
+usable_by: [agent_stage1]
+status: validated (KVM evidence 전까지 generator가 template을 거부)
+scope: [client0_recovery_cld_reconnect]
+
+interface:
+    syz_nfsd_cld_ctl$reconnect(0x2)  # exact admitted invocation
+
+purpose:
+    HCAP-11 복구 중 fresh client0의 Cld_Create upcall이 rpc_pipefs CLD pipe reader 교체와
+    겹치도록 하여, nfsd request context의 -EAGAIN 재시도와 reader-less 재queue 경로를 실행
+
+constraints:
+    HCAP-11 sequence 안에서 expire_client0 뒤, client0 profile 획득 전에 reconnect를 정확히 한 번 호출
+    syz_nfsd_cld_ctl$daemon_down은 어떤 HCAP에서도 admit되지 않음 (fixture 검증 전용)
+    syz 호출은 고정 op enum만 전달하며 path, PID, mount option, CLD payload, xid, command를 전달하지 않음
+    broker만 nfsdcld를 netns/mntns, PID start time, comm/cmdline, 실행 파일, 소유한 rpc_pipefs CLD pipe
+    dev:inode로 선택하고, 그 identity가 직전 transaction 종료 시점과 다르면 ESTALE로 거부
+    reconnect는 daemon을 bounded 시간 동안 SIGSTOP한 뒤 SIGKILL과 재시작으로 교체; 겹치는 CLD 작업과
+    그 동안의 client expiry는 EBUSY
+    실패한 transaction은 daemon을 한 번 복구하고, 복구도 실패하면 broker가 failed 상태로 남아 모든 CLD 작업을
+    EIO로 거부하며 lane status가 fixture를 unhealthy로 판정
+```
+
+CLD 작업의 실행 context와 귀속:
+
+| CLD 작업 | 실행 context | remote-KCOV |
+|---|---|---|
+| RECLAIM_COMPLETE/OPEN_CONFIRM의 `nfsd4_cld_create(_v2)`, `cld_pipe_upcall` 재시도, `rpc_queue_upcall`, completion 대기 | nfsd request (`svc_process`) | 귀속됨 (`request`) |
+| DESTROY_CLIENTID/EXCHANGE_ID/CREATE_SESSION의 `nfsd4_cld_remove` | nfsd request | 귀속됨 (`request`) |
+| broker의 admin expire가 부른 `nfsd4_cld_remove` | broker 프로세스 | 귀속 안 됨 |
+| laundromat의 expiry/remove, grace 종료 | workqueue | 귀속 안 됨 |
+| `rpc_pipe_read`, `cld_pipe_downcall`, pipe open/release와 -EAGAIN purge | nfsdcld syscall | 귀속 안 됨 |
+| `rpc_timeout_upcall_queue` (-ETIMEDOUT) | rpciod workqueue | 귀속 안 됨 |
+| tracking init, version 확인, rpc_pipefs mount notifier | nfsd 시작/관리 | 귀속 안 됨 |
+
+귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.cld` gap으로 남으며, 이 capability는 그
+범위를 지원한다고 주장하지 않는다. 그 context를 귀속하려면 커널 패치가 필요하며 owner 승인 전에는 적용하지
+않는다. trace, dmesg, daemon log는 진단 정보일 뿐 Q1 근거가 아니다.
+
+Broker 카운터(`server/cld.state`, broker 소유):
+`reconnect_attempts/ok/fail`, `down_attempts/ok/fail`, `daemon_stop_ok/fail`, `daemon_start_ok/fail`,
+`refused_busy`(겹친 요청), `refused_identity`(stale identity), `restore_ok/fail`(실패 뒤 복구). 실행 증거는 run별
+delta를 기록한다.
+
+KVM 증거(`capability-evidence/hcap12-kvm.json`, `Hcap12KvmEvidence`)는 run마다 하나의 귀속 generation과 공개
+CLD probe(`cld_create`, `cld_create_error`, `pipe_wait_for_open`) hit 수를 담는다. promotion 조건은 다음과 같다.
+
+- neutral control은 모든 probe를 miss하고 broker를 쓰지 않는다.
+- 시나리오 A(normal)는 create를 hit하고 reader-less 재queue와 오류 경로는 miss한다.
+- 시나리오 C(reconnect)는 create와 reader-less 재queue를 hit하고 오류 경로는 miss하며, run마다
+  `reconnect_ok`가 1이다.
+- 시나리오 B(daemon-down)는 fixture 증거로만 쓰며, run마다 `down_ok`가 1이고 daemon이 복구되어야 한다.
+- 모든 run 뒤에 lane status가 통과하고, broker 실패·거부·복구 카운터는 모두 0이어야 한다.
+
+Probe는 공개 커널 함수와 줄 범위에서 계산하며 후보 metadata를 쓰지 않는다. Host generator는 HCAP-11과 같은
+identity 결합을 검사한 뒤에만 HCAP-12를 promotion한다.
+
+source refs:
+
+```text
+bundle/patches/syzkaller/0028-*
+bundle/lane/lane.sh
+tools/nfs-proxy/src/cld.c
+tools/nfs-lifecycle/run.py
+agent_pipeline/stage1/host/template/capability-evidence/hcap12-kvm.json
+```
+
 ### Target Proxy Architecture와의 관계
 
 HCAP-07/08/09는 현재 `tools/nfs-proxy`에서 검증된 concrete capability를 기록한다.
@@ -653,6 +726,7 @@ STAGE 1
     HCAP-05 normal-flow seeds
     HCAP-06 flow tracing
     HCAP-11 bounded NFSv4.1 client lifecycle recovery
+    HCAP-12 bounded nfsdcld reconnect during NFSv4.1 client recovery
 
 STAGE 2
     Stage 1에서 선택된 scenario

@@ -128,6 +128,19 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
     return stack.enter_context(Stage1Service(parts))
 
 
+def resubmit(service: Stage1Service, job_id: str, kernel_commit: str) -> str:
+    """Submit an earlier job's candidate location again at ``kernel_commit``.
+
+    A candidate binds the kernel commit it was submitted at; when that commit
+    cannot be rebuilt, the location is submitted again and the new job goes
+    through intake like any submission.  The earlier job is kept as it is.
+    """
+    old = service.job(job_id)
+    return service.controller.submit(CandidateSubmission(
+        kernel_commit=kernel_commit, location=old.submission.location),
+        old.job_policy_id)
+
+
 def _job_summary(service: Stage1Service, job_id: str) -> dict:
     job = service.job(job_id)
     out = {"job_id": job.job_id, "state": job.state.value,
@@ -187,6 +200,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--end-line", type=int)
     s.add_argument("--policy", required=True)
 
+    rs = sub.add_parser(
+        "resubmit", help="submit an earlier job's candidate location at "
+        "another kernel commit, as a new job")
+    rs.add_argument("job")
+    rs.add_argument("--commit", required=True)
+
     r = sub.add_parser("run")
     r.add_argument("--job", help="stop when this job reaches a stop state")
     r.add_argument("--timeout", type=float, help="seconds")
@@ -239,6 +258,10 @@ def main(argv: list[str] | None = None) -> int:
                     symbol=args.symbol, start_line=args.start_line,
                     end_line=args.end_line)), args.policy)
             _print(_job_summary(service, job_id))
+        elif args.command == "resubmit":
+            job_id = resubmit(service, args.job, args.commit)
+            _print({"resubmitted_from": args.job,
+                    **_job_summary(service, job_id)})
         elif args.command == "run":
             service.recover()
             for err in service.recover_errors:

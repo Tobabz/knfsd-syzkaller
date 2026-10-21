@@ -191,8 +191,15 @@ uv run python tools/bootstrap-kcov-env.py env ... --update
 
 `bump-kernel.py` applies the kernel series to a shallow clone of the tag. If it applies, `bundle/patches/BASE` moves to that tag and the patch files stay as they are. If it conflicts, the clone is left in the middle of `git am`: resolve it with git (edit, `git add`, `git am --continue`), then run `uv run python tools/bump-kernel.py --export <clone>` to write the rebased series back and update `BASE`. Resolutions are remembered (git rerere) in `cache/rr-cache-kernel` and replayed on the next release.
 
-Re-running bootstrap with `--update` rebuilds the selected kernels (both by default) and syzkaller
-into the same `env/`, so only the latest kernel images are kept. `--skip-build` reuses existing build
+Re-running bootstrap with `--update` rebuilds syzkaller and any selected kernel whose inputs changed
+into the same `env/`, so only the latest kernel images are kept. A kernel whose pinned base, series
+fingerprint, kconfig and clean patched tree all match its `images/<variant>/build.json` is kept as
+it is, so its kernel commit (which harness descriptors and target PC mappings bind) does not move.
+A record written before records carried the kconfig digest is backfilled only after the last passing
+`manifest.json` matches its tree, record, kconfig and images; otherwise `--update` stops without
+removing anything. A tree with local changes is also refused rather than rebuilt.
+`tools/fport-apply.sh` applies each series with a fixed committer and committer date = author date,
+so a rebuild from the same base and series reproduces the same commits. `--skip-build` reuses existing build
 outputs only when the series fingerprint recorded with them (`images/<variant>/build.json`,
 `syzkaller/bin/build.json`) matches the checked-in series; otherwise it fails and asks for a
 rebuild, and the manifest's `series_sha256` and `commits` come from that record. The VM image is reused when its bytes and the base image, baker, boot wrapper, service and

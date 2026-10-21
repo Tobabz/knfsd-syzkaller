@@ -140,8 +140,8 @@ its explicit valid `AUTO` syntax remains part of the pinned parser semantics.
   origin. An explicit close invalidates that root; unknown FD effects invalidate
   all roots. A small allowlist of ordinary IO/metadata calls (listed in
   `preservesRoots` in `facts.go`) preserves existing roots. The bounded
-  `syz_nfsd_client_ctl` fixture control also preserves roots because it cannot
-  consume or replace a program FD. Opening a filename does not prove it stays on
+  `syz_nfsd_client_ctl` and `syz_nfsd_cld_ctl` fixture controls also preserve
+  roots because they cannot consume or replace a program FD. Opening a filename does not prove it stays on
   NFS: symlink/mount traversal is runtime state.
 * **Unsupported:** path/socket/buffer origins; legacy lane/pair and raw NFS socket
   acquisitions whose protocol profile cannot be proved; asynchronous, rerun and

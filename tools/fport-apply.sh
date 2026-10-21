@@ -6,6 +6,8 @@
 # bundle/patches/BASE records the base the series is known to apply to. A target
 # at another base is still tried with `git am -3`; a newer kernel may conflict,
 # and tools/bump-kernel.py moves the series (and BASE) to a newer release or rc.
+# Commits are applied deterministically (fixed committer, committer date =
+# author date), so an unchanged base and series always give the same HEAD.
 set -eu
 
 DRY_RUN=0
@@ -70,7 +72,11 @@ fi
 fails=0
 for p in "$bundle"/*.patch; do
     name=$(basename "$p")
-    if git -C "$target" am -3 "$p"; then
+    # Stable committer identity and date: the same base and patch bytes always
+    # yield the same commits, so re-applying an unchanged series reproduces the
+    # kernel commit that harness descriptors and target mappings are bound to.
+    if GIT_COMMITTER_NAME=knfsd-fuzz GIT_COMMITTER_EMAIL=knfsd-fuzz@localhost \
+        git -C "$target" am -3 --committer-date-is-author-date "$p"; then
         echo "[fport-apply] applied: $name"
     else
         fails=$((fails + 1))

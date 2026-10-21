@@ -85,7 +85,8 @@ UNITS="test_framing:$TEST/test_framing.c:$SRC/framing.c\
        test_proxy:$TEST/test_proxy.c:$SRC/proxy.c:$SRC/framing.c:$SRC/rpc_record.c:$SRC/rpc_decode.c\
        test_journal:$TEST/test_journal.c:$SRC/journal.c:$SRC/jsonw.c:$SRC/sha256.c\
        test_control:$TEST/test_control.c:$SRC/control.c:$SRC/delta.c:$SRC/walk.c:$SRC/edit.c\
-       test_lifecycle:$TEST/test_lifecycle.c:$SRC/lifecycle.c"
+       test_lifecycle:$TEST/test_lifecycle.c:$SRC/lifecycle.c:$SRC/cld.c\
+       test_cld:$TEST/test_cld.c:$SRC/lifecycle.c:$SRC/cld.c"
 
 # Generated ProtocolSchema tables and the annotation file each comes from.
 # A table is committed so the C build (and the guest build container) needs
@@ -272,7 +273,7 @@ if [ "$MODE" != "--test" ]; then
 		"$SRC/schema.c" "$SRC/schema_nfs4.c" "$SRC/schema_nfs3.c" \
 		"$SRC/rpc_decode.c" "$SRC/rule.c" "$SRC/target.c" \
 		"$SRC/journal.c" "$SRC/jsonw.c" "$SRC/sha256.c" \
-		"$SRC/lifecycle.c" -lm
+		"$SRC/lifecycle.c" "$SRC/cld.c" -lm
 	# The fault hook the live tests build in must stay warning-free too.
 	# shellcheck disable=SC2086
 	$CC $CFLAGS -DNFSP_TARGET_FAULT_INJECT -I"$SRC" -c "$SRC/target.c" \
