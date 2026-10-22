@@ -23,10 +23,28 @@ type byteFact struct {
 	Index  int    `json:"argument_index"`
 	Length uint64 `json:"length_bytes"`
 }
+type flockFact struct {
+	Index    int    `json:"argument_index"`
+	LockType uint64 `json:"lock_type"`
+}
+type nlmRPCFact struct {
+	Index     int     `json:"argument_index"`
+	Version   uint64  `json:"version"`
+	Procedure uint64  `json:"procedure"`
+	Block     *uint64 `json:"block,omitempty"`
+}
+type timespecFact struct {
+	Index       int    `json:"argument_index"`
+	Seconds     uint64 `json:"seconds"`
+	Nanoseconds uint64 `json:"nanoseconds"`
+}
 type facts struct {
 	Origins  []originFact  `json:"origins"`
 	Integers []integerFact `json:"integers"`
 	Bytes    []byteFact    `json:"byte_lengths"`
+	Flock    *flockFact    `json:"flock,omitempty"`
+	NLMRPC   *nlmRPCFact   `json:"nlm_rpc,omitempty"`
+	Timespec *timespecFact `json:"timespec,omitempty"`
 }
 type parsedCall struct {
 	Index        int    `json:"index"`
@@ -156,6 +174,17 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 					f.Origins = append(f.Origins, originFact{i, "fd", origin})
 				}
 			}
+			if call.Meta.Name == "fcntl$lock" && i == 2 {
+				if lockType, ok := fieldValue(arg, "type"); ok {
+					f.Flock = &flockFact{i, lockType}
+				}
+			}
+			if call.Meta.CallName == "syz_send_nlm_rpc" && i == 1 {
+				f.NLMRPC = nlmRPC(arg, i)
+			}
+			if call.Meta.CallName == "nanosleep" && i == 0 {
+				f.Timespec = timespec(arg, i)
+			}
 		}
 		result.Calls = append(result.Calls, parsedCall{index, call.Meta.Name, "available", f})
 		if a, ok := profileAcquisition(call); ok {
@@ -197,6 +226,84 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 		return a.Origin < b.Origin
 	})
 	return result, nil
+}
+
+// fieldArg follows only typed pointer, union and struct nodes from the parser.
+func fieldArg(arg prog.Arg, name string) (prog.Arg, bool) {
+	for {
+		switch a := arg.(type) {
+		case *prog.PointerArg:
+			if a.Res == nil {
+				return nil, false
+			}
+			arg = a.Res
+		case *prog.UnionArg:
+			arg = a.Option
+		case *prog.GroupArg:
+			typ, ok := a.Type().(*prog.StructType)
+			if !ok || len(typ.Fields) != len(a.Inner) {
+				return nil, false
+			}
+			for i, field := range typ.Fields {
+				if field.Name == name {
+					return a.Inner[i], true
+				}
+			}
+			return nil, false
+		default:
+			return nil, false
+		}
+	}
+}
+
+func fieldValue(arg prog.Arg, name string) (uint64, bool) {
+	field, ok := fieldArg(arg, name)
+	if !ok || field.Dir() != prog.DirIn {
+		return 0, false
+	}
+	switch value := field.(type) {
+	case *prog.ConstArg:
+		return value.Val, true
+	case *prog.ResultArg:
+		if value.Res == nil {
+			return value.Val, true
+		}
+	}
+	return 0, false
+}
+
+func nlmRPC(arg prog.Arg, index int) *nlmRPCFact {
+	version, ok := fieldValue(arg, "vers")
+	if !ok {
+		return nil
+	}
+	body, ok := fieldArg(arg, "body")
+	if !ok {
+		return nil
+	}
+	procedure, ok := fieldValue(body, "proc")
+	if !ok {
+		return nil
+	}
+	fact := &nlmRPCFact{Index: index, Version: version, Procedure: procedure}
+	if args, ok := fieldArg(body, "args"); ok {
+		if block, ok := fieldValue(args, "block"); ok {
+			fact.Block = &block
+		}
+	}
+	return fact
+}
+
+func timespec(arg prog.Arg, index int) *timespecFact {
+	seconds, ok := fieldValue(arg, "sec")
+	if !ok {
+		return nil
+	}
+	nanoseconds, ok := fieldValue(arg, "nsec")
+	if !ok {
+		return nil
+	}
+	return &timespecFact{index, seconds, nanoseconds}
 }
 
 func isNfsAcquisition(name string) bool {

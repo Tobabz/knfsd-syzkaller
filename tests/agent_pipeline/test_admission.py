@@ -21,16 +21,19 @@ from agent_pipeline.admission import (
     CallAdmissionEntry,
     CallAdmissionProfile,
     CallResourceFacts,
+    FlockFact,
     IntegerFact,
     IntegerRangeConstraint,
     NeutralControlCatalog,
     NeutralControlEntry,
+    NlmRpcFact,
     ProgramResourceUsage,
     ResourceOriginConstraint,
     ResourceOriginFact,
     SyzkallerBuildManifest,
     SyzkallerCallTable,
     SyzkallerTargetIdentity,
+    TimespecFact,
     UntrustedAuthority,
     load_call_admission_authority,
     load_call_admission_profile,
@@ -99,6 +102,46 @@ def valid_facts(*, origin: str = "lane-root") -> CallResourceFacts:
             argument_index=0, resource_type="fd", origin=origin),),
         integers=(IntegerFact(argument_index=1, value=3),),
         byte_lengths=(ByteLengthFact(argument_index=2, length_bytes=128),))
+
+
+def test_optional_nlm_facts_preserve_legacy_canonical_encoding():
+    original = {"origins": [], "integers": [], "byte_lengths": []}
+    record = CallResourceFacts.model_validate_json(canonical_json(original))
+    assert canonical_json(record) == canonical_json(original)
+    assert hashlib.sha256(canonical_json(record)).hexdigest() == hashlib.sha256(
+        canonical_json(original)).hexdigest()
+    assert CallResourceFacts.model_validate_json(canonical_json(record)) == record
+
+
+def test_optional_nlm_facts_are_strict_and_canonical():
+    facts = CallResourceFacts(
+        flock=FlockFact(argument_index=2, lock_type=1),
+        nlm_rpc=NlmRpcFact(argument_index=1, version=4, procedure=2, block=1),
+        timespec=TimespecFact(argument_index=0, seconds=1, nanoseconds=0))
+    encoded = canonical_json(facts)
+    assert CallResourceFacts.model_validate_json(encoded) == facts
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        CallResourceFacts.model_validate({**facts.model_dump(), "unexpected": 1})
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        NlmRpcFact.model_validate({"argument_index": 1, "version": 4,
+                                   "procedure": 2, "unknown": 0})
+    with pytest.raises(ValidationError):
+        TimespecFact(argument_index=0, seconds=-1, nanoseconds=0)
+
+
+@pytest.mark.parametrize("field", ("flock", "nlm_rpc", "timespec"))
+def test_optional_nlm_facts_reject_explicit_null(field):
+    with pytest.raises(ValidationError, match="omitted instead of null"):
+        CallResourceFacts.model_validate_json(canonical_json({
+            "origins": [], "integers": [], "byte_lengths": [], field: None,
+        }))
+
+
+def test_nlm_rpc_block_rejects_explicit_null():
+    with pytest.raises(ValidationError, match="omitted instead of null"):
+        NlmRpcFact.model_validate_json(canonical_json({
+            "argument_index": 1, "version": 4, "procedure": 2, "block": None,
+        }))
 
 
 @pytest.fixture

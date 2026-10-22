@@ -34,6 +34,34 @@ jobs:
       - run: uv sync --locked
       - run: uv run pytest -q
 
+  syzkaller-bridge:
+    # Build the parser from this checkout; bridge-backed tests must not pass
+    # against a locally pinned binary built from different Go sources.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.0'
+          cache: false
+      - run: uv sync --locked
+      - name: Fetch syzkaller at the pinned base
+        run: |
+          commit=$(sed -n 's/^syzkaller_commit=//p' bundle/patches/BASE)
+          git init -q "$RUNNER_TEMP/syzkaller"
+          git -C "$RUNNER_TEMP/syzkaller" fetch -q --depth 1 \
+            https://github.com/google/syzkaller.git "$commit"
+          git -C "$RUNNER_TEMP/syzkaller" checkout -q FETCH_HEAD
+      - name: Build and test the pinned parser bridge
+        run: |
+          uv run python tools/syzkaller/build.py \
+            --source "$RUNNER_TEMP/syzkaller" \
+            --output "$RUNNER_TEMP/syz-bridge" --go "$(command -v go)"
+          KNFSD_SYZ_BUNDLE="$RUNNER_TEMP/syz-bridge/bundle" \
+            uv run pytest -q tests/agent_pipeline/syzkaller
+
   lane-inputs:
     # Lane dependency assembly and bake inputs, and the lane script's
     # quoted sh -c region, without booting a guest.
