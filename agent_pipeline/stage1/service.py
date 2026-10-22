@@ -98,8 +98,6 @@ class Stage1Parts:
     #: False for one-shot commands: Agent Tasks are recorded but not run,
     #: and the service loop (``run``) sends them.
     run_agents: bool = True
-    #: Optional host preparation after candidate intake; not part of Q1 execution.
-    prepare_candidate: Callable[[Store, Path], Callable[[str], object]] | None = None
     #: None until a Proxy build is configured: a Stage 2 rule set then waits
     #: in blocked_operator(stage2_compiler_unavailable).
     compiler: MutationRuleCompiler | None = None
@@ -184,12 +182,10 @@ class Stage1Service:
                   materializer=parts.materializer, judge=self.judge,
                   compiler=parts.compiler, stage2=self.stage2_judge)
         extra = {} if parts.new_id is None else {"new_id": parts.new_id}
-        preparer = (parts.prepare_candidate(self.store, state)
-                    if parts.prepare_candidate is not None else None)
         self.controller = Controller(
             self.store, env, self.runner, self.agents, self.issues,
             parts.registry, parts.tree, self.artifacts, parts.judge_versions,
-            prepare_candidate=preparer, **extra)
+            **extra)
         self.agents.sink = self.controller
         self.publisher = Q1AuthorityPublisher(
             self.store, self.runner, self.receipts, self.bridge,

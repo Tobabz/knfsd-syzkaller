@@ -969,13 +969,15 @@ def _stop_manager(process: subprocess.Popen, timeout_s: float) -> bool:
 
 def _campaign_manager(inputs: _Inputs) -> dict[str, Any]:
     manager = json.loads(json.dumps(inputs.manager))
+    kcsan = inputs.descriptor.sanitizer is Sanitizer.KCSAN
+    if not kcsan and ("kcsan_policy_file" in manager or
+                      "kcsan_policy" in manager):
+        raise Stage2StepError("non-KCSAN campaign selects a KCSAN policy")
+    if not kcsan:
+        return manager
     state_dir = inputs.execution.state_dir
     if state_dir is None:
-        if inputs.descriptor.sanitizer is Sanitizer.KCSAN:
-            raise Stage2StepError("KCSAN campaign lacks Controller state")
-        if "kcsan_policy_file" in manager:
-            raise Stage2StepError("non-KCSAN campaign selects a KCSAN policy")
-        return manager
+        raise Stage2StepError("KCSAN campaign lacks Controller state")
 
     state = Path(state_dir)
     database = state / "controller.sqlite"

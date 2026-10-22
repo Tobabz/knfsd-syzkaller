@@ -70,8 +70,7 @@ class Controller:
                  registry: HarnessRegistry, tree: SourceTree,
                  artifacts: ArtifactStore, judge_versions: JudgeVersions,
                  clock: Callable[[], str] = _utc_now,
-                 new_id: Callable[[], str] = lambda: uuid.uuid4().hex[:12],
-                 prepare_candidate: Callable[[str], object] | None = None
+                 new_id: Callable[[], str] = lambda: uuid.uuid4().hex[:12]
                  ) -> None:
         self.store = store
         self.machine = Machine(env)
@@ -88,7 +87,6 @@ class Controller:
         self.judge_versions = store.judge_versions() or judge_versions
         self.clock = clock
         self.new_id = new_id
-        self.prepare_candidate = prepare_candidate
         self.failures: list[EffectFailure] = []
 
     # ------------------------------------------------------------ intake
@@ -359,7 +357,6 @@ class Controller:
                 # start() failed or never ran: whether the executor took it
                 # is unknown, so send a new attempt, as recover() does; a
                 # late result of this one makes no transition (09 §8).
-                self._prepare_candidate(job)
                 self._apply(job_id, ev.AgentAttemptRestarted(
                     task_id=p.task_id, attempt=p.attempt + 1))
             elif a.status == "succeeded":
@@ -409,7 +406,6 @@ class Controller:
         for task_id in job.cancelling_tasks:
             self._guard(job_id, f"cancel:{task_id}",
                         lambda t=task_id: self._cancel(job_id, t))
-        self._prepare_candidate(job)
         self._guard(job_id, "link_issue",
                     lambda: self._link_gap(self.store.job(job_id)))
         job = self.store.job(job_id)
@@ -570,7 +566,6 @@ class Controller:
 
     def _dispatch(self, job_id: str) -> None:
         job = self.store.job(job_id)
-        self._prepare_candidate(job)
         p = job.pending_task
         if p is None:
             return
@@ -613,11 +608,6 @@ class Controller:
                     job_id=job_id, harness_ref=job.harness.harness_ref,
                     execution_harness_id=job.harness.execution_harness_id))
             self._take_status(job_id, p.task_id, st)
-
-    def _prepare_candidate(self, job: Job) -> None:
-        if self.prepare_candidate is not None and job.candidate is not None \
-                and job.state not in TERMINAL:
-            self.prepare_candidate(job.job_id)
 
     def _prior_repairs(self, job_id: str, p) -> tuple[str, ...]:
         """The stored RepairInputs of the job's earlier Stage 1 repairs,

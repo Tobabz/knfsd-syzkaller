@@ -247,7 +247,8 @@ def stage2_parts(tmp_path, store, *, check=None, mode="") -> Stage2Parts:
         resource_key="test-lane-0", collector_id="test-stage2",
         replay_proxy=tmp_path / "nfs-proxy", crash_window_bound=4,
         env={"LANG": "C.UTF-8", "TEST_PCS": "4096", "TEST_MODE": mode},
-        limits=ProcessLimits(timeout_s=60), poll_interval_s=0.05)
+        limits=ProcessLimits(timeout_s=60), poll_interval_s=0.05,
+        state_dir=tmp_path / "state")
 
     def check_rules(proxy, rule_set, work):
         return check or Compatibility(True, None, "rules ok")
@@ -319,6 +320,11 @@ def test_reached_job_runs_stage2_to_crash_review(tmp_path, build):
         for state in (JobState.S2_GATE, JobState.S2_CAMPAIGN,
                       JobState.S2_REPLAYING):
             assert state in seen
+        executions = list((tmp_path / "state" / "stage2-runs").glob(
+            "*/input/execution.json"))
+        assert executions
+        assert all(json.loads(path.read_text())["state_dir"] == str(tmp_path / "state")
+                   for path in executions)
         gate = job.gate_runs[0]
         assert gate.q1.status.value == "reached"
         assert [(r.rule_id, r.status) for r in gate.rules] == [

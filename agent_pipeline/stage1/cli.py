@@ -40,7 +40,6 @@ from .engine import CommandEngineConfig, CommandExecutionEngine
 from ..stage2.authority import Stage2Profiles
 from ..stage2.engine import Stage2CommandEngine, Stage2EngineConfig
 from .service import Stage1Parts, Stage1Service, Stage2Parts
-from kcsan_pipeline import ProgramPolicyPipeline
 
 #: States where the loop has nothing to do until a person acts.
 STOP_STATES = TERMINAL | {JobState.S1_REACHED, JobState.S1_APPROVAL,
@@ -109,10 +108,6 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
                 crash_window_bound=c.crash_window_bound))
 
     tree = GitSourceTree(config.kernel_repo)
-
-    def preparer(store, root):
-        return ProgramPolicyPipeline(
-            store, root / "kcsan-policies").prepare
     parts = Stage1Parts(
         state_dir=state, artifacts=artifacts, tree=tree,
         registry=ArtifactHarnessRegistry(artifacts, config.harness_catalog_ref),
@@ -129,7 +124,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         compiler=None if config.nfs_proxy is None else
         ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
                                      state / "compile"),
-        stage2=stage2, prepare_candidate=preparer)
+        stage2=stage2)
     return stack.enter_context(Stage1Service(parts))
 
 

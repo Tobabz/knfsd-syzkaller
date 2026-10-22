@@ -17,7 +17,7 @@ import pytest
 
 from agent_pipeline.components import InMemoryRegistry
 from agent_pipeline.contracts import (CandidateSubmission, LocationKind,
-                                      LocationRequest, Q1Status)
+                                      LocationRequest, Q1Status, Sanitizer)
 from agent_pipeline.controller.records import JobState, TaskKind
 from agent_pipeline.q1 import CandidateTarget, KernelIdentity, TargetPcMapping
 from agent_pipeline.runner.process_supervisor import ProcessLimits, ProcessSupervisor
@@ -173,6 +173,20 @@ def submit(service, build) -> str:
         kernel_commit=build.binding.kernel_commit, location=LocationRequest(
             kind=LocationKind.FUNCTION, path="fs/nfsd/synthetic.c",
             symbol="target")), "p1")
+
+
+def test_kcsan_payload_is_deferred_until_campaign(tmp_path, build):
+    with make_service(tmp_path, build, run_agents=False) as service:
+        service.store.save_policy(policy("kcsan", sanitizer=Sanitizer.KCSAN))
+        service.parts.registry.put(build.binding.model_copy(
+            update={"sanitizer": Sanitizer.KCSAN}))
+        job_id = service.controller.submit(CandidateSubmission(
+            kernel_commit=build.binding.kernel_commit,
+            location=LocationRequest(kind=LocationKind.FUNCTION,
+                                     path="fs/nfsd/synthetic.c",
+                                     symbol="target")), "kcsan")
+        assert service.job(job_id).pending_task.kind is TaskKind.AGENT
+        assert not (tmp_path / "state" / "kcsan-policies").exists()
 
 
 def register_mapping(service, build, job_id, pcs=(4096,)) -> str:
