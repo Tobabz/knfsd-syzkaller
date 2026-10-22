@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Union
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, model_serializer, model_validator
 
 from .artifacts import ArtifactStore
 from .contracts import Commit, Record, Sha256
@@ -239,14 +239,21 @@ class NlmRpcFact(AuthorityRecord):
     argument_index: int = Field(ge=0, le=4095)
     version: int = Field(ge=0, le=2**64 - 1)
     procedure: int = Field(ge=0, le=2**64 - 1)
-    block: int | None = Field(default=None, ge=0, le=2**64 - 1,
-                              exclude_if=lambda value: value is None)
+    #: Left out of the encoding when unset, like the optional call facts.
+    block: int | None = Field(default=None, ge=0, le=2**64 - 1)
 
     @model_validator(mode="after")
     def _no_null_block(self):
         if "block" in self.model_fields_set and self.block is None:
             raise ValueError("block must be omitted instead of null")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_block(self, handler):
+        data = handler(self)
+        if data.get("block") is None:
+            data.pop("block", None)
+        return data
 
 
 class TimespecFact(AuthorityRecord):
@@ -261,12 +268,11 @@ class CallResourceFacts(AuthorityRecord):
     origins: tuple[ResourceOriginFact, ...] = ()
     integers: tuple[IntegerFact, ...] = ()
     byte_lengths: tuple[ByteLengthFact, ...] = ()
-    flock: FlockFact | None = Field(default=None,
-                                   exclude_if=lambda value: value is None)
-    nlm_rpc: NlmRpcFact | None = Field(default=None,
-                                      exclude_if=lambda value: value is None)
-    timespec: TimespecFact | None = Field(default=None,
-                                         exclude_if=lambda value: value is None)
+    #: Left out of the encoding when unset, so records stored before these
+    #: facts keep their bytes and digests.
+    flock: FlockFact | None = None
+    nlm_rpc: NlmRpcFact | None = None
+    timespec: TimespecFact | None = None
 
     @model_validator(mode="after")
     def _no_null_facts(self):
@@ -274,6 +280,14 @@ class CallResourceFacts(AuthorityRecord):
                 for name in ("flock", "nlm_rpc", "timespec")):
             raise ValueError("optional fact must be omitted instead of null")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_facts(self, handler):
+        data = handler(self)
+        for name in ("flock", "nlm_rpc", "timespec"):
+            if data.get(name) is None:
+                data.pop(name, None)
+        return data
 
     @model_validator(mode="after")
     def _shape(self) -> CallResourceFacts:
