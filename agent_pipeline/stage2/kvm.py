@@ -460,7 +460,7 @@ def _manager_cmdline(vm: dict[str, Any], descriptor: ExecutionHarnessDescriptor,
     selection = harness.runtime_selection
     expected_fixture = ({"koov.nfs_version": selection.nfs_version}
                         if selection.fixture_mode == "single" else
-                        {"koov.nfs_fixture": "broad-knfsd"})
+                        {"koov.nfs_fixture": selection.fixture_mode})
     required = {**expected_fixture, "koov.nfs_target": "1",
                 "koov.lane_sha256": lane_sha256}
     for key, value in required.items():

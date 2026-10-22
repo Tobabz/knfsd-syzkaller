@@ -25,12 +25,13 @@ from pydantic_ai.messages import (ModelRequest, ModelResponse,  # noqa: E402
                                   RetryPromptPart, ToolCallPart)
 from pydantic_ai.models import Model  # noqa: E402
 from pydantic_ai.models.wrapper import WrapperModel  # noqa: E402
-from pydantic_ai.usage import UsageLimits  # noqa: E402
+from pydantic_ai.usage import RunUsage, UsageLimits  # noqa: E402
 
-from ..contracts import AgentModelPolicy
-from .runtime import OutputRejected, RuntimeRequest, RuntimeResult
-from .tools import (TOOL_DEFINITIONS, BackendBoundaryError, Stage1Toolbox,
-                    ToolBoundaryError)
+from ..contracts import AgentModelPolicy, AgentUsage
+from .runtime import (OutputRejected, RuntimeRequest, RuntimeResult,
+                      attach_usage)
+from .tools import (BackendBoundaryError, Stage1Toolbox, ToolBoundaryError,
+                    known_tool_set)
 
 OUTPUT_TOOL = "stage1_result"
 ModelFactory = Callable[[AgentModelPolicy], Model]
@@ -44,10 +45,12 @@ class PydanticAIRuntimeError(RuntimeError):
 class RuntimeLimits:
     """Trusted host limits, independent of the Controller task retry budget."""
 
-    max_requests: int = 16
-    max_tool_calls: int = 32
-    request_timeout_seconds: float = 60
-    run_timeout_seconds: float = 300
+    # Sized for a Planning run that reads source and syzlang, then checks
+    # its draft with validate_program more than once (#75).
+    max_requests: int = 32
+    max_tool_calls: int = 96
+    request_timeout_seconds: float = 180
+    run_timeout_seconds: float = 1200
 
     def __post_init__(self) -> None:
         for name in ("max_requests", "max_tool_calls"):
@@ -59,6 +62,14 @@ class RuntimeLimits:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value <= 0):
                 raise ValueError(f"{name} must be finite and positive")
+
+
+def _agent_usage(*usages: RunUsage) -> AgentUsage:
+    return AgentUsage(
+        requests=sum(u.requests for u in usages),
+        tool_calls=sum(u.tool_calls for u in usages),
+        input_tokens=sum(u.input_tokens for u in usages),
+        output_tokens=sum(u.output_tokens for u in usages))
 
 
 def _response_identity(response: ModelResponse) -> str:
@@ -83,6 +94,10 @@ class _ResponseGuard(WrapperModel):
         self.allowed_tools = frozenset(request.tools.names) | {OUTPUT_TOOL}
         self.limits = limits
         self.requests = 0
+        #: Responses received but refused here.  PydanticAI counts a
+        #: response only once the request returns it, so a refused one
+        #: never reaches the run's usage.
+        self.rejected = RunUsage()
 
     async def request(self, messages, model_settings, model_request_parameters):
         # PydanticAI has separate text-path and output-tool retry counters.
@@ -100,13 +115,19 @@ class _ResponseGuard(WrapperModel):
         async with asyncio.timeout(self.limits.request_timeout_seconds):
             response = await self.wrapped.request(
                 messages, model_settings, model_request_parameters)
-        _response_identity(response)
-        if response.usage.output_tokens > self.policy.max_output_tokens:
-            raise UsageLimitExceeded("response exceeds max_output_tokens")
-        for part in response.parts:
-            if isinstance(part, ToolCallPart) and part.tool_name not in self.allowed_tools:
-                raise PydanticAIRuntimeError(
-                    f"tool is not registered: {part.tool_name}")
+        try:
+            _response_identity(response)
+            if response.usage.output_tokens > self.policy.max_output_tokens:
+                raise UsageLimitExceeded("response exceeds max_output_tokens")
+            for part in response.parts:
+                if isinstance(part, ToolCallPart) and \
+                        part.tool_name not in self.allowed_tools:
+                    raise PydanticAIRuntimeError(
+                        f"tool is not registered: {part.tool_name}")
+        except Exception:
+            self.rejected.requests += 1
+            self.rejected.incr(response.usage)
+            raise
         return response
 
 
@@ -156,7 +177,7 @@ class PydanticAIRuntime:
         return asyncio.run(self._run(request))
 
     async def _run(self, request: RuntimeRequest) -> RuntimeResult:
-        if request.tools.definitions != TOOL_DEFINITIONS:
+        if not known_tool_set(request.tools.definitions):
             raise PydanticAIRuntimeError("unexpected Stage 1 tool definitions")
         if not isinstance(request.output_type, type) or not issubclass(
                 request.output_type, BaseModel):
@@ -181,8 +202,9 @@ class PydanticAIRuntime:
             envelope = create_model(
                 "Stage1Response", result=(request.output_type, ...),
                 __config__=ConfigDict(extra="forbid"))
+            guard = _ResponseGuard(model, request, self.limits)
             agent = Agent(
-                _ResponseGuard(model, request, self.limits),
+                guard,
                 output_type=ToolOutput(envelope, name=OUTPUT_TOOL),
                 instructions=request.instructions, tools=tools,
                 retries={"tools": TOOL_RETRIES,
@@ -202,24 +224,40 @@ class PydanticAIRuntime:
                 except (OutputRejected, ValidationError) as exc:
                     raise ModelRetry(str(exc)) from exc
 
-            async with asyncio.timeout(self.limits.run_timeout_seconds):
-                result = await agent.run(
-                    request.prompt,
-                    model_settings={
-                        "max_tokens": request.model_policy.max_output_tokens,
-                        "timeout": self.limits.request_timeout_seconds,
-                        "parallel_tool_calls": False,
-                    },
-                    usage_limits=UsageLimits(
-                        request_limit=self.limits.max_requests,
-                        tool_calls_limit=self.limits.max_tool_calls,
-                        output_tokens_limit=(self.limits.max_requests
-                                             * request.model_policy.max_output_tokens),
-                    ),
-                    infer_name=False,
-                )
-            return RuntimeResult(output=result.output.result,
-                                 model_id=_response_identity(result.response))
+            settings = {
+                "max_tokens": request.model_policy.max_output_tokens,
+                "timeout": self.limits.request_timeout_seconds,
+                "parallel_tool_calls": False,
+            }
+            if request.model_policy.reasoning_effort is not None and \
+                    request.model_policy.provider == "openai":
+                settings["openai_reasoning_effort"] = \
+                    request.model_policy.reasoning_effort
+            # Caller-owned, so a run that fails (a limit, a deadline, a
+            # provider error) still reports what it used.
+            run_usage = RunUsage()
+            try:
+                async with asyncio.timeout(self.limits.run_timeout_seconds):
+                    result = await agent.run(
+                        request.prompt,
+                        model_settings=settings,
+                        usage_limits=UsageLimits(
+                            request_limit=self.limits.max_requests,
+                            tool_calls_limit=self.limits.max_tool_calls,
+                            output_tokens_limit=(
+                                self.limits.max_requests
+                                * request.model_policy.max_output_tokens),
+                        ),
+                        usage=run_usage,
+                        infer_name=False,
+                    )
+            except Exception as exc:
+                attach_usage(exc, _agent_usage(run_usage, guard.rejected))
+                raise
+            return RuntimeResult(
+                output=result.output.result,
+                model_id=_response_identity(result.response),
+                usage=_agent_usage(result.usage))
         finally:
             if client is not None:
                 await client.close()

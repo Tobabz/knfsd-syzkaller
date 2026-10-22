@@ -23,10 +23,28 @@ type byteFact struct {
 	Index  int    `json:"argument_index"`
 	Length uint64 `json:"length_bytes"`
 }
+type flockFact struct {
+	Index    int    `json:"argument_index"`
+	LockType uint64 `json:"lock_type"`
+}
+type nlmRPCFact struct {
+	Index     int     `json:"argument_index"`
+	Version   uint64  `json:"version"`
+	Procedure uint64  `json:"procedure"`
+	Block     *uint64 `json:"block,omitempty"`
+}
+type timespecFact struct {
+	Index       int    `json:"argument_index"`
+	Seconds     uint64 `json:"seconds"`
+	Nanoseconds uint64 `json:"nanoseconds"`
+}
 type facts struct {
 	Origins  []originFact  `json:"origins"`
 	Integers []integerFact `json:"integers"`
 	Bytes    []byteFact    `json:"byte_lengths"`
+	Flock    *flockFact    `json:"flock,omitempty"`
+	NLMRPC   *nlmRPCFact   `json:"nlm_rpc,omitempty"`
+	Timespec *timespecFact `json:"timespec,omitempty"`
 }
 type parsedCall struct {
 	Index        int    `json:"index"`
@@ -156,11 +174,30 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 					f.Origins = append(f.Origins, originFact{i, "fd", origin})
 				}
 			}
+			if call.Meta.Name == "fcntl$lock" && i == 2 {
+				if lockType, ok := fieldValue(arg, "type"); ok {
+					f.Flock = &flockFact{i, lockType}
+				}
+			}
+			if call.Meta.CallName == "syz_send_nlm_rpc" && i == 1 {
+				f.NLMRPC = nlmRPC(arg, i)
+			}
+			if call.Meta.CallName == "nanosleep" && i == 0 {
+				f.Timespec = timespec(arg, i)
+			}
 		}
 		result.Calls = append(result.Calls, parsedCall{index, call.Meta.Name, "available", f})
 		if a, ok := profileAcquisition(call); ok {
 			roots[call.Ret] = a.Origin
 			acquired[a] = true
+		} else if call.Meta.CallName == "syz_open_nlm_lane_file" {
+			// The executor opens a regular file strictly beneath the lane
+			// directory (openat2 RESOLVE_BENEATH|NO_XDEV|NO_SYMLINKS|
+			// NO_MAGICLINKS, NFS superblock), so the file keeps the
+			// directory's profile origin. Nothing else is closed.
+			if origin := argumentOrigin(roots, call, 0); origin != "" && call.Ret != nil && isFD(call.Ret) {
+				roots[call.Ret] = origin
+			}
 		} else if isNfsAcquisition(call.Meta.CallName) {
 			// Silently omitting an acquisition could hide a second, conflicting
 			// profile beside a supported acquisition in the same program.
@@ -191,6 +228,84 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 	return result, nil
 }
 
+// fieldArg follows only typed pointer, union and struct nodes from the parser.
+func fieldArg(arg prog.Arg, name string) (prog.Arg, bool) {
+	for {
+		switch a := arg.(type) {
+		case *prog.PointerArg:
+			if a.Res == nil {
+				return nil, false
+			}
+			arg = a.Res
+		case *prog.UnionArg:
+			arg = a.Option
+		case *prog.GroupArg:
+			typ, ok := a.Type().(*prog.StructType)
+			if !ok || len(typ.Fields) != len(a.Inner) {
+				return nil, false
+			}
+			for i, field := range typ.Fields {
+				if field.Name == name {
+					return a.Inner[i], true
+				}
+			}
+			return nil, false
+		default:
+			return nil, false
+		}
+	}
+}
+
+func fieldValue(arg prog.Arg, name string) (uint64, bool) {
+	field, ok := fieldArg(arg, name)
+	if !ok || field.Dir() != prog.DirIn {
+		return 0, false
+	}
+	switch value := field.(type) {
+	case *prog.ConstArg:
+		return value.Val, true
+	case *prog.ResultArg:
+		if value.Res == nil {
+			return value.Val, true
+		}
+	}
+	return 0, false
+}
+
+func nlmRPC(arg prog.Arg, index int) *nlmRPCFact {
+	version, ok := fieldValue(arg, "vers")
+	if !ok {
+		return nil
+	}
+	body, ok := fieldArg(arg, "body")
+	if !ok {
+		return nil
+	}
+	procedure, ok := fieldValue(body, "proc")
+	if !ok {
+		return nil
+	}
+	fact := &nlmRPCFact{Index: index, Version: version, Procedure: procedure}
+	if args, ok := fieldArg(body, "args"); ok {
+		if block, ok := fieldValue(args, "block"); ok {
+			fact.Block = &block
+		}
+	}
+	return fact
+}
+
+func timespec(arg prog.Arg, index int) *timespecFact {
+	seconds, ok := fieldValue(arg, "sec")
+	if !ok {
+		return nil
+	}
+	nanoseconds, ok := fieldValue(arg, "nsec")
+	if !ok {
+		return nil
+	}
+	return &timespecFact{index, seconds, nanoseconds}
+}
+
 func isNfsAcquisition(name string) bool {
 	switch name {
 	case "syz_open_nfs_lane_profile", "syz_open_nfs_lane", "syz_open_nfs_lane_pair",
@@ -198,6 +313,17 @@ func isNfsAcquisition(name string) bool {
 		return true
 	}
 	return false
+}
+
+func argumentOrigin(roots map[*prog.ResultArg]string, call *prog.Call, index int) string {
+	if index >= len(call.Args) {
+		return ""
+	}
+	ref, ok := call.Args[index].(*prog.ResultArg)
+	if !ok || ref.Res == nil || ref.OpDiv != 0 || ref.OpAdd != 0 || !isFD(ref) {
+		return ""
+	}
+	return roots[ref.Res]
 }
 
 func isFD(arg *prog.ResultArg) bool {
@@ -262,7 +388,10 @@ func preservesRoots(name string) bool {
 		"getdents", "getdents64", "fsync", "fdatasync", "fstat", "fstatfs", "lseek",
 		"ftruncate", "fallocate", "flock", "fchmod", "fchown", "fadvise64", "readahead",
 		"sync_file_range", "copy_file_range", "fsetxattr", "fgetxattr", "flistxattr", "fremovexattr",
-		"openat", "nanosleep", "syz_nfsd_client_ctl", "syz_nfsd_cld_ctl":
+		"openat", "nanosleep", "syz_nfsd_client_ctl", "syz_nfsd_cld_ctl",
+		// NLM lane calls (0030) and fcntl neither close nor rebind an
+		// existing descriptor; F_DUPFD returns a new, unrooted one.
+		"fcntl", "recvfrom", "syz_socket_connect_nlm", "syz_nlm_lane_fh", "syz_send_nlm_rpc":
 		return true
 	}
 	return false

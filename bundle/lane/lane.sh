@@ -24,9 +24,16 @@
 #                     passed to the Ganesha process; with ASan requested,
 #                     keep the daemon in the foreground so its ASan reports
 #                     reach the per-lane server.log rather than /dev/null.
-#   NFS_FIXTURE       single (default) | broad-knfsd.  broad-knfsd is an
-#                     experimental fixture that mounts knfsd through NFSv3,
-#                     v4.0, v4.1, and v4.2 at the same time.
+#   NFS_FIXTURE       single (default) | broad-knfsd | nlm-knfsd.  broad-knfsd
+#                     is an experimental fixture that mounts knfsd through
+#                     NFSv3, v4.0, v4.1, and v4.2 at the same time.
+#                     nlm-knfsd is the single NFSv3 fixture with NLM locking:
+#                     both knfsd mounts lock through the kernel lockd, every
+#                     lane namespace runs its own rpcbind and rpc.statd, and
+#                     lockd listens on TCP and UDP port 4045 (fs.nfs
+#                     nlm_tcpport/nlm_udpport) with a 10 s NLM grace period.
+#                     It needs SERVER_IMPL=both and leaves Ganesha mounts
+#                     with nolock.
 #   NFS_VERSION       3 | 4.0 | 4.1 (default) | 4.2; single fixture only
 #   KOOV_NFSV4_LEASE_TIME
 #                     knfsd lease time (default 10 for single, 90 for broad)
@@ -88,11 +95,29 @@ domain_control=$domain_directory/domain_control
 domain_state=$domain_directory/domain
 executor_root=/syz-nfs-lanes
 fixture_mode=${NFS_FIXTURE:-single}
+# fixture_label is the recorded mode.  nlm-knfsd is laid out exactly like the
+# single NFSv3 fixture, so fixture_mode stays "single" and nlm_lane adds the
+# locking pieces on top of it.
+fixture_label=$fixture_mode
+nlm_lane=0
 case "$fixture_mode" in
     single) nfs_version=${NFS_VERSION:-4.${NFS_MINOR_VERSION:-1}} ;;
     broad-knfsd) nfs_version=4.1 ;;
-    *) echo "NFS_FIXTURE must be single or broad-knfsd" >&2; exit 2 ;;
+    nlm-knfsd)
+        test -z "${NFS_VERSION:-}" || test "$NFS_VERSION" = 3 || {
+            echo "nlm-knfsd is an NFSv3 fixture" >&2; exit 2; }
+        nfs_version=3
+        fixture_mode=single
+        nlm_lane=1
+        ;;
+    *) echo "NFS_FIXTURE must be single, broad-knfsd or nlm-knfsd" >&2; exit 2 ;;
 esac
+# lockd port in every lane namespace (fs.nfs.nlm_tcpport is global) and the
+# fixed rpc.statd ports.  The executor connects to the server lockd here.
+nlm_port=4045
+nlm_grace_period=10
+statd_port=662
+statd_outgoing_port=2020
 case "$nfs_version" in
     3) nfs_minor_version=; nfs_mount_type=nfs ;;
     4.0|4.1|4.2) nfs_minor_version=${nfs_version#4.}; nfs_mount_type=nfs4 ;;
@@ -112,6 +137,10 @@ case "$server_impl" in
 esac
 if [ "$fixture_mode" = broad-knfsd ] && [ "$server_impl" != both ]; then
     echo "broad-knfsd requires SERVER_IMPL=both for proxy-backed mounts" >&2
+    exit 2
+fi
+if [ "$nlm_lane" = 1 ] && [ "$server_impl" != both ]; then
+    echo "nlm-knfsd requires SERVER_IMPL=both for proxy-backed mounts" >&2
     exit 2
 fi
 tmpfs_size=${KOOV_TMPFS_SIZE:-256m}
@@ -163,7 +192,8 @@ if [ -z "$ganesha_port" ]; then
     esac
 fi
 export server_port server_impl tmpfs_size knfsd_port ganesha_port nfs_version
-export fixture_mode nfs4_lease_time
+export fixture_mode nfs4_lease_time nlm_lane nlm_port statd_port
+export statd_outgoing_port
 # deps is needed inside the sh -c block: the Ganesha FSAL bind-mounts source
 # from the injected tree, and that path must not be hardcoded twice.
 export deps
@@ -235,8 +265,14 @@ mount_lane_export()
             mount_export=$root/lane$mount_lane/server/export-ganesha
             mount_mountport=20049
         fi
+        # Only the NLM fixture locks, and only on knfsd: Ganesha runs with
+        # Enable_NLM = false.
+        mount_lock=nolock
+        if [ "$nlm_lane" = 1 ] && [ "$mount_backend" = knfsd ]; then
+            mount_lock=lock
+        fi
         nsenter --net="/run/netns/$mount_ns" -- \
-            mount.nfs -o "vers=3,proto=tcp,port=$mount_port,mountproto=tcp,mountport=$mount_mountport,nolock,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
+            mount.nfs -o "vers=3,proto=tcp,port=$mount_port,mountproto=tcp,mountport=$mount_mountport,$mount_lock,sec=sys,actimeo=0,lookupcache=none,nosharecache" \
             "$mount_ip:$mount_export" "$mount_target"
     else
         nsenter --net="/run/netns/$mount_ns" -- \
@@ -526,6 +562,91 @@ create_domain()
     printf '%s\n' "$domain_client_value" > "$domain_root/clients.domain"
 }
 
+# NLM fixture (nlm-knfsd).  The kernel registers lockd with the rpcbind of
+# the namespace it starts in, trying the abstract socket, then the
+# /var/run/rpcbind.sock path in the mounting process's mount namespace, then
+# 127.0.0.1:111.  The clients mount from the root mount namespace, so a
+# root-namespace rpcbind would receive the client lockd registration of
+# every lane.  Stop it and require that nothing listens on its path.
+nlm_prepare_host()
+{
+    if awk '$8 == "/run/rpcbind.sock" || $8 == "/var/run/rpcbind.sock" {
+            found = 1 } END { exit !found }' /proc/net/unix; then
+        systemctl stop rpcbind.socket rpcbind.service >/dev/null 2>&1 || true
+    fi
+    if awk '$8 == "/run/rpcbind.sock" || $8 == "/var/run/rpcbind.sock" {
+            found = 1 } END { exit !found }' /proc/net/unix; then
+        echo "KOOV: a root-namespace rpcbind still listens; nlm-knfsd needs it stopped" >&2
+        return 1
+    fi
+    printf '%s\n' "$nlm_port" > /proc/sys/fs/nfs/nlm_tcpport
+    printf '%s\n' "$nlm_port" > /proc/sys/fs/nfs/nlm_udpport
+    printf '%s\n' "$nlm_grace_period" > /proc/sys/fs/nfs/nlm_grace_period
+    test "$(cat /proc/sys/fs/nfs/nlm_tcpport)" -eq "$nlm_port"
+    test "$(cat /proc/sys/fs/nfs/nlm_udpport)" -eq "$nlm_port"
+}
+
+# Run rpcbind and rpc.statd in a client network namespace, each with its own
+# /run and /var/lib/nfs, before that client mounts with locking.  The kernel
+# NSM upcall and the server's GRANTED callbacks find them through 127.0.0.1
+# and the client address of this namespace.
+nlm_start_client_daemons()
+{
+    nlm_lane_id=$1
+    nlm_client=$2
+    nlm_ns=$3
+    nlm_state=$root/lane$nlm_lane_id/client$nlm_client.nlm
+    mkdir -p "$nlm_state/run" "$nlm_state/nfs/statd/sm" \
+        "$nlm_state/nfs/statd/sm.bak"
+    ip netns exec "$nlm_ns" sh -c '
+        set -eu
+        state=$1
+        mount --bind "$state/run" /run
+        mount --bind "$state/nfs" /var/lib/nfs
+        mkdir -p /run/rpcbind
+        rpcbind -w
+        nlm_wait=0
+        until rpcinfo -p 127.0.0.1 >/dev/null 2>&1; do
+            nlm_wait=$((nlm_wait + 1))
+            test "$nlm_wait" -lt 50 || {
+                echo "KOOV: client rpcbind did not become ready" >&2
+                exit 1
+            }
+            sleep 0.1
+        done
+        rpc.statd --no-notify --port "$statd_port" \
+            --outgoing-port "$statd_outgoing_port" \
+            --state-directory-path /var/lib/nfs/statd
+        nlm_wait=0
+        until rpcinfo -T tcp 127.0.0.1 status 1 >/dev/null 2>&1; do
+            nlm_wait=$((nlm_wait + 1))
+            test "$nlm_wait" -lt 100 || {
+                echo "KOOV: client rpc.statd did not register" >&2
+                exit 1
+            }
+            sleep 0.1
+        done
+    ' sh "$nlm_state" > "$nlm_state.log" 2>&1 || {
+        cat "$nlm_state.log" >&2
+        return 1
+    }
+}
+
+# A shared lock through each knfsd mount waits out the NLM grace period and
+# proves the client lockd, both statd daemons and the server lockd answer.
+# The lock is released when flock exits.
+nlm_probe_mount()
+{
+    timeout 60 flock -s -n "$1/shared/fixture" true
+}
+
+# Status: NLM is registered and answering in the given namespace.
+nlm_registered()
+{
+    "$@" rpcinfo -T tcp 127.0.0.1 nlockmgr 4 >/dev/null 2>&1 &&
+        "$@" rpcinfo -T tcp 127.0.0.1 status 1 >/dev/null 2>&1
+}
+
 setup_client()
 {
     client_lane=$1
@@ -731,6 +852,21 @@ setup_lane()
                 sleep 0.1
             done
         fi
+        if [ "$nlm_lane" = 1 ]; then
+            mkdir -p /var/lib/nfs/statd/sm /var/lib/nfs/statd/sm.bak
+            rpc.statd --no-notify --port "$statd_port" \
+                --outgoing-port "$statd_outgoing_port" \
+                --state-directory-path /var/lib/nfs/statd
+            nlm_wait=0
+            until rpcinfo -T tcp 127.0.0.1 status 1 >/dev/null 2>&1; do
+                nlm_wait=$((nlm_wait + 1))
+                test "$nlm_wait" -lt 100 || {
+                    echo "KOOV: server rpc.statd did not register" >&2
+                    exit 1
+                }
+                sleep 0.1
+            done
+        fi
         if [ "$fixture_mode" = broad-knfsd ]; then
             printf "%s\n" "-2 +3 +4 +4.0 +4.1 +4.2" > /proc/fs/nfsd/versions
         elif [ "$nfs_version" = 3 ]; then
@@ -750,6 +886,18 @@ setup_lane()
         nfsdcld
         printf "tcp $knfsd_port\n" > /proc/fs/nfsd/portlist
         printf "4\n" > /proc/fs/nfsd/threads
+        if [ "$nlm_lane" = 1 ]; then
+            # NFSv3 starts lockd in this namespace with the threads.
+            nlm_wait=0
+            until rpcinfo -T tcp 127.0.0.1 nlockmgr 4 >/dev/null 2>&1; do
+                nlm_wait=$((nlm_wait + 1))
+                test "$nlm_wait" -lt 100 || {
+                    echo "KOOV: server lockd did not register" >&2
+                    exit 1
+                }
+                sleep 0.1
+            done
+        fi
         fi
         # KOOV: Ganesha V15 VFS does not export tmpfs. Use a bounded ext4
         # loop image for its separate tree; knfsd keeps its tmpfs.
@@ -1112,6 +1260,10 @@ EOF
             setup_client0_backend=knfsd
             setup_client1_backend=ganesha
         fi
+        if [ "$nlm_lane" = 1 ]; then
+            nlm_start_client_daemons "$setup_lane_id" 0 "$setup_client0_ns"
+            nlm_start_client_daemons "$setup_lane_id" 1 "$setup_client1_ns"
+        fi
         setup_client "$setup_lane_id" 0 "$setup_client0_ns" \
             "$setup_server0_ip" "$server_port" "$setup_client0_backend"
         setup_client "$setup_lane_id" 1 "$setup_client1_ns" \
@@ -1121,6 +1273,10 @@ EOF
                 ganesha "$setup_server1_ip"
             setup_cross_mount "$setup_lane_id" 1 "$setup_client1_ns" \
                 knfsd "$setup_server0_ip"
+        fi
+        if [ "$nlm_lane" = 1 ]; then
+            nlm_probe_mount "$setup_lane_root/client0/mnt"
+            nlm_probe_mount "$setup_lane_root/client1/knfsd"
         fi
     fi
 
@@ -1478,9 +1634,21 @@ status_fixture()
     status_count=$(cat "$root/fixture.count")
     valid_count "$status_count"
     status_mode=$(cat "$root/fixture.mode")
-    case "$status_mode" in single|broad-knfsd) ;; *) return 1 ;; esac
+    status_label=$status_mode
+    nlm_lane=0
+    case "$status_mode" in
+        single|broad-knfsd) ;;
+        nlm-knfsd) status_mode=single; nlm_lane=1 ;;
+        *) return 1 ;;
+    esac
     status_version=$(cat "$root/fixture.version")
     case "$status_version" in 3|4.0|4.1|4.2) ;; *) return 1 ;; esac
+    if [ "$nlm_lane" = 1 ]; then
+        test "$status_version" = 3
+        test "$server_impl" = both
+        test "$(cat /proc/sys/fs/nfs/nlm_tcpport)" -eq "$nlm_port"
+        test "$(cat /proc/sys/fs/nfs/nlm_udpport)" -eq "$nlm_port"
+    fi
     status_trace=$(cat "$root/fixture.trace")
     case "$status_trace" in 0|1) ;; *) return 1 ;; esac
     proxy_target_dir=$(cat "$root/fixture.target")
@@ -1517,9 +1685,14 @@ status_fixture()
             status_profiles='["knfsd-v41","ganesha-v41"]'
         fi
     fi
-    printf '{"lane_count":%s,"fixture_mode":"%s","profiles":%s,"nfs_version":"%s","nfs_minor":%s,"nfs_trace":%s,"nfs_target":%s,"localio":"N","lanes":[' \
-        "$status_count" "$status_mode" "$status_profiles" \
-        "$status_version" "$status_minor_json" "$status_trace" "$status_target"
+    status_nlm_port=null
+    if [ "$nlm_lane" = 1 ]; then
+        status_nlm_port=$nlm_port
+    fi
+    printf '{"lane_count":%s,"fixture_mode":"%s","profiles":%s,"nfs_version":"%s","nfs_minor":%s,"nfs_trace":%s,"nfs_target":%s,"nlm_port":%s,"localio":"N","lanes":[' \
+        "$status_count" "$status_label" "$status_profiles" \
+        "$status_version" "$status_minor_json" "$status_trace" "$status_target" \
+        "$status_nlm_port"
     status_lane=0
     status_previous_epoch=0
     while test "$status_lane" -lt "$status_count"; do
@@ -1590,6 +1763,33 @@ status_fixture()
             "$status_expected_domain"
         test "$(in_netns_with_host_mounts "$status_client1_ns" cat "$domain_state")" = \
             "$status_expected_domain"
+
+        if [ "$nlm_lane" = 1 ]; then
+            # lockd and rpc.statd answer in all three namespaces, the server
+            # lockd listens on the pinned port, and both knfsd mounts lock.
+            status_nlm_hex=$(printf "%04X" "$nlm_port")
+            nsenter -t "$status_server_pid" -n -- awk -v p="$status_nlm_hex" \
+                '$2 ~ ":"p"$" && $4 == "0A" { n++ } END { exit !n }' \
+                /proc/net/tcp
+            nlm_registered nsenter -t "$status_server_pid" -n -- || {
+                echo "KOOV: server lockd or rpc.statd is not registered" >&2
+                return 1
+            }
+            for status_nlm_ns in "$status_client0_ns" "$status_client1_ns"; do
+                nlm_registered ip netns exec "$status_nlm_ns" || {
+                    echo "KOOV: client lockd or rpc.statd is not registered" >&2
+                    return 1
+                }
+            done
+            for status_nlm_mount in "$status_lane_root/client0/mnt" \
+                "$status_lane_root/client1/knfsd"; do
+                case ",$(findmnt -n -o OPTIONS -- "$status_nlm_mount")," in
+                    *,nolock,*)
+                        echo "KOOV: knfsd mount $status_nlm_mount has nolock" >&2
+                        return 1 ;;
+                esac
+            done
+        fi
 
         # KOOV: the nfsd gates are knfsd-specific, and the client-facing
         # port is no longer hardcoded to 2049.
@@ -1843,7 +2043,7 @@ setup)
     fi; exit "$rc"' EXIT
     mkdir -p "$root"
     printf '%s\n' "$requested_count" > "$root/fixture.count"
-    printf '%s\n' "$fixture_mode" > "$root/fixture.mode"
+    printf '%s\n' "$fixture_label" > "$root/fixture.mode"
     printf '%s\n' "$nfs_version" > "$root/fixture.version"
     printf '%s\n' "$nfs_trace" > "$root/fixture.trace"
     printf '%s\n' "$proxy_target_dir" > "$root/fixture.target"
@@ -1858,6 +2058,9 @@ setup)
         exit 1
     fi
     printf '%s\n' "$requested_count" > "$executor_root/.lane_count"
+    if [ "$nlm_lane" = 1 ]; then
+        nlm_prepare_host
+    fi
     setup_index=0
     while test "$setup_index" -lt "$requested_count"; do
         setup_lane "$setup_index"

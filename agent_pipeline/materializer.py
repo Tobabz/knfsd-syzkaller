@@ -325,6 +325,38 @@ def _hcap12_program_error(parsed: ParsedProgram) -> str | None:
     return None
 
 
+HCAP13_ID = "HCAP-13"
+HCAP13_FIXTURE = "nlm-knfsd"
+HCAP13_CALLS = frozenset({
+    "recvfrom$inet_nlm_tcp", "syz_nlm_lane_fh", "syz_open_nlm_lane_file",
+    "syz_send_nlm_rpc",
+})
+HCAP13_CALL_PREFIXES = ("syz_socket_connect_nlm$",)
+
+
+def _is_hcap13_call(name: str) -> bool:
+    return name in HCAP13_CALLS or name.startswith(HCAP13_CALL_PREFIXES)
+
+
+def _hcap13_program_error(parsed: ParsedProgram, *, role: str,
+                          selection: RuntimeSelection,
+                          required_capabilities: tuple[str, ...]
+                          ) -> str | None:
+    """Return why NLM lane calls are outside HCAP-13's validated fixture.
+
+    The NLM calls reach the lane lockd only on the nlm-knfsd fixture; on any
+    other fixture lockd is not listening on the pinned port and the knfsd
+    mounts use nolock.  A neutral control never carries them.
+    """
+    hcap13 = role == "scenario" and HCAP13_ID in required_capabilities
+    if hcap13 and selection.fixture_mode != HCAP13_FIXTURE:
+        return "fixture_not_nlm"
+    if not hcap13 and any(_is_hcap13_call(call.call)
+                          for call in parsed.calls):
+        return "nlm_without_hcap13"
+    return None
+
+
 class SyzParseFailure(ValueError):
     """A deterministic strict-parse refusal from the injected parser.
 
@@ -457,10 +489,28 @@ class _Failure(Exception):
     reason: str
     detail: str
     profile: str | None = None
+    message: str = ""
 
     def result(self) -> MaterializeRejected:
         return MaterializeRejected(reason=self.reason, detail=self.detail,
-                                   profile=self.profile)
+                                   profile=self.profile, message=self.message)
+
+
+#: Bound on a parser diagnostic carried to the Agent as a repair finding.
+MAX_PARSER_MESSAGE_CHARS = 1024
+
+
+def parser_message(error: BaseException) -> str:
+    """The parser's own diagnostic, printable ASCII on one line, bounded.
+
+    It describes the Agent's own program text (a line, a token, an unknown
+    call), so it is safe to return to the Agent as untrusted data."""
+    text = " | ".join(line.strip() for line in str(error).splitlines()
+                      if line.strip())
+    text = "".join(ch if " " <= ch <= "~" else "?" for ch in text)
+    if len(text) > MAX_PARSER_MESSAGE_CHARS:
+        text = text[:MAX_PARSER_MESSAGE_CHARS - 3] + "..."
+    return text
 
 
 _INVALID_RECORD = (ValueError, TypeError, RecursionError)
@@ -478,8 +528,8 @@ class ArtifactHarnessMaterializer:
 
     @staticmethod
     def _fail(reason: str, detail: str, *,
-              profile: str | None = None) -> None:
-        raise _Failure(reason, detail, profile)
+              profile: str | None = None, message: str = "") -> None:
+        raise _Failure(reason, detail, profile, message)
 
     def _load_plan(self, plan_ref: str) -> ReachabilityPlan:
         try:
@@ -657,7 +707,8 @@ class ArtifactHarnessMaterializer:
             raise
         except SyzParseFailure as error:
             self._parser_refusal(error, role)
-            self._fail(PARSE_FAILURE, f"{role}_strict_parse_failed")
+            self._fail(PARSE_FAILURE, f"{role}_strict_parse_failed",
+                       message=parser_message(error))
         except (ValueError, TypeError, RecursionError):
             self._fail(PARSE_FAILURE, f"{role}_strict_parse_failed")
         if type(parsed) is not ParsedProgram:
@@ -724,6 +775,13 @@ class ArtifactHarnessMaterializer:
             # HCAP-12 scenario contract may carry it, never a neutral control.
             self._fail(CALL_NOT_ADMITTED,
                        f"{role}_hcap12_program_contract:cld_without_hcap12")
+        error = _hcap13_program_error(
+            parsed, role=role, selection=selection,
+            required_capabilities=required_capabilities)
+        if error is not None:
+            self._fail(PROFILE_FIXTURE_ROUTE_MISMATCH
+                       if error == "fixture_not_nlm" else CALL_NOT_ADMITTED,
+                       f"{role}_hcap13_program_contract:{error}")
         if role == "scenario" and HCAP11_ID in required_capabilities:
             error = _hcap11_program_error(parsed)
             if error is not None:
@@ -857,79 +915,104 @@ class ArtifactHarnessMaterializer:
                     effective_hcap_revision=binding.hcap_revision,
                     validation="exact_plan_revision")
             plan = self._load_plan(plan_ref)
-            approval = self._approval(binding)
-            descriptor = approval.descriptor
-            self._runtime(descriptor, plan.runtime_selection)
-            catalog = self._hcap(binding, plan, hcap_authority)
-            identity = descriptor.syzkaller_identity
-            self._seed(plan, catalog, identity)
-
-            try:
-                admission = load_call_admission_authority(
-                    self.artifacts, binding.hcap_revision,
-                    expected_identity=identity)
-                neutral = load_neutral_control_authority(
-                    self.artifacts, binding.hcap_revision,
-                    expected_identity=identity)
-                call_table = load_record(
-                    self.artifacts, identity.call_table_sha256,
-                    SyzkallerCallTable)
-            except OSError:
-                raise
-            except _INVALID_RECORD:
-                self._fail(HOST_AUTHORITY_UNAVAILABLE,
-                           "invalid_materializer_authority")
-
-            neutral_choice = neutral.select(
-                plan.runtime_selection, identity=identity)
-            if not neutral_choice.selected:
-                if neutral_choice.reason == "neutral_control_unavailable":
-                    self._fail(
-                        NEUTRAL_CONTROL_UNAVAILABLE,
-                        "no exact neutral control runtime selection",
-                        profile=plan.runtime_selection.profile)
-                self._fail(HOST_AUTHORITY_UNAVAILABLE,
-                           "neutral_control_identity_mismatch")
-            neutral_required = neutral_choice.required_capability_ids
-            if not set(neutral_required) <= set(plan.required_capabilities):
-                self._fail(CALL_NOT_ADMITTED,
-                           "neutral_capability_not_required_by_plan")
-
-            scenario_bytes = self._program_bytes(
-                plan.program_proposal.artifact_ref,
-                limit=admission.profile.limits.max_program_bytes,
-                role="scenario")
-            neutral_bytes = self._program_bytes(
-                neutral_choice.program_ref,
-                limit=admission.profile.limits.max_program_bytes,
-                role="neutral")
-            scenario_parsed = self._parse(
-                scenario_bytes, plan.program_proposal.artifact_ref,
-                role="scenario", identity=identity)
-            neutral_parsed = self._parse(
-                neutral_bytes, neutral_choice.program_ref,
-                role="neutral", identity=identity)
-            scenario_caps = self._admit(
-                scenario_parsed, role="scenario",
-                selection=plan.runtime_selection,
-                required_capabilities=plan.required_capabilities,
-                authority=admission, call_table=call_table)
-            neutral_caps = self._admit(
-                neutral_parsed, role="neutral",
-                selection=plan.runtime_selection,
-                required_capabilities=neutral_required,
-                authority=admission, call_table=call_table)
-            if not set(neutral_required) <= set(neutral_caps):
-                self._fail(CALL_NOT_ADMITTED,
-                           "neutral_catalog_capability_not_exercised")
-            selected = tuple(sorted(set(scenario_caps) | set(neutral_caps)))
-            return self._persist(
-                plan_ref=plan_ref, plan=plan, binding=binding,
-                descriptor=descriptor, admission=admission,
-                neutral=neutral,
-                neutral_program_ref=neutral_choice.program_ref,
-                scenario_parsed=scenario_parsed,
-                neutral_parsed=neutral_parsed,
-                selected_capabilities=selected)
+            checked = self._check(plan, binding, hcap_authority)
+            return self._persist(plan_ref=plan_ref, plan=plan,
+                                 binding=binding, **checked)
         except _Failure as failure:
             return failure.result()
+
+    def check_draft(self, plan: ReachabilityPlan, program: bytes | None,
+                    binding: HarnessBinding) -> MaterializeRejected | None:
+        """Every check ``materialize`` makes, on a plan not yet stored.
+
+        ``program`` is an inline program's bytes, whose digest the plan's
+        proposal names; a seed's bytes are read from the store.  Nothing
+        is written: this answers an Agent's question about its draft
+        during the run (#75).  None means ``materialize`` would accept the
+        same plan under the same binding and authority.
+        """
+        try:
+            authority = MaterializationHcapAuthority(
+                effective_hcap_revision=binding.hcap_revision,
+                validation="exact_plan_revision")
+            self._check(plan, binding, authority, scenario_bytes=program)
+        except _Failure as failure:
+            return failure.result()
+        return None
+
+    def _check(self, plan: ReachabilityPlan, binding: HarnessBinding,
+               hcap_authority: MaterializationHcapAuthority, *,
+               scenario_bytes: bytes | None = None) -> dict:
+        approval = self._approval(binding)
+        descriptor = approval.descriptor
+        self._runtime(descriptor, plan.runtime_selection)
+        catalog = self._hcap(binding, plan, hcap_authority)
+        identity = descriptor.syzkaller_identity
+        self._seed(plan, catalog, identity)
+
+        try:
+            admission = load_call_admission_authority(
+                self.artifacts, binding.hcap_revision,
+                expected_identity=identity)
+            neutral = load_neutral_control_authority(
+                self.artifacts, binding.hcap_revision,
+                expected_identity=identity)
+            call_table = load_record(
+                self.artifacts, identity.call_table_sha256,
+                SyzkallerCallTable)
+        except OSError:
+            raise
+        except _INVALID_RECORD:
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
+                       "invalid_materializer_authority")
+
+        neutral_choice = neutral.select(
+            plan.runtime_selection, identity=identity)
+        if not neutral_choice.selected:
+            if neutral_choice.reason == "neutral_control_unavailable":
+                self._fail(
+                    NEUTRAL_CONTROL_UNAVAILABLE,
+                    "no exact neutral control runtime selection",
+                    profile=plan.runtime_selection.profile)
+            self._fail(HOST_AUTHORITY_UNAVAILABLE,
+                       "neutral_control_identity_mismatch")
+        neutral_required = neutral_choice.required_capability_ids
+        if not set(neutral_required) <= set(plan.required_capabilities):
+            self._fail(CALL_NOT_ADMITTED,
+                       "neutral_capability_not_required_by_plan")
+
+        limit = admission.profile.limits.max_program_bytes
+        if scenario_bytes is None or plan.program_proposal.kind != "program":
+            scenario_bytes = self._program_bytes(
+                plan.program_proposal.artifact_ref, limit=limit,
+                role="scenario")
+        elif len(scenario_bytes) > limit:
+            self._fail(DISALLOWED_OR_UNAVAILABLE_CALL,
+                       "scenario_program_limit_exceeded")
+        neutral_bytes = self._program_bytes(
+            neutral_choice.program_ref, limit=limit, role="neutral")
+        scenario_parsed = self._parse(
+            scenario_bytes, plan.program_proposal.artifact_ref,
+            role="scenario", identity=identity)
+        neutral_parsed = self._parse(
+            neutral_bytes, neutral_choice.program_ref,
+            role="neutral", identity=identity)
+        scenario_caps = self._admit(
+            scenario_parsed, role="scenario",
+            selection=plan.runtime_selection,
+            required_capabilities=plan.required_capabilities,
+            authority=admission, call_table=call_table)
+        neutral_caps = self._admit(
+            neutral_parsed, role="neutral",
+            selection=plan.runtime_selection,
+            required_capabilities=neutral_required,
+            authority=admission, call_table=call_table)
+        if not set(neutral_required) <= set(neutral_caps):
+            self._fail(CALL_NOT_ADMITTED,
+                       "neutral_catalog_capability_not_exercised")
+        return dict(
+            descriptor=descriptor, admission=admission, neutral=neutral,
+            neutral_program_ref=neutral_choice.program_ref,
+            scenario_parsed=scenario_parsed, neutral_parsed=neutral_parsed,
+            selected_capabilities=tuple(
+                sorted(set(scenario_caps) | set(neutral_caps))))

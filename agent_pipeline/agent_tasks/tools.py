@@ -8,17 +8,21 @@ rejected.  Result counts, snippets and source excerpts are bounded before
 they cross the runtime boundary.
 
 There is deliberately no generic filesystem, shell, process, write,
-artifact-by-path or network tool here.
+artifact-by-path or network tool here.  The one check tool,
+``validate_program``, runs the host's deterministic, side-effect-free plan
+checks (pinned parser, call admission, HCAP) on a draft; it writes nothing
+and is never a verdict.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Literal, Protocol, Sequence
+from typing import Callable, Literal, Protocol, Sequence
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from ..contracts import Record
 from ..hcap import ArtifactHcapChecker, HcapCatalog
@@ -29,6 +33,7 @@ from ..protocol_schema import (SN_DISCRIMINANT, SN_LIST_ELEMENT,
 from ..semantic_promotion import (PromotedSemanticCapabilityRegistry,
                                   promoted_registry)
 from ..intake import ANALYSIS_ROOTS, in_analysis_roots, line_count
+from .planning import ReachabilityPlanDraft
 
 SOURCE_PREFIXES = ANALYSIS_ROOTS
 MAX_SOURCE_LINES = 400
@@ -41,6 +46,10 @@ MAX_HCAP_TEXT_BYTES = 1024
 MAX_SEMANTIC_PATH_RESULTS = 32
 MAX_SEMANTIC_PATH_SCAN = 4096
 MAX_SEMANTIC_PATH_DEPTH = 64
+MAX_VALIDATION_TEXT_BYTES = 2048
+MAX_SYZLANG_RESULTS = 16
+MAX_SYZLANG_BLOCK_BYTES = 1536
+MAX_KNOWLEDGE_TEXT_BYTES = 32 * 1024
 
 
 class ToolBoundaryError(ValueError):
@@ -177,6 +186,113 @@ class SemanticPathLookupArgs(ToolArgs):
                               pattern=r"\S")
     max_results: int = Field(default=MAX_SEMANTIC_PATH_RESULTS, ge=1,
                              le=MAX_SEMANTIC_PATH_RESULTS)
+
+
+class ValidateProgramArgs(ToolArgs):
+    plan: ReachabilityPlanDraft
+
+
+class ProgramValidation(Record):
+    """What the host's plan checks say about a draft.  ``accepted`` means
+    only that materialization would accept it now; Q1 decides reachability.
+    ``stage`` names the check that refused: schema (the draft itself),
+    request (it disagrees with the trusted task), materializer (HCAP, parse
+    or call admission) or host (the check could not run)."""
+
+    accepted: bool
+    stage: Literal["schema", "request", "materializer", "host"] | None = None
+    reason: str | None = None
+    detail: str = ""
+    message: str = ""
+
+
+#: Runs the host checks on a draft; bound by the toolbox factory to one
+#: task's binding and trusted request.
+ProgramValidator = Callable[[ReachabilityPlanDraft], ProgramValidation]
+
+
+class SyzlangSearchArgs(ToolArgs):
+    query: str = Field(min_length=2, max_length=160, pattern=r"\S")
+    max_results: int = Field(default=8, ge=1, le=MAX_SYZLANG_RESULTS)
+
+
+class SyzlangReadArgs(ToolArgs):
+    path: str | None = Field(default=None, max_length=256)
+    start_line: int = Field(default=1, ge=1)
+    end_line: int = Field(default=MAX_SOURCE_LINES, ge=1)
+
+
+class HarnessPatchArgs(ToolArgs):
+    patch: str = Field(min_length=4, max_length=256)
+
+
+class ReferenceProgramArgs(ToolArgs):
+    program_id: str | None = Field(default=None, max_length=256)
+
+
+class SyzlangBlock(Record):
+    path: str
+    line: int
+    text: str
+    truncated: bool
+
+
+class SyzlangMatches(Record):
+    blocks: tuple[SyzlangBlock, ...]
+    truncated: bool
+
+
+class SyzlangFileInfo(Record):
+    path: str
+    line_count: int
+    complete: bool
+
+
+class SyzlangExcerpt(Record):
+    """With no path, ``files`` lists the description files; otherwise
+    ``text`` holds the requested lines of one."""
+
+    files: tuple[SyzlangFileInfo, ...] = ()
+    path: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    text: str = ""
+    complete: bool = True
+    truncated: bool = False
+
+
+class HarnessPatch(Record):
+    name: str
+    subject: str
+    message: str
+    syzlang_hunks: str
+    truncated: bool
+
+
+class ReferenceProgramInfo(Record):
+    program_id: str
+    kind: str
+    runtime_selections: tuple[dict, ...]
+    required_capability_ids: tuple[str, ...]
+
+
+class ReferencePrograms(Record):
+    programs: tuple[ReferenceProgramInfo, ...] = ()
+    program_id: str | None = None
+    text: str = ""
+    truncated: bool = False
+
+
+class KnowledgeSource(Protocol):
+    """``knowledge.HarnessKnowledge``: pinned artifacts of an HCAP."""
+
+    def syzlang(self, revision: str) -> dict: ...
+
+    def patches(self, revision: str) -> list: ...
+
+    def reference_programs(self, revision: str) -> list: ...
+
+    def program_text(self, ref: str, max_bytes: int) -> bytes: ...
 
 
 class SourceExcerpt(Record):
@@ -317,7 +433,9 @@ TOOL_DEFINITIONS = (
         CalleeLookupArgs),
     ToolDefinition(
         "lookup_hcap",
-        "Read bounded capability data from the task's pinned HCAP revision.",
+        "Read bounded capability data from the task's pinned HCAP revision. "
+        "When read_harness_patch is registered, it opens a source_refs "
+        "entry that names a syzkaller series patch.",
         HcapLookupArgs),
     ToolDefinition(
         "lookup_semantic_scope",
@@ -332,6 +450,58 @@ TOOL_DEFINITIONS = (
         "the pinned HCAP revision. query optionally filters paths.",
         SemanticPathLookupArgs),
 )
+
+KNOWLEDGE_TOOLS = (
+    ToolDefinition(
+        "search_syzlang",
+        "Literal search in the syzlang descriptions the pinned syzkaller "
+        "patch series adds (sys/linux/*.txt). Returns whole description "
+        "blocks: a call, struct, flags or resource with its comments.",
+        SyzlangSearchArgs),
+    ToolDefinition(
+        "read_syzlang",
+        f"Read at most {MAX_SOURCE_LINES} lines of one pinned syzlang "
+        "description file. Without path, list the files.",
+        SyzlangReadArgs),
+    ToolDefinition(
+        "read_harness_patch",
+        "Read one pinned syzkaller series patch by its 4-digit number or "
+        "name, as an HCAP source_refs entry such as "
+        "bundle/patches/syzkaller/0020-* names it: subject, message and "
+        "its syzlang description hunks.",
+        HarnessPatchArgs),
+    ToolDefinition(
+        "lookup_reference_programs",
+        "List admitted harness programs the pinned HCAP selects (neutral "
+        "controls and seeds) with their runtime selection; with "
+        "program_id, read one program's syz text. They show working lane "
+        "setup and call syntax, not the candidate.",
+        ReferenceProgramArgs),
+)
+
+VALIDATE_PROGRAM_TOOL = ToolDefinition(
+    "validate_program",
+    "Check a complete ReachabilityPlanDraft with the host's pinned syz "
+    "parser, call admission and HCAP plan check, exactly as the "
+    "Materializer will after you answer. Costs no repair attempt and "
+    "stores nothing. Returns accepted, or the refusing check with its "
+    "reason, detail and parser message. Acceptance is not a Q1 verdict.",
+    ValidateProgramArgs)
+
+
+#: Every tool set a toolbox may expose: the read-only base, then each
+#: optional group the factory bound, in this order.
+OPTIONAL_TOOL_GROUPS = (KNOWLEDGE_TOOLS, (VALIDATE_PROGRAM_TOOL,))
+
+
+def known_tool_set(definitions: tuple[ToolDefinition, ...]) -> bool:
+    if definitions[:len(TOOL_DEFINITIONS)] != TOOL_DEFINITIONS:
+        return False
+    rest = definitions[len(TOOL_DEFINITIONS):]
+    for group in OPTIONAL_TOOL_GROUPS:
+        if rest[:len(group)] == group:
+            rest = rest[len(group):]
+    return rest == ()
 
 
 def _bounded(value: str, limit: int) -> tuple[str, bool]:
@@ -471,28 +641,41 @@ def _roots(path_prefix: str | None) -> tuple[str, ...]:
 
 
 class Stage1Toolbox:
-    """Pinned dispatcher containing exactly seven read-only tools."""
+    """Pinned dispatcher containing seven read-only tools, plus the
+    harness knowledge tools when the factory binds a knowledge source and
+    ``validate_program`` when it binds a program validator."""
 
     def __init__(self, source: KernelSourceIndex, hcap: HcapSource, *,
-                 kernel_commit: str, hcap_revision: str) -> None:
+                 kernel_commit: str, hcap_revision: str,
+                 program_validator: ProgramValidator | None = None,
+                 knowledge: KnowledgeSource | None = None) -> None:
         self._source = source
         self._hcap = hcap
         self._commit = kernel_commit
         self._hcap_revision = hcap_revision
-        self._definitions = {item.name: item for item in TOOL_DEFINITIONS}
+        self._validator = program_validator
+        self._knowledge = knowledge
+        self._all = TOOL_DEFINITIONS
+        if knowledge is not None:
+            self._all += KNOWLEDGE_TOOLS
+        if program_validator is not None:
+            self._all += (VALIDATE_PROGRAM_TOOL,)
+        self._definitions = {item.name: item for item in self._all}
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        return TOOL_DEFINITIONS
+        return self._all
 
     @property
     def names(self) -> tuple[str, ...]:
-        return tuple(item.name for item in TOOL_DEFINITIONS)
+        return tuple(item.name for item in self._all)
 
     def invoke(self, name: str, arguments: dict) -> Record:
         definition = self._definitions.get(name)
         if definition is None:
             raise ToolBoundaryError(f"tool is not registered: {name}")
+        if definition is VALIDATE_PROGRAM_TOOL:
+            return self._validate_program(arguments)
         parsed = definition.arguments.model_validate(arguments)
         if isinstance(parsed, ReadSourceArgs):
             return self._read(parsed)
@@ -508,7 +691,146 @@ class Stage1Toolbox:
             return self._lookup_semantic_scope()
         if isinstance(parsed, SemanticPathLookupArgs):
             return self._lookup_semantic_paths(parsed)
+        if isinstance(parsed, SyzlangSearchArgs):
+            return self._search_syzlang(parsed)
+        if isinstance(parsed, SyzlangReadArgs):
+            return self._read_syzlang(parsed)
+        if isinstance(parsed, HarnessPatchArgs):
+            return self._read_harness_patch(parsed)
+        if isinstance(parsed, ReferenceProgramArgs):
+            return self._reference_programs(parsed)
         raise AssertionError("unhandled Stage 1 tool arguments")
+
+    # ------------------------------------------------ harness knowledge
+
+    def _knowledge_call(self, method: str, *args):
+        # A missing authority is the HCAP's answer, not a call mistake;
+        # it ends the call with a message the model can act on.
+        from .knowledge import KnowledgeUnavailable
+        try:
+            return getattr(self._knowledge, method)(self._hcap_revision,
+                                                    *args)
+        except KnowledgeUnavailable as exc:
+            raise ToolBoundaryError(str(exc)) from exc
+        except ValueError as exc:
+            raise BackendBoundaryError(
+                f"pinned harness knowledge is unreadable: {exc}") from exc
+
+    def _search_syzlang(self, args: SyzlangSearchArgs) -> SyzlangMatches:
+        files = self._knowledge_call("syzlang")
+        blocks: list[SyzlangBlock] = []
+        more = False
+        for item in files.values():
+            lines = item.lines
+            i = 0
+            while i < len(lines):
+                if not lines[i].strip():
+                    i += 1
+                    continue
+                start = i
+                while i < len(lines) and lines[i].strip():
+                    i += 1
+                text = "\n".join(lines[start:i])
+                if args.query not in text:
+                    continue
+                if len(blocks) == args.max_results:
+                    more = True
+                    break
+                bounded, cut = _bounded(text, MAX_SYZLANG_BLOCK_BYTES)
+                blocks.append(SyzlangBlock(path=item.path, line=start + 1,
+                                           text=bounded, truncated=cut))
+            if more:
+                break
+        return SyzlangMatches(blocks=tuple(blocks), truncated=more)
+
+    def _read_syzlang(self, args: SyzlangReadArgs) -> SyzlangExcerpt:
+        files = self._knowledge_call("syzlang")
+        if args.path is None:
+            return SyzlangExcerpt(files=tuple(
+                SyzlangFileInfo(path=item.path, line_count=len(item.lines),
+                                complete=item.complete)
+                for item in files.values()))
+        item = files.get(args.path)
+        if item is None:
+            raise ToolBoundaryError(
+                f"no pinned syzlang description file: {args.path}")
+        if args.end_line < args.start_line:
+            raise ToolBoundaryError("end_line precedes start_line")
+        if args.end_line - args.start_line + 1 > MAX_SOURCE_LINES:
+            raise ToolBoundaryError(
+                f"read at most {MAX_SOURCE_LINES} lines")
+        end = min(args.end_line, len(item.lines))
+        text, cut = _bounded(
+            "\n".join(item.lines[args.start_line - 1:end]),
+            MAX_SOURCE_BYTES)
+        return SyzlangExcerpt(path=item.path, start_line=args.start_line,
+                              end_line=end, text=text,
+                              complete=item.complete, truncated=cut)
+
+    def _read_harness_patch(self, args: HarnessPatchArgs) -> HarnessPatch:
+        wanted = PurePosixPath(args.patch).name.rstrip("*").rstrip("-")
+        matches = [patch for patch in self._knowledge_call("patches")
+                   if patch.name == wanted or
+                   patch.name.startswith(wanted + "-")]
+        if len(matches) != 1:
+            raise ToolBoundaryError(
+                f"no single pinned syzkaller patch matches {args.patch}")
+        patch = matches[0]
+        hunks = "\n\n".join(f"{path}\n{text}"
+                             for path, text in patch.syzlang_hunks)
+        message, cut_message = _bounded(patch.message, MAX_HCAP_TEXT_BYTES)
+        hunks, cut_hunks = _bounded(hunks, MAX_KNOWLEDGE_TEXT_BYTES)
+        return HarnessPatch(name=patch.name, subject=patch.subject,
+                            message=message, syzlang_hunks=hunks,
+                            truncated=cut_message or cut_hunks)
+
+    def _reference_programs(self, args: ReferenceProgramArgs
+                            ) -> ReferencePrograms:
+        programs = self._knowledge_call("reference_programs")
+        if args.program_id is None:
+            return ReferencePrograms(programs=tuple(
+                ReferenceProgramInfo(
+                    program_id=item.program_id, kind=item.kind,
+                    runtime_selections=item.runtime_selections,
+                    required_capability_ids=item.required_capability_ids)
+                for item in programs[:MAX_HCAP_LIST_ITEMS]),
+                truncated=len(programs) > MAX_HCAP_LIST_ITEMS)
+        item = next((p for p in programs if p.program_id == args.program_id),
+                    None)
+        if item is None:
+            raise ToolBoundaryError(
+                f"no pinned reference program: {args.program_id}")
+        try:
+            data = self._knowledge.program_text(item.program_ref,
+                                                MAX_KNOWLEDGE_TEXT_BYTES)
+        except ValueError as exc:
+            raise BackendBoundaryError(
+                f"pinned reference program is unreadable: {exc}") from exc
+        text, cut = _bounded(data.decode("utf-8", errors="replace"),
+                             MAX_KNOWLEDGE_TEXT_BYTES)
+        return ReferencePrograms(program_id=item.program_id, text=text,
+                                 truncated=cut)
+
+    def _validate_program(self, arguments: dict) -> ProgramValidation:
+        # A draft that fails its own schema is an answer here, not a tool
+        # call mistake: the model is asking exactly that question.
+        # Records are strict in Python mode; tool arguments arrive as JSON.
+        try:
+            args = ValidateProgramArgs.model_validate_json(
+                json.dumps(arguments))
+        except (ValidationError, TypeError, ValueError) as exc:
+            text, _ = _bounded(str(exc), MAX_VALIDATION_TEXT_BYTES)
+            return ProgramValidation(accepted=False, stage="schema",
+                                     reason="draft_schema_invalid",
+                                     message=text)
+        result = self._validator(args.plan)
+        if not isinstance(result, ProgramValidation):
+            raise BackendBoundaryError("program validator answered outside "
+                                       "its contract")
+        detail, _ = _bounded(result.detail, MAX_VALIDATION_TEXT_BYTES)
+        message, _ = _bounded(result.message, MAX_VALIDATION_TEXT_BYTES)
+        return result.model_copy(update={"detail": detail,
+                                         "message": message})
 
     def _read(self, args: ReadSourceArgs) -> SourceExcerpt:
         path = _source_path(args.path)

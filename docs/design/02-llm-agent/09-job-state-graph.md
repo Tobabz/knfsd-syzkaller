@@ -393,6 +393,24 @@ RepairInput
 Agent는 이 입력을 받아 §2의 variant 중 하나를 출력한다. 봉인 bundle 안의 문자열(console log, program text 등)은
 guest에서 온 untrusted data이며 지시로 읽지 않는다.
 
+Materializer 거부의 findings는 `(reason, detail)`에, strict parse 실패면 pinned parser의 진단 문장(한 줄,
+1024자 이하)을 세 번째 항목으로 더한다. `detail`은 안정된 code로 남는다.
+
+Agent executor는 Stage 1 repair 프롬프트에 RepairInput 외에 다음을 함께 넣는다(#75). 모두 context이며 Agent
+Task 입력 digest에 들어가지 않는다.
+
+- 수리 대상인 직전 ReachabilityPlan과 그 syz program 원문(64 KiB까지).
+- 같은 job의 이전 Stage 1 repair마다 cause, findings, 그 계획의 program digest. 같은 program을 다시 낸 시도는
+  표시한다. Controller가 `AgentRequest.prior_repairs`로 저장된 RepairInput을 넘긴다.
+- `q1_not_reached`이면 Q1Result가 뜻하는 바를 풀어 쓴 문장. PC, coverage, 위치 정보는 더하지 않는다.
+
+Reachability Planning의 unsupported 출력은 `CapabilityProposal`을 함께 낼 수 있다(#75). 누락 계층(gap_class와
+같다), 선택 경로에서 만들어야 하는 조건, kernel source 근거, 검토한 promoted HCAP마다 부족한 이유, 추가할
+interface, 승격에 필요한 KVM 증거를 담는다. executor가 artifact로 저장하고 `UnsupportedOutput.proposal_ref`로
+넘기며, Controller는 `Job.gap_proposal_ref`에 남긴다(blocked_harness_gap이든 gap_id_unknown이든). 값은 가장
+최근 unsupported 답의 제안이며(제안이 없으면 비운다), job의 gap이 지워지거나 다른 gap으로 바뀌면 함께 비운다. 제안은 HCAP
+항목을 만들거나 승격하지 않는다. 승격은 지금처럼 typed KVM 증거와 owner 승인이 필요하다.
+
 ### 8. 기록과 재시작
 
 ```text

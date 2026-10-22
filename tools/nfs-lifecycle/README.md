@@ -4,7 +4,7 @@ Lifecycle scenarios are timed fixture tests, not syzkaller corpus programs.
 They deliberately wait for lease expiry or restart the server, so putting them
 in `corpus.db` would stall ordinary mutation throughput.
 
-The runner provides four native-version scenarios:
+The runner provides these native-version scenarios:
 
 - `v40-lease-expiry`: create and unmount a temporary v4.0 client, then require
   `confirmed -> expired -> purged` for that client.
@@ -28,6 +28,9 @@ The runner provides four native-version scenarios:
   out. A program that still exports `.meta` without `.extra` fails as an
   `execution:` error naming its unfinished calls, never as a probe miss.
 - `v42-control-restart`: the same restart contract using a native v4.2 mount.
+- `v3-nlm-lock`: the HCAP-13 campaign on the `nlm-knfsd` NFSv3 fixture. It
+  runs four fixed programs (`v3-nlm-{control,lock,rpc,blocked}.prog`), each
+  `--repeat` times (at least 3). See below.
 
 Run one iteration first:
 
@@ -101,3 +104,47 @@ On success the output holds `result.json` (counts and digests only),
 `hcap12-kvm.json` (typed `Hcap12KvmEvidence` bound to the harness and
 `result.json`), `probe-*.json` (public probe ranges and call sites) and the
 raw per-run artifacts, including each run's `cld.state` and dmesg.
+
+## NLM lockd campaign (HCAP-13)
+
+```sh
+tools/nfs-lifecycle/run.py \
+  --scenario v3-nlm-lock \
+  --repeat 3 \
+  --collector-config /path/to/stage1-state/collector.json \
+  --descriptor /path/to/descriptor.json \
+  --kernel-source env/linux \
+  --output /tmp/nfs-v3-nlm-lock
+```
+
+The descriptor must expose the `knfsd-v3` / `nfs_version 3` / `nlm-knfsd`
+runtime selection; the guest boots with `koov.nfs_fixture=nlm-knfsd` and the
+runner requires `lane.sh status` to report that fixture before and after every
+run. Before boot it maps public lockd probes from the descriptor's kernel
+commit to coverage call sites of the pinned vmlinux:
+
+| probe | source | use |
+|---|---|---|
+| `svc_lock` | `nlmsvc_lock` | required |
+| `svc_unlock` | `nlmsvc_unlock` | required |
+| `svc_testlock` | `nlmsvc_testlock` | required |
+| `svc_share` | `nlmsvc_share_file` | required |
+| `clnt_grant` | `nlmclnt_grant` | required |
+| `svc_grant_blocked` | `nlmsvc_grant_blocked` | required |
+| `svc_grant_callback` | `nlmsvc_grant_callback` | required |
+| `svc_grant_reply` | `nlmsvc_grant_reply` | diagnostic |
+
+| phase | program | must reach in every run |
+|---|---|---|
+| `control` | lane `getdents64` only | no lockd probe |
+| `lock` | kernel client F_SETLK, F_GETLK, unlock on `lock0` | `svc_lock`, `svc_unlock`; never `clnt_grant`, `svc_grant_blocked` or `svc_grant_callback` |
+| `rpc` | raw NLMv4 LOCK, TEST, UNLOCK, SHARE, UNSHARE on `lock1` | `svc_lock`, `svc_unlock`, `svc_testlock`, `svc_share` |
+| `blocked` | client1 locks `lock2`; client0 raw blocking LOCK; client1 unlocks; 1 s sleep; raw CANCEL and UNLOCK | `svc_lock`, `svc_unlock`, `clnt_grant`, `svc_grant_blocked`, `svc_grant_callback` |
+
+`clnt_grant` is the client0 lockd serving the server's GRANTED_MSG callback.
+The grant itself runs in the server lockd thread (`svc_grant_blocked`) and
+the callback's completion in rpciod (`svc_grant_callback`); kernel patch 0006
+attributes both to the program whose LOCK created the block (context
+`lockd`). On success the
+output holds `result.json`, `hcap13-kvm.json` (typed `Hcap13KvmEvidence`),
+`probe-*.json` and the raw per-run artifacts, including each run's dmesg.

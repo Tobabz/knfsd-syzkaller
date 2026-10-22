@@ -30,7 +30,8 @@ from agent_pipeline.agent_tasks.executor import Stage1AgentExecutor
 from agent_pipeline.agent_tasks.pydantic_ai_runtime import (
     OUTPUT_TOOL, TOOL_RETRIES, PydanticAIRuntime, PydanticAIRuntimeError,
     RuntimeLimits)
-from agent_pipeline.agent_tasks.runtime import OutputRejected, RuntimeRequest
+from agent_pipeline.agent_tasks.runtime import (OutputRejected, RuntimeRequest,
+                                              failure_usage)
 from agent_pipeline.agent_tasks.tools import (BackendBoundaryError,
                                               IndexedMatch, Stage1Toolbox,
                                               ToolBoundaryError)
@@ -337,12 +338,47 @@ def test_max_output_tokens_checked_on_response(tokens, allowed):
     assert len(script.calls) == 1
 
 
+def test_refused_response_usage_is_kept():
+    # One accepted 10-token response, then one refused at 257 tokens.
+    script = Script(response(parts=[ToolCallPart("lookup_hcap", {})]),
+                    response(tokens=257))
+    with pytest.raises(UsageLimitExceeded) as raised:
+        script.runtime().run(runtime_request(max_tokens=256))
+    usage = failure_usage(raised.value)
+    assert (usage.requests, usage.tool_calls, usage.output_tokens) == \
+        (2, 1, 267)
+
+    unknown = Script(response(parts=[ToolCallPart("not_a_tool", {})],
+                              tokens=7))
+    with pytest.raises(PydanticAIRuntimeError) as raised:
+        unknown.runtime().run(runtime_request())
+    usage = failure_usage(raised.value)
+    assert (usage.requests, usage.output_tokens) == (1, 7)
+
+
+def test_refused_response_usage_reaches_the_sink(tmp_path):
+    script = Script(response(tokens=8193))
+    sink = Sink()
+    Stage1AgentExecutor(script.runtime(), ArtifactStore(tmp_path / "a"),
+                        lambda req: toolbox(), sink).start(
+        request(AgentTask.CANDIDATE_ANALYSIS).model_copy(update={
+            "model_policy": request(AgentTask.CANDIDATE_ANALYSIS)
+            .model_policy.model_copy(update={"max_output_tokens": 8192})}))
+    assert sink.failures[0][2].startswith("UsageLimitExceeded")
+    assert (sink.usage[0].requests, sink.usage[0].output_tokens) == \
+        (1, 8193)
+
+
 def test_model_loop_request_limit():
     script = Script(lambda: response(parts=[ToolCallPart("lookup_hcap", {})]))
     limits = RuntimeLimits(max_requests=2)
-    with pytest.raises(UsageLimitExceeded):
+    with pytest.raises(UsageLimitExceeded) as raised:
         script.runtime(limits=limits).run(runtime_request())
     assert len(script.calls) == 2
+    # What the failed run used stays on its exception.
+    usage = failure_usage(raised.value)
+    assert (usage.requests, usage.tool_calls) == (2, 2)
+    assert usage.output_tokens == 20
 
 
 def test_parallel_tool_batch_is_bounded_before_dispatch():
@@ -362,8 +398,20 @@ def test_stalled_model_has_a_deadline(scope):
 
     limits = RuntimeLimits(**{f"{scope}_timeout_seconds": 0.01})
     runtime = PydanticAIRuntime(lambda policy: FunctionModel(stalled), limits=limits)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError) as raised:
         runtime.run(runtime_request())
+    assert failure_usage(raised.value) is not None
+
+
+def test_failed_run_usage_reaches_the_sink(tmp_path):
+    script = Script(lambda: response(parts=[ToolCallPart("lookup_hcap", {})]))
+    sink = Sink()
+    executor = Stage1AgentExecutor(
+        script.runtime(limits=RuntimeLimits(max_requests=2)),
+        ArtifactStore(tmp_path / "artifacts"), lambda req: toolbox(), sink)
+    executor.start(request(AgentTask.CANDIDATE_ANALYSIS))
+    assert sink.failures[0][2].startswith("UsageLimitExceeded")
+    assert (sink.usage[0].requests, sink.usage[0].tool_calls) == (2, 2)
 
 
 def test_testmodel_is_usable_and_does_not_fabricate_identity():
@@ -499,3 +547,62 @@ def test_default_openai_http_mock_has_no_retries_or_model_fallback(monkeypatch, 
     assert body["background"] is False
     assert {tool["name"] for tool in body["tools"]} == set(toolbox().names) | {OUTPUT_TOOL}
     assert clients[0].is_closed()
+
+
+def test_validate_program_tool_is_registered_and_dispatched():
+    from agent_pipeline.agent_tasks.tools import ProgramValidation
+    from .test_agent_tasks import planning_data
+
+    seen = []
+
+    def validator(draft):
+        seen.append(draft)
+        return ProgramValidation(accepted=False, stage="materializer",
+                                 reason="parse_failure",
+                                 message="line 1: unknown call")
+
+    tools = Stage1Toolbox(FakeSource(), FakeHcap(), kernel_commit="a" * 40,
+                          hcap_revision="b" * 64,
+                          program_validator=validator)
+    script = Script(response(parts=[ToolCallPart(
+        "validate_program", {"plan": planning_data()["plan"]})]), response())
+    script.runtime().run(runtime_request(tools=tools))
+    assert len(seen) == 1 and seen[0].candidate_id == "VC-stage1"
+    returned = [p for m in script.calls[1][0] for p in m.parts
+                if isinstance(p, ToolReturnPart)]
+    assert returned[0].content.message == "line 1: unknown call"
+    # The model is offered the eighth tool only when it is bound.
+    assert "validate_program" in {t.name for t in
+                                  script.calls[0][1].function_tools}
+
+
+@pytest.mark.parametrize(("provider", "effort", "expected"), [
+    ("openai", "high", "high"), ("openai", None, None),
+    ("other", "high", None)])
+def test_reasoning_effort_setting_and_usage(provider, effort, expected):
+    script = Script(response(parts=[ToolCallPart("lookup_hcap", {})]),
+                    response())
+    req = runtime_request()
+    req = replace(req, model_policy=req.model_policy.model_copy(update={
+        "provider": provider, "reasoning_effort": effort}))
+    result = script.runtime().run(req)
+    settings = script.calls[0][1].model_settings
+    assert settings.get("openai_reasoning_effort") == expected
+    assert (result.usage.requests, result.usage.tool_calls) == (2, 1)
+    assert result.usage.output_tokens == 20
+
+
+def test_knowledge_tools_are_offered_and_dispatched():
+    from .test_agent_knowledge import FakeKnowledge
+
+    tools = Stage1Toolbox(FakeSource(), FakeHcap(), kernel_commit="a" * 40,
+                          hcap_revision="b" * 64, knowledge=FakeKnowledge())
+    script = Script(response(parts=[ToolCallPart(
+        "search_syzlang", {"query": "call$two"})]), response())
+    script.runtime().run(runtime_request(tools=tools))
+    offered = {t.name for t in script.calls[0][1].function_tools}
+    assert {"search_syzlang", "read_syzlang", "read_harness_patch",
+            "lookup_reference_programs"} <= offered
+    returned = [p for m in script.calls[1][0] for p in m.parts
+                if isinstance(p, ToolReturnPart)]
+    assert returned[0].content.blocks[0].path == "sys/linux/a.txt"

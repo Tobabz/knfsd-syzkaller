@@ -64,8 +64,13 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         parser = stack.enter_context(PinnedSyzParser(
             config.syzkaller_bundle, identity=config.syzkaller_identity))
     if runtime is None and run_agents:
-        from ..agent_tasks.pydantic_ai_runtime import PydanticAIRuntime
-        runtime = PydanticAIRuntime()
+        from ..agent_tasks.pydantic_ai_runtime import (PydanticAIRuntime,
+                                                       RuntimeLimits)
+        a = config.agent_runtime
+        runtime = PydanticAIRuntime(limits=RuntimeLimits(
+            max_requests=a.max_requests, max_tool_calls=a.max_tool_calls,
+            request_timeout_seconds=a.request_timeout_s,
+            run_timeout_seconds=a.run_timeout_s))
     e = config.engine
     state = Path(config.state_dir)
     engine_config = CommandEngineConfig(

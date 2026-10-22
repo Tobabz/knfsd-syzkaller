@@ -72,6 +72,7 @@ from agent_pipeline.materializer import (
     _Failure,
     _hcap11_program_error,
     _hcap12_program_error,
+    _hcap13_program_error,
     descriptor_id,
 )
 
@@ -195,6 +196,10 @@ def _capabilities():
 
 @pytest.fixture
 def world(tmp_path):
+    return materializer_world(tmp_path)
+
+
+def materializer_world(tmp_path):
     store = ArtifactStore(tmp_path / "cas")
     patch_ref = store.put(b"synthetic patch series\n")
     executor_ref = store.put(b"synthetic syz-executor")
@@ -498,6 +503,50 @@ def test_materializer_enforces_hcap12_program_contract_before_call_grants(
     assert caught.value.result().reason == CALL_NOT_ADMITTED
     assert caught.value.result().detail == (
         f"{role}_hcap12_program_contract:{detail}")
+
+
+HCAP13_CALLS = ("syz_open_nfs_lane_profile$client0_knfsd_v3",
+                "syz_socket_connect_nlm$client0", "syz_send_nlm_rpc",
+                "recvfrom$inet_nlm_tcp", "fsync")
+NLM_RUNTIME = dict(profile="knfsd-v3", nfs_version="3",
+                   fixture_mode="nlm-knfsd")
+
+
+def test_hcap13_program_contract_accepts_nlm_calls_on_nlm_fixture(world):
+    parsed_program = hcap11_parsed(world.identity, HCAP13_CALLS, ())
+    assert _hcap13_program_error(
+        parsed_program, role="scenario", selection=runtime(**NLM_RUNTIME),
+        required_capabilities=("HCAP-01", "HCAP-13")) is None
+    # Ordinary lane I/O on the NLM fixture needs no HCAP-13 contract.
+    assert _hcap13_program_error(
+        hcap11_parsed(world.identity, ("fsync",), ()), role="neutral",
+        selection=runtime(**NLM_RUNTIME),
+        required_capabilities=("HCAP-01",)) is None
+
+
+@pytest.mark.parametrize(("role", "required", "calls", "reason", "detail"), [
+    ("scenario", ("HCAP-13",), ("fsync",),
+     PROFILE_FIXTURE_ROUTE_MISMATCH, "fixture_not_nlm"),
+    ("scenario", ("HCAP-01",), HCAP13_CALLS, CALL_NOT_ADMITTED,
+     "nlm_without_hcap13"),
+    ("neutral", ("HCAP-01", "HCAP-13"), ("syz_nlm_lane_fh", "fsync"),
+     CALL_NOT_ADMITTED, "nlm_without_hcap13"),
+])
+def test_materializer_enforces_hcap13_program_contract_before_call_grants(
+        world, role, required, calls, reason, detail):
+    from agent_pipeline.admission import CallAdmissionAuthority
+    authority = CallAdmissionAuthority(
+        hcap_revision=world.hcap_ref, profile_ref=world.profile_ref,
+        profile=world.profile)
+    with pytest.raises(_Failure) as caught:
+        world.materializer._admit(
+            hcap11_parsed(world.identity, calls, HCAP12_CLIENT0),
+            role=role, selection=world.runtime,
+            required_capabilities=required, authority=authority,
+            call_table=world.call_table)
+    assert caught.value.result().reason == reason
+    assert caught.value.result().detail == (
+        f"{role}_hcap13_program_contract:{detail}")
 
 
 def test_program_flow_persists_and_reloads_complete_records(world):
@@ -1066,3 +1115,63 @@ def test_missing_trusted_seed_program_is_a_host_failure(world):
         check = checker.check_plan(ref, world.hcap_ref)
         assert check.violations == ("seed_reference_not_found",)
         assert not check.host_authority
+
+
+def test_untyped_parse_failure_carries_the_bounded_parser_message(world):
+    world.parser.results[world.scenario_ref] = SyzParseFailure(
+        "bridge refused (2): failed to parse program\n"
+        "line 2: unknown syscall \x1b[31mfoo$bar\n" + "x" * 4000)
+    refused = world.materializer.materialize(world.plan_ref, world.binding)
+    assert (refused.reason, refused.detail) == (
+        PARSE_FAILURE, "scenario_strict_parse_failed")
+    assert refused.message.startswith(
+        "bridge refused (2): failed to parse program | line 2: unknown "
+        "syscall ?[31mfoo$bar")
+    assert len(refused.message) == 1024 and refused.message.endswith("...")
+    # A typed refusal keeps its typed detail and adds no message.
+    world.parser.results[world.scenario_ref] = SyzParseFailure(
+        "x", reason="call_disabled", call="clone3", call_index=2)
+    typed = world.materializer.materialize(world.plan_ref, world.binding)
+    assert typed.message == ""
+
+
+def _stored_files(store) -> set:
+    return {p for p in store.root.rglob("*") if p.is_file()}
+
+
+def test_check_draft_matches_materialize_and_writes_nothing(world):
+    before = _stored_files(world.store)
+    assert world.materializer.check_draft(
+        world.plan, world.scenario_bytes, world.binding) is None
+    assert _stored_files(world.store) == before
+
+    # An inline draft whose bytes were never stored is checked from memory.
+    draft = b"draft program\n"
+    world.parser.results[digest(draft)] = SyzParseFailure(
+        "line 1: unexpected token")
+    plan = world.plan.model_copy(update={"program_proposal": ProgramProposal(
+        kind="program", artifact_ref=digest(draft))})
+    refused = world.materializer.check_draft(plan, draft, world.binding)
+    assert (refused.reason, refused.detail, refused.message) == (
+        PARSE_FAILURE, "scenario_strict_parse_failed",
+        "line 1: unexpected token")
+    assert _stored_files(world.store) == before
+
+    # The same refusal materialize gives for the stored plan.
+    world.parser.results[digest(draft)] = parsed(
+        draft, world.identity,
+        (("read$extra", "available", empty_facts()),))
+    refused = world.materializer.check_draft(plan, draft, world.binding)
+    assert refused.reason == CALL_NOT_ADMITTED
+    world.store.put(draft)
+    assert world.materializer.materialize(
+        put_record(world.store, plan), world.binding) == refused
+
+
+def test_check_draft_bounds_in_memory_program_bytes(world):
+    draft = b"x" * 5000
+    plan = world.plan.model_copy(update={"program_proposal": ProgramProposal(
+        kind="program", artifact_ref=digest(draft))})
+    refused = world.materializer.check_draft(plan, draft, world.binding)
+    assert (refused.reason, refused.detail) == (
+        DISALLOWED_OR_UNAVAILABLE_CALL, "scenario_program_limit_exceeded")

@@ -18,14 +18,15 @@ from pydantic import TypeAdapter
 
 from ..artifacts import ArtifactStore
 from ..components import HarnessRegistry, IssueTracker
-from ..contracts import (AgentOutput, AgentTask, CandidateSubmission, GapRef,
+from ..contracts import (AgentOutput, AgentTask, AgentUsage,
+                         CandidateSubmission, GapRef,
                          HarnessBinding, JudgeVersions, LocationRequest,
                          VulnerabilityCandidate)
 from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
 from .machine import Env, Machine, Outcome, harness_authority_stale
-from .records import (TERMINAL, AgentAttempt, Job, JobState, TaskKind,
-                      Transition)
+from .records import (TERMINAL, AgentAttempt, Job, JobState, RepairInput,
+                      TaskKind, Transition)
 from .store import StaleIssueEvent, Store
 from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
                     RunnerInput,
@@ -154,16 +155,18 @@ class Controller:
     # ------------------------------------------------------------ inputs
 
     def on_agent_result(self, task_id: str, attempt: int,
-                        output: AgentOutput, model_id: str) -> None:
+                        output: AgentOutput, model_id: str, *,
+                        usage: AgentUsage | None = None) -> None:
         """Every output is stored; only the job's pending attempt makes a
-        transition (09 §2)."""
+        transition (09 §2).  ``usage`` is kept on the attempt record only;
+        it never enters a transition."""
         ref = self.artifacts.put(output.model_dump_json().encode())
         job_id = job_of(task_id)
         a = self.store.attempt(task_id, attempt)
         if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
                 "status": "succeeded", "model_id": model_id,
-                "output_ref": ref}))
+                "output_ref": ref, "usage": usage}))
         # Stored first: if this transition fails, poll() applies it from
         # the stored attempt.
         self._guard(job_id, "agent_result", lambda: self._apply(
@@ -171,11 +174,13 @@ class Controller:
                                       output=output, model_id=model_id)))
 
     def on_agent_failure(self, task_id: str, attempt: int,
-                         failure: str) -> None:
+                         failure: str, *,
+                         usage: AgentUsage | None = None) -> None:
+        """``usage``, what the failed run used, is kept like a result's."""
         a = self.store.attempt(task_id, attempt)
         if a is not None and a.status in LIVE:
             self.store.save_attempt(a.model_copy(update={
-                "status": "failed", "failure": failure}))
+                "status": "failed", "failure": failure, "usage": usage}))
         job_id = job_of(task_id)
         self._guard(job_id, "agent_result", lambda: self._apply(
             job_id, ev.AgentFailed(task_id=task_id, attempt=attempt,
@@ -587,7 +592,8 @@ class Controller:
                 model_policy=model_policy,
                 hcap_revision=job.binding.hcap_revision,
                 analysis_ref=job.analysis_ref, plan_ref=job.plan_ref,
-                repair=p.repair,
+                repair=p.repair, binding=job.binding,
+                prior_repairs=self._prior_repairs(job_id, p),
                 **(dict(stage2_input=job.stage2_basis,
                         rule_set_ref=job.rule_set_ref)
                    if p.agent_task is AgentTask.MUTATION_STRATEGY else {})))
@@ -612,6 +618,27 @@ class Controller:
         if self.prepare_candidate is not None and job.candidate is not None \
                 and job.state not in TERMINAL:
             self.prepare_candidate(job.job_id)
+
+    def _prior_repairs(self, job_id: str, p) -> tuple[str, ...]:
+        """The stored RepairInputs of the job's earlier Stage 1 repairs,
+        ordered by repair count, without the one this attempt carries.  A
+        restarted attempt of the same task stores the same RepairInput, so
+        each appears once."""
+        if p.repair is None or p.agent_task is AgentTask.MUTATION_STRATEGY:
+            return ()
+        current = self.artifacts.put(p.repair.model_dump_json().encode())
+        seen: dict[str, int] = {}
+        for a in self.store.attempts(job_id):
+            ref = a.repair_input_digest
+            if ref is None or ref == current or ref in seen or \
+                    a.agent_task is AgentTask.MUTATION_STRATEGY:
+                continue
+            try:
+                seen[ref] = RepairInput.model_validate_json(
+                    self.artifacts.get(ref)).attempt
+            except (OSError, ValueError):
+                continue        # context only: a lost record is skipped
+        return tuple(sorted(seen, key=seen.get))
 
     @staticmethod
     def _runner_input(job: Job) -> RunnerInput:

@@ -7,7 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
-from ..contracts import (AgentModelPolicy, AgentTask, CandidateSubmission,
+from ..contracts import (AgentModelPolicy, AgentTask, AgentUsage,
+                         CandidateSubmission,
                          CompiledRuleSet, GapRef, GateRun, HarnessBinding,
                          JudgeVersions, Materialized, Q1Result, Record,
                          ReplayOutcome, VulnerabilityCandidate)
@@ -326,6 +327,10 @@ class Job(BaseModel):
     state: JobState = JobState.SUBMITTED
     state_reason: str | None = None
     gap: GapRef | None = None
+    #: The CapabilityProposal of the job's latest unsupported Planning
+    #: answer (#75), None when that answer had none.  Cleared with the gap
+    #: it explains, and when the job's gap becomes another one.
+    gap_proposal_ref: str | None = None
     binding: HarnessBinding | None = None
     judge_versions: JudgeVersions | None = None
     job_policy_id: str
@@ -393,3 +398,5 @@ class AgentAttempt(Record):
     model_id: str | None = None
     output_ref: str | None = None
     failure: str | None = None
+    #: What the run used, when its runtime counted it (#75).
+    usage: AgentUsage | None = None

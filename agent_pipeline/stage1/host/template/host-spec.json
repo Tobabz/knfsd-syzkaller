@@ -21,8 +21,6 @@
       ],
       "interface": {
         "syz_calls": [
-          "syz_open_nfs_lane_profile$client0_knfsd_v41",
-          "syz_open_nfs_lane_profile$client1_knfsd_v41",
           "close",
           "flock",
           "fsync",
@@ -32,6 +30,10 @@
           "read",
           "renameat2",
           "statx",
+          "syz_open_nfs_lane_profile$client0_knfsd_v3",
+          "syz_open_nfs_lane_profile$client0_knfsd_v41",
+          "syz_open_nfs_lane_profile$client1_knfsd_v3",
+          "syz_open_nfs_lane_profile$client1_knfsd_v41",
           "unlinkat",
           "write"
         ]
@@ -40,7 +42,7 @@
         "lane client is 0 or 1",
         "profile open only for profiles the fixture exposes (single: knfsd-<version>)",
         "filesystem syscalls take a lane fd as their first argument",
-        "open the lane with both const arguments, exactly: r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0) or r0 = syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1)"
+        "open the lane with both const arguments, exactly: r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0) or r0 = syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1); on the NFSv3 nlm-knfsd selection r0 = syz_open_nfs_lane_profile$client0_knfsd_v3(0x0, 0x0) or r0 = syz_open_nfs_lane_profile$client1_knfsd_v3(0x0, 0x1)"
       ],
       "status": "validated_subset",
       "scope": [
@@ -74,7 +76,7 @@
       },
       "constraints": [
         "Q1 uses generation-attributed remote coverage only",
-        "attributed contexts: request, async_copy, callback_v41"
+        "attributed contexts: request, async_copy, callback_v41, lockd"
       ],
       "status": "validated",
       "scope": [
@@ -82,7 +84,8 @@
       ],
       "source_refs": [
         "bundle/patches/kernel/0001-*",
-        "bundle/patches/kernel/0002-*"
+        "bundle/patches/kernel/0002-*",
+        "bundle/patches/kernel/0006-*"
       ]
     },
     {
@@ -98,7 +101,8 @@
       "interface": {},
       "constraints": [
         "nfs.localio_enabled=N",
-        "single fixture, koov.nfs_version from the selection"
+        "single fixture, koov.nfs_version from the selection",
+        "nlm-knfsd fixture (koov.nfs_fixture=nlm-knfsd) for the NFSv3 HCAP-13 selection"
       ],
       "status": "partially_validated",
       "scope": [
@@ -172,6 +176,46 @@
         "tools/nfs-proxy/src/cld.c",
         "tools/nfs-lifecycle/run.py"
       ]
+    },
+    {
+      "id": "HCAP-13",
+      "name": "NLM lane locking and raw NLM RPC",
+      "purpose": "Drive the lane knfsd lockd through kernel NFS client byte-range locks and raw NLM calls on the nlm-knfsd NFSv3 fixture",
+      "usable_stage": [
+        "stage1"
+      ],
+      "usable_by": [
+        "agent_stage1"
+      ],
+      "interface": {
+        "syz_calls": [
+          "fcntl$lock",
+          "recvfrom$inet_nlm_tcp",
+          "syz_nlm_lane_fh",
+          "syz_open_nlm_lane_file",
+          "syz_send_nlm_rpc",
+          "syz_socket_connect_nlm$client0",
+          "syz_socket_connect_nlm$client1"
+        ]
+      },
+      "constraints": [
+        "nlm-knfsd fixture only: the single NFSv3 knfsd lane with SERVER_IMPL=both, rpcbind and rpc.statd in every lane namespace, both knfsd mounts locking and lockd on TCP port 4045",
+        "lock files: r1 = syz_open_nlm_lane_file(r0, name, mode) beneath a knfsd-v3 lane fd (names lock0, lock1, lock2, shared/fixture; mode 0 read-only, 1 read-write, 2 read-write and create), then fcntl$lock(r1, 0x5 F_GETLK or 0x6 F_SETLK, flock); F_SETLKW and OFD locks are never admitted because the collector runs one non-threaded program",
+        "raw NLM: r3 = syz_socket_connect_nlm$client0(0x0) or $client1(0x1), then syz_send_nlm_rpc(r3, rpc_nlm_call, len) with exact len fields; the @lane file handle takes r2 = syz_nlm_lane_fh(r0, name) of an existing lane file; read each reply with recvfrom$inet_nlm_tcp before the next call; rpc_nlm_call covers every NLM procedure on version 4 (nlm4) and versions 1/3 (nlm3): null, test, lock, cancel, unlock, granted, the *_msg and *_res forms, and on versions 3 and 4 also share and unshare (nlm_shareargs: cookie, nlm_share {caller, @lane fh, owner, mode, access}, reclaim), nm_lock and free_all (nlm_notify: name, state), so share, unshare, nm_lock and free_all need no new call or constructor",
+        "raw NLM share and unshare syz text (share as run in the HCAP-13 KVM campaign): r2 = syz_nlm_lane_fh(r0, &(0x7f0000000040)='lock1\\x00'), r3 = syz_socket_connect_nlm$client0(0x0), then syz_send_nlm_rpc(r3, &(0x7f0000001000)=@v4={0x4, 0x0, 0x2, 0x186b5, 0x4, @share={0x14, @sys={0x1, 0x20, {0x0, {0x9, 'syzkaller'}, 0x0, 0x0, 0x0, []}}, @none={0x0, 0x0}, {@empty=0x0, {{0x9, 'syzkaller'}, @lane={0x14, 0x1000101, 0x0, r2, 0x0}, {0x4, \"01020304\"}, 0x0, 0x1}, 0x0}}}, 0x88); unshare is the same with @unshare={0x15, ...}; NLM version 3 is @v3={xid, 0x0, 0x2, 0x186b5, 0x3, ...} with the same bodies",
+        "raw NLM free_all syz text (procedure 23, nlm_notify {caller name, state}): syz_send_nlm_rpc(r3, &(0x7f0000001000)=@v3={0x6, 0x0, 0x2, 0x186b5, 0x3, @free_all={0x17, @sys={0x1, 0x20, {0x0, {0x9, 'syzkaller'}, 0x0, 0x0, 0x0, []}}, @none={0x0, 0x0}, {{0x9, 'syzkaller'}, 0x0}}}, 0x5c); @v4={..., 0x4, @free_all={...}} is the same on version 4; the parser recomputes msglen",
+        "attributed: the server lane lockd serving a TCP or UDP NLM request and the client lane lockd serving a callback are context request; the server lockd thread granting a blocked lock and the rpciod steps of the GRANTED_MSG callback and of *_RES replies are context lockd, owned by the program whose LOCK created the block or whose request sent the reply; a grant after that program ended is not attributed; async UNLOCK/CANCEL that the kernel NFS client sends from a syscall run in rpciod unattributed; no Stage 1 call sends UDP NLM"
+      ],
+      "status": "validated",
+      "scope": [
+        "nlm_lane_lock_rpc"
+      ],
+      "source_refs": [
+        "bundle/patches/syzkaller/0030-*",
+        "bundle/lane/lane.sh",
+        "tools/nfs-lifecycle/run.py",
+        "bundle/patches/kernel/0006-*"
+      ]
     }
   ],
   "capability_evidence": {
@@ -180,6 +224,9 @@
     ],
     "HCAP-12": [
       "capability-evidence/hcap12-kvm.json"
+    ],
+    "HCAP-13": [
+      "capability-evidence/hcap13-kvm.json"
     ]
   },
   "missing_capability_ids": [
@@ -203,6 +250,29 @@
         ]
       },
       {
+        "call": "fcntl$lock",
+        "capability_ids": [
+          "HCAP-13"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1"
+            ]
+          },
+          {
+            "kind": "integer_range",
+            "argument_index": 1,
+            "minimum": 5,
+            "maximum": 6
+          }
+        ]
+      },
+      {
         "call": "flock",
         "capability_ids": [
           "HCAP-01"
@@ -213,6 +283,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -230,6 +302,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -247,6 +321,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -264,10 +340,18 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
           }
+        ]
+      },
+      {
+        "call": "nanosleep",
+        "capability_ids": [
+          "HCAP-13"
         ]
       },
       {
@@ -281,6 +365,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -298,10 +384,18 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
           }
+        ]
+      },
+      {
+        "call": "recvfrom$inet_nlm_tcp",
+        "capability_ids": [
+          "HCAP-13"
         ]
       },
       {
@@ -315,6 +409,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -332,6 +428,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -351,7 +449,36 @@
         ]
       },
       {
+        "call": "syz_nlm_lane_fh",
+        "capability_ids": [
+          "HCAP-13"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "syz_open_nfs_lane_profile$client0_knfsd_v3",
+        "capability_ids": [
+          "HCAP-01"
+        ]
+      },
+      {
         "call": "syz_open_nfs_lane_profile$client0_knfsd_v41",
+        "capability_ids": [
+          "HCAP-01"
+        ]
+      },
+      {
+        "call": "syz_open_nfs_lane_profile$client1_knfsd_v3",
         "capability_ids": [
           "HCAP-01"
         ]
@@ -360,6 +487,41 @@
         "call": "syz_open_nfs_lane_profile$client1_knfsd_v41",
         "capability_ids": [
           "HCAP-01"
+        ]
+      },
+      {
+        "call": "syz_open_nlm_lane_file",
+        "capability_ids": [
+          "HCAP-13"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "syz_send_nlm_rpc",
+        "capability_ids": [
+          "HCAP-13"
+        ]
+      },
+      {
+        "call": "syz_socket_connect_nlm$client0",
+        "capability_ids": [
+          "HCAP-13"
+        ]
+      },
+      {
+        "call": "syz_socket_connect_nlm$client1",
+        "capability_ids": [
+          "HCAP-13"
         ]
       },
       {
@@ -373,6 +535,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -390,6 +554,8 @@
             "argument_index": 0,
             "resource_type": "fd",
             "allowed_origins": [
+              "nfs-profile:knfsd-v3:client0",
+              "nfs-profile:knfsd-v3:client1",
               "nfs-profile:knfsd-v41:client0",
               "nfs-profile:knfsd-v41:client1"
             ]
@@ -425,6 +591,24 @@
         "syz_nfsd_client_ctl$expire_client0",
         "syz_open_nfs_lane_profile$client0_knfsd_v41",
         "syz_open_nfs_lane_profile$client1_knfsd_v41"
+      ],
+      "trace_mode": "off"
+    },
+    {
+      "profile": "knfsd-v3",
+      "nfs_version": "3",
+      "fixture_mode": "nlm-knfsd",
+      "route": "direct",
+      "topology": "one-lane",
+      "enabled_interfaces": [
+        "remote_cover",
+        "syz_nlm_lane_fh",
+        "syz_open_nfs_lane_profile$client0_knfsd_v3",
+        "syz_open_nfs_lane_profile$client1_knfsd_v3",
+        "syz_open_nlm_lane_file",
+        "syz_send_nlm_rpc",
+        "syz_socket_connect_nlm$client0",
+        "syz_socket_connect_nlm$client1"
       ],
       "trace_mode": "off"
     }
@@ -470,11 +654,35 @@
       "required_capability_ids": [
         "HCAP-01"
       ]
+    },
+    {
+      "runtime_selection": {
+        "profile": "knfsd-v3",
+        "nfs_version": "3",
+        "fixture_mode": "nlm-knfsd",
+        "route": "direct",
+        "topology": "one-lane",
+        "enabled_interfaces": [
+          "remote_cover",
+          "syz_nlm_lane_fh",
+          "syz_open_nfs_lane_profile$client0_knfsd_v3",
+          "syz_open_nfs_lane_profile$client1_knfsd_v3",
+          "syz_open_nlm_lane_file",
+          "syz_send_nlm_rpc",
+          "syz_socket_connect_nlm$client0",
+          "syz_socket_connect_nlm$client1"
+        ],
+        "trace_mode": "off"
+      },
+      "program": "neutral-knfsd-v3.syz",
+      "required_capability_ids": [
+        "HCAP-01"
+      ]
     }
   ],
   "judge_profile": {
     "name": "knfsd-remote-kcov",
-    "revision": "1",
+    "revision": "2",
     "minimum_remote_start_ok": 1,
     "allowed_trace_modes": [
       "off"
@@ -565,6 +773,48 @@
         ]
       },
       {
+        "context": "lockd",
+        "window": "generation-plus-drain",
+        "counters": [
+          {
+            "counter": "new_root_rejected_aborted",
+            "max_delta": 0
+          },
+          {
+            "counter": "new_root_rejected_closing",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_generation",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_root",
+            "max_delta": 0
+          },
+          {
+            "counter": "remote_grant_rejected_token",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_epoch_mismatch",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_lane_unhealthy",
+            "max_delta": 0
+          },
+          {
+            "counter": "cb_section_owner_none",
+            "max_delta": 0
+          }
+        ],
+        "normal_counters": [
+          "lane_owner_failed",
+          "lane_owner_no_generation"
+        ]
+      },
+      {
         "context": "request",
         "window": "generation-plus-drain",
         "counters": [
@@ -598,10 +848,11 @@
   },
   "support_boundary": {
     "name": "knfsd-remote-kcov",
-    "revision": "1",
+    "revision": "2",
     "supported_contexts": [
       "async_copy",
       "callback_v41",
+      "lockd",
       "request"
     ]
   },
@@ -621,6 +872,28 @@
         "reachability_planning": {
           "provider": "openai",
           "model": "gpt-5"
+        }
+      }
+    },
+    {
+      "policy_id": "kasan-agent-effort",
+      "sanitizer": "kasan",
+      "approval_required": false,
+      "stage1_repair_budget": 3,
+      "agent_retry_limit": 3,
+      "runtime_retry_limit": 3,
+      "stage1_agents": {
+        "candidate_analysis": {
+          "provider": "openai",
+          "model": "gpt-5",
+          "max_output_tokens": 32768,
+          "reasoning_effort": "medium"
+        },
+        "reachability_planning": {
+          "provider": "openai",
+          "model": "gpt-5",
+          "max_output_tokens": 32768,
+          "reasoning_effort": "high"
         }
       }
     }
