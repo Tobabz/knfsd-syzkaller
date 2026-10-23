@@ -410,6 +410,17 @@ class FixedCampaign(Record):
         return self.reached + self.not_reached + self.crashes
 
 
+class SeedPlan(Record):
+    """#81 R5: a job started from another job's approved plan (a KCSAN run
+    of a KASAN job's plan).  Intake skips Analysis and Planning: the plan
+    is re-validated against the new binding's HCAP and materialized, and
+    Q1 must reach again on the new harness."""
+
+    from_job: str
+    analysis_ref: str
+    plan_ref: str
+
+
 class Job(BaseModel):
     """09 §8.  Not frozen: the machine works on a deep copy."""
 
@@ -428,6 +439,7 @@ class Job(BaseModel):
     binding: HarnessBinding | None = None
     judge_versions: JudgeVersions | None = None
     job_policy_id: str
+    seed: SeedPlan | None = None
     counters: Counters = Field(default_factory=Counters)
     pending_task: PendingTask | None = None
     cancelling_tasks: tuple[str, ...] = ()

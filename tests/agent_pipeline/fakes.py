@@ -87,6 +87,8 @@ class FakeHcap:
 
         #: HCAP revisions whose host catalog is corrupt.
         self.corrupt: set[str] = set()
+        #: (plan, HCAP revision) of every compatible-replacement check.
+        self.revalidated: list[tuple[str, str]] = []
 
     def check_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
         if hcap_revision in self.corrupt:
@@ -96,6 +98,7 @@ class FakeHcap:
             (plan_ref, hcap_revision), ()))
 
     def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        self.revalidated.append((plan_ref, hcap_revision))
         return self.check_plan(plan_ref, hcap_revision)
 
     def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
@@ -343,8 +346,9 @@ VERSIONS = JudgeVersions(judge_profile_id="jp-1", support_boundary_id="sb-1")
 
 
 def binding(execution: str = "build-1", hcap: str = "hcap-1",
-            commit: str = COMMIT) -> HarnessBinding:
-    return HarnessBinding(kernel_commit=commit, sanitizer=Sanitizer.KASAN,
+            commit: str = COMMIT,
+            sanitizer: Sanitizer = Sanitizer.KASAN) -> HarnessBinding:
+    return HarnessBinding(kernel_commit=commit, sanitizer=sanitizer,
                           execution_harness_id=sha(execution),
                           hcap_revision=hcap)
 

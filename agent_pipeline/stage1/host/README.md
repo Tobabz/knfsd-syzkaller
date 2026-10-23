@@ -118,6 +118,30 @@ guest. Read `probe-1/probe.json`:
    them. If `callsite_plus_5` matches instead, the coverage file holds
    return addresses, and `target-pcs` must shift its PCs to match.
 
+## KASAN and KCSAN from one spec
+
+`variants` in the spec (in place of `variant`) lists the sanitizer builds
+of the same harness, for example:
+
+```json
+"variants": [
+  {"sanitizer": "kasan", "capability_evidence": {"HCAP-11": ["..."]}},
+  {"sanitizer": "kcsan", "capability_evidence": {}}
+]
+```
+
+Build each with `tools/bootstrap-kcov-env.py --variant <sanitizer>` into
+`env/images/<sanitizer>`. The syzkaller build, admission profile, neutral
+controls, judge profile and capability statements are shared. Each variant
+gets its own kernel pins, instrumentation manifest, descriptor, support
+boundary, HCAP revision, approval and binding, so the policy's sanitizer
+selects the harness. KVM capability evidence is pinned to a descriptor, so
+it is collected and listed per variant; a variant without it has those
+capabilities without evidence. `collector.json` keeps each variant's
+`bzimage` and `kernel` under `variant_files`, and the collector boots the
+files of the lease's descriptor. `probe` and `check-pcs` take
+`--variant kcsan`; a KCSAN harness also reports `BUG: KCSAN:` as a crash.
+
 ## How the pieces bind
 
 - **Pins.** The descriptor names each host file (vmlinux as `kernel`,

@@ -35,6 +35,7 @@ from typing import Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...artifacts import ArtifactStore
+from ...contracts import Sanitizer
 from ...crash import CRASH_REPORT_ID, CRASH_REPORT_TYPE, CrashReport, classify
 from ...data import canonical_json, load_record
 from ...hcap import RuntimeSelection
@@ -81,6 +82,9 @@ class CollectorConfig(BaseModel):
     artifact_root: Path
     #: Descriptor build-artifact name -> host file pinned under that name.
     files: dict[str, Path]
+    #: Per sanitizer, the files of that variant's build (its bzImage and
+    #: vmlinux, #81 D10); they override ``files`` for its descriptors.
+    variant_files: dict[Sanitizer, dict[str, Path]] = {}
     ssh_key: Path
     qemu: str = "qemu-system-x86_64"
     memory_mb: int = Field(4096, ge=512)
@@ -98,6 +102,10 @@ class CollectorConfig(BaseModel):
     def load(cls, path: Path) -> CollectorConfig:
         return cls.model_validate_json(Path(path).read_bytes())
 
+    def files_for(self, sanitizer: Sanitizer) -> dict[str, Path]:
+        """The host files a descriptor of ``sanitizer`` boots from."""
+        return {**self.files, **self.variant_files.get(sanitizer, {})}
+
 
 def verify_pins(config: CollectorConfig,
                 descriptor: ExecutionHarnessDescriptor) -> dict[str, Path]:
@@ -106,19 +114,20 @@ def verify_pins(config: CollectorConfig,
     store = ArtifactStore(config.artifact_root)
     cache = PinCache(config.pin_cache)
     builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
+    files = config.files_for(descriptor.sanitizer)
     missing = [n for n in (*RUN_FILES, config.vmlinux_artifact_name)
-               if n not in builds or n not in config.files]
+               if n not in builds or n not in files]
     if missing:
         raise CollectorError(f"descriptor or collector config lacks: "
                              f"{', '.join(missing)}")
-    for name, path in config.files.items():
+    for name, path in files.items():
         if name not in builds:
             raise CollectorError(f"{name} is not a descriptor build artifact")
         pin = load_record(store, builds[name], HostFilePin)
         if pin.name != name:
             raise CollectorError(f"pin for {name} names {pin.name}")
         verify_file(pin, path, cache)
-    return dict(config.files)
+    return files
 
 
 def guest_cmdline(descriptor: ExecutionHarnessDescriptor,

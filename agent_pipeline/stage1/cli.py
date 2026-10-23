@@ -227,6 +227,13 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("job")
     rs.add_argument("--commit", required=True)
 
+    sd = sub.add_parser(
+        "seed", help="start a new job for an earlier job's candidate under "
+        "another policy (e.g. a KCSAN one) from that job's plan, skipping "
+        "Analysis and Planning")
+    sd.add_argument("job")
+    sd.add_argument("--policy", required=True)
+
     r = sub.add_parser("run")
     r.add_argument("--job", help="stop when this job reaches a stop state")
     r.add_argument("--timeout", type=float, help="seconds")
@@ -282,6 +289,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "resubmit":
             job_id = resubmit(service, args.job, args.commit)
             _print({"resubmitted_from": args.job,
+                    **_job_summary(service, job_id)})
+        elif args.command == "seed":
+            try:
+                job_id = service.controller.seed(args.job, args.policy)
+            except (KeyError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            _print({"seeded_from": args.job,
                     **_job_summary(service, job_id)})
         elif args.command == "run":
             service.recover()

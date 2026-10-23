@@ -267,6 +267,10 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
   (`crash_review`는 fixed campaign crash만 쓴다, #81 D8, R2, R3).
 - `s1_running`에 들어가는 모든 전이(재실행과 `resume` 포함)는 그때의 approval policy를 적용한다. 승인이 필요한데
   그 harness의 review manifest가 승인되지 않았으면 `s1_approval`로 간다(`05` §11).
+- 다른 job의 plan으로 시작한 job(`Job.seed`, #81 R5. 예: KASAN job의 plan으로 시작한 KCSAN job)은 intake 뒤
+  Analysis와 Planning을 건너뛴다. 그 plan을 새 binding의 HCAP로 다시 검증(`compatible_replacement`)하고
+  materialize한다. 검증이나 materialize가 거부되면 위 표의 행대로 Planning repair로 간다. binding이 없으면
+  `blocked_harness_gap`의 `resume_point`가 materialize다. Q1은 새 harness에서 다시 도달해야 한다.
 - `REACHED`로 넘어갈 때 Controller는 `Stage2Input`(`01` §5.1)의 구성 artifact와 verdict id를 job에 고정한다.
 
 ### 3.1 fixed campaign과 Stage 1 replay

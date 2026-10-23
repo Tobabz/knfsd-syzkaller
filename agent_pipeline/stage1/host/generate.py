@@ -12,6 +12,10 @@ host's build outputs (``tools/bootstrap-kcov-env.py`` env directory and the
   Q1AdmissibilityProfile, RemoteKcovSupportBoundary and the HCAP that pins
   them;
 * the ExecutionHarnessDescriptor, its approval and the HarnessCatalog;
+  with several ``variants`` (sanitizers, #81 D10) one of each per
+  variant: its kernel, instrumentation, descriptor, KVM evidence, support
+  boundary, HCAP revision and binding, while the syzkaller identity,
+  admission profile, neutral controls and judge profile are shared;
 * ``stage1.json`` (service config), ``collector.json`` (host command
   config) and ``generated.json`` (every digest, for the record).
 
@@ -400,6 +404,17 @@ class Hcap13KvmEvidence(_Spec):
         return self
 
 
+class VariantSpec(_Spec):
+    """One sanitizer build of the shared harness (#81 D10).  Its kernel is
+    ``env_dir/images/<sanitizer>``; capability evidence is pinned to its
+    own descriptor, so each variant names the KVM evidence collected on
+    it."""
+
+    sanitizer: Sanitizer
+    capability_evidence: dict[str, tuple[Path, ...]] = Field(
+        default_factory=dict)
+
+
 CAPABILITY_EVIDENCE_MODELS = {
     "HCAP-11": Hcap11KvmEvidence,
     "HCAP-12": Hcap12KvmEvidence,
@@ -416,7 +431,12 @@ class HostSpec(_Spec):
     artifact_root: Path
     #: ``tools/bootstrap-kcov-env.py`` TARGET_DIR.
     env_dir: Path
+    #: The single variant of a spec without ``variants``.
     variant: Sanitizer = Sanitizer.KASAN
+    #: Several sanitizer variants of the same harness; the first is the
+    #: default the host tools use.  Each carries its own capability
+    #: evidence, so the top-level ``capability_evidence`` stays empty.
+    variants: tuple[VariantSpec, ...] = ()
     ssh_key: Path
     #: The ``bundle`` directory written by ``tools/syzkaller/build.py``;
     #: its sibling ``checkout`` is the patched syzkaller tree it built.
@@ -440,6 +460,26 @@ class HostSpec(_Spec):
     policies: tuple[JobPolicy, ...] = Field(min_length=1)
     engine: EngineSpec = EngineSpec()
     collector: CollectorSpec = CollectorSpec()
+
+    @model_validator(mode="after")
+    def _variants(self) -> Self:
+        if not self.variants:
+            return self
+        if "variant" in self.model_fields_set:
+            raise ValueError("give variant or variants, not both")
+        if self.capability_evidence:
+            raise ValueError("with variants, capability_evidence belongs "
+                             "to each variant (it is pinned to its "
+                             "descriptor)")
+        names = [v.sanitizer for v in self.variants]
+        if len(set(names)) != len(names):
+            raise ValueError("a sanitizer is listed twice in variants")
+        return self
+
+    def variant_specs(self) -> tuple[VariantSpec, ...]:
+        return self.variants or (VariantSpec(
+            sanitizer=self.variant,
+            capability_evidence=self.capability_evidence),)
 
 
 def _gap_vocabulary(spec: HostSpec) -> tuple[str, ...]:
@@ -533,7 +573,17 @@ def _sorted_selections(items):
     return tuple(sorted(items, key=_runtime_key))
 
 
+class GeneratedVariant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    execution_harness_id: str
+    hcap_revision: str
+
+
 class Generated(BaseModel):
+    """``execution_harness_id`` and ``hcap_revision`` are the first
+    variant's; ``variants`` has every one, by sanitizer."""
+
     model_config = ConfigDict(extra="forbid")
 
     stage1_config: Path
@@ -542,7 +592,12 @@ class Generated(BaseModel):
     kernel_commit: str
     execution_harness_id: str
     hcap_revision: str
+    variants: dict[str, GeneratedVariant] = {}
     digests: dict[str, str]
+
+
+#: Descriptor build artifacts that differ between sanitizer variants.
+VARIANT_FILES = ("bzimage", "kernel")
 
 
 def generate(spec_path: Path, *, python: str = sys.executable,
@@ -555,10 +610,14 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     env = _resolve(base, spec.env_dir)
     bundle = _resolve(base, spec.syzkaller_bundle)
     ssh_key = _resolve(base, spec.ssh_key)
-    wrong = [p.policy_id for p in spec.policies if p.sanitizer != spec.variant]
+    variants = spec.variant_specs()
+    sanitizers = {v.sanitizer for v in variants}
+    wrong = [p.policy_id for p in spec.policies
+             if p.sanitizer not in sanitizers]
     if wrong:
+        names = "/".join(v.sanitizer.value for v in variants)
         raise GenerationError(f"policies {wrong} use another sanitizer than "
-                              f"the {spec.variant.value} harness")
+                              f"the {names} harness")
     mutate = [p.policy_id for p in spec.policies
               if p.campaign_mode is CampaignMode.MUTATE]
     if mutate:
@@ -572,18 +631,16 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     state.mkdir(parents=True, exist_ok=True)
     store = ArtifactStore(root)
     digests: dict[str, str] = {}
+    several = len(variants) > 1
+
+    def key(variant: VariantSpec, name: str) -> str:
+        """A variant's own digest; a single variant keeps the plain key."""
+        return f"{variant.sanitizer.value}:{name}" if several else name
 
     # ---------------------------------------------------- host files
     images = env / "images"
-    variant = images / spec.variant.value
     kernel_repo = env / "linux"
-    # The instrumentation manifest below pins the checked-in kernel series,
-    # so the kernel must have been built from exactly that series.
-    build = _build_record(variant / "build.json", "kernel", kernel_repo)
-    kernel_commit = build["head"]
-    files = {
-        "bzimage": variant / "bzImage",
-        "kernel": variant / "vmlinux",
+    common = {
         "vm-image": images / "bookworm-kcov-fresh.qcow2",
         "lane-script": REPO / "bundle" / "lane" / "lane.sh",
         "syz-executor": env / "syzkaller" / "bin" / "linux_amd64" /
@@ -592,24 +649,48 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         "syz-execprog",
         "syz-manager": env / "syzkaller" / "bin" / "syz-manager",
     }
-    builds: list[HarnessBuildArtifact] = []
     file_pins = {}
-    for name, path in sorted(files.items()):
+    common_builds: list[HarnessBuildArtifact] = []
+    for name, path in sorted(common.items()):
         pin = pin_file(name, path)
         ref = put_record(store, pin)
         file_pins[name] = pin
-        builds.append(HarnessBuildArtifact(name=name, artifact_ref=ref))
+        common_builds.append(HarnessBuildArtifact(name=name,
+                                                  artifact_ref=ref))
         digests[f"pin:{name}"] = ref
     patches = REPO / "bundle" / "patches" / "kernel"
     series = [p for p in sorted(patches.glob("*.patch"))]
-    instrumentation = InstrumentationManifest(
-        kernel_patches=tuple(pin_file(p.name, p) for p in series),
-        kernel_config=pin_file(".config", variant / ".config"))
-    instrumentation_ref = put_record(store, instrumentation)
-    builds.append(HarnessBuildArtifact(name="instrumentation",
-                                       artifact_ref=instrumentation_ref))
-    digests["instrumentation"] = instrumentation_ref
-    builds.sort(key=lambda b: b.name)
+    kernel_builds: dict[Sanitizer, dict] = {}
+    variant_files: dict[Sanitizer, dict[str, Path]] = {}
+    variant_builds: dict[Sanitizer, list[HarnessBuildArtifact]] = {}
+    instrumentation_refs: dict[Sanitizer, str] = {}
+    for v in variants:
+        directory = images / v.sanitizer.value
+        # The instrumentation manifest below pins the checked-in kernel
+        # series, so the kernel must have been built from exactly that
+        # series.
+        kernel_builds[v.sanitizer] = _build_record(
+            directory / "build.json", "kernel", kernel_repo)
+        files = {"bzimage": directory / "bzImage",
+                 "kernel": directory / "vmlinux"}
+        builds = list(common_builds)
+        for name, path in sorted(files.items()):
+            ref = put_record(store, pin_file(name, path))
+            builds.append(HarnessBuildArtifact(name=name, artifact_ref=ref))
+            digests[key(v, f"pin:{name}")] = ref
+        instrumentation = InstrumentationManifest(
+            kernel_patches=tuple(pin_file(p.name, p) for p in series),
+            kernel_config=pin_file(".config", directory / ".config"))
+        ref = put_record(store, instrumentation)
+        builds.append(HarnessBuildArtifact(name="instrumentation",
+                                           artifact_ref=ref))
+        digests[key(v, "instrumentation")] = ref
+        builds.sort(key=lambda b: b.name)
+        variant_files[v.sanitizer] = files
+        variant_builds[v.sanitizer] = builds
+        instrumentation_refs[v.sanitizer] = ref
+    # Every variant is a build of the same kernel tree, at its HEAD.
+    kernel_commit = kernel_builds[variants[0].sanitizer]["head"]
 
     # ---------------------------------------------------- syzkaller
     # The executor binaries, the tree they were built from and the parser
@@ -656,15 +737,16 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     capabilities = list(spec.capabilities)
     capability_indexes = {capability.id: index
                           for index, capability in enumerate(capabilities)}
-    unknown_evidence = sorted(set(spec.capability_evidence) -
-                              set(capability_indexes))
-    if unknown_evidence:
-        raise GenerationError("capability_evidence names no capability: "
-                              + unknown_evidence[0])
-    for capability_id, paths in sorted(spec.capability_evidence.items()):
-        if not paths:
-            raise GenerationError(
-                f"capability_evidence for {capability_id} is empty")
+    for v in variants:
+        unknown_evidence = sorted(set(v.capability_evidence) -
+                                  set(capability_indexes))
+        if unknown_evidence:
+            raise GenerationError("capability_evidence names no capability: "
+                                  + unknown_evidence[0])
+        for capability_id, paths in sorted(v.capability_evidence.items()):
+            if not paths:
+                raise GenerationError(
+                    f"capability_evidence for {capability_id} is empty")
     if spec.runtime_selection_capability is not None:
         index = next((i for i, c in enumerate(capabilities)
                       if c.id == spec.runtime_selection_capability), None)
@@ -731,115 +813,142 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         entries=tuple(neutral_entries))
     neutral_ref = put_record(store, neutral)
     digests["neutral_control_catalog"] = neutral_ref
-
-    # The descriptor must exist before identity-sensitive capability evidence
-    # can promote a validated HCAP.  This prevents a stale KVM campaign from a
-    # different lane, kernel, image, syzkaller build, or runtime selection from
-    # being rebound to the newly generated harness.
-    descriptor = ExecutionHarnessDescriptor(
-        kernel_commit=kernel_commit, sanitizer=spec.variant,
-        syzkaller_identity=identity, build_artifacts=tuple(builds),
-        guest_kernel_command_line=spec.guest_kernel_command_line,
-        allowed_runtime_selections=_sorted_selections(
-            entry.runtime_selection for entry in neutral_entries))
-    if "nokaslr" not in descriptor.guest_kernel_command_line.split():
+    judge_profile_ref = put_record(store, spec.judge_profile)
+    digests["q1_admissibility_profile"] = judge_profile_ref
+    if "nokaslr" not in spec.guest_kernel_command_line.split():
         raise GenerationError("guest_kernel_command_line must contain "
                               "nokaslr (the Q1 identity assumes no KASLR)")
-    harness_id = put_record(store, descriptor)
-    assert harness_id == descriptor_id(descriptor)
-    build_refs = {item.name: item.artifact_ref
-                  for item in descriptor.build_artifacts}
-    expected_mapping_identity = KernelIdentity(
-        execution_harness_id=harness_id, kernel_commit=kernel_commit,
-        instrumentation_sha256=build_refs["instrumentation"],
-        vmlinux_sha256=build_refs["kernel"],
-        kaslr_enabled=False, kaslr_offset=0)
 
-    for capability_id, paths in sorted(spec.capability_evidence.items()):
-        refs = []
-        for path in paths:
-            resolved = _resolve(base, path)
-            if not resolved.is_file():
-                raise GenerationError(
-                    f"capability evidence is not a file: {resolved}")
-            contents = _validated_capability_evidence(
-                capability_id, resolved,
-                expected_mapping_identity=expected_mapping_identity,
-                lane_script_sha256=file_pins["lane-script"].sha256)
-            refs.append(store.put(contents))
-        index = capability_indexes[capability_id]
-        capability = capabilities[index]
-        capabilities[index] = capability.model_copy(update={
-            "evidence_refs": tuple(sorted(set(capability.evidence_refs) |
-                                          set(refs)))})
-    draft = HcapCatalog(
-        capabilities=tuple(capabilities),
-        missing_capability_ids=_gap_vocabulary(spec))
-
-    judge_profile_ref = put_record(store, spec.judge_profile)
-    boundary = RemoteKcovSupportBoundary(
-        name=spec.support_boundary.name,
-        revision=spec.support_boundary.revision,
-        kernel_commit=kernel_commit,
-        instrumentation_sha256=instrumentation_ref,
-        supported_contexts=spec.support_boundary.supported_contexts)
-    boundary_ref = put_record(store, boundary)
-    digests["q1_admissibility_profile"] = judge_profile_ref
-    digests["remote_kcov_support_boundary"] = boundary_ref
-    hcap = draft.model_copy(update={"authority_refs": (
-        AuthorityRef(kind="CallAdmissionProfile", artifact_ref=profile_ref),
-        AuthorityRef(kind="NeutralControlCatalog", artifact_ref=neutral_ref),
-        AuthorityRef(kind="Q1AdmissibilityProfile",
-                     artifact_ref=judge_profile_ref),
-        AuthorityRef(kind="RemoteKcovSupportBoundary",
-                     artifact_ref=boundary_ref))})
-    hcap = HcapCatalog.model_validate(hcap.model_dump())
-    hcap_ref = put_record(store, hcap)
-    digests["hcap"] = hcap_ref
+    # ---------------------------------------------------- per variant
+    results: dict[Sanitizer, tuple[str, str, str, HarnessBinding,
+                                   RemoteKcovSupportBoundary]] = {}
+    for v in variants:
+        # The descriptor must exist before identity-sensitive capability
+        # evidence can promote a validated HCAP.  This prevents a stale KVM
+        # campaign from a different lane, kernel, image, syzkaller build,
+        # runtime selection or sanitizer from being rebound to the newly
+        # generated harness.
+        descriptor = ExecutionHarnessDescriptor(
+            kernel_commit=kernel_commit, sanitizer=v.sanitizer,
+            syzkaller_identity=identity,
+            build_artifacts=tuple(variant_builds[v.sanitizer]),
+            guest_kernel_command_line=spec.guest_kernel_command_line,
+            allowed_runtime_selections=_sorted_selections(
+                entry.runtime_selection for entry in neutral_entries))
+        harness_id = put_record(store, descriptor)
+        assert harness_id == descriptor_id(descriptor)
+        build_refs = {item.name: item.artifact_ref
+                      for item in descriptor.build_artifacts}
+        expected_mapping_identity = KernelIdentity(
+            execution_harness_id=harness_id, kernel_commit=kernel_commit,
+            instrumentation_sha256=build_refs["instrumentation"],
+            vmlinux_sha256=build_refs["kernel"],
+            kaslr_enabled=False, kaslr_offset=0)
+        variant_capabilities = list(capabilities)
+        for capability_id, paths in sorted(v.capability_evidence.items()):
+            refs = []
+            for path in paths:
+                resolved = _resolve(base, path)
+                if not resolved.is_file():
+                    raise GenerationError(
+                        f"capability evidence is not a file: {resolved}")
+                contents = _validated_capability_evidence(
+                    capability_id, resolved,
+                    expected_mapping_identity=expected_mapping_identity,
+                    lane_script_sha256=file_pins["lane-script"].sha256)
+                refs.append(store.put(contents))
+            index = capability_indexes[capability_id]
+            capability = variant_capabilities[index]
+            variant_capabilities[index] = capability.model_copy(update={
+                "evidence_refs": tuple(sorted(set(capability.evidence_refs)
+                                              | set(refs)))})
+        draft = HcapCatalog(
+            capabilities=tuple(variant_capabilities),
+            missing_capability_ids=_gap_vocabulary(spec))
+        boundary = RemoteKcovSupportBoundary(
+            name=spec.support_boundary.name,
+            revision=spec.support_boundary.revision,
+            kernel_commit=kernel_commit,
+            instrumentation_sha256=instrumentation_refs[v.sanitizer],
+            supported_contexts=spec.support_boundary.supported_contexts)
+        boundary_ref = put_record(store, boundary)
+        digests[key(v, "remote_kcov_support_boundary")] = boundary_ref
+        hcap = draft.model_copy(update={"authority_refs": (
+            AuthorityRef(kind="CallAdmissionProfile",
+                         artifact_ref=profile_ref),
+            AuthorityRef(kind="NeutralControlCatalog",
+                         artifact_ref=neutral_ref),
+            AuthorityRef(kind="Q1AdmissibilityProfile",
+                         artifact_ref=judge_profile_ref),
+            AuthorityRef(kind="RemoteKcovSupportBoundary",
+                         artifact_ref=boundary_ref))})
+        hcap = HcapCatalog.model_validate(hcap.model_dump())
+        hcap_ref = put_record(store, hcap)
+        digests[key(v, "hcap")] = hcap_ref
+        approval = ExecutionHarnessApproval(
+            descriptor=descriptor, approved_hcap_revisions=(hcap_ref,))
+        approval_ref = put_record(store, approval)
+        binding = HarnessBinding(kernel_commit=kernel_commit,
+                                 sanitizer=v.sanitizer,
+                                 execution_harness_id=harness_id,
+                                 hcap_revision=hcap_ref)
+        digests[key(v, "execution_harness_descriptor")] = harness_id
+        digests[key(v, "execution_harness_approval")] = approval_ref
+        results[v.sanitizer] = (harness_id, hcap_ref, approval_ref, binding,
+                                boundary_ref)
+    first = results[variants[0].sanitizer]
 
     # ---------------------------------------------------- harness
-    approval = ExecutionHarnessApproval(descriptor=descriptor,
-                                        approved_hcap_revisions=(hcap_ref,))
-    approval_ref = put_record(store, approval)
-    binding = HarnessBinding(kernel_commit=kernel_commit,
-                             sanitizer=spec.variant,
-                             execution_harness_id=harness_id,
-                             hcap_revision=hcap_ref)
     report = {
         "schema_version": "stage1-host-generation.v1",
         "generated_at": now or datetime.datetime.now(
             datetime.timezone.utc).isoformat(),
         "spec_sha256": hashlib.sha256(
             spec_path.read_bytes()).hexdigest(),
-        "kernel_commit": kernel_commit, "kernel_build": build,
+        "kernel_commit": kernel_commit,
+        "kernel_build": kernel_builds[variants[0].sanitizer],
         "syzkaller_build": syz_build, "syzkaller_provenance": provenance,
-        "execution_harness_id": harness_id, "hcap_revision": hcap_ref,
+        "execution_harness_id": first[0], "hcap_revision": first[1],
         "digests": dict(sorted(digests.items())),
     }
+    if several:
+        report["variants"] = {
+            s.value: {"kernel_build": kernel_builds[s],
+                      "execution_harness_id": r[0], "hcap_revision": r[1]}
+            for s, r in results.items()}
     evidence_ref = store.put(canonical_json(report))
-    catalog = HarnessCatalog(registrations=(HarnessRegistration(
-        binding=binding, evidence_refs=(evidence_ref,)),))
+    catalog = HarnessCatalog(registrations=tuple(
+        HarnessRegistration(binding=r[3], evidence_refs=(evidence_ref,))
+        for r in results.values()))
     catalog_ref = put_record(store, catalog)
-    digests.update({"execution_harness_descriptor": harness_id,
-                    "execution_harness_approval": approval_ref,
-                    "harness_catalog": catalog_ref,
+    digests.update({"harness_catalog": catalog_ref,
                     "registration_evidence": evidence_ref})
 
     # ---------------------------------------------------- configs
     collector_path = state / "collector.json"
+    if several:
+        collector_files = dict(common)
+        per_variant = {s.value: files for s, files in variant_files.items()}
+    else:
+        collector_files = {**common, **variant_files[variants[0].sanitizer]}
+        per_variant = {}
     collector = CollectorConfig(
         artifact_root=root, ssh_key=ssh_key, pin_cache=state / "pins.json",
-        files={n: p.resolve() for n, p in files.items()},
+        files={n: p.resolve() for n, p in collector_files.items()},
+        variant_files={s: {n: p.resolve() for n, p in files.items()}
+                       for s, files in per_variant.items()},
         **spec.collector.model_dump())
     collector_path.write_text(collector.model_dump_json(indent=2) + "\n")
     config = Stage1Config(
         state_dir=state, artifact_root=root, kernel_repo=kernel_repo,
         harness_catalog_ref=catalog_ref,
-        execution_harness_approvals=(approval_ref,),
+        execution_harness_approvals=tuple(r[2] for r in results.values()),
         syzkaller_bundle=bundle, syzkaller_identity=identity,
         policies=spec.policies,
+        # Each binding's HCAP names its own Q1 authorities; this default
+        # is the first variant's.
         judge_versions=JudgeVersions(judge_profile_id=judge_profile_ref,
-                                     support_boundary_id=boundary_ref),
+                                     support_boundary_id=first[4]),
         engine=EngineConfig(
             argv=(python, "-m", "agent_pipeline.stage1.host", "collect",
                   "--config", str(collector_path), "{input}", "{output}"),
@@ -860,9 +969,13 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     config_path.write_text(config.model_dump_json(indent=2) + "\n")
     report_path = state / "generated.json"
     report["digests"] = dict(sorted(digests.items()))
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True)
+                           + "\n")
     return Generated(stage1_config=config_path,
                      collector_config=collector_path, report=report_path,
                      kernel_commit=kernel_commit,
-                     execution_harness_id=harness_id, hcap_revision=hcap_ref,
+                     execution_harness_id=first[0], hcap_revision=first[1],
+                     variants={s.value: GeneratedVariant(
+                         execution_harness_id=r[0], hcap_revision=r[1])
+                         for s, r in results.items()},
                      digests=digests)

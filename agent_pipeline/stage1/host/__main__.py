@@ -29,16 +29,22 @@ def _collector(args) -> CollectorConfig:
     return CollectorConfig.load(path)
 
 
-def _descriptor(config: Stage1Config, harness_id: str | None = None
-                ) -> ExecutionHarnessDescriptor:
+def _descriptor(config: Stage1Config, harness_id: str | None = None,
+                variant: str | None = None) -> ExecutionHarnessDescriptor:
+    """The descriptor ``harness_id`` names, else the approved one of
+    ``variant`` (a sanitizer), else the first approved one."""
     store = ArtifactStore(config.artifact_root)
     if harness_id is not None:
         return load_record(store, harness_id, ExecutionHarnessDescriptor)
-    approvals = [load_record(store, ref, ExecutionHarnessApproval)
-                 for ref in config.execution_harness_approvals]
-    if len(approvals) != 1:
-        raise SystemExit("several approvals; pass --harness")
-    return approvals[0].descriptor
+    descriptors = [load_record(store, ref, ExecutionHarnessApproval).descriptor
+                   for ref in config.execution_harness_approvals]
+    if variant is None:
+        return descriptors[0]
+    found = [d for d in descriptors if d.sanitizer.value == variant]
+    if not found:
+        raise SystemExit(f"no approved {variant} harness; approved: "
+                         + ", ".join(d.sanitizer.value for d in descriptors))
+    return found[0]
 
 
 def _vmlinux(config: Stage1Config, collector: CollectorConfig,
@@ -47,7 +53,7 @@ def _vmlinux(config: Stage1Config, collector: CollectorConfig,
     builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
     name = config.vmlinux_artifact_name
     pin = load_record(store, builds[name], HostFilePin)
-    path = collector.files[name]
+    path = collector.files_for(descriptor.sanitizer)[name]
     verify_file(pin, path, PinCache(collector.pin_cache))
     return path, pin
 
@@ -82,7 +88,7 @@ def cmd_probe(args) -> int:
     from .vm import QemuGuest, VmConfig
     config = Stage1Config.load(args.stage1)
     collector = _collector(args)
-    descriptor = _descriptor(config)
+    descriptor = _descriptor(config, variant=args.variant)
     files = verify_pins(collector, descriptor)
     selection = descriptor.allowed_runtime_selections[args.selection]
     if args.trace:
@@ -170,7 +176,8 @@ def cmd_check_pcs(args) -> int:
     from .target_pcs import check_pcs, vmlinux_callsites
     config = Stage1Config.load(args.stage1)
     collector = _collector(args)
-    vmlinux, pin = _vmlinux(config, collector, _descriptor(config))
+    vmlinux, pin = _vmlinux(config, collector,
+                            _descriptor(config, variant=args.variant))
     text = args.coverage.read_text()
     if text.lstrip().startswith("{"):
         pcs = json.loads(text)["pcs"]
@@ -199,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--stage1", type=Path, required=True)
         p.add_argument("--collector", type=Path)
+        if name != "target-pcs":
+            # target-pcs takes the job's own harness.
+            p.add_argument("--variant", help="sanitizer of the approved "
+                           "harness to use (default: the first)")
         if name == "probe":
             p.add_argument("--program", type=Path, required=True)
             p.add_argument("--out", type=Path, required=True)
