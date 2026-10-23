@@ -120,6 +120,29 @@ trusted Stage 2 argv. It does not alter syz-manager campaign timeouts.
 the legacy `run_stage2: true`, to start it on Q1 `REACHED`. The campaign thresholds and `fuzz_budget_executions` are
 placeholders until the repository owner sets them.
 
+## Manager config
+
+`python -m agent_pipeline.stage1.host generate SPEC` writes the manager
+config when the host spec has a `stage2` section (#81 D17):
+
+```json
+"stage2": {"procs": 1, "nfs_proxy_window": 6}
+```
+
+It writes `state_dir/stage2-manager.json`, or `stage2-manager-<sanitizer>.json`
+for each variant, from the same descriptor the Stage 1 collector runs: its
+`bzImage`, `vmlinux`, image, syzkaller binaries, SSH key, QEMU, CPUs and
+memory, a frozen copy of the pinned lane script as `workdir_template`, the
+approved command line with the selection's `koov.*` arguments and
+`koov.nfs_target=1`, the 9P lane share, and one journal channel per guest
+lane. `enable_syscalls` is every admitted call and every call the runtime
+selection enables; a given list must include all of them and name only
+calls the syzkaller build has. `runtime_selection` picks the selection the
+manager boots and may be left out when the spec has one. `generated.json`
+records each manager's SHA-256 under `stage2_manager`. Generation does not
+set `Stage1Config.stage2` or `nfs_proxy`, which need the promoted Proxy and
+the judge profiles; pass the manager to the `step` and `preflight` commands.
+
 ## KVM preflight
 
 Before starting a real Stage 2 job, run the read-only readiness check:
@@ -141,8 +164,12 @@ and syzkaller binaries must match the approved harness pins; its SSH key and
 QEMU must match the collector. It also requires remote coverage, program
 snapshot mode disabled, a crash-context window at least as large as
 `crash_window_bound`, one KVM target-mode VM, the exact approved base kernel
-command line plus bounded `koov.*` fixture arguments, and one journal channel
-per active proc. The report records the manager config's SHA-256. Regenerate
+command line plus `koov.*` fixture arguments that boot one of the
+descriptor's runtime selections (its `koov.nfs_version` or
+`koov.nfs_fixture`, its `koov.nfs_trace`; the Stage 1-only `nlm-knfsd`
+fixture is refused), and one journal channel per active proc. With several
+sanitizer variants the manager is checked against the harnesses whose
+`bzimage` and `kernel` it boots, so one manager runs one variant. The report records the manager config's SHA-256. Regenerate
 older Stage 1 harness configs so their descriptor also pins `syz-manager`; a
 Stage 2 preflight intentionally rejects descriptors that pin only the
 executor binaries.

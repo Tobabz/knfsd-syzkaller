@@ -592,5 +592,9 @@
     "grace_s": 11,
     "drain_s": 10,
     "exec_timeout_s": 600
+  },
+  "stage2": {
+    "procs": 1,
+    "nfs_proxy_window": 6
   }
 }

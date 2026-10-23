@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -234,7 +235,9 @@ def _manager_config(tmp_path: Path):
         command_line=("root=/dev/sda", "console=ttyS0", "nokaslr",
                       "nfs.localio_enabled=N"),
         pins=tuple((name, pin_file(name, asset))
-                   for name, asset in assets.items()))
+                   for name, asset in assets.items()),
+        fixtures=frozenset({("koov.nfs_version=4.1", "0"),
+                            ("koov.nfs_fixture=broad-knfsd", "0")}))
     manager = {
         "type": "qemu", "target": "linux/amd64", "procs": 1,
         "workdir_template": str(template),
@@ -328,6 +331,64 @@ def test_manager_config_binds_window_lane_script_and_all_proc_journals(
     path.write_text(json.dumps(manager))
     with pytest.raises(PreflightError, match="at least 4"):
         _manager_check(path, collector, harnesses, command)
+
+
+def test_manager_fixture_is_an_approved_stage2_runtime_selection(tmp_path):
+    # #81 D17: the allowed fixtures are the descriptor's runtime selections.
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    approved_cmdline = manager["vm"]["cmdline"]
+
+    def check(old, new):
+        manager["vm"]["cmdline"] = approved_cmdline.replace(old, new)
+        path.write_text(json.dumps(manager))
+        return _manager_check(path, collector, harnesses, command)
+    assert "approved assets" in check(
+        "koov.nfs_version=4.1", "koov.nfs_fixture=broad-knfsd")
+    assert "approved assets" in check(
+        "koov.nfs_target=1", "koov.nfs_target=1 koov.nfs_trace=0")
+    with pytest.raises(PreflightError, match="koov.nfs_trace=1"):
+        check("koov.nfs_target=1", "koov.nfs_target=1 koov.nfs_trace=1")
+    with pytest.raises(PreflightError, match="no Stage 2 runtime selection"):
+        check("koov.nfs_version=4.1", "koov.nfs_version=4.2")
+    with pytest.raises(PreflightError, match="unapproved dynamic argument"):
+        check("koov.nfs_target=1", "koov.nfs_target=0")
+    with pytest.raises(PreflightError, match="one approved NFS fixture"):
+        check("koov.nfs_version=4.1",
+              "koov.nfs_version=4.1 koov.nfs_fixture=broad-knfsd")
+
+
+def test_nlm_fixture_stays_a_stage1_selection():
+    from agent_pipeline.stage2.host import _stage2_fixtures
+    from .test_materializer import runtime
+    assert _stage2_fixtures((
+        runtime(), runtime(trace_mode="on"),
+        runtime(fixture_mode="broad-knfsd"),
+        runtime(fixture_mode="nlm-knfsd", nfs_version="3",
+                profile="knfsd-v3"))) == {
+        ("koov.nfs_version=4.1", "0"), ("koov.nfs_version=4.1", "1"),
+        ("koov.nfs_fixture=broad-knfsd", "0")}
+
+
+def test_manager_runs_the_variant_whose_kernel_it_boots(tmp_path):
+    # #81 D10: sanitizer variants differ in their kernel only.
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    (kasan,) = harnesses
+    other = tmp_path / "kcsan"
+    other.mkdir()
+    pins = dict(kasan.pins)
+    for name in ("bzimage", "kernel"):
+        (other / name).write_bytes(f"kcsan {name}\n".encode())
+        pins[name] = pin_file(name, other / name)
+    kcsan = dataclasses.replace(kasan, harness_id="b" * 64,
+                                pins=tuple(pins.items()))
+    assert "approved assets" in _manager_check(
+        path, collector, (kasan, kcsan), command)
+    manager["vm"]["kernel"] = str(other / "bzimage")
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="no approved harness's"):
+        _manager_check(path, collector, (kasan, kcsan), command)
 
 
 def test_promoted_runtime_must_match_every_harness():
