@@ -153,9 +153,10 @@ class OperatorAction(Record):
     type: Literal["operator"] = "operator"
     #: start_stage2 is the 09 §4 "Stage 2 start by operator" on s1_reached;
     #: route_gate / route_strategy are 09 §5 route(to) on
-    #: blocked_operator(gate_regression).
+    #: blocked_operator(gate_regression); start_fixed is the 09 §3.1
+    #: fixed start by operator on s1_reached.
     action: Literal["resume", "close", "cancel", "start_stage2",
-                    "route_gate", "route_strategy"]
+                    "start_fixed", "route_gate", "route_strategy"]
     action_id: str
 
 

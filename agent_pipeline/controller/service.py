@@ -324,6 +324,8 @@ class Controller:
                     lambda: self._link_gap(self.store.job(job_id)))
         self._guard(job_id, "pending_task",
                     lambda: self._poll_pending(job_id))
+        self._guard(job_id, "fixed_attempts",
+                    lambda: self._attempts(job_id, poll=True))
         self._guard(job_id, "rebind", lambda: self._retry_rebind(job_id))
 
     def _retry_rebind(self, job_id: str) -> None:
@@ -410,6 +412,7 @@ class Controller:
                     lambda: self._link_gap(self.store.job(job_id)))
         job = self.store.job(job_id)
         p = job.pending_task
+        self._attempts(job_id)
         if p is None:
             if job.state is JobState.SUBMITTED:
                 self._intake(job_id)
@@ -564,10 +567,27 @@ class Controller:
             self.store.link_issue(job.gap, self.issues.open_or_link(
                 job.gap, job.job_id), job.job_id)
 
+    def _attempts(self, job_id: str, poll: bool = False) -> None:
+        """09 §3.1: send each fixed attempt in flight (idempotent by
+        task_id), or with `poll` ask for it first, and take a final one."""
+        job = self.store.job(job_id)
+        if job.state is not JobState.S1_FIXED or job.fixed is None:
+            return
+        for a in job.fixed.in_flight:
+            job = self.store.job(job_id)
+            if job.cancelling_tasks or job.fixed is None or \
+                    a not in job.fixed.in_flight:
+                continue
+            st = self.runner.status(a.task_id) if poll else None
+            if st is None or st.state == "unknown":
+                st = self.runner.submit(a.task_id, self._runner_input(job))
+            self._take_status(job_id, a.task_id, st)
+
     def _dispatch(self, job_id: str) -> None:
         job = self.store.job(job_id)
         p = job.pending_task
         if p is None:
+            self._attempts(job_id)
             return
         if p.kind is TaskKind.AGENT:
             if self.store.attempt(p.task_id, p.attempt) is not None:

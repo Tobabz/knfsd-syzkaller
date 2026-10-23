@@ -260,7 +260,7 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 - `s1_running`의 bundle에 crash report(`06` §10)가 봉인돼 있으면 Controller는 crash finding
   (`Job.crash_findings`의 `CrashFinding`)을 job에 붙인다. Runner task, bundle, harness, plan, 그 실행의 Q1 verdict,
   crash 종류와 첫 crash 줄, panic 여부를 담는다. 그 다음 위 표가 고른 행을 바로 따르지 않고 `s1_replaying`에서
-  finding을 replay한다(§3.1). replay가 끝나면 finding에 `k/M`을 기록하고 검토 대기(`review_queued`)로 두며,
+  finding을 replay한다(§3.1). replay가 끝나면 finding에 `k/M`을 기록하고 검토 대기(`review` `queued`)로 두며,
   job은 그 실행의 verdict가 고른 행으로 간다. crash는 job을 멈추지 않는다(#81 R2). 실행이 끝난 crash(`WARNING:`,
   panic하지 않은 KASAN 보고)는 Q1 verdict대로 진행하고, panic으로 끝나지 못한 실행은 `INCONCLUSIVE(infra)` 행대로
   다시 실행한다. finding은 지워지지 않는다. Q1 crash finding의 검토는 job 상태가 아니라 job에 붙은 목록이다
@@ -289,7 +289,7 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
 | `s1_fixed` | 위 행이 아니고 crash도 없음 | 끝난 attempt 자리에 다음 attempt를 보낸다(보낸 attempt + 남은 attempt < `fixed_attempts`일 때) | — | D11 |
 | `s1_replaying` | replay bundle | crash report가 원래 crash와 같은 signature면 재현으로 센다. 다음 replay를 보낸다. M번째(`fixed_replays`)가 끝나면 다음 crash, 마지막 crash가 끝나면 아래 행 | — | D14 |
 | `s1_replaying` | 마지막 replay, fixed campaign의 crash | `crash_review(fixed_crash)`. crash마다 `k/M`과 `reproduced`(`k>0`)를 기록한다. `k=0`이어도 간다. `resume_point`는 `s1_fixed`(같은 campaign) | — | D14 |
-| `s1_replaying` | 마지막 replay, `s1_running`의 crash finding | finding에 `k/M`을 기록하고 `review_queued`로 둔다. job은 그 실행의 verdict가 고른 §3의 행으로 간다 | — | R2, R3 |
+| `s1_replaying` | 마지막 replay, `s1_running`의 crash finding | finding에 `k/M`을 기록하고 `review`를 `queued`로 둔다. job은 그 실행의 verdict가 고른 §3의 행으로 간다 | — | R2, R3 |
 | `s1_replaying` | 봉인 bundle 없는 Runner 종료 | 같은 replay를 다시 실행한다. 봉인 bundle이 있으면 Q1 verdict와 무관하게 crash report만 보고 센다 | runtime_retry | |
 | `s1_replaying` | replay bundle이 이 task의 것이라는 host provenance가 없음 | `blocked_operator(replay_evidence)`. `resume`이 그 replay를 다시 실행한다 | — | `01` §11.1 |
 | `crash_review` | resume, fixed campaign | `s1_fixed`. 같은 campaign의 수를 이어 간다. 기록한 crash는 남고, 새 crash가 나면 그 crash만 replay한다 | — | |
@@ -310,8 +310,17 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
 - **campaign 기록.** `FixedCampaign`이 campaign id, 보낸 attempt 수, 센 attempt 수(`reached_no_crash`,
   `not_reached`, 도달률), 연속 `not_reached`, crash 목록, `in_flight` task를 가진다. 전이 기록은 attempt마다 소비한
   Q1 verdict를 남긴다.
-- **재평가 이벤트와 취소.** binding 변경, operator `close`·`cancel`은 `in_flight`의 모든 task를 `cancelling_tasks`에
-  더한다(§8). `s1_replaying`은 `s2_replaying`처럼 기록된 harness로 끝까지 간다.
+- **중복 crash.** 같은 harness에서 같은 signature의 crash를 이미 replay했거나 replay를 기다리고 있으면 새 finding은
+  `duplicate`로 남고 replay하지 않는다. fixed campaign도 그 crash로는 멈추지 않는다(매 attempt의 boot `WARNING`이
+  campaign을 매번 멈추지 않게). crash 수에는 더한다.
+- **끝.** crash 없이 센 attempt가 `fixed_attempts`에 닿으면 `s1_reached(fixed_no_signal)`, 검토한 crash가 있었으면
+  `s1_reached(fixed_complete)`이다. 같은 harness로 `s1_reached`에 다시 들어와도(JudgeProfile 재판정) campaign을 또
+  시작하지 않는다. operator `start_fixed`는 새 campaign을 시작한다.
+- **재평가 이벤트와 취소.** binding 변경이 job을 `s1_fixed`나 `s1_replaying` 밖으로 보내면(harness 재생성 등)
+  `in_flight`의 모든 task와 replay task를 `cancelling_tasks`에 더한다(§8). identity가 그대로면 job은 그 자리에서
+  이어 간다(§5). operator `close`·`cancel`도 모두 취소한다. replay가 끝나기 전에 job이 replay를 떠나면 그 finding은
+  `abandoned`로 남는다. replay는 crash가 난 harness로만 돌릴 수 있기 때문이다. JudgeProfile 재판정은
+  `s1_replaying`의 replay를 끊지 않고, Q1 crash finding의 replay가 끝난 뒤 갈 행만 바꾼다.
 
 ### 4. Stage 2 전이
 

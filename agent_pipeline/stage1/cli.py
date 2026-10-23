@@ -179,6 +179,14 @@ def _job_summary(service: Stage1Service, job_id: str) -> dict:
                            **job.campaign.tally.model_dump(mode="json")}
     if job.triage:
         out["triage"] = [t.model_dump(mode="json") for t in job.triage]
+    if job.fixed is not None:
+        k = job.fixed
+        out["fixed"] = {
+            "campaign_id": k.campaign_id, "sent": k.sent,
+            "reached": k.reached, "not_reached": k.not_reached,
+            "crashes": k.crashes,
+            "consecutive_not_reached": k.consecutive_not_reached,
+            "in_flight": [a.task_id for a in k.in_flight]}
     if job.crash_findings:
         out["crash_findings"] = [f.model_dump(mode="json")
                                  for f in job.crash_findings]

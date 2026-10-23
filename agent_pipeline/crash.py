@@ -28,6 +28,8 @@ MAX_LINES = 16
 MAX_LINE = 200
 
 _TIMESTAMP = re.compile(r"^\s*\[\s*[0-9]+\.[0-9]+\]\s*")
+#: A number in a crash line: an address, offset, CPU, PID or line number.
+_NUMBER = re.compile(r"\b(?:0x)?[0-9a-fA-F]*[0-9][0-9a-fA-F]*\b")
 
 
 class CrashKind(str, enum.Enum):
@@ -104,3 +106,11 @@ def classify(console: str, dmesg: str | None, sanitizer: Sanitizer,
                 lines=tuple(line for _, line in found[:MAX_LINES]),
                 panicked=any(k is CrashKind.PANIC for k, _ in found))
     return None
+
+
+def signature(kind: CrashKind | str, title: str) -> str:
+    """What a replay must show to reproduce a crash (09 §3.1): its kind
+    and first crash line with the numbers removed, so another address,
+    CPU or PID is the same crash."""
+    kind = CrashKind(kind)
+    return f"{kind.value}:{_NUMBER.sub('N', title)}"

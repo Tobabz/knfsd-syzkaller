@@ -77,44 +77,106 @@ def test_the_report_is_bounded():
 
 # ------------------------------------------------------------ Controller
 
+def finish(w, j, task_id, status=Q1Status.REACHED, reason=None, crash=None,
+           name=None):
+    """Seal `task_id` with a bundle judged `status`, crashing with
+    `crash`."""
+    job = w.job(j)
+    bundle = name or f"bundle-{task_id}"
+    w.judge.add(bundle, job.binding.execution_harness_id,
+                job.candidate.candidate_id, status, reason)
+    if crash is not None:
+        w.judge.crashes[bundle] = crash
+    w.runner.finish(task_id, bundle=bundle)
+    w.c.poll()
+    return bundle
+
+
+def replay(w, j, crash=None):
+    """One run of the Stage 1 replay."""
+    job = w.job(j)
+    assert job.state is JobState.S1_REPLAYING, job.state
+    return finish(w, j, job.pending_task.task_id, crash=crash)
+
+
+def replays(w, j, *crashes):
+    for crash in crashes:
+        replay(w, j, crash)
+
+
+#: The same crash at other addresses: a replay that reproduces it.
+KASAN_AGAIN = KASAN.replace("12345678", "87654321").replace("12.3", "40.1")
+
+
 @pytest.mark.parametrize(("status", "state"), [
     (Q1Status.REACHED, JobState.S1_REACHED),
     (Q1Status.NOT_REACHED, JobState.S1_PLANNING)])
-def test_a_completed_run_keeps_its_verdict_and_the_finding(
+def test_a_crash_finding_is_replayed_then_the_verdict_routes(
         world, status, state):
     j = world.to_running()
     task = world.job(j).pending_task.task_id
-    world.judge.crashes["b1"] = report(WARNING)
+    world.judge.crashes["b1"] = report(KASAN)
     world.run(j, status, name="b1")
+    job = world.job(j)
+    assert job.state is JobState.S1_REPLAYING
+    assert job.last_verdict.result.status is status
+    (finding,) = job.crash_findings
+    assert (finding.task_id, finding.bundle_ref) == (task, "b1")
+    assert finding.source == "q1" and finding.kind == "kasan"
+    assert not finding.panicked and finding.replay == "pending"
+    assert finding.q1_status == status.value
+    assert finding.q1_verdict_id == job.last_verdict.result.verdict_id
+    assert finding.harness_ref == job.harness.harness_ref
+    # D14: M runs, one at a time; another address is the same crash.
+    replays(world, j, report(KASAN_AGAIN), None, report(WARNING),
+            report(KASAN), None)
     job = world.job(j)
     assert job.state is state
     if status is Q1Status.NOT_REACHED:
         assert job.pending_task.repair.cause \
             is RepairCause.Q1_NOT_REACHED
-    assert job.last_verdict.result.status is status
     (finding,) = job.crash_findings
-    assert (finding.task_id, finding.bundle_ref) == (task, "b1")
-    assert finding.kind == "warning" and not finding.panicked
-    assert finding.q1_status == status.value
-    assert finding.q1_verdict_id == job.last_verdict.result.verdict_id
-    assert finding.harness_ref == job.harness.harness_ref
-    assert finding.replay == "pending"
+    assert finding.replay == "done" and finding.review == "queued"
+    assert (finding.reproduced, finding.replays) == (2, 5)
+    assert [r.reproduced for r in finding.replay_runs] == [
+        True, False, False, True, False]
+    assert finding.replay_runs[2].kind == "warning"
+    assert job.s1_replay is None
     assert world.c.replay(j) == job
 
 
-def test_a_panic_reruns_q1_and_keeps_the_finding(world):
+def test_a_crash_that_never_reproduces_is_still_reviewed(world):
+    j = world.to_running()
+    world.judge.crashes["b1"] = report(WARNING)
+    world.run(j, Q1Status.REACHED, name="b1")
+    replays(world, j, *[None] * 5)
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    f = job.crash_findings[0]
+    assert (f.reproduced, f.replays, f.review) == (0, 5, "queued")
+
+
+def test_a_panic_is_replayed_then_the_run_is_run_again(world):
     j = world.to_running()
     world.judge.crashes["b1"] = report(PANIC)
     world.run(j, Q1Status.INCONCLUSIVE, "infra", name="b1")
+    assert world.job(j).state is JobState.S1_REPLAYING
+    replays(world, j, *[report(PANIC)] * 5)
     job = world.job(j)
     assert job.state is JobState.S1_RUNNING
     assert job.counters.runtime_retry == 1
     assert job.crash_findings[0].panicked
-    world.run(j, Q1Status.REACHED, name="b2")
+    assert job.crash_findings[0].reproduced == 5
+    # The same panic again is the crash already replayed.
+    world.judge.crashes["b2"] = report(PANIC)
+    world.run(j, Q1Status.INCONCLUSIVE, "infra", name="b2")
     job = world.job(j)
-    assert job.state is JobState.S1_REACHED
-    assert [f.bundle_ref for f in job.crash_findings] == ["b1"]
-    assert world.c.replay(j) == job
+    assert job.state is JobState.S1_RUNNING
+    assert job.counters.runtime_retry == 2
+    assert [f.replay for f in job.crash_findings] == ["done", "duplicate"]
+    world.run(j, Q1Status.REACHED, name="b3")
+    assert world.job(j).state is JobState.S1_REACHED
+    assert world.c.replay(j) == world.job(j)
 
 
 def test_findings_accumulate_across_runs(world):
@@ -122,10 +184,13 @@ def test_findings_accumulate_across_runs(world):
     world.judge.crashes["b1"] = report(PANIC)
     world.judge.crashes["b2"] = report(KASAN)
     world.run(j, Q1Status.INCONCLUSIVE, "infra", name="b1")
+    replays(world, j, *[None] * 5)
     world.run(j, Q1Status.REACHED, name="b2")
+    replays(world, j, *[None] * 5)
     job = world.job(j)
-    assert [(f.bundle_ref, f.kind) for f in job.crash_findings] == [
-        ("b1", "oops"), ("b2", "kasan")]
+    assert job.state is JobState.S1_REACHED
+    assert [(f.bundle_ref, f.kind, f.replay) for f in job.crash_findings] \
+        == [("b1", "oops", "done"), ("b2", "kasan", "done")]
     assert world.c.replay(j) == job
 
 
@@ -133,6 +198,57 @@ def test_a_run_without_a_crash_adds_no_finding(world):
     j = world.to_running()
     world.run(j, Q1Status.REACHED)
     assert world.job(j).crash_findings == ()
+
+
+def test_an_unsealed_replay_runs_again_within_runtime_retry(world):
+    j = world.to_running()
+    world.judge.crashes["b1"] = report(KASAN)
+    world.run(j, Q1Status.REACHED, name="b1")
+    replay(world, j, report(KASAN))
+    limit = world.store.policy("p1").runtime_retry_limit
+    for n in range(1, limit + 1):
+        world.crash_run(j)
+        job = world.job(j)
+        assert job.state is JobState.S1_REPLAYING
+        assert job.counters.runtime_retry == n
+    world.crash_run(j)
+    job = world.job(j)
+    assert job.state is JobState.BLOCKED_OPERATOR
+    assert job.state_reason == "runtime_retry_exhausted"
+    assert job.s1_replay is not None
+    world.c.operator(j, "resume")
+    replays(world, j, *[None] * 4)
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    assert job.crash_findings[0].reproduced == 1
+    assert world.c.replay(j) == job
+
+
+def test_a_replay_bundle_without_provenance_blocks(world):
+    j = world.to_running()
+    world.judge.crashes["b1"] = report(KASAN)
+    world.run(j, Q1Status.REACHED, name="b1")
+    p = world.job(j).pending_task
+    world.runner.finish(p.task_id, bundle="unknown-bundle")
+    world.c.poll()
+    job = world.job(j)
+    assert (job.state, job.state_reason) == (JobState.BLOCKED_OPERATOR,
+                                             "replay_evidence")
+    world.c.operator(j, "resume")
+    assert world.job(j).state is JobState.S1_REPLAYING
+
+
+def test_closing_during_a_replay_abandons_it(world):
+    j = world.to_running()
+    world.judge.crashes["b1"] = report(KASAN)
+    world.run(j, Q1Status.REACHED, name="b1")
+    p = world.job(j).pending_task
+    world.c.operator(j, "close")
+    job = world.job(j)
+    assert job.state is JobState.CLOSED
+    assert job.crash_findings[0].replay == "abandoned"
+    assert job.s1_replay is None and world.runner.cancel_calls[p.task_id]
+    assert world.c.replay(j) == job
 
 
 # ------------------------------------------------------------ sealed judge

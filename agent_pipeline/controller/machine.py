@@ -18,6 +18,7 @@ from typing import Callable
 
 from ..components import (HcapChecker, Materializer, MutationRuleCompiler,
                           Q1Judge, Stage2Judge)
+from ..crash import signature
 from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
                          HOST_AUTHORITY_UNAVAILABLE, M1_STATUSES,
                          Q2_STATUSES, REPLAY_EVIDENCE_REJECTED,
@@ -31,8 +32,9 @@ from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
 from . import events as ev
 from .records import (STAGE2_CAUSES, TERMINAL, WAITING, BlockedReason,
                       BundleCursor, Campaign, CampaignTally, ConsumedVerdict,
-                      CrashFinding, CrashRef, Job, JobState, PendingTask,
-                      RepairCause, RepairInput, Replay, Stage2Input, Target,
+                      AttemptTask, CrashFinding, CrashRef, FixedCampaign,
+                      Job, JobState, PendingTask, RepairCause, RepairInput,
+                      Replay, ReplayRun, S1Replay, Stage2Input, Target,
                       TargetKind, TaskKind, TriageItem)
 from .tasks import (CLEANUP_UNCONFIRMED, RunnerInput, agent_input_digest,
                     legacy_runner_input_digest, runner_input_digest)
@@ -48,6 +50,8 @@ STATE_OF_TASK = {t: s for s, t in AGENT_STATES.items()}
 WAITING_KINDS = {TargetKind.BLOCKED_OPERATOR, TargetKind.BLOCKED_HARNESS_GAP}
 #: States that wait on a Runner task, and the target that re-enters each.
 RUNNER_STATES = {JobState.S1_RUNNING: TargetKind.RUNNING,
+                 JobState.S1_FIXED: TargetKind.FIXED,
+                 JobState.S1_REPLAYING: TargetKind.S1_REPLAY,
                  JobState.S2_GATE: TargetKind.GATE,
                  JobState.S2_CAMPAIGN: TargetKind.CAMPAIGN,
                  JobState.S2_REPLAYING: TargetKind.REPLAY}
@@ -146,6 +150,8 @@ class Machine:
             return None
         if j.state is not JobState.S1_REACHED:
             j.stage2_input = None
+        if j.s1_replay is not None and not self._in_s1_replay(j):
+            self._abandon_s1_replay(j)
         j.seq += 1
         return Outcome(j, c.reason, c.consumed, c.verdicts, c.abandoned)
 
@@ -284,6 +290,9 @@ class Machine:
             if e.reason == CLEANUP_UNCONFIRMED:
                 self._cleanup_unconfirmed(c, e.task_id)
             return True
+        if j.state is JobState.S1_FIXED and j.fixed is not None and \
+                any(a.task_id == e.task_id for a in j.fixed.in_flight):
+            return self._attempt_finished(c, e)
         p = j.pending_task
         if not self._is_pending(p, TaskKind.RUNNER, e.task_id) or \
                 j.state not in RUNNER_STATES:
@@ -300,6 +309,8 @@ class Machine:
             return self._campaign_finished(c, cursor, e)
         if j.state is JobState.S2_REPLAYING:
             return self._replay_finished(c, e)
+        if j.state is JobState.S1_REPLAYING:
+            return self._s1_replay_finished(c, e)
         if e.state == "ended_unsealed" or not e.bundle_ref:
             c.reason = f"runner_ended_unsealed:{e.reason or ''}"
             self._goto(c, Target(kind=TargetKind.RUNNING, rerun=True))
@@ -318,18 +329,16 @@ class Machine:
                                          binding=j.binding,
                                          plan_ref=j.plan_ref,
                                          harness_ref=j.harness.harness_ref)
-        crash = self.env.judge.crash_report(e.bundle_ref)
-        if crash is not None:
-            # #81 §3: the crash does not stop the job; the verdict routes it.
-            j.crash_findings = j.crash_findings + (CrashFinding(
-                task_id=e.task_id, bundle_ref=e.bundle_ref,
-                harness_ref=j.harness.harness_ref,
-                execution_harness_id=r.execution_harness_id,
-                plan_ref=j.plan_ref, q1_verdict_id=r.verdict_id,
-                q1_status=r.status.value, q1_reason=r.reason,
-                kind=crash.kind.value, title=crash.title,
-                panicked=crash.panicked),)
-        self._goto(c, self._q1_target(c, r))
+        t = self._q1_target(c, r)
+        i = self._add_finding(c, e, r)
+        if i is not None:
+            # #81 R2, R3: the crash does not stop the job.  It is replayed,
+            # then the verdict routes the job (09 §3, §3.1).
+            c.reason = "crash_finding"
+            j.s1_replay = S1Replay(queue=(i,), after=t)
+            self._goto(c, Target(kind=TargetKind.S1_REPLAY))
+            return True
+        self._goto(c, t)
         return True
 
     def _on_approval_given(self, c: _Call, e: ev.ApprovalGiven) -> bool:
@@ -559,6 +568,11 @@ class Machine:
             # The replay finishes; the re-judge decides where the job
             # goes after crash_review (09 §5).
             j.replay = j.replay.model_copy(update={"resume": t})
+        elif j.state is JobState.S1_REPLAYING and \
+                j.s1_replay.after is not None:
+            # The crash's replay finishes; the re-judge decides the row
+            # the run goes to after it (09 §3.1).
+            j.s1_replay = j.s1_replay.model_copy(update={"after": t})
         elif j.state in WAITING or j.state is JobState.RETRY_PENDING:
             self._set_resume(c, t, self._waiting_base(j))
         else:
@@ -609,6 +623,11 @@ class Machine:
                 return False
             self._start_stage2(c)
             return True
+        if e.action == "start_fixed":
+            if j.state is not JobState.S1_REACHED:
+                return False
+            self._start_fixed(c)
+            return True
         if e.action in ("route_gate", "route_strategy"):
             return self._route(c, e.action)
         if e.action == "resume" and j.state is JobState.CRASH_REVIEW:
@@ -638,6 +657,10 @@ class Machine:
                 j.campaign = j.campaign.model_copy(update={
                     "tally": j.campaign.tally.model_copy(
                         update={tally: 0})})
+            if blocked is BlockedReason.FIXED_NOT_REACHING and \
+                    j.fixed is not None:
+                j.fixed = j.fixed.model_copy(
+                    update={"consecutive_not_reached": 0})
             if blocked is BlockedReason.EXECUTION_CLEANUP:
                 # The operator confirmed the executions are gone.
                 j.uncleaned_tasks = ()
@@ -703,8 +726,11 @@ class Machine:
 
     def _goto(self, c: _Call, t: Target, external: bool = False) -> None:
         j = c.job
-        if not (t.kind in RERUN_KINDS and t.rerun):
+        if not (t.kind in RERUN_KINDS and t.rerun) and \
+                t.kind is not TargetKind.S1_REPLAY:
             # 09 §6: runtime_retry ends with any row that is not a rerun.
+            # A Stage 1 replay sits between a run and the row its verdict
+            # chose, so it keeps the run's count.
             j.counters = j.counters.model_copy(update={"runtime_retry": 0})
         if t.kind in TASK_OF_KIND:
             task = TASK_OF_KIND[t.kind]
@@ -768,18 +794,21 @@ class Machine:
                 return
             self._enter_replay(c, j.replay.crash, j.replay.resume, t.rerun,
                                external or t.external)
+        elif t.kind is TargetKind.FIXED:
+            self._enter_fixed(c)
+        elif t.kind is TargetKind.S1_REPLAY:
+            self._enter_s1_replay(c, t.rerun, external or t.external)
         elif t.kind is TargetKind.REACHED:
-            self._drop_task(c)
-            lv = j.last_verdict
-            j.state = JobState.S1_REACHED
-            j.state_reason = None
-            j.stage2_input = Stage2Input(
-                q1_verdict_id=lv.result.verdict_id, bundle_ref=lv.bundle_ref,
-                plan_ref=lv.plan_ref, harness_ref=lv.harness_ref,
-                execution_harness_id=lv.result.execution_harness_id)
-            self._leave_stage2(j)
-            if c.policy.campaign_mode is CampaignMode.MUTATE:
+            self._reached(c)
+            mode = c.policy.campaign_mode
+            if mode is CampaignMode.MUTATE:
                 self._start_stage2(c)
+            elif mode is CampaignMode.FIXED and not self._fixed_ran(j):
+                self._start_fixed(c)
+            elif mode is CampaignMode.FIXED:
+                # This harness had its campaign: a re-judge that reaches
+                # again does not start another (an operator can).
+                j.state_reason = self._fixed_result(j.fixed)
             else:
                 # #81: Q1 is the deliverable; nothing starts by itself.
                 j.state_reason = "evidence_only"
@@ -878,6 +907,19 @@ class Machine:
         j.compiled = None
         self._goto(c, Target(kind=TargetKind.STRATEGY))
 
+    def _reached(self, c: _Call) -> None:
+        """s1_reached with the Q1 package of the last verdict (09 §3)."""
+        j = c.job
+        self._drop_task(c)
+        lv = j.last_verdict
+        j.state = JobState.S1_REACHED
+        j.state_reason = None
+        j.stage2_input = Stage2Input(
+            q1_verdict_id=lv.result.verdict_id, bundle_ref=lv.bundle_ref,
+            plan_ref=lv.plan_ref, harness_ref=lv.harness_ref,
+            execution_harness_id=lv.result.execution_harness_id)
+        self._leave_stage2(j)
+
     @staticmethod
     def _leave_stage2(j: Job) -> None:
         j.stage2_basis = None
@@ -887,6 +929,316 @@ class Machine:
         j.campaign = None
         j.replay = None
         j.crash_queue = ()
+
+    # ------------------------------------------------------------ fixed
+
+    @staticmethod
+    def _fixed_ran(j: Job) -> bool:
+        return j.fixed is not None and j.harness is not None and \
+            j.fixed.harness_ref == j.harness.harness_ref
+
+    def _fixed_result(self, k: FixedCampaign) -> str:
+        return "fixed_no_signal" if k.crashes == 0 else "fixed_complete"
+
+    def _start_fixed(self, c: _Call) -> None:
+        """09 §3.1, the s1_reached rows: a new fixed campaign on the Q1
+        harness, with the identity check of the Stage 2 start."""
+        j = c.job
+        s2 = j.stage2_input
+        if s2 is None or j.binding is None:
+            self._unexpected(c, Target(kind=TargetKind.REACHED))
+            return
+        if j.harness is None or \
+                s2.execution_harness_id != j.binding.execution_harness_id or \
+                s2.harness_ref != j.harness.harness_ref:
+            c.reason = "fixed_identity_changed"
+            j.harness = None
+            self._goto(c, self._materialize(c, RepairCause.HCAP_CHANGED))
+            return
+        c.reason = "fixed_started"
+        j.task_seq += 1
+        j.fixed = FixedCampaign(
+            campaign_id=f"{j.job_id}.f{j.task_seq}",
+            harness_ref=j.harness.harness_ref,
+            execution_harness_id=j.harness.execution_harness_id,
+            binding=j.binding)
+        self._goto(c, Target(kind=TargetKind.FIXED))
+
+    def _enter_fixed(self, c: _Call) -> None:
+        """s1_fixed: the campaign's attempts, started or continued."""
+        j = c.job
+        here = Target(kind=TargetKind.FIXED)
+        k = j.fixed
+        if k is None or j.harness is None or \
+                j.harness.harness_ref != k.harness_ref:
+            self._unexpected(c, Target(kind=TargetKind.RUNNING))
+            return
+        if not self._runner_free(c, here):
+            return
+        self._drop_task(c)
+        j.state = JobState.S1_FIXED
+        j.state_reason = None
+        j.resume_point = None
+        j.gap = None
+        j.gap_proposal_ref = None
+        self._fill(c)
+
+    def _fixed_waiting(self, j: Job) -> tuple[int, ...]:
+        """The campaign's crashes waiting for replay, by finding index."""
+        k = j.fixed
+        return tuple(i for i, f in enumerate(j.crash_findings)
+                     if f.source == "fixed" and
+                     f.campaign_id == k.campaign_id and f.replay == "pending")
+
+    def _fill(self, c: _Call) -> None:
+        """09 §3.1: attempt tasks up to fixed_parallelism, none while a
+        crash waits; with none left in flight, the replay or the end."""
+        j = c.job
+        k = j.fixed
+        p = c.policy
+        waiting = self._fixed_waiting(j)
+        in_flight = list(k.in_flight)
+        retry = list(k.retry)
+        sent = k.sent
+        digest = runner_input_digest(RunnerInput(
+            job_id=j.job_id, harness_ref=k.harness_ref,
+            execution_harness_id=k.execution_harness_id))
+        while not waiting and len(in_flight) < p.fixed_parallelism:
+            if retry:
+                n = retry.pop(0)
+            elif sent < p.fixed_attempts:
+                sent += 1
+                n = sent
+            else:
+                break
+            in_flight.append(AttemptTask(task_id=self._mint(j), attempt=n,
+                                         input_digest=digest))
+        j.fixed = k = k.model_copy(update={
+            "in_flight": tuple(in_flight), "retry": tuple(retry),
+            "sent": sent})
+        if in_flight:
+            return
+        if waiting:
+            c.reason = "fixed_crash"
+            j.s1_replay = S1Replay(queue=waiting)
+            self._goto(c, Target(kind=TargetKind.S1_REPLAY))
+            return
+        j.counters = j.counters.model_copy(update={"runtime_retry": 0})
+        self._reached(c)
+        j.state_reason = c.reason = self._fixed_result(k)
+
+    def _attempt_finished(self, c: _Call, e: ev.RunnerFinished) -> bool:
+        """09 §3.1, the s1_fixed rows: one attempt's result."""
+        j = c.job
+        k = j.fixed
+        a = next(x for x in k.in_flight if x.task_id == e.task_id)
+        j.fixed = k = k.model_copy(update={"in_flight": tuple(
+            x for x in k.in_flight if x.task_id != e.task_id)})
+        here = Target(kind=TargetKind.FIXED)
+        if e.reason == CLEANUP_UNCONFIRMED:
+            self._retry(j, a)
+            self._cleanup_unconfirmed(c, e.task_id)
+            return True
+        if e.state == "ended_unsealed" or not e.bundle_ref:
+            c.reason = f"runner_ended_unsealed:{e.reason or ''}"
+            return self._attempt_again(c, a)
+        if not self.env.judge.matches_execution(e.bundle_ref, job_id=j.job_id,
+                                                task_id=e.task_id):
+            self._retry(j, a)
+            c.reason = "q1_execution_mismatch"
+            self._block(c, BlockedReason.Q1_EVIDENCE, here)
+            return True
+        r = self.env.judge.judge(e.bundle_ref, j.plan_ref,
+                                 j.candidate.candidate_id, j.judge_versions)
+        c.verdicts.append(r)
+        c.consumed.append(r.verdict_id)
+        if self._add_finding(c, e, r, a) is not None or \
+                self.env.judge.crash_report(e.bundle_ref) is not None:
+            # D12, D13: a crash whatever the verdict; the campaign sends no
+            # new attempt until it is replayed (unless it was already).
+            k = k.model_copy(update={"crashes": k.crashes + 1})
+            c.reason = "fixed_attempt_crash"
+        else:
+            t = self._q1_target(c, r)
+            if t.kind is TargetKind.REACHED:
+                k = k.model_copy(update={"reached": k.reached + 1,
+                                         "consecutive_not_reached": 0})
+                c.reason = "fixed_attempt_reached"
+            elif t.kind is TargetKind.PLANNING:
+                k = k.model_copy(update={
+                    "not_reached": k.not_reached + 1,
+                    "consecutive_not_reached":
+                        k.consecutive_not_reached + 1})
+                c.reason = "fixed_attempt_not_reached"
+            elif t.kind is TargetKind.RUNNING and t.rerun:
+                c.reason = f"fixed_attempt_rerun:{r.reason}"
+                return self._attempt_again(c, a)
+            else:
+                # Evidence, mapping, attribution or identity: §3's row,
+                # resuming this campaign.
+                self._retry(j, a)
+                self._goto(c, t.model_copy(update={"inner": here}))
+                return True
+        j.fixed = k
+        j.counters = j.counters.model_copy(update={"runtime_retry": 0})
+        if k.consecutive_not_reached >= c.policy.fixed_not_reached_limit:
+            c.reason = "fixed_not_reaching"
+            self._block(c, BlockedReason.FIXED_NOT_REACHING, here)
+            return True
+        self._fill(c)
+        return True
+
+    @staticmethod
+    def _retry(j: Job, a: AttemptTask) -> None:
+        """The attempt is sent again under its number."""
+        j.fixed = j.fixed.model_copy(update={
+            "retry": tuple(sorted(j.fixed.retry + (a.attempt,)))})
+
+    def _attempt_again(self, c: _Call, a: AttemptTask) -> bool:
+        """An attempt without a counted outcome: runtime_retry (09 §6)."""
+        j = c.job
+        self._retry(j, a)
+        n = j.counters.runtime_retry
+        if n >= c.policy.runtime_retry_limit:
+            self._block(c, BlockedReason.RUNTIME_RETRY_EXHAUSTED,
+                        Target(kind=TargetKind.FIXED))
+            return True
+        j.counters = j.counters.model_copy(update={"runtime_retry": n + 1})
+        self._fill(c)
+        return True
+
+    # ------------------------------------------------------------ S1 replay
+
+    def _add_finding(self, c: _Call, e: ev.RunnerFinished, r: Q1Result,
+                     a: AttemptTask | None = None) -> int | None:
+        """Record the bundle's crash, if any (#81 §3, 09 §3.1).  Returns
+        its index when it is to be replayed: a crash of the same harness
+        and signature replayed already is a duplicate."""
+        j = c.job
+        crash = self.env.judge.crash_report(e.bundle_ref)
+        if crash is None:
+            return None
+        sig = signature(crash.kind, crash.title)
+        duplicate = any(f.harness_ref == j.harness.harness_ref and
+                        f.signature == sig and
+                        f.replay in ("pending", "done")
+                        for f in j.crash_findings)
+        j.crash_findings = j.crash_findings + (CrashFinding(
+            source="q1" if a is None else "fixed",
+            campaign_id=None if a is None else j.fixed.campaign_id,
+            attempt=None if a is None else a.attempt,
+            task_id=e.task_id, bundle_ref=e.bundle_ref,
+            harness_ref=j.harness.harness_ref,
+            execution_harness_id=r.execution_harness_id,
+            plan_ref=j.plan_ref, q1_verdict_id=r.verdict_id,
+            q1_status=r.status.value, q1_reason=r.reason,
+            kind=crash.kind.value, title=crash.title,
+            panicked=crash.panicked, signature=sig,
+            replay="duplicate" if duplicate else "pending"),)
+        return None if duplicate else len(j.crash_findings) - 1
+
+    def _enter_s1_replay(self, c: _Call, rerun: bool = False,
+                         external: bool = False) -> None:
+        """s1_replaying: one run of the first crash in the queue, on the
+        harness it crashed (09 §3.1)."""
+        j = c.job
+        again = Target(kind=TargetKind.S1_REPLAY, rerun=rerun,
+                       external=external)
+        q = j.s1_replay
+        f = None if q is None else j.crash_findings[q.queue[0]]
+        if f is None or j.harness is None or \
+                j.harness.harness_ref != f.harness_ref:
+            self._unexpected(c, Target(kind=TargetKind.RUNNING))
+            return
+        if not self._runner_free(c, again) or \
+                not self._charge_rerun(c, rerun, external, again):
+            return
+        self._drop_task(c)
+        j.pending_task = PendingTask(
+            task_id=self._mint(j), kind=TaskKind.RUNNER,
+            input_digest=runner_input_digest(RunnerInput(
+                job_id=j.job_id, harness_ref=f.harness_ref,
+                execution_harness_id=f.execution_harness_id)))
+        j.state = JobState.S1_REPLAYING
+        j.state_reason = "rerun" if rerun else None
+        j.resume_point = None
+        j.gap = None
+        j.gap_proposal_ref = None
+
+    def _s1_replay_finished(self, c: _Call, e: ev.RunnerFinished) -> bool:
+        """09 §3.1, the s1_replaying rows."""
+        j = c.job
+        if e.state == "ended_unsealed" or not e.bundle_ref:
+            c.reason = f"runner_ended_unsealed:{e.reason or ''}"
+            self._goto(c, Target(kind=TargetKind.S1_REPLAY, rerun=True))
+            return True
+        if not self.env.judge.matches_execution(e.bundle_ref, job_id=j.job_id,
+                                                task_id=e.task_id):
+            c.reason = "replay_execution_mismatch"
+            self._block(c, BlockedReason.REPLAY_EVIDENCE,
+                        Target(kind=TargetKind.S1_REPLAY))
+            return True
+        q = j.s1_replay
+        i = q.queue[0]
+        f = j.crash_findings[i]
+        crash = self.env.judge.crash_report(e.bundle_ref)
+        runs = f.replay_runs + (ReplayRun(
+            task_id=e.task_id, bundle_ref=e.bundle_ref,
+            kind=None if crash is None else crash.kind.value,
+            title=None if crash is None else crash.title,
+            reproduced=crash is not None and
+            signature(crash.kind, crash.title) == f.signature),)
+        f = f.model_copy(update={"replay_runs": runs})
+        queue = q.queue
+        if len(runs) >= c.policy.fixed_replays:
+            # D14: k/M, and k=0 is reviewed too (reproduced false).
+            f = f.model_copy(update={
+                "replay": "done", "replays": len(runs),
+                "reproduced": sum(x.reproduced for x in runs),
+                "review": "queued"})
+            queue = queue[1:]
+        j.crash_findings = j.crash_findings[:i] + (f,) + \
+            j.crash_findings[i + 1:]
+        c.reason = "s1_replay_run"
+        if queue:
+            j.s1_replay = q.model_copy(update={"queue": queue})
+            self._enter_s1_replay(c)
+            return True
+        j.s1_replay = None
+        if q.after is not None:
+            self._goto(c, q.after)
+            return True
+        c.reason = "fixed_crash_replayed"
+        j.state = JobState.CRASH_REVIEW
+        j.state_reason = "fixed_crash"
+        j.resume_point = Target(kind=TargetKind.FIXED)
+        j.gap = None
+        j.gap_proposal_ref = None
+        return True
+
+    @staticmethod
+    def _in_s1_replay(j: Job) -> bool:
+        """The job replays, or waits to replay again."""
+        if j.state is JobState.S1_REPLAYING:
+            return True
+        t = j.resume_point if j.state in WAITING or \
+            j.state is JobState.RETRY_PENDING else None
+        while t is not None:
+            if t.kind is TargetKind.S1_REPLAY:
+                return True
+            t = t.inner
+        return False
+
+    @staticmethod
+    def _abandon_s1_replay(j: Job) -> None:
+        """The job left the replay before it ended (09 §3.1)."""
+        findings = list(j.crash_findings)
+        for i in j.s1_replay.queue:
+            if findings[i].replay == "pending":
+                findings[i] = findings[i].model_copy(
+                    update={"replay": "abandoned"})
+        j.crash_findings = tuple(findings)
+        j.s1_replay = None
 
     def _compile(self, c: _Call) -> Target:
         """The Mutation Rule Compiler on the stored rule set (09 §4, the
@@ -1567,6 +1919,7 @@ class Machine:
             raise ValueError(f"no model policy for {task}")
         if not stage2:
             self._leave_stage2(j)
+            j.fixed = None
         j.pending_task = PendingTask(task_id=self._mint(j),
                                      kind=TaskKind.AGENT,
                                      input_digest=agent_input_digest(
@@ -1608,6 +1961,7 @@ class Machine:
                 update={"runtime_retry": n + 1})
         self._drop_task(c)
         self._leave_stage2(j)
+        j.fixed = None
         h = j.harness
         if c.policy.approval_required and \
                 h.review_manifest_sha256 not in j.approved_manifests:
@@ -1633,6 +1987,13 @@ class Machine:
         cancelled after commit and the job's next Runner task waits for
         its end (09 §8)."""
         j = c.job
+        k = j.fixed
+        if k is not None and k.in_flight:
+            # 09 §3.1: every attempt in flight, each sent again on resume.
+            j.cancelling_tasks = j.cancelling_tasks + tuple(
+                a.task_id for a in k.in_flight)
+            j.fixed = k.model_copy(update={"in_flight": (), "retry": tuple(
+                sorted(k.retry + tuple(a.attempt for a in k.in_flight)))})
         p = j.pending_task
         if p is None:
             return
