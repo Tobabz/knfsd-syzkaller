@@ -52,7 +52,7 @@ class FakeGuest:
     def __init__(self, config, *, pcs=None, fixture="active", lane_sha=None,
                  nfs_version="4.1", gate="ready", exec_rc="0", dmesg="",
                  generations=GENERATIONS, boot_error=None,
-                 fixture_mode="single"):
+                 fixture_mode="single", console=None, panic=False):
         self.config = config
         self.pcs = pcs
         self.fixture = fixture
@@ -66,6 +66,12 @@ class FakeGuest:
         self.phase = "boot"
         self.dmesg = dmesg
         self.boot_error = boot_error
+        #: Kernel messages the program prints on the serial console;
+        #: ``TEST_CONSOLE`` (a file) when not given.
+        self.console = console
+        #: The kernel panics when the program runs: the guest stops
+        #: answering, and the console ends with the panic.
+        self.panic = panic
         self.commands: list[str] = []
         self.puts: list[tuple[Path, str]] = []
         self.stopped = False
@@ -80,8 +86,18 @@ class FakeGuest:
             return self.lane_sha
         return self.config.cmdline.split("koov.lane_sha256=")[1].split()[0]
 
+    def _print_console(self):
+        text = self.console
+        if text is None and os.environ.get("TEST_CONSOLE"):
+            text = Path(os.environ["TEST_CONSOLE"]).read_text()
+        if text:
+            with open(self.config.console_log, "a") as f:
+                f.write(text)
+
     def run(self, command, *, timeout=60):
         self.commands.append(command)
+        if self.phase == "dead":
+            raise RuntimeError("ssh: connection closed")
         if command.startswith("systemctl is-active"):
             return 0, self.fixture + "\n"
         if "lane.sh status" in command:
@@ -111,7 +127,8 @@ class FakeGuest:
             return 0, "exited\n" if self.phase == "done" else ""
         if command == "touch /tmp/stage1/gate.go":
             assert self.phase == "checked"
-            self.phase = "released"
+            self._print_console()
+            self.phase = "dead" if self.panic else "released"
             return 0, ""
         if command.startswith("cat /tmp/stage1/exec.rc"):
             return 0, self.exec_rc + "\n"

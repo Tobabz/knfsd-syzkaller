@@ -93,7 +93,9 @@ guest. Read `probe-1/probe.json`:
 
 1. **Facts.** `boot_ok`, `fixture_ok`, `lane_ok`, `runner_completed`,
    `collection_completed` and `extra_present` should all be true, and
-   `runtime_errors` should be empty.
+   `runtime_errors` should be empty, and `crash` should be null: a
+   kernel crash on the serial console is reported there, not as a
+   runtime error.
 2. **Generation counters.** `generation_begin` and `aggregate_published`
    should both be 1. execprog's machine check runs its own extra-coverage
    request, which opens a generation, so the window does not cover the

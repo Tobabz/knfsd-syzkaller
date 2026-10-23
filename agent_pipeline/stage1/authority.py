@@ -18,6 +18,7 @@ from ..artifacts import ArtifactStore, validate_digest
 from ..contracts import JudgeVersions, Q1Result, VulnerabilityCandidate
 from ..controller.records import Job, TaskKind
 from ..controller.store import Store
+from ..crash import CrashReport
 from ..data import load_record, put_record
 from ..materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ..q1 import CandidateTarget, ExecutionCorrelation, KernelIdentity, TargetPcMapping
@@ -51,6 +52,9 @@ class PublishedQ1Judge:
     def judge(self, bundle_ref: str, plan_ref: str, candidate_id: str,
               versions: JudgeVersions) -> Q1Result:
         return self.snapshot.judge(bundle_ref, plan_ref, candidate_id, versions)
+
+    def crash_report(self, bundle_ref: str) -> CrashReport | None:
+        return self.snapshot.crash_report(bundle_ref)
 
     def has_required_evidence(self, bundle_ref: str,
                               versions: JudgeVersions) -> bool:

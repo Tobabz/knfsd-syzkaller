@@ -67,7 +67,8 @@ def cmd_collect(args) -> int:
         print(f"collector: {exc}", file=sys.stderr)
         return 2
     print(json.dumps({k: result[k] for k in (
-        "vm_instance_id", "facts", "published_pc_count", "runtime_errors")}))
+        "vm_instance_id", "facts", "published_pc_count", "runtime_errors",
+        "crash")}))
     return 0
 
 
@@ -75,7 +76,8 @@ def cmd_probe(args) -> int:
     """Run one program the way ``collect`` does, without the service: the
     first check on a new host (boot, fixture, counters, coverage)."""
     from ...hcap import RuntimeSelection
-    from .collector import (guest_cmdline, run_lane, verify_pins)
+    from .collector import (crash_report, guest_cmdline, run_lane,
+                            verify_pins)
     from .kcov import counter_deltas, generation_counters
     from .vm import QemuGuest, VmConfig
     config = Stage1Config.load(args.stage1)
@@ -108,6 +110,8 @@ def cmd_probe(args) -> int:
         "boot_ok", "fixture_ok", "lane_ok", "runner_completed",
         "collection_started", "collection_completed", "extra_present")}
     summary["runtime_errors"] = run.runtime_errors
+    crash = crash_report(args.out, args.out / "console.log", descriptor)
+    summary["crash"] = None if crash is None else crash.model_dump(mode="json")
     summary["published_pcs"] = len(run.pcs)
     if run.stats_before is not None and run.stats_after is not None:
         summary["generation"] = generation_counters(

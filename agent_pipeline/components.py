@@ -17,6 +17,7 @@ from .contracts import (CampaignSegment, CompileRejected, CompiledRuleSet,
                         GapRef, ReplayOutcome,
                         MaterializationHcapAuthority, MaterializeRejected,
                         Materialized, Q1Result, Sanitizer)
+from .crash import CrashReport
 
 
 class HcapChecker(Protocol):
@@ -68,6 +69,10 @@ class Q1Judge(Protocol):
     def judge(self, bundle_ref: str, plan_ref: str, candidate_id: str,
               versions: JudgeVersions) -> Q1Result:
         """06 §8-§10 over one sealed bundle (01 §11.1)."""
+
+    def crash_report(self, bundle_ref: str) -> CrashReport | None:
+        """The kernel crash sealed in the bundle, if any (#81 §3).  It does
+        not change the verdict; the Controller keeps it as a finding."""
 
     def has_required_evidence(self, bundle_ref: str,
                               versions: JudgeVersions) -> bool:
