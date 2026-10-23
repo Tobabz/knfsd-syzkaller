@@ -64,6 +64,7 @@ from ..runner.evidence_backend import (ExecutionCapture, HostExecutionFacts,
                                        RunnerEvidenceReceiptStore)
 from ..runner.models import WorkLease
 from ..runner.process_supervisor import HostCommand, ProcessLimits, ProcessSupervisor
+from ..runner.slots import SlotPool, resource
 from ..runner.worker import LeaseControl
 from ..semantic_delta import DeltaReadError
 from ..stage1.engine import (INPUT, MAX_CAPTURE_INDEX_BYTES, OUTPUT,
@@ -145,10 +146,13 @@ class Stage2CommandEngine:
                  receipts: RunnerEvidenceReceiptStore,
                  evidence: EvidenceStore | None = None,
                  limits: EvidenceLimits = EvidenceLimits(),
-                 check_rules: Callable[[Path, bytes, Path], object] = check_rule_set
-                 ) -> None:
+                 check_rules: Callable[[Path, bytes, Path], object] = check_rule_set,
+                 slots: SlotPool | None = None) -> None:
         if not 1 <= config.crash_window_bound <= 64:
             raise ValueError("crash_window_bound must be 1..64")
+        #: The host's KVM slots, shared with Stage 1 (#81 R4); None runs on
+        #: ``config.resource_key``.
+        self.slots = slots
         self.config = config
         self.artifacts = artifacts
         self.supervisor = supervisor
@@ -270,10 +274,10 @@ class Stage2CommandEngine:
         watch = _SegmentControl(control, harvest, self.config.poll_interval_s)
         argv = tuple(arg.replace(INPUT, str(inp)).replace(OUTPUT, str(out))
                      for arg in self.config.argv)
-        result = self.supervisor.run(
-            HostCommand(argv, self.config.cwd, dict(self.config.env)),
-            lease, watch, resource_key=self.config.resource_key,
-            limits=self.config.limits)
+        with resource(self.slots, self.config.resource_key) as key:
+            result = self.supervisor.run(
+                HostCommand(argv, self.config.cwd, dict(self.config.env)),
+                lease, watch, resource_key=key, limits=self.config.limits)
         _write(out.parent / "process.log",
                result.stdout + b"\n--- stderr ---\n" + result.stderr)
         if watch.error is not None:

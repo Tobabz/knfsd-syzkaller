@@ -47,6 +47,7 @@ from ..materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ..runner.evidence_backend import ExecutionCapture, HostExecutionFacts
 from ..runner.models import WorkLease
 from ..runner.process_supervisor import HostCommand, ProcessLimits, ProcessSupervisor
+from ..runner.slots import SlotPool, resource
 from ..runner.worker import LeaseControl
 
 INPUT = "{input}"
@@ -127,11 +128,14 @@ def _write(path: Path, data: bytes) -> None:
 class CommandExecutionEngine:
     def __init__(self, config: CommandEngineConfig, artifacts: ArtifactStore,
                  supervisor: ProcessSupervisor, *,
-                 limits: EvidenceLimits = EvidenceLimits()) -> None:
+                 limits: EvidenceLimits = EvidenceLimits(),
+                 slots: SlotPool | None = None) -> None:
         self.config = config
         self.artifacts = artifacts
         self.supervisor = supervisor
         self.limits = limits
+        #: The host's KVM slots; None runs on ``config.resource_key``.
+        self.slots = slots
 
     def _prepare(self, lease: WorkLease) -> tuple[Path, Path]:
         b = lease.binding
@@ -169,10 +173,10 @@ class CommandExecutionEngine:
         inp, out = self._prepare(lease)
         argv = tuple(arg.replace(INPUT, str(inp)).replace(OUTPUT, str(out))
                      for arg in self.config.argv)
-        result = self.supervisor.run(
-            HostCommand(argv, self.config.cwd, dict(self.config.env)),
-            lease, control, resource_key=self.config.resource_key,
-            limits=self.config.limits)
+        with resource(self.slots, self.config.resource_key) as key:
+            result = self.supervisor.run(
+                HostCommand(argv, self.config.cwd, dict(self.config.env)),
+                lease, control, resource_key=key, limits=self.config.limits)
         log = out.parent / "process.log"
         _write(log, result.stdout + b"\n--- stderr ---\n" + result.stderr)
         if result.reason != "completed" or result.returncode != 0:

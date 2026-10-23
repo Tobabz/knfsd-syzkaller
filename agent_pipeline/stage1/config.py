@@ -70,6 +70,19 @@ class Stage2Config(_Config):
         return argv
 
 
+class SlotsConfig(_Config):
+    """The host's KVM slot pool (09 §8, #81 R6): one guest's size and the
+    host's reserve.  The slot count is computed from the host's CPUs and
+    memory when the service starts; ``engine.resource_key`` (and the Stage
+    2 backend's leases) then run on ``<resource_key>/kvm-<i>``."""
+
+    vm_cpus: int = Field(ge=1, le=256)
+    vm_memory_mb: int = Field(ge=256)
+    reserve_cpus: int = Field(default=2, ge=0)
+    reserve_memory_mb: int = Field(default=4096, ge=0)
+    max_slots: int | None = Field(default=None, ge=1, le=256)
+
+
 class AgentRuntimeConfig(_Config):
     """Host limits of one Agent execution (``RuntimeLimits``); separate
     from the Controller's retry and repair budgets."""
@@ -108,6 +121,8 @@ class Stage1Config(_Config):
     #: blocked_operator(stage2_compiler_unavailable).
     nfs_proxy: Path | None = None
     stage2: Stage2Config | None = None
+    #: Unset: one execution at a time on ``engine.resource_key``.
+    slots: SlotsConfig | None = None
 
     @model_validator(mode="after")
     def _campaign_backends(self) -> Stage1Config:

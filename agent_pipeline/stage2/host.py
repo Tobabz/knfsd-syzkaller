@@ -632,7 +632,10 @@ def preflight(
             checks.add("proxy_identity", "pass",
                        "compiler and replay use the same promoted build")
 
-    if stage2.resource_key == config.engine.resource_key:
+    if config.slots is not None:
+        checks.add("resource_key", "pass",
+                   "Stage 1 and Stage 2 share the host's KVM slot pool")
+    elif stage2.resource_key == config.engine.resource_key:
         checks.add("resource_key", "pass",
                    "Stage 1 and Stage 2 share one KVM resource fence")
     else:

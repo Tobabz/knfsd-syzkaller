@@ -34,6 +34,7 @@ from ..q1 import TargetPcMapping
 from ..registry import ArtifactHarnessRegistry
 from ..rule_compiler import ArtifactMutationRuleCompiler
 from ..runner.process_supervisor import ProcessLimits, ProcessSupervisor
+from ..runner.slots import SlotPolicy, SlotPool
 from .authority import DescriptorKernelIdentity
 from .config import Stage1Config
 from .engine import CommandEngineConfig, CommandExecutionEngine
@@ -72,6 +73,13 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
             run_timeout_seconds=a.run_timeout_s))
     e = config.engine
     state = Path(config.state_dir)
+    slots = None
+    if config.slots is not None:
+        p = config.slots
+        slots = SlotPool.for_host(e.resource_key, SlotPolicy(
+            vm_cpus=p.vm_cpus, vm_memory_mb=p.vm_memory_mb,
+            reserve_cpus=p.reserve_cpus,
+            reserve_memory_mb=p.reserve_memory_mb, max_slots=p.max_slots))
     engine_config = CommandEngineConfig(
         argv=e.argv, cwd=e.cwd, work_root=state / "runs",
         resource_key=e.resource_key, collector_id=e.collector_id, env=e.env,
@@ -80,7 +88,8 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
 
     def engine(store: ArtifactStore) -> CommandExecutionEngine:
         return CommandExecutionEngine(
-            engine_config, store, ProcessSupervisor(state / "processes"))
+            engine_config, store, ProcessSupervisor(state / "processes"),
+            slots=slots)
 
     stage2 = None
     if config.stage2 is not None:
@@ -97,7 +106,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         def stage2_engine(store, receipts, evidence) -> Stage2CommandEngine:
             return Stage2CommandEngine(
                 stage2_config, store, ProcessSupervisor(state / "processes"),
-                receipts=receipts, evidence=evidence)
+                receipts=receipts, evidence=evidence, slots=slots)
 
         stage2 = Stage2Parts(
             engine_factory=stage2_engine,
@@ -121,6 +130,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         worker_id=config.worker_id,
         lease_duration_ns=int(config.lease_duration_s * 1e9),
         agent_workers=config.agent_workers, run_agents=run_agents,
+        runner_workers=1 if slots is None else slots.count,
         compiler=None if config.nfs_proxy is None else
         ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
                                      state / "compile"),

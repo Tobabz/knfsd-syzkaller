@@ -93,6 +93,8 @@ class Stage1Parts:
     worker_id: str = "stage1-worker"
     lease_duration_ns: int = 120_000_000_000
     agent_workers: int = 2
+    #: Runner worker threads: one per KVM slot of the engines' pool.
+    runner_workers: int = 1
     issues: IssueTracker | None = None
     new_id: Callable[[], str] | None = None
     #: False for one-shot commands: Agent Tasks are recorded but not run,
@@ -205,13 +207,17 @@ class Stage1Service:
         self.backend = StepRoutingBackend(EvidenceSealingBackend(
             parts.engine_factory(self.artifacts), self.evidence, self.receipts,
             sealer_id=parts.sealer_id), stage2_backend)
-        self.worker = RunnerWorker(self.runner, self.backend,
-                                   worker_id=parts.worker_id)
+        # One worker per slot; the first keeps the configured worker id.
+        self.workers = [RunnerWorker(
+            self.runner, self.backend,
+            worker_id=parts.worker_id if i == 0 else f"{parts.worker_id}-{i}")
+            for i in range(max(1, parts.runner_workers))]
+        self.worker = self.workers[0]
         self.worker_runs: list[WorkerRun] = []
         self.worker_errors: list[str] = []
         self.recover_errors: list[str] = []
         self._stop = threading.Event()
-        self._worker_thread: threading.Thread | None = None
+        self._worker_threads: list[threading.Thread] = []
 
     # ------------------------------------------------------------ loop
 
@@ -225,13 +231,14 @@ class Stage1Service:
         return failures
 
     def start_worker(self, *, idle_s: float = 0.5) -> None:
-        if self._worker_thread is not None:
+        """Start one thread per Runner worker (per KVM slot)."""
+        if self._worker_threads:
             return
 
-        def loop() -> None:
+        def loop(worker: RunnerWorker) -> None:
             while not self._stop.is_set():
                 try:
-                    run = self.worker.run_once()
+                    run = worker.run_once()
                 except Exception as exc:     # keep the worker alive
                     self.worker_errors.append(f"{type(exc).__name__}: {exc}")
                     run = None
@@ -240,9 +247,12 @@ class Stage1Service:
                 else:
                     self.worker_runs.append(run)
 
-        self._worker_thread = threading.Thread(
-            target=loop, name="stage1-runner-worker", daemon=True)
-        self._worker_thread.start()
+        for i, worker in enumerate(self.workers):
+            thread = threading.Thread(
+                target=loop, args=(worker,), daemon=True,
+                name="stage1-runner-worker" + (f"-{i}" if i else ""))
+            thread.start()
+            self._worker_threads.append(thread)
 
     def step(self, *, wait_s: float = 0.0) -> StepReport:
         report = StepReport()
@@ -311,9 +321,9 @@ class Stage1Service:
         closing are stored before the Store closes."""
         self._stop.set()
         worker_done = True
-        if self._worker_thread is not None:
-            self._worker_thread.join(worker_timeout_s)
-            worker_done = not self._worker_thread.is_alive()
+        for thread in self._worker_threads:
+            thread.join(worker_timeout_s)
+            worker_done = worker_done and not thread.is_alive()
         self.agents.close()
         try:
             self.agents.deliver()

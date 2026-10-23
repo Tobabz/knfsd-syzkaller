@@ -422,7 +422,7 @@ def test_close_keeps_runner_open_for_a_worker_still_cleaning_up(
     task_id = service.job(job_id).pending_task.task_id
     assert service.close(worker_timeout_s=0) is False
     release.set()
-    service._worker_thread.join(30)
+    service._worker_threads[0].join(30)
     try:
         assert service.worker_errors == []
         assert [r.disposition for r in service.worker_runs] == ["not_stopped"]
