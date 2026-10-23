@@ -257,6 +257,17 @@ class GapClass(str, enum.Enum):
     REMOTE_KCOV_ATTRIBUTION = "remote_kcov_attribution"
 
 
+#: The gap IDs the pipeline itself emits (#81 D6).  The Rule Compiler
+#: reports semantic_mutation.unpromoted (``semantic_promotion``) and
+#: state_lineage; Mutation Strategy uses mutation_engine.unlisted, with a
+#: CapabilityProposal, when no listed ID fits.  Host generation adds them
+#: to every HCAP vocabulary so they never route to gap_id_unknown.
+STATE_LINEAGE_GAP_ID = "state_lineage"
+MUTATION_UNLISTED_GAP_ID = "mutation_engine.unlisted"
+PIPELINE_GAP_IDS = (MUTATION_UNLISTED_GAP_ID, "semantic_mutation.unpromoted",
+                    STATE_LINEAGE_GAP_ID)
+
+
 class GapRef(Record):
     """The key of a HarnessGapIssue (07 §3)."""
 
@@ -332,14 +343,16 @@ class RuleSetOutput(Record):
 
 
 class UnsupportedOutput(Record):
-    """05 §8, 07 §3.  An empty missing_capability_id is allowed here and
-    routes to an operator (09 §2, Agent guidance)."""
+    """05 §8, 07 §3.  The Agent executors refuse an empty
+    missing_capability_id, so it does not reach the Controller from a new
+    run.  An empty one is still accepted here, for stored outputs, and
+    routes to an operator (09 §2)."""
 
     variant: Literal["unsupported"] = "unsupported"
     gap_class: GapClass
     missing_capability_id: str
     reason: str
-    #: A stored Planning ``CapabilityProposal`` (#75), left out of the
+    #: A stored ``CapabilityProposal`` (#75, #81), left out of the
     #: encoding when absent so earlier outputs keep their bytes.
     proposal_ref: Sha256 | None = None
 

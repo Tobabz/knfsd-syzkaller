@@ -467,6 +467,10 @@ HarnessGapIssue
 
 state lineage가 필요한 intent는 Compiler가 `requires_state_lineage`로 거부하고, Controller가
 `HarnessGapIssue(gap_class=mutation_engine)`에 missing capability `state_lineage`로 연결한다(issue #6).
+Agent가 직접 `unsupported`를 낼 때 missing capability는 HCAP vocabulary의 id다. 맞는 id가 없으면
+`mutation_engine.unlisted`를 쓰고 `CapabilityProposal`(layer `semantic_subset`, `proxy`, `compiler_lowering`)을
+함께 낸다. 빈 id는 출력 형식 결함으로 executor가 거부한다(#81 D5). proposal은 capability를 만들거나 promotion하지
+않는다.
 초기 runtime(M0–M7)은 다음을 표현하지 않는다.
 
 ```text

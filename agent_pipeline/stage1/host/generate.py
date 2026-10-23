@@ -40,8 +40,8 @@ from ...admission_generation import (AdmissionProfileSource,
                                      PinnedSyzkallerInputs,
                                      generate_call_admission_profile)
 from ...artifacts import ArtifactStore
-from ...contracts import (HarnessBinding, JobPolicy, JudgeVersions, Sanitizer,
-                          Sha256)
+from ...contracts import (PIPELINE_GAP_IDS, CampaignMode, HarnessBinding,
+                          JobPolicy, JudgeVersions, Sanitizer, Sha256)
 from ...data import canonical_json, put_record
 from ...hcap import (AuthorityRef, Capability, HcapCatalog, RuntimeSelection)
 from ...materializer import (ExecutionHarnessApproval,
@@ -437,6 +437,13 @@ class HostSpec(_Spec):
     collector: CollectorSpec = CollectorSpec()
 
 
+def _gap_vocabulary(spec: HostSpec) -> tuple[str, ...]:
+    """The spec's gap IDs and the ones the pipeline emits itself (#81 D6),
+    so every generated HCAP revision lists them explicitly (04 §1.1)."""
+    return tuple(sorted(set(spec.missing_capability_ids) |
+                        set(PIPELINE_GAP_IDS)))
+
+
 def _resolve(base: Path, path: Path) -> Path:
     return (path if path.is_absolute() else base / path).resolve()
 
@@ -547,6 +554,16 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     if wrong:
         raise GenerationError(f"policies {wrong} use another sanitizer than "
                               f"the {spec.variant.value} harness")
+    mutate = [p.policy_id for p in spec.policies
+              if p.campaign_mode is CampaignMode.MUTATE]
+    if mutate:
+        # #81 D16: generation writes no Stage 2 backend, no Proxy for the
+        # Rule Compiler and no promoted semantic registry yet, so a mutate
+        # job could only stop after Q1.
+        raise GenerationError(
+            f"policies {mutate} use campaign_mode mutate, which needs a Stage "
+            "2 backend, an nfs_proxy and a promoted semantic subset; this "
+            "generator configures none of them. Use campaign_mode none")
     state.mkdir(parents=True, exist_ok=True)
     store = ArtifactStore(root)
     digests: dict[str, str] = {}
@@ -658,7 +675,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             "constraints": (*cap.constraints, *listed)})
     admission_draft = HcapCatalog(
         capabilities=tuple(capabilities),
-        missing_capability_ids=tuple(sorted(spec.missing_capability_ids)))
+        missing_capability_ids=_gap_vocabulary(spec))
     with tempfile.TemporaryDirectory() as tmp:
         source_path = Path(tmp) / "source.json"
         hcap_path = Path(tmp) / "hcap.json"
@@ -752,7 +769,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                                           set(refs)))})
     draft = HcapCatalog(
         capabilities=tuple(capabilities),
-        missing_capability_ids=tuple(sorted(spec.missing_capability_ids)))
+        missing_capability_ids=_gap_vocabulary(spec))
 
     judge_profile_ref = put_record(store, spec.judge_profile)
     boundary = RemoteKcovSupportBoundary(

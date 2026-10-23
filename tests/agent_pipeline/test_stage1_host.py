@@ -26,8 +26,8 @@ from agent_pipeline.admission import (BuildFile, SyzkallerBuildManifest,
                                       SyzkallerCallTable,
                                       SyzkallerTargetIdentity)
 from agent_pipeline.artifacts import ArtifactStore
-from agent_pipeline.contracts import (CandidateSubmission, LocationKind,
-                                      LocationRequest, Q1Status)
+from agent_pipeline.contracts import (PIPELINE_GAP_IDS, CandidateSubmission,
+                                      LocationKind, LocationRequest, Q1Status)
 from agent_pipeline.controller.records import JobState
 from agent_pipeline.data import canonical_json, load_record
 from agent_pipeline.q1 import (KernelIdentity, RemoteKcovObservation,
@@ -376,6 +376,26 @@ def test_generate_binds_declared_capability_evidence(host):
         if item.id == "CAP-lane")
     assert len(capability.evidence_refs) == 1
     assert store.get(capability.evidence_refs[0]) == evidence.read_bytes()
+
+
+@needs_gcc
+def test_generated_hcap_lists_the_pipeline_gap_ids(host):
+    # #81 D6: the spec lists none, the generated revision has all three.
+    result = generate(host.spec)
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    catalog = ArtifactHcapChecker(ArtifactStore(host.root / "cas")) \
+        .load_catalog(result.hcap_revision)
+    assert set(catalog.missing_capability_ids) == set(PIPELINE_GAP_IDS)
+
+
+def test_generate_refuses_a_mutate_policy(host):
+    # #81 D16: generation configures no Stage 2 backend yet.
+    spec = json.loads(host.spec.read_text())
+    spec["policies"] = [policy(campaign_mode="mutate").model_dump(
+        mode="json")]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="campaign_mode mutate"):
+        generate(host.spec)
 
 
 @needs_gcc
