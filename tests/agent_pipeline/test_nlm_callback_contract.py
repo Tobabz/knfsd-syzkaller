@@ -11,7 +11,8 @@ from agent_pipeline.stage2.nlm_callback_contract import (
 def sample():
     digest = "a" * 64
     capture = Capture(vm_instance_id="vm-1", capture_sha256=digest,
-                      first_sequence=0, last_sequence=100, complete=True)
+                      first_sequence=0, last_sequence=100,
+                      ordered_observations_complete=True)
     activation = Activation(vm_instance_id="vm-1", session_id="session-1",
                             lane_id=0, generation=1,
                             open_sequence=10, close_sequence=60)
@@ -20,10 +21,10 @@ def sample():
                 journal_request_sha256="b" * 64, output_sha256=digest,
                 forwarded_sha256=digest, forward_complete=True,
                 key_digest="c" * 64, client_ip="10.89.0.6",
-                server_ip="10.89.0.1", sequence=20)
+                server_ip="10.89.0.1", first_sequence=20, last_sequence=22)
     callback = Callback(vm_instance_id="vm-1", key_digest=lock.key_digest,
                         client_ip=lock.client_ip,
-                        server_ip=lock.server_ip, sequence=30)
+                        server_ip=lock.server_ip, first_sequence=30, last_sequence=32)
     return capture, activation, lock, callback
 
 
@@ -42,7 +43,8 @@ def test_unique_live_lock_is_only_diagnostic():
 
 
 @pytest.mark.parametrize("change", [
-    {"complete": False}, {"first_sequence": 25}, {"last_sequence": 25},
+    {"ordered_observations_complete": False}, {"first_sequence": 31},
+    {"last_sequence": 31},
 ])
 def test_capture_gaps_and_cutoffs_refuse_attribution(change):
     capture, _, _, _ = sample()
@@ -52,7 +54,8 @@ def test_capture_gaps_and_cutoffs_refuse_attribution(change):
 
 def test_retransmission_and_new_generation_remain_ambiguous():
     _, activation, lock, callback = sample()
-    retry = lock.model_copy(update={"batch_id": 8, "sequence": 21})
+    retry = lock.model_copy(update={"batch_id": 8, "first_sequence": 23,
+                                    "last_sequence": 24})
     assert decision(locks=(lock, retry))[0].reason == "ambiguous_or_unmatched_lock"
     failed_retry = retry.model_copy(update={"forward_complete": False})
     assert decision(locks=(lock, failed_retry))[0].reason == (
@@ -79,7 +82,8 @@ def test_wrong_route_incomplete_forward_and_missing_lock_fail_closed():
 
 def test_activation_boundary_and_missing_owner_fail_closed():
     _, activation, lock, callback = sample()
-    assert decision(callbacks=(callback.model_copy(update={"sequence": 61}),)
+    assert decision(callbacks=(callback.model_copy(update={"first_sequence": 61,
+                                                            "last_sequence": 62}),)
                     )[0].reason == "outside_activation_window"
     assert decision(activations=())[0].reason == "outside_activation_window"
     assert decision(activations=(activation, activation)

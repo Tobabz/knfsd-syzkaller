@@ -5,19 +5,22 @@ import argparse
 import hashlib
 import json
 import re
+import secrets
 import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from agent_pipeline.data import canonical_json
 from agent_pipeline.stage1.host.vm import QemuGuest, VmConfig
 from agent_pipeline.stage2.kvm import _JournalChannels, _lane_template
 from nlm_callback_attribution import diagnostic, grant_trace_statuses
 from tools.nlm_capture_lifecycle import (
-    CAPTURE, COMPLETE, STATS, STOP, instrument_lane,
+    CAPTURE, COMPLETE, EVENT_LOG, MARKER_SOCKET, STATS, STOP, instrument_lane,
 )
-from tools.nlm_callback_verify import verify_capture
+from tools.nlm_callback_verify import verify_capture, verify_ordered_capture
+from tools.nlm_ordered_capture import build_manifest
 from agent_pipeline.semantic_delta import SealedJournal
 
 
@@ -241,10 +244,16 @@ def main():
             raise RuntimeError("diagnostic rules refused: "
                                + (check.stdout + check.stderr).decode(errors="replace"))
     prefix = tuple(f"nlm-smoke-{lane}" for lane in range(4))
+    vm_instance_id = ("nlm-smoke-" + secrets.token_hex(16)
+                      if args.capture_lifecycle else "nlm-smoke-vm")
+    marker_nonces = {
+        "activation_open": secrets.token_hex(32),
+        "activation_close": secrets.token_hex(32),
+    }
     lane_source = Path("bundle/lane").resolve()
     lane_dir = _lane_template(lane_source, args.output / "lane", rules, prefix)
     if args.capture_lifecycle:
-        instrument_lane(lane_dir / "lane.sh")
+        instrument_lane(lane_dir / "lane.sh", vm_instance_id)
     result = args.output / "result.json"
     guest = None
     channels = None
@@ -253,8 +262,16 @@ def main():
     closure_time = None
     summary = {"status": "failed", "rule_set_id": hashlib.sha256(rules).hexdigest(),
                "mutation_mode": mutation_mode if args.activate else None}
+
+    def mark(phase):
+        if not args.capture_lifecycle:
+            return
+        checked(guest, f"/tmp/nlm-pcap --mark {MARKER_SOCKET} {phase} "
+                + marker_nonces[phase])
+
     try:
-        channels = _JournalChannels(args.output / "journal", "smoke", "nlm-smoke-vm", 4, rules, prefix)
+        channels = _JournalChannels(args.output / "journal", "smoke",
+                                    vm_instance_id, 4, rules, prefix)
         guest = QemuGuest(VmConfig(
             qemu="qemu-system-x86_64", bzimage=args.bzimage, image=args.image,
             lane_dir=lane_dir, ssh_key=args.ssh_key,
@@ -346,6 +363,7 @@ def main():
                 guest, "/tmp/nlm-activate "
                        "/syz-nfs-lanes/proc-0/activation/activation.sock "
                        + summary["rule_set_id"] + " activate")
+            mark("activation_open")
         checked(guest, "sh -c 'timeout 45 " + probe(0, 20 if args.contention else 0) + " &'")
         if args.contention:
             deadline = time.monotonic() + 20
@@ -358,11 +376,16 @@ def main():
                     guest, "/tmp/nlm-activate "
                            "/syz-nfs-lanes/proc-0/activation/activation.sock "
                            + summary["rule_set_id"] + " activate")
+                mark("activation_open")
                 activation_time = time.time()
             checked(guest, "sh -c 'timeout 45 " + probe(1, 0) + " &'")
             time.sleep(3)
             summary["client1_waiting"] = checked(guest, "cat /tmp/nlm-lock-probe-1.out")
             if args.deactivate_before_grant:
+                # Close the diagnostic window before requesting deactivation.
+                # This can exclude a still-active callback, but cannot assign
+                # one that raced with the deactivation ACK.
+                mark("activation_close")
                 summary["deactivation"] = checked(
                     guest, "/tmp/nlm-activate "
                            "/syz-nfs-lanes/proc-0/activation/activation.sock "
@@ -420,6 +443,7 @@ def main():
                               for line in trace.splitlines())
                     for name in ("GRANTED_MSG", "GRANTED_RES")}
         if args.activate and not args.deactivate_before_grant:
+            mark("activation_close")
             summary["deactivation"] = checked(
                 guest, "/tmp/nlm-activate "
                        "/syz-nfs-lanes/proc-0/activation/activation.sock "
@@ -474,6 +498,12 @@ def main():
                                   args.output / "nlm-callback-diagnostic.pcap")
                         guest.get(STATS,
                                   args.output / "nlm-callback-diagnostic.stats")
+                        guest.get(EVENT_LOG,
+                                  args.output / "nlm-callback-diagnostic.events")
+                        guest.get(COMPLETE,
+                                  args.output / "nlm-callback-diagnostic.complete")
+                        guest.get("/tmp/nlm-pcap",
+                                  args.output / "nlm-pcap.collector")
                 else:
                     checked(guest, "pkill -TERM -x nlm-pcap || true; sleep 1")
                     guest.get(capture_path,
@@ -510,12 +540,34 @@ def main():
             channels.close()
             if args.packet_capture and not summary.get("capture_error"):
                 try:
+                    sealed = SealedJournal(args.output / "journal", "smoke")
                     summary["reassembled_diagnostic"] = verify_capture(
-                        SealedJournal(args.output / "journal", "smoke"),
+                        sealed,
                         args.output / "nlm-callback-diagnostic.pcap",
-                        "nlm-smoke-vm", reassemble=True)
+                        vm_instance_id, reassemble=True)
+                    if args.capture_lifecycle and args.activate:
+                        paths = {
+                            "collector": args.output / "nlm-pcap.collector",
+                            "pcap": args.output / "nlm-callback-diagnostic.pcap",
+                            "event_log": args.output / "nlm-callback-diagnostic.events",
+                            "stats": args.output / "nlm-callback-diagnostic.stats",
+                            "complete": args.output / "nlm-callback-diagnostic.complete",
+                        }
+                        manifest, _ = build_manifest(
+                            vm_instance_id=vm_instance_id, **paths,
+                            journal_manifest_sha256=sealed.manifest_sha256(),
+                            expected_markers=marker_nonces)
+                        manifest_path = args.output / "nlm-ordered-capture-manifest.json"
+                        manifest_path.write_bytes(canonical_json(manifest))
+                        summary["ordered_callback_diagnostic"] = (
+                            verify_ordered_capture(
+                                sealed, manifest, vm_instance_id=vm_instance_id,
+                                **paths))
                 except (OSError, ValueError) as error:
-                    summary["reassembly_error"] = str(error)
+                    if args.capture_lifecycle and args.activate:
+                        summary["ordered_capture_error"] = str(error)
+                    else:
+                        summary["reassembly_error"] = str(error)
         if (not active_error and args.contention and args.activate
                 and args.packet_capture and not summary.get("capture_error")):
             callbacks = summary.get("callback_diagnostic", {})
@@ -552,10 +604,13 @@ def main():
         summary["capture_lifecycle_requested"] = args.capture_lifecycle
         if args.capture_lifecycle and summary.get("capture_error"):
             summary["status"] = "failed"
+        if args.capture_lifecycle and summary.get("ordered_capture_error"):
+            summary["status"] = "failed"
         result.write_text(json.dumps(summary, indent=2) + "\n")
         print(json.dumps(summary, indent=2), flush=True)
-        post_error = (summary.get("capture_error") if args.capture_lifecycle
-                      else None)
+        post_error = ((summary.get("capture_error") or
+                       summary.get("ordered_capture_error"))
+                      if args.capture_lifecycle else None)
         if not post_error and summary.get("status", "").endswith("_incomplete"):
             post_error = summary["error"]
         if post_error and not active_error:

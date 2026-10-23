@@ -4,7 +4,8 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tools.nlm_callback_verify import verify
+from tools.nlm_callback_verify import verify, verify_ordered
+from tools.nlm_ordered_capture import OrderedEvent
 
 
 def fixture():
@@ -119,3 +120,88 @@ def test_torn_journal_tail_refuses_all_anchors():
     result = decision(journal, [lock])
     assert result["journal_limitation"] == "torn journal tail"
     assert result["anchors"] == []
+
+
+def ordered_fixture(*, late=False, overlap=False):
+    journal, lock, callback = fixture()
+    lock.update(first_packet_index=1, last_packet_index=1)
+    callback.update(first_packet_index=2, last_packet_index=2)
+    rows = [
+        ("capture_start", 0, "-", "-"),
+        ("marker", 0, "activation_open", "a" * 64),
+        ("packet", 1, "-", "-"),
+    ]
+    if late:
+        rows.append(("marker", 0, "activation_close", "b" * 64))
+        rows.append(("packet", 2, "-", "-"))
+    else:
+        rows.append(("packet", 2, "-", "-"))
+        rows.append(("marker", 0, "activation_close", "b" * 64))
+    rows.extend((("capture_stop", 0, "-", "-"),
+                 ("capture_complete", 0, "-", "-")))
+    events = tuple(OrderedEvent(index, kind, packet, (index + 1) * 1000,
+                                phase, nonce)
+                   for index, (kind, packet, phase, nonce) in enumerate(rows))
+    manifest = {
+        "ordered_observations_complete": True,
+        "marker_sequences": {
+            "activation_open": next(e.sequence for e in events
+                                      if e.phase == "activation_open"),
+            "activation_close": next(e.sequence for e in events
+                                       if e.phase == "activation_close"),
+        },
+        "pcap_sha256": "0" * 64,
+        "manifest_sha256": "1" * 64,
+        "journal_manifest_sha256": journal.manifest_sha256(),
+    }
+    capture = {
+        "parse_error": None, "observed_streams_complete": True,
+        "streams": [{"overlap_observations": int(overlap), "issues": []}],
+        "records": [lock, callback],
+    }
+    return journal, manifest, events, capture, lock, callback
+
+
+def test_ordered_unique_callback_matches_diagnostically():
+    journal, manifest, events, capture, _, _ = ordered_fixture()
+    result = verify_ordered(journal, manifest, events, capture, "vm")
+    assert result["status"] == "diagnostic_only"
+    assert result["capture_complete"] is False
+    assert result["ordered_observations_complete"] is True
+    assert result["attribution"] == [{
+        "schema_version": "nlm-callback-diagnostic.v1",
+        "status": "diagnostic_only", "reason": "matched",
+        "session_id": "session", "lane_id": 0, "generation": 1,
+        "batch_id": 7,
+    }]
+
+
+def test_ordered_late_callback_stays_unassigned():
+    journal, manifest, events, capture, _, _ = ordered_fixture(late=True)
+    result = verify_ordered(journal, manifest, events, capture, "vm")
+    assert result["attribution"][0]["reason"] == "outside_activation_window"
+    assert result["attribution"][0]["generation"] is None
+
+
+def test_ordered_duplicates_overlap_and_dirty_journal_fail_closed():
+    journal, manifest, events, capture, lock, callback = ordered_fixture()
+    capture["records"].append(dict(lock))
+    assert verify_ordered(journal, manifest, events, capture, "vm")[
+        "attribution"][0]["reason"] == "ambiguous_or_unmatched_lock"
+
+    journal, manifest, events, capture, _, callback = ordered_fixture()
+    capture["records"].append(dict(callback))
+    decisions = verify_ordered(journal, manifest, events, capture, "vm")[
+        "attribution"]
+    assert {item["reason"] for item in decisions} == {"duplicate_callback"}
+
+    journal, manifest, events, capture, _, _ = ordered_fixture(overlap=True)
+    result = verify_ordered(journal, manifest, events, capture, "vm")
+    assert result["ordered_observations_complete"] is False
+    assert result["attribution"][0]["reason"] == "capture_incomplete"
+
+    journal, manifest, events, capture, _, _ = ordered_fixture()
+    journal.rejections = [object()]
+    result = verify_ordered(journal, manifest, events, capture, "vm")
+    assert result["journal_clean"] is False
+    assert result["attribution"][0]["reason"] == "capture_incomplete"

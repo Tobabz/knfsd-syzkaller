@@ -19,13 +19,14 @@ class _Record(BaseModel):
 
 
 class Capture(_Record):
-    """A host-captured interval. Complete means no known drops or gaps."""
+    """A diagnostic interval with complete ordered observations."""
 
     vm_instance_id: str = Field(min_length=1)
     capture_sha256: Hex64 = Field(pattern=r"^[0-9a-f]{64}$")
     first_sequence: int = Field(ge=0)
     last_sequence: int = Field(ge=0)
-    complete: bool
+    ordered_observations_complete: bool
+    capture_complete: Literal[False] = False
 
     @model_validator(mode="after")
     def _interval(self) -> Capture:
@@ -66,7 +67,14 @@ class Lock(_Record):
     key_digest: Hex64 = Field(pattern=r"^[0-9a-f]{64}$")
     client_ip: str = Field(min_length=1)
     server_ip: str = Field(min_length=1)
-    sequence: int = Field(ge=0)
+    first_sequence: int = Field(ge=0)
+    last_sequence: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _interval(self) -> Lock:
+        if self.first_sequence > self.last_sequence:
+            raise ValueError("LOCK sequence interval is reversed")
+        return self
 
 
 class Callback(_Record):
@@ -76,7 +84,14 @@ class Callback(_Record):
     key_digest: Hex64 = Field(pattern=r"^[0-9a-f]{64}$")
     client_ip: str = Field(min_length=1)
     server_ip: str = Field(min_length=1)
-    sequence: int = Field(ge=0)
+    first_sequence: int = Field(ge=0)
+    last_sequence: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _interval(self) -> Callback:
+        if self.first_sequence > self.last_sequence:
+            raise ValueError("callback sequence interval is reversed")
+        return self
 
 
 class Attribution(_Record):
@@ -107,7 +122,8 @@ def attribute(capture: Capture, activations: tuple[Activation, ...],
 
     The input contract requires a separate verifier to bind journal_request_sha256
     to a re-admitted EXPOSURE_INTENT and FORWARD_COMPLETE in a sealed journal,
-    and to attest ordered, gap-free capture. No such verifier is wired yet.
+    and to attest complete ordered observations. The disposable diagnostic
+    verifier provides that normalization; production Stage 2 does not call it.
     """
     identities = Counter((cb.key_digest, cb.client_ip, cb.server_ip)
                          for cb in callbacks)
@@ -115,8 +131,9 @@ def attribute(capture: Capture, activations: tuple[Activation, ...],
     for callback in callbacks:
         identity = (callback.key_digest, callback.client_ip,
                     callback.server_ip)
-        if not capture.complete or not (capture.first_sequence <= callback.sequence
-                                        <= capture.last_sequence) or (
+        if not capture.ordered_observations_complete or not (
+                capture.first_sequence <= callback.first_sequence <=
+                callback.last_sequence <= capture.last_sequence) or (
                 callback.vm_instance_id != capture.vm_instance_id):
             result.append(Attribution(reason="capture_incomplete"))
             continue
@@ -128,9 +145,10 @@ def attribute(capture: Capture, activations: tuple[Activation, ...],
                     and lock.key_digest == callback.key_digest
                     and lock.client_ip == callback.client_ip
                     and lock.server_ip == callback.server_ip
-                    and lock.sequence < callback.sequence]
-        if any(not capture.first_sequence <= lock.sequence
-               <= capture.last_sequence for lock in matching):
+                    and lock.last_sequence < callback.first_sequence]
+        if any(not (capture.first_sequence <= lock.first_sequence <=
+                    lock.last_sequence <= capture.last_sequence)
+               for lock in matching):
             result.append(Attribution(reason="capture_incomplete"))
             continue
         # Do not collapse retransmissions or identical locks across generations:
@@ -151,8 +169,9 @@ def attribute(capture: Capture, activations: tuple[Activation, ...],
             result.append(Attribution(reason="capture_incomplete"))
             continue
         if len(windows) != 1 or not (
-                windows[0].open_sequence < lock.sequence < callback.sequence
-                < windows[0].close_sequence):
+                windows[0].open_sequence < lock.first_sequence <=
+                lock.last_sequence < callback.first_sequence <=
+                callback.last_sequence < windows[0].close_sequence):
             result.append(Attribution(reason="outside_activation_window"))
             continue
         result.append(Attribution(reason="matched", session_id=lock.session_id,

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tools.nlm_capture_lifecycle import (
-    COMPLETE, PID, READY, STATS, STOP, instrument_lane,
+    COMPLETE, EVENT_LOG, MARKER_SOCKET, PID, READY, STATS, STOP, instrument_lane,
 )
 
 
@@ -45,7 +45,7 @@ def test_instrumentation_precedes_mounts_and_retains_shell_syntax(tmp_path):
     before = original.read_bytes()
     copy = tmp_path / "lane.sh"
     copy.write_bytes(before)
-    instrument_lane(copy)
+    instrument_lane(copy, "vm-run-test")
     text = copy.read_text()
     assert text.index("/tmp/nlm-pcap") < text.index(
         '        setup_client "$setup_lane_id"')
@@ -53,6 +53,7 @@ def test_instrumentation_precedes_mounts_and_retains_shell_syntax(tmp_path):
         '    ip netns exec "$setup_client0_ns" ping')
     assert f"{STATS} && test -e {COMPLETE}" in text
     assert f"rm -f /tmp/nlm-callback-diagnostic.pcap {STATS} {READY} {COMPLETE} {STOP} {PID}" in text
+    assert f"{EVENT_LOG} {MARKER_SOCKET} vm-run-test" in text
     assert "! pgrep -x nlm-pcap" in text
     assert "diagnostic_capture_start=$(awk" in text
     assert text.count('"/proc/$diagnostic_capture_pid/stat"') >= 4
@@ -71,6 +72,10 @@ def test_instrumentation_refuses_unknown_or_repeated_boundary(tmp_path):
     copy.write_text("#!/bin/sh\n")
     with pytest.raises(ValueError, match="boundary changed"):
         instrument_lane(copy)
+    original = Path(__file__).parents[2] / "bundle/lane/lane.sh"
+    copy.write_bytes(original.read_bytes())
+    with pytest.raises(ValueError, match="VM instance"):
+        instrument_lane(copy, "bad vm identity")
 
 
 def test_instrumented_cleanup_orders_other_processes_before_recorder(tmp_path):

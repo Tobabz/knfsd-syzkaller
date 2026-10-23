@@ -372,6 +372,38 @@ callback attribution across a crash, independent production/replay coverage,
 or an approved/pinned production build. Keep the nlm-knfsd Stage 2 preflight
 and runtime refusal in place until those checks and HCAP promotion are complete.
 
+The disposable callback runner also has an ordered capture mode layered on the
+capture lifecycle. Each run uses a fresh VM identity shared by the host journal
+and collector, and records nonce-bound `activation_open`/`activation_close`
+markers in the same append-only sequence as filtered IPv4/TCP packets. The
+packet socket rejects outgoing loopback duplicates before accounting but keeps
+outbound callback traffic on other interfaces. Clean shutdown produces an event
+log, packet/drop stats, completion record, and a host
+manifest binding those artifacts, the collector binary, sealed journal, marker
+set, and parser version. The offline ordered verifier recomputes the bindings,
+maps reassembled RPC packet intervals to collector sequences, and fails closed
+for loss/count mismatch, crossed ordering, dirty journal, structural stream
+issues, overlap/retransmission ambiguity, duplicate records, or a wrong VM.
+
+For local re-verification, retain all generated files and run:
+
+    .venv/bin/python -m tools.nlm_callback_verify \
+        --journal <run>/journal --name smoke \
+        --pcap <run>/nlm-callback-diagnostic.pcap \
+        --vm-instance-id <manifest-vm-instance-id> \
+        --ordered-manifest <run>/nlm-ordered-capture-manifest.json \
+        --collector <run>/nlm-pcap.collector \
+        --event-log <run>/nlm-callback-diagnostic.events \
+        --stats <run>/nlm-callback-diagnostic.stats \
+        --complete <run>/nlm-callback-diagnostic.complete
+
+The normal control may report one diagnostic `matched` result and the
+deactivate-before-grant control one unowned `outside_activation_window` result.
+The output deliberately keeps `capture_complete=false` and
+`status=diagnostic_only`; only `ordered_observations_complete` describes this
+single disposable run. This does not remove the readiness block for a promoted
+production capture path, change HCAP-13, or connect NLM attribution to Stage 2.
+
 Preflight also requires the outer Stage 2 supervisor timeout to cover the
 slowdown-scaled gate and replay watchdogs and the configured campaign
 timeout. Each step enforces one evidence-finalization reserve around journal

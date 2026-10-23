@@ -1,6 +1,7 @@
 """Disposable lane instrumentation, never used by the production harness."""
 
 from pathlib import Path
+import re
 
 
 CAPTURE = "/tmp/nlm-callback-diagnostic.pcap"
@@ -9,10 +10,15 @@ READY = "/tmp/nlm-callback-diagnostic.ready"
 COMPLETE = "/tmp/nlm-callback-diagnostic.complete"
 STOP = "/tmp/nlm-callback-diagnostic.stop"
 PID = "/tmp/nlm-callback-diagnostic.pid"
+EVENT_LOG = "/tmp/nlm-callback-diagnostic.events"
+MARKER_SOCKET = "/tmp/nlm-callback-diagnostic.marker"
+DEFAULT_VM_INSTANCE_ID = "nlm-smoke-vm"
 
 
-def instrument_lane(path: Path) -> None:
+def instrument_lane(path: Path, vm_instance_id: str = DEFAULT_VM_INSTANCE_ID) -> None:
     """Start before client setup; stop last when the server namespace retires."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", vm_instance_id):
+        raise ValueError("invalid diagnostic VM instance ID")
     source = path.read_text()
     start = '    kill -0 "$setup_server_pid"\n'
     stop = '    stop_pids=$(namespace_pids "$stop_ns")\n'
@@ -22,9 +28,11 @@ def instrument_lane(path: Path) -> None:
     setup = f'''
     if [ "$setup_lane_id" = 0 ]; then
         ! pgrep -x nlm-pcap >/dev/null
-        rm -f {CAPTURE} {STATS} {READY} {COMPLETE} {STOP} {PID} /tmp/nlm-pcap.log
+        rm -f {CAPTURE} {STATS} {READY} {COMPLETE} {STOP} {PID} \
+            {EVENT_LOG} {MARKER_SOCKET} /tmp/nlm-pcap.log
         nsenter -t "$setup_server_pid" -n -- /tmp/nlm-pcap \
             {CAPTURE} {STATS} {READY} {COMPLETE} {STOP} \
+            {EVENT_LOG} {MARKER_SOCKET} {vm_instance_id} \
             >/tmp/nlm-pcap.log 2>&1 < /dev/null &
         diagnostic_capture_pid=$!
         diagnostic_capture_start=$(awk '{{print $22}}' \
