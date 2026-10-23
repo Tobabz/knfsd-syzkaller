@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import re
 import struct
 from dataclasses import dataclass
@@ -118,11 +119,11 @@ def parse_event_log(path: Path) -> tuple[str, tuple[OrderedEvent, ...]]:
     return header[1], tuple(events)
 
 
-def _pcap_timestamps(path: Path) -> tuple[int, ...]:
-    if path.stat().st_size > 64 * 1024 * 1024:
+def _pcap_timestamps(data: bytes) -> tuple[int, ...]:
+    if len(data) > 64 * 1024 * 1024:
         raise ValueError("capture exceeds ordered verifier limit")
     result = []
-    with path.open("rb") as source:
+    with io.BytesIO(data) as source:
         header = source.read(24)
         if len(header) != 24 or header[:4] not in (
                 b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4"):
@@ -187,7 +188,9 @@ def build_manifest(*, vm_instance_id: str, collector: Path, pcap: Path,
         frozenset(("captured", "events", "ordering_ambiguous")))
     packet_events = [event for event in events if event.kind == "packet"]
     packet_count = len(packet_events)
-    pcap_timestamps = _pcap_timestamps(pcap)
+    with pcap.open("rb") as source:
+        pcap_snapshot = source.read(64 * 1024 * 1024 + 1)
+    pcap_timestamps = _pcap_timestamps(pcap_snapshot)
     if len(pcap_timestamps) != packet_count or any(
             observed != event.timestamp_ns // 1000 * 1000
             for observed, event in zip(pcap_timestamps, packet_events, strict=True)):
@@ -207,7 +210,9 @@ def build_manifest(*, vm_instance_id: str, collector: Path, pcap: Path,
     all_socket_packets_captured = socket_packets == packet_count
     ordering_ambiguous = (stats_fields.get("ordering_ambiguous") != 0 or
                           complete_fields.get("ordering_ambiguous") != 0 or
-                          any(left.timestamp_ns > right.timestamp_ns
+                          any(left.timestamp_ns > right.timestamp_ns or (
+                              left.timestamp_ns == right.timestamp_ns and
+                              {left.kind, right.kind} == {"packet", "marker"})
                               for left, right in zip(events, events[1:])))
     drops = stats_fields.get("drops")
     loss_known_zero = isinstance(drops, int) and drops == 0
@@ -216,7 +221,7 @@ def build_manifest(*, vm_instance_id: str, collector: Path, pcap: Path,
         "status": "diagnostic_only",
         "vm_instance_id": vm_instance_id,
         "collector_sha256": _digest(collector),
-        "pcap_sha256": _digest(pcap),
+        "pcap_sha256": hashlib.sha256(pcap_snapshot).hexdigest(),
         "ordered_event_log_sha256": _digest(event_log),
         "capture_stats_sha256": _digest(stats),
         "capture_completion_sha256": _digest(complete),

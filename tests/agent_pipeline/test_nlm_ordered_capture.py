@@ -156,6 +156,29 @@ def test_crossed_event_timestamps_fail_closed_without_collector_flag(tmp_path):
     assert manifest["ordered_observations_complete"] is False
 
 
+@pytest.mark.parametrize("rows", [
+    [
+        ("capture_start", 0, 1_000, "-", "-"),
+        ("marker", 0, 2_000, "activation_open", OPEN),
+        ("packet", 1, 3_000, "-", "-"),
+        ("marker", 0, 3_000, "activation_close", CLOSE),
+        ("capture_stop", 0, 5_000, "-", "-"),
+        ("capture_complete", 0, 6_000, "-", "-"),
+    ],
+    [
+        ("capture_start", 0, 1_000, "-", "-"),
+        ("marker", 0, 3_000, "activation_open", OPEN),
+        ("packet", 1, 3_000, "-", "-"),
+        ("marker", 0, 4_000, "activation_close", CLOSE),
+        ("capture_stop", 0, 5_000, "-", "-"),
+        ("capture_complete", 0, 6_000, "-", "-"),
+    ],
+])
+def test_equal_packet_marker_timestamps_fail_closed(tmp_path, rows):
+    manifest, _ = _build(_artifacts(tmp_path, markers=rows))
+    assert manifest["ordered_observations_complete"] is False
+
+
 def test_torn_event_log_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="torn ordered event log"):
         _build(_artifacts(tmp_path, final_newline=False))

@@ -1,10 +1,11 @@
 """The journal/pcap comparator reports only unpromoted observations."""
 
+import hashlib
 from types import SimpleNamespace as NS
 
 import pytest
 
-from tools.nlm_callback_verify import verify, verify_ordered
+from tools.nlm_callback_verify import verify, verify_ordered, verify_ordered_capture
 from tools.nlm_ordered_capture import OrderedEvent
 
 
@@ -205,3 +206,24 @@ def test_ordered_duplicates_overlap_and_dirty_journal_fail_closed():
     result = verify_ordered(journal, manifest, events, capture, "vm")
     assert result["journal_clean"] is False
     assert result["attribution"][0]["reason"] == "capture_incomplete"
+
+
+def test_ordered_capture_rejects_replacement_after_manifest_check(
+        tmp_path, monkeypatch):
+    journal, manifest, events, _, _, _ = ordered_fixture()
+    original = b"manifest-bound-pcap"
+    pcap = tmp_path / "capture.pcap"
+    pcap.write_bytes(original)
+    manifest["pcap_sha256"] = hashlib.sha256(original).hexdigest()
+
+    def verify_then_replace(*args, **kwargs):
+        pcap.write_bytes(b"replacement-pcap")
+        return events
+
+    monkeypatch.setattr("tools.nlm_callback_verify.verify_manifest",
+                        verify_then_replace)
+    with pytest.raises(ValueError, match="snapshot does not match manifest"):
+        verify_ordered_capture(
+            journal, manifest, collector=tmp_path / "collector", pcap=pcap,
+            event_log=tmp_path / "events", stats=tmp_path / "stats",
+            complete=tmp_path / "complete", vm_instance_id="vm")

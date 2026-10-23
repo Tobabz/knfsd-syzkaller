@@ -7,6 +7,7 @@ authenticate the VM, capture loss, or remote KCOV ownership.
 from __future__ import annotations
 
 import hashlib
+import io
 import ipaddress
 import struct
 from dataclasses import dataclass, field
@@ -35,10 +36,10 @@ class _Stream:
     issues: set[str] = field(default_factory=set)
 
 
-def _packets(path: Path):
-    if path.stat().st_size > MAX_CAPTURE_BYTES:
+def _packets(data: bytes):
+    if len(data) > MAX_CAPTURE_BYTES:
         raise Incomplete("capture_size_limit")
-    with path.open("rb") as source:
+    with io.BytesIO(data) as source:
         header = source.read(24)
         if len(header) != 24 or header[:4] not in (
                 b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4"):
@@ -192,7 +193,7 @@ def _records(stream: _Stream, record_budget: int, byte_budget: int
     return records, issues, overlaps, record_count, record_bytes
 
 
-def reconstruct(path: Path) -> dict:
+def reconstruct_bytes(data: bytes) -> dict:
     """Reassemble observed bytes, refusing gaps and conflicting overlaps.
 
     A SYN anchors record framing. Reused endpoint tuples get distinct local
@@ -204,7 +205,7 @@ def reconstruct(path: Path) -> dict:
     next_connection = 0
     total_segments = 0
     try:
-        for ordinal, timestamp, endpoints, seq, flags, body in _packets(path):
+        for ordinal, timestamp, endpoints, seq, flags, body in _packets(data):
             src, dst, sport, dport = endpoints
             pair = tuple(sorted(((src, sport), (dst, dport))))
             current = connections.get(pair)
@@ -284,3 +285,14 @@ def reconstruct(path: Path) -> dict:
             "observed_streams_complete": bool(reports) and all(
                 not report["issues"] for report in reports),
             "records": records, "streams": reports}
+
+
+def reconstruct(path: Path) -> dict:
+    """Reconstruct one bounded path snapshot."""
+    with path.open("rb") as source:
+        data = source.read(MAX_CAPTURE_BYTES + 1)
+    if len(data) > MAX_CAPTURE_BYTES:
+        return {"status": "diagnostic_only", "capture_complete": False,
+                "observed_streams_complete": False,
+                "parse_error": "capture_size_limit", "records": [], "streams": []}
+    return reconstruct_bytes(data)

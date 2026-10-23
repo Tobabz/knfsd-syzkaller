@@ -243,7 +243,7 @@ static int receive_marker(struct capture_state *state, int marker_fd)
 		return -1;
 	/* Both queues use kernel receive timestamps. Crossing timestamps mean
 	 * poll scheduling could not establish a total order. */
-	if (state->last_packet_ns > timestamp_ns ||
+	if ((state->last_packet_ns != 0 && state->last_packet_ns >= timestamp_ns) ||
 	    (state->last_marker_ns != 0 && timestamp_ns <= state->last_marker_ns))
 		state->ordering_ambiguous = 1;
 	state->last_marker_ns = timestamp_ns;
@@ -276,10 +276,24 @@ static int get_packet_stats(int fd, struct packet_stats *result)
 
 static int freeze_packet_socket(int fd)
 {
-	struct sockaddr_ll address = { .sll_family = AF_PACKET };
+	struct sock_filter instructions[] = {
+		BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	struct sock_fprog filter = {
+		.len = sizeof(instructions) / sizeof(instructions[0]),
+		.filter = instructions,
+	};
+	struct sockaddr_ll address = {
+		.sll_family = AF_PACKET,
+		.sll_protocol = htons(ETH_P_IP),
+	};
 
-	/* Protocol zero unregisters the packet hook and synchronize_net() in the
-	 * kernel completes before bind returns. Queued packets remain drainable. */
+	/* A zero protocol preserves po->num in packet_do_bind(), so it cannot
+	 * detach an ETH_P_ALL socket. Reject new traffic first, then force a
+	 * protocol rehook. The old hook's synchronize_net() completes before bind
+	 * returns; the replacement hook cannot queue or account packets. */
+	if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &filter, sizeof(filter)) != 0)
+		return -1;
 	return bind(fd, (struct sockaddr *)&address, sizeof(address));
 }
 

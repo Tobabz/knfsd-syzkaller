@@ -20,7 +20,7 @@ from agent_pipeline.stage2.nlm_callback_contract import (
 )
 from tools.nlm_callback_attribution import calls
 from tools.nlm_ordered_capture import OrderedEvent, verify_manifest
-from tools.nlm_tcp_capture import reconstruct
+from tools.nlm_tcp_capture import MAX_CAPTURE_BYTES, reconstruct, reconstruct_bytes
 
 
 def _key(event):
@@ -292,7 +292,13 @@ def verify_ordered_capture(journal: SealedJournal, manifest: dict, *,
         manifest, vm_instance_id=vm_instance_id, collector=collector, pcap=pcap,
         event_log=event_log, stats=stats, complete=complete,
         journal_manifest_sha256=journal.manifest_sha256())
-    capture = reconstruct(pcap)
+    with pcap.open("rb") as source:
+        pcap_snapshot = source.read(MAX_CAPTURE_BYTES + 1)
+    if len(pcap_snapshot) > MAX_CAPTURE_BYTES:
+        raise ValueError("ordered pcap exceeds verifier limit")
+    if hashlib.sha256(pcap_snapshot).hexdigest() != manifest.get("pcap_sha256"):
+        raise ValueError("ordered pcap snapshot does not match manifest")
+    capture = reconstruct_bytes(pcap_snapshot)
     return verify_ordered(journal, manifest, events, capture, vm_instance_id)
 
 
