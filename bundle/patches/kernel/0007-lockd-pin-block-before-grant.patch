@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Sat, 24 Oct 2026 00:00:00 +0900
+Subject: [PATCH] lockd: pin blocked lock before grant attribution
+
+nlmsvc_retry_blocked() continues processing a selected blocked lock after
+releasing nlm_blocked_lock. Pin the block before dropping the list lock so
+the owner pointer and grant path cannot dereference a freed block. Release
+the temporary reference after processing the block.
+---
+ fs/lockd/svclock.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/lockd/svclock.c b/fs/lockd/svclock.c
+--- a/fs/lockd/svclock.c
++++ b/fs/lockd/svclock.c
+@@ -1028,6 +1028,8 @@ nlmsvc_retry_blocked(struct svc_rqst *rqstp)
+ 			timeout = block->b_when - jiffies;
+ 			break;
+ 		}
++		/* Keep the selected block alive while processing outside the lock. */
++		kref_get(&block->b_count);
+ 		spin_unlock(&nlm_blocked_lock);
+ 
+ 		dprintk("nlmsvc_retry_blocked(%p, when=%ld)\n",
+@@ -1051,5 +1053,6 @@ nlmsvc_retry_blocked(struct svc_rqst *rqstp)
+ 			sunrpc_fuzz_cb_owner_put(fuzz_owner);
+ 		}
++		nlmsvc_release_block(block);
+ 		spin_lock(&nlm_blocked_lock);
+ 	}
+ 	spin_unlock(&nlm_blocked_lock);
+-- 
+2.34.1
