@@ -25,7 +25,7 @@ from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
                          GateRun, HcapCheck,
                          NEUTRAL_CONTROL_UNAVAILABLE, TASK_VARIANTS, AgentTask,
                          CampaignMode, GapClass, GapRef, HarnessBinding,
-                         JobPolicy,
+                         JobPolicy, STATE_LINEAGE_GAP_ID,
                          MaterializationHcapAuthority, MaterializeRejected,
                          Q1Result, Q1Status, kernel_revision_gap)
 from . import events as ev
@@ -911,7 +911,7 @@ class Machine:
         if r.reason in COMPILER_GAP:
             cap = r.missing_capability_id
             if cap is None and r.reason == "requires_state_lineage":
-                cap = "state_lineage"           # 08 §15, 07 §4
+                cap = STATE_LINEAGE_GAP_ID      # 08 §15, 07 §4
             if not cap or not self.env.hcap.knows_capability(
                     j.binding.hcap_revision, cap):
                 return Target(kind=TargetKind.BLOCKED_OPERATOR,

@@ -181,8 +181,15 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | Mutation Strategy | `rule_set` | `08` §5 |
 | | `unsupported(mutation_engine, missing_capability_id, reason)` | `08` §15 |
 
-- `missing_capability_id`는 HCAP data의 controlled vocabulary에 있어야 한다(`07` §3). 비었거나 vocabulary 밖이면
+- `missing_capability_id`는 HCAP data의 controlled vocabulary에 있어야 한다(`07` §3). vocabulary 밖이면
   `blocked_operator(gap_id_unknown)`로 보낸다. Agent에게 기존 id 중 하나를 고르라고 돌려보내지 않는다.
+- 빈 `missing_capability_id`는 출력 형식 결함이다. Agent executor의 출력 검증이 같은 실행 안에서 거부하고 다시 받으므로
+  `agent_repair`에 세지 않는다. 저장된 이전 출력처럼 빈 id가 Controller에 닿으면 `blocked_operator(gap_id_unknown)`로
+  보낸다(#81 D5).
+- Mutation Strategy는 맞는 id가 없으면 `mutation_engine.unlisted`와 `CapabilityProposal`(layer `semantic_subset`,
+  `proxy`, `compiler_lowering`)을 함께 낸다. Planning처럼 proposal은 `gap_proposal_ref`로 job에 붙는다.
+- host 생성은 pipeline이 스스로 내는 gap id `semantic_mutation.unpromoted`, `state_lineage`,
+  `mutation_engine.unlisted`를 모든 HCAP revision의 vocabulary에 넣는다(#81 D6).
 - 결과는 `task_id`가 job의 `pending_task`와 같을 때만 전이를 만든다. Agent task는 attempt도 같아야 한다(§8).
   다르면(취소되거나 교체된 task나 attempt의 늦은 결과) artifact로 저장만 한다.
 - `task_id`가 맞지만 아래 표에 없는 결과(새 reason 값, 상태에 맞지 않는 결과)는 `blocked_operator(unexpected_event)`로
@@ -763,8 +770,8 @@ bundle fixture로 대신한다.
   지시로 읽는 것.
 - **확장 절차:** Agent Task 출력 variant나 verdict reason을 추가하면 §2–§5 표와 검증 오라클 1, 2를 함께 고친다.
 - **제약:** `unsupported`의 `missing_capability_id`는 HCAP vocabulary에서만 고른다. 맞는 id가 없으면 가장 가까운
-  id를 고르지 말고 비워 두고, 필요한 capability를 `reason`에 적는다. Controller가 `blocked_operator(gap_id_unknown)`로
-  보낸다.
+  id를 고르지 않는다. Mutation Strategy는 `mutation_engine.unlisted`와 proposal을 내고, 필요한 capability를
+  `reason`과 proposal에 적는다. 빈 id는 executor가 거부한다(#81 D5).
 - **검증 방법:** 출력은 Controller가 schema로 검증한다. schema 통과는 형식이 맞다는 뜻일 뿐 HCAP 검사,
   Materializer, Compiler, Judge를 통과한다는 뜻이 아니다.
 
