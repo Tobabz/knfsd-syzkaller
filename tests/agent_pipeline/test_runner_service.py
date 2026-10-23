@@ -243,12 +243,12 @@ def test_expired_lease_ends_as_runner_restart_and_is_not_rerun(tmp_path):
 
 def test_worker_heartbeat_keeps_a_long_run_leased(tmp_path):
     runner = DurableRunner(tmp_path / "runner.sqlite",
-                           lease_duration_ns=300_000_000)
+                           lease_duration_ns=1_000_000_000)
     runner.submit("job-1.t1", runner_input())
 
     class SlowBackend:
         def execute(self, lease, control):
-            deadline = time.monotonic() + 1.0   # > 3 lease durations
+            deadline = time.monotonic() + 3.5   # > 3 lease durations
             while time.monotonic() < deadline:
                 assert not control.stop_requested()
                 time.sleep(0.05)
@@ -539,7 +539,9 @@ def test_backend_in_flight_cancel_cannot_publish_late_success(tmp_path):
             return BackendResult(bundle_ref=sha("late"))
 
     runner.submit("job-1.t1", runner_input())
-    worker = RunnerWorker(runner, BlockingBackend(), worker_id="worker")
+    # The frozen clock keeps the lease valid; heartbeat must not race cancel().
+    worker = RunnerWorker(runner, BlockingBackend(), worker_id="worker",
+                          heartbeat_interval_s=60)
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(worker.run_once)
         assert entered.wait(timeout=5)

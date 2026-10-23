@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
 import agent_pipeline.stage2.host as stage2_host
 from agent_pipeline.admission import SyzkallerTargetIdentity
-from agent_pipeline.contracts import JudgeVersions
+from agent_pipeline.contracts import (CandidateSubmission, JudgeVersions,
+                                      LocationKind, LocationRequest)
+from agent_pipeline.controller.records import Job, JobState
 from agent_pipeline.runner.process_supervisor import ProcessLimits
 from agent_pipeline.semantic_promotion import (
     BuildRegistry, CapabilityRegistry, PromotedSemanticCapabilityRegistry,
@@ -24,7 +27,8 @@ from agent_pipeline.stage1.host.pins import pin_file
 from agent_pipeline.stage2.host import (
     KVM_API_VERSION, PreflightError, _ApprovedHarness, _Checks,
     _check_command, _check_kernel_repo, _check_kvm, _check_manager,
-    _check_policies, _check_runtime, _check_stage2_timeout,
+    _check_job_authority, _check_policies, _check_runtime, _check_stage2_job,
+    _check_stage2_timeout, _load_job_read_only,
     _verify_pins_read_only, preflight,
 )
 from agent_pipeline.stage2.kvm import stage2_timeout_budget
@@ -96,6 +100,20 @@ def test_unconfigured_stage2_is_reported_without_creating_state(tmp_path):
     assert not report.ready
     assert [(item.name, item.status) for item in report.checks] == [
         ("stage1_config", "pass"), ("stage2_config", "error")]
+    assert not config.state_dir.exists()
+    assert not config.artifact_root.exists()
+
+
+def test_job_preflight_uses_read_only_lookup_without_creating_state(tmp_path):
+    config = _config(tmp_path)
+    path = tmp_path / "stage1.json"
+    path.write_text(config.model_dump_json(indent=2))
+    report = preflight(path, job_id="job-missing",
+                       kvm_path=tmp_path / "absent-kvm")
+    assert not report.ready
+    assert [(item.name, item.status) for item in report.checks] == [
+        ("stage1_config", "pass"), ("stage2_job", "error"),
+        ("stage2_config", "error")]
     assert not config.state_dir.exists()
     assert not config.artifact_root.exists()
 
@@ -293,6 +311,120 @@ def test_manager_config_binds_approved_assets_and_command(tmp_path):
     path.write_text(json.dumps(manager))
     with pytest.raises(PreflightError, match="approved command line"):
         _manager_check(path, collector, harnesses, command)
+
+
+def test_manager_rejects_stage1_only_nlm_fixture(tmp_path):
+    path, manager, _, collector, harnesses, command = _manager_config(tmp_path)
+    manager["vm"]["cmdline"] = manager["vm"]["cmdline"].replace(
+        "koov.nfs_version=4.1", "koov.nfs_fixture=nlm-knfsd")
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="unapproved dynamic argument"):
+        _manager_check(path, collector, harnesses, command)
+
+
+def _job_readiness(fixture="nlm-knfsd", stage2_hcap=False):
+    binding = SimpleNamespace(execution_harness_id="a" * 64,
+                              hcap_revision="b" * 64)
+    materialized = SimpleNamespace(
+        harness_ref="c" * 64, execution_harness_id=binding.execution_harness_id,
+        hcap_revision=binding.hcap_revision, authority_hcap_revision=None)
+    job = SimpleNamespace(
+        job_id="job-test", state=JobState.S1_REACHED, binding=binding,
+        harness=materialized,
+        stage2_input=SimpleNamespace(harness_ref=materialized.harness_ref,
+                                     execution_harness_id=binding.execution_harness_id,
+                                     plan_ref="d" * 64))
+    harness = SimpleNamespace(
+        execution_harness_id=binding.execution_harness_id,
+        hcap_revision=binding.hcap_revision,
+        plan_ref=job.stage2_input.plan_ref,
+        required_capability_ids=("HCAP-13",) if fixture == "nlm-knfsd" else (),
+        selected_capability_ids=("HCAP-13",) if fixture == "nlm-knfsd" else (),
+        runtime_selection=SimpleNamespace(fixture_mode=fixture,
+                                          nfs_version="3" if fixture == "nlm-knfsd" else "4.1"))
+    hcap = SimpleNamespace(capabilities=(SimpleNamespace(
+        id="HCAP-13", usable_stage=("stage1", "stage2") if stage2_hcap else ("stage1",),
+        usable_by=("agent_stage1", "agent_stage2") if stage2_hcap else ("agent_stage1",)),))
+    manager = {"vm": {"cmdline": "root=/dev/sda " + (
+        "koov.nfs_fixture=nlm-knfsd" if fixture == "nlm-knfsd" else
+        "koov.nfs_version=4.1")}}
+    return job, harness, hcap, manager, (binding,)
+
+
+def test_job_readiness_rejects_nlm_even_if_hcap_is_promoted():
+    arguments = _job_readiness()
+    with pytest.raises(PreflightError, match="HCAP-13 is approved for Stage 1 only"):
+        _check_stage2_job(*arguments)
+    arguments = _job_readiness(stage2_hcap=True)
+    with pytest.raises(PreflightError, match="promoted NLM Proxy"):
+        _check_stage2_job(*arguments)
+
+
+def test_job_authority_checks_reached_identity_before_manager_config():
+    job, harness, hcap, _, _ = _job_readiness()
+    with pytest.raises(PreflightError, match="Stage 1 only"):
+        _check_job_authority(job, harness, hcap)
+    job.state = JobState.S1_RUNNING
+    with pytest.raises(PreflightError, match="reached Stage 2 basis"):
+        _check_job_authority(job, harness, hcap)
+
+
+def test_job_authority_accepts_revalidated_hcap_without_changing_harness():
+    job, harness, hcap, manager, _ = _job_readiness("single")
+    original = job.harness.hcap_revision
+    job.binding.hcap_revision = "e" * 64
+    job.harness.authority_hcap_revision = job.binding.hcap_revision
+    assert "approved single fixture" in _check_stage2_job(
+        job, harness, hcap, manager, (job.binding,))
+    assert harness.hcap_revision == original
+    job.harness.authority_hcap_revision = None
+    with pytest.raises(PreflightError, match="approved harness"):
+        _check_job_authority(job, harness, hcap)
+
+
+def test_job_authority_rejects_wrong_plan_and_unbound_hcap13():
+    job, harness, hcap, _, _ = _job_readiness("single")
+    harness.plan_ref = "f" * 64
+    with pytest.raises(PreflightError, match="approved harness"):
+        _check_job_authority(job, harness, hcap)
+    harness.plan_ref = job.stage2_input.plan_ref
+    harness.selected_capability_ids = ("HCAP-13",)
+    with pytest.raises(PreflightError, match="non-NLM runtime selection"):
+        _check_job_authority(job, harness, hcap)
+
+
+def test_job_readiness_binds_manager_fixture_and_preserves_nfs4_path():
+    job, harness, hcap, manager, bindings = _job_readiness("single")
+    assert "approved single fixture" in _check_stage2_job(
+        job, harness, hcap, manager, bindings)
+    manager["vm"]["cmdline"] = "koov.nfs_fixture=broad-knfsd"
+    with pytest.raises(PreflightError, match="manager fixture differs"):
+        _check_stage2_job(job, harness, hcap, manager, bindings)
+
+
+def test_job_lookup_does_not_create_a_missing_controller_database(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        _load_job_read_only(tmp_path, "job-missing")
+    assert not (tmp_path / "controller.sqlite").exists()
+
+
+def test_job_lookup_reads_existing_database_without_mutating_it(tmp_path):
+    job = Job(
+        job_id="job-test", job_policy_id="test-policy",
+        submission=CandidateSubmission(
+            kernel_commit="a" * 40,
+            location=LocationRequest(
+                kind=LocationKind.FUNCTION, path="test.c", symbol="test")))
+    database = tmp_path / "controller.sqlite"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, body TEXT)")
+        db.execute("INSERT INTO jobs VALUES (?, ?)",
+                   (job.job_id, job.model_dump_json()))
+    original = database.read_bytes()
+    assert _load_job_read_only(tmp_path, job.job_id) == job
+    with pytest.raises(PreflightError, match="job is absent"):
+        _load_job_read_only(tmp_path, "job-other")
+    assert database.read_bytes() == original
 
 
 def test_manager_config_binds_window_lane_script_and_all_proc_journals(

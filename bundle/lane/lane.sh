@@ -115,6 +115,15 @@ esac
 # lockd port in every lane namespace (fs.nfs.nlm_tcpport is global) and the
 # fixed rpc.statd ports.  The executor connects to the server lockd here.
 nlm_port=4045
+nlm_backend_port=4050
+nlm_relay_experiment=${KOOV_NLM_RELAY_EXPERIMENT:-0}
+case "$nlm_relay_experiment" in
+    0|1) ;;
+    *) echo "KOOV_NLM_RELAY_EXPERIMENT must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "$nlm_relay_experiment" = 1 ] && [ "$nlm_lane" != 1 ]; then
+    echo "NLM relay experiment requires nlm-knfsd" >&2; exit 2
+fi
 nlm_grace_period=10
 statd_port=662
 statd_outgoing_port=2020
@@ -174,6 +183,18 @@ if [ -n "$proxy_target_dir" ]; then
         exit 2
     fi
 fi
+# The ordinary NLM fixture still bypasses the relay. The experimental path
+# is not Stage 2 authority until callback, journal and replay checks pass.
+if [ "$action" = setup ] && [ "$nlm_lane" = 1 ] &&
+        [ -n "$proxy_target_dir" ] && [ "$nlm_relay_experiment" != 1 ]; then
+    echo "nlm-knfsd target mode requires a promoted NLM relay" >&2
+    exit 2
+fi
+if [ "$nlm_relay_experiment" = 1 ] && [ "$action" = setup ] &&
+        [ -z "$proxy_target_dir" ]; then
+    echo "NLM relay experiment requires target mode" >&2
+    exit 2
+fi
 # KOOV: per-backend listen ports.  In "both" mode the relay keeps 2049 and
 # each backend listens on its own port behind it.
 knfsd_port=${KOOV_KNFS_PORT:-}
@@ -194,6 +215,7 @@ fi
 export server_port server_impl tmpfs_size knfsd_port ganesha_port nfs_version
 export fixture_mode nfs4_lease_time nlm_lane nlm_port statd_port
 export statd_outgoing_port
+export nlm_backend_port nlm_relay_experiment
 # deps is needed inside the sh -c block: the Ganesha FSAL bind-mounts source
 # from the injected tree, and that path must not be hardcoded twice.
 export deps
@@ -854,6 +876,10 @@ setup_lane()
         fi
         if [ "$nlm_lane" = 1 ]; then
             mkdir -p /var/lib/nfs/statd/sm /var/lib/nfs/statd/sm.bak
+            if [ "$nlm_relay_experiment" = 1 ]; then
+                command -v lockd-netlink-port >/dev/null
+                test "$(lockd-netlink-port set "$nlm_backend_port")" = "$nlm_backend_port"
+            fi
             rpc.statd --no-notify --port "$statd_port" \
                 --outgoing-port "$statd_outgoing_port" \
                 --state-directory-path /var/lib/nfs/statd
@@ -883,7 +909,9 @@ setup_lane()
         else
             rpc.mountd --no-nfs-version 3 --no-udp --port 20048
         fi
-        nfsdcld
+        if [ "$nfs_version" != 3 ]; then
+            nfsdcld
+        fi
         printf "tcp $knfsd_port\n" > /proc/fs/nfsd/portlist
         printf "4\n" > /proc/fs/nfsd/threads
         if [ "$nlm_lane" = 1 ]; then
@@ -897,6 +925,12 @@ setup_lane()
                 }
                 sleep 0.1
             done
+            if [ "$nlm_relay_experiment" = 1 ]; then
+                command -v nlm-rpcbind-front >/dev/null
+                nlm-rpcbind-front "$nlm_port"
+                rpcinfo -p 127.0.0.1 | awk -v port="$nlm_port" \
+                    "\$1 == 100021 && \$2 == 4 && \$3 == \"tcp\" && \$4 == port { found = 1 } END { exit !found }"
+            fi
         fi
         fi
         # KOOV: Ganesha V15 VFS does not export tmpfs. Use a bounded ext4
@@ -1139,22 +1173,26 @@ EOF
                 echo "KOOV: guest lifecycle admin not on PATH" >&2
                 exit 1
             }
-            # The broker also owns the bounded nfsdcld control.  It
-            # validates the daemon started above (namespaces, executable,
-            # argv, CLD pipe inode) before it reports ready, and replaces it
-            # only with this same executable and argv.
-            cld_daemon=$(command -v nfsdcld)
-            case "$cld_daemon" in
-                /*) ;;
-                *) echo "KOOV: nfsdcld has no absolute path: $cld_daemon" >&2
-                   exit 1 ;;
-            esac
-            nfs-proxy --lifecycle-admin \
-                "$executor_root/proc-$lane/control/lifecycle.sock" \
-                --lane "$lane" \
-                --cld-daemon "$cld_daemon" \
-                --cld-state "$lane_root/server/cld.state" \
-                > "$lane_root/server/lifecycle.log" 2>&1 &
+            if [ "$nfs_version" = 3 ]; then
+                nfs-proxy --lifecycle-admin \
+                    "$executor_root/proc-$lane/control/lifecycle.sock" \
+                    --lane "$lane" \
+                    > "$lane_root/server/lifecycle.log" 2>&1 &
+            else
+                # NFSv4 needs the broker to validate and control nfsdcld.
+                cld_daemon=$(command -v nfsdcld)
+                case "$cld_daemon" in
+                    /*) ;;
+                    *) echo "KOOV: nfsdcld has no absolute path: $cld_daemon" >&2
+                       exit 1 ;;
+                esac
+                nfs-proxy --lifecycle-admin \
+                    "$executor_root/proc-$lane/control/lifecycle.sock" \
+                    --lane "$lane" \
+                    --cld-daemon "$cld_daemon" \
+                    --cld-state "$lane_root/server/cld.state" \
+                    > "$lane_root/server/lifecycle.log" 2>&1 &
+            fi
             lifecycle_pid=$!
             printf "%s\n" "$lifecycle_pid" > \
                 "$lane_root/server/lifecycle.pid"
@@ -1189,6 +1227,16 @@ EOF
                 # sink installed (journal_sink --session-prefix): a restarted
                 # VM never continues a full or quarantined session.
                 proxy_session="$(cat "$lane_root/server/target/session_prefix").$(cat /proc/sys/kernel/random/uuid)"
+                if [ "$nlm_relay_experiment" = 1 ]; then
+                    # Only backend replies use the local table; GRANTED callbacks
+                    # from another source port still reach the client lockd.
+                    ip route add local "10.89.$lane.2/32" dev lo table 100
+                    ip route add local "10.89.$lane.6/32" dev lo table 100
+                    ip rule add pref 100 from "10.89.$lane.1" ipproto tcp sport "$nlm_backend_port" lookup 100
+                    nlm_front_args="--nlm-listen 10.89.$lane.1:$nlm_port --nlm-backend 10.89.$lane.1:$nlm_backend_port --nlm-preserve-client-ip"
+                else
+                    nlm_front_args=
+                fi
                 nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
                     "10.89.$lane.1:$server_port" "10.89.$lane.5:$server_port" \
                     "10.89.$lane.1:$knfsd_port" "10.89.$lane.5:$ganesha_port" \
@@ -1197,6 +1245,7 @@ EOF
                     --journal "/dev/virtio-ports/nfsp-journal-$lane" \
                     --lane "$lane" \
                     --activation "$executor_root/proc-$lane/activation/activation.sock" \
+                    $nlm_front_args \
                     > "$lane_root/server/proxy.log" 2>&1 &
             else
                 nfs-proxy "10.89.$lane.2" "10.89.$lane.6" \
@@ -1219,6 +1268,10 @@ EOF
                 proxy_wait=$((proxy_wait + 1))
                 sleep 0.1
             done
+            if [ "$nlm_relay_experiment" = 1 ]; then
+                grep -q "^relay NLM TCP ready: port=$nlm_port$" \
+                    "$lane_root/server/proxy.log"
+            fi
         fi
         touch "$lane_root/server.ready"
         exec sleep 86400
@@ -1652,6 +1705,11 @@ status_fixture()
     status_trace=$(cat "$root/fixture.trace")
     case "$status_trace" in 0|1) ;; *) return 1 ;; esac
     proxy_target_dir=$(cat "$root/fixture.target")
+    nlm_relay_experiment=0
+    if test -f "$root/fixture.nlm_relay_experiment"; then
+        nlm_relay_experiment=$(cat "$root/fixture.nlm_relay_experiment")
+        case "$nlm_relay_experiment" in 0|1) ;; *) return 1 ;; esac
+    fi
     status_target=false
     if [ -n "$proxy_target_dir" ]; then
         status_target=true
@@ -1728,20 +1786,30 @@ status_fixture()
             test "$status_lifecycle_starttime" = \
                 "$(cat "$status_lane_root/server/lifecycle.starttime")"
             status_lifecycle_cmdline=$(tr '\000' ' ' < "/proc/$status_lifecycle_pid/cmdline")
-            case "$status_lifecycle_cmdline" in
-                *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane --cld-daemon /"*" --cld-state $status_lane_root/server/cld.state "*) ;;
-                *) echo "KOOV: lifecycle admin process identity mismatch" >&2
-                   return 1 ;;
-            esac
+            if [ "$status_version" = 3 ]; then
+                case "$status_lifecycle_cmdline" in
+                    *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane ") ;;
+                    *) echo "KOOV: lifecycle admin process identity mismatch" >&2
+                       return 1 ;;
+                esac
+            else
+                case "$status_lifecycle_cmdline" in
+                    *"nfs-proxy --lifecycle-admin $executor_root/proc-$status_lane/control/lifecycle.sock --lane $status_lane --cld-daemon /"*" --cld-state $status_lane_root/server/cld.state "*) ;;
+                    *) echo "KOOV: lifecycle admin process identity mismatch" >&2
+                       return 1 ;;
+                esac
+            fi
             if ! pid_owns_unix_socket "$status_lifecycle_pid" \
                     "$executor_root/proc-$status_lane/control/lifecycle.sock"; then
                 echo "KOOV: lifecycle admin does not own its socket" >&2
                 return 1
             fi
-            if ! cld_daemon_valid "$status_lane_root/server/cld.state" \
-                    "$status_server_pid" "$status_server_ns"; then
-                echo "KOOV: nfsdcld is not the broker-validated idle daemon" >&2
-                return 1
+            if [ "$status_version" != 3 ]; then
+                if ! cld_daemon_valid "$status_lane_root/server/cld.state" \
+                        "$status_server_pid" "$status_server_ns"; then
+                    echo "KOOV: nfsdcld is not the broker-validated idle daemon" >&2
+                    return 1
+                fi
             fi
         fi
 
@@ -1767,14 +1835,27 @@ status_fixture()
         if [ "$nlm_lane" = 1 ]; then
             # lockd and rpc.statd answer in all three namespaces, the server
             # lockd listens on the pinned port, and both knfsd mounts lock.
-            status_nlm_hex=$(printf "%04X" "$nlm_port")
+            status_nlm_listener_port=$nlm_port
+            if [ "$nlm_relay_experiment" = 1 ]; then
+                status_nlm_listener_port=$nlm_backend_port
+            fi
+            status_nlm_hex=$(printf "%04X" "$status_nlm_listener_port")
             nsenter -t "$status_server_pid" -n -- awk -v p="$status_nlm_hex" \
                 '$2 ~ ":"p"$" && $4 == "0A" { n++ } END { exit !n }' \
                 /proc/net/tcp
-            nlm_registered nsenter -t "$status_server_pid" -n -- || {
-                echo "KOOV: server lockd or rpc.statd is not registered" >&2
-                return 1
-            }
+            if [ "$nlm_relay_experiment" = 1 ]; then
+                nsenter -t "$status_server_pid" -m -n -- \
+                    lockd-netlink-port get | grep -qx "$nlm_backend_port"
+                nsenter -t "$status_client0_pid" -m -n -- \
+                    rpcinfo -T tcp "10.89.$status_lane.1" nlockmgr 4 >/dev/null
+                nsenter -t "$status_server_pid" -m -n -- \
+                    rpcinfo -T tcp 127.0.0.1 status 1 >/dev/null
+            else
+                nlm_registered nsenter -t "$status_server_pid" -n -- || {
+                    echo "KOOV: server lockd or rpc.statd is not registered" >&2
+                    return 1
+                }
+            fi
             for status_nlm_ns in "$status_client0_ns" "$status_client1_ns"; do
                 nlm_registered ip netns exec "$status_nlm_ns" || {
                     echo "KOOV: client lockd or rpc.statd is not registered" >&2
@@ -2047,6 +2128,7 @@ setup)
     printf '%s\n' "$nfs_version" > "$root/fixture.version"
     printf '%s\n' "$nfs_trace" > "$root/fixture.trace"
     printf '%s\n' "$proxy_target_dir" > "$root/fixture.target"
+    printf '%s\n' "$nlm_relay_experiment" > "$root/fixture.nlm_relay_experiment"
     if test -e "$executor_root" || test -L "$executor_root"; then
         echo "$executor_root is already owned by another fixture" >&2
         exit 1

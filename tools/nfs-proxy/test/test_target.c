@@ -24,6 +24,56 @@ static unsigned checks, failures;
 	fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
 	fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
+static void test_empty_ruleset_forwards_eligible_record(void)
+{
+	struct nfsp_target t = {0};
+	struct tgen generation = {.generation = 1};
+	struct nfsp_rpc_envelope rpc = {.msg_type = NFSP_RPC_CALL};
+	struct nfsp_rpc_record record = {0};
+	struct nfsp_semantic_event event = {.record = &record, .rpc = &rpc};
+
+	t.gens = &generation;
+	t.ngens = 1;
+	t.cur.action = NFSP_RELAY_FORWARD;
+	eligible(&t, &event, 1, NULL);
+	CHECK(t.cur.action == NFSP_RELAY_FORWARD && t.stats.eligible == 1,
+	      "empty ruleset must forward an eligible record unchanged");
+}
+
+static void test_context_route_encoding(void)
+{
+	struct nfsp_jbuf b;
+	struct context c = {0};
+	const char *legacy = "\"record_context\":{\"backend\":0,\"client\":0,"
+		"\"connection_id\":1,\"direction\":\"c2s\","
+		"\"message_type\":\"call\",\"procedure\":1,"
+		"\"program\":100003,\"version\":4,\"xid\":7}";
+	const char *nlm = "\"record_context\":{\"backend\":0,\"client\":0,"
+		"\"connection_id\":1,\"direction\":\"c2s\","
+		"\"message_type\":\"call\",\"procedure\":1,"
+		"\"program\":100021,\"route\":\"nlm\","
+		"\"version\":4,\"xid\":7}";
+
+	c.connection_id = 1;
+	c.direction = NFSP_DIR_C2S;
+	c.procedure = 1;
+	c.program = 100003;
+	c.version = 4;
+	c.xid = 7;
+	nfsp_jb_init(&b, 1024);
+	j_context(&b, &c, 1);
+	CHECK(!b.failed && strcmp(b.p, legacy) == 0,
+	      "NFS record_context encoding changed");
+	nfsp_jb_free(&b);
+	c.route = NFSP_ROUTE_NLM;
+	c.program = 100021;
+	nfsp_jb_init(&b, 1024);
+	j_context(&b, &c, 1);
+	CHECK(!b.failed && strcmp(b.p, nlm) == 0,
+	      "NLM route is missing or not in canonical key order");
+	nfsp_jb_free(&b);
+}
+
 #define TEST_SESSION "target-retirement"
 #define ZERO64 "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -360,6 +410,8 @@ static void test_complete_ack_is_retirement_point(void)
 
 int main(void)
 {
+	test_empty_ruleset_forwards_eligible_record();
+	test_context_route_encoding();
 	test_complete_ack_is_retirement_point();
 	printf("%u checks, %u failures\n", checks, failures);
 	return failures ? 1 : 0;

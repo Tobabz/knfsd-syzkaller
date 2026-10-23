@@ -87,7 +87,7 @@ def test_registry_is_canonical_and_names_the_build(proxy_binary, build):
     assert reg.semantic_runtime_version == 1
     assert _schema_id() in reg.schema_ids
     assert {s.schema_id.split("/")[0] for s in reg.schemas} == {
-        "nfs3", "nfs4.0", "nfs4.1", "nfs4.2"}
+        "nfs3", "nfs4.0", "nfs4.1", "nfs4.2", "nlm4"}
     assert reg.mutation_kinds == ("replace",)
     assert reg.transforms == ("copy", "literal")
     assert "encoded" not in reg.parts

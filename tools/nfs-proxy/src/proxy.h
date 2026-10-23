@@ -10,6 +10,7 @@
 
 #define NFSP_CLIENTS 2u
 #define NFSP_BACKENDS 2u
+#define NFSP_MAX_LISTENERS (NFSP_BACKENDS + 1u)
 #define NFSP_DIR_C2S 0
 #define NFSP_DIR_S2C 1
 
@@ -50,6 +51,7 @@ struct nfsp_route {
 
 struct nfsp_proxy_stats {
 	uint16_t bound_port[NFSP_BACKENDS];
+	uint16_t nlm_bound_port;
 	uint32_t accepted[NFSP_CLIENTS][NFSP_BACKENDS];
 	uint32_t connected[NFSP_CLIENTS][NFSP_BACKENDS];
 	uint32_t connect_failed[NFSP_CLIENTS][NFSP_BACKENDS];
@@ -63,6 +65,13 @@ struct nfsp_proxy_stats {
 
 struct nfsp_proxy_cfg {
 	struct nfsp_route route[NFSP_BACKENDS];
+	/* Optional NLM TCP route to knfsd. Disabled when listen_ip is NULL.
+	 * Its listener shares this process, connection IDs and relay hooks.
+	 * The caller must provide a non-conflicting network binding. */
+	struct nfsp_route nlm_route;
+	/* Bind the NLM backend connection to the accepted client IP. This
+	 * requires transparent-socket privileges and a guest return route. */
+	int nlm_preserve_client_ip;
 	const char *client_ip[NFSP_CLIENTS];
 	size_t msg_limit;  /* zero chooses NFSP_MSG_LIMIT_DEFAULT */
 	unsigned connect_timeout_ms; /* zero chooses a finite default */
@@ -134,8 +143,8 @@ struct nfsp_proxy_cfg {
 	void *relay_arg;
 };
 
-/* on_ready runs after BOTH listeners bind.  Its stats pointer is valid until
- * run returns; callers must synchronize before reading counters concurrently. */
+/* on_ready runs after all configured listeners bind. Its stats pointer is valid
+ * until run returns; callers must synchronize before reading counters. */
 int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 		   struct nfsp_proxy_stats *stats,
 		   void (*on_ready)(const struct nfsp_proxy_stats *, void *),

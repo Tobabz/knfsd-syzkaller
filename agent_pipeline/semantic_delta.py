@@ -134,6 +134,8 @@ class SealedJournal:
                 ValueError, TypeError) as error:
             raise DeltaReadError(f"journal fails re-admission: {error}") from error
         self.sessions = self._index(view)
+        self.events = tuple(view.events())
+        self.rejections = tuple(view.rejections())
         # The view read the same bytes the digests name: refuse a journal
         # that changed while it was read.
         if self._segments(limits) != self.segments:

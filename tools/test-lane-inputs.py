@@ -56,6 +56,19 @@ with tempfile.TemporaryDirectory() as directory:
     assert retry.returncode == 2 and b"already exists" in retry.stderr
     assert output.read_bytes() == before
 
+    lockd_helper = work / "lockd-netlink-port"
+    front_helper = work / "nlm-rpcbind-front"
+    lockd_helper.write_bytes(b"\x7fELFlockd")
+    front_helper.write_bytes(b"\x7fELFfront")
+    nlm_output = work / "lane-nlm.tar.gz"
+    nlm_command = [sys.executable, str(assemble), "--ganesha-deps", str(deps),
+                   "--proxy", str(proxy), "--lockd-port", str(lockd_helper),
+                   "--rpcbind-front", str(front_helper), "--out", str(nlm_output)]
+    subprocess.run(nlm_command, check=True, capture_output=True)
+    with tarfile.open(nlm_output) as archive:
+        assert archive.extractfile("./usr/sbin/lockd-netlink-port").read() == lockd_helper.read_bytes()
+        assert archive.extractfile("./usr/sbin/nlm-rpcbind-front").read() == front_helper.read_bytes()
+
     # Parsing must find all three moved lane files without explicit overrides.
     for version in ("3", "4.0", "4.1", "4.2"):
         args = baker["parse_args"]([
@@ -99,6 +112,31 @@ with tempfile.TemporaryDirectory() as directory:
     assert '--cld-state "$lane_root/server/cld.state"' in lane_text
     assert 'cld_daemon_valid "$status_lane_root/server/cld.state"' in lane_text
     assert "nfsdcld is not the broker-validated idle daemon" in lane_text
+    # A v3-only kernel has no nfsd/cld pipe. Keep the lifecycle endpoint,
+    # but require CLD daemon control and status verification for v4.
+    assert 'if [ "$nfs_version" != 3 ]; then' in lane_text
+    assert 'if [ "$nfs_version" = 3 ]; then' in lane_text
+    assert 'if [ "$status_version" = 3 ]; then' in lane_text
+    assert 'if [ "$status_version" != 3 ]; then' in lane_text
+    boot_text = (ROOT / "bundle/lane/boot-fixture.sh").read_text()
+    assert '"$(cat "$port/name")" = "nfsp-journal-$lane"' in boot_text
+    assert '[ -c "$device" ]' in boot_text
+    assert '[ -c "$journal" ]' in boot_text
+    function_start = boot_text.index("virtio_device_matches()\n{")
+    function_end = boot_text.index("\n}\n", function_start) + 3
+    device_function = boot_text[function_start:function_end]
+    null_stat = os.stat("/dev/null")
+    device_major = os.major(null_stat.st_rdev)
+    device_minor = os.minor(null_stat.st_rdev)
+    for major_delta, minor_delta, expected_rc in (
+            (0, 0, 0), (1, 0, 1), (0, 1, 1)):
+        checked_device = subprocess.run(
+            ["sh", "-c", device_function +
+             '\nvirtio_device_matches "$1" "$2" "$3"', "sh",
+             "/dev/null", str(device_major + major_delta),
+             str(device_minor + minor_delta)],
+            capture_output=True, text=True)
+        assert checked_device.returncode == expected_rc, checked_device
     cld_start = lane_text.index("cld_daemon_valid()\n{")
     cld_end = lane_text.index("\n}\n", cld_start) + 3
     cld_function = lane_text[cld_start:cld_end]
@@ -458,6 +496,17 @@ for nlm_env, nlm_message in (
         env={**os.environ, **nlm_env}, capture_output=True, text=True)
     assert nlm_result.returncode == 2, nlm_result
     assert nlm_message in nlm_result.stderr, nlm_result.stderr
+with tempfile.TemporaryDirectory() as target_dir:
+    nlm_target = subprocess.run(
+        ["sh", str(ROOT / "bundle/lane/lane.sh"), "setup",
+         "/tmp/frozen-phase9.nlmtarget", "1"],
+        env={**os.environ, "NFS_FIXTURE": "nlm-knfsd",
+             "NFS_PROXY_TARGET_DIR": target_dir},
+        capture_output=True, text=True)
+    assert nlm_target.returncode == 2, nlm_target
+    assert "target mode requires a promoted NLM relay" in nlm_target.stderr
+    assert '"$nlm_relay_experiment" != 1' in lane_source
+    assert 'koov.nlm_relay_experiment=*)' in boot_source
 assert "koov.nfs_trace=*) trace=${arg#koov.nfs_trace=} ;;" in boot_source
 assert "trace=0\n" in boot_source
 # Proxy target mode is opt-in: koov.nfs_target=1 maps the share's target/
@@ -468,6 +517,10 @@ assert "target=0\n" in boot_source
 assert "NFS_PROXY_TARGET_DIR=/run/frozen-phase9/target" in boot_source
 assert boot_source.index("NFS_PROXY_TARGET_DIR=/run/frozen-phase9/target") < \
     boot_source.index('umount "$source_dir"\nactual_sha')
+assert 'device_number=$(cat "$port/dev")' in boot_source
+assert 'mknod "$device" c "$major" "$minor"' in boot_source
+assert boot_source.index('[ "$(cat "$port/name")" = "nfsp-journal-$lane" ]') < \
+    boot_source.index('mknod "$device" c "$major" "$minor"')
 assert "proxy_target_dir=${NFS_PROXY_TARGET_DIR:-}" in lane_source
 assert "export proxy_target_dir" in lane_source
 assert '--activation "$executor_root/proc-$lane/activation/activation.sock"' in lane_source
