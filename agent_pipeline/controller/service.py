@@ -265,8 +265,8 @@ class Controller:
         return self.operator(job_id, f"route_{to}")
 
     def start_stage2(self, job_id: str) -> Outcome | None:
-        """09 §4: an operator starts Stage 2 of a job in s1_reached.  Until
-        JobPolicy.run_stage2 may be true this is the only way in."""
+        """09 §4: an operator starts Stage 2 of a job in s1_reached.  Unless
+        JobPolicy.campaign_mode is mutate this is the only way in."""
         return self.operator(job_id, "start_stage2")
 
     def operator(self, job_id: str, action: str) -> Outcome | None:

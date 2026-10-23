@@ -24,7 +24,8 @@ from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
                          REPLAY_STATUSES, CampaignSegment, CompiledRuleSet,
                          GateRun, HcapCheck,
                          NEUTRAL_CONTROL_UNAVAILABLE, TASK_VARIANTS, AgentTask,
-                         GapClass, GapRef, HarnessBinding, JobPolicy,
+                         CampaignMode, GapClass, GapRef, HarnessBinding,
+                         JobPolicy,
                          MaterializationHcapAuthority, MaterializeRejected,
                          Q1Result, Q1Status, kernel_revision_gap)
 from . import events as ev
@@ -766,8 +767,11 @@ class Machine:
                 plan_ref=lv.plan_ref, harness_ref=lv.harness_ref,
                 execution_harness_id=lv.result.execution_harness_id)
             self._leave_stage2(j)
-            if c.policy.run_stage2:
+            if c.policy.campaign_mode is CampaignMode.MUTATE:
                 self._start_stage2(c)
+            else:
+                # #81: Q1 is the deliverable; nothing starts by itself.
+                j.state_reason = "evidence_only"
         elif t.kind is TargetKind.BLOCKED_OPERATOR:
             self._drop_task(c)
             j.state = JobState.BLOCKED_OPERATOR
