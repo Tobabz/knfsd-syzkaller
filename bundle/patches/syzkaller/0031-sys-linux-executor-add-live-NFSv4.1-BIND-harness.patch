@@ -1,0 +1,571 @@
+From 4e793c03d0b878adc4c6da57dc575fc6b83fdbda Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Fri, 23 Oct 2026 22:55:55 +0900
+Subject: [PATCH] sys/linux, executor: add live NFSv4.1 BIND harness
+
+Add a bounded live-session BIND_CONN_TO_SESSION pseudo-call for the direct client0 NFSv4.1 lane. The executor opens a fresh TCP connection in the profile network namespace, performs EXCHANGE_ID/CREATE_SESSION, pipelines BIND_CONN_TO_SESSION records on the same transport, reads one reply, and resets the connection. The program supplies the lane profile fd and bounded dir/pipeline/round values; owner, clientid, sessionid and wire details stay executor-owned.
+---
+ executor/common_linux.h      | 469 ++++++++++++++++++++++++++++++++++-
+ pkg/vminfo/linux_syscalls.go |   1 +
+ sys/linux/fs_nfs_fuzz.txt    |   8 +
+ sys/linux/nfs_fuzz_test.go   |  25 ++
+ 4 files changed, 502 insertions(+), 1 deletion(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 1321802bd..ab8d0a219 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2826,11 +2826,14 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+ 
+ #if SYZ_EXECUTOR || __NR_syz_open_nfs_lane || __NR_syz_socket_connect_nfs || \
+     __NR_syz_open_nfs_lane_pair || __NR_syz_open_nfs_lane_profile || \
+-    __NR_syz_socket_connect_nfs_pair || \
++    __NR_syz_socket_connect_nfs_pair || __NR_syz_nfs_bind_live || \
+     __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || \
+     __NR_syz_nfsd_client_ctl || __NR_syz_nfsd_cld_ctl || __NR_syz_send_nfs_fuzz || \
+     __NR_syz_socket_connect_nlm || __NR_syz_open_nlm_lane_file || \
+     __NR_syz_nlm_lane_fh || __NR_syz_send_nlm_rpc
++#include <arpa/inet.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <fcntl.h>
+ #include <sched.h>
+ #include <stdio.h>
+@@ -2961,6 +2964,470 @@ static long syz_socket_connect_nfs_pair(volatile long a0, volatile long a1)
+ 	return nfs_socket_connect_pair(a0, a1);
+ }
+ 
++struct nfs_bind_buf {
++	uint8* data;
++	size_t len;
++	size_t cap;
++	size_t op_start;
++};
++
++static uint32 nfs_bind_get32(const uint8* p)
++{
++	return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) |
++	       ((uint32)p[2] << 8) | (uint32)p[3];
++}
++
++static uint64 nfs_bind_get64(const uint8* p)
++{
++	return ((uint64)nfs_bind_get32(p) << 32) | nfs_bind_get32(p + 4);
++}
++
++static void nfs_bind_put32(uint8* p, uint32 value)
++{
++	p[0] = (uint8)(value >> 24);
++	p[1] = (uint8)(value >> 16);
++	p[2] = (uint8)(value >> 8);
++	p[3] = (uint8)value;
++}
++
++static int nfs_bind_buf_init(struct nfs_bind_buf* b, size_t cap)
++{
++	b->data = (uint8*)malloc(cap);
++	if (!b->data) {
++		b->len = b->cap = 0;
++		errno = ENOMEM;
++		return -1;
++	}
++	b->len = 0;
++	b->cap = cap;
++	b->op_start = 0;
++	return 0;
++}
++
++static void nfs_bind_buf_free(struct nfs_bind_buf* b)
++{
++	free(b->data);
++	b->data = NULL;
++	b->len = b->cap = 0;
++	b->op_start = 0;
++}
++
++static int nfs_bind_buf_need(struct nfs_bind_buf* b, size_t n)
++{
++	if (n > b->cap - b->len) {
++		errno = EMSGSIZE;
++		return -1;
++	}
++	return 0;
++}
++
++static int nfs_bind_buf_u32(struct nfs_bind_buf* b, uint32 value)
++{
++	if (nfs_bind_buf_need(b, 4))
++		return -1;
++	nfs_bind_put32(b->data + b->len, value);
++	b->len += 4;
++	return 0;
++}
++
++static int nfs_bind_buf_u64(struct nfs_bind_buf* b, uint64 value)
++{
++	if (nfs_bind_buf_u32(b, (uint32)(value >> 32)))
++		return -1;
++	return nfs_bind_buf_u32(b, (uint32)value);
++}
++
++static int nfs_bind_buf_fixed(struct nfs_bind_buf* b, const void* p, size_t n)
++{
++	if (nfs_bind_buf_need(b, n))
++		return -1;
++	memcpy(b->data + b->len, p, n);
++	b->len += n;
++	return 0;
++}
++
++static int nfs_bind_buf_opaque(struct nfs_bind_buf* b, const void* p, size_t n)
++{
++	static const uint8 zero[4] = {};
++	size_t pad = (4 - (n & 3)) & 3;
++	if (nfs_bind_buf_u32(b, (uint32)n) || nfs_bind_buf_fixed(b, p, n) ||
++	    nfs_bind_buf_fixed(b, zero, pad))
++		return -1;
++	return 0;
++}
++
++static int nfs_bind_read_full(int fd, void* buf, size_t len)
++{
++	size_t off = 0;
++	while (off < len) {
++		ssize_t n = read(fd, (uint8*)buf + off, len - off);
++		if (n <= 0) {
++			if (n < 0 && errno == EINTR)
++				continue;
++			return -1;
++		}
++		off += n;
++	}
++	return 0;
++}
++
++static int nfs_bind_send_all(int fd, const void* buf, size_t len)
++{
++	size_t off = 0;
++	while (off < len) {
++		ssize_t n = send(fd, (const uint8*)buf + off, len - off,
++				 MSG_NOSIGNAL);
++		if (n <= 0) {
++			if (n < 0 && errno == EINTR)
++				continue;
++			return -1;
++		}
++		off += n;
++	}
++	return 0;
++}
++
++static int nfs_bind_recv_record(int fd, struct nfs_bind_buf* b)
++{
++	uint8 marker[4];
++	uint32 value;
++	size_t len;
++	if (nfs_bind_read_full(fd, marker, sizeof(marker)))
++		return -1;
++	value = nfs_bind_get32(marker);
++	if (!(value & 0x80000000U))
++		return -1;
++	len = value & 0x7fffffffU;
++	if (len > b->cap) {
++		errno = EMSGSIZE;
++		return -1;
++	}
++	if (nfs_bind_read_full(fd, b->data, len))
++		return -1;
++	b->len = len;
++	return 0;
++}
++
++static int nfs_bind_send_record(int fd, const void* data, size_t len)
++{
++	uint8* wire;
++	size_t total = len + 4;
++	if (total < len || total > 0x7fffffffU) {
++		errno = EMSGSIZE;
++		return -1;
++	}
++	wire = (uint8*)malloc(total);
++	if (!wire) {
++		errno = ENOMEM;
++		return -1;
++	}
++	nfs_bind_put32(wire, 0x80000000U | (uint32)len);
++	memcpy(wire + 4, data, len);
++	int ret = nfs_bind_send_all(fd, wire, total);
++	free(wire);
++	return ret;
++}
++
++static int nfs_bind_rpc_header(struct nfs_bind_buf* b, uint32 xid)
++{
++	uint8 cred[64] = {};
++	struct nfs_bind_buf c = {cred, 0, sizeof(cred), 0};
++	const char machine[] = "bindlive";
++	static const uint8 zero[4] = {};
++	size_t pad;
++
++	if (nfs_bind_buf_u32(&c, 0) ||
++	    nfs_bind_buf_opaque(&c, machine, sizeof(machine) - 1) ||
++	    nfs_bind_buf_u32(&c, 0) ||
++	    nfs_bind_buf_u32(&c, 0) ||
++	    nfs_bind_buf_u32(&c, 0))
++		return -1;
++	pad = (4 - (c.len & 3)) & 3;
++	if (nfs_bind_buf_u32(b, xid) ||
++	    nfs_bind_buf_u32(b, 0) || // RPC_CALL
++	    nfs_bind_buf_u32(b, 2) || // RPC version
++	    nfs_bind_buf_u32(b, 100003) || // NFS program
++	    nfs_bind_buf_u32(b, 4) || // NFS version
++	    nfs_bind_buf_u32(b, 1) || // NFSPROC4_COMPOUND
++	    nfs_bind_buf_u32(b, 1) || // AUTH_SYS
++	    nfs_bind_buf_u32(b, (uint32)c.len) ||
++	    nfs_bind_buf_fixed(b, c.data, c.len) ||
++	    nfs_bind_buf_fixed(b, zero, pad) ||
++	    nfs_bind_buf_u32(b, 0) || // AUTH_NONE
++	    nfs_bind_buf_u32(b, 0))
++		return -1;
++	return 0;
++}
++
++static int nfs_bind_reply_op_start(const struct nfs_bind_buf* r, uint32 xid,
++				   size_t* op_start)
++{
++	size_t off;
++	uint32 verifier_len, tag_len;
++	if (r->len < 24 || nfs_bind_get32(r->data) != xid ||
++	    nfs_bind_get32(r->data + 4) != 1 || // RPC_REPLY
++	    nfs_bind_get32(r->data + 8) != 0) // RPC_MSG_ACCEPTED
++		return -1;
++	verifier_len = nfs_bind_get32(r->data + 16);
++	off = 20 + verifier_len + ((4 - (verifier_len & 3)) & 3);
++	if (off + 12 > r->len || nfs_bind_get32(r->data + off) != 0)
++		return -1;
++	off += 4; // accept_stat
++	if (nfs_bind_get32(r->data + off) != 0) // COMPOUND4res.status
++		return -1;
++	off += 4;
++	tag_len = nfs_bind_get32(r->data + off);
++	off += 4 + tag_len + ((4 - (tag_len & 3)) & 3);
++	if (off + 4 > r->len)
++		return -1;
++	off += 4; // result count
++	*op_start = off;
++	return 0;
++}
++
++static int nfs_bind_send_rpc(int fd, const struct nfs_bind_buf* body,
++			     uint32 xid, struct nfs_bind_buf* reply)
++{
++	struct nfs_bind_buf rpc;
++	if (nfs_bind_buf_init(&rpc, body->len + 128))
++		return -1;
++	if (nfs_bind_rpc_header(&rpc, xid) ||
++	    nfs_bind_buf_fixed(&rpc, body->data, body->len) ||
++	    nfs_bind_send_record(fd, rpc.data, rpc.len)) {
++		int saved_errno = errno;
++		nfs_bind_buf_free(&rpc);
++		errno = saved_errno;
++		return -1;
++	}
++	nfs_bind_buf_free(&rpc);
++	if (!reply)
++		return 0;
++	if (nfs_bind_buf_init(reply, 65536))
++		return -1;
++	if (nfs_bind_recv_record(fd, reply)) {
++		int saved_errno = errno;
++		nfs_bind_buf_free(reply);
++		errno = saved_errno;
++		return -1;
++	}
++	if (nfs_bind_reply_op_start(reply, xid, &reply->op_start) ||
++	    reply->op_start + 8 > reply->len) {
++		int saved_errno = EPROTO;
++		nfs_bind_buf_free(reply);
++		errno = saved_errno;
++		return -1;
++	}
++	return 0;
++}
++
++static int nfs_bind_exchange(int fd, const uint8* owner,
++			     uint64* clientid, uint32* seqid)
++{
++	static const uint8 verifier[8] = {'B', 'I', 'N', 'D', 'R', 'C', 'E', '!'};
++	struct nfs_bind_buf b = {}, reply = {};
++	size_t op_start;
++	int ret = -1;
++	if (nfs_bind_buf_init(&b, 512))
++		return -1;
++	if (nfs_bind_buf_opaque(&b, "x", 1) ||
++	    nfs_bind_buf_u32(&b, 1) ||
++	    nfs_bind_buf_u32(&b, 1) ||
++	    nfs_bind_buf_u32(&b, 42) || // OP_EXCHANGE_ID
++	    nfs_bind_buf_fixed(&b, verifier, sizeof(verifier)) ||
++	    nfs_bind_buf_opaque(&b, owner, 16) ||
++	    nfs_bind_buf_u32(&b, 0) ||
++	    nfs_bind_buf_u32(&b, 0) ||
++	    nfs_bind_buf_u32(&b, 0))
++		goto out;
++	if (nfs_bind_send_rpc(fd, &b, 0x45584944U, &reply))
++		goto out;
++	op_start = reply.op_start;
++	if (op_start + 20 > reply.len || nfs_bind_get32(reply.data + op_start) != 42 ||
++	    nfs_bind_get32(reply.data + op_start + 4) != 0)
++		goto out;
++	*clientid = nfs_bind_get64(reply.data + op_start + 8);
++	*seqid = nfs_bind_get32(reply.data + op_start + 16);
++	ret = 0;
++out:
++	nfs_bind_buf_free(&b);
++	nfs_bind_buf_free(&reply);
++	return ret;
++}
++
++static int nfs_bind_channel(struct nfs_bind_buf* b, uint32 maxreq,
++			    uint32 maxresp, uint32 cached, uint32 maxops,
++			    uint32 maxreqs)
++{
++	return nfs_bind_buf_u32(b, 0) || nfs_bind_buf_u32(b, maxreq) ||
++	       nfs_bind_buf_u32(b, maxresp) || nfs_bind_buf_u32(b, cached) ||
++	       nfs_bind_buf_u32(b, maxops) || nfs_bind_buf_u32(b, maxreqs) ||
++	       nfs_bind_buf_u32(b, 0);
++}
++
++static int nfs_bind_create(int fd, uint64 clientid, uint32 seqid,
++			   uint8 sessionid[16])
++{
++	struct nfs_bind_buf b = {}, reply = {};
++	size_t op_start;
++	int ret = -1;
++	if (nfs_bind_buf_init(&b, 512))
++		return -1;
++	if (nfs_bind_buf_opaque(&b, "c", 1) ||
++	    nfs_bind_buf_u32(&b, 1) ||
++	    nfs_bind_buf_u32(&b, 1) ||
++	    nfs_bind_buf_u32(&b, 43) || // OP_CREATE_SESSION
++	    nfs_bind_buf_u64(&b, clientid) ||
++	    nfs_bind_buf_u32(&b, seqid) ||
++	    nfs_bind_buf_u32(&b, 0) ||
++	    nfs_bind_channel(&b, 4096, 4096, 0, 8, 4) ||
++	    nfs_bind_channel(&b, 4096, 4096, 0, 8, 4) ||
++	    nfs_bind_buf_u32(&b, 0x40000000U) ||
++	    nfs_bind_buf_u32(&b, 0))
++		goto out;
++	if (nfs_bind_send_rpc(fd, &b, 0x43524553U, &reply))
++		goto out;
++	op_start = reply.op_start;
++	if (op_start + 24 > reply.len || nfs_bind_get32(reply.data + op_start) != 43 ||
++	    nfs_bind_get32(reply.data + op_start + 4) != 0)
++		goto out;
++	memcpy(sessionid, reply.data + op_start + 8, 16);
++	ret = 0;
++out:
++	nfs_bind_buf_free(&b);
++	nfs_bind_buf_free(&reply);
++	return ret;
++}
++
++static int nfs_bind_send_bind(int fd, const uint8 sessionid[16], uint32 xid,
++			      uint32 dir)
++{
++	struct nfs_bind_buf b = {};
++	int ret = -1;
++	if (nfs_bind_buf_init(&b, 128))
++		return -1;
++	if (nfs_bind_buf_opaque(&b, "b", 1) ||
++	    nfs_bind_buf_u32(&b, 1) ||
++	    nfs_bind_buf_u32(&b, 1) ||
++	    nfs_bind_buf_u32(&b, 41) || // OP_BIND_CONN_TO_SESSION
++	    nfs_bind_buf_fixed(&b, sessionid, 16) ||
++	    nfs_bind_buf_u32(&b, dir) ||
++	    nfs_bind_buf_u32(&b, 0))
++		goto out;
++	ret = nfs_bind_send_rpc(fd, &b, xid, NULL);
++out:
++	nfs_bind_buf_free(&b);
++	return ret;
++}
++
++static int nfs_bind_connect(void)
++{
++	if (nfs_fuzz_netns_fds[0] < 0 || !nfs_fuzz_server_addrs[0]) {
++		errno = ENODEV;
++		return -1;
++	}
++	int current = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
++	if (current < 0)
++		return -1;
++	if (setns(nfs_fuzz_netns_fds[0], CLONE_NEWNET)) {
++		int saved_errno = errno;
++		close(current);
++		errno = saved_errno;
++		return -1;
++	}
++	int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
++	int saved_errno = 0;
++	if (fd < 0) {
++		saved_errno = errno;
++	} else {
++		struct sockaddr_in addr = {};
++		struct timeval tv = {.tv_sec = 3};
++		int one = 1;
++		addr.sin_family = AF_INET;
++		addr.sin_port = htons(2049);
++		addr.sin_addr.s_addr = nfs_fuzz_server_addrs[0];
++		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++		if (connect(fd, (struct sockaddr*)&addr, sizeof(addr))) {
++			saved_errno = errno;
++			close(fd);
++			fd = -1;
++		}
++	}
++	if (setns(current, CLONE_NEWNET)) {
++		saved_errno = errno;
++		if (fd >= 0)
++			close(fd);
++		fd = -1;
++	}
++	close(current);
++	errno = saved_errno;
++	return fd;
++}
++
++static void nfs_bind_reset(int fd)
++{
++	struct linger linger = {.l_onoff = 1, .l_linger = 0};
++	setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
++	close(fd);
++}
++
++static long syz_nfs_bind_live(volatile long a0, volatile long a1,
++			      volatile long a2, volatile long a3)
++{
++	static uint32 nonce;
++	struct stat st;
++	int profile_fd = a0;
++	unsigned long dir = a1, pipeline = a2, rounds = a3;
++	int completed = 0;
++
++	if (profile_fd < 0 || fstat(profile_fd, &st) || !S_ISDIR(st.st_mode) ||
++	    dir > 3 || pipeline < 1 || pipeline > 64 || rounds < 1 ||
++	    rounds > 8) {
++		errno = EINVAL;
++		return -1;
++	}
++	for (unsigned long round = 0; round < rounds; round++) {
++		uint8 owner[16] = {};
++		uint8 sessionid[16] = {};
++		uint64 clientid = 0;
++		uint32 seqid = 0;
++		uint32 xid = 0x42494e00U + (uint32)(round << 8);
++		int fd = nfs_bind_connect();
++		int sent = 0;
++		if (fd < 0)
++			continue;
++		memcpy(owner, "bindlive", 8);
++		nfs_bind_put32(owner + 8, (uint32)getpid());
++		nfs_bind_put32(owner + 12, nonce++);
++		if (nfs_bind_exchange(fd, owner, &clientid, &seqid) ||
++		    nfs_bind_create(fd, clientid, seqid, sessionid)) {
++			close(fd);
++			continue;
++		}
++		for (unsigned long i = 0; i < pipeline; i++) {
++			if (nfs_bind_send_bind(fd, sessionid, xid + (uint32)i,
++					       (uint32)dir))
++				break;
++			sent++;
++		}
++		if (sent) {
++			struct nfs_bind_buf reply = {};
++			if (!nfs_bind_buf_init(&reply, 65536)) {
++				nfs_bind_recv_record(fd, &reply);
++				nfs_bind_buf_free(&reply);
++			}
++			completed++;
++		}
++		nfs_bind_reset(fd);
++	}
++	if (!completed) {
++		errno = EPROTO;
++		return -1;
++	}
++	return 0;
++}
++
+ // The NLM lane fixture pins the kernel lockd to this TCP port in every lane
+ // namespace.  Both clients reach the server's lockd at the .1 address.
+ #define NFS_LANE_NLM_PORT 4045
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index e33729a8d..166a33079 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -114,6 +114,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_socket_connect_nfs_pair":   alwaysSupported,
+ 	"syz_open_nfs_lane_pair":        alwaysSupported,
+ 	"syz_open_nfs_lane_profile":     alwaysSupported,
++	"syz_nfs_bind_live":             alwaysSupported,
+ 	"syz_arm_nfs_proxy":             alwaysSupported,
+ 	"syz_arm_nfs_proxy_v2":          alwaysSupported,
+ 	"syz_nfsd_client_ctl":           alwaysSupported,
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+index 8f4a66698..e8d1a45c6 100644
+--- a/sys/linux/fs_nfs_fuzz.txt
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -53,6 +53,14 @@ syz_open_nfs_lane_profile$client1_knfsd_v42(profile const[3], client const[1]) f
+ syz_open_nfs_lane_profile$client0_ganesha_v41(profile const[4], client const[0]) fd_nfs_dir
+ syz_open_nfs_lane_profile$client1_ganesha_v41(profile const[4], client const[1]) fd_nfs_dir
+ 
++# Open a fresh NFSv4.1 client/session on the direct client0 lane, then send a
++# bounded pipeline of BIND_CONN_TO_SESSION calls on that same transport and
++# reset it after the first reply.  The profile directory is the lane token; the
++# executor opens its own TCP connection in that profile's network namespace.
++# dir is the BIND direction (3 is FORE_OR_BOTH), pipeline is 1..64 calls per
++# round, and rounds is 1..8 fresh client/session attempts.
++syz_nfs_bind_live$client0_knfsd_v41(fd fd_nfs_dir, dir int32[0:3], pipeline int32[1:64], rounds int32[1:8])
++
+ # Ask the server-netns broker to expire exactly the confirmed NFSv4.1 record
+ # owned by this deterministic lane client.  The broker, not the program,
+ # chooses /proc/fs/nfsd/clients, the owner string, minor version and ctl
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 268554264..1a6587f89 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -265,6 +265,31 @@ func TestNFSNativeProfiles(t *testing.T) {
+ 	}
+ }
+ 
++func TestNFSLiveBind(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	call := requireNFSFuzzCall(t, target, "syz_nfs_bind_live$client0_knfsd_v41")
++	if call.CallName != "syz_nfs_bind_live" || len(call.Args) != 4 {
++		t.Fatalf("%s has wrong dispatch or arity", call.Name)
++	}
++	profile, ok := call.Args[0].Type.(*prog.ResourceType)
++	if !ok || profile.Desc.Name != "fd_nfs_dir" {
++		t.Fatalf("%s profile argument is %T %v, want fd_nfs_dir", call.Name,
++			call.Args[0].Type, call.Args[0].Type)
++	}
++	for i := 1; i < len(call.Args); i++ {
++		if _, ok := call.Args[i].Type.(*prog.IntType); !ok {
++			t.Fatalf("%s argument %d is %T %v, want int32", call.Name, i,
++				call.Args[i].Type, call.Args[i].Type)
++		}
++	}
++	if call.Ret != nil {
++		t.Fatalf("%s returns %T, want status-only pseudo call", call.Name, call.Ret)
++	}
++}
++
+ func TestNFSv41LifecycleAdmin(t *testing.T) {
+ 	target, err := prog.GetTarget("linux", "amd64")
+ 	if err != nil {

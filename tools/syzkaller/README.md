@@ -143,6 +143,10 @@ its explicit valid `AUTO` syntax remains part of the pinned parser semantics.
   `syz_nfsd_client_ctl` and `syz_nfsd_cld_ctl` fixture controls also preserve
   roots because they cannot consume or replace a program FD, as do `fcntl`
   (F_DUPFD returns a new, unrooted FD) and the NLM lane calls of patch 0030.
+  The `syz_nfs_bind_live$client0_knfsd_v41` pseudo-call of patch 0031 is likewise
+  root-preserving, not an acquisition: it receives the exact profile directory
+  FD and the admission profile names that FD's `nfs-profile:knfsd-v41:client0`
+  origin.
   Opening a filename does not prove it stays on NFS: symlink/mount traversal is
   runtime state. The one exception is `syz_open_nlm_lane_file`: the executor
   opens a regular file strictly beneath its lane directory argument (openat2
