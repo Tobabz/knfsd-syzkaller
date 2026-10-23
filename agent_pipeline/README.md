@@ -266,3 +266,16 @@ in `s1_reached(evidence_only)`, and a policy may opt in to `mutate`. The legacy
 `run_stage2` still loads (true means `mutate`). The campaign thresholds await
 an owner decision. See the Stage 2
 README's validation status and real-host runbook.
+
+`campaign_mode` `fixed` (09 §3.1) runs the reached Q1 harness again without
+mutation: `s1_fixed` keeps up to `fixed_parallelism` attempt tasks in flight
+(the one exception to a job's single pending task) until `fixed_attempts`
+are counted, `fixed_not_reached_limit` consecutive `not_reached` attempts
+block it, or an attempt crashes. An operator starts one on any reached job
+with `operator <job> start_fixed`. Every Stage 1 crash, of a Q1 run or a
+fixed attempt, is a `Job.crash_findings` entry replayed in `s1_replaying`
+(`fixed_replays` runs, k/M by crash signature); a Q1 finding then follows
+its run's verdict, a fixed crash goes to `crash_review`, whose `resume`
+continues the campaign. `Stage1Config.slots` sizes the host's KVM slot pool
+(`runner/slots.py`, 09 §8): one Runner worker per slot, shared by Stage 1
+runs, fixed attempts, replays and Stage 2 leases.

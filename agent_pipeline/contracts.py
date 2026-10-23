@@ -195,6 +195,19 @@ class JobPolicy(Record):
     campaign_inconclusive_generations: int = Field(default=100, ge=1)
     #: Program executions a campaign may run before an operator decides.
     fuzz_budget_executions: int = Field(default=100000, ge=1)
+    # Fixed campaign (09 §3.1, #81 D15).  Placeholders like the Stage 2
+    # thresholds above.
+    #: Counted attempts without a crash after which the campaign ends in
+    #: s1_reached(fixed_no_signal).
+    fixed_attempts: int = Field(default=50, ge=1)
+    #: Runs of each crash's program in s1_replaying (k/M).
+    fixed_replays: int = Field(default=5, ge=1)
+    #: Consecutive not_reached attempts that stop the campaign
+    #: (blocked_operator(fixed_not_reaching)).
+    fixed_not_reached_limit: int = Field(default=5, ge=1)
+    #: Attempt tasks in flight at once; the Runner runs as many as it has
+    #: free VM slots (#81 R1).
+    fixed_parallelism: int = Field(default=4, ge=1)
 
     @model_validator(mode="before")
     @classmethod
@@ -221,10 +234,6 @@ class JobPolicy(Record):
 
     @model_validator(mode="after")
     def _campaign_mode(self) -> JobPolicy:
-        if self.campaign_mode is CampaignMode.FIXED:
-            # The fixed campaign lands later in #81; until then a fixed
-            # policy would have nowhere to go after Q1.
-            raise ValueError("campaign_mode fixed is not available yet")
         if self.run_stage2 != (self.campaign_mode is CampaignMode.MUTATE):
             object.__setattr__(self, "run_stage2",
                                self.campaign_mode is CampaignMode.MUTATE)

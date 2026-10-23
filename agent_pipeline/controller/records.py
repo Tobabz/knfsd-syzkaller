@@ -23,6 +23,8 @@ class JobState(str, enum.Enum):
     S1_APPROVAL = "s1_approval"
     S1_RUNNING = "s1_running"
     S1_REACHED = "s1_reached"
+    S1_FIXED = "s1_fixed"
+    S1_REPLAYING = "s1_replaying"
     S2_STRATEGY = "s2_strategy"
     S2_GATE = "s2_gate"
     S2_CAMPAIGN = "s2_campaign"
@@ -63,6 +65,7 @@ class BlockedReason(str, enum.Enum):
     CAMPAIGN_BUDGET_EXHAUSTED = "campaign_budget_exhausted"
     CAMPAIGN_EVIDENCE = "campaign_evidence"
     REPLAY_EVIDENCE = "replay_evidence"
+    FIXED_NOT_REACHING = "fixed_not_reaching"
     # Host configuration, not in the 09 tables: no Mutation Rule Compiler,
     # or no Stage 2 execution backend (Runner steps and Stage2Judge), is
     # configured.  The job waits with its rule set; resume compiles it
@@ -100,8 +103,9 @@ class TargetKind(str, enum.Enum):
     s1_reached; strategy starts Mutation Strategy, compile runs the Mutation
     Rule Compiler on the stored rule set, gate runs the baseline-with-rules
     gate on the compiled set, campaign continues the job's campaign and
-    replay replays its crash again; the last two are waiting states with a
-    resume point of their own (`inner`)."""
+    replay replays its crash again; fixed continues the job's fixed
+    campaign and s1_replay its Stage 1 replay (09 §3.1); the last two are
+    waiting states with a resume point of their own (`inner`)."""
 
     ANALYSIS = "analysis"
     PLANNING = "planning"
@@ -113,6 +117,8 @@ class TargetKind(str, enum.Enum):
     GATE = "gate"
     CAMPAIGN = "campaign"
     REPLAY = "replay"
+    FIXED = "fixed"
+    S1_REPLAY = "s1_replay"
     BLOCKED_OPERATOR = "blocked_operator"
     BLOCKED_HARNESS_GAP = "blocked_harness_gap"
 
@@ -316,15 +322,33 @@ class TriageItem(Record):
     routing: Literal["none", "replayed", "queued", "unrouted"] = "none"
 
 
+class ReplayRun(Record):
+    """One run of a Stage 1 replay (09 §3.1).  ``kind`` and ``title`` are
+    the run's own crash, None when it did not crash."""
+
+    task_id: str
+    bundle_ref: str
+    kind: str | None = None
+    title: str | None = None
+    reproduced: bool
+
+
 class CrashFinding(Record):
-    """#81 §3: a kernel crash sealed in a Stage 1 run's bundle.  Like a
-    triage item it does not change the job's state: the run's Q1 verdict
-    routes the job as usual (a panic leaves the run incomplete, so it is
-    run again), and the finding stays on the job for replay and review.
+    """#81 §3, 09 §3.1: a kernel crash sealed in a Stage 1 bundle, of an
+    s1_running run (``source`` q1) or a fixed campaign attempt (fixed).
+    A q1 finding does not stop the job: it is replayed, then the run's Q1
+    verdict routes the job as usual.  A fixed finding stops the campaign's
+    new attempts and goes to crash_review after its replay.
 
-    ``replay`` is ``pending`` until the Stage 1 replay (M runs, ``k/M``)
-    takes it."""
+    ``replay``: ``pending`` until its replay ends, then ``done`` with
+    ``reproduced`` of ``replays`` runs (k/M) and ``review`` queued;
+    ``duplicate`` when a finding of the same harness and signature was
+    replayed already, so it is not replayed again; ``abandoned`` when the
+    job left the replay before it ended (a binding change, close)."""
 
+    source: Literal["q1", "fixed"] = "q1"
+    campaign_id: str | None = None          # fixed
+    attempt: int | None = None              # fixed
     task_id: str
     bundle_ref: str
     harness_ref: str
@@ -336,7 +360,54 @@ class CrashFinding(Record):
     kind: str
     title: str
     panicked: bool
-    replay: Literal["pending"] = "pending"
+    signature: str
+    replay: Literal["pending", "done", "duplicate", "abandoned"] = "pending"
+    replay_runs: tuple[ReplayRun, ...] = ()
+    replays: int | None = None
+    reproduced: int | None = None
+    review: Literal["none", "queued"] = "none"
+
+
+class S1Replay(Record):
+    """The Stage 1 replay in progress (09 §3.1): the crash findings still
+    to replay, by index in ``Job.crash_findings``, the first one now, and
+    where the job goes after the last.  ``after`` None is a fixed
+    campaign's crash_review."""
+
+    queue: tuple[int, ...] = Field(min_length=1)
+    after: Target | None = None
+
+
+class AttemptTask(Record):
+    """A fixed campaign attempt's Runner task in flight."""
+
+    task_id: str
+    attempt: int
+    input_digest: str
+
+
+class FixedCampaign(Record):
+    """09 §3.1: the job's Q1 harness run again unchanged, attempt by
+    attempt.  ``sent`` attempt numbers were minted; an attempt that ended
+    without a counted outcome is sent again under its number (``retry``).
+    The campaign takes no new attempt while one of its crashes waits for
+    replay."""
+
+    campaign_id: str
+    harness_ref: str
+    execution_harness_id: str
+    binding: HarnessBinding
+    sent: int = 0
+    reached: int = 0
+    not_reached: int = 0
+    crashes: int = 0
+    consecutive_not_reached: int = 0
+    in_flight: tuple[AttemptTask, ...] = ()
+    retry: tuple[int, ...] = ()
+
+    @property
+    def counted(self) -> int:
+        return self.reached + self.not_reached + self.crashes
 
 
 class Job(BaseModel):
@@ -388,6 +459,10 @@ class Job(BaseModel):
     triage: tuple[TriageItem, ...] = ()
     #: Crashes of Stage 1 runs, in the order their bundles were judged.
     crash_findings: tuple[CrashFinding, ...] = ()
+    #: The fixed campaign of the job's Q1 harness (09 §3.1); kept after it
+    #: ends until the job leaves that harness.
+    fixed: FixedCampaign | None = None
+    s1_replay: S1Replay | None = None
     seq: int = 0
     task_seq: int = 0
 

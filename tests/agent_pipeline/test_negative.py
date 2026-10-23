@@ -33,6 +33,8 @@ def test_stage2_is_opt_in():
     ({"campaign_mode": "mutate"}, CampaignMode.MUTATE),
     ({"campaign_mode": "none", "run_stage2": False}, CampaignMode.NONE),
     ({"campaign_mode": "mutate", "run_stage2": True}, CampaignMode.MUTATE),
+    ({"campaign_mode": "fixed"}, CampaignMode.FIXED),
+    ({"campaign_mode": "fixed", "run_stage2": False}, CampaignMode.FIXED),
 ])
 def test_legacy_run_stage2_maps_to_campaign_mode(kw, mode):
     p = policy(**kw)
@@ -51,10 +53,10 @@ def test_legacy_policy_json_keeps_loading():
 @pytest.mark.parametrize("kw", [
     {"campaign_mode": "none", "run_stage2": True},
     {"campaign_mode": "mutate", "run_stage2": False},
-    # The fixed campaign is not implemented yet.
-    {"campaign_mode": "fixed"},
+    {"campaign_mode": "fixed", "run_stage2": True},
+    {"campaign_mode": "fixed", "fixed_attempts": 0},
 ])
-def test_conflicting_or_unavailable_campaign_mode_is_refused(kw):
+def test_conflicting_campaign_mode_is_refused(kw):
     with pytest.raises(ValidationError):
         policy(**kw)
 

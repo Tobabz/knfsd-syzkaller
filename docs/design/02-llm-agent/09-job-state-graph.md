@@ -66,9 +66,35 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
    | REACHED
    v
  s1_reached ---- campaign_mode mutate ----> s2_strategy      (Figure 2)
+            +--- campaign_mode fixed -----> s1_fixed         (Figure 2a)
+
+ a sealed crash in an s1_running bundle -> crash finding, s1_replaying, then
+ the verdict's row above (§3)
 
  [A] Agent  [R] Runner  [H] human  {..} deterministic step inside a transition
  (repair) agent_repair budget, (rerun) runtime_retry budget (§6)
+```
+
+그림 2a. fixed campaign과 Stage 1 replay
+
+```text
+ s1_fixed [R]  up to P attempt tasks at a time -- sealed bundle --> {Q1 Judge, crash report}
+   +-- infra / unsealed --------------------> s1_fixed  (rerun the attempt)
+   +-- K consecutive not_reached -----------> blocked_operator(fixed_not_reaching)
+   +-- N attempts without a crash ----------> s1_reached(fixed_no_signal)
+   | first crash: no new attempts; in-flight attempts finish
+   v
+ s1_replaying [R]  each crash, M runs one at a time -- bundle --> {crash report}
+   | k/M recorded per crash
+   v
+ crash_review [H]
+   +-- resume ------------------------------> s1_fixed (same campaign)
+   | close
+   v
+ closed(crash_reported)
+
+ s1_replaying also replays a crash finding of s1_running (§3); it then goes
+ to the row the run's verdict chose, not to crash_review.
 ```
 
 그림 2. Stage 2
@@ -139,12 +165,14 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
 | `s1_planning` | Agent: Reachability Planning | analysis 완료, Stage 1 repair |
 | `s1_approval` | 사람: review manifest 승인 | materialize 성공, approval policy가 요구할 때 |
 | `s1_running` | Runner: Stage 1 실행 (scenario와 neutral control, `06` §11) | materialize 또는 승인, 재실행 |
-| `s1_reached` | 없음. Q1 package를 보존하고 Stage 2 시작을 기다린다 | Q1 `REACHED` |
+| `s1_reached` | 없음. Q1 package를 보존하고 Stage 2 시작을 기다린다 | Q1 `REACHED`, fixed campaign이 crash 없이 끝남 |
+| `s1_fixed` | Runner: fixed campaign의 attempt들(§3.1) | `s1_reached`에서 `campaign_mode` `fixed`, `crash_review`의 `resume` |
+| `s1_replaying` | Runner: Stage 1 crash의 replay 실행(§3.1) | fixed campaign의 crash, `s1_running` bundle의 crash finding |
 | `s2_strategy` | Agent: Mutation Strategy | Stage 2 시작, Stage 2 repair |
 | `s2_gate` | Runner: baseline-with-rules gate와 neutral run (`01` §3) | compile 성공, 재실행 |
 | `s2_campaign` | Runner: fuzz campaign | gate 통과, crash review 뒤 재개 |
 | `s2_replaying` | Runner: `CrashContextWindow` replay | window에 `APPLIED` rule이 있는 Q2 `OBSERVED` |
-| `crash_review` | 사람: crash report 검토 | replay 비교 verdict |
+| `crash_review` | 사람: crash report 검토 | replay 비교 verdict, fixed campaign crash의 replay |
 | `blocked_harness_gap` | issue (`07` §7) | gap |
 | `retry_pending` | Controller 처리 (queue, `07` §7) | issue resolved |
 | `parked` | issue 재개 또는 해결 (`07` §7) | issue deferred |
@@ -155,7 +183,9 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
 
 - 결정적 component(intake 검증, harness binding, HCAP 검사, Materializer, Compiler, Q1·M1·Q2 Judge, replay
   comparator)는 상태가 아니다. 전이 안에서 실행한다.
-- job의 미완료 task는 최대 하나다(`pending_task`). Agent, Runner, 사람에게 보낸 요청은 `task_id`를 가진다.
+- job의 미완료 task는 최대 하나다(`pending_task`). 예외는 `s1_fixed`의 attempt task들이다. `s1_fixed`는
+  `pending_task` 없이 attempt task를 `fixed_parallelism`개까지 함께 둔다(`FixedCampaign.in_flight`, §3.1).
+  Agent, Runner, 사람에게 보낸 요청은 `task_id`를 가진다.
   전이가 만드는 요청(재실행, `resume`, repair 포함)은 모두 새 `task_id`를 받는다. 같은 `task_id`는 §8의 재발송과
   재시작 처리에서만 쓴다.
 - `blocked_harness_gap`, `blocked_operator`, `parked`, `retry_pending`, `crash_review`는 `resume_point`(다시 들어갈
@@ -227,16 +257,70 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | `s1_running` | verdict의 `candidate_id`나 `execution_harness_id`가 job과 다름 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
 
 - ambient control의 결과(`06` §11)는 기록만 하고 전이를 바꾸지 않는다.
-- `s1_running`의 bundle에 crash report(`06` §10)가 봉인돼 있으면 Controller는 위 행의 전이와 함께 crash finding
-  (`Job.crash_findings`의 `CrashFinding`)을 job에 붙인다. triage 항목처럼 job 상태를 바꾸지 않는 검토 항목이다.
-  Runner task, bundle, harness, plan, 그 실행의 Q1 verdict, crash 종류와 첫 crash 줄, panic 여부를 담는다. 실행이
-  끝난 crash(`WARNING:`, panic하지 않은 KASAN 보고)는 Q1 verdict대로 진행하고, panic으로 끝나지 못한 실행은
-  `INCONCLUSIVE(infra)` 행대로 다시 실행하며 finding은 남는다. finding은 지워지지 않는다. replay는 `pending`으로
-  기다린다. replay(새 VM에서 같은 program M회, `k/M` 기록, `k=0`이어도 `reproduced=false`로 검토)는 fixed campaign의
-  replay와 함께 구현한다(#81 PR 4).
+- `s1_running`의 bundle에 crash report(`06` §10)가 봉인돼 있으면 Controller는 crash finding
+  (`Job.crash_findings`의 `CrashFinding`)을 job에 붙인다. Runner task, bundle, harness, plan, 그 실행의 Q1 verdict,
+  crash 종류와 첫 crash 줄, panic 여부를 담는다. 그 다음 위 표가 고른 행을 바로 따르지 않고 `s1_replaying`에서
+  finding을 replay한다(§3.1). replay가 끝나면 finding에 `k/M`을 기록하고 검토 대기(`review` `queued`)로 두며,
+  job은 그 실행의 verdict가 고른 행으로 간다. crash는 job을 멈추지 않는다(#81 R2). 실행이 끝난 crash(`WARNING:`,
+  panic하지 않은 KASAN 보고)는 Q1 verdict대로 진행하고, panic으로 끝나지 못한 실행은 `INCONCLUSIVE(infra)` 행대로
+  다시 실행한다. finding은 지워지지 않는다. Q1 crash finding의 검토는 job 상태가 아니라 job에 붙은 목록이다
+  (`crash_review`는 fixed campaign crash만 쓴다, #81 D8, R2, R3).
 - `s1_running`에 들어가는 모든 전이(재실행과 `resume` 포함)는 그때의 approval policy를 적용한다. 승인이 필요한데
   그 harness의 review manifest가 승인되지 않았으면 `s1_approval`로 간다(`05` §11).
 - `REACHED`로 넘어갈 때 Controller는 `Stage2Input`(`01` §5.1)의 구성 artifact와 verdict id를 job에 고정한다.
+
+### 3.1 fixed campaign과 Stage 1 replay
+
+fixed campaign은 Q1이 `REACHED`인 harness와 program을 그대로 새 VM에서 여러 번 돌려 crash를 찾는다(#81 D11–D15).
+program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시작 조건과 identity 검사는 Stage 2 시작(§4 첫 두 행)과
+같다. attempt 하나는 Runner task 하나이고 봉인 bundle 하나다. Runner 입력은 Stage 1 실행과 같다(job의 harness).
+
+| 상태 | 이벤트와 조건 | 다음 상태 | counter (§6) | 근거 |
+|---|---|---|---|---|
+| `s1_reached` | fixed 시작(JobPolicy `campaign_mode` `fixed`, 또는 operator `start_fixed`). Q1 evidence의 identity가 job의 bound identity와 같음 | `s1_fixed` (새 fixed campaign, attempt를 `min(fixed_parallelism, fixed_attempts)`개 보낸다) | — | #81 D11 |
+| `s1_reached` | fixed 시작, identity 다름 | §5의 identity 변경 처리 | — | `01` §11.2 |
+| `s1_fixed` | attempt bundle에 crash report가 있음(Q1 verdict와 무관) | crash를 campaign에 기록(`crash`). 새 attempt를 보내지 않는다. 남은 attempt가 모두 끝나면 `s1_replaying` | — | #81 D12, D13 |
+| `s1_fixed` | Q1 `REACHED`, crash 없음 | `reached_no_crash`로 센다. 연속 `not_reached`를 0으로 | — | D12 |
+| `s1_fixed` | Q1 `NOT_REACHED`, crash 없음 | `not_reached`로 센다. 연속 `not_reached`에 더한다 | — | D12 |
+| `s1_fixed` | Q1 `INCONCLUSIVE(infra)`, `INCONCLUSIVE(loss)`, crash 없음, 또는 봉인 bundle 없는 Runner 종료 | 같은 attempt 번호로 새 task를 보낸다. attempt로 세지 않는다 | runtime_retry | D12 |
+| `s1_fixed` | Q1 `INCONCLUSIVE(evidence)`, `INCONCLUSIVE(mapping)`, `INCONCLUSIVE(unsupported_attribution)`, verdict의 identity가 job과 다름 | 남은 attempt를 취소하고 §3의 같은 행(`blocked_operator(q1_*)`, `blocked_harness_gap`). `resume_point`는 `s1_fixed`(같은 campaign) | — | `06` §13 |
+| `s1_fixed` | 연속 `not_reached`가 `fixed_not_reached_limit`에 닿음 | 남은 attempt를 취소하고 `blocked_operator(fixed_not_reaching)`. `resume`은 연속 수를 0으로 되돌려 같은 campaign을 이어 간다 | — | D13 |
+| `s1_fixed` | 센 attempt(`reached_no_crash` + `not_reached`)가 `fixed_attempts`에 닿고 crash 없음 | `s1_reached(fixed_no_signal)`. 이후 operator가 `start_stage2`로 mutate를 시작할 수 있다 | — | D13 |
+| `s1_fixed` | 위 행이 아니고 crash도 없음 | 끝난 attempt 자리에 다음 attempt를 보낸다(보낸 attempt + 남은 attempt < `fixed_attempts`일 때) | — | D11 |
+| `s1_replaying` | replay bundle | crash report가 원래 crash와 같은 signature면 재현으로 센다. 다음 replay를 보낸다. M번째(`fixed_replays`)가 끝나면 다음 crash, 마지막 crash가 끝나면 아래 행 | — | D14 |
+| `s1_replaying` | 마지막 replay, fixed campaign의 crash | `crash_review(fixed_crash)`. crash마다 `k/M`과 `reproduced`(`k>0`)를 기록한다. `k=0`이어도 간다. `resume_point`는 `s1_fixed`(같은 campaign) | — | D14 |
+| `s1_replaying` | 마지막 replay, `s1_running`의 crash finding | finding에 `k/M`을 기록하고 `review`를 `queued`로 둔다. job은 그 실행의 verdict가 고른 §3의 행으로 간다 | — | R2, R3 |
+| `s1_replaying` | 봉인 bundle 없는 Runner 종료 | 같은 replay를 다시 실행한다. 봉인 bundle이 있으면 Q1 verdict와 무관하게 crash report만 보고 센다 | runtime_retry | |
+| `s1_replaying` | replay bundle이 이 task의 것이라는 host provenance가 없음 | `blocked_operator(replay_evidence)`. `resume`이 그 replay를 다시 실행한다 | — | `01` §11.1 |
+| `crash_review` | resume, fixed campaign | `s1_fixed`. 같은 campaign의 수를 이어 간다. 기록한 crash는 남고, 새 crash가 나면 그 crash만 replay한다 | — | |
+
+- **attempt와 병렬.** `s1_fixed`는 attempt task를 `fixed_parallelism`(P)개까지 함께 둔다. Controller는 P개를 보내고,
+  Runner는 VM slot(§8)이 빈 만큼만 실행한다. 그래서 실제 병렬 수는 `min(P, 빈 slot)`이고, slot이 P보다 적어도
+  설정을 거부하지 않는다(R1). attempt 결과는 그 task가 `in_flight`에 있을 때만 받는다. 같은 task의 결과는 한 번만
+  센다. lease가 끊겨 Runner가 같은 task를 다시 실행해도 Controller가 받는 최종 결과는 하나다(§8).
+- **첫 crash.** crash가 난 뒤에도 이미 보낸 attempt는 끝까지 돌리고(D11) 그 결과도 센다. 그 사이에 난 crash도
+  campaign에 더한다. 남은 attempt가 모두 끝나면 모은 crash 전부를 순서대로 replay한다.
+- **crash record.** attempt 번호, Runner task, bundle, harness, program ref, runtime selection, Q1 verdict, crash
+  종류와 첫 crash 줄, panic 여부. journal과 rule set은 없다(D14). 같은 `CrashFinding` 형식으로 `Job.crash_findings`에
+  남기고 출처(`q1`, `fixed`)를 적는다.
+- **replay.** crash마다 같은 program을 새 VM에서 `fixed_replays`(M)번, 한 번에 하나씩 돌린다(P=1). replay 하나는
+  Runner task 하나다. 재현 여부는 replay bundle의 crash report가 원래 crash와 같은 signature(crash 종류와, 숫자를
+  지운 첫 crash 줄)인지로 정한다. 다른 crash가 나면 재현으로 세지 않고 그 replay 기록에 남긴다. race는 재현이
+  안 돼도 crash가 무효가 아니므로 `k=0`도 검토로 보낸다(`reproduced=false`).
+- **campaign 기록.** `FixedCampaign`이 campaign id, 보낸 attempt 수, 센 attempt 수(`reached_no_crash`,
+  `not_reached`, 도달률), 연속 `not_reached`, crash 목록, `in_flight` task를 가진다. 전이 기록은 attempt마다 소비한
+  Q1 verdict를 남긴다.
+- **중복 crash.** 같은 harness에서 같은 signature의 crash를 이미 replay했거나 replay를 기다리고 있으면 새 finding은
+  `duplicate`로 남고 replay하지 않는다. fixed campaign도 그 crash로는 멈추지 않는다(매 attempt의 boot `WARNING`이
+  campaign을 매번 멈추지 않게). crash 수에는 더한다.
+- **끝.** crash 없이 센 attempt가 `fixed_attempts`에 닿으면 `s1_reached(fixed_no_signal)`, 검토한 crash가 있었으면
+  `s1_reached(fixed_complete)`이다. 같은 harness로 `s1_reached`에 다시 들어와도(JudgeProfile 재판정) campaign을 또
+  시작하지 않는다. operator `start_fixed`는 새 campaign을 시작한다.
+- **재평가 이벤트와 취소.** binding 변경이 job을 `s1_fixed`나 `s1_replaying` 밖으로 보내면(harness 재생성 등)
+  `in_flight`의 모든 task와 replay task를 `cancelling_tasks`에 더한다(§8). identity가 그대로면 job은 그 자리에서
+  이어 간다(§5). operator `close`·`cancel`도 모두 취소한다. replay가 끝나기 전에 job이 replay를 떠나면 그 finding은
+  `abandoned`로 남는다. replay는 crash가 난 harness로만 돌릴 수 있기 때문이다. JudgeProfile 재판정은
+  `s1_replaying`의 replay를 끊지 않고, Q1 crash finding의 replay가 끝난 뒤 갈 행만 바꾼다.
 
 ### 4. Stage 2 전이
 
@@ -369,8 +453,9 @@ remote_kcov.kernel_revision.<commit>)`이다. 대기 상태에서는 이 검증�
 | `agent_repair[stage1]` | Stage 1에서 `(repair)` 전이의 수(cause `hcap_changed` 제외). 전이마다 Agent Task 하나를 부른다 | operator `resume` | `blocked_operator(stage1_repair_budget)` |
 | `agent_repair[stage2]` | Stage 2에서 `(repair)` 전이의 수(cause `hcap_changed` 제외) | operator `resume` | `blocked_operator(stage2_repair_budget)` |
 | `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공, 새 요청 시작 | `blocked_operator(agent_failure)` |
-| `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s2_gate`, `s2_campaign`, `s2_replaying`) | 그 단계가 재실행이 아닌 행으로 끝날 때, Runner 입력이 바뀔 때. `s2_campaign`은 이어 간 campaign이 bundle을 봉인할 때도(campaign evidence는 §4의 campaign 임계값이 따로 센다). 재실행 행으로 가는 결과는 판정된 verdict여도(`INCONCLUSIVE(loss)`, gate의 M1 `INCONCLUSIVE`) 되돌리지 않는다 | `blocked_operator(runtime_retry_exhausted)` |
+| `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s1_fixed`, `s1_replaying`, `s2_gate`, `s2_campaign`, `s2_replaying`). `s1_fixed`는 campaign의 연속 infra attempt를 센다 | 그 단계가 재실행이 아닌 행으로 끝날 때, Runner 입력이 바뀔 때. `s2_campaign`은 이어 간 campaign이 bundle을 봉인할 때도(campaign evidence는 §4의 campaign 임계값이 따로 센다). 재실행 행으로 가는 결과는 판정된 verdict여도(`INCONCLUSIVE(loss)`, gate의 M1 `INCONCLUSIVE`) 되돌리지 않는다 | `blocked_operator(runtime_retry_exhausted)` |
 | campaign 임계값, fuzz budget | `01` §11.1, §12 | — | §4 표 |
+| fixed campaign 수 | 센 attempt(`fixed_attempts`), 연속 `not_reached`(`fixed_not_reached_limit`) | 연속 수: `reached_no_crash`, operator `resume` | §3.1 표 |
 
 - 한도 N은 재시도 횟수다. 처음 한 번 뒤에 센 일이 N번까지 일어날 수 있다. counter가 N인 상태에서 한 번 더 일어나면 그 일 대신
   `blocked_operator`로 간다.
@@ -437,6 +522,8 @@ Job
     counters               # §6
     pending_task?          # task_id, kind (agent | runner | human),
                            # 입력 digest, agent면 지금 attempt
+    fixed?                 # s1_fixed의 campaign과 in_flight attempt task (§3.1)
+    crash_findings[]       # Stage 1 crash (q1 | fixed), replay k/M과 검토 상태
     cancelling_tasks[]     # cancel을 보내고 종료 응답을 기다리는 Runner task
     uncleaned_tasks[]      # lease는 끝났지만 실행 정리를 확인하지 못한 Runner task
     resume_point?          # 대기 상태(§1)와 retry_pending일 때. 대기 상태를
@@ -495,8 +582,14 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
   멱등이므로 몇 번 보내도 실행은 하나다.
 - 결과를 받지 않기로 한 Runner task(§5의 재평가 이벤트, operator `close`·`cancel`, campaign 정지)는 아직 보내지
   않은 것까지 그 전이와 같은 transaction에서 `cancelling_tasks`에 더하고, commit 뒤에 `cancel`을 보낸다. 종료를
-  답한 task는 목록에서 뺀다. 같은 job의 다음 Runner task는 목록이 빈 뒤에 보낸다. 그래서 job의 Runner 실행은 한
-  번에 하나다. 그 뒤에 온 bundle은 전이를 만들지 않는다(§2). campaign evidence는 §4대로 triage 항목만 만든다.
+  답한 task는 목록에서 뺀다. 같은 job의 다음 Runner task는 목록이 빈 뒤에 보낸다. 그래서 job의 Runner 실행은
+  `s1_fixed`의 attempt를 빼면 한 번에 하나다. 그 뒤에 온 bundle은 전이를 만들지 않는다(§2). campaign evidence는
+  §4대로 triage 항목만 만든다.
+- **VM slot.** Runner는 host의 KVM slot 수만큼 실행을 함께 돌린다. slot 수는 Runner가 시작할 때 host의 CPU와
+  메모리로 계산한다: `min((cpus - reserve_cpus) // vm_cpus, (memory - reserve_memory) // vm_memory)`, 최소 1(#81 R6).
+  같은 설정이 큰 host에서 더 많이 돌린다. Stage 1 실행, fixed attempt, replay, Stage 2 lease가 같은 slot을 나눠
+  쓴다(R4). slot은 backend 자원 잠금(`<resource_key>/kvm-<i>`)이고, 빈 slot이 없으면 task는 Runner queue에서
+  기다린다. Controller는 slot을 모른다.
 - 결정적 component는 입력의 순수 함수다. commit 전에 Controller가 죽으면 같은 이벤트로 전이를 다시 계산한다.
 - Controller가 재시작하면 `pending_task`나 `cancelling_tasks`가 있는 job을 다시 본다.
   - `cancelling_tasks`의 task마다 `cancel`을 다시 보내고, 목록이 빈 뒤에야 Runner `pending_task`를 다룬다.
@@ -537,7 +630,7 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 8. **window에 `APPLIED`가 있는 crash는 campaign을 멈추고 review를 기다린다.** `01` §12는 autonomous mutation repair를
    멈추고 evidence를 freeze하고 replay한 뒤 human review로 보낸다. 같은 rule set으로 fuzzing을 계속할지는 사람이
    정한다(`crash_review`의 `resume`).
-9. **job당 미완료 task는 하나이고 결과는 `task_id`로 대조한다.** 전이마다 소비한 verdict를 정확히 하나의 시도에
+9. **job당 미완료 task는 하나이고(`s1_fixed`의 attempt는 예외, 근거 18) 결과는 `task_id`로 대조한다.** 전이마다 소비한 verdict를 정확히 하나의 시도에
    묶어야 evidence lineage가 섞이지 않는다(`01` §11.1). 재시작 뒤 다시 실행한 Agent task는 attempt까지 대조한다.
    그래야 `abandoned`로 기록한 실행의 출력이 전이를 만들지 않는다. 전이가 만드는 요청마다 새 `task_id`를 주는
    것은 Runner가 `task_id`에 대해 멱등이기 때문이다. 같은 `task_id`를 쓰면 다시 실행해야 할 단계가 이전 실행의
@@ -584,6 +677,14 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
     지점으로 돌아가는 규칙은 `REACHED`가 아닌 verdict로 `s1_reached`에 들어가 `Stage2Input`을 고정한다. 결과가 정한
     `resume_point`는 지금 판정이 갈 곳이고, 대기 상태가 아닌 job이 같은 이벤트로 가는 곳과 같다.
 
+18. **fixed campaign의 attempt만 job 안에서 함께 돌린다.** attempt는 같은 harness의 독립 실행이라 서로의 결과가
+    다음 입력을 바꾸지 않는다. 그래서 순서가 경로를 바꾸지 않고(첫 crash 뒤에도 남은 attempt는 끝까지 센다), 결과를
+    `task_id`로 대조하는 규칙(근거 9)은 그대로다. 결과에 따라 다음 입력이 바뀌는 단계(repair, gate, replay)는 하나씩
+    둔다. replay는 같은 crash를 M번 돌리는 중 다른 VM의 부하가 재현율을 흐리지 않도록 P=1이다(D14).
+19. **Q1 crash finding은 replay한 뒤 job을 verdict대로 보낸다.** `01` §12의 replay·검토 규칙은 fixed crash와 같게
+    적용하고(R3), job을 멈추지는 않는다(R2). replay를 job이 나중에 쉴 때로 미루면 job이 다른 harness로 옮겨 간 뒤
+    replay할 수 없게 된다. 검토는 사람의 대기 상태가 아니라 job에 붙은 목록이다.
+
 ## 검토한 대안
 
 | 선택지 | 얻는 것 | 비용·한계 | 채택 여부와 이유 |
@@ -601,6 +702,8 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 | Runner 실행을 Controller의 자식 프로세스로 둔다 | Controller와 함께 끝나므로 중복 실행이 없다 | Controller 재시작마다 campaign이 끊기고, Runner를 다른 호스트로 옮길 수 없다 | 채택 안 함. Runner를 한 호스트에 고정하고 Controller 재시작보다 짧은 실행만 맡기게 되면 재검토 |
 | 늦게 온 `APPLIED` crash를 triage로만 남긴다 | 단순하다. 정지 뒤의 evidence가 경로를 바꾸지 않는다 | `01` §12의 replay·검토에 닿지 않는 `APPLIED` crash가 생긴다. 여러 VM이 같은 window에서 함께 crash하면 흔하다 | 채택 안 함. §4의 queue와 repair 중단 규칙을 쓴다 |
 | 늦게 온 `APPLIED` crash가 대기 상태의 job도 replay로 옮긴다 | 모든 `APPLIED` crash가 replay된다 | budget 소진이나 gap으로 멈춘 job이 사람 동작 없이 다시 실행된다(근거 13) | 채택 안 함. `unrouted` triage로 남긴다 |
+| fixed attempt N개를 task 하나가 돌린다 | Controller 상태가 단순하다 | lease가 길어지고, 중간에 끊기면 센 attempt를 복구할 수 없다 | 채택 안 함(#81 D11) |
+| Q1 crash finding을 `crash_review`로 보내 job을 멈춘다 | 검토가 빠르다 | 일반 crash(boot WARNING 등)가 Stage 1 진행을 끊는다 | 채택 안 함(#81 R2) |
 | `runtime_retry`를 유효한 verdict에서 0으로 되돌린다 | verdict가 나왔으면 관측 경로가 동작한 것으로 본다 | 판정된 `INCONCLUSIVE(loss)`나 gate의 M1 `INCONCLUSIVE`가 반복되면 한도에 닿지 않는다 | 채택 안 함. 한도가 재실행 loop를 끝내는 유일한 장치다. 재실행 사이에 관측이 나아졌는지 판정하는 규칙이 생기면 재검토 |
 
 ## 영향
@@ -612,7 +715,8 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
   구현할 task 계약(§8). 이 표가 틀리면 Q1 없는 Stage 2 진입, 잘못된 repair, 끝나지 않는 loop가 생긴다.
 - **운영**: budget이 LLM 호출과 VM 시간을 묶는다. `blocked_operator`가 사람 개입 지점이라 한도가 작으면 사람
   부담이 커지고, 크면 비용이 커진다. job의 Runner 실행은 한 번에 하나라(§8) Runner의 `cancel` 응답이 늦으면 그
-  job의 다음 Runner task도 늦어진다.
+  job의 다음 Runner task도 늦어진다. fixed campaign은 job 하나가 VM slot을 `fixed_parallelism`개까지 쓰므로 다른
+  job의 Stage 1 실행이 slot을 기다릴 수 있다.
 
 ## 신뢰성 요구
 
@@ -681,6 +785,14 @@ bundle fixture로 대신한다.
    - `resume`이나 재실행 행이 부른 Runner 단계는 새 `task_id`로 실제로 다시 실행된다.
    - campaign 실행 중에 Controller를 죽였다 살리면 그동안 봉인된 bundle을 빠짐없이 순서대로 받는다.
    - 재시작 전 attempt의 Agent 출력은 늦게 와도 전이를 만들지 않는다.
+6. fixed campaign(§3.1): fake Runner로 attempt 0개, 1개, N개, P개 병렬을 돌린다.
+   - lease가 attempt 중간에 끊겨 Runner가 같은 task를 다시 실행해도 그 attempt는 한 번만 센다.
+   - 첫 crash 뒤 새 attempt를 보내지 않고, 이미 보낸 attempt의 결과와 crash를 모두 받은 뒤 replay한다.
+   - 연속 K회 `not_reached`는 `blocked_operator(fixed_not_reaching)`, crash 없는 N회는
+     `s1_reached(fixed_no_signal)`이다. infra attempt는 세지 않고 `runtime_retry` 한도에서 멈춘다.
+   - replay는 `k/M`을 기록하고 `k=0`이어도 `crash_review`로 간다(`reproduced=false`).
+   - `s1_running`의 crash finding은 replay한 뒤 그 실행의 verdict 행으로 가고, job은 `crash_review`에 멈추지 않는다.
+   - 위 모두에서 `Transition`을 처음부터 다시 적용한 상태가 저장된 상태와 같다.
 
 증명하지 않는 것: Agent 출력의 품질, Runner와 Judge의 정확성(각자의 오라클: `06`, `01` §8.2, `../03-nfs-proxy/05`),
 실제 provider 장애 양상.
@@ -721,6 +833,9 @@ bundle fixture로 대신한다.
   바뀌고 기본값은 `none`이다. `run_stage2`만 있는 기존 policy는 참이면 `mutate`, 거짓이면 `none`으로 읽고,
   두 값이 어긋나면 거부한다. 거짓은 mutation을 시작하지 않는다는 뜻이라 `fixed`와도 어긋나지 않는다. `fixed`는
   fixed campaign이 들어올 때까지 받지 않는다.
+  **결정됨(2026-10-23, 저장소 소유자, #81 D11–D15, R1–R6):** fixed campaign(§3.1)과 VM slot pool(§8). JobPolicy 값
+  `fixed_attempts`=50, `fixed_replays`=5, `fixed_not_reached_limit`=5, `fixed_parallelism`=4는 Stage 2 임계값처럼
+  자리값이다.
 - **결정됨(2026-10-13, 저장소 소유자):** `agent_retry`는 요청 단위로 센다. 새 요청이 시작되면 0에서 센다.
 - **결정됨(2026-10-13, 저장소 소유자):** candidate 하나에 job 여러 개(예: sanitizer별)를 둘 수 있다. 같은
   target(commit, location)은 같은 `candidate_id`다(`02` §7).

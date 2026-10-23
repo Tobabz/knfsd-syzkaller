@@ -50,7 +50,7 @@ from ...materializer import (ExecutionHarnessApproval,
 from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
                    RemoteKcovSupportBoundary)
 from ...registry import HarnessCatalog, HarnessRegistration
-from ..config import EngineConfig, Stage1Config
+from ..config import EngineConfig, SlotsConfig, Stage1Config
 from .collector import CollectorConfig
 from .pins import InstrumentationManifest, pin_file
 
@@ -82,6 +82,11 @@ class EngineSpec(_Spec):
     resource_key: str = "kvm-lane-0"
     timeout_s: float = 1800
     max_output_bytes: int = 1_048_576
+    #: The KVM slot pool (09 §8): a guest is the collector's cpus and
+    #: memory, and the host keeps this much for itself.
+    reserve_cpus: int = Field(default=2, ge=0)
+    reserve_memory_mb: int = Field(default=4096, ge=0)
+    max_slots: int | None = Field(default=None, ge=1, le=256)
 
 
 class CollectorSpec(_Spec):
@@ -844,7 +849,13 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             resource_key=spec.engine.resource_key,
             collector_id="stage1-host-collector",
             timeout_s=spec.engine.timeout_s,
-            max_output_bytes=spec.engine.max_output_bytes))
+            max_output_bytes=spec.engine.max_output_bytes),
+        slots=SlotsConfig(
+            vm_cpus=spec.collector.cpus,
+            vm_memory_mb=spec.collector.memory_mb,
+            reserve_cpus=spec.engine.reserve_cpus,
+            reserve_memory_mb=spec.engine.reserve_memory_mb,
+            max_slots=spec.engine.max_slots))
     config_path = state / "stage1.json"
     config_path.write_text(config.model_dump_json(indent=2) + "\n")
     report_path = state / "generated.json"

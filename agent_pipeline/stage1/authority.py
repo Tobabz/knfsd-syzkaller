@@ -172,33 +172,46 @@ class Q1AuthorityPublisher:
         results = []
         published = False
         for job in list(self.store.jobs()):
-            p = job.pending_task
-            if p is None or p.kind is not TaskKind.RUNNER or \
-                    p.runner_input is not None:
-                continue            # Stage 2 has its own authority
-            completion = self.runner.receipt(p.task_id)
-            if completion is None or completion.final_state != "sealed":
-                continue
-            try:
-                self.bridge.publication(completion.bundle_ref)
-                continue                    # already published
-            except KeyError:
-                pass
-            try:
-                context = self.context(job, p.task_id)
-                self.bridge.publish(context)
-            except Q1AuthorityPending as exc:
-                results.append(Publication(job.job_id, p.task_id, "pending",
-                                           str(exc)))
-            except (Q1ReceiptRejected, ValueError, OSError) as exc:
-                results.append(Publication(job.job_id, p.task_id, "rejected",
-                                           f"{type(exc).__name__}: {exc}"))
-            else:
-                published = True
-                results.append(Publication(job.job_id, p.task_id, "published"))
+            for task_id in self._stage1_tasks(job):
+                completion = self.runner.receipt(task_id)
+                if completion is None or completion.final_state != "sealed":
+                    continue
+                try:
+                    self.bridge.publication(completion.bundle_ref)
+                    continue                    # already published
+                except KeyError:
+                    pass
+                try:
+                    context = self.context(job, task_id)
+                    self.bridge.publish(context)
+                except Q1AuthorityPending as exc:
+                    results.append(Publication(job.job_id, task_id,
+                                               "pending", str(exc)))
+                except (Q1ReceiptRejected, ValueError, OSError) as exc:
+                    results.append(Publication(
+                        job.job_id, task_id, "rejected",
+                        f"{type(exc).__name__}: {exc}"))
+                else:
+                    published = True
+                    results.append(Publication(job.job_id, task_id,
+                                               "published"))
         if published:
             self.judge.install(self.bridge.snapshot())
         return results
+
+    @staticmethod
+    def _stage1_tasks(job: Job) -> list[str]:
+        """The job's Stage 1 Runner tasks awaiting a result: its pending
+        one (a run or a replay) and its fixed attempts in flight.  Stage 2
+        has its own authority."""
+        tasks = []
+        p = job.pending_task
+        if p is not None and p.kind is TaskKind.RUNNER and \
+                p.runner_input is None:
+            tasks.append(p.task_id)
+        if job.fixed is not None:
+            tasks.extend(a.task_id for a in job.fixed.in_flight)
+        return tasks
 
     def _dispatch_snapshot(self, job_id: str, task_id: str) -> Job:
         """The job as stored by the transition that minted this task.
@@ -207,9 +220,7 @@ class Q1AuthorityPublisher:
         possibly newer current binding.
         """
         for t in self.store.transitions(job_id):
-            p = t.job.pending_task
-            if p is not None and p.kind is TaskKind.RUNNER and \
-                    p.task_id == task_id:
+            if task_id in self._stage1_tasks(t.job):
                 return t.job
         raise Q1ReceiptRejected(f"no dispatch transition for {task_id}")
 
