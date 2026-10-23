@@ -17,6 +17,7 @@ from agent_pipeline.agent_tasks.planning import (ReachabilityPlanningOutput,
                                                  completed_plan)
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.contracts import (AgentModelPolicy, AgentTask,
+                                      CampaignMode,
                                       CompileRejected, GapClass, GapRef,
                                       JudgeVersions, PlanOutput, Q1Status,
                                       RuleSetOutput,
@@ -335,6 +336,10 @@ def test_reached_job_waits_until_an_operator_starts_stage2(world):
     job_id = reached(world)
     j = world.job(job_id)
     assert j.pending_task is None and j.stage2_basis is None
+    # campaign_mode none: Q1 is the deliverable (#81).
+    assert j.state_reason == "evidence_only"
+    assert not any(r.agent_task is AgentTask.MUTATION_STRATEGY
+                   for r in world.agents.requests)
     world.c.start_stage2(job_id)
 
     j = world.job(job_id)
@@ -350,6 +355,18 @@ def test_reached_job_waits_until_an_operator_starts_stage2(world):
     assert req.analysis_ref == j.analysis_ref
     assert req.model_policy == Stage2AgentPolicy().mutation_strategy
     assert world.c.replay(job_id) == world.job(job_id)
+
+
+@pytest.mark.parametrize("kw", [{"campaign_mode": CampaignMode.MUTATE},
+                                {"run_stage2": True}])
+def test_mutate_policy_starts_stage2_on_reached(make_world, kw):
+    w = make_world(**kw)
+    w.hcap.vocabulary.add("state_lineage")
+    job_id = w.to_running()
+    w.run(job_id, Q1Status.REACHED)
+    j = w.job(job_id)
+    assert j.state is JobState.S2_STRATEGY and j.state_reason is None
+    assert w.agents.requests[-1].agent_task is AgentTask.MUTATION_STRATEGY
 
 
 def test_stage2_model_policy_is_its_own(make_world):

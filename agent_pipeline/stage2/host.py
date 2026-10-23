@@ -28,7 +28,7 @@ from typing import Callable, Literal
 from pydantic import Field
 
 from ..artifacts import ArtifactStore
-from ..contracts import JobPolicy, Record
+from ..contracts import CampaignMode, JobPolicy, Record
 from ..data import load_record, parse_json
 from ..hcap import ArtifactHcapChecker
 from ..m1 import M1JudgeProfile
@@ -339,13 +339,14 @@ def _policy_values(policy: JobPolicy) -> tuple[int, ...]:
 
 
 def _check_policies(policies: tuple[JobPolicy, ...], checks: _Checks) -> None:
-    enabled = [p.policy_id for p in policies if p.run_stage2]
+    enabled = [p.policy_id for p in policies
+               if p.campaign_mode is CampaignMode.MUTATE]
     if enabled:
         checks.add("stage2_policy", "pass",
                    "automatic Stage 2 enabled for: " + ", ".join(enabled))
     else:
         checks.add("stage2_policy", "warning",
-                   "run_stage2 is false for every policy; use operator start_stage2")
+                   "no policy has campaign_mode mutate; use operator start_stage2")
     defaults = [p.policy_id for p in policies
                 if _policy_values(p) == _POLICY_DEFAULTS]
     if defaults:

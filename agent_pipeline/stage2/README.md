@@ -114,9 +114,10 @@ replay guests. Keep the default unless the durable host journal's measured
 fsync latency requires a larger executor timeout; record any override in the
 trusted Stage 2 argv. It does not alter syz-manager campaign timeouts.
 
-`JobPolicy.run_stage2` is false by default. With it false an operator
-starts Stage 2 of a reached job (`operator JOB start_stage2`); a policy may
-set it true. The campaign thresholds and `fuzz_budget_executions` are
+`JobPolicy.campaign_mode` is `none` by default: a reached job waits in
+`s1_reached(evidence_only)` and an operator starts Stage 2
+(`operator JOB start_stage2`). A policy may set `campaign_mode: mutate`, or
+the legacy `run_stage2: true`, to start it on Q1 `REACHED`. The campaign thresholds and `fuzz_budget_executions` are
 placeholders until the repository owner sets them.
 
 ## KVM preflight

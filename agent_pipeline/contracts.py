@@ -139,6 +139,17 @@ class Stage2AgentPolicy(Record):
         AgentModelPolicy(provider="openai", model="gpt-5"))
 
 
+class CampaignMode(str, enum.Enum):
+    """What a job does after Q1 reaches (#81, 09 §4)."""
+
+    #: Q1 is the deliverable: the job stays in s1_reached(evidence_only).
+    NONE = "none"
+    #: Repeat the approved Stage 1 program without mutation.
+    FIXED = "fixed"
+    #: The Stage 2 semantic mutation path (s2_strategy onward).
+    MUTATE = "mutate"
+
+
 class JobPolicy(Record):
     """01 §11.1, 09 §6.  Limits count retries: how many times the counted
     thing may happen after the first try.  With a limit of 1 one repair runs
@@ -146,20 +157,22 @@ class JobPolicy(Record):
 
     Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
     Agent retries, three Runner reruns, no human approval before a run.
-    run_stage2 becomes true by default once Stage 2 is implemented.  The
-    backend, judges and real-KVM host paths for gate, campaign and replay are
-    in.  A provider-backed real candidate has not yet traversed the complete
-    service path, however, and the campaign thresholds below are still
-    placeholders.  It therefore stays false by default: a policy may opt in,
-    and otherwise an operator starts Stage 2 of a reached job.  The Stage 2
-    repair budget follows the Stage 1 default."""
+    campaign_mode defaults to none (owner decision, 2026-10-23, #81 D3): a
+    reached job waits in s1_reached(evidence_only), and a policy opts in to
+    mutate, or an operator starts Stage 2 of a reached job.  run_stage2 is
+    the legacy form of the same choice (#81 D2): given alone, true means
+    mutate and false means none, and it is kept equal to campaign_mode ==
+    mutate so stored policies keep loading.  The Stage 2 repair budget
+    follows the Stage 1 default."""
 
     policy_id: str
     sanitizer: Sanitizer
     approval_required: bool = False
-    # False: a REACHED job waits in s1_reached (09 rationale 11).  True on
-    # a host without a Stage 2 backend leaves the job in
+    # Read when a job enters s1_reached (09 §4).  mutate on a host without a
+    # Stage 2 backend leaves the job in
     # blocked_operator(stage2_gate_unavailable) after compiling.
+    campaign_mode: CampaignMode = CampaignMode.NONE
+    # Legacy; derived from campaign_mode.
     run_stage2: bool = False
     stage1_agents: Stage1AgentPolicy = Field(default_factory=Stage1AgentPolicy)
     stage2_agents: Stage2AgentPolicy = Field(default_factory=Stage2AgentPolicy)
@@ -182,6 +195,40 @@ class JobPolicy(Record):
     campaign_inconclusive_generations: int = Field(default=100, ge=1)
     #: Program executions a campaign may run before an operator decides.
     fuzz_budget_executions: int = Field(default=100000, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_run_stage2(cls, data):
+        """Map run_stage2 to campaign_mode and keep the two equal.  Both
+        given and disagreeing is an error.  run_stage2 false agrees with
+        none and fixed: it only says that mutation does not start."""
+        if not isinstance(data, dict):
+            return data
+        legacy = data.get("run_stage2")
+        if not isinstance(legacy, bool):
+            return data     # absent, or left to field validation
+        mode = data.get("campaign_mode")
+        try:
+            mode = None if mode is None else CampaignMode(mode)
+        except ValueError:
+            return data     # left to field validation
+        if mode is None:
+            mode = CampaignMode.MUTATE if legacy else CampaignMode.NONE
+        elif legacy != (mode is CampaignMode.MUTATE):
+            raise ValueError(f"run_stage2={legacy} conflicts with "
+                             f"campaign_mode={mode.value}")
+        return {**data, "campaign_mode": mode}
+
+    @model_validator(mode="after")
+    def _campaign_mode(self) -> JobPolicy:
+        if self.campaign_mode is CampaignMode.FIXED:
+            # The fixed campaign lands later in #81; until then a fixed
+            # policy would have nowhere to go after Q1.
+            raise ValueError("campaign_mode fixed is not available yet")
+        if self.run_stage2 != (self.campaign_mode is CampaignMode.MUTATE):
+            object.__setattr__(self, "run_stage2",
+                               self.campaign_mode is CampaignMode.MUTATE)
+        return self
 
 
 # ---------------------------------------------------------------- binding

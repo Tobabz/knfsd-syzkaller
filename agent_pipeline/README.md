@@ -261,6 +261,8 @@ host command itself has run gate, bounded campaign and replay steps on real
 generation barriers and remote-KCOV evidence path. The synthetic service test
 still owns the complete `s1_reached` through `crash_review` assertion, so the
 real-host result is not a claim that an actual candidate or live Agent has run
-end to end. `JobPolicy.run_stage2` remains false by default (a policy may opt
-in) while the campaign thresholds await an owner decision. See the Stage 2
+end to end. `JobPolicy.campaign_mode` defaults to `none`: a reached job waits
+in `s1_reached(evidence_only)`, and a policy may opt in to `mutate`. The legacy
+`run_stage2` still loads (true means `mutate`). The campaign thresholds await
+an owner decision. See the Stage 2
 README's validation status and real-host runbook.

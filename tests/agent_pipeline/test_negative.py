@@ -6,7 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from agent_pipeline.contracts import (HOST_AUTHORITY_UNAVAILABLE,
-                                      AnalysisOutput, GapClass, GapRef,
+                                      AnalysisOutput, CampaignMode, GapClass,
+                                      GapRef, JobPolicy,
                                       MaterializeRejected,
                                       HarnessBinding, PlanOutput, Q1Status,
                                       Sanitizer)
@@ -18,10 +19,44 @@ from .fakes import COMMIT, VERSIONS, binding, policy, sha
 
 
 def test_stage2_is_opt_in():
+    assert policy().campaign_mode is CampaignMode.NONE
     assert policy().run_stage2 is False
-    assert policy(run_stage2=True).run_stage2 is True
     with pytest.raises(ValidationError):
         policy(run_stage2="maybe")
+    with pytest.raises(ValidationError):
+        policy(campaign_mode="sometimes")
+
+
+@pytest.mark.parametrize("kw,mode", [
+    ({"run_stage2": True}, CampaignMode.MUTATE),
+    ({"run_stage2": False}, CampaignMode.NONE),
+    ({"campaign_mode": "mutate"}, CampaignMode.MUTATE),
+    ({"campaign_mode": "none", "run_stage2": False}, CampaignMode.NONE),
+    ({"campaign_mode": "mutate", "run_stage2": True}, CampaignMode.MUTATE),
+])
+def test_legacy_run_stage2_maps_to_campaign_mode(kw, mode):
+    p = policy(**kw)
+    assert p.campaign_mode is mode
+    assert p.run_stage2 is (mode is CampaignMode.MUTATE)
+    # A stored policy loads back equal, so save_policy accepts it again.
+    assert JobPolicy.model_validate_json(p.model_dump_json()) == p
+
+
+def test_legacy_policy_json_keeps_loading():
+    old = {"policy_id": "p1", "sanitizer": "kasan", "run_stage2": True}
+    p = JobPolicy.model_validate_json(json.dumps(old))
+    assert p.campaign_mode is CampaignMode.MUTATE and p.run_stage2 is True
+
+
+@pytest.mark.parametrize("kw", [
+    {"campaign_mode": "none", "run_stage2": True},
+    {"campaign_mode": "mutate", "run_stage2": False},
+    # The fixed campaign is not implemented yet.
+    {"campaign_mode": "fixed"},
+])
+def test_conflicting_or_unavailable_campaign_mode_is_refused(kw):
+    with pytest.raises(ValidationError):
+        policy(**kw)
 
 
 @pytest.mark.parametrize("status,reason", [

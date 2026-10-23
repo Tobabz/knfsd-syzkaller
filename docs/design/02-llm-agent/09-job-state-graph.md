@@ -65,7 +65,7 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
    +-- INCONCLUSIVE unsupported_attribution > blocked_harness_gap
    | REACHED
    v
- s1_reached ---- JobPolicy run_stage2 -----> s2_strategy      (Figure 2)
+ s1_reached ---- campaign_mode mutate ----> s2_strategy      (Figure 2)
 
  [A] Agent  [R] Runner  [H] human  {..} deterministic step inside a transition
  (repair) agent_repair budget, (rerun) runtime_retry budget (§6)
@@ -212,7 +212,7 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | `s1_approval` | approve. 승인이 가리키는 review manifest hash가 현재 harness의 hash와 같음 | `s1_running` | — | `05` §11 |
 | `s1_approval` | approve, hash 다름 | 상태 유지. 승인으로 받지 않는다 | — | `02` §6 |
 | `s1_approval` | deny(note) | `s1_planning` (repair, `reviewer_denied`) | agent_repair | |
-| `s1_running` | Q1 `REACHED` | `s1_reached`. JobPolicy `run_stage2`가 참이면 바로 Stage 2를 시작한다(§4 첫 행) | — | `06` §12 |
+| `s1_running` | Q1 `REACHED` | `s1_reached`. JobPolicy `campaign_mode`가 `mutate`이면 바로 Stage 2를 시작한다(§4 첫 행). `none`이면 `s1_reached(evidence_only)`에서 기다린다 | — | `06` §12 |
 | `s1_running` | Q1 `NOT_REACHED` | `s1_planning` (repair, `q1_not_reached`) | agent_repair | `06` §13 |
 | `s1_running` | Q1 `INCONCLUSIVE(infra)`, `INCONCLUSIVE(loss)`, 봉인 bundle 없는 Runner 종료 | `s1_running` (같은 harness 재실행) | runtime_retry | `06` §13, `01` §12 |
 | `s1_running` | Q1 `INCONCLUSIVE(evidence)`, `INCONCLUSIVE(mapping)` | `blocked_operator(q1_evidence)`, `blocked_operator(q1_mapping)` | — | `06` §13, `01` §11.1 |
@@ -360,8 +360,8 @@ remote_kcov.kernel_revision.<commit>)`이다. 대기 상태에서는 이 검증�
 
 - 한도 N은 재시도 횟수다. 처음 한 번 뒤에 센 일이 N번까지 일어날 수 있다. counter가 N인 상태에서 한 번 더 일어나면 그 일 대신
   `blocked_operator`로 간다.
-- 한도 값은 JobPolicy가 소유한다(`01` §11.1의 retry / repair budget, campaign repair 임계값). Stage 2 시작 여부
-  `run_stage2`와 approval policy도 JobPolicy 값이다.
+- 한도 값은 JobPolicy가 소유한다(`01` §11.1의 retry / repair budget, campaign repair 임계값). Q1 뒤에 할 일
+  `campaign_mode`와 approval policy도 JobPolicy 값이다.
 - 외부 이벤트(§5)가 부른 재실행과 Controller 재시작은 budget을 쓰지 않는다. 재시작 뒤 Runner task는 새 실행 없이
   기존 실행을 다시 받고, `abandoned`로 기록한 Agent 실행은 `agent_retry`에 세지 않는다(§8).
 - budget 소진은 결론이 아니다. `blocked_operator`는 "도달 불가"나 "취약점 없음"을 뜻하지 않으며, 그런 결론
@@ -534,9 +534,12 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
     evidence lineage가 갈린다. 결과를 버린 Runner task도 종료를 확인한 뒤에 다음 task를 보낸다. 버린 campaign도
     끝날 때까지 VM을 쓰고 evidence를 봉인하며, replay는 freeze한 evidence가 필요하기 때문이다(`01` §12). 모르는
     `task_id`의 `cancel`을 기록해 두는 것은 늦게 도착한 submit이 버린 task를 시작하지 못하게 하려는 것이다.
-11. **Stage 2 시작은 JobPolicy `run_stage2`가 정한다.** Stage 1을 먼저 구현하는 동안
-    (`../decisions/2026-10-13-agent-implementation-stack.md` 결정 1) `REACHED` job은 `s1_reached`에서 기다린다.
-    promotion된 semantic subset이 없는 동안 Mutation Strategy를 부르면 `mutation_engine` gap만 생긴다(`04` §5).
+11. **Q1 뒤에 할 일은 JobPolicy `campaign_mode`가 정한다.** 기본값 `none`에서는 Q1이 결과물이고 `REACHED` job은
+    `s1_reached(evidence_only)`에서 기다린다. `mutate`만 Stage 2를 자동으로 시작한다. 모든 후보가 mutation
+    campaign을 필요로 하지는 않고, promotion된 semantic subset이 없는 동안 Mutation Strategy를 부르면
+    `mutation_engine` gap만 생긴다(`04` §5). `campaign_mode`는 job이 `s1_reached`에 들어갈 때 읽는다.
+    `PolicyChanged`는 이후 전이에만 적용되므로 이미 `s1_reached`에서 기다리는 job은 operator `start_stage2`로
+    시작한다(#81).
 12. **승인 단계는 approval policy가 요구할 때만 둔다.** approval policy는 trusted controller의 execution policy이고
     (`02` §8), 승인 대상은 review manifest가 hash로 묶는다(`05` §11). 승인 필요 여부는 `s1_running`에 들어갈 때마다
     그때의 policy로 정한다. JobPolicy 변경은 이후 전이에만 적용되므로(`01` §11.1), 대기 중 계산한 `resume_point`를
@@ -544,7 +547,7 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 13. **재평가 이벤트는 대기 상태를 끝내지 않는다.** `blocked_operator`와 `crash_review`는 사람이 이어 갈지 정하는
     지점이고(§6, `01` §12), gap 상태는 issue가 정한다(`07` §7). harness 교체나 HCAP·JudgeProfile 변경은 그 결정을
     대신하지 않으므로 `resume_point`만 바꾼다. 상태를 옮기면 승인이 필요 없는 정책에서 harness 교체만으로 실행이
-    재개되고, `run_stage2`가 참이면 campaign까지 다시 돈다. `s1_approval`은 대기 상태에 넣지 않는다. identity가
+    재개되고, `campaign_mode`가 `mutate`이면 campaign까지 다시 돈다. `s1_approval`은 대기 상태에 넣지 않는다. identity가
     바뀌면 승인할 harness 자체가 바뀌므로 새 review manifest의 승인을 다시 기다린다. 이전 binding에서 소비한
     verdict의 재판정은 기록만 한다. 그 verdict로 세운 경로는 binding 변경이 이미 무효로 했기 때문이다(`01` §11.2).
     재판정이 이 순서를 뒤집으면 새 identity에서 Q1을 다시 세우지 않고 이전 gate 결과로 campaign에 간다.
@@ -578,7 +581,7 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 | job 전체 budget 하나 | 단순하다 | infra 재실행이 Agent repair 몫을 먹는다. `01` §12는 둘을 다른 문제로 나눈다 | 채택 안 함 |
 | vocabulary에 없는 gap id를 Agent에 돌려보냄 | 자동화 | 맞지 않는 id에 묶일 수 있다 | 채택 안 함. vocabulary가 안정되면 재검토 |
 | `APPLIED` crash 뒤에도 campaign 계속 | 같은 budget으로 더 탐색한다 | review 전에 같은 crash를 반복할 수 있고, 계속할지는 사람 판단이다 | 채택 안 함. `crash_review`에서 `resume`할 수 있다 |
-| 재평가 이벤트가 대기 상태의 job도 옮긴다 | 사람 개입 없이 새 harness로 이어 간다 | budget 소진이나 crash 검토로 멈춘 job이 harness 교체만으로 다시 실행되고, `run_stage2`가 참이면 campaign까지 간다 | 채택 안 함. 대기 사유별로 자동 재개 조건을 정하게 되면 재검토 |
+| 재평가 이벤트가 대기 상태의 job도 옮긴다 | 사람 개입 없이 새 harness로 이어 간다 | budget 소진이나 crash 검토로 멈춘 job이 harness 교체만으로 다시 실행되고, `campaign_mode`가 `mutate`이면 campaign까지 간다 | 채택 안 함. 대기 사유별로 자동 재개 조건을 정하게 되면 재검토 |
 | 대기 중 identity 변경을 재개할 때 적용한다 | 대기 중 여러 번 바뀌어도 한 번만 계산한다 | `resume_point`가 실제로 갈 곳을 보여 주지 않는다 | 채택 안 함. 대기 중 다시 materialize하는 비용이 커지면 재검토 |
 | 재시작 때 Runner의 실행을 모두 멈추고 다시 보낸다 | Runner 계약이 단순하다 | 진행 중인 VM 시간을 버리고, 멈췄다는 확인이 여전히 필요하다 | 채택 안 함. Runner가 task 기록을 durable하게 둘 수 없으면 재검토 |
 | Runner 실행을 Controller의 자식 프로세스로 둔다 | Controller와 함께 끝나므로 중복 실행이 없다 | Controller 재시작마다 campaign이 끊기고, Runner를 다른 호스트로 옮길 수 없다 | 채택 안 함. Runner를 한 호스트에 고정하고 Controller 재시작보다 짧은 실행만 맡기게 되면 재검토 |
@@ -700,6 +703,10 @@ bundle fixture로 대신한다.
   bounded campaign, replay의 standalone host 경로를 실제 KVM으로 확인했다. campaign 임계값은 아직 저장소 소유자
   결정이 아니며 실제 candidate의 전체 service 경로도 #57에서 검증해야 하므로 기본값은 거짓이다. 기본값을 참으로
   바꾸는 시점은 저장소 소유자가 정한다.
+  **결정됨(2026-10-23, 저장소 소유자, #81 D1–D4):** `run_stage2`는 `campaign_mode`(`none`·`fixed`·`mutate`)로
+  바뀌고 기본값은 `none`이다. `run_stage2`만 있는 기존 policy는 참이면 `mutate`, 거짓이면 `none`으로 읽고,
+  두 값이 어긋나면 거부한다. 거짓은 mutation을 시작하지 않는다는 뜻이라 `fixed`와도 어긋나지 않는다. `fixed`는
+  fixed campaign이 들어올 때까지 받지 않는다.
 - **결정됨(2026-10-13, 저장소 소유자):** `agent_retry`는 요청 단위로 센다. 새 요청이 시작되면 0에서 센다.
 - **결정됨(2026-10-13, 저장소 소유자):** candidate 하나에 job 여러 개(예: sanitizer별)를 둘 수 있다. 같은
   target(commit, location)은 같은 `candidate_id`다(`02` §7).
@@ -722,7 +729,7 @@ bundle fixture로 대신한다.
   닫는 동작.
 - **미결:** Stage 2 실행 전 사람 승인. 기존 계약의 approval binding은 Stage 1 review manifest뿐이다(`05` §11).
 - **구현 범위(#46):** `s1_reached`·`s2_strategy` 행과 Compiler 결과 행은 `tests/agent_pipeline/test_stage2_strategy.py`가
-  가짜 model과 가짜 Compiler로 확인한다. `run_stage2`가 거짓이면 Stage 2는 operator 동작
+  가짜 model과 가짜 Compiler로 확인한다. `campaign_mode`가 `mutate`가 아니면 Stage 2는 operator 동작
   `start_stage2`로 시작한다. Compiler는 `rule_compiler.ArtifactMutationRuleCompiler`이고, host 설정에 promotion된
   Proxy build(`Stage1Config.nfs_proxy`)가 없으면 rule set은 `blocked_operator(stage2_compiler_unavailable)`에서
   기다린다. `agent_repair[stage2]`의 한도(`stage2_repair_budget`)는 Stage 1과 같은 3회로 두었다(저장소 소유자 결정
@@ -738,8 +745,9 @@ bundle fixture로 대신한다.
   `stage2_compiler_unavailable`은 host 설정 사유라 표에 넣지 않는다. 표에 없는 reason `campaign_evidence`(campaign
   bundle의 host provenance 불일치)는 §4 표에 더했다.
 - `run_stage2`는 Stage 2 backend가 없는 동안 거짓만 받았다. 참이 되면 실행할 수 없는 Stage 2로 job이 자동으로
-  들어가기 때문이다. backend가 들어온 뒤로는 참도 받지만 기본값은 거짓이다. backend를 설정하지 않은 host에서 참인
-  policy의 job은 compile 뒤 `blocked_operator(stage2_gate_unavailable)`에서 기다린다.
+  들어가기 때문이다. backend가 들어온 뒤로는 참도 받지만 기본값은 거짓이다. 지금은 `campaign_mode`가 같은 선택을
+  하며 기본값은 `none`이다. backend를 설정하지 않은 host에서 `mutate`인 policy의 job은 compile 뒤
+  `blocked_operator(stage2_gate_unavailable)`에서 기다린다.
 - **미구현:** gate verdict의 JudgeProfile 재판정(§5). 재평가는 Stage 1 Q1 verdict만 다시 판정한다. Stage 2 실행 전
   사람 승인도 없다(미결 그대로).
 - **부분 검증:** 검증 오라클 1–5와 `s1_reached`부터 `crash_review`까지의 전체 service 전이는
