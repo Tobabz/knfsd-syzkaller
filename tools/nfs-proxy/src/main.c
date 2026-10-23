@@ -22,10 +22,12 @@ static _Atomic int snapshot_requested;
 
 extern const struct nfsp_schema_family nfsp_schema_family_nfs4;
 extern const struct nfsp_schema_family nfsp_schema_family_nfs3;
+extern const struct nfsp_schema_family nfsp_schema_family_nlm4;
 
 static const struct nfsp_schema_family *const families[] = {
 	&nfsp_schema_family_nfs4,
 	&nfsp_schema_family_nfs3,
+	&nfsp_schema_family_nlm4,
 };
 
 /* What the event loop's hooks share: either part may be absent. */
@@ -45,6 +47,16 @@ static void snapshot_signal(int sig)
 {
 	(void)sig;
 	atomic_store(&snapshot_requested, 1);
+}
+
+static int install_signal(int signum, void (*handler)(int))
+{
+	struct sigaction action = {0};
+
+	action.sa_handler = handler;
+	if (sigemptyset(&action.sa_mask) != 0)
+		return -1;
+	return sigaction(signum, &action, NULL);
 }
 
 static void print_stats(const struct nfsp_proxy_stats *stats, const char *phase)
@@ -126,6 +138,8 @@ static void ready(const struct nfsp_proxy_stats *stats, void *arg)
 	(void)arg;
 	printf("relay ready: knfsd=%u ganesha=%u\n",
 	       stats->bound_port[0], stats->bound_port[1]);
+	if (stats->nlm_bound_port != 0)
+		printf("relay NLM TCP ready: port=%u\n", stats->nlm_bound_port);
 	fflush(stdout);
 }
 
@@ -207,7 +221,9 @@ static void usage(const char *program)
 		"[--control PATH --delta-dir DIR | --replay DELTA_FILE] "
 		"[--semantic]\n"
 		"       %s ... --target RULES --session-id ID --journal PATH "
-		"--lane N [--activation PATH] [--drain-bound-ms MS]\n"
+		"--lane N [--activation PATH] [--drain-bound-ms MS] "
+		"[--nlm-listen IP:PORT --nlm-backend IP:PORT "
+		"--nlm-preserve-client-ip]\n"
 		"       %s --check-rules RULES\n"
 		"       %s --describe-rules RULES\n"
 		"       %s --capability-registry\n"
@@ -222,6 +238,10 @@ static void usage(const char *program)
 		"journal at PATH (Unix socket or virtio-serial port) before it "
 		"is forwarded.  The executor drives activation on the "
 		"SOCK_SEQPACKET endpoint --activation (target.h).\n"
+		"--nlm-listen and --nlm-backend add a TCP-only NLM route to "
+		"the same target session; no fixture config enables it yet. "
+		"--nlm-preserve-client-ip binds its backend socket to the "
+		"accepted client IP and requires guest return routing.\n"
 		"--check-rules loads RULES as --target would and reports, on "
 		"one line, whether this runtime accepts it (exit 0) or refuses "
 		"it (exit 3): the semantic replay compatibility gate.\n"
@@ -267,8 +287,10 @@ int main(int argc, char **argv)
 	const char *control_path = NULL, *delta_dir = NULL, *replay = NULL;
 	const char *rules_path = NULL, *session_id = NULL, *journal_path = NULL;
 	const char *activation_path = NULL, *lane_arg = NULL, *drain_arg = NULL;
+	const char *nlm_listen = NULL, *nlm_backend = NULL;
+	int nlm_preserve_client_ip = 0;
 	struct nfsp_target_cfg tcfg;
-	char ips[4][INET_ADDRSTRLEN];
+	char ips[6][INET_ADDRSTRLEN];
 	struct in_addr src[2];
 	int rc;
 	if (argc == 3 && strcmp(argv[1], "--check-rules") == 0)
@@ -339,6 +361,12 @@ int main(int argc, char **argv)
 			i--;
 			continue;
 		}
+		if (strcmp(argv[i], "--nlm-preserve-client-ip") == 0 &&
+		    !nlm_preserve_client_ip) {
+			nlm_preserve_client_ip = 1;
+			i--;
+			continue;
+		}
 		if (i + 1 >= argc) { usage(argv[0]); return 2; }
 		if (strcmp(argv[i], "--control") == 0 && control_path == NULL)
 			control_path = argv[i + 1];
@@ -360,10 +388,21 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[i], "--drain-bound-ms") == 0 &&
 			 drain_arg == NULL)
 			drain_arg = argv[i + 1];
+		else if (strcmp(argv[i], "--nlm-listen") == 0 &&
+			 nlm_listen == NULL)
+			nlm_listen = argv[i + 1];
+		else if (strcmp(argv[i], "--nlm-backend") == 0 &&
+			 nlm_backend == NULL)
+			nlm_backend = argv[i + 1];
 		else { usage(argv[0]); return 2; }
 	}
 	if ((control_path == NULL) != (delta_dir == NULL) ||
-	    (replay != NULL && control_path != NULL)) { usage(argv[0]); return 2; }
+	    (replay != NULL && control_path != NULL) ||
+	    ((nlm_listen == NULL) != (nlm_backend == NULL)) ||
+	    (nlm_listen != NULL && rules_path == NULL) ||
+	    (nlm_preserve_client_ip && nlm_listen == NULL)) {
+		usage(argv[0]); return 2;
+	}
 	memset(&tcfg, 0, sizeof(tcfg));
 	if (rules_path != NULL) {
 		/* Target mode owns the relay's rewrite and observer hooks. */
@@ -389,7 +428,10 @@ int main(int argc, char **argv)
 	    endpoint(argv[3], ips[0], &cfg.route[0].listen_port) != 0 ||
 	    endpoint(argv[4], ips[1], &cfg.route[1].listen_port) != 0 ||
 	    endpoint(argv[5], ips[2], &cfg.route[0].backend_port) != 0 ||
-	    endpoint(argv[6], ips[3], &cfg.route[1].backend_port) != 0) {
+	    endpoint(argv[6], ips[3], &cfg.route[1].backend_port) != 0 ||
+	    (nlm_listen != NULL &&
+	     (endpoint(nlm_listen, ips[4], &cfg.nlm_route.listen_port) != 0 ||
+	      endpoint(nlm_backend, ips[5], &cfg.nlm_route.backend_port) != 0))) {
 		usage(argv[0]);
 		return 2;
 	}
@@ -399,6 +441,11 @@ int main(int argc, char **argv)
 	cfg.route[1].listen_ip = ips[1];
 	cfg.route[0].backend_ip = ips[2];
 	cfg.route[1].backend_ip = ips[3];
+	if (nlm_listen != NULL) {
+		cfg.nlm_route.listen_ip = ips[4];
+		cfg.nlm_route.backend_ip = ips[5];
+		cfg.nlm_preserve_client_ip = nlm_preserve_client_ip;
+	}
 	cfg.stop = &stop_requested;
 	cfg.on_stats = maybe_snapshot;
 	if (control_path != NULL || replay != NULL) {
@@ -469,9 +516,12 @@ int main(int argc, char **argv)
 		fprintf(stderr, "signal stop flag must be lock-free on this host\n");
 		return 2;
 	}
-	signal(SIGINT, stop_signal);
-	signal(SIGTERM, stop_signal);
-	signal(SIGUSR1, snapshot_signal);
+	if (install_signal(SIGINT, stop_signal) != 0 ||
+	    install_signal(SIGTERM, stop_signal) != 0 ||
+	    install_signal(SIGUSR1, snapshot_signal) != 0) {
+		perror("install proxy signal handlers");
+		return 2;
+	}
 	rc = nfsp_proxy_run(&cfg, &stats, ready, NULL);
 	/* Every answer still owed, then RUN_COMPLETE if the session is clean.
 	 * The wait covers a draining generation's bound. */

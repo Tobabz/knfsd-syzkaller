@@ -1,0 +1,8 @@
+# Target-kernel NLM v4 XDR (RFC 1813 Appendix II plus missing definitions).
+family nlm4
+program NLM4_PROG NLM4_VERS
+procedure-prefix NLMPROC4_
+leaf args result
+status-type nlm4_stats
+source nlm4.x
+branch NLM4_DENIED denied

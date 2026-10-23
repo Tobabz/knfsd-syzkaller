@@ -297,7 +297,7 @@ static void j_correlation(struct nfsp_target *t, struct nfsp_jbuf *b,
 }
 
 struct context {
-	unsigned backend, client;
+	unsigned backend, client, route;
 	uint64_t connection_id;
 	int direction;
 	int reply;
@@ -322,6 +322,10 @@ static void j_context(struct nfsp_jbuf *b, const struct context *c, int first)
 	nfsp_jb_u64(b, c->procedure);
 	nfsp_jb_key(b, "program", 0);
 	nfsp_jb_u64(b, c->program);
+	if (c->route == NFSP_ROUTE_NLM) {
+		nfsp_jb_key(b, "route", 0);
+		nfsp_jb_str(b, "nlm");
+	}
 	nfsp_jb_key(b, "version", 0);
 	nfsp_jb_u64(b, c->version);
 	nfsp_jb_key(b, "xid", 0);
@@ -1027,6 +1031,9 @@ static void eligible(struct nfsp_target *t, const struct nfsp_semantic_event *ev
 	if (g == NULL)
 		return;
 	t->stats.eligible++;
+	/* An empty diagnostic ruleset has nothing to resolve or mutate. */
+	if (t->ruleset.nrules == 0)
+		return;
 	memset(&rr, 0, sizeof(rr));
 	memset(&tx, 0, sizeof(tx));
 	memset(&res, 0, sizeof(res));
@@ -1044,6 +1051,7 @@ static void eligible(struct nfsp_target *t, const struct nfsp_semantic_event *ev
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.backend = rec->conn.backend;
 	ctx.client = rec->conn.client;
+	ctx.route = rec->conn.route;
 	ctx.connection_id = rec->conn.connection_id;
 	ctx.direction = rec->direction;
 	ctx.reply = reply;

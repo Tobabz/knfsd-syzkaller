@@ -20,6 +20,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -28,12 +29,14 @@ from typing import Callable, Literal
 from pydantic import Field
 
 from ..artifacts import ArtifactStore
-from ..contracts import JobPolicy, Record
+from ..contracts import HarnessBinding, JobPolicy, Record
+from ..controller.records import Job, JobState
 from ..data import load_record, parse_json
-from ..hcap import ArtifactHcapChecker
+from ..hcap import ArtifactHcapChecker, HcapCatalog
 from ..m1 import M1JudgeProfile
 from ..materializer import (ExecutionHarnessApproval,
-                            ExecutionHarnessDescriptor, descriptor_id)
+                            ExecutionHarnessDescriptor, ReachabilityHarness,
+                            descriptor_id)
 from ..q2 import Q2JudgeProfile
 from ..registry import HarnessCatalog
 from ..runner.process_supervisor import ProcessLimits
@@ -307,6 +310,97 @@ def _check_runtime(
     return build
 
 
+def _load_job_read_only(state_dir: Path, job_id: str) -> Job:
+    database = (state_dir / "controller.sqlite").resolve(strict=True)
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as db:
+        db.execute("PRAGMA query_only=ON")
+        row = db.execute("SELECT body FROM jobs WHERE job_id = ?",
+                         (job_id,)).fetchone()
+    if row is None:
+        raise PreflightError(f"job is absent: {job_id}")
+    return Job.model_validate_json(row[0])
+
+
+def _check_job_authority(
+    job: Job, harness: ReachabilityHarness, hcap: HcapCatalog,
+) -> None:
+    if job.state != JobState.S1_REACHED or job.binding is None or \
+            job.harness is None or job.stage2_input is None:
+        raise PreflightError("job lacks a reached Stage 2 basis")
+    basis = job.stage2_input
+    authority_revision = (job.harness.authority_hcap_revision
+                          or job.harness.hcap_revision)
+    if (basis.harness_ref != job.harness.harness_ref
+            or basis.execution_harness_id != job.binding.execution_harness_id
+            or job.harness.execution_harness_id != basis.execution_harness_id
+            or job.harness.hcap_revision != harness.hcap_revision
+            or authority_revision != job.binding.hcap_revision
+            or harness.execution_harness_id != basis.execution_harness_id
+            or harness.plan_ref != basis.plan_ref):
+        raise PreflightError("job Stage 2 basis differs from its approved harness")
+    if "HCAP-13" in (*harness.required_capability_ids,
+                     *harness.selected_capability_ids) and (
+            harness.runtime_selection.fixture_mode != "nlm-knfsd"):
+        raise PreflightError("HCAP-13 harness has a non-NLM runtime selection")
+    if harness.runtime_selection.fixture_mode != "nlm-knfsd":
+        return
+    capability = next((cap for cap in hcap.capabilities
+                       if cap.id == "HCAP-13"), None)
+    if capability is None or "HCAP-13" not in harness.required_capability_ids:
+        raise PreflightError("NLM fixture lacks required HCAP-13 authority")
+    if ("stage2" not in capability.usable_stage
+            or "agent_stage2" not in capability.usable_by):
+        raise PreflightError("HCAP-13 is approved for Stage 1 only")
+    raise PreflightError(
+        "NLM Stage 2 requires a promoted NLM Proxy, port 4045 relay "
+        "and independent KVM evidence")
+
+
+def _check_stage2_job(
+    job: Job, harness: ReachabilityHarness, hcap: HcapCatalog,
+    manager: dict, bindings: tuple[HarnessBinding, ...],
+) -> str:
+    _check_job_authority(job, harness, hcap)
+    if job.binding not in bindings:
+        raise PreflightError("job lacks a registered Stage 1/Stage 2 binding")
+    selection = harness.runtime_selection
+    vm = manager.get("vm")
+    if not isinstance(vm, dict):
+        raise PreflightError("manager VM config is absent")
+    cmdline = str(vm.get("cmdline", "")).split()
+    expected = (f"koov.nfs_version={selection.nfs_version}"
+                if selection.fixture_mode == "single" else
+                f"koov.nfs_fixture={selection.fixture_mode}")
+    if expected not in cmdline:
+        raise PreflightError("manager fixture differs from job runtime selection")
+    return f"job {job.job_id} selects approved {selection.fixture_mode} fixture"
+
+
+def _check_job_from_state(
+    config: Stage1Config, job_id: str, manager_path: Path | None,
+) -> str:
+    job = _load_job_read_only(config.state_dir, job_id)
+    if job.state != JobState.S1_REACHED:
+        raise PreflightError("job is not in s1_reached")
+    if job.harness is None or job.binding is None:
+        raise PreflightError("job lacks a materialized harness or binding")
+    if not config.artifact_root.is_dir():
+        raise PreflightError(f"artifact root is absent: {config.artifact_root}")
+    store = ArtifactStore(config.artifact_root)
+    harness = load_record(store, job.harness.harness_ref, ReachabilityHarness)
+    hcap = ArtifactHcapChecker(store).load_catalog(job.binding.hcap_revision)
+    _check_job_authority(job, harness, hcap)
+    catalog = load_record(store, config.harness_catalog_ref, HarnessCatalog)
+    if manager_path is None:
+        raise PreflightError("manager config is required for job readiness")
+    manager = parse_json(manager_path.read_bytes())
+    if not isinstance(manager, dict):
+        raise PreflightError("manager config is not a JSON object")
+    return _check_stage2_job(
+        job, harness, hcap, manager,
+        tuple(item.binding for item in catalog.registrations))
+
+
 def _check_kernel_repo(config: Stage1Config) -> str:
     if not config.kernel_repo.is_dir():
         raise PreflightError(f"kernel repository is absent: {config.kernel_repo}")
@@ -542,6 +636,7 @@ def _check_manager(
 def preflight(
     stage1_path: Path, *, collector_path: Path | None = None,
     manager_path: Path | None = None, kvm_path: Path = Path("/dev/kvm"),
+    job_id: str | None = None,
     which: Callable[[str], str | None] = shutil.which,
     runtime_reader: Callable[[Path], BuildRegistry] = read_build_registry,
 ) -> PreflightReport:
@@ -553,6 +648,9 @@ def preflight(
         checks.add("stage1_config", "error", f"{type(exc).__name__}: {exc}")
         return PreflightReport(ready=False, checks=tuple(checks.items))
     checks.add("stage1_config", "pass", f"loaded {stage1_path}")
+    if job_id is not None:
+        checks.attempt("stage2_job", lambda: _check_job_from_state(
+            config, job_id, manager_path))
     stage2 = config.stage2
     if stage2 is None:
         checks.add("stage2_config", "error", "Stage1Config.stage2 is unset")
@@ -672,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--stage1", type=Path, required=True)
     check.add_argument("--collector", type=Path)
     check.add_argument("--manager", type=Path, required=True)
+    check.add_argument("--job", help="check one reached job and its fixture")
     check.add_argument("--kvm", type=Path, default=Path("/dev/kvm"))
     check.add_argument("--json", action="store_true")
     step = sub.add_parser("step")
@@ -696,7 +795,8 @@ def main(argv: list[str] | None = None) -> int:
             args.input, args.output)
         return 0
     report = preflight(args.stage1, collector_path=args.collector,
-                       manager_path=args.manager, kvm_path=args.kvm)
+                       manager_path=args.manager, kvm_path=args.kvm,
+                       job_id=args.job)
     if args.json:
         print(report.model_dump_json(indent=2))
     else:

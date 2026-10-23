@@ -20,6 +20,7 @@ from agent_pipeline.stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
                                                   EXECPROG_EXIT_GRACE_S, POLL_S,
                                                   CollectorConfig, execprog_argv,
                                                   execprog_timeout)
+from agent_pipeline.stage1.host.kcov import LaneRun
 from agent_pipeline.stage1.host.pins import PinError, pin_file
 from agent_pipeline.stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
                                            GUEST_TRANSFER_TIMEOUT_S,
@@ -38,6 +39,74 @@ from agent_pipeline.stage2.kvm import (
 )
 
 from .stage2_host import rules_bytes
+
+
+def test_gate_preserves_fixture_failure_without_executor_log(tmp_path, monkeypatch):
+    from agent_pipeline.stage2 import kvm
+
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "segments").mkdir()
+    lane = tmp_path / "lane"
+    lane.mkdir()
+    (lane / "lane.sh").write_text("#!/bin/sh\n")
+    execution = SimpleNamespace(gate_repetitions=1, task_id="job-test.t1",
+                                lease_generation=1,
+                                execution_harness_id="a" * 64)
+    inputs = SimpleNamespace(
+        execution=execution, descriptor=SimpleNamespace(
+            kernel_commit="0" * 40,
+            build_artifacts=(SimpleNamespace(name="instrumentation",
+                                             artifact_ref="b" * 64),
+                             SimpleNamespace(name="kernel",
+                                             artifact_ref="c" * 64))),
+        collector=SimpleNamespace(instrumentation_artifact_name="instrumentation",
+                                  vmlinux_artifact_name="kernel"),
+        manager={"workdir_template": str(lane)}, rules=b"rules", lanes=1,
+        files={}, root=tmp_path,
+        correlation=lambda vm, lane, generation: kvm.ExecutionCorrelation(
+            job_id="job-test", task_id="job-test.t1",
+            execution_harness_id="a" * 64, vm_instance_id=vm,
+            lane=lane, generation_id=generation),
+        harness=SimpleNamespace(
+            runtime_selection=SimpleNamespace(trace_mode="off"),
+            candidate_id="candidate"), lane_sha256="b" * 64,
+    )
+
+    class Channels:
+        name = "gate0"
+
+        def __init__(self, *args):
+            pass
+
+        def qemu_args(self, **kwargs):
+            return ()
+
+        def close(self):
+            pass
+
+    class Guest:
+        def stop(self):
+            pass
+
+    seen = {}
+    monkeypatch.setattr(kvm, "_JournalChannels", Channels)
+    monkeypatch.setattr(kvm, "_direct_guest", lambda *args: Guest())
+    monkeypatch.setattr(kvm, "run_lane", lambda *args, **kwargs: LaneRun(
+        boot_ok=True, runtime_errors=["fixture_not_ready"]))
+    monkeypatch.setattr(kvm, "_neutral_run", lambda *args, **kwargs: pytest.fail(
+        "neutral run must not start before fixture readiness"))
+    monkeypatch.setattr(kvm, "_closed_evidence_channels", lambda *args: (
+        kvm._evidence_seal_window(out, 0)))
+    monkeypatch.setattr(kvm, "_journal_artifacts", lambda *args, **kwargs: [])
+    monkeypatch.setattr(kvm, "_seal_segment", lambda *args, **kwargs: (
+        seen.update(kwargs)))
+
+    kvm._gate(inputs, out, StepOptions(tmp_path / "manager", tmp_path / "collector"))
+    observation = json.loads(seen["artifacts"][0].data)
+    assert observation["runtime_errors"] == ["fixture_not_ready"]
+    assert observation["fixture_ok"] is False
+    assert seen["artifacts"][3].data == b""
 
 
 def execution_record(**updates) -> dict:
@@ -220,6 +289,16 @@ def test_manager_cmdline_is_bound_to_harness_selection():
             {"cmdline": value.replace("koov.nfs_version=4.1",
                                       "koov.nfs_version=3")},
             descriptor, harness, lane)
+
+
+def test_stage2_step_rejects_stage1_only_nlm_fixture():
+    descriptor = SimpleNamespace(guest_kernel_command_line="root=/dev/sda")
+    harness = SimpleNamespace(runtime_selection=SimpleNamespace(
+        fixture_mode="nlm-knfsd", nfs_version="3", trace_mode="off"))
+    with pytest.raises(Stage2StepError, match="Stage 1 only"):
+        _manager_cmdline({"cmdline": "root=/dev/sda "
+                          "koov.nfs_fixture=nlm-knfsd"},
+                         descriptor, harness, "a" * 64)
 
 
 def test_manager_runtime_assets_are_bound_to_harness_pins(tmp_path):

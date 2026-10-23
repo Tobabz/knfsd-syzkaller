@@ -20,7 +20,7 @@ gcc -std=c11 -O2 -g -pthread -Wall -Wextra -Werror -Wshadow \
     /src/rpc_record.c \
     /src/control.c /src/delta.c /src/walk.c /src/edit.c \
     /src/semantic.c /src/txn.c /src/nfs_decode.c /src/schema.c \
-    /src/schema_nfs4.c /src/schema_nfs3.c /src/rpc_decode.c \
+    /src/schema_nfs4.c /src/schema_nfs3.c /src/schema_nlm4.c /src/rpc_decode.c \
     /src/resolver.c /src/mutation_apply.c /src/activation.c /src/rule.c \
     /src/target.c /src/journal.c /src/jsonw.c /src/sha256.c \
     /src/lifecycle.c /src/cld.c
@@ -73,7 +73,7 @@ validate_binary /work/guest-delta-replay replay-probe
         /src/walk.c /src/walk.h /src/edit.c /src/edit.h \
         /src/semantic.c /src/semantic.h /src/txn.c /src/txn.h \
         /src/nfs_decode.c /src/nfs_decode.h /src/schema.c /src/schema.h \
-        /src/schema_nfs4.c /src/schema_nfs3.c /src/rpc_decode.c \
+        /src/schema_nfs4.c /src/schema_nfs3.c /src/schema_nlm4.c /src/rpc_decode.c \
         /src/rpc_decode.h \
         /src/resolver.c /src/resolver.h /src/mutation_apply.c \
         /src/mutation_apply.h /src/activation.c /src/activation.h \

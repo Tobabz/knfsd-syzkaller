@@ -169,14 +169,17 @@ The RFC texts are not committed; their pins are enough to fetch and check them.
 |---|---|---|---|
 | `nfs4/nfs4.ann` | `../src/schema_nfs4.c` | RFC 7531 (4.0), RFC 5662 + RFC 8435 + RFC 8154 (4.1), RFC 7863 + RFC 8276 + RFC 9754 + RFC 8435 + RFC 8154 (4.2) | NFSv4 COMPOUND, CALL and REPLY |
 | `nfs3/nfs3.ann` | `../src/schema_nfs3.c` | RFC 1813, assembled (`nfs3/SOURCES`) | NFSv3, all 22 procedures, CALL and REPLY |
+| `nlm4/nlm4.ann` | `../src/schema_nlm4.c` | target-kernel NLMv4 XDR, SHA-256 pinned by `nlm4/kernel_xdr.py` | NLMv4 CALL/REPLY; Stage 2 still gated |
 | `../test/schema/tproto.ann` | `../test/schema_tproto.c` | written for the tests | synthetic, host tests only |
 | `../test/schema/tflat.ann` | `../test/schema_tflat.c` | written for the tests | synthetic, host tests only |
 | `../test/schema/tedge.ann` | `../test/schema_tedge.c` | written for the tests | synthetic, host tests only: operation unions outside an operation array |
 
-NFSv3 is RFC 1813's NFS program only. The MOUNT and NLM protocols of its
-appendices run on their own programs, and NFSACL (100227), which shares port
-2049 with NFSv3 on Linux, is in no RFC; their messages are
-`unsupported_schema`. An NFSv3 REPLY decodes only with the procedure its
+NFSv3 is RFC 1813's NFS program only. MOUNT and NFSACL (100227) remain
+`unsupported_schema`. NLMv4 has a separate program-100021 table from the
+SHA-256-pinned target-kernel XDR (`nlm4/kernel_xdr.py`). RFC 1813 omits its
+argument/result types; the kernel supplies those plus Linux-private procedure
+16. The table alone does not enable the NLM lane or approve Stage 2 mutation.
+An NFSv3 REPLY decodes only with the procedure its
 CALL's TransactionEntry gives (design 03 §8). NFSv4.2 is RFC 7863 plus the extensions knfsd
 implements: the RFC 8276 xattr operations and the RFC 9754 attribute
 delegation types. RFC 9754 declares delegation types 4 and 5 but no

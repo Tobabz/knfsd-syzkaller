@@ -112,6 +112,7 @@ class RecordContext(_Record):
     message_type: Literal["call", "reply"]
     procedure: Uint32
     program: Uint32
+    route: Literal["nlm"] | None = None
     version: Uint32
     xid: Uint32
 
@@ -276,10 +277,15 @@ def parse_request(raw: bytes) -> JournalRequest:
         parse_json(raw)
         envelope = _Envelope.model_validate_json(raw)
         payload = EVENT_PAYLOADS[envelope.event_type].model_validate(envelope.payload)
+        payload_json = payload.model_dump(mode="json")
+        if isinstance(payload, (ExposureIntentPayload, ApplyRefusalPayload)) and \
+                payload.record_context.route is None:
+            # Legacy NFS requests omit this new optional field entirely.
+            payload_json["record_context"].pop("route")
         canonical = canonical_json({
             "event_seq": envelope.event_seq,
             "event_type": envelope.event_type,
-            "payload": payload.model_dump(mode="json"),
+            "payload": payload_json,
             "proxy_session_id": envelope.proxy_session_id,
             "rule_set_id": envelope.rule_set_id,
             "schema_version": envelope.schema_version,
@@ -453,6 +459,11 @@ def _admit(session: _Session, request: JournalRequest) -> _Verdict:
         return _accept() if gen.state == "admitting" else _refuse("generation_not_admitting")
     if kind in ("EXPOSURE_INTENT", "APPLY_REFUSAL"):
         ctx: RecordContext = payload.record_context  # type: ignore[attr-defined]
+        if ctx.route == "nlm" and (ctx.backend != 0 or ctx.program != 100021 or
+                                   ctx.version != 4):
+            return _refuse("nlm_route_mismatch")
+        if ctx.route is None and ctx.program == 100021:
+            return _refuse("nlm_route_missing")
         if gen.state == "draining" and ctx.message_type != "reply":
             return _refuse("draining_call_context")
         if kind == "EXPOSURE_INTENT":

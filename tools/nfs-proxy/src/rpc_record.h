@@ -46,7 +46,12 @@
 struct nfsp_connection_ref {
 	uint64_t connection_id;
 	unsigned client, backend;
+	/* NLM shares the knfsd backend but not its listening transport. */
+	unsigned route;
 };
+
+#define NFSP_ROUTE_NFS 0u
+#define NFSP_ROUTE_NLM 1u
 
 /* The canonical record (design 01 §1).  `direction` is NFSP_DIR_C2S or
  * NFSP_DIR_S2C from proxy.h.  rpc_payload is a read-only view that is valid

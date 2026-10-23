@@ -37,6 +37,7 @@ struct conn {
 	uint64_t connection_id;
 	int client_fd, backend_fd;
 	unsigned client, backend;
+	unsigned route;
 	int connecting, connected;
 	uint64_t connect_deadline_ms;
 	int client_eof, backend_eof, client_wr_closed, backend_wr_closed;
@@ -53,7 +54,7 @@ struct state {
 	const struct nfsp_proxy_cfg *cfg;
 	struct nfsp_proxy_stats *stats;
 	struct conn conns[NFSP_MAX_CONNS];
-	int listeners[NFSP_BACKENDS];
+	int listeners[NFSP_MAX_LISTENERS];
 	struct in_addr clients[NFSP_CLIENTS];
 	size_t limit;
 	/* Monotonic over the whole run, never derived from a slot or an fd,
@@ -114,7 +115,8 @@ static int listener(const struct nfsp_route *r, uint16_t *bound)
 }
 
 /* A stalled or filtered local backend must not stall the other route. */
-static int start_backend(const struct nfsp_route *r, int *connecting)
+static int start_backend(const struct nfsp_route *r, int *connecting,
+			 const struct sockaddr_in *source)
 {
 	struct sockaddr_in sa;
 	int fd;
@@ -124,6 +126,23 @@ static int start_backend(const struct nfsp_route *r, int *connecting)
 	if (nonblock(fd) != 0 || tcp_nodelay(fd) != 0) {
 		close(fd);
 		return -1;
+	}
+	if (source != NULL) {
+		struct sockaddr_in local = *source;
+		local.sin_port = 0;
+		/* In the guest this address is non-local; a loopback-only test
+		 * can bind it without CAP_NET_ADMIN. Both need a return route. */
+		if (bind(fd, (const struct sockaddr *)&local, sizeof(local)) != 0) {
+			int one = 1;
+			if (errno != EADDRNOTAVAIL ||
+			    setsockopt(fd, SOL_IP, IP_TRANSPARENT,
+				       &one, sizeof(one)) != 0 ||
+			    bind(fd, (const struct sockaddr *)&local,
+				 sizeof(local)) != 0) {
+				close(fd);
+				return -1;
+			}
+		}
 	}
 	if (connect(fd, (const struct sockaddr *)&sa, sizeof(sa)) == 0) {
 		*connecting = 0;
@@ -143,6 +162,7 @@ static struct nfsp_connection_ref conn_ref(const struct conn *c)
 	ref.connection_id = c->connection_id;
 	ref.client = c->client;
 	ref.backend = c->backend;
+	ref.route = c->route;
 	return ref;
 }
 
@@ -491,14 +511,15 @@ static void half_close(struct conn *c)
 	}
 }
 
-static void accept_route(struct state *s, unsigned backend)
+static void accept_route(struct state *s, unsigned route)
 {
 	struct sockaddr_in peer;
 	socklen_t plen = sizeof(peer);
 	struct conn *c = NULL;
 	unsigned client;
+	unsigned backend = route == NFSP_BACKENDS ? 0u : route;
 	size_t i;
-	int cfd = accept(s->listeners[backend], (struct sockaddr *)&peer, &plen);
+	int cfd = accept(s->listeners[route], (struct sockaddr *)&peer, &plen);
 	if (cfd < 0) return;
 	for (client = 0; client < NFSP_CLIENTS; client++)
 		if (peer.sin_addr.s_addr == s->clients[client].s_addr) break;
@@ -519,6 +540,7 @@ static void accept_route(struct state *s, unsigned backend)
 	c->backend_fd = -1;
 	c->client = client;
 	c->backend = backend;
+	c->route = route == NFSP_BACKENDS ? NFSP_ROUTE_NLM : NFSP_ROUTE_NFS;
 	c->connection_id = s->next_connection_id++;
 	nfsp_framing_init(&c->c2s, s->limit);
 	nfsp_framing_init(&c->s2c, s->limit);
@@ -527,7 +549,11 @@ static void accept_route(struct state *s, unsigned backend)
 		struct nfsp_connection_ref ref = conn_ref(c);
 		s->cfg->on_connection(&ref, NFSP_CONN_OPENED, s->cfg->on_connection_arg);
 	}
-	c->backend_fd = start_backend(&s->cfg->route[backend], &c->connecting);
+	c->backend_fd = start_backend(route == NFSP_BACKENDS ?
+				      &s->cfg->nlm_route : &s->cfg->route[route],
+				      &c->connecting,
+				      route == NFSP_BACKENDS &&
+				      s->cfg->nlm_preserve_client_ip ? &peer : NULL);
 	if (c->backend_fd < 0) {
 		s->stats->connect_failed[client][backend]++;
 		conn_close(s, c);
@@ -570,6 +596,7 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 {
 	struct state *s;
 	unsigned b;
+	unsigned routes;
 	size_t i;
 	int rc = -1;
 	if (cfg == NULL || stats == NULL || cfg->stop == NULL) return -1;
@@ -582,7 +609,7 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 	/* Sentinels before the first goto out: calloc's zeros are valid fds
 	 * and would make `out` close fd 0 and report never-opened slots as
 	 * closed connections. */
-	for (b = 0; b < NFSP_BACKENDS; b++) s->listeners[b] = -1;
+	for (b = 0; b < NFSP_MAX_LISTENERS; b++) s->listeners[b] = -1;
 	for (i = 0; i < NFSP_MAX_CONNS; i++) s->conns[i].client_fd = -1;
 	if (s->limit > SIZE_MAX - NFSP_FRAG_HEADER_LEN - NFSP_READ_CHUNK ||
 	    s->limit < NFSP_FRAG_HEADER_LEN) goto out;
@@ -591,16 +618,23 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 		if (cfg->client_ip[b] == NULL ||
 		    inet_pton(AF_INET, cfg->client_ip[b], &s->clients[b]) != 1) goto out;
 	if (s->clients[0].s_addr == s->clients[1].s_addr) goto out;
+	routes = cfg->nlm_route.listen_ip == NULL ? NFSP_BACKENDS :
+		 NFSP_MAX_LISTENERS;
 	for (b = 0; b < NFSP_BACKENDS; b++) {
 		s->listeners[b] = listener(&cfg->route[b], &stats->bound_port[b]);
 		if (s->listeners[b] < 0) goto out;
 	}
+	if (routes == NFSP_MAX_LISTENERS) {
+		s->listeners[NFSP_BACKENDS] = listener(&cfg->nlm_route,
+						      &stats->nlm_bound_port);
+		if (s->listeners[NFSP_BACKENDS] < 0) goto out;
+	}
 	if (on_ready != NULL) on_ready(stats, ready_arg);
 	rc = 0;
 	while (!atomic_load(cfg->stop)) {
-		struct pollfd pfd[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
-		int owner[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
-		int side[NFSP_BACKENDS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
+		struct pollfd pfd[NFSP_MAX_LISTENERS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
+		int owner[NFSP_MAX_LISTENERS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
+		int side[NFSP_MAX_LISTENERS + 2u * NFSP_MAX_CONNS + NFSP_EXTRA_FDS];
 		nfds_t count = 0;
 		int n;
 		uint64_t now = now_ms();
@@ -617,7 +651,7 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 		}
 		if (cfg->on_stats != NULL)
 			cfg->on_stats(stats, cfg->on_stats_arg);
-		for (b = 0; b < NFSP_BACKENDS; b++) {
+		for (b = 0; b < routes; b++) {
 			pfd[count] = (struct pollfd){s->listeners[b], POLLIN, 0};
 			owner[count] = -1;
 			side[count++] = (int)b;
@@ -707,7 +741,7 @@ int nfsp_proxy_run(const struct nfsp_proxy_cfg *cfg,
 out:
 	for (i = 0; i < NFSP_MAX_CONNS; i++)
 		if (s->conns[i].client_fd >= 0) conn_close(s, &s->conns[i]);
-	for (b = 0; b < NFSP_BACKENDS; b++)
+	for (b = 0; b < NFSP_MAX_LISTENERS; b++)
 		if (s->listeners[b] >= 0) close(s->listeners[b]);
 	nfsp_record_buf_free(&s->payload);
 	free(s);

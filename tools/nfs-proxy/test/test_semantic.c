@@ -16,11 +16,13 @@
 
 extern const struct nfsp_schema_family nfsp_schema_family_nfs4;
 extern const struct nfsp_schema_family nfsp_schema_family_nfs3;
+extern const struct nfsp_schema_family nfsp_schema_family_nlm4;
 
 /* As the proxy registers them (main.c). */
 static const struct nfsp_schema_family *const fams[] = {
 	&nfsp_schema_family_nfs4,
 	&nfsp_schema_family_nfs3,
+	&nfsp_schema_family_nlm4,
 };
 
 static int failures;
@@ -46,6 +48,9 @@ static int checks;
 #define OP_GETFH	10u
 #define NFS3_READ	6u
 #define NFS3_WRITE	7u
+#define NLM_PROG	100021u
+#define NLM_LOCK	2u
+#define NLM_LOCK_RES	12u
 
 struct msg {
 	uint8_t b[512];
@@ -66,6 +71,12 @@ static void wraw(struct msg *m, const char *s, size_t len)
 	m->n += len;
 	while (m->n % 4u)
 		m->b[m->n++] = 0;
+}
+
+static void wblob(struct msg *m, const char *s, size_t len)
+{
+	w32(m, (uint32_t)len);
+	wraw(m, s, len);
 }
 
 static void call_header(struct msg *m, uint32_t xid, uint32_t prog,
@@ -221,6 +232,38 @@ static void v3_read_reply(struct msg *m, uint32_t xid)
 	w32(m, 1);		/* eof */
 	w32(m, 5);		/* data */
 	wraw(m, "hello", 5);
+}
+
+static void nlm_lock_call(struct msg *m, uint32_t xid)
+{
+	call_header(m, xid, NLM_PROG, 4, NLM_LOCK);
+	wblob(m, "cookie", 6);
+	w32(m, 1);		/* block */
+	w32(m, 1);		/* exclusive */
+	wblob(m, "host", 4);
+	wblob(m, "fh", 2);
+	wblob(m, "owner", 5);
+	w32(m, 7);		/* svid */
+	w32(m, 0);
+	w32(m, 0x1000);		/* offset */
+	w32(m, 0);
+	w32(m, 0x20);		/* length */
+	w32(m, 0);		/* reclaim */
+	w32(m, 42);		/* state */
+}
+
+static void nlm_lock_reply(struct msg *m, uint32_t xid)
+{
+	reply_header(m, xid);
+	wblob(m, "cookie", 6);
+	w32(m, 0);		/* NLM4_GRANTED */
+}
+
+static void nlm_lock_res_call(struct msg *m, uint32_t xid)
+{
+	call_header(m, xid, NLM_PROG, 4, NLM_LOCK_RES);
+	wblob(m, "cookie", 6);
+	w32(m, 0);		/* NLM4_GRANTED */
 }
 
 static void cb_call(struct msg *m, uint32_t xid)
@@ -485,6 +528,50 @@ static void test_nfs3_reply_schema(void)
 	nfsp_semantic_free(&s);
 }
 
+/* LOCK_RES is a separate RPC CALL, not the REPLY to LOCK_MSG.  This
+ * synthetic connection checks direction-keyed dispatch, not callback routing. */
+static void test_nlm4_sync_and_async(void)
+{
+	struct nfsp_semantic s;
+	struct msg m;
+
+	setup(&s, NFSP_TXN_FWD_ORIGINAL);
+	nlm_lock_call(&m, 9);
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	CHECK(seen.txn == NFSP_TXN_INSERTED && seen.status ==
+	      NFSP_DECODE_DECODED && seen.entry_prog == NLM_PROG &&
+	      seen.entry_proc == NLM_LOCK && !strcmp(seen.proc_name, "LOCK"),
+	      "NLM LOCK call: %s", nfsp_decode_strstatus(seen.status));
+
+	nlm_lock_res_call(&m, 9);
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_INSERTED && seen.status ==
+	      NFSP_DECODE_DECODED && seen.entry_proc == NLM_LOCK_RES &&
+	      !strcmp(seen.proc_name, "LOCK_RES"),
+	      "NLM LOCK_RES call: %s", nfsp_decode_strstatus(seen.status));
+
+	nlm_lock_reply(&m, 9);
+	feed(&s, 1, NFSP_DIR_S2C, &m);
+	CHECK(seen.txn == NFSP_TXN_FOUND && seen.entry_proc == NLM_LOCK &&
+	      seen.status == NFSP_DECODE_DECODED &&
+	      seen.source == NFSP_DISPATCH_TRANSACTION_ENTRY &&
+	      seen.has_request && !strcmp(seen.proc_name, "LOCK") &&
+	      seen.nfields > 0, "NLM LOCK reply: %s",
+	      nfsp_decode_strstatus(seen.status));
+
+	reply_header(&m, 9);	/* LOCK_RES has a void RPC reply. */
+	feed(&s, 1, NFSP_DIR_C2S, &m);
+	CHECK(seen.txn == NFSP_TXN_FOUND && seen.entry_proc == NLM_LOCK_RES &&
+	      seen.status == NFSP_DECODE_DECODED &&
+	      seen.source == NFSP_DISPATCH_TRANSACTION_ENTRY &&
+	      seen.has_request && !strcmp(seen.proc_name, "LOCK_RES") &&
+	      seen.nfields == 0, "NLM LOCK_RES reply: %s",
+	      nfsp_decode_strstatus(seen.status));
+	CHECK(s.txn.stats.outstanding == 0 && s.txn.stats.found == 2,
+	      "both NLM transactions are complete");
+	nfsp_semantic_free(&s);
+}
+
 /* Oracle 13: on one connection a forechannel CALL (C2S) and a backchannel
  * CALL (S2C) with the same XID are two transactions; each REPLY, which
  * travels the other way, finds its own. */
@@ -611,7 +698,7 @@ static void test_ambiguous(void)
 static void test_lifecycle(void)
 {
 	struct nfsp_semantic s;
-	struct nfsp_connection_ref c = { 1, 0, 0 };
+	struct nfsp_connection_ref c = { 1, 0, 0, NFSP_ROUTE_NFS };
 	struct msg m;
 
 	setup(&s, NFSP_TXN_FWD_ORIGINAL);
@@ -676,6 +763,7 @@ int main(void)
 	test_out_of_order_minors();
 	test_no_dispatch();
 	test_nfs3_reply_schema();
+	test_nlm4_sync_and_async();
 	test_backchannel();
 	test_forwarded_unknown();
 	test_reuse_after_unresolved();

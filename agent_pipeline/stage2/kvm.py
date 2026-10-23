@@ -438,6 +438,10 @@ def _manager_assets(manager: dict[str, Any], vm: dict[str, Any],
 
 def _manager_cmdline(vm: dict[str, Any], descriptor: ExecutionHarnessDescriptor,
                      harness: ReachabilityHarness, lane_sha256: str) -> str:
+    if harness.runtime_selection.fixture_mode == "nlm-knfsd":
+        raise Stage2StepError(
+            "nlm-knfsd is Stage 1 only; Stage 2 NLM relay and semantic "
+            "promotion are unavailable")
     raw = vm.get("cmdline")
     if not isinstance(raw, str) or not raw:
         raise Stage2StepError("manager VM has no kernel command line")
@@ -744,11 +748,16 @@ def _gate(inputs: _Inputs, output: Path, options: StepOptions) -> None:
                     inputs.harness.runtime_selection, inputs.lane_sha256,
                     inputs.collector, work, result,
                     exec_slowdown=options.exec_slowdown)
-                scenario_output = (work / "executor.log").read_text(
-                    errors="replace")
-                neutral, neutral_output = _neutral_run(
-                    guest, inputs.root / "neutral.syz", inputs.collector,
-                    exec_slowdown=options.exec_slowdown)
+                scenario_log = work / "executor.log"
+                scenario_output = (scenario_log.read_text(errors="replace")
+                                   if scenario_log.is_file() else "")
+                if not (scenario.boot_ok and scenario.fixture_ok
+                        and scenario.lane_ok):
+                    neutral, neutral_output = LaneRun(), ""
+                else:
+                    neutral, neutral_output = _neutral_run(
+                        guest, inputs.root / "neutral.syz", inputs.collector,
+                        exec_slowdown=options.exec_slowdown)
             finally:
                 guest.stop()
         except BaseException:

@@ -67,6 +67,7 @@ struct fake {
 	unsigned nworkers;
 	unsigned nrecords;
 	_Atomic unsigned accepted, received[2];
+	_Atomic uint32_t peer_addr[2];
 };
 
 struct fixture {
@@ -85,6 +86,8 @@ struct fixture {
 	pthread_mutex_t rendezvous_mutex;
 	pthread_cond_t rendezvous_cond;
 	_Atomic unsigned mutations;
+	_Atomic unsigned target_seen[2][2];
+	_Atomic unsigned target_nlm_seen;
 	struct conn_log conns;
 };
 
@@ -185,9 +188,12 @@ static void *serve(void *arg)
 	struct fake *b = job->backend;
 	struct fixture *f = b->parent;
 	int fd = job->fd;
+	struct sockaddr_in peer = {0};
+	socklen_t peer_len = sizeof(peer);
 	uint8_t h[4], body[16], reply[6];
 	free(job);
 	timeout_socket(fd);
+	(void)getpeername(fd, (struct sockaddr *)&peer, &peer_len);
 	for (unsigned i = 0; i < b->nrecords; i++) {
 		uint32_t word;
 		unsigned client;
@@ -196,6 +202,7 @@ static void *serve(void *arg)
 		if (ntohl(word) != 0x80000002u || exact(fd, body, 2) != 0) break;
 		client = (unsigned)(body[0] >> 4);
 		if (client >= 2 || body[1] != (uint8_t)('0' + b->backend)) break;
+		atomic_store(&b->peer_addr[client], peer.sin_addr.s_addr);
 		atomic_fetch_add(&b->received[client], 1u);
 		if (f->rendezvous) {
 			pthread_mutex_lock(&f->rendezvous_mutex);
@@ -311,7 +318,26 @@ static void log_conn(const struct nfsp_connection_ref *ref, int event, void *arg
 	if (event == NFSP_CONN_CLOSED) atomic_fetch_add(&l->nclosed, 1u);
 }
 
-static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrecords)
+static int target_passthrough(const struct nfsp_rpc_record *record,
+			      const uint8_t *framed, size_t len,
+			      struct nfsp_relay_verdict *verdict, void *arg)
+{
+	struct fixture *f = arg;
+	if (record->conn.backend != 0 || record->conn.client >= 2 ||
+	    (record->conn.route != NFSP_ROUTE_NFS &&
+	     record->conn.route != NFSP_ROUTE_NLM) ||
+	    record->direction < 0 || record->direction > 1 ||
+	    record->rpc_payload_len != 2 || len != 6 || framed == NULL ||
+	    verdict->out != framed || verdict->out_len != len)
+		return NFSP_RELAY_REFUSE;
+	atomic_fetch_add(&f->target_seen[record->conn.client][record->direction], 1u);
+	if (record->conn.route == NFSP_ROUTE_NLM)
+		atomic_fetch_add(&f->target_nlm_seen, 1u);
+	return NFSP_RELAY_FORWARD;
+}
+
+static int fixture_up_routes(struct fixture *f, int dead, int rendezvous,
+			     unsigned nrecords, int nlm)
 {
 	struct sockaddr_in sa = {0};
 	socklen_t len = sizeof(sa);
@@ -328,6 +354,11 @@ static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrec
 	f->cfg.client_ip[1] = fixture_client_ip[1];
 	f->cfg.route[0] = (struct nfsp_route){fixture_listen_ip[0], 0, "127.0.0.1", f->fake[0].port};
 	f->cfg.route[1] = (struct nfsp_route){fixture_listen_ip[1], 0, "127.0.0.1", f->fake[1].port};
+	if (nlm)
+		f->cfg.nlm_route = (struct nfsp_route){fixture_listen_ip[0], 0,
+						"127.0.0.1", f->fake[0].port};
+	if (nlm)
+		f->cfg.nlm_preserve_client_ip = 1;
 	if (dead) {
 		f->dead_fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (f->dead_fd < 0) return -1;
@@ -346,6 +377,10 @@ static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrec
 	f->cfg.connect_timeout_ms = 250;
 	f->cfg.on_record = mutate;
 	f->cfg.on_record_arg = f;
+	if (nlm) {
+		f->cfg.on_relay = target_passthrough;
+		f->cfg.relay_arg = f;
+	}
 	f->cfg.on_connection = log_conn;
 	f->cfg.on_connection_arg = &f->conns;
 	if (pthread_create(&f->proxy_thread, NULL, run_proxy, f) != 0) return -1;
@@ -357,7 +392,13 @@ static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrec
 		f->port[1] = f->stats.bound_port[1];
 	}
 	pthread_mutex_unlock(&f->mutex);
-	return f->ready && f->port[0] && f->port[1] ? 0 : -1;
+	return f->ready && f->port[0] && f->port[1] &&
+		(!nlm || f->stats.nlm_bound_port) ? 0 : -1;
+}
+
+static int fixture_up(struct fixture *f, int dead, int rendezvous, unsigned nrecords)
+{
+	return fixture_up_routes(f, dead, rendezvous, nrecords, 0);
 }
 
 static void fixture_down(struct fixture *f)
@@ -389,6 +430,25 @@ static int client_socket(struct fixture *f, unsigned client, unsigned backend)
 	if (inet_pton(AF_INET, f->cfg.route[backend].listen_ip, &dst.sin_addr) != 1)
 		goto fail;
 	dst.sin_port = htons(f->port[backend]);
+	if (bind(fd, (struct sockaddr *)&src, sizeof(src)) != 0 ||
+	    connect(fd, (struct sockaddr *)&dst, sizeof(dst)) != 0) goto fail;
+	return fd;
+fail:
+	close(fd);
+	return -1;
+}
+
+static int nlm_client_socket(struct fixture *f, unsigned client)
+{
+	struct sockaddr_in src = {0}, dst = {0};
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+	timeout_socket(fd);
+	src.sin_family = dst.sin_family = AF_INET;
+	if (inet_pton(AF_INET, f->cfg.client_ip[client], &src.sin_addr) != 1 ||
+	    inet_pton(AF_INET, f->cfg.nlm_route.listen_ip, &dst.sin_addr) != 1)
+		goto fail;
+	dst.sin_port = htons(f->stats.nlm_bound_port);
 	if (bind(fd, (struct sockaddr *)&src, sizeof(src)) != 0 ||
 	    connect(fd, (struct sockaddr *)&dst, sizeof(dst)) != 0) goto fail;
 	return fd;
@@ -464,6 +524,62 @@ static void test_four(void)
 	CHECK(f.stats.relay_errors == 0 && f.stats.framing_errors == 0,
 	      "unexpected relay/framing error: %u/%u",
 	      f.stats.relay_errors, f.stats.framing_errors);
+}
+
+static void test_nlm_route_shares_identity(void)
+{
+	struct fixture f;
+	int nfs, nlm;
+	unsigned opened = 0;
+	uint64_t ids[2] = {0, 0};
+	printf("optional NLM route shares the NFS relay identity domain\n");
+	if (fixture_up_routes(&f, 0, 0, 2, 1) != 0) {
+		CHECK(0, "NLM fixture setup"); return;
+	}
+	nfs = client_socket(&f, 0, 0);
+	nlm = nlm_client_socket(&f, 1);
+	CHECK(nfs >= 0 && nlm >= 0, "NFS and NLM routes connect");
+	if (nfs >= 0) {
+		CHECK(request(nfs, 0, 0, 1) == 0 && reply(nfs, 0, 0, 1) == 0,
+		      "NFS route relays");
+		close(nfs);
+	}
+	if (nlm >= 0) {
+		CHECK(request(nlm, 1, 0, 2) == 0 && reply(nlm, 1, 0, 2) == 0,
+		      "NLM route relays through knfsd backend");
+		close(nlm);
+	}
+	fixture_down(&f);
+	for (unsigned i = 0; i < atomic_load(&f.conns.nev); i++) {
+		const struct conn_event *event = &f.conns.ev[i];
+		if (event->event != NFSP_CONN_OPENED) continue;
+		if (opened < 2) ids[opened] = event->ref.connection_id;
+		CHECK(event->ref.backend == 0, "NLM must retain knfsd backend identity");
+		CHECK(event->ref.route == (event->ref.client == 1 ?
+		      NFSP_ROUTE_NLM : NFSP_ROUTE_NFS),
+		      "connection has wrong transport route");
+		opened++;
+	}
+	CHECK(opened == 2 && ids[0] != 0 && ids[1] != 0 && ids[0] != ids[1],
+	      "connections do not share or reuse an identity");
+	CHECK(atomic_load(&f.conns.nclosed) == 2, "both connections close once");
+	CHECK(atomic_load(&f.target_nlm_seen) == 2,
+	      "NLM call and reply retain transport route");
+	CHECK(f.stats.accepted[0][0] == 1 && f.stats.accepted[1][0] == 1 &&
+	      atomic_load(&f.fake[0].received[0]) == 1 &&
+	      atomic_load(&f.fake[0].received[1]) == 1,
+	      "both routes reach the same knfsd backend");
+	struct in_addr nlm_source;
+	CHECK(inet_pton(AF_INET, fixture_client_ip[1], &nlm_source) == 1,
+	      "fixture NLM client address parses");
+	CHECK(atomic_load(&f.fake[0].peer_addr[1]) == nlm_source.s_addr,
+	      "NLM backend must see the original client IP");
+	for (unsigned c = 0; c < 2; c++)
+		for (unsigned d = 0; d < 2; d++)
+			CHECK(atomic_load(&f.target_seen[c][d]) == 1,
+			      "target hook missed route client=%u direction=%u", c, d);
+	CHECK(f.stats.relay_errors == 0 && f.stats.framing_errors == 0,
+	      "NLM route introduced a relay error");
 }
 
 static void test_dead(void)
@@ -1251,6 +1367,7 @@ int main(int argc, char **argv)
 		return 3;
 	}
 	test_four();
+	test_nlm_route_shares_identity();
 	test_dead();
 	test_three_coalesced_and_split();
 	test_resize_keeps_stream_in_sync();

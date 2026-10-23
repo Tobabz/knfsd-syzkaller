@@ -174,6 +174,37 @@ def test_retransmission_is_re_acked_without_a_second_append(journal, tmp_path):
     assert len([e for e in journal.events() if e.request.event_type == "EXPOSURE_INTENT"]) == 1
 
 
+def test_nlm_route_context_is_typed_and_checked(journal):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1),
+                                        "draining_generations": []})[1])
+    payload = exposure(1, 0)
+    assert "route" not in payload["record_context"]  # legacy NFS encoding
+    accepted(g.send("EXPOSURE_INTENT", payload)[1])
+    payload = exposure(1, 1)
+    payload["record_context"] = ctx(program=100021, version=4)
+    refused(g.send("EXPOSURE_INTENT", payload)[1], "nlm_route_missing")
+
+    for change in ({"backend": 1}, {"program": 100003}, {"version": 3}):
+        payload = exposure(1, 1)
+        payload["record_context"] = ctx(**{"route": "nlm", "program": 100021,
+                                           "version": 4, **change})
+        refused(g.send("EXPOSURE_INTENT", payload)[1], "nlm_route_mismatch")
+
+    payload = exposure(1, 1)
+    payload["record_context"] = ctx(route="nlm", program=100021, version=4)
+    accepted(g.send("EXPOSURE_INTENT", payload)[1])
+    refusal = {"correlation": corr(1), "record_context": ctx(
+        route="nlm", program=100021, version=4, message_type="reply"),
+        "refusal": "conflict", "rule_id": "r1"}
+    accepted(g.send("APPLY_REFUSAL", refusal)[1])
+    refusal["record_context"] = ctx(route="other", program=100021, version=4)
+    refused(g.send("APPLY_REFUSAL", refusal)[1], "malformed_request")
+    payload = exposure(1, 2)
+    payload["record_context"]["route"] = None
+    refused(g.send("EXPOSURE_INTENT", payload)[1], "malformed_request")
+
+
 def test_same_seq_other_payload_is_conflict_and_recorded(journal):
     g = started(journal)
     accepted(g.send("GENERATION_OPEN", {"correlation": corr(1),
