@@ -5,7 +5,7 @@ to run one candidate on a real guest:
 
 | Command | What |
 |---|---|
-| `generate SPEC` | Writes every host record `stage1.json` refers to, plus `stage1.json` and `collector.json` |
+| `generate SPEC` | Writes every host record `stage1.json` refers to, plus `stage1.json` and `collector.json`; with a `stage2` section, the Stage 2 syz-manager config (`../../stage2/README.md`) |
 | `collect --config collector.json IN OUT` | The engine's host command: boots one guest, runs the harness program on lane 0 with remote KCOV, writes the capture |
 | `probe --stage1 S --program P --out D` | Runs one program the same way, without the service. Use it first on a new host |
 | `target-pcs --stage1 S --job J --out F` | Builds a verified `TargetPcMapping` for a submitted job from the pinned vmlinux |
@@ -140,7 +140,8 @@ it is collected and listed per variant; a variant without it has those
 capabilities without evidence. `collector.json` keeps each variant's
 `bzimage` and `kernel` under `variant_files`, and the collector boots the
 files of the lease's descriptor. `probe` and `check-pcs` take
-`--variant kcsan`; a KCSAN harness also reports `BUG: KCSAN:` as a crash.
+`--variant kcsan`; a KCSAN harness also reports `BUG: KCSAN:` as a crash. A
+`stage2` section writes one manager config per variant.
 
 ## How the pieces bind
 

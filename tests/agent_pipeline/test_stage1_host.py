@@ -9,6 +9,7 @@ the model responses and the syzkaller parser.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -1543,3 +1544,128 @@ def test_a_kcsan_harness_seals_a_kcsan_report(host, tmp_path):
     run = _collect(host, tmp_path / "kasan", approval=0, pcs=["0x401000"],
                    console=KCSAN_REPORT)
     assert _crash(run) is None
+
+
+# ------------------------------------------------------------ Stage 2 manager
+
+def _with_stage2(host, **stage2):
+    spec = json.loads(host.spec.read_text())
+    spec["stage2"] = stage2
+    host.spec.write_text(json.dumps(spec, indent=1))
+
+
+def _preflight_manager(host, result, path: Path) -> str:
+    """The Stage 2 preflight's manager check on a generated config, against
+    every generated harness."""
+    from agent_pipeline.materializer import (ExecutionHarnessApproval,
+                                             descriptor_id)
+    from agent_pipeline.stage2.host import _approved_harness, _check_manager
+    config = Stage1Config.load(result.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    descriptors = [load_record(store, ref, ExecutionHarnessApproval).descriptor
+                   for ref in config.execution_harness_approvals]
+    harnesses = tuple(_approved_harness(store, descriptor_id(d), d)
+                      for d in descriptors)
+    (host.env / "syzkaller" / "bin" / "syz-manager").chmod(0o755)
+    command = SimpleNamespace(
+        argv=("/bin/true", "--manager", str(path), "{input}", "{output}"),
+        cwd=host.root)
+    return _check_manager(
+        path, 4, command=command,
+        collector=CollectorConfig.load(result.collector_config),
+        harnesses=harnesses, expected_target=config.syzkaller_identity.target,
+        which=lambda _: "/bin/true")
+
+
+@needs_gcc
+def test_generate_writes_a_stage2_manager_the_preflight_accepts(host):
+    # #81 D17: the manager is pinned to the Stage 1 collector's descriptor.
+    _with_stage2(host, procs=2, nfs_proxy_window=6)
+    result = generate(host.spec)
+    path = result.stage2_managers["kasan"]
+    assert path == host.root / "state" / "stage2-manager.json"
+    manager = json.loads(path.read_text())
+    # Every admitted call and every call the selection enables.
+    assert manager["enable_syscalls"] == ["close", "openat$lane", "read$extra"]
+    assert manager["procs"] == 2
+    assert manager["experimental"] == {"remote_cover": True,
+                                       "nfs_proxy_window": 6}
+    collector = CollectorConfig.load(result.collector_config)
+    assert manager["vm"]["kernel"] == str(collector.files["bzimage"])
+    assert Path(manager["kernel_obj"]) / "vmlinux" == collector.files["kernel"]
+    assert manager["image"] == str(collector.files["vm-image"])
+    assert manager["sshkey"] == str(collector.ssh_key)
+    lane = Path(manager["workdir_template"]) / "lane.sh"
+    assert lane.read_bytes() == collector.files["lane-script"].read_bytes()
+    cmdline = manager["vm"]["cmdline"].split()
+    assert cmdline[:4] == ["root=/dev/sda", "console=ttyS0", "nokaslr",
+                           "nfs.localio_enabled=N"]
+    assert {"koov.nfs_version=4.1", "koov.nfs_trace=0",
+            "koov.nfs_target=1"} <= set(cmdline)
+    assert result.digests["stage2_manager"] == hashlib.sha256(
+        path.read_bytes()).hexdigest()
+    assert "2 proc(s)" in _preflight_manager(host, result, path)
+    # Generating again keeps the frozen lane template.
+    assert generate(host.spec).stage2_managers["kasan"].read_bytes() == \
+        path.read_bytes()
+
+
+@needs_gcc
+def test_stage2_manager_calls_include_the_approved_calls(host):
+    _with_stage2(host, enable_syscalls=["close", "write$known"])
+    with pytest.raises(GenerationError,
+                       match=r"lacks approved calls: openat\$lane, read\$extra"):
+        generate(host.spec)
+    _with_stage2(host, enable_syscalls=[
+        "close", "openat$lane", "read$extra", "write$nope"])
+    with pytest.raises(GenerationError, match=r"lacks: write\$nope"):
+        generate(host.spec)
+    _with_stage2(host, enable_syscalls=[
+        "close", "openat$lane", "read$extra", "write$known"])
+    manager = json.loads(generate(host.spec).stage2_managers["kasan"]
+                         .read_text())
+    assert manager["enable_syscalls"][-1] == "write$known"
+
+
+@needs_gcc
+def test_stage2_manager_boots_a_spec_runtime_selection(host):
+    other = host.selection.model_copy(update={"nfs_version": "4.2",
+                                              "profile": "knfsd-v42"})
+    _with_stage2(host, runtime_selection=other.model_dump(mode="json"))
+    with pytest.raises(GenerationError, match="not one of runtime_selections"):
+        generate(host.spec)
+
+
+@needs_gcc
+def test_each_variant_gets_its_own_stage2_manager(host):
+    _two_variants(host)
+    _with_stage2(host)
+    result = generate(host.spec)
+    assert set(result.stage2_managers) == {"kasan", "kcsan"}
+    kernels = set()
+    for name, path in result.stage2_managers.items():
+        assert path.name == f"stage2-manager-{name}.json"
+        manager = json.loads(path.read_text())
+        kernels.add(manager["vm"]["kernel"])
+        # The preflight matches the manager to its own variant.
+        assert "approved assets" in _preflight_manager(host, result, path)
+        assert result.digests[f"{name}:stage2_manager"]
+    assert len(kernels) == 2
+
+
+def test_live_spec_manager_enables_the_live_bind_calls():
+    # The live BIND path is the HCAP-14 syzlang calls (patch 0031); the
+    # manager enables them as approved calls.
+    from agent_pipeline.stage1.host.generate import HostSpec, _approved_calls
+    spec = HostSpec.model_validate_json(
+        (REPO / "stage1-host-live/host-spec.json").read_bytes())
+    assert spec.stage2 is not None
+    bind = next(c for c in spec.capabilities if c.id == "HCAP-14")
+    (selection,) = spec.runtime_selections
+    calls = {e.call for e in spec.admission_source.entries} | {
+        i for i in selection.enabled_interfaces if i != "remote_cover"}
+    table = SimpleNamespace(calls=tuple(sorted(calls)))
+    approved = _approved_calls(spec.admission_source, table, selection)
+    assert set(bind.interface.syz_calls) <= approved
+    assert "write$nfs41_bind_conn_to_session" in approved
+    assert "remote_cover" not in approved

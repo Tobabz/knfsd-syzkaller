@@ -18,6 +18,8 @@ host's build outputs (``tools/bootstrap-kcov-env.py`` env directory and the
   admission profile, neutral controls and judge profile are shared;
 * ``stage1.json`` (service config), ``collector.json`` (host command
   config) and ``generated.json`` (every digest, for the record).
+* with a ``stage2`` section (#81 D17), the Stage 2 syz-manager config of
+  each variant (``stage2-manager.json``) and its frozen lane template.
 
 Generation checks the cross-record rules the service enforces later, so a
 wrong spec fails here and not in the middle of a run.
@@ -55,8 +57,8 @@ from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
                    RemoteKcovSupportBoundary)
 from ...registry import HarnessCatalog, HarnessRegistration
 from ..config import EngineConfig, SlotsConfig, Stage1Config
-from .collector import CollectorConfig
-from .pins import InstrumentationManifest, pin_file
+from .collector import CollectorConfig, guest_cmdline
+from .pins import InstrumentationManifest, file_sha256, pin_file
 
 REPO = Path(__file__).resolve().parents[3]
 DEFAULT_CMDLINE = "root=/dev/sda console=ttyS0 nokaslr nfs.localio_enabled=N"
@@ -404,6 +406,25 @@ class Hcap13KvmEvidence(_Spec):
         return self
 
 
+class Stage2ManagerSpec(_Spec):
+    """``stage2``: the syz-manager config a Stage 2 lease runs (#81 D17).
+    Generation writes it from each variant's descriptor, so its kernel,
+    image, lane script, syzkaller binaries, command line, SSH key and QEMU
+    are the ones the Stage 1 collector runs."""
+
+    #: The runtime selection the manager boots; it may be left out when
+    #: the spec has one.  A Stage 2 lease checks it against its harness.
+    runtime_selection: RuntimeSelection | None = None
+    procs: int = Field(default=1, ge=1, le=64)
+    #: ``experimental.nfs_proxy_window``; the Stage 2 preflight requires
+    #: at least ``Stage2Config.crash_window_bound``.
+    nfs_proxy_window: int = Field(default=6, ge=1, le=64)
+    #: Calls the manager enables.  Left out, they are the approved calls:
+    #: every admitted call and every call a runtime selection enables.
+    #: Given, they must include all of them.
+    enable_syscalls: tuple[str, ...] | None = None
+
+
 class VariantSpec(_Spec):
     """One sanitizer build of the shared harness (#81 D10).  Its kernel is
     ``env_dir/images/<sanitizer>``; capability evidence is pinned to its
@@ -460,6 +481,7 @@ class HostSpec(_Spec):
     policies: tuple[JobPolicy, ...] = Field(min_length=1)
     engine: EngineSpec = EngineSpec()
     collector: CollectorSpec = CollectorSpec()
+    stage2: Stage2ManagerSpec | None = None
 
     @model_validator(mode="after")
     def _variants(self) -> Self:
@@ -593,11 +615,109 @@ class Generated(BaseModel):
     execution_harness_id: str
     hcap_revision: str
     variants: dict[str, GeneratedVariant] = {}
+    #: Sanitizer -> the Stage 2 manager config generated for it.
+    stage2_managers: dict[str, Path] = {}
     digests: dict[str, str]
 
 
 #: Descriptor build artifacts that differ between sanitizer variants.
 VARIANT_FILES = ("bzimage", "kernel")
+
+#: boot-fixture.sh always sets up this many lanes; the manager gets one
+#: journal channel for each (and at least one for each proc).
+GUEST_LANES = 4
+
+
+def _approved_calls(profile, table: SyzkallerCallTable,
+                    selection: RuntimeSelection) -> set[str]:
+    """Every admitted call and every call the selection enables; its other
+    interfaces are runtime features (``remote_cover``)."""
+    calls = set(table.calls)
+    return ({e.call for e in profile.entries}
+            | {i for i in selection.enabled_interfaces if i in calls})
+
+
+def _stage2_selection(spec: HostSpec) -> RuntimeSelection:
+    wanted = spec.stage2.runtime_selection
+    if wanted is None:
+        if len(spec.runtime_selections) != 1:
+            raise GenerationError("stage2.runtime_selection is required when "
+                                  "the spec has several runtime selections")
+        return spec.runtime_selections[0]
+    match = [s for s in spec.runtime_selections
+             if _runtime_key(s) == _runtime_key(wanted)]
+    if not match:
+        raise GenerationError("stage2.runtime_selection is not one of "
+                              "runtime_selections")
+    return match[0]
+
+
+def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
+                  selection: RuntimeSelection) -> tuple[str, ...]:
+    approved = _approved_calls(profile, table, selection)
+    given = spec.stage2.enable_syscalls
+    if given is None:
+        return tuple(sorted(approved))
+    missing = sorted(approved - set(given))
+    if missing:
+        raise GenerationError("stage2.enable_syscalls lacks approved calls: "
+                              + ", ".join(missing))
+    unknown = sorted(set(given) - set(table.calls))
+    if unknown:
+        raise GenerationError("stage2.enable_syscalls names calls the "
+                              "syzkaller build lacks: " + ", ".join(unknown))
+    if len(set(given)) != len(given):
+        raise GenerationError("stage2.enable_syscalls repeats a call")
+    return given
+
+
+def _stage2_manager(spec: HostSpec, *, descriptor: ExecutionHarnessDescriptor,
+                    selection: RuntimeSelection, calls: tuple[str, ...],
+                    files: dict[str, Path], template: Path, lane_sha256: str,
+                    syzkaller: Path, ssh_key: Path, state: Path) -> dict:
+    """The syz-manager config of one variant, in the shape the Stage 2
+    preflight and KVM step check (``stage2/host.py``, ``stage2/kvm.py``).
+    The step replaces the workdir, the lane template, the HTTP address
+    and the journal channels for each lease."""
+    s2 = spec.stage2
+    cmdline = " ".join([guest_cmdline(descriptor, selection, lane_sha256),
+                        "koov.nfs_target=1"])
+    sockets = state / "stage2-journal"
+    if any(c.isspace() or c == "," for c in str(sockets)):
+        raise GenerationError("state_dir cannot contain whitespace or commas "
+                              "(it is in the manager's QEMU arguments)")
+    qemu_args = [
+        "-enable-kvm", "-cpu", "host",
+        "-fsdev", ("local,id=koov_lane,path={{TEMPLATE}},"
+                   "security_model=none,readonly=on"),
+        "-device", "virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane",
+        "-device", "virtio-serial-pci,id=nfspser"]
+    for lane in range(max(GUEST_LANES, s2.procs)):
+        qemu_args += [
+            "-chardev", (f"socket,id=nfspj{lane},"
+                         f"path={sockets / f'lane{lane}.sock'},server=off"),
+            "-device", (f"virtserialport,bus=nfspser.0,chardev=nfspj{lane},"
+                        f"name=nfsp-journal-{lane}")]
+    return {
+        "name": f"stage2-{descriptor.sanitizer.value}",
+        "target": descriptor.syzkaller_identity.target,
+        "http": "",
+        "workdir": str(state / "stage2-workdir"),
+        "workdir_template": str(template),
+        "kernel_obj": str(files["kernel"].parent),
+        "image": str(files["vm-image"]),
+        "sshkey": str(ssh_key),
+        "syzkaller": str(syzkaller),
+        "procs": s2.procs,
+        "type": "qemu",
+        "enable_syscalls": list(calls),
+        "experimental": {"remote_cover": True,
+                         "nfs_proxy_window": s2.nfs_proxy_window},
+        "vm": {"count": 1, "cpu": spec.collector.cpus,
+               "mem": spec.collector.memory_mb, "qemu": spec.collector.qemu,
+               "kernel": str(files["bzimage"]), "cmdline": cmdline,
+               "qemu_args": " ".join(qemu_args)},
+    }
 
 
 def generate(spec_path: Path, *, python: str = sys.executable,
@@ -813,6 +933,9 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         entries=tuple(neutral_entries))
     neutral_ref = put_record(store, neutral)
     digests["neutral_control_catalog"] = neutral_ref
+    if spec.stage2 is not None:
+        stage2_selection = _stage2_selection(spec)
+        stage2_calls = _stage2_calls(spec, profile, table, stage2_selection)
     judge_profile_ref = put_record(store, spec.judge_profile)
     digests["q1_admissibility_profile"] = judge_profile_ref
     if "nokaslr" not in spec.guest_kernel_command_line.split():
@@ -822,6 +945,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     # ---------------------------------------------------- per variant
     results: dict[Sanitizer, tuple[str, str, str, HarnessBinding,
                                    RemoteKcovSupportBoundary]] = {}
+    descriptors: dict[Sanitizer, ExecutionHarnessDescriptor] = {}
     for v in variants:
         # The descriptor must exist before identity-sensitive capability
         # evidence can promote a validated HCAP.  This prevents a stale KVM
@@ -896,6 +1020,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         digests[key(v, "execution_harness_approval")] = approval_ref
         results[v.sanitizer] = (harness_id, hcap_ref, approval_ref, binding,
                                 boundary_ref)
+        descriptors[v.sanitizer] = descriptor
     first = results[variants[0].sanitizer]
 
     # ---------------------------------------------------- harness
@@ -965,6 +1090,34 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             reserve_cpus=spec.engine.reserve_cpus,
             reserve_memory_mb=spec.engine.reserve_memory_mb,
             max_slots=spec.engine.max_slots))
+    managers: dict[Sanitizer, Path] = {}
+    if spec.stage2 is not None:
+        # A frozen copy of the pinned lane script is the manager's lane
+        # template (tools/prepare-live-lane-config.py does the same).
+        lane = file_pins["lane-script"]
+        template = state / f"lane-template-{lane.sha256[:16]}"
+        template.mkdir(exist_ok=True)
+        frozen = template / "lane.sh"
+        if not frozen.exists() or file_sha256(frozen) != lane.sha256:
+            frozen.unlink(missing_ok=True)
+            frozen.write_bytes(common["lane-script"].read_bytes())
+            frozen.chmod(0o444)
+        for v in variants:
+            manager = _stage2_manager(
+                spec, descriptor=descriptors[v.sanitizer],
+                selection=stage2_selection, calls=stage2_calls,
+                files={n: p.resolve() for n, p in
+                       {**common, **variant_files[v.sanitizer]}.items()},
+                template=template, lane_sha256=lane.sha256,
+                syzkaller=(env / "syzkaller").resolve(), ssh_key=ssh_key,
+                state=state)
+            name = (f"stage2-manager-{v.sanitizer.value}.json" if several
+                    else "stage2-manager.json")
+            data = (json.dumps(manager, indent=2) + "\n").encode()
+            (state / name).write_bytes(data)
+            managers[v.sanitizer] = state / name
+            digests[key(v, "stage2_manager")] = \
+                hashlib.sha256(data).hexdigest()
     config_path = state / "stage1.json"
     config_path.write_text(config.model_dump_json(indent=2) + "\n")
     report_path = state / "generated.json"
@@ -978,4 +1131,6 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                      variants={s.value: GeneratedVariant(
                          execution_harness_id=r[0], hcap_revision=r[1])
                          for s, r in results.items()},
+                     stage2_managers={s.value: p
+                                      for s, p in managers.items()},
                      digests=digests)

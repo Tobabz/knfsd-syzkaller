@@ -70,6 +70,9 @@ class _ApprovedHarness:
     harness_id: str
     command_line: tuple[str, ...]
     pins: tuple[tuple[str, HostFilePin], ...]
+    #: The koov fixture arguments of the descriptor's allowed runtime
+    #: selections, as (selection argument, koov.nfs_trace value) pairs.
+    fixtures: frozenset[tuple[str, str]] = frozenset()
 
     def pin(self, name: str) -> HostFilePin:
         try:
@@ -243,7 +246,18 @@ def _approved_harness(
     return _ApprovedHarness(
         harness_id=harness_id,
         command_line=tuple(descriptor.guest_kernel_command_line.split()),
-        pins=tuple(pins))
+        pins=tuple(pins),
+        fixtures=_stage2_fixtures(descriptor.allowed_runtime_selections))
+
+
+def _stage2_fixtures(selections) -> frozenset[tuple[str, str]]:
+    """The koov arguments that boot each selection Stage 2 may run, as
+    stage1/host/collector.py guest_cmdline writes them."""
+    return frozenset(
+        (f"koov.nfs_version={s.nfs_version}" if s.fixture_mode == "single"
+         else f"koov.nfs_fixture={s.fixture_mode}",
+         "1" if s.trace_mode == "on" else "0")
+        for s in selections if s.fixture_mode not in _STAGE1_ONLY_FIXTURES)
 
 
 def _check_harnesses(
@@ -383,14 +397,12 @@ def _bind_manager_command(path: Path, command) -> None:
         "manager config must be an explicit Stage 2 command argument")
 
 
-# nlm-knfsd is a Stage 1 reachability fixture (HCAP-13); a Stage 2 manager
-# command line selecting it is refused here.
-_DYNAMIC_CMDLINE_VALUES = {
-    "koov.nfs_fixture": {"broad-knfsd"},
-    "koov.nfs_target": {"1"},
-    "koov.nfs_trace": {"0", "1"},
-    "koov.nfs_version": {"3", "4.0", "4.1", "4.2"},
-}
+# A manager boots one fixture of an approved runtime selection (#81 D17):
+# koov.nfs_version for a single fixture, koov.nfs_fixture otherwise, with
+# that selection's koov.nfs_trace.  nlm-knfsd is a Stage 1 reachability
+# fixture (HCAP-13); a Stage 2 manager command line selecting it is refused.
+_STAGE1_ONLY_FIXTURES = frozenset({"nlm-knfsd"})
+_SELECTION_KEYS = ("koov.nfs_fixture", "koov.nfs_version")
 
 
 def _check_approved_command_line(
@@ -406,25 +418,61 @@ def _check_approved_command_line(
         if key == "koov.lane_sha256":
             allowed = bool(separator and len(value) == 64
                            and all(c in "0123456789abcdef" for c in value))
+        elif key == "koov.nfs_target":
+            allowed = token == "koov.nfs_target=1"
+        elif key == "koov.nfs_trace":
+            allowed = value in ("0", "1") and separator == "="
         else:
-            allowed = separator == "=" and \
-                value in _DYNAMIC_CMDLINE_VALUES.get(key, set())
+            allowed = key in _SELECTION_KEYS and separator == "="
         if not allowed or key in dynamic:
             raise PreflightError(
                 f"manager VM cmdline has unapproved dynamic argument {token}")
         dynamic[key] = value
-    selection = set(dynamic) & {"koov.nfs_fixture", "koov.nfs_version"}
-    if selection not in ({"koov.nfs_fixture"}, {"koov.nfs_version"}):
+    selection = [f"{key}={dynamic[key]}" for key in _SELECTION_KEYS
+                 if key in dynamic]
+    if len(selection) != 1:
         raise PreflightError(
             "manager VM cmdline must select one approved NFS fixture")
     for required in ("koov.lane_sha256", "koov.nfs_target"):
         if required not in dynamic:
             raise PreflightError(
                 f"manager VM cmdline lacks approved {required}")
+    trace = dynamic.get("koov.nfs_trace")
     for harness in harnesses:
         if tuple(base) != harness.command_line:
             raise PreflightError(
                 "manager VM base cmdline differs from the approved command line")
+        if not any(fixture == selection[0] and trace in (None, mode)
+                   for fixture, mode in harness.fixtures):
+            raise PreflightError(
+                f"manager VM fixture {selection[0]} (koov.nfs_trace={trace}) "
+                "is no Stage 2 runtime selection of approved harness "
+                f"{harness.harness_id[:12]}")
+
+
+def _manager_harnesses(
+    value: dict, vm: dict, harnesses: tuple[_ApprovedHarness, ...],
+) -> tuple[_ApprovedHarness, ...]:
+    """The approved harnesses whose kernel the manager boots.  Sanitizer
+    variants (#81 D10) share every other file, so one manager runs one
+    variant."""
+    if not harnesses:
+        raise PreflightError("no approved harness is available")
+    kernel = _required_path(value, "kernel_obj") / "vmlinux"
+    bzimage = _required_path(vm, "kernel", parent="manager VM")
+    try:
+        actual = {"kernel": (file_sha256(kernel), kernel.stat().st_size),
+                  "bzimage": (file_sha256(bzimage), bzimage.stat().st_size)}
+    except OSError as exc:
+        raise PreflightError(f"manager kernel is unreadable: {exc}") from exc
+    matched = tuple(
+        harness for harness in harnesses
+        if all((harness.pin(name).sha256, harness.pin(name).size) == ident
+               for name, ident in actual.items()))
+    if not matched:
+        raise PreflightError(
+            "manager kernel and bzImage are no approved harness's")
+    return matched
 
 
 def _check_manager_assets(
@@ -432,8 +480,6 @@ def _check_manager_assets(
     harnesses: tuple[_ApprovedHarness, ...],
     *, expected_target: str, which: Callable[[str], str | None],
 ) -> None:
-    if not harnesses:
-        raise PreflightError("no approved harness is available")
     kernel_obj = _required_path(value, "kernel_obj")
     syzkaller = _required_path(value, "syzkaller")
     if value.get("target") != expected_target:
@@ -502,6 +548,7 @@ def _check_manager(
     procs = value.get("procs")
     if type(procs) is not int or not 1 <= procs <= 64:
         raise PreflightError("target-mode campaign requires procs in [1, 64]")
+    harnesses = _manager_harnesses(value, vm, harnesses)
     cmdline = str(vm.get("cmdline", "")).split()
     _check_approved_command_line(cmdline, harnesses)
     template_value = value.get("workdir_template")
