@@ -134,6 +134,36 @@ func TestNLMLaneFileKeepsLaneOrigin(t *testing.T) {
 	}
 }
 
+func TestLiveSessionSocketKeepsLaneOrigin(t *testing.T) {
+	source := lane +
+		"r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)\n" +
+		"recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000000200)=\"\"/16, 0x10, 0x0, 0x0, 0x0)\n" +
+		"setsockopt$sock_linger(r1, 0x1, 0xd, &(0x7f0000000000)={0x1, 0x0}, 0x8)\n" +
+		"close(r1)\n" +
+		"fsync(r0)\n" +
+		"recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000000200)=\"\"/16, 0x10, 0x0, 0x0, 0x0)\n"
+	r := mustParse(t, source)
+	origin := "nfs-profile:knfsd-v41:client0"
+	for _, index := range []int{1, 2, 3, 4, 5} {
+		if len(r.Calls[index].Facts.Origins) != 1 || r.Calls[index].Facts.Origins[0].Origin != origin {
+			t.Fatalf("call %d lost the lane origin: %+v", index, r.Calls[index].Facts)
+		}
+	}
+	if len(r.Calls[6].Facts.Origins) != 0 {
+		t.Fatal("closed lane socket retains origin")
+	}
+	if len(r.Acquisitions) != 1 {
+		t.Fatalf("the lane socket is not an acquisition: %+v", r.Acquisitions)
+	}
+	// A socket connected through an unrooted directory stays unrooted.
+	r = mustParse(t, "r0 = openat(0xffffffffffffff9c, &(0x7f0000000000)='./file0\\x00', 0x0, 0x0)\n"+
+		"r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)\n"+
+		"recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000000200)=\"\"/16, 0x10, 0x0, 0x0, 0x0)\n")
+	if len(r.Calls[2].Facts.Origins) != 0 {
+		t.Fatal("unrooted lane socket gained an origin")
+	}
+}
+
 func TestAllExplicitProfiles(t *testing.T) {
 	for p, suffix := range []string{"knfsd_v3", "knfsd_v40", "knfsd_v41", "knfsd_v42", "ganesha_v41"} {
 		for client := 0; client < 2; client++ {

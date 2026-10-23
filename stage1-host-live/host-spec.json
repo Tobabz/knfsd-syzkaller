@@ -114,8 +114,8 @@
     },
     {
       "id": "HCAP-14",
-      "name": "live NFSv4.1 BIND transport reset",
-      "purpose": "Open a fresh NFSv4.1 client and session on the direct client0 lane, then pipeline BIND_CONN_TO_SESSION on the same transport and reset it",
+      "name": "live NFSv4.1 session BIND transport reset",
+      "purpose": "Drive a fresh NFSv4.1 client and session from the program on a client0 lane transport, then pipeline BIND_CONN_TO_SESSION on that transport and reset it",
       "usable_stage": [
         "stage1"
       ],
@@ -124,15 +124,24 @@
       ],
       "interface": {
         "syz_calls": [
-          "syz_nfs_bind_live$client0_knfsd_v41",
-          "syz_open_nfs_lane_profile$client0_knfsd_v41"
+          "recvfrom$inet_nfs_fuzz_tcp",
+          "recvfrom$nfs41_create_session",
+          "recvfrom$nfs41_exchange_id",
+          "setsockopt$sock_linger",
+          "syz_open_nfs_lane_profile$client0_knfsd_v41",
+          "syz_socket_connect_nfs_lane$client0_knfsd_v41",
+          "write$nfs41_bind_conn_to_session",
+          "write$nfs41_create_session",
+          "write$nfs41_exchange_id"
         ]
       },
       "constraints": [
-        "one non-threaded Stage 1 program on client0; the live-bind pseudo-call takes the exact client0 knfsd-v41 profile directory fd as its lane token",
-        "the executor opens a fresh NFSv4.1 client and session on that lane, sends 1..64 BIND_CONN_TO_SESSION operations on the same transport, and resets it after the first reply",
-        "dir must be 3 for the FORE_OR_BOTH cn_flags read-modify-write path; rounds is 1..8 fresh client/session attempts",
-        "AUTH_SYS only, direct knfsd endpoint; the profile acquisition is parser-proven and the call cannot be used without it",
+        "one non-threaded Stage 1 program on client0; syz_socket_connect_nfs_lane takes the exact client0 knfsd-v41 profile directory fd as its lane token and only opens the TCP transport, with 3 s send/receive timeouts",
+        "the program writes each one-op COMPOUND itself: EXCHANGE_ID, then CREATE_SESSION with the clientid and sequenceid that recvfrom$nfs41_exchange_id captured, then one write of 1..64 BIND_CONN_TO_SESSION records with the sessionid that recvfrom$nfs41_create_session captured",
+        "requests use an empty tag and AUTH_SYS so the first op result sits 48 bytes into the reply record; a failed op leaves the captured resources meaningless and the later calls fail",
+        "dir 3 (FORE_OR_BOTH) reaches the cn_flags read-modify-write path; one round is connect, the six session calls, a zero setsockopt$sock_linger and close; a program holds at most 4 rounds (syzkaller's 40-call limit), so more rounds come from repeated execution",
+        "client owners are fixed program bytes, so a repeated program reuses its confirmed client within the lease and opens a new session on it",
+        "direct knfsd endpoint; the profile acquisition is parser-proven, the socket inherits its origin, and the calls cannot be used without it",
         "this capability establishes live-session BIND and transport-reset reachability, not a race outcome or KASAN"
       ],
       "status": "experimental",
@@ -142,11 +151,10 @@
       "validated_scope": [],
       "source_refs": [
         "bundle/patches/syzkaller/0031-*",
-        "env/syzkaller/sys/linux/fs_nfs_fuzz.txt",
+        "env/syzkaller/sys/linux/socket_inet_nfs.txt",
         "stage1-host-live/live-bind.syz",
         "stage1-host-live/live-bind-race.syz",
-        "stage1-host-live/live-bind-race64p.syz",
-        "stage1-host-live/live-bind-race64p2.syz"
+        "stage1-host-live/live-bind-race64p.syz"
       ]
     }
   ],
@@ -158,7 +166,7 @@
     "limits": {
       "max_program_bytes": 65536,
       "max_calls_per_program": 128,
-      "max_resources_per_program": 512
+      "max_resources_per_program": 1024
     },
     "entries": [
       {
@@ -184,7 +192,55 @@
         ]
       },
       {
-        "call": "syz_nfs_bind_live$client0_knfsd_v41",
+        "call": "recvfrom$inet_nfs_fuzz_tcp",
+        "capability_ids": [
+          "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "recvfrom$nfs41_create_session",
+        "capability_ids": [
+          "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "recvfrom$nfs41_exchange_id",
+        "capability_ids": [
+          "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "setsockopt$sock_linger",
         "capability_ids": [
           "HCAP-14"
         ],
@@ -204,6 +260,70 @@
         "capability_ids": [
           "HCAP-01"
         ]
+      },
+      {
+        "call": "syz_socket_connect_nfs_lane$client0_knfsd_v41",
+        "capability_ids": [
+          "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "write$nfs41_bind_conn_to_session",
+        "capability_ids": [
+          "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "write$nfs41_create_session",
+        "capability_ids": [
+          "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "write$nfs41_exchange_id",
+        "capability_ids": [
+          "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
       }
     ]
   },
@@ -216,8 +336,8 @@
       "topology": "one-lane",
       "enabled_interfaces": [
         "remote_cover",
-        "syz_nfs_bind_live$client0_knfsd_v41",
-        "syz_open_nfs_lane_profile$client0_knfsd_v41"
+        "syz_open_nfs_lane_profile$client0_knfsd_v41",
+        "syz_socket_connect_nfs_lane$client0_knfsd_v41"
       ],
       "trace_mode": "off"
     }
@@ -232,8 +352,8 @@
         "topology": "one-lane",
         "enabled_interfaces": [
           "remote_cover",
-          "syz_nfs_bind_live$client0_knfsd_v41",
-          "syz_open_nfs_lane_profile$client0_knfsd_v41"
+          "syz_open_nfs_lane_profile$client0_knfsd_v41",
+          "syz_socket_connect_nfs_lane$client0_knfsd_v41"
         ],
         "trace_mode": "off"
       },
