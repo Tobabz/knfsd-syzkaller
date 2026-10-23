@@ -227,6 +227,13 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | `s1_running` | verdict의 `candidate_id`나 `execution_harness_id`가 job과 다름 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
 
 - ambient control의 결과(`06` §11)는 기록만 하고 전이를 바꾸지 않는다.
+- `s1_running`의 bundle에 crash report(`06` §10)가 봉인돼 있으면 Controller는 위 행의 전이와 함께 crash finding
+  (`Job.crash_findings`의 `CrashFinding`)을 job에 붙인다. triage 항목처럼 job 상태를 바꾸지 않는 검토 항목이다.
+  Runner task, bundle, harness, plan, 그 실행의 Q1 verdict, crash 종류와 첫 crash 줄, panic 여부를 담는다. 실행이
+  끝난 crash(`WARNING:`, panic하지 않은 KASAN 보고)는 Q1 verdict대로 진행하고, panic으로 끝나지 못한 실행은
+  `INCONCLUSIVE(infra)` 행대로 다시 실행하며 finding은 남는다. finding은 지워지지 않는다. replay는 `pending`으로
+  기다린다. replay(새 VM에서 같은 program M회, `k/M` 기록, `k=0`이어도 `reproduced=false`로 검토)는 fixed campaign의
+  replay와 함께 구현한다(#81 PR 4).
 - `s1_running`에 들어가는 모든 전이(재실행과 `resume` 포함)는 그때의 approval policy를 적용한다. 승인이 필요한데
   그 harness의 review manifest가 승인되지 않았으면 `s1_approval`로 간다(`05` §11).
 - `REACHED`로 넘어갈 때 Controller는 `Stage2Input`(`01` §5.1)의 구성 artifact와 verdict id를 job에 고정한다.

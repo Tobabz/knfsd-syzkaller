@@ -138,6 +138,7 @@ class FakeJudge:
     def __init__(self) -> None:
         self.bundles: dict[str, dict] = {}
         self.missing: set[tuple[str, str]] = set()
+        self.crashes: dict[str, object] = {}
 
     def add(self, bundle: str, harness_id: str, candidate_id: str,
             status: Q1Status, reason: str | None = None,
@@ -167,6 +168,9 @@ class FakeJudge:
             support_boundary_id=versions.support_boundary_id,
             evidence_manifest_sha256=sha("manifest", bundle_ref),
             status=status, reason=reason, gap_signal=gap)
+
+    def crash_report(self, bundle_ref):
+        return self.crashes.get(bundle_ref)
 
     def has_required_evidence(self, bundle_ref, versions) -> bool:
         return (bundle_ref, versions.judge_profile_id) not in self.missing

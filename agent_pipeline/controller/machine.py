@@ -31,9 +31,9 @@ from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
 from . import events as ev
 from .records import (STAGE2_CAUSES, TERMINAL, WAITING, BlockedReason,
                       BundleCursor, Campaign, CampaignTally, ConsumedVerdict,
-                      CrashRef, Job, JobState, PendingTask, RepairCause,
-                      RepairInput, Replay, Stage2Input, Target, TargetKind,
-                      TaskKind, TriageItem)
+                      CrashFinding, CrashRef, Job, JobState, PendingTask,
+                      RepairCause, RepairInput, Replay, Stage2Input, Target,
+                      TargetKind, TaskKind, TriageItem)
 from .tasks import (CLEANUP_UNCONFIRMED, RunnerInput, agent_input_digest,
                     legacy_runner_input_digest, runner_input_digest)
 
@@ -318,6 +318,17 @@ class Machine:
                                          binding=j.binding,
                                          plan_ref=j.plan_ref,
                                          harness_ref=j.harness.harness_ref)
+        crash = self.env.judge.crash_report(e.bundle_ref)
+        if crash is not None:
+            # #81 §3: the crash does not stop the job; the verdict routes it.
+            j.crash_findings = j.crash_findings + (CrashFinding(
+                task_id=e.task_id, bundle_ref=e.bundle_ref,
+                harness_ref=j.harness.harness_ref,
+                execution_harness_id=r.execution_harness_id,
+                plan_ref=j.plan_ref, q1_verdict_id=r.verdict_id,
+                q1_status=r.status.value, q1_reason=r.reason,
+                kind=crash.kind.value, title=crash.title,
+                panicked=crash.panicked),)
         self._goto(c, self._q1_target(c, r))
         return True
 

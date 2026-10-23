@@ -11,8 +11,12 @@ Failures are split the same way the Controller splits them:
   descriptor lacks ``nokaslr``, QEMU is missing): exit nonzero, which the
   engine records as ``capture_failed``, a runtime failure;
 * the guest ran but something failed (no boot, fixture or lane not ready,
-  executor error, guest oops): the capture is written with those facts
-  false or listed as runtime errors, and the Judge returns INCONCLUSIVE.
+  executor error): the capture is written with those facts false or
+  listed as runtime errors, and the Judge returns INCONCLUSIVE.
+
+A kernel crash is neither: it is sealed as a ``crash-report`` artifact
+(``agent_pipeline.crash``) and is not a runtime error.  A run it did not
+stop is judged as usual; a panic leaves the run incomplete.
 """
 
 from __future__ import annotations
@@ -31,13 +35,14 @@ from typing import Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...artifacts import ArtifactStore
+from ...crash import CRASH_REPORT_ID, CRASH_REPORT_TYPE, CrashReport, classify
 from ...data import canonical_json, load_record
 from ...hcap import RuntimeSelection
 from ...materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ...q1 import ExecutionCorrelation, KernelIdentity
 from ...sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE
 from .kcov import (STATE_COMMAND, STATS_COMMAND, LaneRun, capture_records,
-                   fatal_dmesg, lane_state_ok, parse_cover_pcs, parse_stats,
+                   lane_state_ok, parse_cover_pcs, parse_stats,
                    unsettled_generations)
 from .pins import HostFilePin, PinCache, verify_file
 from .vm import GUEST_COMMAND_TIMEOUT_S, Guest, QemuGuest, VmConfig
@@ -329,8 +334,6 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
         _, dmesg = guest.run(
             "dmesg", timeout=EVIDENCE_COMMAND_TIMEOUT_S)
         _write_log(out / "dmesg.log", dmesg)
-        for line in fatal_dmesg(dmesg)[:16]:
-            run.runtime_errors.append(f"guest: {line.strip()[:200]}")
         _collect_cover(guest, run, result)
     except Exception as exc:     # the guest side failed; keep the facts
         run.runtime_errors.append(f"{type(exc).__name__}: {str(exc)[:300]}")
@@ -366,6 +369,18 @@ def _write_log(path: Path, text: str) -> None:
     if len(data) > LOG_LIMIT:
         data = b"[truncated]\n" + data[-LOG_LIMIT:]
     path.write_bytes(data)
+
+
+def crash_report(out: Path, console: Path, descriptor:
+                 ExecutionHarnessDescriptor) -> CrashReport | None:
+    """The run's crash, from the whole console log (read after the guest
+    stopped), else from the ``dmesg`` the collector fetched."""
+    dmesg = out / "dmesg.log"
+    return classify(
+        console.read_bytes().decode("utf-8", "replace")
+        if console.is_file() else "",
+        dmesg.read_bytes().decode("utf-8", "replace")
+        if dmesg.is_file() else None, descriptor.sanitizer)
 
 
 def _tail(path: Path) -> bytes:
@@ -425,6 +440,8 @@ def collect(config: CollectorConfig, inp: Path, out: Path, *,
         "collection_started", "collection_completed", "extra_present")}
     result["published_pc_count"] = len(run.pcs)
     result["runtime_errors"] = run.runtime_errors
+    crash = crash_report(out, console, descriptor)
+    result["crash"] = None if crash is None else crash.model_dump(mode="json")
     observation, coverage = capture_records(
         run, candidate_id=harness.candidate_id, identity=identity,
         correlation=correlation, trace_mode=selection.trace_mode)
@@ -440,6 +457,11 @@ def collect(config: CollectorConfig, inp: Path, out: Path, *,
         {"identity": "collector-result", "type": RESULT_TYPE,
          "path": "collector-result.json"},
         {"identity": "console-log", "type": LOG_TYPE, "path": "console.log"}]
+    if crash is not None:
+        (out / "crash-report.json").write_bytes(canonical_json(crash))
+        artifacts.append({"identity": CRASH_REPORT_ID,
+                          "type": CRASH_REPORT_TYPE,
+                          "path": "crash-report.json"})
     for name in ("executor.log", "dmesg.log"):
         if (out / name).is_file():
             artifacts.append({"identity": name.removesuffix(".log") + "-log",

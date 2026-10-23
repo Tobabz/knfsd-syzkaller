@@ -1,0 +1,178 @@
+"""#81 §3: a kernel crash in a Stage 1 run is a finding, not an infra
+failure.  The run's Q1 verdict routes the job as usual."""
+
+from __future__ import annotations
+
+import pytest
+from pydantic import ValidationError
+
+from agent_pipeline.contracts import Q1Status, Sanitizer
+from agent_pipeline.controller.records import JobState, RepairCause
+from agent_pipeline.crash import (CRASH_REPORT_ID, CRASH_REPORT_TYPE,
+                                  CrashKind, CrashReport, classify)
+from agent_pipeline.data import canonical_json
+from agent_pipeline.evidence import ArtifactInput
+from agent_pipeline.evidence import ExecutionCorrelation as EC
+
+from . import test_sealed_q1 as sealed
+
+KASAN = ("[   12.345678] ==================================================\n"
+         "[   12.345680] BUG: KASAN: slab-use-after-free in nfsd4_bind\n"
+         "[   12.345690] Read of size 8 at addr ffff888012345678\n")
+WARNING = "[    9.000001] WARNING: CPU: 1 PID: 77 at fs/nfsd/nfs4state.c:12\n"
+PANIC = ("[   20.000000] Oops: general protection fault, probably for "
+         "non-canonical address\n"
+         "[   20.000100] Kernel panic - not syncing: Fatal exception\n")
+KCSAN = "[    5.000000] BUG: KCSAN: data-race in nfsd4_bind / nfsd4_destroy\n"
+
+
+def report(text: str, sanitizer=Sanitizer.KASAN) -> CrashReport:
+    found = classify(text, None, sanitizer)
+    assert found is not None
+    return found
+
+
+# ------------------------------------------------------------ classifier
+
+@pytest.mark.parametrize(("text", "kind"), [
+    (KASAN, CrashKind.KASAN), (WARNING, CrashKind.WARNING),
+    (PANIC, CrashKind.OOPS), ("kernel BUG at mm/slub.c:42!\n",
+                              CrashKind.KERNEL_BUG),
+    ("BUG: unable to handle page fault\n", CrashKind.BUG)])
+def test_every_crash_pattern_is_a_crash(text, kind):
+    assert report(text).kind is kind
+
+
+def test_the_report_keeps_the_crash_lines_without_timestamps():
+    r = report(WARNING + KASAN)
+    assert r.source == "console" and r.kind is CrashKind.WARNING
+    assert r.title == "WARNING: CPU: 1 PID: 77 at fs/nfsd/nfs4state.c:12"
+    assert r.lines == (r.title,
+                       "BUG: KASAN: slab-use-after-free in nfsd4_bind")
+    assert not r.panicked
+    assert report(PANIC).panicked
+
+
+def test_kcsan_is_a_crash_only_on_a_kcsan_harness():
+    assert classify(KCSAN, None, Sanitizer.KASAN) is None
+    assert report(KCSAN, Sanitizer.KCSAN).kind is CrashKind.KCSAN
+
+
+def test_the_console_is_the_primary_evidence():
+    assert classify("Linux version\n", None, Sanitizer.KASAN) is None
+    assert classify("Linux version\n", KASAN, Sanitizer.KASAN).source \
+        == "dmesg"
+    assert classify(WARNING, KASAN, Sanitizer.KASAN).kind \
+        is CrashKind.WARNING
+
+
+def test_the_report_is_bounded():
+    r = report(WARNING * 40)
+    assert len(r.lines) == 16
+    with pytest.raises(ValidationError):
+        CrashReport(source="console", sanitizer=Sanitizer.KASAN,
+                    kind=CrashKind.BUG, title="x" * 201, lines=("x",),
+                    panicked=False)
+
+
+# ------------------------------------------------------------ Controller
+
+@pytest.mark.parametrize(("status", "state"), [
+    (Q1Status.REACHED, JobState.S1_REACHED),
+    (Q1Status.NOT_REACHED, JobState.S1_PLANNING)])
+def test_a_completed_run_keeps_its_verdict_and_the_finding(
+        world, status, state):
+    j = world.to_running()
+    task = world.job(j).pending_task.task_id
+    world.judge.crashes["b1"] = report(WARNING)
+    world.run(j, status, name="b1")
+    job = world.job(j)
+    assert job.state is state
+    if status is Q1Status.NOT_REACHED:
+        assert job.pending_task.repair.cause \
+            is RepairCause.Q1_NOT_REACHED
+    assert job.last_verdict.result.status is status
+    (finding,) = job.crash_findings
+    assert (finding.task_id, finding.bundle_ref) == (task, "b1")
+    assert finding.kind == "warning" and not finding.panicked
+    assert finding.q1_status == status.value
+    assert finding.q1_verdict_id == job.last_verdict.result.verdict_id
+    assert finding.harness_ref == job.harness.harness_ref
+    assert finding.replay == "pending"
+    assert world.c.replay(j) == job
+
+
+def test_a_panic_reruns_q1_and_keeps_the_finding(world):
+    j = world.to_running()
+    world.judge.crashes["b1"] = report(PANIC)
+    world.run(j, Q1Status.INCONCLUSIVE, "infra", name="b1")
+    job = world.job(j)
+    assert job.state is JobState.S1_RUNNING
+    assert job.counters.runtime_retry == 1
+    assert job.crash_findings[0].panicked
+    world.run(j, Q1Status.REACHED, name="b2")
+    job = world.job(j)
+    assert job.state is JobState.S1_REACHED
+    assert [f.bundle_ref for f in job.crash_findings] == ["b1"]
+    assert world.c.replay(j) == job
+
+
+def test_findings_accumulate_across_runs(world):
+    j = world.to_running()
+    world.judge.crashes["b1"] = report(PANIC)
+    world.judge.crashes["b2"] = report(KASAN)
+    world.run(j, Q1Status.INCONCLUSIVE, "infra", name="b1")
+    world.run(j, Q1Status.REACHED, name="b2")
+    job = world.job(j)
+    assert [(f.bundle_ref, f.kind) for f in job.crash_findings] == [
+        ("b1", "oops"), ("b2", "kasan")]
+    assert world.c.replay(j) == job
+
+
+def test_a_run_without_a_crash_adds_no_finding(world):
+    j = world.to_running()
+    world.run(j, Q1Status.REACHED)
+    assert world.job(j).crash_findings == ()
+
+
+# ------------------------------------------------------------ sealed judge
+
+def _sealed(tmp_path, crash_artifact):
+    f = sealed.setup(tmp_path)
+    bundle = f.evidence.verify(f.bundle_ref, expected_correlation=EC(
+        **f.correlation.model_dump()))
+    artifacts = [ArtifactInput(identity=a.descriptor.identity,
+                               type=a.descriptor.type, data=a.data)
+                 for a in bundle.artifacts]
+    sealed.reseal(f, artifacts + [crash_artifact])
+    return f
+
+
+def test_the_sealed_judge_reads_the_crash_and_keeps_the_verdict(tmp_path):
+    crash = report(KASAN)
+    f = _sealed(tmp_path, ArtifactInput(
+        identity=CRASH_REPORT_ID, type=CRASH_REPORT_TYPE,
+        data=canonical_json(crash)))
+    assert f.judge.crash_report(f.bundle_ref) == crash
+    assert sealed.result(f).status is Q1Status.REACHED
+
+
+def test_an_unreadable_crash_report_is_unjudgeable_evidence(tmp_path):
+    f = _sealed(tmp_path, ArtifactInput(
+        identity=CRASH_REPORT_ID, type=CRASH_REPORT_TYPE, data=b"{}"))
+    assert f.judge.crash_report(f.bundle_ref) is None
+    r = sealed.result(f)
+    assert (r.status, r.reason) == (Q1Status.INCONCLUSIVE, "evidence")
+
+
+def test_a_bundle_without_a_crash_report_has_no_crash(tmp_path):
+    f = sealed.setup(tmp_path)
+    assert f.judge.crash_report(f.bundle_ref) is None
+
+
+def test_a_panic_line_naming_its_cause_is_the_panic():
+    r = report("BUG: KASAN: use-after-free in nfsd4_bind\n"
+               "Kernel panic - not syncing: KASAN: panic_on_warn set\n")
+    assert r.kind is CrashKind.KASAN and r.panicked
+    assert report("Kernel panic - not syncing: KASAN: x\n").kind \
+        is CrashKind.PANIC

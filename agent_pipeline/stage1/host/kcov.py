@@ -41,8 +41,6 @@ GENERATION_SOURCES = {
 _SECTION = re.compile(r"^== .*/([A-Za-z0-9_]+)$")
 _COUNTER = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*) (-?[0-9]+)$")
 _PC = re.compile(r"^0x([0-9a-fA-F]+)$")
-FATAL_DMESG = re.compile(
-    r"BUG:(?! KCSAN:)|KASAN:|kernel BUG|Kernel panic|Oops:|WARNING:")
 
 STATS_COMMAND = ("for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do "
                  "echo \"== $f\"; cat \"$f\"; done")
@@ -137,10 +135,6 @@ def parse_cover_pcs(text: str) -> set[int]:
             raise ValueError(f"coverage PC out of range: {line[:80]!r}")
         pcs.add(pc)
     return pcs
-
-
-def fatal_dmesg(text: str) -> list[str]:
-    return [line for line in text.splitlines() if FATAL_DMESG.search(line)]
 
 
 def lane_state_ok(text: str) -> bool:

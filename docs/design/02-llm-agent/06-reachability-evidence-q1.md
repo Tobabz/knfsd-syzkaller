@@ -334,6 +334,12 @@ unsupported_attribution   target 미관측이고 expected_context가 support bou
 `unsupported_attribution`은 HarnessGapSignal로, 나머지는 Agent reasoning보다 runtime/observability 문제를
 먼저 해결하는 쪽으로 보낸다(§13).
 
+kernel crash(`KASAN:`, `BUG:`, `kernel BUG`, `Oops:`, `Kernel panic`, `WARNING:`, KCSAN harness의 `BUG: KCSAN:`)는
+`infra`가 아니다. collector는 crash를 `runtime_errors`에 넣지 않고 serial console(없으면 `dmesg`)에서 찾아
+`crash-report` artifact(`agent_pipeline.crash.CrashReport`)로 bundle에 봉인한다. 실행이 끝났으면 Q1은 coverage로
+평소대로 판정한다. panic으로 실행이 끝나지 못했으면 그 사실(runner 미완료, guest 응답 없음) 때문에 `infra`가
+된다. crash는 어느 경우든 Controller가 job의 crash finding으로 남긴다(`09` §3, #81 §3).
+
 ## 11. Remote KCOV 밖의 관측
 
 flow trace, tracepoint, kprobe 같은 도구는 path 분석과 디버깅에는 사용할 수 있지만 Q1 oracle은 아니다.

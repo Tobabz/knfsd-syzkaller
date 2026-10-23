@@ -316,6 +316,29 @@ class TriageItem(Record):
     routing: Literal["none", "replayed", "queued", "unrouted"] = "none"
 
 
+class CrashFinding(Record):
+    """#81 §3: a kernel crash sealed in a Stage 1 run's bundle.  Like a
+    triage item it does not change the job's state: the run's Q1 verdict
+    routes the job as usual (a panic leaves the run incomplete, so it is
+    run again), and the finding stays on the job for replay and review.
+
+    ``replay`` is ``pending`` until the Stage 1 replay (M runs, ``k/M``)
+    takes it."""
+
+    task_id: str
+    bundle_ref: str
+    harness_ref: str
+    execution_harness_id: str
+    plan_ref: str
+    q1_verdict_id: str
+    q1_status: str
+    q1_reason: str | None = None
+    kind: str
+    title: str
+    panicked: bool
+    replay: Literal["pending"] = "pending"
+
+
 class Job(BaseModel):
     """09 §8.  Not frozen: the machine works on a deep copy."""
 
@@ -363,6 +386,8 @@ class Job(BaseModel):
     #: APPLIED crashes of the campaign under review, replayed next.
     crash_queue: tuple[CrashRef, ...] = ()
     triage: tuple[TriageItem, ...] = ()
+    #: Crashes of Stage 1 runs, in the order their bundles were judged.
+    crash_findings: tuple[CrashFinding, ...] = ()
     seq: int = 0
     task_seq: int = 0
 

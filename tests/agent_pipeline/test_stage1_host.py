@@ -29,6 +29,7 @@ from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.contracts import (PIPELINE_GAP_IDS, CandidateSubmission,
                                       LocationKind, LocationRequest, Q1Status)
 from agent_pipeline.controller.records import JobState
+from agent_pipeline.crash import CRASH_REPORT_TYPE, CrashKind, CrashReport
 from agent_pipeline.data import canonical_json, load_record
 from agent_pipeline.q1 import (KernelIdentity, RemoteKcovObservation,
                                TargetPcMapping)
@@ -284,8 +285,6 @@ def test_cover_pcs_and_lane_state():
                               "owner 1")
     assert not kcov.lane_state_ok("lane_id 0 lane_epoch 1 valid 0 "
                                   "unhealthy 0 owner 1")
-    assert kcov.fatal_dmesg("ok\nKASAN: use-after-free\nBUG: KCSAN: race") \
-        == ["KASAN: use-after-free"]
 
 
 def test_objdump_and_addr2line_parsing():
@@ -964,9 +963,6 @@ def test_collector_records_guest_failures_as_facts(host, tmp_path):
     run = _collect(host, tmp_path / "a", pcs=[], fixture="failed")
     assert run.observation.boot_ok and not run.observation.fixture_ok
     assert "fixture_not_ready" in run.observation.runtime_errors
-    run = _collect(host, tmp_path / "b", pcs=["0x401000"],
-                   dmesg="BUG: KASAN: slab-out-of-bounds in nfsd4_open\n")
-    assert any("KASAN" in e for e in run.observation.runtime_errors)
     # A fixture of another mode is not the selection's fixture.
     run = _collect(host, tmp_path / "d", pcs=["0x401000"],
                    fixture_mode="nlm-knfsd")
@@ -974,6 +970,51 @@ def test_collector_records_guest_failures_as_facts(host, tmp_path):
     run = _collect(host, tmp_path / "c", boot_error="no ssh")
     assert not run.observation.boot_ok
     assert run.observation.generation.generation_begin is None
+
+
+def _crash(run):
+    entries = {a["identity"]: a for a in run.capture["artifacts"]}
+    if "crash-report" not in entries:
+        return None
+    assert entries["crash-report"]["type"] == CRASH_REPORT_TYPE
+    return CrashReport.model_validate_json(
+        (run.out / entries["crash-report"]["path"]).read_bytes())
+
+
+@needs_gcc
+def test_collector_seals_a_crash_of_a_completed_run(host, tmp_path):
+    """#81 §3: the crash is a sealed report, not a runtime error; the run
+    stays complete and judgeable."""
+    run = _collect(host, tmp_path / "a", pcs=["0x401000"],
+                   console="[   9.1] WARNING: CPU: 0 PID: 1 at x.c:1\n")
+    obs = run.observation
+    assert obs.runtime_errors == ()
+    assert obs.runner_completed and obs.generation_attributed
+    crash = _crash(run)
+    assert (crash.source, crash.kind) == ("console", CrashKind.WARNING)
+    assert crash.title == "WARNING: CPU: 0 PID: 1 at x.c:1"
+    assert not crash.panicked
+    assert b"WARNING: CPU: 0" in (run.out / "console.log").read_bytes()
+    # The console is the primary evidence; dmesg is the fallback.
+    run = _collect(host, tmp_path / "b", pcs=["0x401000"],
+                   dmesg="BUG: KASAN: slab-out-of-bounds in nfsd4_open\n")
+    assert run.observation.runtime_errors == ()
+    assert (_crash(run).source, _crash(run).kind) == ("dmesg",
+                                                      CrashKind.KASAN)
+    assert _crash(_collect(host, tmp_path / "c", pcs=["0x401000"])) is None
+
+
+@needs_gcc
+def test_collector_seals_a_panic_of_an_incomplete_run(host, tmp_path):
+    run = _collect(host, tmp_path / "a", pcs=["0x401000"], panic=True,
+                   console="BUG: KASAN: use-after-free in nfsd4_bind\n"
+                           "Kernel panic - not syncing: KASAN: panic_on_warn"
+                           "\n")
+    obs = run.observation
+    assert not obs.runner_completed and obs.runtime_errors
+    crash = _crash(run)
+    assert crash.kind is CrashKind.KASAN and crash.panicked
+    assert crash.source == "console"
 
 
 @needs_gcc
@@ -1040,17 +1081,24 @@ collect(CollectorConfig.load(sys.argv[1]), Path(sys.argv[2]),
 
 
 @needs_gcc
-def test_generated_host_runs_a_candidate_to_reached(host, tmp_path):
+@pytest.mark.parametrize("warning", (False, True))
+def test_generated_host_runs_a_candidate_to_reached(host, tmp_path, warning):
     """stage1.json from generate, the collector (scripted guest) as the
-    engine command, and a mapping from target-pcs on the gcc binary."""
+    engine command, and a mapping from target-pcs on the gcc binary.  A
+    WARNING while the program runs is a crash finding; the job still
+    reaches s1_reached on its coverage (#81 §3)."""
     result = generate(host.spec)
     config = Stage1Config.load(result.stage1_config)
     pcs_file = tmp_path / "cover-pcs.txt"
+    console = tmp_path / "console.txt"
+    console.write_text("[  7.5] WARNING: CPU: 0 PID: 9 at fs/nfsd/x.c:3\n"
+                       if warning else "")
     config = config.model_copy(update={"engine": EngineConfig(
         argv=(sys.executable, "-I", "-c", COMMAND.format(repo=str(REPO)),
               str(result.collector_config), "{input}", "{output}"),
         cwd=tmp_path, resource_key="test-lane",
-        env={"LANG": "C.UTF-8", "TEST_COVER_PCS": str(pcs_file)},
+        env={"LANG": "C.UTF-8", "TEST_COVER_PCS": str(pcs_file),
+             "TEST_CONSOLE": str(console)},
         timeout_s=60)})
     config_path = tmp_path / "stage1-test.json"
     config_path.write_text(config.model_dump_json())
@@ -1097,6 +1145,14 @@ def test_generated_host_runs_a_candidate_to_reached(host, tmp_path):
             service.store.effect_failures(job_id), service.worker_errors)
         verdict = job.last_verdict.result
         assert verdict.status is Q1Status.REACHED
+        if warning:
+            (finding,) = job.crash_findings
+            assert finding.kind == "warning"
+            assert finding.title.startswith("WARNING: CPU: 0 PID: 9")
+            assert finding.bundle_ref == job.last_verdict.bundle_ref
+            assert finding.q1_verdict_id == verdict.verdict_id
+        else:
+            assert job.crash_findings == ()
         assert service.controller.replay(job_id) == job
     coverage = next(Path(config.state_dir, "runs").glob("*/output/coverage.json"))
     assert host_main(["check-pcs", "--stage1", str(result.stage1_config),

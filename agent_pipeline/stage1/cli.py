@@ -169,6 +169,9 @@ def _job_summary(service: Stage1Service, job_id: str) -> dict:
                            **job.campaign.tally.model_dump(mode="json")}
     if job.triage:
         out["triage"] = [t.model_dump(mode="json") for t in job.triage]
+    if job.crash_findings:
+        out["crash_findings"] = [f.model_dump(mode="json")
+                                 for f in job.crash_findings]
     if job.replay is not None:
         out["replay"] = {"crash_bundle_ref": job.replay.crash.bundle_ref,
                          "outcome": None if job.replay.outcome is None else
