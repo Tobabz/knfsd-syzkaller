@@ -21,13 +21,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from agent_pipeline.admission import (BuildFile, SyzkallerBuildManifest,
                                       SyzkallerCallTable,
                                       SyzkallerTargetIdentity)
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.contracts import (PIPELINE_GAP_IDS, CandidateSubmission,
-                                      LocationKind, LocationRequest, Q1Status)
+                                      LocationKind, LocationRequest, Q1Status,
+                                      Sanitizer)
 from agent_pipeline.controller.records import JobState
 from agent_pipeline.crash import CRASH_REPORT_TYPE, CrashKind, CrashReport
 from agent_pipeline.data import canonical_json, load_record
@@ -868,11 +870,12 @@ def test_series_fingerprint_is_the_bootstrap_record_digest():
 
 # ------------------------------------------------------------ collector
 
-def _inputs(tmp: Path, config: Stage1Config, harness_selection) -> Path:
+def _inputs(tmp: Path, config: Stage1Config, harness_selection,
+            approval: int = 0) -> Path:
     """An engine-shaped input directory for one lease."""
     from agent_pipeline.materializer import ExecutionHarnessApproval
     store = ArtifactStore(config.artifact_root)
-    approval = load_record(store, config.execution_harness_approvals[0],
+    approval = load_record(store, config.execution_harness_approvals[approval],
                            ExecutionHarnessApproval)
     from agent_pipeline.materializer import descriptor_id
     harness_id = descriptor_id(approval.descriptor)
@@ -906,11 +909,11 @@ def _inputs(tmp: Path, config: Stage1Config, harness_selection) -> Path:
     return inp
 
 
-def _collect(host, tmp, **fake):
+def _collect(host, tmp, approval=0, **fake):
     result = generate(host.spec)
     config = Stage1Config.load(result.stage1_config)
     collector = CollectorConfig.load(result.collector_config)
-    inp = _inputs(tmp, config, host.selection)
+    inp = _inputs(tmp, config, host.selection, approval)
     out = tmp / "output"
     out.mkdir()
     guests = []
@@ -1404,3 +1407,139 @@ def test_kernel_series_apply_is_deterministic(tmp_path):
             ["git", "-C", str(tree), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True).stdout.strip())
     assert heads[0] == heads[1] != commit
+
+
+# ------------------------------------------------------------ KCSAN variant
+
+def _two_variants(host, **variant_kw):
+    """The host's KASAN build plus a KCSAN build of the same tree, one spec
+    for both (#81 D10)."""
+    images = host.env / "images" / "kcsan"
+    images.mkdir()
+    _compile_vmlinux(host.env / "linux", images / "vmlinux")
+    (images / "bzImage").write_bytes(b"synthetic kcsan bzImage")
+    (images / ".config").write_text("CONFIG_KCOV=y\nCONFIG_KCSAN=y\n")
+    (images / "build.json").write_text(json.dumps({
+        "head": host.kernel_commit,
+        "series_sha256": series_fingerprint("kernel")}))
+    spec = json.loads(host.spec.read_text())
+    del spec["variant"]
+    spec["variants"] = [{"sanitizer": "kasan", **variant_kw.get("kasan", {})},
+                        {"sanitizer": "kcsan", **variant_kw.get("kcsan", {})}]
+    spec["policies"].append(policy("p-kcsan", sanitizer="kcsan").model_dump(
+        mode="json"))
+    host.spec.write_text(json.dumps(spec, indent=1))
+
+
+@needs_gcc
+def test_one_spec_generates_a_harness_per_variant(host):
+    _two_variants(host)
+    result = generate(host.spec)
+    config = Stage1Config.load(result.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    from agent_pipeline.materializer import ExecutionHarnessApproval
+    from agent_pipeline.registry import ArtifactHarnessRegistry
+    descriptors = [load_record(store, ref, ExecutionHarnessApproval).descriptor
+                   for ref in config.execution_harness_approvals]
+    assert [d.sanitizer.value for d in descriptors] == ["kasan", "kcsan"]
+    kasan, kcsan = descriptors
+    builds = [{a.name: a.artifact_ref for a in d.build_artifacts}
+              for d in descriptors]
+    # The kernel build is the variant's own; the rest is shared.
+    for name in ("bzimage", "instrumentation"):
+        assert builds[0][name] != builds[1][name]
+    for name in ("lane-script", "syz-executor", "vm-image"):
+        assert builds[0][name] == builds[1][name]
+    assert kasan.syzkaller_identity == kcsan.syzkaller_identity
+    assert set(result.variants) == {"kasan", "kcsan"}
+    assert result.execution_harness_id == \
+        result.variants["kasan"].execution_harness_id
+    ids = {v.execution_harness_id for v in result.variants.values()}
+    hcaps = {v.hcap_revision for v in result.variants.values()}
+    assert len(ids) == len(hcaps) == 2
+    # The policy's sanitizer selects the binding.
+    registry = ArtifactHarnessRegistry(store, config.harness_catalog_ref)
+    for name, variant in result.variants.items():
+        b = registry.lookup(host.kernel_commit, Sanitizer(name))
+        assert (b.execution_harness_id, b.hcap_revision) == (
+            variant.execution_harness_id, variant.hcap_revision)
+    # Each HCAP names its own support boundary (its instrumentation).
+    checker = ArtifactHcapChecker(store)
+    versions = [checker.judge_versions(v.hcap_revision)
+                for v in result.variants.values()]
+    assert versions[0].judge_profile_id == versions[1].judge_profile_id
+    assert versions[0].support_boundary_id != versions[1].support_boundary_id
+    assert config.judge_versions == versions[0]
+    collector = CollectorConfig.load(result.collector_config)
+    assert "bzimage" not in collector.files
+    assert collector.files_for(Sanitizer.KCSAN)["bzimage"] == \
+        (host.env / "images" / "kcsan" / "bzImage").resolve()
+    assert result.digests["kcsan:hcap"] == \
+        result.variants["kcsan"].hcap_revision
+
+
+@needs_gcc
+def test_capability_evidence_belongs_to_its_variant(host):
+    evidence = host.root / "kcsan-evidence.json"
+    evidence.write_text('{"schema_version":"test-evidence.v1"}\n')
+    _two_variants(host, kcsan={"capability_evidence": {
+        "CAP-lane": ["kcsan-evidence.json"]}})
+    result = generate(host.spec)
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    checker = ArtifactHcapChecker(ArtifactStore(host.root / "cas"))
+
+    def refs(name):
+        catalog = checker.load_catalog(result.variants[name].hcap_revision)
+        return next(c for c in catalog.capabilities
+                    if c.id == "CAP-lane").evidence_refs
+    assert refs("kasan") == ()
+    assert len(refs("kcsan")) == 1
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ({"variant": "kasan"}, "variant or variants"),
+    ({"capability_evidence": {"CAP-lane": ["x.json"]}},
+     "belongs to each variant"),
+    ({"variants": [{"sanitizer": "kcsan"}, {"sanitizer": "kcsan"}]},
+     "listed twice"),
+])
+def test_variant_spec_errors(host, change, message):
+    from agent_pipeline.stage1.host.generate import HostSpec
+    spec = json.loads(host.spec.read_text())
+    del spec["variant"]
+    spec["variants"] = [{"sanitizer": "kasan"}]
+    spec.update(change)
+    with pytest.raises(ValidationError, match=message):
+        HostSpec.model_validate_json(json.dumps(spec))
+
+
+def test_a_policy_needs_a_generated_variant(host):
+    spec = json.loads(host.spec.read_text())
+    spec["policies"].append(policy("p-kcsan", sanitizer="kcsan").model_dump(
+        mode="json"))
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="another sanitizer"):
+        generate(host.spec)
+
+
+KCSAN_REPORT = ("[   4.2] BUG: KCSAN: data-race in nfsd4_bind_conn / "
+                "nfsd4_destroy_session\n")
+
+
+@needs_gcc
+def test_a_kcsan_harness_seals_a_kcsan_report(host, tmp_path):
+    _two_variants(host)
+    run = _collect(host, tmp_path / "kcsan", approval=1, pcs=["0x401000"],
+                   console=KCSAN_REPORT)
+    crash = _crash(run)
+    assert crash.kind is CrashKind.KCSAN and crash.sanitizer is \
+        Sanitizer.KCSAN
+    assert crash.title.startswith("BUG: KCSAN: data-race in nfsd4_bind_conn")
+    assert run.observation.runtime_errors == ()
+    assert run.guest.config.bzimage == \
+        (host.env / "images" / "kcsan" / "bzImage").resolve()
+    # The same report on the KASAN harness is not a crash of its own.
+    run = _collect(host, tmp_path / "kasan", approval=0, pcs=["0x401000"],
+                   console=KCSAN_REPORT)
+    assert _crash(run) is None

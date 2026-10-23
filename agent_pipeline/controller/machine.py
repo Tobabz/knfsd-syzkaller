@@ -167,15 +167,23 @@ class Machine:
             j.state_reason = e.rejection or "no_candidate"
             return True
         j.candidate = e.candidate
+        start = Target(kind=TargetKind.ANALYSIS)
+        if j.seed is not None:
+            # #81 R5: the seeded plan, re-validated on this binding.
+            j.analysis_ref = j.seed.analysis_ref
+            j.plan_ref = j.seed.plan_ref
+            start = Target(kind=TargetKind.MATERIALIZE)
         binding = self._usable(c, e.binding)
         if binding is None:
             self._goto(c, Target(kind=TargetKind.BLOCKED_HARNESS_GAP,
                                  gap=kernel_revision_gap(
                                      e.candidate.kernel_commit),
-                                 inner=Target(kind=TargetKind.ANALYSIS)))
+                                 inner=start))
         else:
             j.binding = binding
-            self._goto(c, Target(kind=TargetKind.ANALYSIS))
+            if j.seed is not None:
+                c.reason = "seeded_plan"
+            self._goto(c, start)
         return True
 
     def _on_agent_succeeded(self, c: _Call, e: ev.AgentSucceeded) -> bool:

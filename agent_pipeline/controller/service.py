@@ -26,6 +26,7 @@ from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
 from .machine import Env, Machine, Outcome, harness_authority_stale
 from .records import (TERMINAL, AgentAttempt, Job, JobState, RepairInput,
+                      SeedPlan,
                       TaskKind, Transition)
 from .store import StaleIssueEvent, Store
 from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
@@ -112,18 +113,32 @@ class Controller:
                 start_line=loc.start_line, end_line=loc.end_line)),
             policy_id)
 
-    def submit(self, submission: CandidateSubmission, policy_id: str) -> str:
+    def submit(self, submission: CandidateSubmission, policy_id: str, *,
+               seed: SeedPlan | None = None) -> str:
         """Register the candidate and start a job for it.  A submission
         intake refuses still gets a job, which ends rejected (09 §3)."""
         self.store.policy(policy_id)            # must exist
         job = Job(job_id=f"job-{self.new_id()}", submission=submission,
-                  job_policy_id=policy_id)
+                  job_policy_id=policy_id, seed=seed)
         self.store.create(job, Transition(
             job_id=job.job_id, seq=0, from_state=None, to_state=job.state,
             reason="submitted", event={"type": "submitted"},
             job_policy_id=policy_id, at=self.clock(), job=job))
         self._intake(job.job_id)
         return job.job_id
+
+    def seed(self, job_id: str, policy_id: str) -> str:
+        """#81 R5: a new job for ``job_id``'s candidate under another
+        policy (another sanitizer), started from its plan instead of
+        Analysis and Planning.  The plan is re-validated against the new
+        binding's HCAP before it is materialized."""
+        src = self.store.job(job_id)
+        if src.candidate is None or src.analysis_ref is None or \
+                src.plan_ref is None:
+            raise ValueError(f"{job_id} has no plan to seed a job with")
+        return self.submit(src.submission, policy_id, seed=SeedPlan(
+            from_job=job_id, analysis_ref=src.analysis_ref,
+            plan_ref=src.plan_ref))
 
     def _intake(self, job_id: str) -> None:
         job = self.store.job(job_id)
