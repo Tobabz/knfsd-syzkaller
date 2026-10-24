@@ -14,7 +14,8 @@ from agent_pipeline.data import canonical_json
 from agent_pipeline.evidence import ArtifactInput, EvidenceStore
 from agent_pipeline.runner import DurableRunner, LeaseLost, RunnerWorker
 from agent_pipeline.runner.evidence_backend import (
-    CAPTURE_FAILED, DUPLICATE_ARTIFACT, STAGE2_BACKEND_UNAVAILABLE,
+    CAPTURE_FAILED, DUPLICATE_ARTIFACT, LEASE_LOST_DURING_CAPTURE,
+    STAGE2_BACKEND_UNAVAILABLE,
     EvidenceSealingBackend, ExecutionCapture, HostExecutionFacts,
     RunnerEvidenceReceiptStore, StepRoutingBackend, StreamingSealingBackend)
 from agent_pipeline.runner.models import BackendResult
@@ -162,6 +163,35 @@ def test_cancel_meanwhile_keeps_the_sealed_bundles(world):
     st = world.runner.complete(lease, BackendResult(bundle_ref=sha("b")))
     assert st.state == "ended_unsealed"
     assert st.bundles == (sha("a"), sha("b"))
+
+
+def test_segments_finished_after_a_cancel_are_still_sealed(world):
+    class CancelMidway:
+        def run(self, lease, control, emit):
+            emit(capture(0))
+            world.runner.cancel(lease.binding.task_id)
+            assert control.stop_requested()
+            emit(capture(1))         # finished before the command stopped
+
+    run = RunnerWorker(world.runner, world.streaming(CancelMidway()),
+                       worker_id="w").run_once()
+    assert run.status.state == "ended_unsealed"
+    assert len(run.status.bundles) == 2
+
+
+def test_a_segment_of_a_lost_lease_is_refused(world):
+    class Lost:
+        def append_bundle(self, lease, bundle_ref):
+            raise LeaseLost(lease.binding.task_id)
+
+    backend = StreamingSealingBackend(
+        Segments(world.runner, [lambda: capture(0), lambda: capture(1)]),
+        world.evidence, world.receipts, Lost(), sealer_id="stage2-test")
+    lease = world.runner.claim("w")
+    from agent_pipeline.runner.worker import LeaseControl
+    result = backend.execute(lease, LeaseControl(world.runner, lease))
+    assert result.bundle_ref is None
+    assert result.reason == LEASE_LOST_DURING_CAPTURE
 
 
 def test_stage1_receipt_bytes_have_no_stage2_input(tmp_path):

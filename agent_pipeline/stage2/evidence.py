@@ -134,6 +134,9 @@ class Stage2HostFacts(_Record):
     production_end: Termination | None = None
     compatibility: Compatibility | None = None
     plan_error: str | None = Field(default=None, max_length=512)
+    #: The CrashContextWindow bound the replay was planned with; the judge
+    #: takes the window with the same bound.
+    window_bound: int | None = Field(default=None, ge=1, le=64)
 
     @model_validator(mode="after")
     def _one_report(self) -> Stage2HostFacts:
@@ -145,7 +148,8 @@ class Stage2HostFacts(_Record):
         if self.step != "replay":
             if reports[self.step] is None:
                 raise ValueError(f"{self.step} bundle without its report")
-            if self.production_end or self.compatibility or self.plan_error:
+            if self.production_end or self.compatibility or self.plan_error \
+                    or self.window_bound is not None:
                 raise ValueError("replay facts on a non-replay bundle")
         elif self.plan_error is None:
             if self.replay is None or self.compatibility is None or \

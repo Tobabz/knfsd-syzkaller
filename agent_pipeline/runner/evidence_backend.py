@@ -32,6 +32,7 @@ from ..evidence import (
     SealingMetadata,
 )
 from .models import BackendResult, Digest, HostRecord, Identifier, Timestamp, WorkLease
+from .service import LeaseLost
 from .worker import ExecutionNotStopped, LeaseControl
 
 
@@ -553,10 +554,15 @@ class StreamingSealingBackend(EvidenceSealingBackend):
         sealed: list[str] = []
 
         def emit(capture: ExecutionCapture) -> None:
-            result = self.seal(lease, control, capture)
+            # A segment finished before a cancel is still sealed and added
+            # (append_bundle accepts it); a lost lease refuses it there.
+            result = self.seal(lease, _CancelTolerant(control), capture)
             if result.bundle_ref is None:
                 raise CaptureRefused(result.reason)
-            self.bundles.append_bundle(control.lease, result.bundle_ref)
+            try:
+                self.bundles.append_bundle(control.lease, result.bundle_ref)
+            except LeaseLost:
+                raise CaptureRefused(LEASE_LOST_DURING_CAPTURE) from None
             sealed.append(result.bundle_ref)
 
         try:
@@ -572,6 +578,21 @@ class StreamingSealingBackend(EvidenceSealingBackend):
         if not sealed:
             return self._unsealed(CAPTURE_FAILED)
         return BackendResult(bundle_ref=sealed[-1])
+
+
+class _CancelTolerant:
+    """``control`` for sealing a capture that already finished: a stop
+    request no longer refuses it, so a cancel keeps what ran before it."""
+
+    def __init__(self, inner: LeaseControl) -> None:
+        self._inner = inner
+
+    @property
+    def lease(self) -> WorkLease:
+        return self._inner.lease
+
+    def stop_requested(self) -> bool:
+        return False
 
 
 STAGE2_BACKEND_UNAVAILABLE = "stage2_backend_unavailable"

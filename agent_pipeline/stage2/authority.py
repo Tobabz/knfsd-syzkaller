@@ -174,6 +174,18 @@ class Stage2AuthorityStore:
             raise KeyError(bundle_ref)
         return self._decode(row)
 
+    def has(self, bundle_ref: str) -> bool:
+        validate_digest(bundle_ref)
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM runner_stage2_publications WHERE bundle_ref = ?",
+                (bundle_ref,)).fetchone() is not None
+
+    def count(self) -> int:
+        with self._lock:
+            return self._db.execute(
+                "SELECT COUNT(*) FROM runner_stage2_publications").fetchone()[0]
+
     def snapshot(self) -> ArtifactStage2Judge:
         entries = []
         size = 0
@@ -276,15 +288,15 @@ class Stage2AuthorityPublisher:
 
     def publish_ready(self) -> list[Publication]:
         results = []
+        installed = self.judge.snapshot.executions
         published = False
         for job in list(self.store.jobs()):
             for task_id in self._tasks(job):
                 for fact in self.runner.bundles(task_id):
-                    try:
-                        self.publications.publication(fact.bundle_ref)
-                        continue            # already published
-                    except KeyError:
-                        pass
+                    if fact.bundle_ref in installed:
+                        continue
+                    if self.publications.has(fact.bundle_ref):
+                        continue            # published, not yet installed
                     try:
                         self.publications.publish(self.publication(job, fact))
                     except Q1AuthorityPending as exc:
@@ -300,7 +312,10 @@ class Stage2AuthorityPublisher:
                         published = True
                         results.append(Publication(job.job_id, task_id,
                                                    "published"))
-        if published:
+        # Also when an earlier pass published but did not install (an
+        # exception in between): publications are append-only, so a
+        # different count means the snapshot is behind.
+        if published or self.publications.count() != len(installed):
             self.judge.install(self.publications.snapshot())
         return results
 

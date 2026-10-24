@@ -173,13 +173,20 @@ class ArtifactStage2Judge:
         return x.correlation.job_id == job_id and \
             x.correlation.task_id == task_id
 
-    def _open(self, x: Stage2Execution, stack: list) -> _Evidence:
+    def _facts(self, x: Stage2Execution
+               ) -> tuple[VerifiedBundle, Stage2HostFacts]:
         bundle = self.evidence.verify(x.bundle_ref,
                                       expected_correlation=x.correlation)
         facts = Stage2HostFacts.model_validate_json(
             bundle.get(HOST_FACTS_ID, expected_type=HOST_FACTS_TYPE))
         if facts.step != x.step:
             raise ValueError("host facts name another step")
+        return bundle, facts
+
+    def _open(self, x: Stage2Execution, stack: list,
+              opened: tuple[VerifiedBundle, Stage2HostFacts] | None = None
+              ) -> _Evidence:
+        bundle, facts = opened if opened is not None else self._facts(x)
         report = getattr(facts, x.step)
         journal = None
         if report is not None:
@@ -491,8 +498,11 @@ class ArtifactStage2Judge:
         try:
             if compiled != x.compiled or candidate_id != x.candidate.candidate_id:
                 raise ValueError("request does not match the published campaign")
-            ev = self._open(x, stack)
-            executions = ev.facts.campaign.executions
+            # The host's execution count holds even when the segment's
+            # journal or coverage cannot be judged.
+            opened = self._facts(x)
+            executions = opened[1].campaign.executions
+            ev = self._open(x, stack, opened)
             m1_rules, _, _ = self._rule_set(x)
             counts, generation_ids = self._generation_counts(x, ev, m1_rules)
             applied: tuple[str, ...] = ()
@@ -573,10 +583,10 @@ class ArtifactStage2Judge:
         log = ev.text(CRASH_LOG_ID, CRASH_LOG_TYPE)
         if log is None:
             return (), None
-        window = parse_crash_context(
-            log, vm_instance_id=x.correlation.vm_instance_id,
-            bound=x.crash_window_bound)
         try:
+            window = parse_crash_context(
+                log, vm_instance_id=x.correlation.vm_instance_id,
+                bound=x.crash_window_bound)
             plan = plan_replay(ev.journal, window)
         except PlanError:
             return (), None
@@ -624,7 +634,7 @@ class ArtifactStage2Judge:
                     raise ValueError("the crash bundle has no crash log")
                 window = parse_crash_context(
                     log, vm_instance_id=crash.correlation.vm_instance_id,
-                    bound=x.crash_window_bound)
+                    bound=facts.window_bound or x.crash_window_bound)
                 plan = plan_replay(production.journal, window)
                 text = ev.text(REPLAY_EXECPROG_ID, EXECPROG_TYPE) or ""
                 compat = facts.compatibility
