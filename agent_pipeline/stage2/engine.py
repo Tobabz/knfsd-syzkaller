@@ -31,7 +31,7 @@ Command contract (``{input}`` and ``{output}`` in argv are replaced):
 
 A segment counts once its directory exists under its final name: write it
 as ``segments/.NNNNNN.tmp`` and rename it.  A gate must finish
-``gate_repetitions`` segments, a replay one, a campaign at least one;
+``gate_repetitions`` segments (no more), a replay one, a campaign at least one;
 fewer ends the lease ``capture_failed`` (a runtime failure, never a
 verdict), keeping the segments already sealed.
 
@@ -239,7 +239,8 @@ class Stage2CommandEngine:
         write_replay_inputs(plan, target)
         _write(target / "host.json", canonical_json(
             {"production_end": production_end.value,
-             "compatibility": compatibility.model_dump(mode="json")}))
+             "compatibility": compatibility.model_dump(mode="json"),
+             "window_bound": self.config.crash_window_bound}))
         return None
 
     # ------------------------------------------------------------ run
@@ -256,6 +257,7 @@ class Stage2CommandEngine:
         replay_facts = None
         if t.step == "replay":
             replay_facts = parse_json((inp / "replay" / "host.json").read_bytes())
+        wanted = {"gate": t.gate_repetitions, "replay": 1}.get(t.step)
         taken = 0
         started = time.time_ns()
 
@@ -265,8 +267,9 @@ class Stage2CommandEngine:
                 seg = out / SEGMENTS / f"{taken:06d}"
                 if not seg.is_dir():
                     return
-                if taken >= MAX_SEGMENTS:
-                    raise CaptureError("too many segments")
+                if taken >= (MAX_SEGMENTS if wanted is None else wanted):
+                    raise CaptureError(f"{t.step} wrote more than "
+                                       f"{taken} segments")
                 emit(self._read_segment(t.step, seg, started, replay_facts))
                 started = time.time_ns()
                 taken += 1
@@ -287,7 +290,6 @@ class Stage2CommandEngine:
         if result.reason != "completed" or result.returncode != 0:
             raise CaptureError(
                 f"host command ended {result.reason} rc={result.returncode}")
-        wanted = {"gate": t.gate_repetitions, "replay": 1}.get(t.step)
         if (wanted is not None and taken != wanted) or taken == 0:
             raise CaptureError(f"{t.step} finished {taken} segments")
 

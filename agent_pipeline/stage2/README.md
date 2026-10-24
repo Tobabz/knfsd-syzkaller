@@ -72,7 +72,7 @@ numbered from 0, as `segments/.NNNNNN.tmp` renamed when complete. Its
 | campaign | `CampaignHostFacts`: `journal_name`, `executions`, the Q2 collector facts (console identity and completeness, every syz-manager report identity, `vm_termination`, `collection_window`) | `q2-evidence`, console, reports (`sealed_q2`); `crash-log` when the VM crashed; `generation-coverage/<lane>.<generation>` per program generation; `journal/...` |
 | replay | `ReplayHostFacts`: `journal_name`, `replay_end`, `fixture_failed` | `execprog.replay`; `journal/...` of the separate replay journal |
 
-A gate must finish `gate_repetitions` segments, a replay one, a campaign at
+A gate must finish exactly `gate_repetitions` segments, a replay one, a campaign at
 least one; fewer, a nonzero exit or a malformed segment ends the lease
 `capture_failed` (a runtime failure the Controller reruns, never a verdict)
 and keeps the segments already sealed. For a replay the engine plans before
