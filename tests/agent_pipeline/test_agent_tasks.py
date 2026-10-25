@@ -295,6 +295,24 @@ def test_planning_stores_inline_program_and_emits_existing_plan_variant(tmp_path
         b"syz_test$open()\n"
 
 
+def test_planning_instructions_require_client_side_triggers():
+    # 04 §3.2: the Agent reads no design document, only its instructions.
+    from agent_pipeline.agent_tasks.executor import (MUTATION_INSTRUCTIONS,
+                                                     PLANNING_INSTRUCTIONS)
+    planning = " ".join(PLANNING_INSTRUCTIONS.split())
+    for rule in ("fixture setup before the run is not a trigger",
+                 "must be an NFS client action",
+                 "Server behavior a client induces",
+                 "must never act on the server directly",
+                 "/proc/fs/nfsd/clients/<id>/ctl",
+                 "even if the pinned HCAP admits it",
+                 "gap_class remote_kcov_attribution"):
+        assert rule in planning, rule
+    mutation = " ".join(MUTATION_INSTRUCTIONS.split())
+    assert "C2S change stands in for a malicious NFS client" in mutation
+    assert "S2C change for a malicious NFS server" in mutation
+
+
 def test_actual_model_id_is_required_and_never_filled_from_policy(tmp_path):
     runtime = DeterministicFunctionRuntime(
         [analysis_data()], actual_model="requested-model")
