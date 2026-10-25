@@ -42,6 +42,9 @@ rendered Markdown (이 문서)
 
 - `hcap_revision`은 canonical machine-readable HCAP의 digest다. Controller가 job을 harness에 묶을 때 그
   harness를 기술하는 revision을 고르고, plan과 verdict가 이 값을 기록한다(`01` §11.2, issue #13).
+- revision에는 두 status가 있다. promoted revision은 사람이 검토해 공유 HCAP으로 올린 것이고, staged revision은
+  Harness Generation(`07` §5)이 만든 patch set이 Runner 검증을 통과해 생긴 것이다. staged revision은 그 gap key의
+  job들이 쓰며, promoted revision을 바꾸지 않는다. plan과 verdict는 어느 쪽인지 기록한다.
 - HCAP data는 `missing_capability_id`의 controlled vocabulary도 담는다(`07` §3, issue #13). 예:
   `state_lineage`, `remote_kcov.context.<context>`, `remote_kcov.kernel_revision.<commit>`,
   `neutral_control.<profile>`(`05` §11).
@@ -832,7 +835,8 @@ MANUAL / LEGACY CAMPAIGN (Agent pipeline 아님)
 ```
 
 promotion된 semantic subset이 없으면 Agent Stage 2의 semantic 요청은 `unsupported_by_current_harness`로
-처리하고 `HarnessGapIssue(gap_class=mutation_engine)`를 semantic runtime 구현·검증 작업에 연결한다.
+처리하고 `HarnessGapIssue(gap_class=mutation_engine)`를 연결한 뒤 Harness Generation(`07` §5)이 semantic
+runtime capability를 생성·검증한다.
 legacy 경로를 manual 실험에 쓰더라도 Controller는 Agent intent가 지원된다고 주장하지 않는다(issue #8).
 
 Stage 1은 mutation capability를 Q1을 만들기 위한 우회 수단으로 사용하지 않는다.
@@ -862,15 +866,21 @@ Harness Capability Specification
        HarnessGapIssue 생성/연결
               |
               v
-       blocked_harness_gap
+       Harness Generation (07 §5)
+              |
+              v
+       staged HCAP revision -> Reachability Planning 재개
+              |
+              +-- 생성 실패 -> blocked_harness_gap
 ```
 
 Agent는 없는 capability를 있다고 가정하지 않는다.
-candidate 실행 중에 즉석에서 source를 바꾸지 않는다.
-대신 별도 Harness Extension Work에서 syzlang, pseudo-syscall/executor, fixture/tool,
-mutation-engine capability를 확장할 수 있다.
+Stage 1/2 Agent는 candidate 실행 중에 즉석에서 source를 바꾸지 않는다.
+없는 capability는 Harness Generation이 syzlang, pseudo-syscall/executor, fixture/tool,
+mutation-engine, remote-KCOV 계측으로 생성하고 검증한다.
 
-Linux kernel source를 바꾸는 observability extension은 자동 수행하지 않고 human decision issue로 관리한다.
+Linux kernel source를 바꾸는 observability extension도 Harness Generation이 생성한다. target kernel 동작을 바꾸지
+않는 계측만 허용하고, `07` §5.2의 검증을 통과해야 쓴다. 공유 HCAP으로의 promotion은 사람이 검토한다.
 자세한 계약은 `07-harness-gap-issue.md`를 따른다.
 
 ## 7. 갱신 책임

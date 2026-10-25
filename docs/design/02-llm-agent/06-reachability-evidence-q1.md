@@ -466,6 +466,7 @@ Q1 = INCONCLUSIVE
     +-- unsupported_attribution
            -> HarnessGapSignal
            -> Controller가 HarnessGapIssue(remote_kcov_attribution)를 생성하거나 연결 (07 §2)
+           -> Harness Generation이 attribution 계측을 생성·검증 (07 §5)
 ~~~
 
 Q1 상태만으로 source patch를 생성하지 않는다.

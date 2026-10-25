@@ -7,6 +7,8 @@
 > `agent_pipeline/rule_compiler.py`. gate·campaign·replay의 Runner backend와 artifact 기반 Stage 2 Judge는 미구현).
 > 구현 스택은 `../decisions/2026-10-13-agent-implementation-stack.md`
 > 관련 게이트: Q1 / Stage 2 baseline-with-rules gate / Q2 / Replay
+> 설계 변경(2026-10-25): gap은 `blocked_harness_gap`이 아니라 `harness_generating`(§3.2)으로 간다. 구현은 아직
+> gap에서 멈춘다(issue #83). 결정 기록은 `../decisions/2026-10-25-harness-generation-on-gap.md`
 
 ## 요약
 
@@ -39,19 +41,19 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
  submitted
    | {intake, harness binding}
    +-- intake invalid ----------------------> rejected
-   +-- no validated harness ----------------> blocked_harness_gap
+   +-- no validated harness ----------------> harness_generating
    v
  s1_analysis [A]
    | CandidateAnalysis
    v
  s1_planning [A]
-   +-- unsupported -------------------------> blocked_harness_gap
+   +-- unsupported -------------------------> harness_generating
    +-- reanalysis_required -----------------> s1_analysis      (repair)
    | plan
    v
  {HCAP check, Materializer}
    +-- typed reject ------------------------> s1_planning      (repair)
-   +-- neutral_control_unavailable ---------> blocked_harness_gap
+   +-- neutral_control_unavailable ---------> harness_generating
    | ReachabilityHarness
    v
  s1_approval [H]   (only when approval policy requires it)
@@ -62,7 +64,7 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
    +-- NOT_REACHED -------------------------> s1_planning      (repair)
    +-- INCONCLUSIVE infra / loss -----------> s1_running       (rerun)
    +-- INCONCLUSIVE evidence / mapping -----> blocked_operator
-   +-- INCONCLUSIVE unsupported_attribution > blocked_harness_gap
+   +-- INCONCLUSIVE unsupported_attribution > harness_generating
    | REACHED
    v
  s1_reached ---- campaign_mode mutate ----> s2_strategy      (Figure 2)
@@ -101,13 +103,13 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
 
 ```text
  s2_strategy [A]
-   +-- unsupported -------------------------> blocked_harness_gap
+   +-- unsupported -------------------------> harness_generating
    | MutationRuleSet
    v
  {Compiler}
    +-- agent-fixable reject ----------------> s2_strategy      (repair)
    +-- unsupported_capability /
-   |   requires_state_lineage --------------> blocked_harness_gap
+   |   requires_state_lineage --------------> harness_generating
    | CompiledMutationRule[]
    v
  s2_gate [R] -- sealed bundles --> {Q1 / M1 Judge, gate table 01 §3}
@@ -140,8 +142,15 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
    |                         resume -> resume_point    close -> closed
    +-- operator cancel ---------------------------------> closed(cancelled)
 
- blocked_harness_gap [I]                                           (07 §7)
+ harness_generating [A][R]                                         (07 §5, §3.2)
+   +-- staged harness for the gap key exists -> {re-binding} -> resume_point
+   +-- generated harness validated ----------> {re-binding} -> resume_point
+   +-- validation rejected ------------------> harness_generating (regenerate)
+   +-- budget exhausted / infeasible --------> blocked_harness_gap
+
+ blocked_harness_gap [I]   (fallback only)                         (07 §7)
    +-- issue resolved -> retry_pending -> {re-binding} -> resume_point
+   +-- operator retry_generation -> harness_generating
    +-- issue deferred -> parked [I] -> issue reopened -> blocked_harness_gap
    |                                   issue resolved -> retry_pending
    +-- issue wont_fix -> closed_unsupported
@@ -173,7 +182,8 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
 | `s2_campaign` | Runner: fuzz campaign | gate 통과, crash review 뒤 재개 |
 | `s2_replaying` | Runner: `CrashContextWindow` replay | window에 `APPLIED` rule이 있는 Q2 `OBSERVED` |
 | `crash_review` | 사람: crash report 검토 | replay 비교 verdict, fixed campaign crash의 replay |
-| `blocked_harness_gap` | issue (`07` §7) | gap |
+| `harness_generating` | Agent + Runner: Harness Generation과 검증 (`07` §5, §3.2) | gap (§3, §4의 gap 행) |
+| `blocked_harness_gap` | issue (`07` §7) | Harness Generation 실패(§3.2) |
 | `retry_pending` | Controller 처리 (queue, `07` §7) | issue resolved |
 | `parked` | issue 재개 또는 해결 (`07` §7) | issue deferred |
 | `blocked_operator` | 사람: operator 동작 (§5) | budget 소진(§6), fail-closed 경로(§2–§4) |
@@ -188,7 +198,7 @@ Controller는 아직 없으므로 관측된 증상은 없다. 문제는 설계 �
   Agent, Runner, 사람에게 보낸 요청은 `task_id`를 가진다.
   전이가 만드는 요청(재실행, `resume`, repair 포함)은 모두 새 `task_id`를 받는다. 같은 `task_id`는 §8의 재발송과
   재시작 처리에서만 쓴다.
-- `blocked_harness_gap`, `blocked_operator`, `parked`, `retry_pending`, `crash_review`는 `resume_point`(다시 들어갈
+- `harness_generating`, `blocked_harness_gap`, `blocked_operator`, `parked`, `retry_pending`, `crash_review`는 `resume_point`(다시 들어갈
   상태와 그 입력)를 기억한다.
 - `blocked_operator`, `crash_review`, `blocked_harness_gap`, `parked`는 사람이나 issue의 결정을 기다리는 대기
   상태다(`s1_approval`은 제외한다, 근거 13). 대기 상태는 그 상태의 operator 동작이나 issue 이벤트로만 끝나고,
@@ -235,16 +245,16 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | 상태 | 이벤트와 조건 | 다음 상태 | counter (§6) | 근거 |
 |---|---|---|---|---|
 | `submitted` | intake 실패 | `rejected(reason)` | — | `02` §3 |
-| `submitted` | intake 통과, `kernel_commit`용 검증된 harness 없음 | `blocked_harness_gap(remote_kcov_attribution, remote_kcov.kernel_revision.<commit>)` | — | `01` §11.2, `07` §2 |
+| `submitted` | intake 통과, `kernel_commit`용 검증된 harness 없음 | `harness_generating(remote_kcov_attribution, remote_kcov.kernel_revision.<commit>)` | — | `01` §11.2, `07` §2 |
 | `submitted` | intake 통과, harness와 `hcap_revision` 묶음 | `s1_analysis` | — | `01` §11.2 |
 | `s1_analysis` | `analysis` | `s1_planning` | — | `03` §13 |
 | `s1_planning` | `plan`, HCAP 검사 실패(없는 capability, `usable_by`에 `agent_stage1` 없음, 다른 `hcap_revision`) | `s1_planning` (repair, `hcap_invalid`) | agent_repair | `04` §1.1, `05` §8 |
 | `s1_planning` | `plan`, Materializer typed 거부(`neutral_control_unavailable`, `host_authority_unavailable` 제외) | `s1_planning` (repair, `materializer_rejected`) | agent_repair | `05` §11, §13 |
 | `s1_planning` | `plan`, Materializer `host_authority_unavailable`(build approval에 없는 `hcap_revision`, 깨진 build artifact·HCAP·admission 기록, parser identity 불일치) 또는 HCAP 검사가 host catalog 자체를 읽을 수 없다(깨진 catalog). plan을 고쳐 해결할 수 없다. catalog나 dependency 파일이 없거나 읽기가 실패하면 전이 없이 다음 poll에서 다시 시도한다 | `blocked_operator(host_authority)`. `resume_point`는 materialize다 | — | `05` §11, §13 |
-| `s1_planning` | `plan`, Materializer `neutral_control_unavailable` | `blocked_harness_gap(fixture_or_tool, neutral_control.<profile>)` | — | `05` §11 |
+| `s1_planning` | `plan`, Materializer `neutral_control_unavailable` | `harness_generating(fixture_or_tool, neutral_control.<profile>)` | — | `05` §11 |
 | `s1_planning` | `plan`, materialize 성공, approval policy가 승인을 요구 | `s1_approval` | — | `05` §11, `02` §8 |
 | `s1_planning` | `plan`, materialize 성공, 승인 불필요 | `s1_running` | — | |
-| `s1_planning` | `unsupported` | `blocked_harness_gap(gap_class, missing_capability_id)` | — | `05` §8, `07` §2 |
+| `s1_planning` | `unsupported` | `harness_generating(gap_class, missing_capability_id)` | — | `05` §8, `07` §2 |
 | `s1_planning` | `reanalysis_required` | `s1_analysis` (repair, `reanalysis_requested`) | agent_repair | `03` §14 |
 | `s1_approval` | approve. 승인이 가리키는 review manifest hash가 현재 harness의 hash와 같음 | `s1_running` | — | `05` §11 |
 | `s1_approval` | approve, hash 다름 | 상태 유지. 승인으로 받지 않는다 | — | `02` §6 |
@@ -253,7 +263,7 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 | `s1_running` | Q1 `NOT_REACHED` | `s1_planning` (repair, `q1_not_reached`) | agent_repair | `06` §13 |
 | `s1_running` | Q1 `INCONCLUSIVE(infra)`, `INCONCLUSIVE(loss)`, 봉인 bundle 없는 Runner 종료 | `s1_running` (같은 harness 재실행) | runtime_retry | `06` §13, `01` §12 |
 | `s1_running` | Q1 `INCONCLUSIVE(evidence)`, `INCONCLUSIVE(mapping)` | `blocked_operator(q1_evidence)`, `blocked_operator(q1_mapping)` | — | `06` §13, `01` §11.1 |
-| `s1_running` | Q1 `INCONCLUSIVE(unsupported_attribution)` | `blocked_harness_gap(remote_kcov_attribution, remote_kcov.context.<expected_context>)` | — | `06` §7, §13 |
+| `s1_running` | Q1 `INCONCLUSIVE(unsupported_attribution)` | `harness_generating(remote_kcov_attribution, remote_kcov.context.<expected_context>)` | — | `06` §7, §13 |
 | `s1_running` | verdict의 `candidate_id`나 `execution_harness_id`가 job과 다름 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
 
 - ambient control의 결과(`06` §11)는 기록만 하고 전이를 바꾸지 않는다.
@@ -270,7 +280,7 @@ Agent Task 출력의 variant는 다음과 같다. 각 variant의 내용은 오�
 - 다른 job의 plan으로 시작한 job(`Job.seed`, #81 R5. 예: KASAN job의 plan으로 시작한 KCSAN job)은 intake 뒤
   Analysis와 Planning을 건너뛴다. 그 plan을 새 binding의 HCAP로 다시 검증(`compatible_replacement`)하고
   materialize한다. 검증이나 materialize가 거부되면 위 표의 행대로 Planning repair로 간다. binding이 없으면
-  `blocked_harness_gap`의 `resume_point`가 materialize다. Q1은 새 harness에서 다시 도달해야 한다.
+  `harness_generating`의 `resume_point`가 materialize다. Q1은 새 harness에서 다시 도달해야 한다.
 - `REACHED`로 넘어갈 때 Controller는 `Stage2Input`(`01` §5.1)의 구성 artifact와 verdict id를 job에 고정한다.
 
 ### 3.1 fixed campaign과 Stage 1 replay
@@ -287,7 +297,7 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
 | `s1_fixed` | Q1 `REACHED`, crash 없음 | `reached_no_crash`로 센다. 연속 `not_reached`를 0으로 | — | D12 |
 | `s1_fixed` | Q1 `NOT_REACHED`, crash 없음 | `not_reached`로 센다. 연속 `not_reached`에 더한다 | — | D12 |
 | `s1_fixed` | Q1 `INCONCLUSIVE(infra)`, `INCONCLUSIVE(loss)`, crash 없음, 또는 봉인 bundle 없는 Runner 종료 | 같은 attempt 번호로 새 task를 보낸다. attempt로 세지 않는다 | runtime_retry | D12 |
-| `s1_fixed` | Q1 `INCONCLUSIVE(evidence)`, `INCONCLUSIVE(mapping)`, `INCONCLUSIVE(unsupported_attribution)`, verdict의 identity가 job과 다름 | 남은 attempt를 취소하고 §3의 같은 행(`blocked_operator(q1_*)`, `blocked_harness_gap`). `resume_point`는 `s1_fixed`(같은 campaign) | — | `06` §13 |
+| `s1_fixed` | Q1 `INCONCLUSIVE(evidence)`, `INCONCLUSIVE(mapping)`, `INCONCLUSIVE(unsupported_attribution)`, verdict의 identity가 job과 다름 | 남은 attempt를 취소하고 §3의 같은 행(`blocked_operator(q1_*)`, `harness_generating`). `resume_point`는 `s1_fixed`(같은 campaign) | — | `06` §13 |
 | `s1_fixed` | 연속 `not_reached`가 `fixed_not_reached_limit`에 닿음 | 남은 attempt를 취소하고 `blocked_operator(fixed_not_reaching)`. `resume`은 연속 수를 0으로 되돌려 같은 campaign을 이어 간다 | — | D13 |
 | `s1_fixed` | 센 attempt(`reached_no_crash` + `not_reached`)가 `fixed_attempts`에 닿고 crash 없음 | `s1_reached(fixed_no_signal)`. 이후 operator가 `start_stage2`로 mutate를 시작할 수 있다 | — | D13 |
 | `s1_fixed` | 위 행이 아니고 crash도 없음 | 끝난 attempt 자리에 다음 attempt를 보낸다(보낸 attempt + 남은 attempt < `fixed_attempts`일 때) | — | D11 |
@@ -326,6 +336,36 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
   `abandoned`로 남는다. replay는 crash가 난 harness로만 돌릴 수 있기 때문이다. JudgeProfile 재판정은
   `s1_replaying`의 replay를 끊지 않고, Q1 crash finding의 replay가 끝난 뒤 갈 행만 바꾼다.
 
+### 3.2 gap 경로: harness 생성
+
+§3, §3.1, §4에서 `harness_generating(gap_class, missing_capability_id)`로 가는 행을 gap 행이라 한다. gap은 job을
+멈추지 않는다. Controller는 `HarnessGapIssue`를 만들거나 연결하고(`07` §2), 그 행이 정한 `resume_point`를 기억한
+채 Harness Generation(`07` §5)을 시작한다.
+
+| 상태 | 이벤트와 조건 | 다음 상태 | counter (§6) | 근거 |
+|---|---|---|---|---|
+| gap 행 | 같은 gap key의 staged 또는 promoted harness가 이미 있고 job이 아직 그 binding이 아님 | 다시 binding하고 `resume_point`로 간다(§5의 binding 변경 규칙) | — | `07` §2, §7 |
+| gap 행 | 같은 gap key의 Harness Generation이 진행 중 | `harness_generating`. 그 작업의 결과를 함께 기다린다 | — | `07` §2 |
+| gap 행 | 그 밖 | `harness_generating`. 생성 Agent Task를 보낸다(입력은 아래) | — | `07` §5 |
+| `harness_generating` | 생성 Agent `extension(patch_set)` | 같은 상태. Runner에 검증 task를 보낸다 | — | `07` §5.2 |
+| `harness_generating` | 검증 통과 | staged `hcap_revision`(build가 바뀌었으면 새 ExecutionHarnessIdentity)을 만들고 다시 binding한다. `resume_point`로 간다. binding 변경 처리는 §5의 identity 변경 또는 `hcap_revision` 변경 행과 같다. 같은 gap key로 기다리던 job도 모두 같은 처리를 한다 | — | `07` §5.2, `01` §11.2 |
+| `harness_generating` | 검증 거부(typed reason, 봉인 bundle) | 같은 상태. 거부 사유와 evidence를 넘겨 생성 Agent Task를 다시 보낸다 | harness_generation | `07` §5.2 |
+| `harness_generating` | 검증 `INCONCLUSIVE(infra)` 또는 봉인 bundle 없는 Runner 종료 | 같은 검증을 다시 실행한다 | runtime_retry | |
+| `harness_generating` | 생성 Agent `infeasible(reason)` | `blocked_harness_gap(gap_class, missing_capability_id)`. `resume_point`는 그대로 | — | `07` §7 |
+| `harness_generating` | `harness_generation` 한도 초과 | `blocked_harness_gap(gap_class, missing_capability_id, generation_exhausted)`. `resume_point`는 그대로 | — | `07` §7, §6 |
+
+- 생성 Agent Task 입력은 `GapRef`, `Job.gap_proposal_ref`의 `CapabilityProposal`(있으면), candidate,
+  CandidateAnalysis, 지금 binding의 HCAP, 이전 생성 시도의 patch set과 검증 거부 사유다. 출력 variant는
+  `extension(patch_set)`과 `infeasible(reason)`이다. 출력은 경로를 직접 정하지 않고, 검증 verdict가 정한다(§2).
+- `harness_generating`은 대기 상태가 아니다. Agent와 Runner가 일하는 상태다. 재평가 이벤트(§5)가 오면 진행 중인
+  생성은 계속하고, 검증 통과 뒤 binding할 때 그때의 binding 기준으로 `01` §11.2를 적용한다.
+- 생성 작업은 gap key `(gap_class, missing_capability_id)`마다 하나다. 여러 job이 같은 key로 들어오면 하나의 생성
+  결과를 함께 쓴다. budget도 그 작업 단위로 센다.
+- staged harness로 얻은 Q1·M1·Q2 verdict와 crash report는 staged `hcap_revision`과 patch set digest를 기록한다.
+  promotion(`07` §5.3)이 끝나면 issue resolved 이벤트와 §5의 `hcap_revision` 행이 job을 promoted revision으로 옮긴다.
+- `kernel_commit`용 harness가 없는 경우(binding 실패 행)의 생성은 계측 series의 이식과 그 build의 검증이다.
+  Q1은 그 build에서 처음부터 세운다.
+
 ### 4. Stage 2 전이
 
 Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implementation-stack.md` 결정 1). 아래 표는
@@ -338,12 +378,12 @@ Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implement
 | `s1_reached` | Stage 2 시작, identity 다름 | §5의 identity 변경 처리 | — | `01` §11.2 |
 | `s2_strategy` | `rule_set`, Compiler 성공 | `s2_gate` | — | `08` §12 |
 | `s2_strategy` | `rule_set`, Compiler 거부 `unknown_path`, `type_mismatch`, `message_type_inconsistent`, `selector_mismatch`, `missing_required_field` | `s2_strategy` (repair, `compiler_rejected`) | agent_repair | `08` §12 |
-| `s2_strategy` | `rule_set`, Compiler 거부 `unsupported_capability`, `requires_state_lineage` | `blocked_harness_gap(mutation_engine, missing_capability_id)`. `resume_point`는 그 rule set을 다시 compile하는 지점이다 | — | `08` §12, §15, `07` §7 |
-| `s2_strategy` | `unsupported` | `blocked_harness_gap(mutation_engine, missing_capability_id)` | — | `08` §15 |
+| `s2_strategy` | `rule_set`, Compiler 거부 `unsupported_capability`, `requires_state_lineage` | `harness_generating(mutation_engine, missing_capability_id)`. `resume_point`는 그 rule set을 다시 compile하는 지점이다 | — | `08` §12, §15, `07` §7 |
+| `s2_strategy` | `unsupported` | `harness_generating(mutation_engine, missing_capability_id)` | — | `08` §15 |
 | `s2_gate` | gate Q1 `NOT_REACHED` | `blocked_operator(gate_regression)` | — | `01` §3, `08` §16 |
 | `s2_gate` | gate Q1 `INCONCLUSIVE(infra)`, `INCONCLUSIVE(loss)`, 봉인 bundle 없는 Runner 종료 | `s2_gate` 재실행 | runtime_retry | `01` §3 |
 | `s2_gate` | gate Q1 `INCONCLUSIVE(evidence)`, `INCONCLUSIVE(mapping)` | `blocked_operator(q1_evidence)`, `blocked_operator(q1_mapping)` | — | `01` §3, `06` §13 |
-| `s2_gate` | gate Q1 `INCONCLUSIVE(unsupported_attribution)` | `blocked_harness_gap(remote_kcov_attribution, remote_kcov.context.<expected_context>)` | — | `01` §3, `06` §13 |
+| `s2_gate` | gate Q1 `INCONCLUSIVE(unsupported_attribution)` | `harness_generating(remote_kcov_attribution, remote_kcov.context.<expected_context>)` | — | `01` §3, `06` §13 |
 | `s2_gate` | Q1 `REACHED`, 평가한 rule 중 M1 `INCONCLUSIVE`가 있음 | `s2_gate` 재실행 | runtime_retry | `01` §3 |
 | `s2_gate` | Q1 `REACHED`, `targets_baseline_traffic=true`인 intent의 M1이 `NOT_APPLIED` | `s2_strategy` (repair, `gate_not_applied`) | agent_repair | `01` §3, `08` §16 |
 | `s2_gate` | 봉인 bundle이 이 task의 것이라는 host provenance가 없거나, Judge 결과가 그 bundle이 아닌 다른 bundle을 가리킴 | `blocked_operator(q1_evidence)` | — | `01` §11.1 |
@@ -417,7 +457,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
   `resume_point`가 된다. 재개하면 job은 그 대기 상태로 들어가고, 그 상태를 끝내는 동작이 그 `resume_point`로
   보낸다.
 - 결과인 대기 상태의 `resume_point`는 표가 정한다. 행이 따로 정하지 않으면 그 결과를 낸 단계이고(Q1 판정이면
-  `s1_running`), 교체 없는 폐기로 생긴 `blocked_harness_gap`은 기준 지점이다. 앞선 재평가가 기준 지점을 바꿔
+  `s1_running`), 교체 없는 폐기로 생긴 `harness_generating`은 기준 지점이다. 앞선 재평가가 기준 지점을 바꿔
   놓았어도 재개는 지금 판정이 정한 곳으로 간다(근거 16).
 - 재판정 결과로 `resume_point`를 정하면 job은 그 verdict를 소비한 것으로 기록하고, 다음 재판정은 그 verdict와
   비교한다.
@@ -426,6 +466,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 
 | 이벤트 | 대상 | 처리 | 근거 |
 |---|---|---|---|
+| operator `retry_generation` | `blocked_harness_gap`, `parked` | `harness_generating`. `harness_generation` counter를 0으로 되돌리고 같은 gap과 `resume_point`로 생성을 다시 시작한다 | `07` §7 |
 | issue resolved | `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding한 뒤 `resume_point`로 간다. binding이 바뀌었으면 먼저 표 위 규칙대로 `resume_point`를 바꾼다. identity가 바뀌었으면 아래 identity 변경 행을, identity가 같고 `hcap_revision`만 바뀌었으면(build를 바꾸지 않은 promotion) 아래 `hcap_revision` 변경 행을 적용한다. 그 `hcap_revision`의 변경 이벤트가 issue 이벤트보다 늦게 오거나 오지 않아도 같다 | `07` §7 |
 | issue deferred | `blocked_harness_gap` | `parked` | `07` §7 |
 | issue reopened | `parked` | `blocked_harness_gap`. 같은 gap과 `resume_point`로 issue를 다시 기다린다 | `07` §7 |
@@ -444,7 +485,7 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 통과하면 `s1_running`(승인이 필요하면 `s1_approval`)이다. 실패하면 §3의 HCAP 검사·Materializer 행이 정하는 곳이며,
 repair로 가면 cause는 `hcap_changed`다. plan이 없으면 Stage 1의 Agent 상태(`s1_analysis` 또는 `s1_planning`)를 다시
 시작한다. Stage 2에 있었어도 Q1을 새 identity에서 다시 세운다(`01` §11.2). 다시 binding할 검증된 harness build가
-없으면(교체 없는 폐기) §3의 binding 실패 행과 같은 `blocked_harness_gap(remote_kcov_attribution,
+없으면(교체 없는 폐기) §3의 binding 실패 행과 같은 `harness_generating(remote_kcov_attribution,
 remote_kcov.kernel_revision.<commit>)`이다. 대기 상태에서는 이 검증과 materialize를 identity 변경 때 하고, 그 결과가
 `resume_point`가 된다. 승인 필요 여부는 `s1_running`에 들어갈 때 정한다(§3).
 
@@ -458,6 +499,7 @@ remote_kcov.kernel_revision.<commit>)`이다. 대기 상태에서는 이 검증�
 | `agent_repair[stage2]` | Stage 2에서 `(repair)` 전이의 수(cause `hcap_changed` 제외) | operator `resume` | `blocked_operator(stage2_repair_budget)` |
 | `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공, 새 요청 시작 | `blocked_operator(agent_failure)` |
 | `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s1_fixed`, `s1_replaying`, `s2_gate`, `s2_campaign`, `s2_replaying`). `s1_fixed`는 campaign의 연속 infra attempt를 센다 | 그 단계가 재실행이 아닌 행으로 끝날 때, Runner 입력이 바뀔 때. `s2_campaign`은 이어 간 campaign이 bundle을 봉인할 때도(campaign evidence는 §4의 campaign 임계값이 따로 센다). 재실행 행으로 가는 결과는 판정된 verdict여도(`INCONCLUSIVE(loss)`, gate의 M1 `INCONCLUSIVE`) 되돌리지 않는다 | `blocked_operator(runtime_retry_exhausted)` |
+| `harness_generation[gap key]` | 같은 gap key에서 검증이 거부된 생성 시도의 수 | 검증 통과, operator `retry_generation` | `blocked_harness_gap(..., generation_exhausted)` (§3.2) |
 | campaign 임계값, fuzz budget | `01` §11.1, §12 | — | §4 표 |
 | fixed campaign 수 | 센 attempt(`fixed_attempts`), 연속 `not_reached`(`fixed_not_reached_limit`) | 연속 수: `reached_no_crash`, operator `resume` | §3.1 표 |
 
@@ -510,9 +552,11 @@ Task 입력 digest에 들어가지 않는다.
 Reachability Planning의 unsupported 출력은 `CapabilityProposal`을 함께 낼 수 있다(#75). 누락 계층(gap_class와
 같다), 선택 경로에서 만들어야 하는 조건, kernel source 근거, 검토한 promoted HCAP마다 부족한 이유, 추가할
 interface, 승격에 필요한 KVM 증거를 담는다. executor가 artifact로 저장하고 `UnsupportedOutput.proposal_ref`로
-넘기며, Controller는 `Job.gap_proposal_ref`에 남긴다(blocked_harness_gap이든 gap_id_unknown이든). 값은 가장
+넘기며, Controller는 `Job.gap_proposal_ref`에 남긴다(harness_generating이든 gap_id_unknown이든). 값은 가장
 최근 unsupported 답의 제안이며(제안이 없으면 비운다), job의 gap이 지워지거나 다른 gap으로 바뀌면 함께 비운다. 제안은 HCAP
-항목을 만들거나 승격하지 않는다. 승격은 지금처럼 typed KVM 증거와 owner 승인이 필요하다.
+항목을 직접 만들거나 승격하지 않는다. Harness Generation(§3.2)이 이 제안을 입력으로 harness를 생성하고, 검증을
+통과하면 staged HCAP 항목이 된다. 공유 HCAP으로의 승격은 지금처럼 typed KVM 증거와 owner 승인이 필요하지만
+job을 막지 않는다(`07` §5.3).
 
 ### 8. 기록과 재시작
 
@@ -688,6 +732,11 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 19. **Q1 crash finding은 replay한 뒤 job을 verdict대로 보낸다.** `01` §12의 replay·검토 규칙은 fixed crash와 같게
     적용하고(R3), job을 멈추지는 않는다(R2). replay를 job이 나중에 쉴 때로 미루면 job이 다른 harness로 옮겨 간 뒤
     replay할 수 없게 된다. 검토는 사람의 대기 상태가 아니라 job에 붙은 목록이다.
+20. **gap은 job을 멈추지 않고 harness를 생성한다(2026-10-25, 사용자 결정).** 이 pipeline의 목적은 candidate마다
+    도달 harness를 만드는 것이다(`01` §1). 맞는 harness가 없다는 것은 결론이 아니라 다음에 할 일이다. 사람이 gap마다
+    capability를 구현하면 job 처리량이 사람 시간에 묶인다(#83). 신뢰는 사람의 사전 승인이 아니라 Runner의 결정적
+    검증(`07` §5.2)과 evidence에 남는 staged revision·patch set digest에서 온다. `blocked_harness_gap`은 생성이 실패한
+    경우의 fallback으로만 남는다.
 
 ## 검토한 대안
 
@@ -698,6 +747,8 @@ campaign처럼 실행 중에 bundle을 여러 번 봉인하는 task는 `running`
 | 모든 INCONCLUSIVE를 자동 재실행 | 사람 개입이 준다 | 결정적 실패에 budget을 쓰고 무결성 실패를 가린다 | 채택 안 함 |
 | budget 소진을 종료 상태로 | 단순하다 | 이어 갈 수 없고, 종료가 음성 결론처럼 읽힌다 | 채택 안 함 |
 | job 전체 budget 하나 | 단순하다 | infra 재실행이 Agent repair 몫을 먹는다. `01` §12는 둘을 다른 문제로 나눈다 | 채택 안 함 |
+| gap에서 `blocked_harness_gap`으로 멈추고 사람이 harness를 만든다(이전 설계) | 사람이 모든 harness 변경을 먼저 검토한다 | gap마다 job이 사람을 기다린다. pipeline이 harness를 만든다는 목적과 어긋난다 | 채택 안 함(2026-10-25). 생성 실패 시 fallback으로만 남긴다 |
+| gap에서 생성하고 promotion까지 자동으로 한다 | 사람 개입이 가장 적다 | 검토되지 않은 계측이 공유 HCAP에 들어가 다른 job의 결론까지 바꾼다 | 채택 안 함. job은 staged revision으로 진행하고 promotion은 사람이 검토한다 |
 | vocabulary에 없는 gap id를 Agent에 돌려보냄 | 자동화 | 맞지 않는 id에 묶일 수 있다 | 채택 안 함. vocabulary가 안정되면 재검토 |
 | `APPLIED` crash 뒤에도 campaign 계속 | 같은 budget으로 더 탐색한다 | review 전에 같은 crash를 반복할 수 있고, 계속할지는 사람 판단이다 | 채택 안 함. `crash_review`에서 `resume`할 수 있다 |
 | 재평가 이벤트가 대기 상태의 job도 옮긴다 | 사람 개입 없이 새 harness로 이어 간다 | budget 소진이나 crash 검토로 멈춘 job이 harness 교체만으로 다시 실행되고, `campaign_mode`가 `mutate`이면 campaign까지 간다 | 채택 안 함. 대기 사유별로 자동 재개 조건을 정하게 되면 재검토 |
@@ -758,7 +809,7 @@ bundle fixture로 대신한다.
    - 임계값과 fuzz budget 아래의 Q2 `NOT_OBSERVED` campaign bundle은 campaign을 멈추지 않는다. 실행 중에 받은
      bundle이면 같은 task를 계속 기다리고, `sealed`로 끝난 task의 마지막 bundle이면 처리한 뒤 다음 task로 이어 간다.
    - `s2_strategy`에서 `hcap_revision`이 바뀌고 plan이 새 HCAP 검증에 실패하면 Mutation Strategy를 다시 부르지
-     않고 `s1_planning`(repair, `hcap_changed`)으로 간다. Compiler 거부로 `blocked_harness_gap(mutation_engine)`에
+     않고 `s1_planning`(repair, `hcap_changed`)으로 간다. Compiler 거부로 `harness_generating(mutation_engine)`이나 `blocked_harness_gap(mutation_engine)`에
      있는 job은 gap을 닫은 promotion 뒤 Mutation Strategy를 다시 부르지 않고 저장된 rule set을 다시 compile한다.
    - 같은 identity에서 gap을 닫은 promotion의 issue resolved가 그 `hcap_revision`의 변경 이벤트보다 먼저 와도
      `retry_pending`은 plan을 새 HCAP으로 다시 검증한다. 실패하면 `s1_planning`(repair, `hcap_changed`)으로 가고,
@@ -812,11 +863,15 @@ bundle fixture로 대신한다.
 | `blocked_operator(execution_cleanup)` | Runner backend가 실행 정리를 확인하지 못한 채 lease가 끝났다(signal 실패, 죽지 않는 프로세스) | job의 `uncleaned_tasks`, Runner의 attempt 기록, backend 자원 상태(`ProcessSupervisor`면 `quarantined`) | 실행이 사라졌는지 확인한 뒤 `resume` |
 | `blocked_operator(host_authority)` | registry가 build approval보다 먼저 새 `hcap_revision`을 공개했다, build artifact·HCAP·admission 기록이 깨졌다, parser build가 harness identity와 다르다 | `Transition`의 Materializer 거부 detail | 호스트 쪽 기록을 고친 뒤 `resume`(다시 materialize한다) |
 | `blocked_operator(gap_id_unknown)` | HCAP vocabulary에 없는 capability가 필요하다 | `unsupported` 출력의 `reason`에 적힌 필요한 capability | vocabulary를 확장해 `resume`하거나 close |
+| `harness_generating`과 `blocked_harness_gap`을 오간다 | 생성 Agent가 같은 patch set을 반복하거나 검증 기준이 생성 범위 밖(예: target kernel 동작을 바꾸는 patch) | gap key의 `generation[]` 기록, 검증 거부 사유 | 사람이 harness를 만들어 issue를 resolved로 하거나 `retry_generation` |
 | issue가 해결됐는데 `blocked_harness_gap`에 남아 있다 | issue 상태 이벤트를 받지 못했다 | tracker 상태와 job의 issue 참조 | 원인 모름. tracker 연동을 확인한다 |
 | operator `route(to)`가 받아지지 않는다 | gate를 실행한 뒤 재평가 이벤트가 binding을 바꿨거나 gate verdict를 다르게 판정해 `resume_point`가 바뀌었다 | `Transition`의 재평가 이벤트 기록, `resume_point` | `resume`으로 지금 `resume_point`에 보낸다 |
 
 ## 한계와 미결 사항
 
+- **결정됨(2026-10-25, 사용자), 미구현:** gap 경로의 `harness_generating`(§3.2). 지금 `agent_pipeline/`은 gap에서
+  `blocked_harness_gap`으로 멈춘다. 생성 Agent의 격리 방식, 검증 profile의 구체 내용, 생성 범위의 우선순위는
+  issue #83에서 정한다.
 - **결정됨:** 상태 목록, 전이 규칙(§2), Stage 1 전이(§3), 대기 상태와 재평가 이벤트 규칙(§5), budget counter의
   종류와 되돌리는 조건(§6), 기록과 재시작 규칙, Controller가 요구하는 Runner task 계약(§8).
 - **구현됨(2026-10-18):** `DurableRunner`가 task, cancel, lease, completion과 streaming bundle을 SQLite에
