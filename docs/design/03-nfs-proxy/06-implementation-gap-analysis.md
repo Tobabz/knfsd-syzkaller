@@ -1112,8 +1112,12 @@ Harness Capability Specification을 갱신한다(§21).
 - 검증: `tests/agent_pipeline/test_semantic_promotion.py`(빌드한 Proxy의 registry가 rule validation과 일치하는지,
   M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI).
 
-남은 것: subset마다 KVM에서 production crash window와 replay를 실행하고 `semantic_promotion record`/`promote`로
-promotion하는 일(사람이 한다, `tools/nfs-proxy/README.md` "Capability registry and promotion"). Mutation Rule
+남은 것:
+
+- M7 1단계(crash survival pending으로 staged pin)는 아직 구현되지 않았다. 지금 `promote`는 guest crash로 끝난
+  run만 센다(#83).
+- subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
+  일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
 한 subset에 맞는지 확인한다(`../02-llm-agent/08-mutation-rule-set.md` §12 "구현").
 
