@@ -248,7 +248,7 @@ validation (Runner, §5.2)
   위의 OS 사용자 권한이 그 경계다. 모델에 노출할 file·shell tool은 이 API 위에 직접 정의한다(library가 정해 둔
   tool은 없다). 사람 확인이 필요한 명령이 생기면 `ApprovalRequiredToolset`으로 묶을 수 있다.
 - 생성 Agent가 worktree에서 돌린 build와 test 결과는 판정이 아니다. staged revision을 만드는 판정은 Runner가
-  patch set만 받아 새 격리 KVM 환경에서 다시 build하고 §5.2를 실행해 낸다. Agent worktree의 산출물(binary,
+  patch set만 받아 새 격리 VM 환경(기본 KVM)에서 다시 build하고 §5.2를 실행해 낸다. Agent worktree의 산출물(binary,
   log)은 그 판정에 쓰지 않는다.
 - 생성물의 트리거는 `04` §3.2를 따른다. 클라이언트가 유도한 서버 동작은 허용하지만, 실행 중에 harness가 서버를
   직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버 데몬 정지·종료·재시작, 서버 설정 변경)를 하는 executor·helper·fixture 동작은 만들지 않는다. 자연 경로가
@@ -263,7 +263,7 @@ validation (Runner, §5.2)
 ```text
 build PASS (선택한 sanitizer variant)
 bootstrap 검증 (기존 harness와 같은 기준)
-proposal의 promotion_evidence (KVM)
+proposal의 promotion_evidence (VM 실행, 기본 KVM)
 새 capability를 쓰는 smoke program과 neutral control
 기존 HCAP capability 회귀 (기존 seed와 lane 경로가 같은 결과)
 remote_kcov_attribution이면: 알려진 target에서 attribution이 성립하고, RemoteKcovSupportBoundary가 그 계측을 기술함
