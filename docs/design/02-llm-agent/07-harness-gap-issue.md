@@ -267,6 +267,8 @@ proposal의 promotion_evidence (KVM)
 새 capability를 쓰는 smoke program과 neutral control
 기존 HCAP capability 회귀 (기존 seed와 lane 경로가 같은 결과)
 remote_kcov_attribution이면: 알려진 target에서 attribution이 성립하고, RemoteKcovSupportBoundary가 그 계측을 기술함
+mutation_engine이면: 생성한 semantic subset이 M7 promotion gate(03-nfs-proxy/06 §30)를 통과하고, 그 registry digest가
+    staged revision의 HCAP-10 authority_refs에 들어감
 트리거 기준 (04 §3.2): 새 capability의 실행 중 트리거가 NFS 클라이언트의 행위뿐이고 harness가 서버를 직접 조작하지 않음
 ```
 

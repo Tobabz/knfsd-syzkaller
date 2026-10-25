@@ -825,6 +825,10 @@ semantic capability registry
   entry는 promoted registry를 `authority_refs`로, 검증된 subset을 `validated_scope`로 참조한다.
 - Agent와 Mutation Rule Compiler는 promoted scope만 쓴다. 실행 중인 binary가 runtime에 광고하는 범위만으로는
   쓰지 않는다(§7.1).
+- 여기서 promoted는 M7 gate를 통과해 job이 binding한 `hcap_revision`에 pin됐다는 뜻이다. 그 revision은 promoted
+  revision일 수도 있고 Harness Generation이 만든 staged revision(§1.1)일 수도 있다. staged revision이 semantic
+  subset을 담으려면 그 subset이 생성 검증(`07` §5.2)에서 M7 gate를 통과해야 한다. staged revision을 공유 HCAP으로
+  올리는 사람의 promotion(`07` §5.3)과는 다른 단계다.
 - path, operator, transform 목록을 이 문서나 Agent·Proxy 설계 문서에 복제하지 않는다.
 
 promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다. registry 생성과 promotion gate는
@@ -939,9 +943,10 @@ runtime이 pin된 authority보다 적거나 다르게 보고
     -> INCONCLUSIVE(infra) / 차단
     -> repository maintenance defect
 
-runtime이 promotion되지 않은 capability를 더 노출
+runtime이 pin된 authority에 없는 capability를 더 노출
     -> 사용하지 않는다
-    -> validation / promotion이 authority를 갱신하기 전에는 Agent capability가 아니다
+    -> validation / promotion(M7 gate나 Harness Generation 검증)이 binding한 revision의 authority를
+       갱신하기 전에는 Agent capability가 아니다. staged revision에 pin된 것은 사용한다
 ```
 
 ### 7.2 drift guard
