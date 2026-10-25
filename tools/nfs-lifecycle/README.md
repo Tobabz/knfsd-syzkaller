@@ -17,16 +17,6 @@ The runner provides these native-version scenarios:
   target PCs and every stimulus must hit at least one. The fixed programs in
   `programs/` differ only by `syz_nfsd_client_ctl$expire_client0` and remain
   validation inputs rather than mutation seeds.
-- `v41-cld-lifecycle`: the HCAP-12 campaign. It runs four fixed programs in
-  order, each `--repeat` times (at least 3): the neutral control, scenario A
-  (`normal`: expiry then client0 recovery), scenario C (`reconnect`: expiry,
-  one `syz_nfsd_cld_ctl$reconnect`, then recovery) and scenario B
-  (`daemon_down`: expiry, nfsdcld held down past the 30 s upcall timeout, then
-  recovery; fixture evidence only, never an admitted call). See below.
-  `daemon_down` runs with `syz-execprog -program-timeout=90s` (syzkaller
-  0029): the slowdown-derived budget stops at 15 s, before the upcall times
-  out. A program that still exports `.meta` without `.extra` fails as an
-  `execution:` error naming its unfinished calls, never as a probe miss.
 - `v42-control-restart`: the same restart contract using a native v4.2 mount.
 - `v3-nlm-lock`: the HCAP-13 campaign on the `nlm-knfsd` NFSv3 fixture. It
   runs four fixed programs (`v3-nlm-{control,lock,rpc,blocked}.prog`), each
@@ -66,44 +56,10 @@ trace, lifecycle broker audit line, executor log, raw coverage, metadata,
 generation counters and pre-window generation state, including on executor or
 coverage-cardinality failures.
 
-## nfsdcld/rpc_pipefs campaign (HCAP-12)
-
-```sh
-tools/nfs-lifecycle/run.py \
-  --scenario v41-cld-lifecycle \
-  --repeat 3 \
-  --collector-config /path/to/stage1-state/collector.json \
-  --descriptor /path/to/descriptor.json \
-  --kernel-source env/linux \
-  --output /tmp/nfs-v41-cld-lifecycle
-```
-
-The descriptor must expose the runtime selection that enables
-`syz_nfsd_cld_ctl$reconnect`. No candidate mapping is used: before boot the
-runner maps three public probes from the descriptor's kernel commit
-(`--kernel-source` is a git tree that has it) to coverage call sites of the
-pinned vmlinux:
-
-| probe | source |
-|---|---|
-| `cld_create` | `nfsd4_cld_create` and `nfsd4_cld_create_v2` |
-| `cld_create_error` | the error report after `out_err:` in both |
-| `pipe_wait_for_open` | the no-reader `RPC_PIPE_WAIT_FOR_OPEN` branch of `rpc_queue_upcall` |
-
-Every run waits for the broker to be idle, executes one gated program, waits
-for the broker again and requires `lane.sh status` to pass. A broker that
-failed, refused or replaced the wrong transaction, or a failed lane status, is
-reported as a `fixture:` error and invalidates the campaign. It is never
-turned into a probe miss. A run outside the validated behavior also fails the
-campaign: a control that reaches a probe, a normal run that requeues without a
-reader, or a reconnect run that misses the requeue. The OP_RECLAIM_COMPLETE
-trace count and the create-failure dmesg count are recorded as diagnostics
-only.
-
-On success the output holds `result.json` (counts and digests only),
-`hcap12-kvm.json` (typed `Hcap12KvmEvidence` bound to the harness and
-`result.json`), `probe-*.json` (public probe ranges and call sites) and the
-raw per-run artifacts, including each run's `cld.state` and dmesg.
+The former `v41-cld-lifecycle` campaign (HCAP-12) was removed with that
+capability (#98): it stopped and restarted the server's nfsdcld, which no NFS
+client can do. The `syz_nfsd_cld_ctl` executor call and the nfsdcld broker stay
+for fixture work.
 
 ## NLM lockd campaign (HCAP-13)
 

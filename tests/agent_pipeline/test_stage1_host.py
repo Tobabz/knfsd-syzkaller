@@ -46,7 +46,7 @@ from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   guest_cmdline)
 from agent_pipeline.stage1.host.generate import (GenerationError,
                                                  HCAP11_RECOVERY_ORDER,
-                                                 Hcap11KvmEvidence, Hcap12KvmEvidence,
+                                                 Hcap11KvmEvidence,
                                                  Hcap13KvmEvidence,
                                                  generate,
                                                  series_fingerprint)
@@ -482,43 +482,16 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         generate(host.spec)
 
 
-def _hcap12_run(completed=3, *, create=1, error=0, wait=0, **broker):
-    counters = dict.fromkeys((
-        "reconnect_ok", "reconnect_fail", "down_ok", "down_fail",
-        "daemon_stop_fail", "daemon_start_fail", "refused_busy",
-        "refused_identity", "restore_ok", "restore_fail"), 0)
-    counters.update(broker)
-    return {
-        "completed": completed,
-        "probe_hits": {"cld_create": [create] * completed,
-                       "cld_create_error": [error] * completed,
-                       "pipe_wait_for_open": [wait] * completed},
-        "broker": counters,
-        "status_checks_passed": completed,
-        "attributed_generations": completed,
-    }
-
-
-def _hcap12_evidence(identity, lane_sha256):
+def _kvm_evidence(identity, lane_sha256):
+    """Fields every typed KVM campaign evidence record shares."""
     return {
         "schema_version": "hcap-kvm-evidence.v1",
-        "capability_id": "HCAP-12",
         "observed_at": "2026-10-20",
-        "scenario": "v41-cld-lifecycle",
         "execution_harness_id": identity.execution_harness_id,
         "mapping_identity": identity.model_dump(mode="json"),
-        "probe_mapping_sha256": {"cld_create": "1" * 64,
-                                 "cld_create_error": "2" * 64,
-                                 "pipe_wait_for_open": "3" * 64},
         "campaign_result_sha256": "b" * 64,
         "guest_lane_script_sha256": lane_sha256,
         "guest_nfs_proxy_sha256": "c" * 64,
-        "runs": {
-            "control": _hcap12_run(create=0),
-            "normal": _hcap12_run(),
-            "reconnect": _hcap12_run(wait=1, reconnect_ok=3),
-            "daemon_down": _hcap12_run(create=1, error=1, wait=1, down_ok=3),
-        },
         "generation_contract": {
             "generation_begin_each": 1,
             "aggregate_published_each": 1,
@@ -535,107 +508,10 @@ def _hcap12_evidence(identity, lane_sha256):
     }
 
 
-HCAP12_IDENTITY = KernelIdentity(
+EVIDENCE_IDENTITY = KernelIdentity(
     execution_harness_id="d" * 64, kernel_commit="e" * 40,
     instrumentation_sha256="f" * 64, vmlinux_sha256="9" * 64,
     kaslr_enabled=False, kaslr_offset=0)
-
-
-def test_hcap12_evidence_accepts_the_validated_campaign_shape():
-    evidence = Hcap12KvmEvidence.model_validate(
-        _hcap12_evidence(HCAP12_IDENTITY, "8" * 64))
-    assert evidence.runs.reconnect.broker.reconnect_ok == 3
-
-
-@pytest.mark.parametrize(("path", "value", "message"), [
-    (("runs", "control", "probe_hits", "cld_create"), [0, 1, 0],
-     "control run reached a CLD probe"),
-    (("runs", "normal", "probe_hits", "cld_create"), [1, 0, 1],
-     "normal run missed the CLD create upcall"),
-    (("runs", "normal", "probe_hits", "pipe_wait_for_open"), [0, 0, 1],
-     "normal run queued without a pipe reader"),
-    (("runs", "reconnect", "probe_hits", "pipe_wait_for_open"), [1, 0, 1],
-     "reconnect run missed the reader-loss requeue"),
-    (("runs", "reconnect", "probe_hits", "cld_create_error"), [0, 1, 0],
-     "reconnect run reached the create error path"),
-    (("runs", "reconnect", "broker", "reconnect_ok"), 2,
-     "reconnect broker transactions differ"),
-    (("runs", "reconnect", "broker", "restore_ok"), 1,
-     "failed or refused transaction"),
-    (("runs", "daemon_down", "broker", "down_ok"), 2,
-     "daemon-down broker transactions differ"),
-    (("runs", "normal", "broker", "reconnect_ok"), 1,
-     "normal run invoked the nfsdcld broker"),
-    (("runs", "control", "broker", "refused_busy"), 1,
-     "failed or refused transaction"),
-    (("runs", "normal", "status_checks_passed"), 2,
-     "left the lane fixture unhealthy"),
-    (("runs", "reconnect", "attributed_generations"), 2,
-     "lacks one attributed generation"),
-    (("runs", "normal", "completed"), 2, "greater than or equal to 3"),
-    (("probe_mapping_sha256",), {"cld_create": "1" * 64},
-     "probe mappings differ"),
-    (("crash_signature_count",), 1, "crash or artifact error"),
-    (("shareable_result_contains_target_metadata_or_addresses",), True,
-     "private target data"),
-    (("capability_id",), "HCAP-11", "HCAP-12"),
-])
-def test_hcap12_evidence_rejects_unvalidated_campaigns(path, value, message):
-    evidence = _hcap12_evidence(HCAP12_IDENTITY, "8" * 64)
-    target = evidence
-    for key in path[:-1]:
-        target = target[key]
-    target[path[-1]] = value
-    with pytest.raises(ValueError, match=message):
-        Hcap12KvmEvidence.model_validate(evidence)
-
-
-@needs_gcc
-def test_hcap12_evidence_is_bound_to_generated_harness(host):
-    initial = generate(host.spec)
-    config = Stage1Config.load(initial.stage1_config)
-    store = ArtifactStore(config.artifact_root)
-    from agent_pipeline.materializer import ExecutionHarnessApproval
-    from agent_pipeline.stage1.host.pins import HostFilePin
-    descriptor = load_record(store, config.execution_harness_approvals[0],
-                             ExecutionHarnessApproval).descriptor
-    builds = {item.name: item.artifact_ref
-              for item in descriptor.build_artifacts}
-    lane_pin = load_record(store, builds["lane-script"], HostFilePin)
-    identity = KernelIdentity(
-        execution_harness_id=initial.execution_harness_id,
-        kernel_commit=descriptor.kernel_commit,
-        instrumentation_sha256=builds["instrumentation"],
-        vmlinux_sha256=builds["kernel"],
-        kaslr_enabled=False, kaslr_offset=0)
-    value = _hcap12_evidence(identity, lane_pin.sha256)
-    evidence = host.root / "hcap12-evidence.json"
-    evidence.write_text(json.dumps(value))
-    spec = json.loads(host.spec.read_text())
-    spec["capabilities"].append({
-        "id": "HCAP-12", "name": "cld", "purpose": "test binding",
-        "usable_stage": ["stage1"], "usable_by": ["agent_stage1"],
-        "interface": {"runtime_features": ["cld_reconnect"]},
-        "status": "validated", "scope": ["client0_recovery_cld_reconnect"],
-    })
-    spec["capability_evidence"] = {"HCAP-12": [evidence.name]}
-    host.spec.write_text(json.dumps(spec, indent=1))
-    result = generate(host.spec)
-    from agent_pipeline.hcap import HcapCatalog
-    catalog = load_record(store, result.hcap_revision, HcapCatalog)
-    cld = next(item for item in catalog.capabilities if item.id == "HCAP-12")
-    assert len(cld.evidence_refs) == 1
-
-    value["guest_lane_script_sha256"] = "7" * 64
-    evidence.write_text(json.dumps(value))
-    with pytest.raises(GenerationError, match="HCAP-12 evidence names "
-                       "another guest lane script"):
-        generate(host.spec)
-    value["guest_lane_script_sha256"] = lane_pin.sha256
-    value["runs"]["reconnect"]["probe_hits"]["pipe_wait_for_open"] = [0] * 3
-    evidence.write_text(json.dumps(value))
-    with pytest.raises(GenerationError, match="invalid HCAP-12 KVM evidence"):
-        generate(host.spec)
 
 
 def test_template_spec_is_valid():
@@ -672,38 +548,20 @@ def test_template_spec_is_valid():
                selection.enabled_interfaces
                for selection in spec.runtime_selections)
 
-    # HCAP-12 is promoted only by typed KVM evidence for exactly this
-    # harness: until capability-evidence/hcap12-kvm.json exists, generate()
-    # refuses the template, so the reconnect call is never admitted early.
-    cld = next(c for c in spec.capabilities if c.id == "HCAP-12")
-    assert cld.interface.syz_calls == ("syz_nfsd_cld_ctl$reconnect",)
-    assert cld.scope == ("client0_recovery_cld_reconnect",)
-    assert spec.capability_evidence["HCAP-12"] == (
-        Path("capability-evidence/hcap12-kvm.json"),)
-    cld_evidence = template / spec.capability_evidence["HCAP-12"][0]
-    if cld_evidence.is_file():
-        evidence_json = json.loads(cld_evidence.read_text())
-        assert Hcap12KvmEvidence.model_validate(
-            evidence_json).capability_id == "HCAP-12"
-        assert not {"target_pcs", "candidate_id", "path", "symbol"} & set(
-            evidence_json)
-    reconnect = next(e for e in spec.admission_source.entries
-                     if e.call == "syz_nfsd_cld_ctl$reconnect")
-    assert reconnect.capability_ids == ("HCAP-12",)
-    assert all(not e.call.startswith("syz_nfsd_cld_ctl$daemon_down")
+    # HCAP-12 (nfsdcld reconnect) was withdrawn (#98): stopping a server
+    # daemon is not an NFS client action, so nothing admits nfsdcld control.
+    assert all(c.id != "HCAP-12" for c in spec.capabilities)
+    assert "HCAP-12" not in spec.capability_evidence
+    assert all(not e.call.startswith("syz_nfsd_cld_ctl$")
                for e in spec.admission_source.entries)
-    assert all("syz_nfsd_cld_ctl$daemon_down" not in
-               selection.enabled_interfaces
-               for selection in spec.runtime_selections)
-    # The HCAP-11 selection is unchanged; reconnect has its own selection.
+    assert all(not call.startswith("syz_nfsd_cld_ctl$")
+               for selection in spec.runtime_selections
+               for call in selection.enabled_interfaces)
+    assert all(not call.startswith("syz_nfsd_cld_ctl$")
+               for item in spec.neutral_controls
+               for call in item.runtime_selection.enabled_interfaces)
     v41 = [s for s in spec.runtime_selections if s.profile == "knfsd-v41"]
-    with_cld = [s for s in v41
-                if "syz_nfsd_cld_ctl$reconnect" in s.enabled_interfaces]
-    without = [s for s in v41
-               if "syz_nfsd_cld_ctl$reconnect" not in s.enabled_interfaces]
-    assert len(with_cld) == len(without) == 1
-    assert set(with_cld[0].enabled_interfaces) - set(
-        without[0].enabled_interfaces) == {"syz_nfsd_cld_ctl$reconnect"}
+    assert len(v41) == 1
     assert "remote_kcov.context.cld" in spec.missing_capability_ids
 
     # HCAP-13 has its own nlm-knfsd NFSv3 selection, a neutral control on
@@ -753,7 +611,7 @@ def _hcap13_run(completed=3, **hits):
 
 
 def _hcap13_evidence(identity, lane_sha256):
-    value = _hcap12_evidence(identity, lane_sha256)
+    value = _kvm_evidence(identity, lane_sha256)
     value.update({
         "capability_id": "HCAP-13",
         "scenario": "v3-nlm-lock",
@@ -775,7 +633,7 @@ def _hcap13_evidence(identity, lane_sha256):
 
 def test_hcap13_evidence_accepts_the_validated_campaign_shape():
     evidence = Hcap13KvmEvidence.model_validate(
-        _hcap13_evidence(HCAP12_IDENTITY, "8" * 64))
+        _hcap13_evidence(EVIDENCE_IDENTITY, "8" * 64))
     assert evidence.runs.blocked.probe_hits.clnt_grant == (1, 1, 1)
 
 
@@ -811,7 +669,7 @@ def test_hcap13_evidence_accepts_the_validated_campaign_shape():
     (("scenario",), "v41-cld-lifecycle", "v3-nlm-lock"),
 ])
 def test_hcap13_evidence_rejects_unvalidated_campaigns(path, value, message):
-    evidence = _hcap13_evidence(HCAP12_IDENTITY, "8" * 64)
+    evidence = _hcap13_evidence(EVIDENCE_IDENTITY, "8" * 64)
     target = evidence
     for key in path[:-1]:
         target = target[key]

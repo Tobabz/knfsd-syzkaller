@@ -232,37 +232,26 @@ class CompletedExecGuest(FailedExecGuest):
 def run_cover_program(runner, tmp_path, cover, **kwargs):
     guest = CompletedExecGuest(runner, cover)
     result = runner.run_program(
-        guest, tmp_path, "daemon_down", 1, "/sys/kernel/tracing",
+        guest, tmp_path, "stimulus", 1, "/sys/kernel/tracing",
         lambda artifacts, pcs: {"pcs": len(pcs)}, **kwargs)
     return guest, result
 
 
-def test_daemon_down_program_budget_covers_the_upcall_timeout(
-        tmp_path, monkeypatch):
+def test_run_program_exports_remote_cover_artifacts(tmp_path, monkeypatch):
     runner = load_runner()
     monkeypatch.setattr(runner.time, "sleep", lambda _: None)
-    budget = runner.CLD_PROGRAM_TIMEOUT_S["daemon_down"]
-    # The executor kills an idle program only after 3/5 of its budget; that
-    # must outlast the 30 s upcall timeout and the 35 s daemon outage.
-    assert budget * 3 / 5 > 35
-    assert set(runner.CLD_PROGRAM_TIMEOUT_S) == {"daemon_down"}
     cover = {"cover_prog1.extra": "0xffffffff81001234\n",
              "cover_prog1.meta": "unfinished_calls 0\n"}
-    guest, result = run_cover_program(
-        runner, tmp_path, cover, program_timeout_s=budget)
-    assert "-program-timeout=90s" in guest.started[0]
+    guest, result = run_cover_program(runner, tmp_path, cover)
+    assert "-program-timeout" not in guest.started[0]
     assert result["pcs"] == 1
     assert result["coverage_files"] == sorted(cover)
     exported = sorted(path.name for path in tmp_path.iterdir()
                       if path.name.endswith((".extra", ".meta")))
-    assert exported == ["daemon_down-001.coverage.extra",
-                        "daemon_down-001.coverage.meta",
-                        "daemon_down-001.coverage.raw.cover_prog1.extra",
-                        "daemon_down-001.coverage.raw.cover_prog1.meta"]
-    default = tmp_path / "default"
-    default.mkdir()
-    guest, _ = run_cover_program(runner, default, cover)
-    assert "-program-timeout" not in guest.started[0]
+    assert exported == ["stimulus-001.coverage.extra",
+                        "stimulus-001.coverage.meta",
+                        "stimulus-001.coverage.raw.cover_prog1.extra",
+                        "stimulus-001.coverage.raw.cover_prog1.meta"]
 
 
 @pytest.mark.parametrize(("meta", "message"), (
@@ -278,39 +267,25 @@ def test_unpublished_generation_is_a_typed_execution_failure(
     monkeypatch.setattr(runner.time, "sleep", lambda _: None)
     cover = {"cover_prog1.0": "0x1\n", "cover_prog1.meta": meta}
     with pytest.raises(RuntimeError, match=message):
-        run_cover_program(runner, tmp_path, cover, program_timeout_s=90)
+        run_cover_program(runner, tmp_path, cover)
     # The .meta is still retained as raw evidence.
-    assert (tmp_path / "daemon_down-001.coverage.meta").read_text() == meta
-    assert not (tmp_path / "daemon_down-001.coverage.extra").exists()
+    assert (tmp_path / "stimulus-001.coverage.meta").read_text() == meta
+    assert not (tmp_path / "stimulus-001.coverage.extra").exists()
 
 
-def test_admin_and_cld_campaigns_pick_distinct_runtime_selections(tmp_path):
-    runner, config, descriptor_path, mapping_path, _ = write_identity_inputs(
-        tmp_path)
+def test_admin_context_refuses_two_matching_runtime_selections(tmp_path):
+    runner, config, descriptor_path, _, _ = write_identity_inputs(tmp_path)
     descriptor = ExecutionHarnessDescriptor.model_validate_json(
         descriptor_path.read_text())
     admin = descriptor.allowed_runtime_selections[0]
-    cld = admin.model_copy(update={"enabled_interfaces": tuple(sorted(
-        (*admin.enabled_interfaces, runner.CLD_RECONNECT)))})
+    extra = admin.model_copy(update={"enabled_interfaces": tuple(sorted(
+        (*admin.enabled_interfaces, "syz_nfsd_cld_ctl$reconnect")))})
     descriptor = descriptor.model_copy(update={
         "allowed_runtime_selections": tuple(sorted(
-            (admin, cld), key=lambda item: canonical_json(item)))})
+            (admin, extra), key=lambda item: canonical_json(item)))})
     descriptor_path.write_text(descriptor.model_dump_json(indent=2))
-    # The harness ID changed with the selections; rebind the mapping.
-    mapping = TargetPcMapping.model_validate_json(mapping_path.read_text())
-    mapping_path.write_text(mapping.model_copy(update={
-        "identity": mapping.identity.model_copy(update={
-            "execution_harness_id": descriptor_id(descriptor)})}
-    ).model_dump_json(indent=2))
-    context = runner.load_admin_context(config, descriptor_path, mapping_path)
-    assert runner.CLD_RECONNECT not in context.selection.enabled_interfaces
-    context = runner.load_admin_context(
-        config, descriptor_path, None,
-        required=runner.CLD_REQUIRED_INTERFACES)
-    assert runner.CLD_RECONNECT in context.selection.enabled_interfaces
-    assert context.target_pcs == frozenset()
-    assert "target_mapping_sha256" not in context.evidence_identity
-    assert context.identity.execution_harness_id == descriptor_id(descriptor)
+    with pytest.raises(RuntimeError, match="must expose one exact"):
+        runner.load_admin_context(config, descriptor_path, None)
 
 
 RECOVER_SOURCE = """\
@@ -320,71 +295,29 @@ nfsd4_cld_create(struct nfs4_client *clp)
 \tint ret;
 
 \tret = cld_pipe_upcall(cn->cn_pipe, &cup->cu_u.cu_msg, nn);
-out_err:
-\tif (ret)
-\t\tprintk(KERN_ERR "NFSD: Unable to create client "
-\t\t\t\t"record on stable storage: %d\\n", ret);
-}
-
-static void
-nfsd4_cld_create_v2(struct nfs4_client *clp)
-{
-\tint ret;
-out_err:
-\tif (ret)
-\t\tpr_err("NFSD: Unable to create client record: %d\\n",
-\t\t\t\tret);
 }
 """
-PIPE_SOURCE = """\
-int
-rpc_queue_upcall(struct rpc_pipe *pipe, struct rpc_pipe_msg *msg)
-{
-\tif (pipe->nreaders) {
-\t\tres = 0;
-\t} else if (pipe->flags & RPC_PIPE_WAIT_FOR_OPEN) {
-\t\tif (list_empty(&pipe->pipe))
-\t\t\tqueue_delayed_work(rpciod_workqueue, &pipe->queue_timeout, 1);
-\t\tres = 0;
-\t}
-\treturn res;
-}
-"""
-
-
-def test_cld_probe_ranges_name_only_the_public_probe_lines():
-    runner = load_runner()
-    sources = {"fs/nfsd/nfs4recover.c": RECOVER_SOURCE,
-               "net/sunrpc/rpc_pipe.c": PIPE_SOURCE}
-    ranges = runner.probe_ranges(sources.__getitem__)
-    assert [(item["function"], item["start_line"], item["end_line"])
-            for item in ranges["cld_create"]] == [
-        ("nfsd4_cld_create", 2, 11), ("nfsd4_cld_create_v2", 14, 21)]
-    assert [(item["start_line"], item["end_line"])
-            for item in ranges["cld_create_error"]] == [(9, 10), (19, 20)]
-    assert [(item["start_line"], item["end_line"])
-            for item in ranges["pipe_wait_for_open"]] == [(6, 10)]
 
 
 @pytest.mark.parametrize(("source", "function", "part", "message"), [
-    (RECOVER_SOURCE.replace("out_err:", "done:"), "nfsd4_cld_create",
-     "error_report", "error report not found"),
-    (PIPE_SOURCE.replace("WAIT_FOR_OPEN", "OTHER"), "rpc_queue_upcall",
-     "wait_for_open", "branch not found"),
     (RECOVER_SOURCE + RECOVER_SOURCE, "nfsd4_cld_create", "function",
      "definitions=2"),
-    (PIPE_SOURCE, "nfsd4_cld_create", "function", "definitions=0"),
+    (RECOVER_SOURCE, "nfsd4_cld_create_v2", "function", "definitions=0"),
+    (RECOVER_SOURCE.replace("}\n", ""), "nfsd4_cld_create", "function",
+     "has no end"),
 ])
-def test_cld_probe_ranges_fail_closed(source, function, part, message):
+def test_probe_ranges_fail_closed(source, function, part, message):
     runner = load_runner()
     with pytest.raises(RuntimeError, match=message):
         runner.probe_range(source, function, part)
+    with pytest.raises(ValueError, match="unknown probe part"):
+        runner.probe_range(RECOVER_SOURCE, "nfsd4_cld_create", "error_report")
 
 
-def test_cld_probe_pcs_require_function_path_and_line():
+def test_probe_pcs_require_function_path_and_line():
     runner = load_runner()
     from agent_pipeline.stage1.host.target_pcs import Frame
-    ranges = {"pipe_wait_for_open": [{
+    ranges = {"pipe_upcall": [{
         "path": "net/sunrpc/rpc_pipe.c", "function": "rpc_queue_upcall",
         "start_line": 145, "end_line": 153}]}
     frames = [
@@ -395,133 +328,7 @@ def test_cld_probe_pcs_require_function_path_and_line():
              Frame("rpc_queue_upcall", "/b/net/sunrpc/rpc_pipe.c", 150)]),
         (5, [Frame("rpc_queue_upcall", "/b/net/sunrpc/other.c", 146)]),
     ]
-    assert runner.select_probe_pcs(frames, ranges) == {
-        "pipe_wait_for_open": {1, 4}}
-
-
-CLD_STATE_TEXT = (
-    "state={state}\nseq={seq}\nop=reconnect\npid={pid}\nstarttime=77\n"
-    "pipe=1:2\nerrno=0\n" + "".join(
-        "%s=0\n" % name for name in (
-            "reconnect_attempts", "reconnect_ok", "reconnect_fail",
-            "down_attempts", "down_ok", "down_fail", "daemon_stop_ok",
-            "daemon_stop_fail", "daemon_start_ok", "daemon_start_fail",
-            "refused_busy", "refused_identity", "restore_ok",
-            "restore_fail")))
-
-
-class StateGuest:
-    def __init__(self, states):
-        self.states = list(states)
-
-    def guest(self, command, timeout=60):
-        assert command.startswith("cat ")
-        return self.states.pop(0) if len(self.states) > 1 else self.states[0]
-
-
-def test_cld_broker_failure_is_a_fixture_failure(monkeypatch):
-    runner = load_runner()
-    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
-    held = CLD_STATE_TEXT.format(state="held", seq=1, pid=10)
-    idle = CLD_STATE_TEXT.format(state="idle", seq=1, pid=11)
-    assert runner.wait_cld_idle(StateGuest([held, idle]))["pid"] == "11"
-    failed = CLD_STATE_TEXT.format(state="failed", seq=1, pid=0)
-    with pytest.raises(RuntimeError, match="^fixture: nfsdcld broker failed"):
-        runner.wait_cld_idle(StateGuest([failed]))
-    with pytest.raises(RuntimeError, match="fixture: nfsdcld broker stayed"):
-        runner.wait_cld_idle(StateGuest([held]), timeout=0)
-    with pytest.raises(RuntimeError, match="malformed"):
-        runner.parse_cld_state("not a state line\n")
-
-
-def test_cld_request_and_completion_bind_the_run_transaction():
-    runner = load_runner()
-    line = ("cld request lane=0 op=2 status=0 seq=4 pid=10 "
-            "starttime=77\n")
-    request = runner.validate_cld_request("reconnect", line)
-    assert request == {"seq": "4", "pid": "10", "starttime": "77"}
-    before = runner.parse_cld_state(
-        CLD_STATE_TEXT.format(state="idle", seq=3, pid=10))
-    after = runner.parse_cld_state(
-        CLD_STATE_TEXT.format(state="idle", seq=4, pid=11))
-    runner.validate_cld_completion(request, before, after)
-    runner.validate_cld_completion(None, before, before)
-    with pytest.raises(RuntimeError, match="not replaced"):
-        runner.validate_cld_completion(request, before, runner.parse_cld_state(
-            CLD_STATE_TEXT.format(state="idle", seq=4, pid=10)))
-    with pytest.raises(RuntimeError, match="another transaction"):
-        runner.validate_cld_completion(request, before, runner.parse_cld_state(
-            CLD_STATE_TEXT.format(state="idle", seq=5, pid=11)))
-    with pytest.raises(RuntimeError, match="changed without a request"):
-        runner.validate_cld_completion(None, before, after)
-    with pytest.raises(RuntimeError, match="invoked the nfsdcld broker"):
-        runner.validate_cld_request("normal", line)
-    with pytest.raises(RuntimeError, match="^fixture: .* refused"):
-        runner.validate_cld_request("reconnect", line.replace(
-            "status=0", "status=16"))
-    with pytest.raises(RuntimeError, match="^fixture: .* refused"):
-        runner.validate_cld_request("daemon_down", line)
-    with pytest.raises(RuntimeError, match="count=2"):
-        runner.validate_cld_request("reconnect", line + line)
-
-
-def cld_run(phase, *, create=1, error=0, wait=0, **broker):
-    runner = load_runner()
-    counters = dict.fromkeys(runner.CLD_DELTA_COUNTERS, 0)
-    counters.update(broker)
-    return {
-        "probe_hits": {"cld_create": create, "cld_create_error": error,
-                       "pipe_wait_for_open": wait},
-        "broker": counters, "status_check": "pass",
-        "attributed_generation": phase != "daemon_down",
-        "generation": {"remote_start_ok": 4},
-    }
-
-
-@pytest.mark.parametrize(("phase", "run", "message"), [
-    ("normal", cld_run("normal", create=0), "missed the CLD create"),
-    ("normal", cld_run("normal", wait=1), "queued without a pipe reader"),
-    ("normal", cld_run("normal", reconnect_ok=1), "transactions differ"),
-    ("reconnect", cld_run("reconnect"), "transactions differ"),
-    ("reconnect", cld_run("reconnect", reconnect_ok=1),
-     "missed the reader-loss requeue"),
-    ("reconnect", cld_run("reconnect", wait=1, error=1, reconnect_ok=1),
-     "create error path"),
-    ("reconnect", cld_run("reconnect", wait=1, reconnect_ok=1,
-                          restore_ok=1), "fixture: .* restore_ok"),
-    ("daemon_down", cld_run("daemon_down"), "transactions differ"),
-])
-def test_cld_runs_fail_closed(phase, run, message):
-    runner = load_runner()
-    with pytest.raises(RuntimeError, match=message):
-        runner.check_cld_run(phase, run)
-
-
-def test_cld_evidence_is_typed_and_carries_no_addresses(tmp_path):
-    runner, config, descriptor, _, _ = write_identity_inputs(tmp_path)
-    context = runner.load_admin_context(config, descriptor, None)
-    cycles = {
-        "control": [cld_run("control", create=0)] * 3,
-        "normal": [cld_run("normal")] * 3,
-        "reconnect": [cld_run("reconnect", wait=1, reconnect_ok=1)] * 3,
-        "daemon_down": [cld_run("daemon_down", error=1, down_ok=1)] * 3,
-    }
-    for phase, runs in cycles.items():
-        for run in runs:
-            runner.check_cld_run(phase, run)
-    guest = {"guest_lane_script_sha256": "4" * 64,
-             "guest_nfs_proxy_sha256": "5" * 64}
-    digests = {name: "6" * 64 for name in runner.CLD_PROBES}
-    evidence = runner.hcap12_evidence(
-        context, guest, digests, cycles, b'{"status": "pass"}\n', 0, 0)
-    assert evidence.capability_id == "HCAP-12"
-    assert evidence.runs.reconnect.broker.reconnect_ok == 3
-    assert evidence.runs.daemon_down.attributed_generations == 0
-    assert evidence.generation_contract.minimum_remote_start_ok == 4
-    with pytest.raises(ValueError, match="private target data"):
-        runner.hcap12_evidence(
-            context, guest, digests, cycles,
-            b'{"pc": "0xffffffff81001234"}\n', 0, 0)
+    assert runner.select_probe_pcs(frames, ranges) == {"pipe_upcall": {1, 4}}
 
 
 GRANT_SOURCE = """\

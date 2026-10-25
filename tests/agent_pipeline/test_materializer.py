@@ -71,7 +71,6 @@ from agent_pipeline.materializer import (
     SyzParseFailure,
     _Failure,
     _hcap11_program_error,
-    _hcap12_program_error,
     _hcap13_program_error,
     descriptor_id,
 )
@@ -438,71 +437,34 @@ def test_materializer_enforces_hcap11_program_contract_before_call_grants(
     assert caught.value.result().detail.endswith("client0_recovery_missing")
 
 
-HCAP12_EXPIRE = "syz_nfsd_client_ctl$expire_client0"
-HCAP12_ACQUIRE = "syz_open_nfs_lane_profile$client0_knfsd_v41"
-HCAP12_CLIENT0 = ("nfs-profile:knfsd-v41:client0",)
+V41_EXPIRE = "syz_nfsd_client_ctl$expire_client0"
+V41_ACQUIRE = "syz_open_nfs_lane_profile$client0_knfsd_v41"
+CLIENT0 = ("nfs-profile:knfsd-v41:client0",)
 
 
-def test_hcap12_program_contract_accepts_reconnect_inside_recovery(world):
-    parsed_program = hcap11_parsed(
-        world.identity,
-        (HCAP12_EXPIRE, "syz_nfsd_cld_ctl$reconnect", HCAP12_ACQUIRE,
-         "fsync"), HCAP12_CLIENT0)
-    assert _hcap12_program_error(parsed_program) is None
-    assert _hcap11_program_error(parsed_program) is None
-
-
-@pytest.mark.parametrize(("calls", "reason"), [
-    ((HCAP12_EXPIRE, HCAP12_ACQUIRE, "fsync"), "cld_reconnect_count"),
-    ((HCAP12_EXPIRE, "syz_nfsd_cld_ctl$reconnect",
-      "syz_nfsd_cld_ctl$reconnect", HCAP12_ACQUIRE, "fsync"),
-     "cld_reconnect_count"),
-    (("syz_nfsd_cld_ctl$reconnect", HCAP12_EXPIRE, HCAP12_ACQUIRE,
-      "fsync"), "cld_reconnect_order"),
-    ((HCAP12_EXPIRE, HCAP12_ACQUIRE, "syz_nfsd_cld_ctl$reconnect",
-      "fsync"), "cld_reconnect_order"),
-    ((HCAP12_EXPIRE, "syz_nfsd_cld_ctl$daemon_down", HCAP12_ACQUIRE,
-      "fsync"), "cld_operation_not_validated"),
-    ((HCAP12_EXPIRE, "syz_nfsd_cld_ctl$reconnect",
-      "syz_nfsd_cld_ctl$daemon_down", HCAP12_ACQUIRE, "fsync"),
-     "cld_operation_not_validated"),
-    (("syz_nfsd_cld_ctl$reconnect", HCAP12_ACQUIRE, "fsync"),
-     "hcap11:expiry_count"),
-    ((HCAP12_EXPIRE, "syz_nfsd_cld_ctl$reconnect", HCAP12_ACQUIRE),
-     "hcap11:client0_recovery_io_missing"),
-])
-def test_hcap12_program_contract_rejects_count_order_and_operation(
-        world, calls, reason):
-    assert _hcap12_program_error(
-        hcap11_parsed(world.identity, calls, HCAP12_CLIENT0)) == reason
-
-
-@pytest.mark.parametrize(("role", "required", "calls", "detail"), [
+@pytest.mark.parametrize(("role", "required", "calls"), [
     ("scenario", ("HCAP-11", "HCAP-12"),
-     (HCAP12_EXPIRE, "syz_nfsd_cld_ctl$daemon_down", HCAP12_ACQUIRE,
-      "fsync"), "cld_operation_not_validated"),
+     (V41_EXPIRE, "syz_nfsd_cld_ctl$reconnect", V41_ACQUIRE, "fsync")),
     ("scenario", ("HCAP-11",),
-     (HCAP12_EXPIRE, "syz_nfsd_cld_ctl$reconnect", HCAP12_ACQUIRE,
-      "fsync"), "cld_without_hcap12"),
-    ("neutral", ("HCAP-11", "HCAP-12"),
-     ("syz_nfsd_cld_ctl$reconnect", HCAP12_ACQUIRE, "fsync"),
-     "cld_without_hcap12"),
+     (V41_EXPIRE, "syz_nfsd_cld_ctl$daemon_down", V41_ACQUIRE, "fsync")),
+    ("neutral", ("HCAP-01",),
+     ("syz_nfsd_cld_ctl$reconnect", V41_ACQUIRE, "fsync")),
 ])
-def test_materializer_enforces_hcap12_program_contract_before_call_grants(
-        world, role, required, calls, detail):
+def test_materializer_refuses_nfsdcld_control_before_call_grants(
+        world, role, required, calls):
+    # HCAP-12 was withdrawn (#98): a trigger never controls a server daemon.
     from agent_pipeline.admission import CallAdmissionAuthority
     authority = CallAdmissionAuthority(
         hcap_revision=world.hcap_ref, profile_ref=world.profile_ref,
         profile=world.profile)
     with pytest.raises(_Failure) as caught:
         world.materializer._admit(
-            hcap11_parsed(world.identity, calls, HCAP12_CLIENT0),
+            hcap11_parsed(world.identity, calls, CLIENT0),
             role=role, selection=world.runtime,
             required_capabilities=required, authority=authority,
             call_table=world.call_table)
     assert caught.value.result().reason == CALL_NOT_ADMITTED
-    assert caught.value.result().detail == (
-        f"{role}_hcap12_program_contract:{detail}")
+    assert caught.value.result().detail == f"{role}_server_daemon_control"
 
 
 HCAP13_CALLS = ("syz_open_nfs_lane_profile$client0_knfsd_v3",
@@ -540,7 +502,7 @@ def test_materializer_enforces_hcap13_program_contract_before_call_grants(
         profile=world.profile)
     with pytest.raises(_Failure) as caught:
         world.materializer._admit(
-            hcap11_parsed(world.identity, calls, HCAP12_CLIENT0),
+            hcap11_parsed(world.identity, calls, CLIENT0),
             role=role, selection=world.runtime,
             required_capabilities=required, authority=authority,
             call_table=world.call_table)
