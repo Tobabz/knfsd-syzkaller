@@ -1069,6 +1069,10 @@ M7은 subset 단위로 반복하는 promotion gate다(issue #8). semantic subset
 state value, v4.1+ backchannel correlation, preserve/raw behavior, semantic Delta crash survival,
 dynamic-original semantic replay를 포함해야 한다. 모든 subset은 semantic Delta crash survival과
 semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능에 해당할 때 통과한다.
+crash survival 증거는 campaign에서 자연히 생긴 guest crash로만 얻는다. 검증을 위해 guest를 일부러
+crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지). 그런 crash가 아직 없으면 그 subset은
+promotion하지 않는다. Harness Generation이 만든 subset은 그동안 crash survival pending으로 staged revision에만
+pin된다(`../02-llm-agent/07-harness-gap-issue.md` §5.2, §5.3).
 
 Validation evidence를 HCAP `evidence_refs`에 추가하고 subset의 registry digest와 scope를 promotion한 뒤에만
 Harness Capability Specification을 갱신한다(§21).

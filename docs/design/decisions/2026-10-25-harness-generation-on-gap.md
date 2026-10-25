@@ -34,7 +34,11 @@
 4. **promotion은 사람이 하되 job을 막지 않는다.** 검증을 통과한 생성물은 staged HCAP revision이 된다. 공유 HCAP으로
    올리는 promotion은 사람이 검토하고(`04` §1.1, `07` §5.3), 그동안 job은 staged revision으로 진행한다. 그 위의 모든
    verdict와 crash report는 staged revision과 patch set digest를 기록한다.
-5. **`blocked_harness_gap`은 fallback이다.** 생성 Agent가 `infeasible`을 내거나 `harness_generation` budget을 다
+5. **검증에 인위적 crash를 쓰지 않는다.** (사용자 결정, 2026-10-25) mutation_engine 생성물의 M7 crash survival은
+   campaign에서 자연히 생긴 crash로만 확인한다. guest를 일부러 crash시키는 것(sysrq panic, NMI, 강제 reset)은
+   인위적 동작이므로 쓰지 않는다. 그 확인이 생길 때까지 subset은 crash survival pending으로 staged revision에만 pin되고
+   공유 HCAP promotion은 미룬다(`07` §5.2, §5.3).
+6. **`blocked_harness_gap`은 fallback이다.** 생성 Agent가 `infeasible`을 내거나 `harness_generation` budget을 다
    쓰면 job은 기존처럼 issue를 기다린다. operator는 `retry_generation`으로 생성을 다시 시작할 수 있다.
 
 ## 검토한 대안
@@ -53,4 +57,6 @@
   안의 결과는 staged revision에 쓰이지 않는다.
 - 자동 이식한 계측의 attribution 검증이 놓친 오류는 Q1을 거짓 `REACHED`나 `NOT_REACHED`로 만들 수 있다. 검증
   profile의 구체 내용(어떤 알려진 target으로 확인하는지)은 #83에서 정한다.
-- 생성 비용(LLM, KVM 시간)이 gap 수에 비례해 는다. gap key 단위 공유와 `harness_generation` budget이 상한이다.
+- crash survival이 pending인 subset으로 처음 생긴 자연 crash에서 MutationDelta가 남지 않으면, 그 crash는 replay로
+  재현할 수 없다. 그 사실을 crash와 함께 기록하고 subset을 promotion에서 거부하는 것으로 처리한다.
+- 생성 비용(LLM, VM 시간)이 gap 수에 비례해 는다. gap key 단위 공유와 `harness_generation` budget이 상한이다.
