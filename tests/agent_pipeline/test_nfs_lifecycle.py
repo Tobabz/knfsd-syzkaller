@@ -639,3 +639,17 @@ def test_nlm_programs_use_only_lane_profile_and_nlm_calls():
                  for call in calls]
         assert set(calls) <= allowed, phase
         assert "0x7, " not in path.read_text(), "F_SETLKW in %s" % phase
+
+
+def test_checked_guest_scales_command_timeouts_by_the_slowdown():
+    runner = load_runner()
+    seen = []
+
+    class Raw:
+        def run(self, command, timeout):
+            seen.append(timeout)
+            return 0, "ok"
+
+    assert runner.CheckedGuest(Raw(), scale=10).guest("true") == "ok"
+    runner.CheckedGuest(Raw()).guest("true", timeout=120)
+    assert seen == [600, 120]

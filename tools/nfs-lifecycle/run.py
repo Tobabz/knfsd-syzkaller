@@ -194,16 +194,21 @@ CLD_CREATE_FAILURE = "Unable to create client record on stable storage"
 
 
 class CheckedGuest:
-    """Compatibility adapter for the lifecycle helpers' checked guest API."""
+    """Compatibility adapter for the lifecycle helpers' checked guest API.
 
-    def __init__(self, guest):
+    ``scale`` multiplies every command timeout: the helpers' timeouts are
+    KVM-speed budgets, and a TCG guest is ``exec_slowdown`` times slower.
+    """
+
+    def __init__(self, guest, scale=1):
         self._guest = guest
+        self._scale = scale
 
     def start(self):
         self._guest.start()
 
     def guest(self, command, timeout=60):
-        rc, output = self._guest.run(command, timeout=timeout)
+        rc, output = self._guest.run(command, timeout=timeout * self._scale)
         if rc != 0:
             raise RuntimeError("guest rc=%d: %s: %s" %
                                (rc, command, output[-1500:]))
@@ -324,7 +329,7 @@ def make_admin_vm(context, output):
         console_log=output / "console.log", memory_mb=config.memory_mb,
         cpus=config.cpus, boot_timeout_s=config.boot_timeout_s,
         accel=config.accel))
-    return CheckedGuest(guest)
+    return CheckedGuest(guest, scale=config.exec_slowdown)
 
 
 def verify_admin_guest(vm, context):
