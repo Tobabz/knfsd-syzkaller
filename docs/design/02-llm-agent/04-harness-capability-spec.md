@@ -173,19 +173,22 @@ CallAdmissionProfile              # repository authority artifact, HCAP authorit
   목록은 profile이 소유하며 이 문서에 복제하지 않는다.
 - artifact는 첫 Stage 1 Materializer 통합에서 도입한다(§1.1의 milestone 규칙).
 
-### 3.2 자극 기준
+### 3.2 트리거 기준
 
-capability는 실제 위협 모델 안의 시나리오만 지원한다(결정 기록 `../decisions/2026-10-25-natural-stimulus.md`).
+capability는 실제 위협 모델 안의 시나리오만 지원한다(결정 기록 `../decisions/2026-10-25-natural-trigger.md`).
 
-- **자극**은 Q1에서 대상 커널 코드를 실행시키려고 프로그램이 실행 중에 일으키는 행위다. 실행 전 환경
-  구성(fixture 설정, 포트, lease·grace 시간, 데몬 기동)은 자극이 아니다.
-- 자극은 클라이언트나 네트워크 상대가 할 수 있는 행위여야 한다. 실행 중에 서버에서 일으키는 행위(서버 관리
-  인터페이스 쓰기, 서버 데몬 정지·종료·재시작, 서버 설정 변경)는 허용하지 않는다.
+- **트리거**는 Q1에서 대상 커널 코드를 실행시키려고 프로그램이 실행 중에 일으키는 행위다. 실행 전 환경
+  구성(fixture 설정, 포트, lease·grace 시간, 데몬 기동)은 트리거가 아니다.
+- 트리거는 NFS 클라이언트의 행위여야 한다(요청, syscall, 요청 중단, 연결 끊기. 여러 클라이언트의 조합 포함).
+- 클라이언트의 행위 때문에 서버가 하는 동작(callback, lease 만료와 laundromat 처리, blocked lock grant, 서버
+  데몬으로 가는 upcall)은 허용한다.
+- 실행 중에 harness나 helper가 서버를 직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버 데몬 정지·종료·재시작,
+  서버 설정 변경)는 허용하지 않는다.
 - 같은 대상에 도달하는 자연 경로가 있으면 그 경로를 쓴다. 자연 경로가 RemoteKcovSupportBoundary 밖이면
-  `remote_kcov_attribution` gap으로 계측을 생성한다(`07` §5). 귀속되지 않는다는 이유로 부자연스러운 자극으로
+  `remote_kcov_attribution` gap으로 계측을 생성한다(`07` §5). 귀속되지 않는다는 이유로 부자연스러운 트리거로
   우회하거나 대상을 포기하지 않는다.
 - 이 기준은 사람이 만든 capability와 Harness Generation이 만든 capability에 똑같이 적용한다.
-- S2C 변조를 네트워크 중간자의 행위로 허용할지는 미결이다(결정 기록 "미결").
+- S2C 변조(클라이언트와 서버 사이 경로의 공격자가 응답을 바꾸는 것)를 허용할지는 미결이다(결정 기록 "미결").
 
 ## 4. 현재 capability catalog
 
@@ -561,7 +564,7 @@ tools/nfs-proxy/README.md
 
 ### HCAP-11 — Bounded NFSv4.1 client lifecycle recovery
 
-> 자극 기준(§3.2) 위반: expiry는 서버 namespace의 broker가 서버 관리 인터페이스
+> 트리거 기준(§3.2) 위반: expiry는 서버 namespace의 broker가 서버 관리 인터페이스
 > `/proc/fs/nfsd/clients/<id>/ctl`에 쓰는 동작이다. Agent 사용 범위에서 빼고 자연 경로(lease 만료와 그 귀속
 > 계측)로 다시 만든다. 아래는 code를 바꾸기 전의 현재 상태다.
 
@@ -618,7 +621,7 @@ agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
 
 ### HCAP-12 — Bounded nfsdcld reconnect during NFSv4.1 client recovery
 
-> 자극 기준(§3.2) 위반: reconnect는 broker가 서버 데몬 nfsdcld를 SIGSTOP·SIGKILL·재시작하는 동작이고, HCAP-11
+> 트리거 기준(§3.2) 위반: reconnect는 broker가 서버 데몬 nfsdcld를 SIGSTOP·SIGKILL·재시작하는 동작이고, HCAP-11
 > sequence 위에서만 동작한다. Agent 사용 범위에서 뺀다. 아래는 code를 바꾸기 전의 현재 상태다.
 
 ```text
@@ -897,7 +900,7 @@ Harness Capability Specification
 
 Agent는 없는 capability를 있다고 가정하지 않는다.
 Stage 1/2 Agent는 candidate 실행 중에 즉석에서 source를 바꾸지 않는다.
-Planning은 자연 경로가 있으면 그 경로를 고르며, 그 경로가 귀속되지 않으면 서버 쪽 자극으로 우회하지 않고
+Planning은 자연 경로가 있으면 그 경로를 고르며, 그 경로가 귀속되지 않으면 서버 직접 조작으로 우회하지 않고
 `remote_kcov_attribution` gap을 낸다(§3.2).
 없는 capability는 Harness Generation이 syzlang, pseudo-syscall/executor, fixture/tool,
 mutation-engine, remote-KCOV 계측으로 생성하고 검증한다.
