@@ -838,8 +838,10 @@ Agent SDK does NOT own
     harness extension patch set -> Runner 검증 -> staged HCAP
 ```
 
-Harness Generation Agent는 source를 쓰지만 staging 영역에만 쓴다. build PASS, 검증 판정, staged revision 생성은
-Agent 밖(Runner와 Controller)에 있다.
+Harness Generation Agent는 source를 쓰지만 staging 영역에만 쓴다. 다른 Agent와 달리 job과 gap key마다 만든 격리
+workspace에서 파일과 shell 권한을 가지며 network 권한은 없다(`07` §5.1). 위 "does NOT own"의 shell command
+authority는 그 workspace 밖의 권한을 말한다. Agent가 workspace에서 돌린 build와 test는 참고일 뿐이고, build PASS,
+검증 판정, staged revision 생성은 Agent 밖(Runner와 Controller)에 있다.
 
 필요해질 때만 kernel-path analyst, NFS protocol analyst, harness analyst 같은 specialist를 추가한다.
 

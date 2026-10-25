@@ -235,11 +235,16 @@ validation (Runner, §5.2)
 - 생성물은 patch set이다: `bundle/` 아래 syzlang, executor, fixture, host spec entry, Proxy/compiler 변경,
   kernel 계측 patch. promoted HCAP과 main branch에는 쓰지 않고 staging 영역(job과 gap key로 이름 붙인 branch나
   artifact)에만 쓴다.
-- 생성 Agent가 쓴 code는 guest와 host 도구에서 실행된다. 그래서 build와 실행은 Runner가 격리된 KVM 환경에서
-  하고, 생성 Agent에는 shell과 network 권한을 주지 않는다(`01` §10). 생성 Agent가 쓸 수 있는 것은 staging
-  영역의 파일과 검증 요청뿐이다.
-- 생성물의 트리거는 `04` §3.2를 따른다. 클라이언트가 유도한 서버 동작은 허용하지만, 실행 중에 harness가 서버를 직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버
-  데몬 정지·종료·재시작, 서버 설정 변경)를 하는 executor·helper·fixture 동작은 만들지 않는다. 자연 경로가
+- 생성 Agent는 파일과 shell 권한을 가진다(2026-10-25 사용자 결정). 설계 문서와 repository를 직접 읽고, staging
+  checkout에서 code를 고치고, build와 test를 스스로 돌려 patch set을 다듬는다. 이 작업은 job과 gap key마다 새로
+  만든 격리 workspace(container나 VM)에서 한다. workspace에는 repository의 staging checkout, pinned toolchain,
+  kernel source가 있고, host의 state, artifact store의 쓰기 권한, publish credential, 다른 job의 workspace는 없다.
+  network 권한은 주지 않는다. promoted HCAP과 main branch는 읽기만 한다.
+- 생성 Agent가 workspace에서 돌린 build와 test 결과는 판정이 아니다. staged revision을 만드는 판정은 Runner가
+  patch set만 받아 새 격리 KVM 환경에서 다시 build하고 §5.2를 실행해 낸다. Agent workspace의 산출물(binary,
+  log)은 그 판정에 쓰지 않는다.
+- 생성물의 트리거는 `04` §3.2를 따른다. 클라이언트가 유도한 서버 동작은 허용하지만, 실행 중에 harness가 서버를
+  직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버 데몬 정지·종료·재시작, 서버 설정 변경)를 하는 executor·helper·fixture 동작은 만들지 않는다. 자연 경로가
   귀속되지 않으면 우회하지 않고 그 context의 귀속 계측을 함께 생성한다.
 - vulnerability fix patch는 생성하지 않는다(§6). target kernel code의 동작을 바꾸는 patch는 계측으로 보지 않고
   거부한다.

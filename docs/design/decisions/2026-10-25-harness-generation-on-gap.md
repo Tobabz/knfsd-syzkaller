@@ -47,8 +47,10 @@
 
 ## 남은 위험
 
-- 생성 Agent가 쓴 code가 guest와 host 도구에서 실행된다. 격리 방식(어디서 build하고 무엇에 접근하는지)은 #83에서
-  정한다.
+- 생성 Agent는 격리 workspace에서 파일과 shell 권한을 가진다(2026-10-25 사용자 결정, `07` §5.1). workspace가
+  격리되지 않거나 credential이 들어가면 생성 Agent가 host나 다른 job에 영향을 줄 수 있다. workspace 구현(container
+  또는 VM, 자원 한도, 수명)은 #83에서 정한다. 판정은 Runner가 patch set만 받아 다시 build해 내므로 workspace
+  안의 결과는 staged revision에 쓰이지 않는다.
 - 자동 이식한 계측의 attribution 검증이 놓친 오류는 Q1을 거짓 `REACHED`나 `NOT_REACHED`로 만들 수 있다. 검증
   profile의 구체 내용(어떤 알려진 target으로 확인하는지)은 #83에서 정한다.
 - 생성 비용(LLM, KVM 시간)이 gap 수에 비례해 는다. gap key 단위 공유와 `harness_generation` budget이 상한이다.
