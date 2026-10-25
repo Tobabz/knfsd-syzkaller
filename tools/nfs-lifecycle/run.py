@@ -322,7 +322,8 @@ def make_admin_vm(context, output):
         lane_dir=context.files["lane-script"].parent,
         ssh_key=config.ssh_key, cmdline=command_line,
         console_log=output / "console.log", memory_mb=config.memory_mb,
-        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s))
+        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s,
+        accel=config.accel))
     return CheckedGuest(guest)
 
 
