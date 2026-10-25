@@ -419,36 +419,7 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         instrumentation_sha256=builds["instrumentation"],
         vmlinux_sha256=builds["kernel"],
         kaslr_enabled=False, kaslr_offset=0)
-    evidence_value = {
-        "schema_version": "hcap-kvm-evidence.v1",
-        "capability_id": "HCAP-11",
-        "observed_at": "2026-10-19",
-        "scenario": "v41-client-expiry",
-        "execution_harness_id": initial.execution_harness_id,
-        "mapping_identity": identity.model_dump(mode="json"),
-        "target_mapping_sha256": "a" * 64,
-        "campaign_result_sha256": "b" * 64,
-        "guest_lane_script_sha256": lane_pin.sha256,
-        "guest_nfs_proxy_sha256": "c" * 64,
-        "runs": {
-            "control": {"completed": 1, "target_hit_counts": [0]},
-            "stimulus": {"completed": 1, "target_hit_counts": [1]},
-        },
-        "generation_contract": {
-            "generation_begin_each": 1,
-            "aggregate_published_each": 1,
-            "generation_aborted_each": 0,
-            "scratch_overflow_each": 0,
-            "merge_truncation_each": 0,
-            "outstanding_tokens_after_each": 0,
-            "remote_refs_after_each": 0,
-            "minimum_remote_start_ok": 1,
-        },
-        "recovery_order": list(HCAP11_RECOVERY_ORDER),
-        "crash_signature_count": 0,
-        "raw_artifact_error_count": 0,
-        "shareable_result_contains_target_metadata_or_addresses": False,
-    }
+    evidence_value = _hcap11_evidence(identity, lane_pin.sha256)
     evidence = host.root / "hcap11-evidence.json"
     evidence.write_text(json.dumps(evidence_value))
     spec = json.loads(host.spec.read_text())
@@ -526,9 +497,10 @@ def test_template_spec_is_valid():
         assert set(selection.enabled_interfaces) - {"remote_cover"} <= calls
     lifecycle = next(c for c in spec.capabilities if c.id == "HCAP-11")
     assert lifecycle.status == "validated"
-    assert lifecycle.scope == ("client0_confirmed_expiry_recovery",)
+    assert lifecycle.scope == ("client0_courtesy_expiry_recovery",)
     assert lifecycle.interface.syz_calls == (
-        "syz_nfsd_client_ctl$expire_client0",)
+        "syz_nfs_lane_link$heal_client0",
+        "syz_nfs_lane_link$partition_client0", "syz_open_nlm_lane_file")
     assert spec.capability_evidence["HCAP-11"] == (
         Path("capability-evidence/hcap11-kvm.json"),)
     evidence_path = template / spec.capability_evidence["HCAP-11"][0]
@@ -539,14 +511,20 @@ def test_template_spec_is_valid():
     assert evidence.shareable_result_contains_target_metadata_or_addresses is False
     assert not {"target_pcs", "candidate_id", "path", "symbol"} & set(
         evidence_json)
-    assert any("syz_nfsd_client_ctl$expire_client0(0x0)" in item
-               for item in lifecycle.constraints)
-    expiry = next(e for e in spec.admission_source.entries
-                  if e.call == "syz_nfsd_client_ctl$expire_client0")
-    assert expiry.capability_ids == ("HCAP-11",)
-    assert all("syz_nfsd_client_ctl$expire_client1" not in
-               selection.enabled_interfaces
-               for selection in spec.runtime_selections)
+    assert evidence.scenario == "v41-courtesy-expiry"
+    # #96: the server admin expiry is not an NFS client action, so nothing
+    # admits or enables syz_nfsd_client_ctl; the partition is client0's own
+    # link and only HCAP-11 admits it.
+    assert all(not e.call.startswith("syz_nfsd_client_ctl$")
+               for e in spec.admission_source.entries)
+    assert all(not call.startswith("syz_nfsd_client_ctl$")
+               for selection in spec.runtime_selections
+               for call in selection.enabled_interfaces)
+    for call in ("syz_nfs_lane_link$heal_client0",
+                 "syz_nfs_lane_link$partition_client0"):
+        entry = next(e for e in spec.admission_source.entries
+                     if e.call == call)
+        assert entry.capability_ids == ("HCAP-11",)
 
     # HCAP-12 (nfsdcld reconnect) was withdrawn (#98): stopping a server
     # daemon is not an NFS client action, so nothing admits nfsdcld control.
@@ -584,7 +562,10 @@ def test_template_spec_is_valid():
                for item in spec.neutral_controls)
     entries = {e.call: e for e in spec.admission_source.entries}
     for call in nlm.interface.syz_calls:
-        assert entries[call].capability_ids == ("HCAP-13",)
+        # HCAP-11's delegation open shares the NLM lane file open.
+        want = (("HCAP-11", "HCAP-13") if call == "syz_open_nlm_lane_file"
+                else ("HCAP-13",))
+        assert entries[call].capability_ids == want
     lock = entries["fcntl$lock"]
     assert [(c.kind, getattr(c, "minimum", None), getattr(c, "maximum", None))
             for c in lock.resource_constraints] == [
@@ -629,6 +610,77 @@ def _hcap13_evidence(identity, lane_sha256):
         },
     })
     return value
+
+
+def _hcap11_run(completed=3, **hits):
+    probes = dict.fromkeys(("break_deleg", "create_session",
+                            "exchange_id"), 0)
+    probes.update(hits)
+    return {
+        "completed": completed,
+        "probe_hits": {name: [count] * completed
+                       for name, count in probes.items()},
+        "status_checks_passed": completed,
+        "attributed_generations": completed,
+    }
+
+
+def _hcap11_evidence(identity, lane_sha256):
+    value = _kvm_evidence(identity, lane_sha256)
+    value.update({
+        "capability_id": "HCAP-11",
+        "scenario": "v41-courtesy-expiry",
+        "probe_mapping_sha256": {name: "1" * 64 for name in (
+            "break_deleg", "create_session", "exchange_id")},
+        "nfsv4_lease_time_s": 10,
+        "partition_hold_s": 15,
+        "runs": {
+            "control": _hcap11_run(),
+            "stimulus": _hcap11_run(create_session=3, exchange_id=5,
+                                    break_deleg=2),
+        },
+        "recovery_order": list(HCAP11_RECOVERY_ORDER),
+    })
+    return value
+
+
+def test_hcap11_evidence_accepts_the_validated_campaign_shape():
+    evidence = Hcap11KvmEvidence.model_validate(
+        _hcap11_evidence(EVIDENCE_IDENTITY, "8" * 64))
+    assert evidence.runs.stimulus.probe_hits.break_deleg == (2, 2, 2)
+
+
+@pytest.mark.parametrize(("path", "value", "message"), [
+    (("runs", "control", "probe_hits", "exchange_id"), [0, 1, 0],
+     "control run reached an HCAP-11 probe"),
+    (("runs", "stimulus", "probe_hits", "break_deleg"), [2, 0, 2],
+     "stimulus run missed break_deleg"),
+    (("runs", "stimulus", "probe_hits", "create_session"), [0, 3, 3],
+     "stimulus run missed create_session"),
+    (("runs", "stimulus", "status_checks_passed"), 2,
+     "left the lane fixture unhealthy"),
+    (("runs", "control", "attributed_generations"), 2,
+     "lacks one attributed generation"),
+    (("runs", "stimulus", "completed"), 2, "greater than or equal to 3"),
+    (("probe_mapping_sha256",), {"exchange_id": "1" * 64},
+     "probe mappings differ"),
+    (("recovery_order",), ["nfsd_clid_admin_expired"],
+     "recovery order differs"),
+    (("partition_hold_s",), 5, "15"),
+    (("nfsv4_lease_time_s",), 90, "10"),
+    (("scenario",), "v41-client-expiry", "v41-courtesy-expiry"),
+    (("crash_signature_count",), 1, "crash or artifact error"),
+    (("shareable_result_contains_target_metadata_or_addresses",), True,
+     "private target data"),
+])
+def test_hcap11_evidence_rejects_unvalidated_campaigns(path, value, message):
+    evidence = _hcap11_evidence(EVIDENCE_IDENTITY, "8" * 64)
+    target = evidence
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=message):
+        Hcap11KvmEvidence.model_validate(evidence)
 
 
 def test_hcap13_evidence_accepts_the_validated_campaign_shape():
@@ -789,6 +841,22 @@ def _collect(host, tmp, approval=0, **fake):
                                               .read_text()))
 
 
+def test_partition_programs_get_a_raised_program_budget():
+    from agent_pipeline.stage1.host.collector import (execprog_argv,
+                                                      program_timeout_s)
+    partition = (b"r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)\n"
+                 b"syz_nfs_lane_link$partition_client0(0x0, 0x0)\n")
+    assert program_timeout_s(b"getdents64(r0, 0x0, 0x0)\n") is None
+    assert program_timeout_s(partition) == 90
+    # syzkaller scales its program budget by min(slowdown, 3).
+    assert program_timeout_s(partition, 10) == 270
+    argv = execprog_argv(600, 10, program_timeout_s(partition, 10))
+    assert "-program-timeout=270s /tmp/stage1/program.syz" in argv
+    assert "-program-timeout" not in execprog_argv(600, 10)
+    with pytest.raises(ValueError, match="inside the watchdog"):
+        execprog_argv(60, 1, 90)
+
+
 @needs_gcc
 def test_collector_writes_a_generation_attributed_capture(host, tmp_path):
     run = _collect(host, tmp_path / "lease", pcs=["0x401000", "0x401010"])
@@ -806,6 +874,7 @@ def test_collector_writes_a_generation_attributed_capture(host, tmp_path):
     stats = [i for i, c in enumerate(commands) if "*_stats" in c]
     released = commands.index("touch /tmp/stage1/gate.go")
     assert stats[0] < released < stats[1]
+    assert not any("-program-timeout" in c for c in commands)
     assert obs.lane_trace_mode == "off"
     coverage = PublishedCoverage.model_validate_json(
         (run.out / "coverage.json").read_bytes())

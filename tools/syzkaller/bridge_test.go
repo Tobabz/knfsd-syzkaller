@@ -107,6 +107,25 @@ func TestCldControlPreservesDirectFD(t *testing.T) {
 	}
 }
 
+func TestLanePartitionPreservesDirectFD(t *testing.T) {
+	source := lane +
+		"r1 = syz_open_nlm_lane_file(r0, &(0x7f0000000000)='lock0\\x00', 0x2)\n" +
+		"fcntl$lock(r1, 0x6, &(0x7f0000000300)={0x1, 0x0, 0x0, 0x1000, 0x0})\n" +
+		"syz_nfs_lane_link$partition_client0(0x0, 0x0)\n" +
+		"syz_nfs_lane_link$heal_client0(0x0, 0x1)\n" +
+		"fsync(r1)\nstatx(r0, &(0x7f0000000100)='lock0\\x00', 0x0, 0x7ff, &(0x7f0000000200))\n"
+	r := mustParse(t, source)
+	origin := "nfs-profile:knfsd-v41:client0"
+	for _, index := range []int{5, 6} {
+		if len(r.Calls[index].Facts.Origins) != 1 || r.Calls[index].Facts.Origins[0].Origin != origin {
+			t.Fatalf("call %d lost lane provenance across the partition: %+v", index, r.Calls[index].Facts)
+		}
+	}
+	if r.Calls[2].Facts.Flock == nil || r.Calls[2].Facts.Flock.LockType != 1 {
+		t.Fatalf("lock type fact missing: %+v", r.Calls[2].Facts)
+	}
+}
+
 func TestNLMLaneFileKeepsLaneOrigin(t *testing.T) {
 	source := "r0 = syz_open_nfs_lane_profile$client1_knfsd_v3(0x0, 0x1)\n" +
 		"r1 = syz_open_nlm_lane_file(r0, &(0x7f0000000000)='lock0\\x00', 0x2)\n" +

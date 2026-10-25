@@ -140,7 +140,8 @@ its explicit valid `AUTO` syntax remains part of the pinned parser semantics.
   origin. An explicit close invalidates that root; unknown FD effects invalidate
   all roots. A small allowlist of ordinary IO/metadata calls (listed in
   `preservesRoots` in `facts.go`) preserves existing roots. The bounded
-  `syz_nfsd_client_ctl` and `syz_nfsd_cld_ctl` fixture controls also preserve
+  `syz_nfsd_client_ctl` and `syz_nfsd_cld_ctl` fixture controls and the
+  `syz_nfs_lane_link` client partition of patch 0032 also preserve
   roots because they cannot consume or replace a program FD, as do `fcntl`
   (F_DUPFD returns a new, unrooted FD), `setsockopt` and the NLM lane calls of
   patch 0030.

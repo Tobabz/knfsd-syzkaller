@@ -68,7 +68,7 @@ def write_identity_inputs(tmp_path):
     selection = RuntimeSelection(
         profile="knfsd-v41", nfs_version="4.1", fixture_mode="single",
         route="direct", topology="one-lane",
-        enabled_interfaces=tuple(sorted(runner.ADMIN_REQUIRED_INTERFACES)),
+        enabled_interfaces=tuple(sorted(runner.COURTESY_REQUIRED_INTERFACES)),
         trace_mode="off")
     descriptor = ExecutionHarnessDescriptor(
         kernel_commit="a" * 40, sanitizer=Sanitizer.KASAN,
@@ -191,9 +191,9 @@ def test_admin_exec_failure_retains_all_available_raw_artifacts(tmp_path):
     runner = load_runner()
     guest = FailedExecGuest(runner)
     with pytest.raises(RuntimeError, match="rc=7"):
-        runner.run_admin_program(
+        runner.run_program(
             guest, tmp_path, "stimulus", 1, "/sys/kernel/tracing",
-            {0xffffffff81001234})
+            lambda artifacts, pcs: {})
     stem = "stimulus-001."
     expected = (
         "executor.log", "stats-before.txt", "stats-after.txt",
@@ -244,6 +244,7 @@ def test_run_program_exports_remote_cover_artifacts(tmp_path, monkeypatch):
              "cover_prog1.meta": "unfinished_calls 0\n"}
     guest, result = run_cover_program(runner, tmp_path, cover)
     assert "-program-timeout" not in guest.started[0]
+    assert "-slowdown=1 " in guest.started[0]
     assert result["pcs"] == 1
     assert result["coverage_files"] == sorted(cover)
     exported = sorted(path.name for path in tmp_path.iterdir()
@@ -446,3 +447,193 @@ def test_nlm_programs_use_only_lane_profile_and_nlm_calls():
                  for call in calls]
         assert set(calls) <= allowed, phase
         assert "0x7, " not in path.read_text(), "F_SETLKW in %s" % phase
+
+
+def courtesy_trace(*, old="6a1f0c2e:00000003", new="6a1f0c2e:00000005",
+                   order=None):
+    lines = {
+        "open0": "nfsd-1 [000] 10.000001: nfsd_compound_status: op=3/6 "
+                 "OP_OPEN status=0",
+        "recall": "nfsd-2 [001] 29.900001: nfsd_cb_recall: "
+                  "addr=10.0.0.2:0 client %s stateid 00000003:00000001"
+                  % old,
+        "expired": "nfsd-2 [001] 30.000001: nfsd_mark_client_expired: "
+                   "addr=10.0.0.2:801 client %s cl_rpc_users=0" % old,
+        "purged": "kworker-3 [002] 30.000002: nfsd_clid_purged: client %s"
+                  % old,
+        "delay": "nfsd-2 [001] 30.000003: nfsd_compound_status: op=3/6 "
+                 "OP_OPEN status=10008",
+        "open1": "nfsd-2 [001] 30.000004: nfsd_compound_status: op=3/6 "
+                 "OP_OPEN status=0",
+        "fresh": "nfsd-1 [000] 40.000001: nfsd_clid_fresh: "
+                 "addr=10.0.0.2:801 name='Linux NFSv4.1 c0' "
+                 "verifier=0x01 flavor=sys client=%s" % new,
+        "exchange": "nfsd-1 [000] 40.000002: nfsd_compound_status: op=1/1 "
+                    "OP_EXCHANGE_ID status=0",
+        "slot": "nfsd-1 [000] 40.000003: nfsd_slot_seqid_unconf: "
+                "addr=10.0.0.2:801 client %s idx=0 seqid=1 slot_seqid=0 "
+                "flags=" % new,
+        "confirmed": "nfsd-1 [000] 40.000004: nfsd_clid_confirmed: "
+                     "client %s" % new,
+        "create": "nfsd-1 [000] 40.000005: nfsd_compound_status: op=1/1 "
+                  "OP_CREATE_SESSION status=0",
+    }
+    order = order or list(lines)
+    return "".join(lines[name] + "\n" for name in order)
+
+
+def test_courtesy_trace_accepts_the_client_induced_recovery():
+    runner = load_runner()
+    lineage = runner.validate_courtesy_trace(courtesy_trace(), "")
+    assert lineage["expired_clientid"] == "6a1f0c2e:00000003"
+    assert lineage["recovered_clientid"] == "6a1f0c2e:00000005"
+    assert tuple(lineage["ordered_events"]) == runner.COURTESY_ORDER
+    assert lineage["selected_trace_lines"][3] == (
+        "nfsd_compound_status: op=3/6 OP_OPEN status=0")
+    assert "verifier=(redacted) " in lineage["selected_trace_lines"][4]
+    assert not runner.SHAREABLE_HEX_RE.search(
+        "\n".join(lineage["selected_trace_lines"]))
+    from agent_pipeline.stage1.host.generate import HCAP11_RECOVERY_ORDER
+    assert runner.COURTESY_ORDER == HCAP11_RECOVERY_ORDER
+
+
+@pytest.mark.parametrize(("kwargs", "lifecycle", "message"), [
+    ({}, "lifecycle request lane=0\n", "invoked the lifecycle broker"),
+    ({"new": "6a1f0c2e:00000003"}, "", "reused the expired clientid"),
+    ({"order": ["open0", "recall", "expired", "purged", "delay", "fresh",
+                "exchange", "slot", "confirmed", "create"]}, "",
+     "conflicting OPEN count=0"),
+    ({"order": ["open0", "recall", "purged", "expired", "open1", "fresh",
+                "exchange", "slot", "confirmed", "create"]}, "",
+     "out of order"),
+    ({"order": ["open0", "expired", "recall", "purged", "open1", "fresh",
+                "exchange", "slot", "confirmed", "create"]}, "",
+     "out of order"),
+    ({"order": ["open0", "expired", "purged", "open1", "fresh", "exchange",
+                "slot", "confirmed", "create"]}, "",
+     "delegation recall of the expired client count=0"),
+    ({"order": ["open0", "recall", "open1", "fresh", "exchange", "slot",
+                "confirmed", "create"]}, "", "courtesy client expiry count=0"),
+    ({"order": ["open0", "recall", "expired", "purged", "open1", "exchange",
+                "slot", "confirmed", "create"]}, "",
+     "fresh client trace count=0"),
+])
+def test_courtesy_trace_fails_closed(kwargs, lifecycle, message):
+    runner = load_runner()
+    with pytest.raises(RuntimeError, match=message):
+        runner.validate_courtesy_trace(courtesy_trace(**kwargs), lifecycle)
+
+
+def courtesy_run(**hits):
+    probes = dict.fromkeys(load_runner().COURTESY_PROBES, 0)
+    probes.update(hits)
+    return {"probe_hits": probes, "status_check": "pass",
+            "generation": {"remote_start_ok": 2},
+            "lineage": {"ordered_events": list(
+                load_runner().COURTESY_ORDER)}}
+
+
+def test_courtesy_runs_fail_closed():
+    runner = load_runner()
+    runner.check_courtesy_run("control", courtesy_run())
+    runner.check_courtesy_run("stimulus", courtesy_run(
+        create_session=1, exchange_id=1, break_deleg=1))
+    with pytest.raises(RuntimeError, match="control reached nfsd probe"):
+        runner.check_courtesy_run("control", courtesy_run(exchange_id=1))
+    with pytest.raises(RuntimeError, match="missed break_deleg"):
+        runner.check_courtesy_run("stimulus", courtesy_run(
+            create_session=1, exchange_id=1))
+
+
+def test_courtesy_campaign_types_its_evidence(tmp_path):
+    runner, config, descriptor_path, _, _ = write_identity_inputs(tmp_path)
+    context = runner.load_admin_context(config, descriptor_path, None)
+    cycles = {"control": [courtesy_run()] * 3,
+              "stimulus": [courtesy_run(create_session=2, exchange_id=3,
+                                        break_deleg=1)] * 3}
+    guest = {"guest_lane_script_sha256": "4" * 64,
+             "guest_nfs_proxy_sha256": "5" * 64}
+    digests = {name: "6" * 64 for name in runner.COURTESY_PROBES}
+    evidence = runner.hcap11_evidence(
+        context, guest, digests, cycles, b'{"status": "pass"}\n', 0, 0)
+    assert evidence.capability_id == "HCAP-11"
+    assert evidence.scenario == "v41-courtesy-expiry"
+    assert evidence.runs.stimulus.probe_hits.break_deleg == (1, 1, 1)
+    assert (evidence.nfsv4_lease_time_s, evidence.partition_hold_s) == (10, 15)
+    with pytest.raises(ValueError, match="private target data"):
+        runner.hcap11_evidence(
+            context, guest, digests, cycles,
+            b'{"pc": "0xffffffff81001234"}\n', 0, 0)
+
+
+def test_courtesy_programs_differ_by_the_client_induced_expiry():
+    runner = load_runner()
+    from agent_pipeline.stage1.host.collector import program_timeout_s
+    control = runner.COURTESY_PROGRAMS["control"].read_bytes()
+    stimulus = runner.COURTESY_PROGRAMS["stimulus"].read_bytes()
+    assert program_timeout_s(control) is None
+    assert program_timeout_s(stimulus, 10) == 270
+    allowed = {"close", "getdents64", "openat", "read", "statx", "unlinkat",
+               *runner.COURTESY_REQUIRED_INTERFACES} - {
+        "remote_cover"}
+    for text in (control, stimulus):
+        calls = [line.split("(", 1)[0].split("= ")[-1]
+                 for line in text.decode().splitlines()]
+        assert set(calls) <= allowed
+        assert not any(call.startswith("syz_nfsd_") for call in calls)
+
+
+def test_courtesy_stimulus_starts_execprog_with_the_raised_budget(
+        tmp_path, monkeypatch):
+    runner = load_runner()
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    cover = {"cover_prog1.extra": "0xffffffff81001234\n",
+             "cover_prog1.meta": "unfinished_calls 0\n"}
+    guest, _ = run_cover_program(runner, tmp_path, cover, slowdown=10,
+                                 program_budget_s=270)
+    assert "-slowdown=10 " in guest.started[0]
+    assert "-program-timeout=270s " in guest.started[0]
+    assert "timeout 3000 " in guest.started[0]
+
+
+def test_checked_guest_scales_command_timeouts_by_the_slowdown():
+    runner = load_runner()
+    seen = []
+
+    class Raw:
+        def run(self, command, timeout):
+            seen.append(timeout)
+            return 0, "ok"
+
+    assert runner.CheckedGuest(Raw(), scale=10).guest("true") == "ok"
+    runner.CheckedGuest(Raw()).guest("true", timeout=120)
+    assert seen == [600, 120]
+
+
+class StatusGuest:
+    def __init__(self, runner, stderr=""):
+        self.runner = runner
+        self.stderr = stderr
+
+    def guest(self, command, timeout=60):
+        if command.startswith("/run/frozen-phase9/lane.sh status "):
+            assert command.endswith("2>%s" % self.runner.STATUS_STDERR)
+            return '{"fixture_mode": "single"}\n'
+        if command == "cat %s" % self.runner.STATUS_STDERR:
+            return self.stderr
+        if command == "dmesg":
+            return "clean\n"
+        raise AssertionError(command)
+
+
+def test_fixture_check_keeps_lane_status_stderr_apart(tmp_path):
+    runner = load_runner()
+    runner.check_fixture_after(StatusGuest(runner), tmp_path, "stimulus", 1,
+                               "single")
+    assert (tmp_path / "stimulus-001.lane-status.txt").is_file()
+    with pytest.raises(RuntimeError, match="wrote to stderr after control: "
+                       "KOOV: odd"):
+        runner.check_fixture_after(StatusGuest(runner, "KOOV: odd\n"),
+                                   tmp_path, "control", 1, "single")
+    assert (tmp_path / "control-001.lane-status.stderr.txt").read_text() == (
+        "KOOV: odd\n")

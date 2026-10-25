@@ -64,6 +64,11 @@ FIXTURE_POLL_S = 3.0
 LANE = 0
 LOG_LIMIT = 4 * 1024 * 1024
 EXECPROG_EXIT_GRACE_S = 60
+#: syzkaller program budget, in KVM seconds, for a program that holds a lane
+#: client partition (syzkaller patch 0032): the 15 s hold past the lease,
+#: the client's TCP reconnect backoff after heal, and the recovery.
+PARTITION_PROGRAM_TIMEOUT_S = 90
+PARTITION_CALL = "syz_nfs_lane_link$partition_"
 EVIDENCE_COMMAND_TIMEOUT_S = 120
 RESULT_TYPE = "application/vnd.knfsd.collector-result+json"
 LOG_TYPE = "text/plain"
@@ -222,17 +227,37 @@ def execprog_timeout(timeout_s: float, slowdown: int = 1) -> int:
     return math.ceil(timeout_s * slowdown)
 
 
-def execprog_argv(timeout_s: float, slowdown: int = 1) -> str:
+def program_timeout_s(program: bytes, slowdown: int = 1) -> int | None:
+    """The raised syzkaller program budget a program needs, or None.
+
+    syzkaller's default budget is 5 s scaled by min(slowdown, 3); a program
+    that partitions a lane client waits past the lease, so it gets
+    ``PARTITION_PROGRAM_TIMEOUT_S`` under the same scale.
+    """
+    if PARTITION_CALL.encode() not in program:
+        return None
+    return PARTITION_PROGRAM_TIMEOUT_S * min(slowdown, 3)
+
+
+def execprog_argv(timeout_s: float, slowdown: int = 1,
+                  program_timeout: int | None = None) -> str:
     """Start execprog in the background.  It stops at the gate after the
-    machine check; ``EXEC_RC`` holds its exit status once it is done."""
+    machine check; ``EXEC_RC`` holds its exit status once it is done.
+    ``program_timeout`` (seconds) raises the syzkaller program budget."""
     watchdog_s = execprog_timeout(timeout_s, slowdown)
+    if program_timeout is not None and not (
+            0 < program_timeout < watchdog_s):
+        raise ValueError("program timeout must be inside the watchdog")
     argv = [f"{GUEST_DIR}/syz-execprog",
             f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
             "-arch=amd64", "-vmarch=amd64", "-sandbox=none", "-procs=1",
             "-repeat=1", "-threaded=false", "-cover=true",
             "-coverfile=/tmp/cov/cover", "-remote-cover=true",
             "-disable=all", "-debug", "-vv=1", f"-slowdown={slowdown}",
-            f"-gate={GATE}", f"{GUEST_DIR}/program.syz"]
+            f"-gate={GATE}"]
+    if program_timeout is not None:
+        argv.append(f"-program-timeout={program_timeout}s")
+    argv.append(f"{GUEST_DIR}/program.syz")
     body = (f"timeout --kill-after={EXECPROG_EXIT_GRACE_S} "
             f"{watchdog_s} {shlex.join(argv)} > {EXEC_LOG} 2>&1; "
             f"echo $? > {EXEC_RC}")
@@ -302,7 +327,9 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
                         f"{GUEST_DIR}/syz-execprog")
         sleep(config.grace_s)
         timeout_s = execprog_timeout(config.exec_timeout_s, exec_slowdown)
-        _checked(guest, execprog_argv(config.exec_timeout_s, exec_slowdown))
+        _checked(guest, execprog_argv(
+            config.exec_timeout_s, exec_slowdown,
+            program_timeout_s(program.read_bytes(), exec_slowdown)))
         exec_deadline = (time.monotonic() + timeout_s
                          + EXECPROG_EXIT_GRACE_S)
         gate = _wait_execprog(guest, True, exec_deadline, sleep)

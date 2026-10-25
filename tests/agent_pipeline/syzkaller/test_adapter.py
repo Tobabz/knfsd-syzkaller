@@ -77,6 +77,15 @@ def test_lifecycle_control_preserves_nfs_provenance(parser, identity):
     assert facts.origins[0].origin == "nfs-profile:knfsd-v41:client0"
 
 
+def test_lane_partition_preserves_nfs_provenance(parser, identity):
+    source = (LANE + b"syz_nfs_lane_link$partition_client0(0x0, 0x0)\n"
+              b"syz_nfs_lane_link$heal_client0(0x0, 0x1)\n"
+              b"fsync(r0)\n")
+    result = parser.parse(source, identity=identity)
+    facts = result.calls[3].resource_facts
+    assert facts.origins[0].origin == "nfs-profile:knfsd-v41:client0"
+
+
 def test_cld_control_preserves_nfs_provenance(parser, identity):
     source = (LANE + b"syz_nfsd_cld_ctl$reconnect(0x2)\n"
               b"syz_nfsd_cld_ctl$daemon_down(0x3)\n"

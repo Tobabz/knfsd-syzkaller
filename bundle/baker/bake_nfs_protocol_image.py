@@ -121,8 +121,14 @@ class VM:
             if self.process.poll() is not None:
                 raise RuntimeError("QEMU exited before SSH became ready\n%s"
                                    % self.diagnostics())
-            result = subprocess.run([*self.ssh, "true"], capture_output=True,
-                                    text=True, timeout=8)
+            try:
+                result = subprocess.run([*self.ssh, "true"],
+                                        capture_output=True, text=True,
+                                        timeout=8 * self.args.slowdown)
+            except subprocess.TimeoutExpired:
+                # Under TCG sshd can accept before it can answer.
+                self.last_ssh_error = "ssh probe timed out"
+                continue
             if result.returncode == 0:
                 return
             self.last_ssh_error = result.stderr.strip()
