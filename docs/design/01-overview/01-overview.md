@@ -42,8 +42,8 @@ Mutation Engine의 실행 대상 선택 확장은 후속 계획이다.
 
 이 절의 그림은 지금 구현된 legacy/manual 경로(Layer 0, NFSPARM arm)를 설명한다. target 계약이 아니다.
 target Agent pipeline에서 Agent는 program을 제안하고 Harness Materializer가 검증한다
-(`02-llm-agent/05-reachability-plan.md` §11). syzlang·pseudo-syscall 확장은 별도 Harness Extension Work다
-(`02-llm-agent/07-harness-gap-issue.md`). Agent pipeline은 legacy arm을 쓰지 않는다
+(`02-llm-agent/05-reachability-plan.md` §11). syzlang·pseudo-syscall 확장은 gap을 만났을 때 pipeline의
+Harness Generation이 만든다(`02-llm-agent/07-harness-gap-issue.md` §5). Agent pipeline은 legacy arm을 쓰지 않는다
 (`02-llm-agent/04-harness-capability-spec.md` §5, issue #8). target 흐름은 `02-llm-agent/01` §2와
 `03-nfs-proxy/01-architecture.md` §16이 소유한다.
 

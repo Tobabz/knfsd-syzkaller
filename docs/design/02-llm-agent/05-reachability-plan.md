@@ -189,8 +189,9 @@ unsupported_by_current_harness
 
 로 판정한다.
 
-Controller는 이 결과를 받아 `HarnessGapIssue`를 생성하거나 기존 issue에 연결하고,
-candidate를 `blocked_harness_gap` 상태로 둔다.
+Controller는 이 결과를 받아 `HarnessGapIssue`를 생성하거나 기존 issue에 연결하고, Harness Generation(07 §5)으로
+필요한 capability를 생성한다. 생성한 harness가 검증을 통과하면 job은 새 HCAP revision으로 Planning을 다시 한다.
+job은 생성이 실패했을 때만 `blocked_harness_gap`에 머문다(09 §3.2).
 
 ## 9. q1_observation
 
@@ -307,8 +308,8 @@ review manifest는 실행 전에 검증된 program, neutral control program, run
 ExecutionHarnessIdentity를 hash로 묶는다(approval binding). identity가 바뀌면 harness를 다시 materialize한다(01 §11.2).
 
 현재 capability가 부족하면 Materializer가 source를 즉석에서 수정하지 않는다.
-별도 Harness Extension Work에서 필요한 syzlang/pseudo-syscall/fixture/tool 확장을 구현·검증한 뒤
-Capability Specification을 갱신하고 이 candidate를 재시도한다.
+Harness Generation(07 §5)이 필요한 syzlang/pseudo-syscall/fixture/tool 확장을 생성·검증하고 staged Capability
+Specification을 만들면, 이 candidate는 그 revision으로 이어 간다.
 
 ## 12. ReachabilityHarness
 
@@ -378,12 +379,12 @@ Candidate execution
     |
     +-- current capability insufficient
             -> HarnessGapIssue
-            -> separate Harness Extension Work
-            -> capability spec update
-            -> candidate retry
+            -> Harness Generation (07 §5, pipeline 안에서 자동)
+            -> staged capability spec
+            -> candidate resume
 ```
 
-Harness Extension Work에서는 syzlang, pseudo-syscall/executor, fixture/tool 같은
-**harness patch**가 가능하다.
+Harness Generation에서는 syzlang, pseudo-syscall/executor, fixture/tool, remote-KCOV 계측 같은
+**harness patch**를 만든다. candidate execution 중인 Planning Agent와 Materializer는 source를 바꾸지 않는다.
 
 Linux kernel vulnerability fix patch는 Crash Report 이후 별도 phase다.

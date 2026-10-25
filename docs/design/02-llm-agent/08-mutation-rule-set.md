@@ -366,6 +366,7 @@ Agent가 고칠 수 있는 입력
 schema상 유효하지만 runtime이 지원하지 않는 기능
     unsupported_capability, requires_state_lineage
         -> HarnessGapIssue(gap_class=mutation_engine)
+        -> Harness Generation (07 §5) -> 저장된 rule set 다시 compile
 ```
 
 Compiler는 live field offset, current original bytes, runtime XID 또는 Nth-message identity를
@@ -480,7 +481,8 @@ client0의 stateid를 client1 요청에 사용
 이전 transaction에서 받은 sessionid / clientid 참조
 ```
 
-Harness Extension Work가 해결된 뒤 Stage 2를 다시 실행한다.
+Harness Generation(`07` §5)이 그 capability를 생성·검증하면 Stage 2를 이어 간다. 생성이 실패하면 job은
+`blocked_harness_gap`에서 기다린다.
 
 ## 16. Q1 baseline 보존
 
