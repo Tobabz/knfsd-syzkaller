@@ -173,6 +173,7 @@ ownerless/background work
 새 async continuation path
 현재 propagation이 없는 callback/workqueue path
 client-side target without remote attribution
+자연 경로가 workqueue에서 도는 경우 (예: lease 만료의 laundromat, 04 §3.2)
 candidate.kernel_commit용 harness build 없음 (remote_kcov.kernel_revision.<commit>)
 ```
 
@@ -237,6 +238,9 @@ validation (Runner, §5.2)
 - 생성 Agent가 쓴 code는 guest와 host 도구에서 실행된다. 그래서 build와 실행은 Runner가 격리된 KVM 환경에서
   하고, 생성 Agent에는 shell과 network 권한을 주지 않는다(`01` §10). 생성 Agent가 쓸 수 있는 것은 staging
   영역의 파일과 검증 요청뿐이다.
+- 생성물의 자극은 `04` §3.2를 따른다. 실행 중에 서버에서 일으키는 행위(서버 관리 인터페이스 쓰기, 서버
+  데몬 정지·종료·재시작, 서버 설정 변경)를 하는 executor·helper·fixture 동작은 만들지 않는다. 자연 경로가
+  귀속되지 않으면 우회하지 않고 그 context의 귀속 계측을 함께 생성한다.
 - vulnerability fix patch는 생성하지 않는다(§6). target kernel code의 동작을 바꾸는 patch는 계측으로 보지 않고
   거부한다.
 
@@ -251,6 +255,7 @@ proposal의 promotion_evidence (KVM)
 새 capability를 쓰는 smoke program과 neutral control
 기존 HCAP capability 회귀 (기존 seed와 lane 경로가 같은 결과)
 remote_kcov_attribution이면: 알려진 target에서 attribution이 성립하고, RemoteKcovSupportBoundary가 그 계측을 기술함
+자극 기준 (04 §3.2): 새 capability의 실행 중 행위가 클라이언트나 네트워크 상대의 행위뿐임
 ```
 
 통과하면 Controller는 staged `hcap_revision`(status `staged`, `04` §1.1)과 build가 바뀌었으면 새
