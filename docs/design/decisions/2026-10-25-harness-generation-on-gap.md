@@ -47,9 +47,9 @@
 
 ## 남은 위험
 
-- 생성 Agent는 격리 workspace에서 파일과 shell 권한을 가진다(2026-10-25 사용자 결정, `07` §5.1). workspace가
-  격리되지 않거나 credential이 들어가면 생성 Agent가 host나 다른 job에 영향을 줄 수 있다. workspace 구현(container
-  또는 VM, 자원 한도, 수명)은 #83에서 정한다. 판정은 Runner가 patch set만 받아 다시 build해 내므로 workspace
+- 생성 Agent는 gap별 git worktree에서 파일과 shell 권한을 가진다(2026-10-25 사용자 결정, `07` §5.1). container나
+  VM 없이 별도 OS 사용자와 secret 없는 환경이 경계다. 그 권한 설정이 틀리면 생성 Agent가 Controller state나
+  credential에 닿을 수 있다. 자원 한도와 worktree 수명은 #83에서 정한다. 판정은 Runner가 patch set만 받아 다시 build해 내므로 workspace
   안의 결과는 staged revision에 쓰이지 않는다.
 - 자동 이식한 계측의 attribution 검증이 놓친 오류는 Q1을 거짓 `REACHED`나 `NOT_REACHED`로 만들 수 있다. 검증
   profile의 구체 내용(어떤 알려진 target으로 확인하는지)은 #83에서 정한다.

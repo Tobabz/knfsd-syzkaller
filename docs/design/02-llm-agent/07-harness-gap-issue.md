@@ -235,13 +235,20 @@ validation (Runner, §5.2)
 - 생성물은 patch set이다: `bundle/` 아래 syzlang, executor, fixture, host spec entry, Proxy/compiler 변경,
   kernel 계측 patch. promoted HCAP과 main branch에는 쓰지 않고 staging 영역(job과 gap key로 이름 붙인 branch나
   artifact)에만 쓴다.
-- 생성 Agent는 파일과 shell 권한을 가진다(2026-10-25 사용자 결정). 설계 문서와 repository를 직접 읽고, staging
-  checkout에서 code를 고치고, build와 test를 스스로 돌려 patch set을 다듬는다. 이 작업은 job과 gap key마다 새로
-  만든 격리 workspace(container나 VM)에서 한다. workspace에는 repository의 staging checkout, pinned toolchain,
-  kernel source가 있고, host의 state, artifact store의 쓰기 권한, publish credential, 다른 job의 workspace는 없다.
-  network 권한은 주지 않는다. promoted HCAP과 main branch는 읽기만 한다.
-- 생성 Agent가 workspace에서 돌린 build와 test 결과는 판정이 아니다. staged revision을 만드는 판정은 Runner가
-  patch set만 받아 새 격리 KVM 환경에서 다시 build하고 §5.2를 실행해 낸다. Agent workspace의 산출물(binary,
+- 생성 Agent는 파일과 shell 권한을 가진다(2026-10-25 사용자 결정). 설계 문서와 repository를 직접 읽고, gap
+  key마다 하나인 git worktree(staging)에서 code를 고치고, build와 test를 스스로 돌려 patch set을 다듬는다.
+  container나 VM은 쓰지 않는다. 지킬 것은 두 가지다.
+  - 판정 근거를 쓰지 못한다. 생성 Agent는 별도 OS 사용자로 돌고, Controller state, artifact store, 다른 gap의
+    worktree에 쓸 수 없다(읽기 전용이거나 접근 불가). promoted HCAP과 main branch는 읽기만 한다.
+  - credential을 보지 못한다. LLM API key, GitHub token 같은 secret이 없는 환경 변수와 파일 권한으로 실행한다.
+  network 권한은 주지 않는다.
+- 구현은 pydantic-ai(2.55.0)의 Workspace API를 쓴다. `LocalWorkspace(worktree, env=...)` capability가 tool에
+  `ctx.workspace`(파일 읽기·쓰기, 명령 실행)를 주며, 명령에는 `PATH`, `HOME`, `LANG`, `LC_*`와 넘긴 `env`만
+  전달하므로 이 process의 secret 환경 변수는 새지 않는다. `LocalWorkspace`는 파일 시스템을 격리하지 않으므로
+  위의 OS 사용자 권한이 그 경계다. 모델에 노출할 file·shell tool은 이 API 위에 직접 정의한다(library가 정해 둔
+  tool은 없다). 사람 확인이 필요한 명령이 생기면 `ApprovalRequiredToolset`으로 묶을 수 있다.
+- 생성 Agent가 worktree에서 돌린 build와 test 결과는 판정이 아니다. staged revision을 만드는 판정은 Runner가
+  patch set만 받아 새 격리 KVM 환경에서 다시 build하고 §5.2를 실행해 낸다. Agent worktree의 산출물(binary,
   log)은 그 판정에 쓰지 않는다.
 - 생성물의 트리거는 `04` §3.2를 따른다. 클라이언트가 유도한 서버 동작은 허용하지만, 실행 중에 harness가 서버를
   직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버 데몬 정지·종료·재시작, 서버 설정 변경)를 하는 executor·helper·fixture 동작은 만들지 않는다. 자연 경로가
