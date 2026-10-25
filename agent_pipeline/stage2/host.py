@@ -1,4 +1,4 @@
-"""Readiness checks and the real host entry point for Stage 2 KVM.
+"""Readiness checks and the real host entry point for Stage 2 VMs (KVM or TCG).
 
 The Stage 2 engine deliberately treats its host command as trusted
 configuration.  Preflight checks that configuration and its immutable
@@ -20,7 +20,6 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
-import stat
 import subprocess
 import sys
 from typing import Callable, Literal
@@ -35,6 +34,8 @@ from ..m1 import M1JudgeProfile
 from ..materializer import (ExecutionHarnessApproval,
                             ExecutionHarnessDescriptor, descriptor_id)
 from ..q2 import Q2JudgeProfile
+from ..qemu_accel import (KVM_API_VERSION, KVM_GET_API_VERSION,  # noqa: F401
+                          AccelError, accel_of, check_kvm)
 from ..registry import HarnessCatalog
 from ..runner.process_supervisor import ProcessLimits
 from ..semantic_promotion import (BuildRegistry,
@@ -116,28 +117,24 @@ def _executable(path: Path | str, *, which: Callable[[str], str | None]
     return found
 
 
-KVM_GET_API_VERSION = 0xAE00
-KVM_API_VERSION = 12
-
-
 def _check_kvm(
     path: Path, *,
     opener: Callable[[Path, int], int] = os.open,
     ioctl: Callable[[int, int], int] = fcntl.ioctl,
     closer: Callable[[int], None] = os.close,
 ) -> str:
-    info = path.stat()
-    if not stat.S_ISCHR(info.st_mode):
-        raise PreflightError(f"not a character device: {path}")
-    fd = opener(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
     try:
-        version = ioctl(fd, KVM_GET_API_VERSION)
-    finally:
-        closer(fd)
-    if version != KVM_API_VERSION:
-        raise PreflightError(
-            f"{path} reported KVM API {version}, expected {KVM_API_VERSION}")
-    return f"{path} opened successfully with KVM API {version}"
+        return check_kvm(path, opener=opener, ioctl=ioctl, closer=closer)
+    except AccelError as exc:
+        raise PreflightError(str(exc)) from exc
+
+
+def _check_accel(collector: CollectorConfig, kvm_path: Path) -> str:
+    """KVM must work when the collector runs under it; TCG needs nothing."""
+    if collector.accel == "kvm":
+        return _check_kvm(kvm_path)
+    return (f"collector runs under TCG (exec slowdown "
+            f"{collector.exec_slowdown}); KVM is not used")
 
 
 def _check_command(config, *, which: Callable[[str], str | None]) -> str:
@@ -173,7 +170,8 @@ def _check_stage2_timeout(config, collector: CollectorConfig,
                           policies: tuple[JobPolicy, ...]) -> str:
     """Ensure the outer supervisor cannot preempt an inner step watchdog."""
     try:
-        slowdown = int(_command_option(config.argv, "--exec-slowdown", "1"))
+        slowdown = int(_command_option(config.argv, "--exec-slowdown",
+                                       str(collector.exec_slowdown)))
         campaign = float(_command_option(
             config.argv, "--campaign-timeout", "1800"))
         manager_stop = float(_command_option(
@@ -565,8 +563,9 @@ def _check_manager(
     if lane_tokens != [lane_digest]:
         raise PreflightError("manager lane script differs from koov.lane_sha256")
     qemu_args = str(vm.get("qemu_args", ""))
-    if "-enable-kvm" not in qemu_args.split():
-        raise PreflightError("manager QEMU args lack -enable-kvm")
+    if accel_of(qemu_args) != collector.accel:
+        raise PreflightError(
+            f"manager QEMU args do not select the collector's {collector.accel}")
     journal_names = {
         part.removeprefix("name=")
         for token in qemu_args.split()
@@ -615,7 +614,7 @@ def preflight(
         return PreflightReport(ready=False, checks=tuple(checks.items))
     checks.add("collector_config", "pass", f"loaded {collector_file}")
 
-    checks.attempt("kvm", lambda: _check_kvm(kvm_path))
+    checks.attempt("accel", lambda: _check_accel(collector, kvm_path))
     checks.attempt("stage2_command",
                    lambda: _check_command(stage2, which=which))
     checks.attempt("stage2_timeout",
@@ -731,8 +730,9 @@ def main(argv: list[str] | None = None) -> int:
     step.add_argument("--campaign-executions", type=int, default=128)
     step.add_argument("--campaign-timeout", type=float, default=1800)
     step.add_argument("--manager-stop-timeout", type=float, default=45)
-    step.add_argument("--exec-slowdown", type=int, default=1,
-                      help="syz-execprog slowdown for direct gate/replay VMs")
+    step.add_argument("--exec-slowdown", type=int, default=None,
+                      help="syz-execprog slowdown for direct gate/replay VMs "
+                           "(default: the collector's)")
     step.add_argument("input", type=Path)
     step.add_argument("output", type=Path)
     args = parser.parse_args(argv)

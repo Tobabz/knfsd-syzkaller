@@ -7,6 +7,7 @@ import signal
 import struct
 import time
 import zlib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -196,9 +197,14 @@ def test_journal_lane_count_uses_complete_fixture_topology():
             {"qemu_args": ("-enable-kvm "
                            "-device virtserialport,name=nfsp-journal-0 "
                            "-device virtserialport,name=nfsp-journal-0")}, 1)
-    with pytest.raises(Stage2StepError, match="enable KVM"):
+    with pytest.raises(Stage2StepError, match="collector's kvm"):
         _journal_lane_count(
             {"qemu_args": "-device virtserialport,name=nfsp-journal-0"}, 1)
+    tcg = {"qemu_args": ("-accel tcg,thread=multi -cpu max "
+                         "-device virtserialport,name=nfsp-journal-0")}
+    assert _journal_lane_count(tcg, 1, accel="tcg") == 1
+    with pytest.raises(Stage2StepError, match="collector's kvm"):
+        _journal_lane_count(tcg, 1)
 
 
 def test_manager_cmdline_is_bound_to_harness_selection():
@@ -463,3 +469,7 @@ def test_direct_qemu_appends_trusted_journal_arguments(tmp_path):
     guest.port = 2222
     argv = guest.qemu_argv()
     assert argv[-2:] == ["-device", "test-device"]
+    assert argv[1:4] == ["-enable-kvm", "-cpu", "host"]
+    guest.config = replace(config, accel="tcg")
+    assert guest.qemu_argv()[1:5] == [
+        "-accel", "tcg,thread=multi", "-cpu", "max"]

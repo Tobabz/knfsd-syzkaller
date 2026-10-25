@@ -3,11 +3,15 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+from agent_pipeline import qemu_accel  # noqa: E402  (standard library only)
 
 PROFILE_VERSIONS = {
     "knfsd-v3": "3",
@@ -156,6 +160,11 @@ def main():
         "--state-dir", type=Path,
         help=("persistent campaign state directory; sets config.workdir to "
               "<state-dir>/workdir and stores the frozen lane template there"))
+    parser.add_argument(
+        "--accel", choices=("auto", "kvm", "tcg"),
+        default=os.environ.get(qemu_accel.ENV_OVERRIDE) or "auto",
+        help="QEMU accelerator (auto: KVM when /dev/kvm works, else TCG; "
+        "syz-manager scales its timeouts for TCG itself)")
     args = parser.parse_args()
     profile = args.profile
     if args.version or args.minor:
@@ -233,8 +242,11 @@ def main():
     # shared base image never takes guest writes (and syz-manager's
     # image-integrity guard holds).
     disk_snapshot = "" if vm.get("snapshot") else " -snapshot"
+    accel = qemu_accel.resolve(args.accel)
+    accel_args = ("-enable-kvm -cpu host,migratable=off" if accel == "kvm"
+                  else " ".join(qemu_accel.qemu_args(accel)))
     vm["qemu_args"] = (
-        "-enable-kvm -cpu host,migratable=off" + disk_snapshot + " "
+        accel_args + disk_snapshot + " "
         "-fsdev local,id=koov_lane,path={{TEMPLATE}},security_model=none,readonly=on "
         "-device virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane"
     )

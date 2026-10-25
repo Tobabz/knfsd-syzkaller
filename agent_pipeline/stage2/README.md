@@ -91,7 +91,7 @@ judged REPLAY_INVALID instead of retried.
            "agent_pipeline.stage2.host", "step", "--manager",
            "/var/lib/knfsd/stage2/manager.json", "--collector",
            "/var/lib/knfsd/stage1/collector.json",
-           "--campaign-executions", "128", "--exec-slowdown", "1",
+           "--campaign-executions", "128",
            "{input}", "{output}"],
   "cwd": "/var/lib/knfsd/stage2",
   "resource_key": "host-a/kvm",
@@ -110,9 +110,12 @@ The step command limits one syz-manager invocation to 128 completed programs
 by default so its generation artifacts fit the 255-artifact segment bound.
 The Controller starts further campaign tasks until policy routes the job.
 `--exec-slowdown` is the bounded syz-execprog slowdown for direct gate and
-replay guests. Keep the default unless the durable host journal's measured
+replay guests. Left out, it is the collector's `exec_slowdown`: 1 under KVM,
+10 under TCG. Override it only when the durable host journal's measured
 fsync latency requires a larger executor timeout; record any override in the
-trusted Stage 2 argv. It does not alter syz-manager campaign timeouts.
+trusted Stage 2 argv. It does not alter syz-manager campaign timeouts;
+syz-manager raises its own slowdown when its QEMU arguments contain
+`-accel tcg`.
 
 `JobPolicy.campaign_mode` is `none` by default: a reached job waits in
 `s1_reached(evidence_only)` and an operator starts Stage 2
@@ -154,8 +157,9 @@ python -m agent_pipeline.stage2.host preflight \
   --manager stage2-manager.json
 ```
 
-The check does not boot a VM or change pipeline state. It verifies access to
-`/dev/kvm`, QEMU/SSH/SCP, the configured host command and its input/output
+The check does not boot a VM or change pipeline state. It verifies the
+collector's accelerator (`/dev/kvm` opens with the expected API when the
+collector runs under KVM; nothing when it runs under TCG), QEMU/SSH/SCP, the configured host command and its input/output
 placeholders, every pinned harness file, the three judge profiles, each
 binding's approved HCAP and promoted semantic subset, and that the Compiler
 and replay Proxy report the promoted build. The required syz-manager config
@@ -163,7 +167,8 @@ must be an explicit Stage 2 command argument. Its kernel, image, lane script
 and syzkaller binaries must match the approved harness pins; its SSH key and
 QEMU must match the collector. It also requires remote coverage, program
 snapshot mode disabled, a crash-context window at least as large as
-`crash_window_bound`, one KVM target-mode VM, the exact approved base kernel
+`crash_window_bound`, one target-mode VM whose QEMU arguments select the
+collector's accelerator, the exact approved base kernel
 command line plus `koov.*` fixture arguments that boot one of the
 descriptor's runtime selections (its `koov.nfs_version` or
 `koov.nfs_fixture`, its `koov.nfs_trace`; the Stage 1-only `nlm-knfsd`

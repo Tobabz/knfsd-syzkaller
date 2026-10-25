@@ -27,6 +27,20 @@ from pathlib import Path
 
 REPO = Path(os.environ.get("REPO_ROOT", Path(__file__).resolve().parents[2]))
 
+# KVM when the host has it, TCG (software CPU emulation) otherwise; mirrors
+# agent_pipeline/qemu_accel.py, which this standalone script cannot import.
+KVM_DEVICE = "/dev/kvm"
+TCG_SLOWDOWN = 10
+QEMU_ACCEL_ARGS = {"kvm": ["-enable-kvm", "-cpu", "host"],
+                   "tcg": ["-accel", "tcg,thread=multi", "-cpu", "max"]}
+
+
+def resolve_accel(choice):
+    if choice != "auto":
+        return choice
+    return "kvm" if os.access(KVM_DEVICE, os.R_OK | os.W_OK) else "tcg"
+
+
 # An SSH key/auth rejection never heals by waiting for the guest.
 SSH_AUTH_MARKERS = ("Permission denied", "Load key",
                     "Too many authentication failures")
@@ -82,7 +96,7 @@ class VM:
         self.log_files += [self.serial_log, qemu_log_path]
         self.last_ssh_error = ""
         drive = "file=%s,format=qcow2,if=ide" % self.args.output
-        cmd = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
+        cmd = ["qemu-system-x86_64", *QEMU_ACCEL_ARGS[self.args.accel],
                "-m", str(self.args.memory), "-smp", str(self.args.cpus),
                "-display", "none", "-serial", "file:%s" % self.serial_log,
                "-no-reboot"]
@@ -101,7 +115,8 @@ class VM:
         self.process = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=self.qemu_log,
             stderr=subprocess.STDOUT)
-        deadline = time.monotonic() + self.args.boot_timeout
+        deadline = (time.monotonic()
+                    + self.args.boot_timeout * self.args.slowdown)
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError("QEMU exited before SSH became ready\n%s"
@@ -120,7 +135,8 @@ class VM:
 
     def guest(self, command, timeout=60):
         result = subprocess.run([*self.ssh, command], capture_output=True,
-                                text=True, timeout=timeout)
+                                text=True,
+                                timeout=timeout * self.args.slowdown)
         if result.returncode:
             raise RuntimeError("guest command failed rc=%d: %s\n%s" % (
                 result.returncode, command, result.stderr[-2000:]))
@@ -168,9 +184,14 @@ def parse_args(argv=None):
                         default=REPO / "bundle" / "lane" / "fixture.service")
     parser.add_argument("--cpus", type=int, default=4)
     parser.add_argument("--memory", type=int, default=4096)
-    parser.add_argument("--boot-timeout", type=int, default=240)
+    parser.add_argument("--boot-timeout", type=int, default=240,
+                        help="KVM-speed seconds; scaled under TCG")
+    parser.add_argument("--accel", choices=("auto", "kvm", "tcg"),
+                        default=os.environ.get("KOOV_QEMU_ACCEL") or "auto")
     args = parser.parse_args(argv)
     args.version = args.version or "4." + args.minor
+    args.accel = resolve_accel(args.accel)
+    args.slowdown = TCG_SLOWDOWN if args.accel == "tcg" else 1
     for field in ("base_image", "kernel", "ssh_key", "deps_tar",
                   "lane_script", "boot_fixture", "service"):
         path = getattr(args, field).resolve()
@@ -188,6 +209,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    print("qemu accelerator: %s" % args.accel, flush=True)
     base_sha = sha256(args.base_image)
     print("base %s sha256=%s" % (args.base_image, base_sha), flush=True)
     print("converting to %s" % args.output, flush=True)
@@ -218,7 +240,7 @@ def main(argv=None):
             timeout=180)
         vm.guest("systemctl poweroff", timeout=10)
         try:
-            vm.process.wait(timeout=90)
+            vm.process.wait(timeout=90 * args.slowdown)
         except subprocess.TimeoutExpired:
             raise RuntimeError("guest did not power off cleanly")
         if vm.process.returncode != 0:
@@ -248,7 +270,7 @@ def main(argv=None):
         print("lanes: %s" % fixture["lane_count"], flush=True)
         vm.guest("systemctl poweroff", timeout=10)
         try:
-            vm.process.wait(timeout=90)
+            vm.process.wait(timeout=90 * args.slowdown)
         except subprocess.TimeoutExpired:
             raise RuntimeError("verification guest did not power off")
         vm.process = None
