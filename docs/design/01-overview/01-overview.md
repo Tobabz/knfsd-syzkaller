@@ -194,6 +194,11 @@ KCSAN 보고는 반드시 커널 중단을 뜻하지 않는다. 결과를 해석
    manager는 proc마다 lane 하나를 동시에 쓴다(`procs` = lane 수, 최상위 `snapshot` 끔).
 5. **sanitizer는 대상 서버가 실행되는 곳에 둔다.** knfsd는 커널 계측(KASAN/KCSAN)이다.
 6. **실패는 조용히 하지 않는다.** 정지한 lane은 fail-closed로 처리한다(syzkaller 0008, 0013).
+7. **guest는 VM에서 돌리고, KVM은 가속 수단이다.** patch한 커널을 부팅하고 crash를 호스트와 분리하려면 VM이
+   필요하다. 가속은 `/dev/kvm`이 쓰이면 KVM, 아니면 TCG(소프트웨어 에뮬레이션)다
+   (`agent_pipeline/qemu_accel.py`). TCG에서는 generator가 boot·fixture·engine 시간과 execprog slowdown을 10배로
+   늘리고, syz-manager는 `-accel tcg`를 보고 자기 slowdown을 올린다. TCG는 느리고 경쟁 타이밍이 달라지므로 KCSAN
+   결과와 시간 의존 시나리오는 KVM 결과와 같은 것으로 보지 않는다.
 
 ## 설계 근거
 

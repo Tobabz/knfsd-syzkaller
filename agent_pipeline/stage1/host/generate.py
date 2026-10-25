@@ -55,6 +55,8 @@ from ...materializer import (ExecutionHarnessApproval,
                              _runtime_key, descriptor_id)
 from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
                    RemoteKcovSupportBoundary)
+from ...qemu_accel import Accel, AccelChoice, resolve, slowdown
+from ...qemu_accel import qemu_args as accel_qemu_args
 from ...registry import HarnessCatalog, HarnessRegistration
 from ..config import EngineConfig, SlotsConfig, Stage1Config
 from .collector import CollectorConfig, guest_cmdline
@@ -97,6 +99,11 @@ class EngineSpec(_Spec):
 
 class CollectorSpec(_Spec):
     qemu: str = "qemu-system-x86_64"
+    #: ``auto`` uses KVM when the generating host can open ``/dev/kvm``
+    #: and TCG otherwise.  The timeouts here are KVM-speed budgets: under
+    #: TCG the boot, fixture and engine budgets and the execprog slowdown
+    #: are scaled by ``qemu_accel.TCG_SLOWDOWN``.
+    accel: AccelChoice = "auto"
     memory_mb: int = 4096
     cpus: int = 4
     boot_timeout_s: float = 300
@@ -546,7 +553,8 @@ def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
     return given
 
 
-def _stage2_manager(spec: HostSpec, *, descriptor: ExecutionHarnessDescriptor,
+def _stage2_manager(spec: HostSpec, *, accel: Accel,
+                    descriptor: ExecutionHarnessDescriptor,
                     selection: RuntimeSelection, calls: tuple[str, ...],
                     files: dict[str, Path], template: Path, lane_sha256: str,
                     syzkaller: Path, ssh_key: Path, state: Path) -> dict:
@@ -562,7 +570,7 @@ def _stage2_manager(spec: HostSpec, *, descriptor: ExecutionHarnessDescriptor,
         raise GenerationError("state_dir cannot contain whitespace or commas "
                               "(it is in the manager's QEMU arguments)")
     qemu_args = [
-        "-enable-kvm", "-cpu", "host",
+        *accel_qemu_args(accel),
         "-fsdev", ("local,id=koov_lane,path={{TEMPLATE}},"
                    "security_model=none,readonly=on"),
         "-device", "virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane",
@@ -932,12 +940,17 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     else:
         collector_files = {**common, **variant_files[variants[0].sanitizer]}
         per_variant = {}
+    accel = resolve(spec.collector.accel)
+    scale = slowdown(accel)
+    timings = spec.collector.model_dump(exclude={"accel"})
+    timings["boot_timeout_s"] *= scale
+    timings["fixture_timeout_s"] *= scale
     collector = CollectorConfig(
         artifact_root=root, ssh_key=ssh_key, pin_cache=state / "pins.json",
         files={n: p.resolve() for n, p in collector_files.items()},
         variant_files={s: {n: p.resolve() for n, p in files.items()}
                        for s, files in per_variant.items()},
-        **spec.collector.model_dump())
+        accel=accel, exec_slowdown=scale, **timings)
     collector_path.write_text(collector.model_dump_json(indent=2) + "\n")
     config = Stage1Config(
         state_dir=state, artifact_root=root, kernel_repo=kernel_repo,
@@ -957,7 +970,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                            "HOME": os.environ.get("HOME", str(state))},
             resource_key=spec.engine.resource_key,
             collector_id="stage1-host-collector",
-            timeout_s=spec.engine.timeout_s,
+            timeout_s=spec.engine.timeout_s * scale,
             max_output_bytes=spec.engine.max_output_bytes),
         slots=SlotsConfig(
             vm_cpus=spec.collector.cpus,
@@ -979,7 +992,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             frozen.chmod(0o444)
         for v in variants:
             manager = _stage2_manager(
-                spec, descriptor=descriptors[v.sanitizer],
+                spec, accel=accel, descriptor=descriptors[v.sanitizer],
                 selection=stage2_selection, calls=stage2_calls,
                 files={n: p.resolve() for n, p in
                        {**common, **variant_files[v.sanitizer]}.items()},

@@ -1469,6 +1469,32 @@ def test_generate_writes_a_stage2_manager_the_preflight_accepts(host):
 
 
 @needs_gcc
+@pytest.mark.parametrize("accel", ["kvm", "tcg"])
+def test_generate_runs_guests_under_the_chosen_accelerator(host, accel):
+    # KVM is a speed choice: a TCG host scales the KVM-speed budgets.
+    spec = json.loads(host.spec.read_text())
+    spec["collector"] = {"accel": accel}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    _with_stage2(host)
+    result = generate(host.spec)
+    collector = CollectorConfig.load(result.collector_config)
+    config = Stage1Config.load(result.stage1_config)
+    scale = 1 if accel == "kvm" else 10
+    assert collector.accel == accel
+    assert collector.exec_slowdown == scale
+    assert collector.boot_timeout_s == 300 * scale
+    assert collector.fixture_timeout_s == 180 * scale
+    assert collector.exec_timeout_s == 600
+    assert config.engine.timeout_s == 1800 * scale
+    manager = json.loads(result.stage2_managers["kasan"].read_text())
+    head = manager["vm"]["qemu_args"].split()[:4]
+    assert head == (["-enable-kvm", "-cpu", "host", "-fsdev"]
+                    if accel == "kvm" else
+                    ["-accel", "tcg,thread=multi", "-cpu", "max"])
+    _preflight_manager(host, result, result.stage2_managers["kasan"])
+
+
+@needs_gcc
 def test_stage2_manager_calls_include_the_approved_calls(host):
     _with_stage2(host, enable_syscalls=["close", "write$known"])
     with pytest.raises(GenerationError,
