@@ -267,8 +267,8 @@ proposal의 promotion_evidence (VM 실행, 기본 KVM)
 새 capability를 쓰는 smoke program과 neutral control
 기존 HCAP capability 회귀 (기존 seed와 lane 경로가 같은 결과)
 remote_kcov_attribution이면: 알려진 target에서 attribution이 성립하고, RemoteKcovSupportBoundary가 그 계측을 기술함
-mutation_engine이면: 생성한 semantic subset이 crash survival을 뺀 M7 항목(03-nfs-proxy/06 §30)을 통과하고, 그
-    registry digest가 crash_survival pending 표시와 함께 staged revision의 HCAP-10 authority_refs에 들어감
+mutation_engine이면: 생성한 semantic subset이 M7 1단계(staged pin, 03-nfs-proxy/06 §30)를 통과해 그 registry
+    digest가 crash survival pending 표시와 함께 staged revision의 HCAP-10 authority_refs에 들어감
 트리거 기준 (04 §3.2): 새 capability의 실행 중 트리거가 NFS 클라이언트의 행위뿐이고 harness가 서버를 직접 조작하지 않음
 ```
 
@@ -288,11 +288,9 @@ staged harness로 진행 중인 job은 그대로 진행하고, promotion이 끝�
 staged revision으로 만든 결과는 거부 사실과 함께 남기고, 해당 job은 `09` §5의 binding 변경 규칙으로 다시
 gap 경로에 들어간다.
 
-mutation_engine 생성물은 crash survival 증거가 생길 때까지 promotion하지 않는다. 증거는 그 subset을 쓴 campaign에서
-자연히 생긴 Q2 crash의 sealed evidence가 crash cut 위치의 MutationDelta를 담고, 그 delta로 한 replay가
-REPLAY_EQUIVALENT인 것이다. 그 전까지 staged revision으로 job은 계속 진행하고 issue는 `resolved`가 되지 않는다.
-자연 crash에서 delta가 남지 않았으면 그 crash는 replay로 재현할 수 없다는 사실과 함께 기록하고, 그 subset은
-promotion에서 거부한다.
+mutation_engine 생성물은 M7 2단계(자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를 통과할 때까지
+promotion하지 않는다. 사람이 구현한 subset과 같은 기준이다. 그 전까지 staged revision으로 job은 계속 진행하고
+issue는 `resolved`가 되지 않는다.
 
 ## 6. Patch 종류의 구분
 

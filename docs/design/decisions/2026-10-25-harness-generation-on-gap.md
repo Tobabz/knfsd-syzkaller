@@ -34,10 +34,11 @@
 4. **promotion은 사람이 하되 job을 막지 않는다.** 검증을 통과한 생성물은 staged HCAP revision이 된다. 공유 HCAP으로
    올리는 promotion은 사람이 검토하고(`04` §1.1, `07` §5.3), 그동안 job은 staged revision으로 진행한다. 그 위의 모든
    verdict와 crash report는 staged revision과 patch set digest를 기록한다.
-5. **검증에 인위적 crash를 쓰지 않는다.** (사용자 결정, 2026-10-25) mutation_engine 생성물의 M7 crash survival은
+5. **검증에 인위적 crash를 쓰지 않는다.** (사용자 결정, 2026-10-25) semantic subset의 M7 crash survival은
    campaign에서 자연히 생긴 crash로만 확인한다. guest를 일부러 crash시키는 것(sysrq panic, NMI, 강제 reset)은
-   인위적 동작이므로 쓰지 않는다. 그 확인이 생길 때까지 subset은 crash survival pending으로 staged revision에만 pin되고
-   공유 HCAP promotion은 미룬다(`07` §5.2, §5.3).
+   인위적 동작이므로 쓰지 않는다. 그 확인이 생길 때까지 subset은 crash survival pending으로 staged revision에만
+   pin되고 공유 HCAP promotion은 미룬다(`03-nfs-proxy/06` §30, `07` §5.2, §5.3). subset을 사람이 구현했는지
+   생성했는지는 구분하지 않는다.
 6. **`blocked_harness_gap`은 fallback이다.** 생성 Agent가 `infeasible`을 내거나 `harness_generation` budget을 다
    쓰면 job은 기존처럼 issue를 기다린다. operator는 `retry_generation`으로 생성을 다시 시작할 수 있다.
 

@@ -1070,9 +1070,18 @@ state value, v4.1+ backchannel correlation, preserve/raw behavior, semantic Delt
 dynamic-original semantic replay를 포함해야 한다. 모든 subset은 semantic Delta crash survival과
 semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능에 해당할 때 통과한다.
 crash survival 증거는 campaign에서 자연히 생긴 guest crash로만 얻는다. 검증을 위해 guest를 일부러
-crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지). 그런 crash가 아직 없으면 그 subset은
-promotion하지 않는다. Harness Generation이 만든 subset은 그동안 crash survival pending으로 staged revision에만
-pin된다(`../02-llm-agent/07-harness-gap-issue.md` §5.2, §5.3).
+crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지).
+
+그래서 M7은 두 단계다. subset을 누가 구현했는지(사람, Harness Generation)는 구분하지 않는다.
+
+1. staged pin: crash survival을 뺀 항목을 통과하면 registry digest가 crash survival pending 표시와 함께 staged
+   `hcap_revision`의 HCAP-10에 pin된다. 그 revision을 binding한 job은 이 subset을 쓴다.
+2. promotion: 그 subset을 쓴 campaign에서 자연히 생긴 Q2 crash의 sealed evidence가 crash cut 위치의 MutationDelta를
+   담고, 그 delta로 한 replay가 REPLAY_EQUIVALENT이면 공유 HCAP으로 promotion할 수 있다. 그 전에는 promotion하지
+   않는다. 자연 crash에서 delta가 남지 않았으면 그 crash는 replay로 재현할 수 없다는 사실과 함께 기록하고 subset은
+   promotion에서 거부한다.
+
+Harness Generation 쪽 적용은 `../02-llm-agent/07-harness-gap-issue.md` §5.2, §5.3이 따른다.
 
 Validation evidence를 HCAP `evidence_refs`에 추가하고 subset의 registry digest와 scope를 promotion한 뒤에만
 Harness Capability Specification을 갱신한다(§21).
