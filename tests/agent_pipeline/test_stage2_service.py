@@ -100,7 +100,7 @@ def segment(n, vm, host, files):
 
 def journal(name, vm, generations):
     files = []
-    for path in write_journal(out / ("j-" + name), name, vm=vm, lane=0,
+    for path in write_journal(out / ("j-" + vm), name, vm=vm, lane=0,
                               candidate_id=candidate, rules=rules,
                               generations=generations):
         files.append(("journal/" + path.name, JOURNAL_TYPE, path.read_bytes()))
@@ -139,7 +139,8 @@ def q1(vm):
 D1, D2, D5 = program_digest(1), program_digest(2), program_digest(5)
 mode = os.environ.get("TEST_MODE", "")
 if step == "gate":
-    for n in range(execution["gate_repetitions"] - (mode == "short_gate")):
+    for n in range(execution["gate_repetitions"] - (mode == "short_gate")
+                   + (mode == "extra_gate")):
         vm = f"vm-gate-{n}"
         neutral = PublishedCoverage(correlation=correlation(vm, 1),
                                     pcs=(8192,))
@@ -385,6 +386,70 @@ def test_a_gate_short_of_its_repetitions_is_a_runtime_failure(
                             for r in runs)
         # Each short gate still sealed the repetition it finished.
         assert all(len(r.status.bundles) == 1 for r in runs)
+
+
+def test_a_gate_past_its_repetitions_seals_no_extra_bundle(tmp_path, build):
+    with make_stage2_service(tmp_path, build, mode="extra_gate",
+                             gate_repetitions=2) as service:
+        job = run_job(service, build)
+        assert job.state is JobState.BLOCKED_OPERATOR
+        runs = [r for r in service.worker_runs
+                if r.status.state == "ended_unsealed"]
+        assert runs and all(r.status.reason == "capture_failed"
+                            and len(r.status.bundles) == 2 for r in runs), \
+            [(r.status.reason, len(r.status.bundles)) for r in runs]
+
+
+def test_published_segments_judge_around_unusable_parts(tmp_path, build,
+                                                         monkeypatch):
+    from agent_pipeline.replay_runner import PlanError
+    from agent_pipeline.stage2 import judge as judge_module
+    from agent_pipeline.stage2.evidence import (HOST_FACTS_ID,
+                                                HOST_FACTS_TYPE,
+                                                Stage2HostFacts)
+    from agent_pipeline.stage2.judge import ArtifactStage2Judge
+
+    with make_stage2_service(tmp_path, build) as service:
+        job = run_job(service, build)
+        assert job.state is JobState.CRASH_REVIEW
+        published = service.stage2_judge.snapshot
+        executions = dict(published.executions)
+        campaign = job.triage[0].bundle_ref
+        args = dict(candidate_id=job.candidate.candidate_id,
+                    compiled=job.compiled)
+
+        # The replay was planned, and is judged, with the bound it sealed.
+        replay = next(x for x in executions.values() if x.step == "replay")
+        bundle = service.evidence.verify(
+            replay.bundle_ref, expected_correlation=replay.correlation)
+        facts = Stage2HostFacts.model_validate_json(
+            bundle.get(HOST_FACTS_ID, expected_type=HOST_FACTS_TYPE))
+        assert facts.window_bound == 4
+
+        # A crash log with no usable window costs only the window.
+        def no_window(*a, **k):
+            raise PlanError("crash log has no last executing programs")
+        with monkeypatch.context() as m:
+            m.setattr(judge_module, "parse_crash_context", no_window)
+            segment = published.judge_campaign(campaign, **args)
+        assert segment.crash_window_applied == ()
+        assert segment.reached_generations == 1
+
+        # A journal that cannot be read keeps the host's execution count.
+        def torn(*a, **k):
+            raise ValueError("torn journal")
+        with monkeypatch.context() as m:
+            m.setattr(judge_module, "open_journal", torn)
+            segment = published.judge_campaign(campaign, **args)
+        assert segment.reached_generations == 0
+        assert segment.executions == 100
+
+        # Published authority the judge has not installed is installed on
+        # the next pass, without publishing anything again.
+        service.stage2_judge.install(ArtifactStage2Judge(
+            service.artifacts, executions={}))
+        assert service.stage2_publisher.publish_ready() == []
+        assert dict(service.stage2_judge.snapshot.executions) == executions
 
 
 def test_without_a_stage2_backend_the_rule_set_waits_for_an_operator(
