@@ -14,7 +14,7 @@ Run the read-only check with::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import os
@@ -29,7 +29,8 @@ from pydantic import Field
 from ..artifacts import ArtifactStore
 from ..contracts import CampaignMode, JobPolicy, Record
 from ..data import load_record, parse_json
-from ..hcap import ArtifactHcapChecker
+from ..admission import CallAdmissionProfile
+from ..hcap import ArtifactHcapChecker, HcapCatalog, layout_refusals
 from ..m1 import M1JudgeProfile
 from ..materializer import (ExecutionHarnessApproval,
                             ExecutionHarnessDescriptor, descriptor_id)
@@ -74,6 +75,9 @@ class _ApprovedHarness:
     #: The koov fixture arguments of the descriptor's allowed runtime
     #: selections, as (selection argument, koov.nfs_trace value) pairs.
     fixtures: frozenset[tuple[str, str]] = frozenset()
+    #: Each bound HCAP revision with its call admission profile; a manager
+    #: must stay inside their capabilities' validated layouts (#99).
+    authorities: tuple[tuple[HcapCatalog, CallAdmissionProfile], ...] = ()
 
     def pin(self, name: str) -> HostFilePin:
         try:
@@ -275,6 +279,7 @@ def _check_harnesses(
     promoted: list[PromotedSemanticCapabilityRegistry] = []
     harnesses: list[_ApprovedHarness] = []
     checked_descriptors: set[str] = set()
+    authorities: dict[str, list[tuple[HcapCatalog, CallAdmissionProfile]]] = {}
     for registration in catalog.registrations:
         binding = registration.binding
         approval = by_descriptor.get(binding.execution_harness_id)
@@ -293,6 +298,16 @@ def _check_harnesses(
             raise PreflightError(
                 f"HCAP {binding.hcap_revision[:12]} has no promoted semantic subset")
         promoted.append(registry)
+        profiles = [ref.artifact_ref for ref in (
+            *hcap.authority_refs,
+            *(ref for cap in hcap.capabilities for ref in cap.authority_refs))
+            if ref.kind == "CallAdmissionProfile"]
+        if len(set(profiles)) != 1:
+            raise PreflightError(
+                f"HCAP {binding.hcap_revision[:12]} pins no single call "
+                "admission profile")
+        authorities.setdefault(binding.execution_harness_id, []).append(
+            (hcap, load_record(store, profiles[0], CallAdmissionProfile)))
         if binding.execution_harness_id not in checked_descriptors:
             _verify_pins_read_only(collector, descriptor)
             harnesses.append(_approved_harness(
@@ -302,7 +317,31 @@ def _check_harnesses(
         if "nokaslr" not in tokens or "nfs.localio_enabled=N" not in tokens:
             raise PreflightError(
                 "Stage 2 harness requires nokaslr and nfs.localio_enabled=N")
-    return tuple(promoted), tuple(harnesses)
+    return tuple(promoted), tuple(
+        replace(harness, authorities=tuple(authorities[harness.harness_id]))
+        for harness in harnesses)
+
+
+def _check_layout(value: dict, procs: int,
+                  harnesses: tuple[_ApprovedHarness, ...]) -> None:
+    """The manager's procs and calls stay inside the validated layouts of
+    every bound HCAP's capabilities (#99)."""
+    calls = value.get("enable_syscalls")
+    if calls is not None and (not isinstance(calls, list) or not all(
+            isinstance(call, str) for call in calls)):
+        raise PreflightError("manager enable_syscalls must be a list of calls")
+    for harness in harnesses:
+        for hcap, profile in harness.authorities:
+            # Without enable_syscalls syz-manager enables every call.
+            enabled = (calls if calls is not None
+                       else [entry.call for entry in profile.entries])
+            refusals = layout_refusals(
+                hcap, profile.entries, enabled_calls=enabled,
+                runtime_features=("remote_cover",), procs=procs)
+            if refusals:
+                raise PreflightError(
+                    f"manager at {procs} proc(s) exceeds a validated "
+                    f"layout: {refusals[0]}")
 
 
 def _check_runtime(
@@ -547,6 +586,7 @@ def _check_manager(
     if type(procs) is not int or not 1 <= procs <= 64:
         raise PreflightError("target-mode campaign requires procs in [1, 64]")
     harnesses = _manager_harnesses(value, vm, harnesses)
+    _check_layout(value, procs, harnesses)
     cmdline = str(vm.get("cmdline", "")).split()
     _check_approved_command_line(cmdline, harnesses)
     template_value = value.get("workdir_template")

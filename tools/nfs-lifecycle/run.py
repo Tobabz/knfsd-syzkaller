@@ -108,6 +108,9 @@ LIFECYCLE_RE = re.compile(
     r"clientid=0x([0-9a-fA-F]{16}) minor=1 sessions=([1-9][0-9]*)$",
     re.MULTILINE)
 SHAREABLE_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
+#: Every campaign runs syz-execprog -procs=1 (start_admin_exec): one proc,
+#: lane 0.  The evidence records it (#99).
+EXECPROG_LAYOUT = {"procs": 1, "lanes": [0]}
 COURTESY_REQUIRED_INTERFACES = frozenset((
     "remote_cover",
     "syz_nfs_lane_link$heal_client0",
@@ -992,6 +995,7 @@ def hcap13_evidence(context, guest_identity, probe_digests, cycles,
         "campaign_result_sha256": hashlib.sha256(result_bytes).hexdigest(),
         "guest_lane_script_sha256": guest_identity["guest_lane_script_sha256"],
         "guest_nfs_proxy_sha256": guest_identity["guest_nfs_proxy_sha256"],
+        "layout": EXECPROG_LAYOUT,
         "runs": runs,
         "generation_contract": {
             "generation_begin_each": 1,
@@ -1102,6 +1106,7 @@ def hcap11_evidence(context, guest_identity, probe_digests, cycles,
         "campaign_result_sha256": hashlib.sha256(result_bytes).hexdigest(),
         "guest_lane_script_sha256": guest_identity["guest_lane_script_sha256"],
         "guest_nfs_proxy_sha256": guest_identity["guest_nfs_proxy_sha256"],
+        "layout": EXECPROG_LAYOUT,
         "nfsv4_lease_time_s": HCAP11_LEASE_TIME_S,
         "partition_hold_s": HCAP11_PARTITION_HOLD_S,
         "runs": runs,

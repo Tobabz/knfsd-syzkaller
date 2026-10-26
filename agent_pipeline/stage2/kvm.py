@@ -30,9 +30,11 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..admission import CallAdmissionProfile
 from ..artifacts import ArtifactStore
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ExecutionCorrelation as EvidenceCorrelation
+from ..hcap import HcapCatalog, layout_refusals
 from ..journal_sink import (CHANNEL_CLOSE_TIMEOUT_S, SEGMENT_SUFFIX,
                             ChannelIdentity, ChannelServer, HostJournal)
 from ..materializer import (ExecutionHarnessDescriptor, ReachabilityHarness,
@@ -477,6 +479,66 @@ def _manager_cmdline(vm: dict[str, Any], descriptor: ExecutionHarnessDescriptor,
     return raw
 
 
+def _authority_record(root: Path, name: str, expected_ref: str, model):
+    path = root / name
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise Stage2StepError(f"cannot read {name}") from exc
+    if hashlib.sha256(raw).hexdigest() != expected_ref:
+        raise Stage2StepError(f"{name} differs from harness authority")
+    try:
+        parse_json(raw)
+        value = model.model_validate_json(raw)
+    except (TypeError, ValueError) as exc:
+        raise Stage2StepError(f"{name} is not a valid authority record") from exc
+    if canonical_json(value) != raw:
+        raise Stage2StepError(f"{name} is not canonical")
+    return value
+
+
+def _validate_runtime_authority(
+        root: Path, harness: ReachabilityHarness,
+        descriptor: ExecutionHarnessDescriptor, manager: dict[str, Any],
+) -> None:
+    """Bind the manager's actual layout to the harness authorities."""
+    catalog = _authority_record(
+        root, "hcap.json", harness.hcap_revision, HcapCatalog)
+    profile = _authority_record(
+        root, "admission.json", harness.call_admission_profile_ref,
+        CallAdmissionProfile)
+    profile_refs = {
+        ref.artifact_ref
+        for ref in (*catalog.authority_refs,
+                    *(ref for capability in catalog.capabilities
+                      for ref in capability.authority_refs))
+        if ref.kind == "CallAdmissionProfile"
+    }
+    if profile_refs != {harness.call_admission_profile_ref}:
+        raise Stage2StepError(
+            "HCAP does not select the harness call admission authority")
+    if profile.identity != descriptor.syzkaller_identity:
+        raise Stage2StepError(
+            "call admission authority differs from the harness build")
+    procs = manager.get("procs")
+    if type(procs) is not int or not 1 <= procs <= 64:
+        raise Stage2StepError(
+            "Stage 2 KVM step requires manager procs in [1, 64]")
+    calls = manager.get("enable_syscalls")
+    if calls is not None and (not isinstance(calls, list) or not all(
+            isinstance(call, str) for call in calls)):
+        raise Stage2StepError(
+            "manager enable_syscalls must be a list of calls")
+    enabled = calls if calls is not None else [entry.call for entry in profile.entries]
+    refusals = layout_refusals(
+        catalog, profile.entries, enabled_calls=enabled,
+        runtime_features=("remote_cover",), procs=procs)
+    if refusals:
+        raise Stage2StepError(
+            f"manager at {procs} proc(s) exceeds a validated layout: "
+            f"{refusals[0]}")
+
+
 def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
     execution = _Execution.model_validate_json((root / "execution.json").read_bytes())
     harness = ReachabilityHarness.model_validate_json((root / "harness.json").read_bytes())
@@ -498,6 +560,7 @@ def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
     procs = manager.get("procs")
     if type(procs) is not int or not 1 <= procs <= 64:
         raise Stage2StepError("Stage 2 KVM step requires manager procs in [1, 64]")
+    _validate_runtime_authority(root, harness, descriptor, manager)
     lanes = _journal_lane_count(vm, procs, accel=collector.accel)
     builds = {item.name: item.artifact_ref for item in descriptor.build_artifacts}
     lane_pin = _manager_assets(manager, vm, collector, descriptor, builds)

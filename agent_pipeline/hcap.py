@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, JsonValue, model_validator
+from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from .artifacts import ArtifactStore
 from .contracts import CandidateLocation, HcapCheck, JudgeVersions, Record, Sha256
@@ -72,6 +72,47 @@ class CapabilityInterface(HcapRecord):
         return self
 
 
+#: syz-executor proc ``i`` uses NFS lane ``i`` (syzkaller patch 0007), so a
+#: run with ``procs`` N uses lanes 0..N-1.  The guest has this many lanes.
+MAX_PROCS = 64
+
+
+class ExecutionLayout(HcapRecord):
+    """The executor layout a capability's evidence validated (#99).
+
+    ``procs`` is the number of executor procs that ran concurrently and
+    ``lanes`` the lanes whose behaviour the evidence checked.  A run with
+    ``procs`` N is inside the layout when N is at most ``procs`` and every
+    lane 0..N-1 is in ``lanes``.
+    """
+
+    procs: int = Field(ge=1, le=MAX_PROCS)
+    lanes: tuple[Annotated[int, Field(ge=0, lt=MAX_PROCS)], ...] = Field(
+        min_length=1)
+
+    @field_validator("lanes", mode="before")
+    @classmethod
+    def _list(cls, value):
+        # Typed evidence is validated from Python dicts, not only JSON.
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def _shape(self) -> ExecutionLayout:
+        if self.lanes != tuple(sorted(set(self.lanes))):
+            raise ValueError("lanes must be sorted and unique")
+        if self.lanes[-1] >= self.procs:
+            raise ValueError("a lane outside the layout's procs")
+        return self
+
+    def covers(self, procs: int) -> bool:
+        return procs <= self.procs and set(range(procs)) <= set(self.lanes)
+
+
+#: Stage 1 runs one program on one proc (``syz-execprog -procs=1``), lane 0.
+#: It is also the layout of a capability that declares none.
+STAGE1_LAYOUT = ExecutionLayout(procs=1, lanes=(0,))
+
+
 class Capability(HcapRecord):
     """04 §3 plus explicit coarse scope labels, not inferred support.
 
@@ -80,6 +121,10 @@ class Capability(HcapRecord):
     of those labels. For ``validated``, all declared scope is validated.
     Evidence references pin records; this checker does not establish that
     those records substantiate a maintainer's validation claim.
+
+    ``validated_layout`` is the executor layout of that evidence.  Without
+    one the capability is validated only in ``STAGE1_LAYOUT``; a run with
+    more procs must not use it (``layout()``).
     """
 
     id: Identifier
@@ -99,6 +144,10 @@ class Capability(HcapRecord):
     evidence_refs: tuple[Sha256, ...] = ()
     authority_refs: tuple[AuthorityRef, ...] = ()
     source_refs: tuple[Text, ...] = ()
+    validated_layout: ExecutionLayout | None = None
+
+    def layout(self) -> ExecutionLayout:
+        return self.validated_layout or STAGE1_LAYOUT
 
     @model_validator(mode="after")
     def _shape(self) -> Capability:
@@ -114,6 +163,36 @@ class Capability(HcapRecord):
                 and set(self.validated_scope) != set(self.scope)):
             raise ValueError("validated must cover all declared scope")
         return self
+
+
+def calls_in_layout(catalog: HcapCatalog, entries, procs: int) -> set[str]:
+    """The admitted calls a run with ``procs`` procs may enable: those with
+    at least one admitting capability whose layout covers the run.
+    ``entries`` are CallAdmissionProfile entries."""
+    covered = {cap.id for cap in catalog.capabilities
+               if cap.layout().covers(procs)}
+    return {entry.call for entry in entries
+            if covered & set(entry.capability_ids)}
+
+
+def layout_refusals(catalog: HcapCatalog, entries, *,
+                    enabled_calls, runtime_features, procs: int) -> list[str]:
+    """Why a run with ``procs`` procs, these enabled calls and runtime
+    features, exceeds the validated layouts of the catalog's capabilities
+    (#99).  An admitted call needs an admitting capability that covers the
+    run, and a runtime feature a declaring capability that does; calls
+    without an admission entry are not this check's."""
+    admitted = {entry.call for entry in entries}
+    allowed = calls_in_layout(catalog, entries, procs)
+    refusals = [f"call_outside_validated_layout:{call}"
+                for call in sorted(set(enabled_calls))
+                if call in admitted and call not in allowed]
+    for feature in sorted(set(runtime_features)):
+        caps = [cap for cap in catalog.capabilities
+                if feature in cap.interface.runtime_features]
+        if caps and not any(cap.layout().covers(procs) for cap in caps):
+            refusals.append(f"runtime_feature_outside_validated_layout:{feature}")
+    return refusals
 
 
 class HcapCatalog(HcapRecord):
@@ -414,6 +493,8 @@ class ArtifactHcapChecker:
                 unvalidated = set(use.scope)
             if set(use.unvalidated_scope) != unvalidated:
                 violations.append(f"unvalidated_scope_not_explicit:{cap.id}")
+            if not cap.layout().covers(STAGE1_LAYOUT.procs):
+                violations.append(f"layout_not_validated:{cap.id}")
             # Exact interface descriptions only, no wildcard expansion and
             # no host_tooling. Actual program calls need CallAdmissionProfile.
             interfaces.update(cap.interface.syz_calls)

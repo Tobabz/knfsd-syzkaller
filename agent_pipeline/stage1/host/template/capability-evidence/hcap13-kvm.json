@@ -24,6 +24,12 @@
   "campaign_result_sha256": "6ed8653ac75ce9dd863d6564dc793b9193f1c6a8a178d2867bf7bfae3dbd8034",
   "guest_lane_script_sha256": "318e79ea7d288e02efdfc357a26ddcff4f80cd6605fb50d4178e95bf2e89a104",
   "guest_nfs_proxy_sha256": "df9134f9432ae158cb4aa342925b4f5fefc12c022135744d9bb30a10d2369c36",
+  "layout": {
+    "procs": 1,
+    "lanes": [
+      0
+    ]
+  },
   "runs": {
     "control": {
       "completed": 3,

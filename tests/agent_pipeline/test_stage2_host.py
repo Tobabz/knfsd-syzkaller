@@ -426,3 +426,63 @@ def test_operator_start_and_placeholder_thresholds_are_warnings():
     changed = policy(run_stage2=True, fuzz_budget_executions=1234)
     _check_policies((changed,), checks)
     assert all(item.status == "pass" for item in checks.items)
+
+
+def test_manager_stays_inside_the_validated_layouts(tmp_path):
+    # #99: procs above a capability's validated layout refuse its calls
+    # and its runtime features; the manager's other checks still run.
+    from dataclasses import replace
+
+    from agent_pipeline.hcap import HcapCatalog
+    path, manager, _, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    catalog = HcapCatalog.model_validate({
+        "capabilities": (
+            {"id": "CAP-lane", "name": "lane", "purpose": "lane",
+             "usable_stage": ("stage2",), "usable_by": ("agent_stage2",),
+             "interface": {"syz_calls": ("openat$lane",)},
+             "status": "validated", "scope": ("lane",),
+             "validated_layout": {"procs": 2, "lanes": (0, 1)}},
+            {"id": "CAP-observe", "name": "kcov", "purpose": "kcov",
+             "usable_stage": ("stage2",), "usable_by": ("agent_stage2",),
+             "interface": {"runtime_features": ("remote_cover",)},
+             "status": "validated", "scope": ("generation",),
+             "validated_layout": {"procs": 2, "lanes": (0, 1)}},
+            {"id": "CAP-one", "name": "one lane", "purpose": "lane 0",
+             "usable_stage": ("stage2",), "usable_by": ("agent_stage2",),
+             "interface": {"syz_calls": ("syz_lane0_only",)},
+             "status": "validated", "scope": ("lane0",)}),
+        "missing_capability_ids": ()}, strict=False)
+    profile = SimpleNamespace(entries=(
+        SimpleNamespace(call="openat$lane", capability_ids=("CAP-lane",)),
+        SimpleNamespace(call="syz_lane0_only", capability_ids=("CAP-one",))))
+    harnesses = tuple(replace(item, authorities=((catalog, profile),))
+                      for item in harnesses)
+    manager["procs"] = 2
+    manager["vm"]["qemu_args"] += \
+        " -device virtserialport,name=nfsp-journal-1"
+    manager["enable_syscalls"] = ["openat$lane", "close"]
+    path.write_text(json.dumps(manager))
+    assert "2 proc(s)" in _manager_check(path, collector, harnesses, command)
+    manager["enable_syscalls"] = ["openat$lane", "syz_lane0_only"]
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match=r"call_outside_validated_layout:"
+                       r"syz_lane0_only"):
+        _manager_check(path, collector, harnesses, command)
+    # Without enable_syscalls syz-manager enables every call.
+    del manager["enable_syscalls"]
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="syz_lane0_only"):
+        _manager_check(path, collector, harnesses, command)
+    manager["enable_syscalls"] = ["openat$lane"]
+    manager["procs"] = 3
+    manager["vm"]["qemu_args"] += \
+        " -device virtserialport,name=nfsp-journal-2"
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match=r"openat\$lane"):
+        _manager_check(path, collector, harnesses, command)
+    manager["enable_syscalls"] = []
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="runtime_feature_outside_"
+                       "validated_layout:remote_cover"):
+        _manager_check(path, collector, harnesses, command)

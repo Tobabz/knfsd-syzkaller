@@ -55,7 +55,13 @@
       "source_refs": [
         "bundle/patches/syzkaller/0020-*",
         "bundle/lane/lane.sh"
-      ]
+      ],
+      "validated_layout": {
+        "procs": 1,
+        "lanes": [
+          0
+        ]
+      }
     },
     {
       "id": "HCAP-03",
@@ -86,7 +92,13 @@
         "bundle/patches/kernel/0001-*",
         "bundle/patches/kernel/0002-*",
         "bundle/patches/kernel/0006-*"
-      ]
+      ],
+      "validated_layout": {
+        "procs": 1,
+        "lanes": [
+          0
+        ]
+      }
     },
     {
       "id": "HCAP-04",
@@ -102,7 +114,8 @@
       "constraints": [
         "nfs.localio_enabled=N",
         "single fixture, koov.nfs_version from the selection",
-        "nlm-knfsd fixture (koov.nfs_fixture=nlm-knfsd) for the NFSv3 HCAP-13 selection"
+        "nlm-knfsd fixture (koov.nfs_fixture=nlm-knfsd) for the NFSv3 HCAP-13 selection",
+        "Stage 2 manager procs are at most what validated_layout covers (one proc on lane 0 until lane-topology evidence widens it); `python -m agent_pipeline.stage2.topology --procs 4` runs that campaign and its hcap04-kvm.json is the evidence for HCAP-01, HCAP-03 and HCAP-04 at {procs 4, lanes 0-3}"
       ],
       "status": "partially_validated",
       "scope": [
@@ -110,7 +123,13 @@
       ],
       "source_refs": [
         "bundle/lane/boot-fixture.sh"
-      ]
+      ],
+      "validated_layout": {
+        "procs": 1,
+        "lanes": [
+          0
+        ]
+      }
     },
     {
       "id": "HCAP-11",
@@ -137,7 +156,8 @@
         "knfsd gives no delegation on a file whose delegation it recalled in the last 30 to 60 s, so a repeated program must start from a file it creates: the validated stimulus opens with O_CREAT (mode 0x2) and ends with client0's unlinkat of the file",
         "lane file names are lock0, lock1, lock2 and shared/fixture; client0 and client1 must name the same file, which the parser cannot prove, so a program that names different files only misses the path",
         "the validated run observes nfsd_break_deleg_cb in client1's OPEN request recalling client0's delegation, the courtesy client0 expired and purged by the laundromat, client1's OPEN granted, then client0's EXCHANGE_ID and CREATE_SESSION; the laundromat expiry itself runs in a workqueue and is not attributed",
-        "the Stage 1 collector raises the syzkaller program budget (syz-execprog -program-timeout) for a program that partitions, so the 15 s hold and the recovery finish inside one program"
+        "the Stage 1 collector raises the syzkaller program budget (syz-execprog -program-timeout) for a program that partitions, so the 15 s hold and the recovery finish inside one program",
+        "validated on lane 0 with one proc (the Stage 1 collector): a Stage 2 manager with more procs does not enable the calls only this capability admits"
       ],
       "status": "validated",
       "scope": [
@@ -147,7 +167,13 @@
         "bundle/patches/syzkaller/0032-*",
         "bundle/lane/lane.sh",
         "tools/nfs-lifecycle/run.py"
-      ]
+      ],
+      "validated_layout": {
+        "procs": 1,
+        "lanes": [
+          0
+        ]
+      }
     },
     {
       "id": "HCAP-13",
@@ -176,7 +202,8 @@
         "raw NLM: r3 = syz_socket_connect_nlm$client0(0x0) or $client1(0x1), then syz_send_nlm_rpc(r3, rpc_nlm_call, len) with exact len fields; the @lane file handle takes r2 = syz_nlm_lane_fh(r0, name) of an existing lane file; read each reply with recvfrom$inet_nlm_tcp before the next call; rpc_nlm_call covers every NLM procedure on version 4 (nlm4) and versions 1/3 (nlm3): null, test, lock, cancel, unlock, granted, the *_msg and *_res forms, and on versions 3 and 4 also share and unshare (nlm_shareargs: cookie, nlm_share {caller, @lane fh, owner, mode, access}, reclaim), nm_lock and free_all (nlm_notify: name, state), so share, unshare, nm_lock and free_all need no new call or constructor",
         "raw NLM share and unshare syz text (share as run in the HCAP-13 KVM campaign): r2 = syz_nlm_lane_fh(r0, &(0x7f0000000040)='lock1\\x00'), r3 = syz_socket_connect_nlm$client0(0x0), then syz_send_nlm_rpc(r3, &(0x7f0000001000)=@v4={0x4, 0x0, 0x2, 0x186b5, 0x4, @share={0x14, @sys={0x1, 0x20, {0x0, {0x9, 'syzkaller'}, 0x0, 0x0, 0x0, []}}, @none={0x0, 0x0}, {@empty=0x0, {{0x9, 'syzkaller'}, @lane={0x14, 0x1000101, 0x0, r2, 0x0}, {0x4, \"01020304\"}, 0x0, 0x1}, 0x0}}}, 0x88); unshare is the same with @unshare={0x15, ...}; NLM version 3 is @v3={xid, 0x0, 0x2, 0x186b5, 0x3, ...} with the same bodies",
         "raw NLM free_all syz text (procedure 23, nlm_notify {caller name, state}): syz_send_nlm_rpc(r3, &(0x7f0000001000)=@v3={0x6, 0x0, 0x2, 0x186b5, 0x3, @free_all={0x17, @sys={0x1, 0x20, {0x0, {0x9, 'syzkaller'}, 0x0, 0x0, 0x0, []}}, @none={0x0, 0x0}, {{0x9, 'syzkaller'}, 0x0}}}, 0x5c); @v4={..., 0x4, @free_all={...}} is the same on version 4; the parser recomputes msglen",
-        "attributed: the server lane lockd serving a TCP or UDP NLM request and the client lane lockd serving a callback are context request; the server lockd thread granting a blocked lock and the rpciod steps of the GRANTED_MSG callback and of *_RES replies are context lockd, owned by the program whose LOCK created the block or whose request sent the reply; a grant after that program ended is not attributed; async UNLOCK/CANCEL that the kernel NFS client sends from a syscall run in rpciod unattributed; no Stage 1 call sends UDP NLM"
+        "attributed: the server lane lockd serving a TCP or UDP NLM request and the client lane lockd serving a callback are context request; the server lockd thread granting a blocked lock and the rpciod steps of the GRANTED_MSG callback and of *_RES replies are context lockd, owned by the program whose LOCK created the block or whose request sent the reply; a grant after that program ended is not attributed; async UNLOCK/CANCEL that the kernel NFS client sends from a syscall run in rpciod unattributed; no Stage 1 call sends UDP NLM",
+        "validated on lane 0 with one proc (the Stage 1 collector): a Stage 2 manager with more procs does not enable the calls only this capability admits"
       ],
       "status": "validated",
       "scope": [
@@ -187,7 +214,13 @@
         "bundle/lane/lane.sh",
         "tools/nfs-lifecycle/run.py",
         "bundle/patches/kernel/0006-*"
-      ]
+      ],
+      "validated_layout": {
+        "procs": 1,
+        "lanes": [
+          0
+        ]
+      }
     }
   ],
   "capability_evidence": {
@@ -849,5 +882,23 @@
     "grace_s": 11,
     "drain_s": 10,
     "exec_timeout_s": 600
+  },
+  "stage2": {
+    "runtime_selection": {
+      "profile": "knfsd-v41",
+      "nfs_version": "4.1",
+      "fixture_mode": "single",
+      "route": "direct",
+      "topology": "one-lane",
+      "enabled_interfaces": [
+        "remote_cover",
+        "syz_nfs_lane_link$heal_client0",
+        "syz_nfs_lane_link$partition_client0",
+        "syz_open_nfs_lane_profile$client0_knfsd_v41",
+        "syz_open_nfs_lane_profile$client1_knfsd_v41",
+        "syz_open_nlm_lane_file"
+      ],
+      "trace_mode": "off"
+    }
   }
 }

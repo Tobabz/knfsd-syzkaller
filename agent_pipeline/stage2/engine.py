@@ -15,7 +15,8 @@ Command contract (``{input}`` and ``{output}`` in argv are replaced):
                         execution_harness_id, lease_generation, compiled_ref,
                         rule_set_id, gate_repetitions, campaign_id,
                         crash_bundle_ref (null when the step has none)
-    ``harness.json``, ``descriptor.json``, ``program.syz``, ``neutral.syz``
+    ``harness.json``, ``descriptor.json``, ``hcap.json``, ``admission.json``,
+    ``program.syz``, ``neutral.syz``
                         as for Stage 1
     ``rules.nfsprul1``  the compiled rule set to install, byte for byte
     ``compiled.json``   its ``CompiledMutationRuleSet`` record
@@ -53,9 +54,11 @@ from typing import Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..admission import CallAdmissionProfile
 from ..artifacts import ArtifactStore
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ArtifactInput, EvidenceLimits, EvidenceStore
+from ..hcap import HcapCatalog
 from ..materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ..replay_runner import (PlanError, check_rule_set, parse_crash_context,
                              plan_replay, write_replay_inputs)
@@ -178,6 +181,10 @@ class Stage2CommandEngine:
             raise CaptureError("harness does not belong to this execution harness")
         descriptor = load_record(self.artifacts, b.execution_harness_id,
                                  ExecutionHarnessDescriptor)
+        hcap = load_record(self.artifacts, harness.hcap_revision, HcapCatalog)
+        admission = load_record(
+            self.artifacts, harness.call_admission_profile_ref,
+            CallAdmissionProfile)
         compiled = load_record(self.artifacts, t.compiled_ref,
                                CompiledMutationRuleSet)
         if compiled.harness_ref != b.harness_ref:
@@ -195,6 +202,8 @@ class Stage2CommandEngine:
             "crash_bundle_ref": t.crash_bundle_ref}))
         _write(inp / "harness.json", canonical_json(harness))
         _write(inp / "descriptor.json", canonical_json(descriptor))
+        _write(inp / "hcap.json", canonical_json(hcap))
+        _write(inp / "admission.json", canonical_json(admission))
         _write(inp / "program.syz", self.artifacts.get(harness.program_ref))
         _write(inp / "neutral.syz",
                self.artifacts.get(harness.neutral_program_ref))

@@ -49,6 +49,7 @@ from .hcap import (
     Q1Observation,
     ReachabilityPlan,
     RuntimeSelection,
+    STAGE1_LAYOUT,
 )
 
 
@@ -647,6 +648,9 @@ class ArtifactHarnessMaterializer:
             if set(use.unvalidated_scope) != unvalidated:
                 violations.append(
                     f"unvalidated_scope_not_explicit:{capability.id}")
+            # Stage 1 runs one proc on lane 0 (#99).
+            if not capability.layout().covers(STAGE1_LAYOUT.procs):
+                violations.append(f"layout_not_validated:{capability.id}")
             interfaces.update(capability.interface.syz_calls)
             interfaces.update(capability.interface.runtime_features)
         for interface in plan.runtime_selection.enabled_interfaces:

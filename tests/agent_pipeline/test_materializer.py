@@ -1216,3 +1216,23 @@ def test_check_draft_bounds_in_memory_program_bytes(world):
     refused = world.materializer.check_draft(plan, draft, world.binding)
     assert (refused.reason, refused.detail) == (
         DISALLOWED_OR_UNAVAILABLE_CALL, "scenario_program_limit_exceeded")
+
+
+def test_materializer_refuses_a_capability_not_validated_on_lane_zero(world):
+    # #99: Stage 1 runs one proc on lane 0, outside this layout.
+    from agent_pipeline.hcap import ExecutionLayout
+    capabilities = tuple(
+        cap.model_copy(update={"validated_layout": ExecutionLayout(
+            procs=2, lanes=(1,))}) if cap.id == "CAP-lane" else cap
+        for cap in world.hcap.capabilities)
+    replacement_ref = put_record(world.store, world.hcap.model_copy(
+        update={"capabilities": capabilities}))
+    binding = world.binding.model_copy(update={"hcap_revision": replacement_ref})
+    result = _approved_for(world, replacement_ref).materialize(
+        world.plan_ref, binding,
+        hcap_authority=MaterializationHcapAuthority(
+            effective_hcap_revision=replacement_ref,
+            validation="compatible_replacement"))
+    assert isinstance(result, MaterializeRejected)
+    assert result.reason == CALL_NOT_ADMITTED
+    assert result.detail == "hcap_plan_violation:layout_not_validated:CAP-lane"

@@ -71,6 +71,10 @@ from tests.agent_pipeline.stage2_host import (KASAN_REPORT, crash_log,
 inp, out = Path(sys.argv[1]), Path(sys.argv[2])
 execution = json.loads((inp / "execution.json").read_text())
 harness = json.loads((inp / "harness.json").read_text())
+assert hashlib.sha256((inp / "hcap.json").read_bytes()).hexdigest() == \
+    harness["hcap_revision"]
+assert hashlib.sha256((inp / "admission.json").read_bytes()).hexdigest() == \
+    harness["call_admission_profile_ref"]
 step = execution["step"]
 candidate = harness["candidate_id"]
 rules = (inp / "rules.nfsprul1").read_bytes()

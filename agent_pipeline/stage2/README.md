@@ -51,6 +51,7 @@ and `{output}` in argv are replaced with the lease's directories.
 `input/` holds `execution.json` (job, task, step, harness, lease
 generation, `compiled_ref`, `rule_set_id`, `gate_repetitions`,
 `campaign_id`, `crash_bundle_ref`), `harness.json`, `descriptor.json`,
+`hcap.json`, `admission.json`,
 `program.syz`, `neutral.syz`, `rules.nfsprul1` (install these bytes) and
 `compiled.json`. A replay also has `replay/`: `rules.bin` (the bytes the
 crash's journal recorded), `programs.log` (the window, in order, for
@@ -129,7 +130,7 @@ placeholders until the repository owner sets them.
 config when the host spec has a `stage2` section (#81 D17):
 
 ```json
-"stage2": {"procs": 1, "nfs_proxy_window": 6}
+"stage2": {"nfs_proxy_window": 6}
 ```
 
 It writes `state_dir/stage2-manager.json`, or `stage2-manager-<sanitizer>.json`
@@ -145,6 +146,51 @@ manager boots and may be left out when the spec has one. `generated.json`
 records each manager's SHA-256 under `stage2_manager`. Generation does not
 set `Stage1Config.stage2` or `nfs_proxy`, which need the promoted Proxy and
 the judge profiles; pass the manager to the `step` and `preflight` commands.
+
+### Validated layouts (#99)
+
+Every capability carries a `validated_layout` (`procs` and the proc lanes
+its evidence ran on); a capability without one is validated on Stage 1's
+layout, `procs: 1` on lane 0. Stage 1 plans run there, so a plan that uses a
+capability whose layout does not cover lane 0 is refused
+(`layout_not_validated:<id>`). A layout wider than Stage 1's must come from
+typed capability evidence whose `layout` equals the declared one.
+
+`procs` defaults to the layout of the runtime selection's capability
+(HCAP-04). A larger `procs` is refused, calls whose admitting capabilities
+do not cover `procs` are left out of `enable_syscalls` (a given list naming
+one is refused), and `remote_cover` must be covered. `preflight` repeats the
+check on the manager it is given against each approved harness's catalog
+and call admission profile.
+
+### Lane topology evidence
+
+HCAP-01, HCAP-03 and HCAP-04 widen together from one bounded syz-manager
+campaign:
+
+```sh
+python -m agent_pipeline.stage2.topology \
+    --manager state/stage2-manager.json \
+    --collector state/collector.json \
+    --descriptor state/descriptor.json \
+    --output state/topology --procs 4
+```
+
+The campaign runs the manager with `procs` lanes, `reproduce: false`, the
+neutral program's calls and an empty Proxy rule set, and stops when every
+lane has at least `--executions` (default 8) executions or at `--timeout`.
+Per lane it requires that every spooled execution is attributed to that
+lane, was acknowledged by the lane's Proxy, reports a healthy lane, and that
+each generation it ran opened on that lane's journal channel with no event
+from another lane. It writes `result.json` and, when every lane passes,
+`hcap04-kvm.json`. Promotable evidence is bound to the repository's fixed
+`v41-client-io-control.prog` digest; the command does not accept another
+corpus. Add that file to `capability_evidence` for HCAP-01,
+HCAP-03 and HCAP-04 and set their `validated_layout` to
+`{"procs": 4, "lanes": [0, 1, 2, 3]}`.
+
+`lane.sh status` runs inside the guest and is not reachable from a manager
+VM, so the per-execution health fields of the spool record stand in for it.
 
 ## KVM preflight
 
