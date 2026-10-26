@@ -1,26 +1,68 @@
-From 215c7fab3c56b32d5e51ba2f0cc432746a5820e4 Mon Sep 17 00:00:00 2001
-From: knfsd bridge builder <bridge@localhost>
-Date: Mon, 26 Oct 2026 18:45:48 +0900
+From 628ab68bc99651d024fedd9bf33169c1cca51dbd Mon Sep 17 00:00:00 2001
+From: ci <ci@localhost>
+Date: Tue, 27 Oct 2026 01:09:24 +0900
 Subject: [PATCH] syz-manager: collect coverage in corpus-run mode
 
 ---
- syz-manager/manager.go | 6 ++++++
- 1 file changed, 6 insertions(+)
+ syz-manager/corpus_run_test.go | 21 +++++++++++++++++++++
+ syz-manager/manager.go         | 16 ++++++++++------
+ 2 files changed, 31 insertions(+), 6 deletions(-)
+ create mode 100644 syz-manager/corpus_run_test.go
 
+diff --git a/syz-manager/corpus_run_test.go b/syz-manager/corpus_run_test.go
+new file mode 100644
+index 000000000..ebec92ed7
+--- /dev/null
++++ b/syz-manager/corpus_run_test.go
+@@ -0,0 +1,21 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package main
++
++import (
++	"testing"
++
++	"github.com/google/syzkaller/pkg/flatrpc"
++)
++
++func TestCorpusRunExecOpts(t *testing.T) {
++	opts := corpusRunExecOpts()
++	want := flatrpc.ExecFlagCollectSignal | flatrpc.ExecFlagCollectCover
++	if opts.ExecFlags != want {
++		t.Fatalf("ExecFlags = %v, want %v", opts.ExecFlags, want)
++	}
++	if opts.EnvFlags != 0 {
++		t.Fatalf("EnvFlags = %v, want zero so feature detection decides", opts.EnvFlags)
++	}
++}
 diff --git a/syz-manager/manager.go b/syz-manager/manager.go
-index 137e6ecd0..532268260 100644
+index d1e42f0a2..2e761a80b 100644
 --- a/syz-manager/manager.go
 +++ b/syz-manager/manager.go
-@@ -1313,6 +1313,12 @@ func (cr *corpusRunner) Next() *queue.Request {
+@@ -1313,12 +1313,16 @@ func (cr *corpusRunner) Next() *queue.Request {
  	return &queue.Request{
  		Prog:      p,
  		Important: true,
-+		// corpus-run is also a coverage-producing campaign.  Feature
-+		// detection enables remote coverage; these flags select local KCOV
-+		// and the managed generation publication path.
-+		ExecOpts: flatrpc.ExecOpts{
-+			ExecFlags: flatrpc.ExecFlagCollectSignal | flatrpc.ExecFlagCollectCover,
-+		},
+-		// corpus-run is also a coverage-producing campaign.  Feature
+-		// detection enables remote coverage; these flags select local KCOV
+-		// and the managed generation publication path.
+-		ExecOpts: flatrpc.ExecOpts{
+-			ExecFlags: flatrpc.ExecFlagCollectSignal | flatrpc.ExecFlagCollectCover,
+-		},
++		ExecOpts:  corpusRunExecOpts(),
++	}
++}
++
++// corpusRunExecOpts selects local KCOV collection.  Feature detection has
++// already set ExecEnvExtraCover when remote coverage is available; overriding
++// EnvFlags here would bypass that decision.
++func corpusRunExecOpts() flatrpc.ExecOpts {
++	return flatrpc.ExecOpts{
++		ExecFlags: flatrpc.ExecFlagCollectSignal | flatrpc.ExecFlagCollectCover,
  	}
  }
  
+-- 
+2.34.1
+
