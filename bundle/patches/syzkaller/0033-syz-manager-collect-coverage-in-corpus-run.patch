@@ -1,12 +1,12 @@
-From 628ab68bc99651d024fedd9bf33169c1cca51dbd Mon Sep 17 00:00:00 2001
+From c3956d141b1438e84e2c7b5b311691751e8c0395 Mon Sep 17 00:00:00 2001
 From: ci <ci@localhost>
-Date: Tue, 27 Oct 2026 01:09:24 +0900
+Date: Tue, 27 Oct 2026 01:17:01 +0900
 Subject: [PATCH] syz-manager: collect coverage in corpus-run mode
 
 ---
  syz-manager/corpus_run_test.go | 21 +++++++++++++++++++++
- syz-manager/manager.go         | 16 ++++++++++------
- 2 files changed, 31 insertions(+), 6 deletions(-)
+ syz-manager/manager.go         | 10 ++++++++++
+ 2 files changed, 31 insertions(+)
  create mode 100644 syz-manager/corpus_run_test.go
 
 diff --git a/syz-manager/corpus_run_test.go b/syz-manager/corpus_run_test.go
@@ -37,19 +37,13 @@ index 000000000..ebec92ed7
 +	}
 +}
 diff --git a/syz-manager/manager.go b/syz-manager/manager.go
-index d1e42f0a2..2e761a80b 100644
+index 137e6ecd0..2e761a80b 100644
 --- a/syz-manager/manager.go
 +++ b/syz-manager/manager.go
-@@ -1313,12 +1313,16 @@ func (cr *corpusRunner) Next() *queue.Request {
+@@ -1313,6 +1313,16 @@ func (cr *corpusRunner) Next() *queue.Request {
  	return &queue.Request{
  		Prog:      p,
  		Important: true,
--		// corpus-run is also a coverage-producing campaign.  Feature
--		// detection enables remote coverage; these flags select local KCOV
--		// and the managed generation publication path.
--		ExecOpts: flatrpc.ExecOpts{
--			ExecFlags: flatrpc.ExecFlagCollectSignal | flatrpc.ExecFlagCollectCover,
--		},
 +		ExecOpts:  corpusRunExecOpts(),
 +	}
 +}
