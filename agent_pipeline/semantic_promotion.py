@@ -622,6 +622,9 @@ def with_semantic_capability(catalog: HcapCatalog, promoted_ref: str,
     The entry lists the promoted subset ids as its scope and references the
     promoted registry by digest; the subsets' contents stay in that
     authority (04 §1.1), which the Agent reads with ``lookup_semantic_scope``.
+    Its promotion is the M7 gate (``promote``), Stage 2's criterion in
+    place of the probe campaign (07 §5.3 item 7), so the entry carries no
+    contract.  The rest of the catalog, its gap contracts included, is kept.
     """
     ids = tuple(p.subset.subset_id for p in promoted.subsets)
     evidence = tuple(sorted({r for p in promoted.subsets
@@ -652,9 +655,11 @@ def with_semantic_capability(catalog: HcapCatalog, promoted_ref: str,
                          if c.id != capability_id) + (entry,)
     missing = tuple(sorted(set(catalog.missing_capability_ids)
                            | {UNPROMOTED_GAP_ID}))
+    kept = {name: getattr(catalog, name)
+            for name in ("authority_refs", "gap_contracts")
+            if name in catalog.model_fields_set}
     return HcapCatalog(capabilities=capabilities,
-                       missing_capability_ids=missing,
-                       authority_refs=catalog.authority_refs)
+                       missing_capability_ids=missing, **kept)
 
 
 def promoted_registry(store: ArtifactStore, catalog: HcapCatalog, *,

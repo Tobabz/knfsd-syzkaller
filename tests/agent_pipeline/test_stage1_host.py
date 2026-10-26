@@ -42,11 +42,13 @@ from agent_pipeline.stage1.config import EngineConfig, Stage1Config
 from agent_pipeline.stage1.host import kcov
 from agent_pipeline.stage1.host.__main__ import main as host_main
 import agent_pipeline.stage1.host.generate as generate_module
-from agent_pipeline.hcap import STAGE1_LAYOUT, HcapCatalog
+from agent_pipeline.hcap import (STAGE1_LAYOUT, Capability, CapabilityContract,
+                                 ExecutionLayout, GapContract, HcapCatalog)
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
 from agent_pipeline.stage1.host.generate import (GenerationError,
+                                                 capability_baseline_sha256,
                                                  HCAP11_RECOVERY_ORDER,
                                                  Hcap11KvmEvidence,
                                                  Hcap13KvmEvidence,
@@ -170,7 +172,7 @@ def _write_syz_record(env: Path, **override) -> None:
 
 
 @pytest.fixture
-def host(tmp_path):
+def host(tmp_path, monkeypatch):
     """A bootstrap env, a parser bundle and a host spec over them."""
     env = tmp_path / "env"
     linux = env / "linux"
@@ -238,7 +240,9 @@ def host(tmp_path):
     }
     path = tmp_path / "host-spec.json"
     path.write_text(json.dumps(spec, indent=1))
-    return SimpleNamespace(root=tmp_path, spec=path, env=env,
+    # The synthetic capabilities stand for ones promoted before #100.
+    _mark_legacy(monkeypatch, spec)
+    return SimpleNamespace(root=tmp_path, spec=path, env=env, monkeypatch=monkeypatch,
                            kernel_commit=kernel_commit, identity=identity,
                            selection=selection)
 
@@ -362,7 +366,9 @@ def test_generate_pins_files_and_writes_consistent_configs(host):
 
 
 @needs_gcc
-def test_generate_binds_declared_capability_evidence(host):
+def test_generate_refuses_untyped_capability_evidence(host):
+    # #100: evidence without a typed model promotes no capability, whoever
+    # wrote it.
     evidence = host.root / "capability-evidence.json"
     evidence.write_text(
         '{"schema_version":"test-evidence.v1","result":"pass"}\n')
@@ -370,16 +376,8 @@ def test_generate_binds_declared_capability_evidence(host):
     spec["capability_evidence"] = {
         "CAP-lane": ["capability-evidence.json"]}
     host.spec.write_text(json.dumps(spec, indent=1))
-
-    result = generate(host.spec)
-    store = ArtifactStore(host.root / "cas")
-    from agent_pipeline.hcap import ArtifactHcapChecker
-    capability = next(
-        item for item in ArtifactHcapChecker(store).load_catalog(
-            result.hcap_revision).capabilities
-        if item.id == "CAP-lane")
-    assert len(capability.evidence_refs) == 1
-    assert store.get(capability.evidence_refs[0]) == evidence.read_bytes()
+    with pytest.raises(GenerationError, match="no typed evidence model"):
+        generate(host.spec)
 
 
 @needs_gcc
@@ -432,6 +430,7 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         "status": "validated", "scope": ["client0_recovery"],
     })
     spec["capability_evidence"] = {"HCAP-11": [evidence.name]}
+    _mark_legacy(host.monkeypatch, spec)
     host.spec.write_text(json.dumps(spec, indent=1))
 
     result = generate(host.spec)
@@ -545,6 +544,13 @@ def test_template_spec_is_valid():
         assert capability.layout() == STAGE1_LAYOUT
     assert evidence.layout == STAGE1_LAYOUT
     assert spec.stage2 is not None and spec.stage2.procs is None
+
+    # #100: the criteria judge new and revised capabilities; the template's
+    # are all unchanged legacy entries.
+    assert generate_module.promoted_by_criteria(spec) == ()
+    live = HostSpec.model_validate_json(
+        (REPO / "stage1-host-live/host-spec.json").read_bytes())
+    assert generate_module.promoted_by_criteria(live) == ()
     assert all(not call.startswith("syz_nfsd_cld_ctl$")
                for item in spec.neutral_controls
                for call in item.runtime_selection.enabled_interfaces)
@@ -1419,10 +1425,15 @@ def test_one_spec_generates_a_harness_per_variant(host):
 
 @needs_gcc
 def test_capability_evidence_belongs_to_its_variant(host):
+    _two_variants(host)
+    identity, lane_sha256 = _generated_identity(host, "kcsan")
     evidence = host.root / "kcsan-evidence.json"
-    evidence.write_text('{"schema_version":"test-evidence.v1"}\n')
-    _two_variants(host, kcsan={"capability_evidence": {
-        "CAP-lane": ["kcsan-evidence.json"]}})
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-lane", PROBE_CONTRACT)))
+    spec = json.loads(host.spec.read_text())
+    spec["variants"][1]["capability_evidence"] = {
+        "CAP-lane": ["kcsan-evidence.json"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
     result = generate(host.spec)
     from agent_pipeline.hcap import ArtifactHcapChecker
     checker = ArtifactHcapChecker(ArtifactStore(host.root / "cas"))
@@ -1591,20 +1602,24 @@ def test_stage2_manager_calls_include_the_approved_calls(host):
     assert manager["enable_syscalls"][-1] == "write$known"
 
 
-def _generated_identity(host):
-    """The mapping identity and lane script digest of the host's harness,
-    which typed KVM evidence must name."""
+def _generated_identity(host, sanitizer="kasan"):
+    """The mapping identity and lane script digest of the host's harness
+    for ``sanitizer``, which typed KVM evidence must name."""
     initial = generate(host.spec)
     config = Stage1Config.load(initial.stage1_config)
     store = ArtifactStore(config.artifact_root)
-    from agent_pipeline.materializer import ExecutionHarnessApproval
+    from agent_pipeline.materializer import (ExecutionHarnessApproval,
+                                             descriptor_id)
     from agent_pipeline.stage1.host.pins import HostFilePin
-    descriptor = load_record(store, config.execution_harness_approvals[0],
-                             ExecutionHarnessApproval).descriptor
+    descriptor = next(
+        approval.descriptor for approval in (
+            load_record(store, ref, ExecutionHarnessApproval)
+            for ref in config.execution_harness_approvals)
+        if approval.descriptor.sanitizer.value == sanitizer)
     builds = {item.name: item.artifact_ref
               for item in descriptor.build_artifacts}
     identity = KernelIdentity(
-        execution_harness_id=initial.execution_harness_id,
+        execution_harness_id=descriptor_id(descriptor),
         kernel_commit=descriptor.kernel_commit,
         instrumentation_sha256=builds["instrumentation"],
         vmlinux_sha256=builds["kernel"],
@@ -1795,3 +1810,263 @@ def test_live_spec_manager_enables_the_live_bind_calls():
     assert set(bind.interface.syz_calls) <= approved
     assert "write$nfs41_bind_conn_to_session" in approved
     assert "remote_cover" not in approved
+
+
+# ------------------------------------------------------------ promotion (#100)
+
+def _mark_legacy(monkeypatch, spec):
+    """Every capability of ``spec`` keeps its earlier promotion."""
+    monkeypatch.setattr(generate_module, "LEGACY_CAPABILITY_BASELINES", {
+        c["id"]: frozenset({capability_baseline_sha256(
+            Capability.model_validate_json(json.dumps(c)))})
+        for c in spec["capabilities"]})
+
+
+PROBE_CONTRACT = {
+    "entry_points": [{"kind": "fixture_action", "name": "lane_partition"}],
+    "boundary_functions": ["nfsd4_exchange_id", "nfsd4_create_session"]}
+
+
+def _probe_evidence(identity, lane_sha256, capability_id, contract, **change):
+    from agent_pipeline.promotion import contract_sha256
+    probes = contract["boundary_functions"]
+    value = {
+        "schema_version": "promotion-probe-evidence.v1",
+        "capability_id": capability_id,
+        "contract_sha256": contract_sha256(
+            CapabilityContract.model_validate_json(json.dumps(contract))),
+        "observed_at": "2026-10-26",
+        "execution_harness_id": identity.execution_harness_id,
+        "mapping_identity": identity.model_dump(mode="json"),
+        "guest_lane_script_sha256": lane_sha256,
+        "layout": {"procs": 1, "lanes": [0]},
+        "accelerator": "kvm", "exec_slowdown": 1,
+        "probes": probes,
+        "probe_mapping_sha256": {name: "c" * 64 for name in probes},
+        "minimal": {"program_sha256s": ["d" * 64], "runs": 3,
+                    "runs_hitting": 3, "probes_hit": probes},
+        "generated": {"program_sha256s": [f"{n:064x}" for n in range(16)],
+                      "runs": 40, "runs_hitting": 12, "probes_hit": probes},
+        "neutral": {"program_sha256s": ["f" * 64], "runs": 3,
+                    "runs_hitting": 0, "probes_hit": []},
+        "generated_without_entry_call": 0, "crash_signature_count": 0,
+        "shareable_result_contains_target_metadata_or_addresses": False,
+    }
+    value.update(change)
+    return value
+
+
+def _new_capability(contract=None):
+    capability = {
+        "id": "CAP-new", "name": "partition", "purpose": "test promotion",
+        "usable_stage": ["stage1"], "usable_by": ["agent_stage1"],
+        "interface": {"runtime_features": ["lane_partition"]},
+        "status": "validated", "scope": ["client0_partition"]}
+    if contract is not None:
+        capability["contract"] = contract
+    return capability
+
+
+@needs_gcc
+def test_a_new_capability_must_meet_the_promotion_criteria(host):
+    spec = json.loads(host.spec.read_text())
+    spec["capabilities"].append(_new_capability())
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="CAP-new does not meet the "
+                       "promotion criteria.*contract_missing"):
+        generate(host.spec)
+    spec["capabilities"][-1] = _new_capability(PROBE_CONTRACT)
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="promotion_evidence_missing"):
+        generate(host.spec)
+    # The probe campaign has to be this harness's; generate once without
+    # the new capability to learn its identity.
+    spec["capabilities"].pop()
+    host.spec.write_text(json.dumps(spec, indent=1))
+    identity, lane_sha256 = _generated_identity(host)
+    spec["capabilities"].append(_new_capability(PROBE_CONTRACT))
+    evidence = host.root / "promotion.json"
+    spec["capability_evidence"] = {"CAP-new": [evidence.name]}
+    other = {**PROBE_CONTRACT, "boundary_functions": ["nfsd4_exchange_id"]}
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-new", other)))
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="promotion_evidence_contract_"
+                       "mismatch, probes_not_contract_boundary"):
+        generate(host.spec)
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-new", PROBE_CONTRACT)))
+    result = generate(host.spec)
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          result.hcap_revision, HcapCatalog)
+    promoted = next(c for c in catalog.capabilities if c.id == "CAP-new")
+    assert promoted.contract == CapabilityContract.model_validate_json(
+        json.dumps(PROBE_CONTRACT))
+    assert len(promoted.evidence_refs) == 1
+    # A gap filler declares the vocabulary's contract for its gap.
+    spec["capabilities"][-1]["fills_gap"] = "lane.partition"
+    spec["missing_capability_ids"] = ["lane.partition"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="gap_contract_missing:lane.partition"):
+        generate(host.spec)
+    spec["gap_contracts"] = [{"missing_capability_id": "lane.partition",
+                              "contract": {**PROBE_CONTRACT,
+                                           "time_dependent": True}}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="contract_differs_from_gap:lane.partition"):
+        generate(host.spec)
+    spec["gap_contracts"][0]["contract"] = PROBE_CONTRACT
+    host.spec.write_text(json.dumps(spec, indent=1))
+    # A candidate raised the gap; the campaign names its programs.
+    with pytest.raises(GenerationError,
+                       match="candidate_programs_not_withheld"):
+        generate(host.spec)
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-new", PROBE_CONTRACT,
+        withheld_program_sha256s=["7" * 64])))
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          generate(host.spec).hcap_revision, HcapCatalog)
+    assert catalog.gap_contracts[0].missing_capability_id == "lane.partition"
+
+    # A Harness Generation patch set can change the spec, so the Controller
+    # passes the gap, its contract and the spec the patch set started from:
+    # the spec cannot narrow that contract, and every capability the patch
+    # set adds or changes fills that gap.
+    gap = GapContract.model_validate_json(json.dumps(
+        {"missing_capability_id": "lane.partition",
+         "contract": PROBE_CONTRACT}))
+    base_spec = host.root / "base-spec.json"
+    base_spec.write_text(json.dumps(
+        {**spec, "capabilities": spec["capabilities"][:-1]}, indent=1))
+    with pytest.raises(GenerationError, match="the gap and the base spec"):
+        generate(host.spec, gap=gap)
+    generate(host.spec, gap=gap, base_spec=base_spec)
+    narrowed = GapContract.model_validate_json(json.dumps(
+        {"missing_capability_id": "lane.partition",
+         "contract": {**PROBE_CONTRACT, "time_dependent": True}}))
+    with pytest.raises(GenerationError, match="another contract than the "
+                       "Controller's"):
+        generate(host.spec, gap=narrowed, base_spec=base_spec)
+    del spec["gap_contracts"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          generate(host.spec, gap=gap,
+                                   base_spec=base_spec).hcap_revision,
+                          HcapCatalog)
+    assert catalog.gap_contracts == (gap,)
+    # Once CAP-new is in the base, a later patch set that leaves it alone
+    # is not held to the later gap, and one that changes nothing fills none.
+    base_spec.write_text(host.spec.read_text())
+    with pytest.raises(GenerationError, match="adds or changes no "
+                       "capability for gap lane.partition"):
+        generate(host.spec, gap=gap, base_spec=base_spec)
+    del spec["capabilities"][-1]["fills_gap"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="CAP-new does not fill gap "
+                       "lane.partition"):
+        generate(host.spec, gap=gap, base_spec=base_spec)
+
+
+def test_a_patch_set_is_held_to_its_own_gap_only():
+    """Capabilities the base already holds, filling another gap or none,
+    are not the patch set's."""
+    base = _capabilities()
+    earlier = base[0].model_copy(update={"id": "CAP-a",
+                                         "fills_gap": "gap.a"})
+    human = base[0].model_copy(update={"id": "CAP-human"})
+    new = base[0].model_copy(update={"id": "CAP-b", "fills_gap": "gap.b"})
+
+    def spec(*capabilities):
+        return SimpleNamespace(capabilities=capabilities)
+
+    changed = generate_module._changed_capabilities(
+        spec(earlier, human, new), spec(earlier, human))
+    assert changed == (new,)
+    generate_module._check_fills(changed, "gap.b")
+    revised = human.model_copy(update={"purpose": "changed by the patch"})
+    changed = generate_module._changed_capabilities(
+        spec(earlier, revised, new), spec(earlier, human))
+    with pytest.raises(GenerationError, match="CAP-human does not fill gap "
+                       "gap.b"):
+        generate_module._check_fills(changed, "gap.b")
+    # A patch set cannot drop a base capability for its own.
+    with pytest.raises(GenerationError, match="removes CAP-human"):
+        generate_module._changed_capabilities(spec(earlier, new),
+                                              spec(earlier, human))
+
+
+@needs_gcc
+def test_a_changed_legacy_capability_is_judged_again(host, monkeypatch):
+    spec = json.loads(host.spec.read_text())
+    spec["capabilities"][0]["purpose"] = "a revised purpose"
+    host.spec.write_text(json.dumps(spec, indent=1))
+    name = spec["capabilities"][0]["id"]
+    with pytest.raises(GenerationError, match=f"{name} does not meet the "
+                       "promotion criteria.*contract_missing"):
+        generate(host.spec)
+
+    # The baselines are the repository's: a capability the spec adds is
+    # judged even under a legacy ID.
+    spec["capabilities"][0]["purpose"] = _capabilities()[0].purpose
+    spec["capabilities"].append(_new_capability())
+    spec["capabilities"][-1]["id"] = "HCAP-01"
+    host.spec.write_text(json.dumps(spec, indent=1))
+    monkeypatch.setattr(generate_module, "LEGACY_CAPABILITY_BASELINES", {
+        **generate_module.LEGACY_CAPABILITY_BASELINES,
+        "HCAP-01": frozenset({"0" * 64})})
+    with pytest.raises(GenerationError, match="HCAP-01 does not meet"):
+        generate(host.spec)
+
+
+def test_a_layout_change_keeps_the_legacy_baseline():
+    capability = _capabilities()[0]
+    widened = capability.model_copy(update={
+        "validated_layout": ExecutionLayout(procs=2, lanes=(0, 1))})
+    assert capability_baseline_sha256(widened) == \
+        capability_baseline_sha256(capability)
+    assert capability_baseline_sha256(capability.model_copy(
+        update={"purpose": "other"})) != capability_baseline_sha256(capability)
+
+
+@needs_gcc
+def test_new_syz_call_arguments_must_be_general(host, monkeypatch):
+    from agent_pipeline.promotion import ArgumentLeaf, CallShape, CallShapes
+    import agent_pipeline.syzkaller.adapter as adapter
+
+    class Parser:
+        def __init__(self, bundle, *, identity):
+            self.identity = identity
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def describe(self, calls):
+            assert calls == ["read$extra"]
+            return CallShapes(
+                syzkaller_commit=self.identity.syzkaller_commit,
+                calls=(CallShape(call="read$extra", leaves=(
+                    ArgumentLeaf(path="fd", literal=False),
+                    ArgumentLeaf(path="len", literal=True, value=64))),))
+
+    monkeypatch.setattr(adapter, "PinnedSyzParser", Parser)
+    spec = json.loads(host.spec.read_text())
+    extra = next(c for c in spec["capabilities"] if c["id"] == "CAP-extra")
+    extra["contract"] = {
+        "entry_points": [{"kind": "syz_call", "name": "read$extra"}],
+        "boundary_functions": ["nfsd_read"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match=r"CAP-extra syz call arguments "
+                       r"are not general.*literal_argument:read\$extra:len"):
+        generate(host.spec)
+    extra["contract"]["fixed_arguments"] = [
+        {"call": "read$extra", "path": "len", "value": 64}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    # General arguments; promotion still needs its probe campaign.
+    with pytest.raises(GenerationError, match="promotion_evidence_missing"):
+        generate(host.spec)

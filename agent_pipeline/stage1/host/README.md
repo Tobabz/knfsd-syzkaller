@@ -150,6 +150,60 @@ files of the lease's descriptor. `probe` and `check-pcs` take
 `--variant kcsan`; a KCSAN harness also reports `BUG: KCSAN:` as a crash. A
 `stage2` section writes one manager config per variant.
 
+## Promotion criteria (#100)
+
+Capability evidence must be typed: a `promotion-probe-evidence.v1`
+campaign, or the capability's own KVM evidence model. Untyped evidence is
+refused for every capability.
+
+`generate.LEGACY_CAPABILITY_BASELINES` pins, for each capability the
+checked-in specs held before the criteria, `capability_baseline_sha256` of
+its entry (without `validated_layout` and evidence references). The
+repository pins them, so a spec cannot exempt a capability. While an entry
+still matches, it keeps its earlier status; that includes the live spec's
+HCAP-14, which has been `experimental` since before the criteria. A new
+capability, or one whose entry changed, needs all of the following, and
+`generate` refuses the spec otherwise:
+
+- a `contract` (entry points, boundary functions, fixed arguments and
+  types; `docs/design/02-llm-agent/04-harness-capability-spec.md` §3.3);
+- a `PromotionProbeEvidence` file in `capability_evidence` whose probes
+  are the contract's boundary functions and whose minimal, generated and
+  neutral run sets meet the thresholds in `agent_pipeline/promotion.py`
+  (KVM only for a `time_dependent` contract);
+- syz call arguments that carry no literal the contract does not fix. The
+  check reads the pinned target's argument shapes through the parser
+  bundle's `describe`, so the bundle must be built from this repository's
+  bridge sources.
+
+`gap_contracts` gives the contract a capability filling each gap ID must
+declare; it is copied into the generated HCAP. A capability names the gap
+it fills with `fills_gap`, and `generate` refuses it unless its contract is
+that gap's. A capability that fills a gap also needs a campaign that names
+the candidate's programs in `withheld_program_sha256s`.
+
+The spec's `gap_contracts` are the operator's statement. A Harness
+Generation patch set can change the spec, so on that path the Controller
+passes the gap and its contract from its own state, with the spec the patch
+set started from:
+
+```sh
+uv run python -m agent_pipeline.stage1.host generate SPEC \
+    --gap gap.json --base-spec base-host-spec.json
+```
+
+`gap.json` is a `GapContract`. The spec cannot give that gap another
+contract, and every capability the patch set adds or changes relative to
+the base spec must fill that gap, and it may not remove a base capability.
+Capabilities the base already holds are not the patch set's, whatever gap
+they fill. The base spec must come from the Controller's own read-only
+store, not from the generation worktree.
+
+Outside the legacy baselines, "judged" means every generation: a capability
+promoted after the criteria keeps its promotion only while its spec entry
+lists a probe campaign bound to the generated harness. That is the same
+binding the capability-specific KVM evidence has.
+
 ## How the pieces bind
 
 - **Pins.** The descriptor names each host file (vmlinux as `kernel`,

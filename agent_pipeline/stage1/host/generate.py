@@ -50,11 +50,14 @@ from ...contracts import (PIPELINE_GAP_IDS, CampaignMode, HarnessBinding,
                           JobPolicy, JudgeVersions, Sanitizer, Sha256)
 from ...data import canonical_json, put_record
 from ...hcap import (STAGE1_LAYOUT, AuthorityRef, Capability, ExecutionLayout,
-                      HcapCatalog, RuntimeSelection, calls_in_layout,
-                      layout_refusals)
+                      GapContract, HcapCatalog, RuntimeSelection,
+                      calls_in_layout, layout_refusals)
 from ...materializer import (ExecutionHarnessApproval,
                              ExecutionHarnessDescriptor, HarnessBuildArtifact,
                              _runtime_key, descriptor_id)
+from ...promotion import (PromotionProbeEvidence,
+                          argument_generality_refusals,
+                          gap_contract_refusals, promotion_refusals)
 from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
                    RemoteKcovSupportBoundary)
 from ...qemu_accel import Accel, AccelChoice, resolve, slowdown
@@ -503,6 +506,8 @@ class HostSpec(_Spec):
     #: generated HCAP catalog. Paths are relative to this spec.
     capability_evidence: dict[str, tuple[Path, ...]] = Field(
         default_factory=dict)
+    #: The contract each gap ID's capability must declare (04 §3.3).
+    gap_contracts: tuple[GapContract, ...] = ()
     #: The capability whose constraints list the allowed runtime selections.
     #: The Agent reads capabilities through its HCAP lookup tool and must
     #: plan with one of these selections exactly.
@@ -539,6 +544,50 @@ class HostSpec(_Spec):
             capability_evidence=self.capability_evidence),)
 
 
+def capability_baseline_sha256(capability: Capability) -> str:
+    """The digest ``legacy_capabilities`` pins: the spec entry without its
+    validated layout, which lane-topology evidence widens on its own (#99),
+    and without generated evidence references."""
+    entry = capability.model_dump(
+        mode="json", exclude={"validated_layout", "evidence_refs"})
+    return hashlib.sha256(canonical_json(entry)).hexdigest()
+
+
+#: ``capability_baseline_sha256`` of each capability promoted before the
+#: promotion criteria (#100), as the checked-in specs declare it
+#: (``template/host-spec.json``, ``stage1-host-live/host-spec.json``).  The
+#: repository pins them here, so a spec cannot exempt a capability itself.
+LEGACY_CAPABILITY_BASELINES: dict[str, frozenset[str]] = {
+    "HCAP-01": frozenset({
+        "7eda8c8105255246dfd25dc06c65e42461d88782000497f41a969d20ef7a9ff3",
+    }),
+    "HCAP-03": frozenset({
+        "bd33c79879dfaddb358acf7bb2ffbd8c0d00c604c52645adb07b0fb777518eee",
+    }),
+    "HCAP-04": frozenset({
+        "023a636701aeec882c157de3fe6024e4e2476fa4eca18b0d943e4b5b8fb254cb",
+        "c9f8ff612235085419c3b91c8acae70322fe0a85719134e10aece2d2528502b1",
+    }),
+    "HCAP-11": frozenset({
+        "7315aeedfeb596d88a56e6006008175e53fbd88406c7607a6e2709c11e317f6e",
+    }),
+    "HCAP-13": frozenset({
+        "499b5103293c9b078d58e2ae25ccc20f139d5526538005093c55f1950c222f81",
+    }),
+    "HCAP-14": frozenset({
+        "096aa8aa37724038105100a892507e68f7834cb94311aeaa1289cd9c62a6bca3",
+    }),
+}
+
+
+def promoted_by_criteria(spec: HostSpec) -> tuple[Capability, ...]:
+    """The capabilities the promotion criteria judge: every one that is not
+    an unchanged legacy entry (#100)."""
+    return tuple(c for c in spec.capabilities
+                 if capability_baseline_sha256(c)
+                 not in LEGACY_CAPABILITY_BASELINES.get(c.id, frozenset()))
+
+
 def _gap_vocabulary(spec: HostSpec) -> tuple[str, ...]:
     """The spec's gap IDs and the ones the pipeline emits itself (#81 D6),
     so every generated HCAP revision lists them explicitly (04 §1.1)."""
@@ -553,18 +602,31 @@ def _resolve(base: Path, path: Path) -> Path:
 def _validated_capability_evidence(
         capability_id: str, path: Path, *,
         expected_mapping_identity: KernelIdentity,
-        lane_script_sha256: str) -> tuple[bytes, ExecutionLayout | None]:
+        lane_script_sha256: str,
+) -> tuple[bytes, ExecutionLayout, PromotionProbeEvidence | None]:
     """Validate identity-sensitive evidence before it can promote an HCAP.
 
-    Capabilities with a typed KVM evidence model (CAPABILITY_EVIDENCE_MODELS)
-    accept only evidence of that model bound to the generated execution
-    harness, its full mapping identity and the pinned guest lane script.
-    Returns the bytes and the executor layout the typed evidence ran.
+    Evidence is typed: a promotion probe campaign (#100) for any capability,
+    or the capability's own KVM evidence model (CAPABILITY_EVIDENCE_MODELS).
+    Untyped evidence is refused for every capability.  Either kind must be
+    bound to the generated execution harness, its full mapping identity and
+    the pinned guest lane script.  Returns the bytes, the executor layout
+    the evidence ran and the probe campaign, if it is one.
     """
     contents = path.read_bytes()
-    model = CAPABILITY_EVIDENCE_MODELS.get(capability_id)
+    try:
+        schema = json.loads(contents).get("schema_version")
+    except (ValueError, AttributeError) as error:
+        raise GenerationError(
+            f"{capability_id} evidence {path} is not a JSON object") from error
+    if schema == "promotion-probe-evidence.v1":
+        model = PromotionProbeEvidence
+    else:
+        model = CAPABILITY_EVIDENCE_MODELS.get(capability_id)
     if model is None:
-        return contents, None
+        raise GenerationError(
+            f"{capability_id} evidence {path} has no typed evidence model; "
+            "give promotion-probe-evidence.v1 (#100)")
     try:
         evidence = model.model_validate_json(contents)
     except ValidationError as error:
@@ -585,7 +647,93 @@ def _validated_capability_evidence(
                                     (evidence.capability_id,)):
         raise GenerationError(
             f"{capability_id} evidence validates other capabilities")
-    return contents, evidence.layout
+    probe = evidence if isinstance(evidence, PromotionProbeEvidence) else None
+    return contents, evidence.layout, probe
+
+
+def _with_gap(spec: HostSpec, gap: GapContract) -> HostSpec:
+    """The spec with the Controller's gap contract, which a contract the
+    spec gives the same gap must equal."""
+    gap_id = gap.missing_capability_id
+    own = [g for g in spec.gap_contracts if g.missing_capability_id == gap_id]
+    if any(g.contract != gap.contract for g in own):
+        raise GenerationError(
+            f"the spec gives gap {gap_id} another contract than the "
+            "Controller's (#100)")
+    if gap_id not in _gap_vocabulary(spec):
+        raise GenerationError(f"gap {gap_id} is not in the spec's vocabulary")
+    contracts = (*(g for g in spec.gap_contracts
+                   if g.missing_capability_id != gap_id), gap)
+    return spec.model_copy(update={"gap_contracts": tuple(
+        sorted(contracts, key=lambda g: g.missing_capability_id))})
+
+
+def _changed_capabilities(spec: HostSpec,
+                          base: HostSpec) -> tuple[Capability, ...]:
+    """The capabilities ``spec`` adds to ``base`` or changes in it, compared
+    the way the legacy baselines are.  A patch set adds capabilities and
+    never removes one."""
+    before = {c.id: capability_baseline_sha256(c) for c in base.capabilities}
+    removed = sorted(set(before) - {c.id for c in spec.capabilities})
+    if removed:
+        raise GenerationError(
+            f"the patch set removes {', '.join(removed)} from the base spec")
+    return tuple(c for c in spec.capabilities
+                 if before.get(c.id) != capability_baseline_sha256(c))
+
+
+def _check_fills(capabilities: tuple[Capability, ...], gap_id: str) -> None:
+    """#100: a Harness Generation patch set adds or changes only
+    capabilities that fill the gap it was generated for."""
+    if not capabilities:
+        raise GenerationError(
+            f"the patch set adds or changes no capability for gap {gap_id}")
+    for capability in capabilities:
+        if capability.fills_gap != gap_id:
+            raise GenerationError(
+                f"{capability.id} does not fill gap {gap_id}, the gap this "
+                "generation is for (#100)")
+
+
+def _check_gap_contracts(spec: HostSpec,
+                         capabilities: tuple[Capability, ...]) -> None:
+    """#100: a capability filling a gap declares that gap's vocabulary
+    contract, not one fitted to the candidate that raised it."""
+    gaps = HcapCatalog(capabilities=(),
+                       missing_capability_ids=_gap_vocabulary(spec),
+                       gap_contracts=spec.gap_contracts)
+    for capability in capabilities:
+        if capability.fills_gap is None:
+            continue
+        refusals = gap_contract_refusals(gaps, capability.fills_gap,
+                                         capability)
+        if refusals:
+            raise GenerationError(
+                f"{capability.id} does not meet the promotion criteria "
+                f"(#100): {', '.join(refusals)}")
+
+
+def _check_argument_generality(capabilities: tuple[Capability, ...],
+                               bundle: Path,
+                               identity: SyzkallerTargetIdentity) -> None:
+    """#100: the syz call arguments of each capability the promotion
+    criteria judge carry only the literals its contract fixes, read from
+    the pinned target's argument shapes."""
+    contracts = [(c, c.contract) for c in capabilities
+                 if c.contract is not None and c.contract.syz_calls()]
+    if not contracts:
+        return
+    from ...syzkaller.adapter import PinnedSyzParser
+    calls = sorted({call for _, contract in contracts
+                    for call in contract.syz_calls()})
+    with PinnedSyzParser(bundle, identity=identity) as parser:
+        shapes = parser.describe(calls)
+    for capability, contract in contracts:
+        refusals = argument_generality_refusals(contract, shapes)
+        if refusals:
+            raise GenerationError(
+                f"{capability.id} syz call arguments are not general "
+                f"(#100): {', '.join(refusals)}")
 
 
 def _check_layout(capability: Capability,
@@ -820,10 +968,23 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
 
 
 def generate(spec_path: Path, *, python: str = sys.executable,
-             now: str | None = None) -> Generated:
+             now: str | None = None,
+             gap: GapContract | None = None,
+             base_spec: Path | None = None) -> Generated:
+    """``gap`` is the Controller's contract for the gap a Harness
+    Generation patch set fills (#100), and ``base_spec`` the spec the patch
+    set started from.  Both come from outside the spec, which the patch set
+    can change: every capability the patch set adds or changes must fill
+    that gap, and the spec cannot give the gap another contract."""
+    if (gap is None) != (base_spec is None):
+        raise GenerationError("give the gap and the base spec together")
     spec_path = Path(spec_path).resolve()
     base = spec_path.parent
     spec = HostSpec.model_validate_json(spec_path.read_bytes())
+    if gap is not None:
+        spec = _with_gap(spec, gap)
+        changed = _changed_capabilities(spec, HostSpec.model_validate_json(
+            Path(base_spec).read_bytes()))
     state = _resolve(base, spec.state_dir)
     root = _resolve(base, spec.artifact_root)
     env = _resolve(base, spec.env_dir)
@@ -951,6 +1112,11 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     if (identity.build_manifest_sha256 != put_record(store, manifest)
             or identity.call_table_sha256 != put_record(store, table)):
         raise GenerationError("bundle identity.json disagrees with its files")
+    judged = promoted_by_criteria(spec)
+    if gap is not None:
+        _check_fills(changed, gap.missing_capability_id)
+    _check_gap_contracts(spec, judged)
+    _check_argument_generality(judged, bundle, identity)
 
     # ---------------------------------------------------- authorities
     capabilities = list(spec.capabilities)
@@ -981,7 +1147,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             "constraints": (*cap.constraints, *listed)})
     admission_draft = HcapCatalog(
         capabilities=tuple(capabilities),
-        missing_capability_ids=_gap_vocabulary(spec))
+        missing_capability_ids=_gap_vocabulary(spec),
+        gap_contracts=spec.gap_contracts)
     with tempfile.TemporaryDirectory() as tmp:
         source_path = Path(tmp) / "source.json"
         hcap_path = Path(tmp) / "hcap.json"
@@ -1071,6 +1238,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             kaslr_enabled=False, kaslr_offset=0)
         variant_capabilities = list(capabilities)
         evidence_layouts: dict[str, list[ExecutionLayout]] = {}
+        probe_evidence: list[PromotionProbeEvidence] = []
         for capability_id, paths in sorted(v.capability_evidence.items()):
             refs = []
             for path in paths:
@@ -1078,13 +1246,13 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                 if not resolved.is_file():
                     raise GenerationError(
                         f"capability evidence is not a file: {resolved}")
-                contents, layout = _validated_capability_evidence(
+                contents, layout, probe = _validated_capability_evidence(
                     capability_id, resolved,
                     expected_mapping_identity=expected_mapping_identity,
                     lane_script_sha256=file_pins["lane-script"].sha256)
-                if layout is not None:
-                    evidence_layouts.setdefault(capability_id, []).append(
-                        layout)
+                evidence_layouts.setdefault(capability_id, []).append(layout)
+                if probe is not None:
+                    probe_evidence.append(probe)
                 refs.append(store.put(contents))
             index = capability_indexes[capability_id]
             capability = variant_capabilities[index]
@@ -1093,9 +1261,16 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                                               | set(refs)))})
         for capability in variant_capabilities:
             _check_layout(capability, evidence_layouts.get(capability.id, []))
+        for capability in judged:
+            refusals = promotion_refusals(capability, probe_evidence)
+            if refusals:
+                raise GenerationError(
+                    f"{capability.id} does not meet the promotion criteria "
+                    f"(#100): {', '.join(refusals)}")
         draft = HcapCatalog(
             capabilities=tuple(variant_capabilities),
-            missing_capability_ids=_gap_vocabulary(spec))
+            missing_capability_ids=_gap_vocabulary(spec),
+            gap_contracts=spec.gap_contracts)
         boundary = RemoteKcovSupportBoundary(
             name=spec.support_boundary.name,
             revision=spec.support_boundary.revision,

@@ -25,7 +25,7 @@ def bundle():
     root = Path(value)
     provenance = json.loads((root / "provenance.json").read_bytes())
     sources = provenance["bridge_sources"]
-    for name in ("bridge.go", "facts.go"):
+    for name in ("bridge.go", "facts.go", "shapes.go"):
         current = Path(__file__).parents[3] / "tools" / "syzkaller" / name
         assert sources[name] == hashlib.sha256(current.read_bytes()).hexdigest(), (
             f"bundle {name} differs from the checked-in source")
@@ -324,3 +324,16 @@ def test_silent_helper_timeout_and_minimal_environment(tmp_path):
 def test_limits_cannot_be_disabled(kwargs):
     with pytest.raises(ValueError):
         BridgeLimits(**kwargs)
+
+
+def test_describe_reports_the_literal_arguments(parser):
+    shapes = parser.describe(["syz_open_nlm_lane_file",
+                              "syz_nfs_lane_link$partition_client0"])
+    assert [c.call for c in shapes.calls] == [
+        "syz_nfs_lane_link$partition_client0", "syz_open_nlm_lane_file"]
+    link = shapes.get("syz_nfs_lane_link$partition_client0")
+    assert [(l.path, l.literal, l.value) for l in link.leaves] == [
+        ("client", True, 0), ("op", True, 0)]
+    assert not any(l.literal for l in shapes.get("syz_open_nlm_lane_file").leaves)
+    with pytest.raises(SyzParseFailure):
+        parser.describe(["no_such_call"])
