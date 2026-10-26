@@ -43,8 +43,11 @@
    밖이면 그것은 `remote_kcov_attribution` gap이다. Harness Generation이 그 context의 계측을 생성하고 검증한다
    (`07` §5). 부자연스러운 트리거로 우회하지 않는다.
 7. **HCAP-11과 HCAP-12는 이 기준을 위반한다.** HCAP-11의 만료는 클라이언트가 유도한 것이 아니라 broker가 서버 관리 인터페이스에 쓴 것이고, HCAP-12의 데몬 재시작은 클라이언트가 유도할 수 없다. Agent 사용 범위에서 빼고, 자연 경로(lease 만료와 그 귀속 계측)로
-   다시 만든다. code 변경(host generator template, CallAdmissionProfile, 관련 테스트)은 별도 작업으로 하며 그
-   전까지 `04`의 두 항목에 위반 사실을 적어 둔다.
+   다시 만든다. HCAP-12는 카탈로그에서 삭제했다(#98). HCAP-11은 자연 경로로 다시 만들었다(#96): client0이 자기
+   lane namespace의 link를 lease보다 오래 내려 courtesy client가 되고, client1의 OPEN이 client0의 write
+   delegation을 회수할 때 서버가 client0을 만료시키며, client0은 heal 뒤 새 clientid로 복구한다. laundromat의
+   만료 자체는 귀속되지 않지만 delegation 회수(client1의 OPEN)와 복구(EXCHANGE_ID, CREATE_SESSION)는 nfsd
+   request로 귀속된다.
 8. **Proxy 변조는 공격자 역할의 메시지다.** 실제 취약점 시나리오에서 C2S 변조는 악의적인 클라이언트가, S2C
    변조는 악의적인 서버가 직접 만든다. 이 환경은 변조를 정상 시나리오와 구분하려고 클라이언트와 서버 사이에
    Proxy를 둔다. 따라서 Proxy가 만든 record는 그 방향 송신자의 protocol 메시지여야 하며, S2C 변조는 서버 응답을
@@ -65,7 +68,7 @@
 - **lease 만료 경로의 귀속.** laundromat는 여러 클라이언트를 한 번에 처리하는 주기적 workqueue다. owner를
   마지막으로 lease를 갱신한 요청의 program에서 이어받을지, generation이 닫힌 뒤 일어나는 만료를 어떻게 다룰지,
   프로그램이 lease 시간(fixture 설정, 최소 10초) 동안 실행돼야 하는 제약을 executor timeout과 어떻게 맞출지는
-  생성과 검증에서 정한다.
+  생성과 검증에서 정한다. HCAP-11은 partition 프로그램에 syz-execprog `-program-timeout`을 올려 맞췄다(#96).
 
 ## 남은 위험
 

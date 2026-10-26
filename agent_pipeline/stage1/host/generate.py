@@ -113,19 +113,49 @@ class CollectorSpec(_Spec):
     exec_timeout_s: float = 600
 
 
+HCAP11_PROBES = ("break_deleg", "create_session", "exchange_id")
+
+
+class Hcap11ProbeHits(_Spec):
+    """Per-run counts of attributed PCs in each public probe range."""
+
+    #: nfsd_break_deleg_cb: client1's OPEN recalls the write delegation of
+    #: the courtesy client0 and marks it expirable.
+    break_deleg: tuple[int, ...]
+    #: nfsd4_create_session: client0's recovered session.
+    create_session: tuple[int, ...]
+    #: nfsd4_exchange_id: client0's recovered client record.
+    exchange_id: tuple[int, ...]
+
+    def each(self, name: str) -> tuple[int, ...]:
+        return getattr(self, name)
+
+
 class Hcap11RunEvidence(_Spec):
-    completed: int = Field(ge=1, le=999)
-    target_hit_counts: tuple[int, ...]
+    completed: int = Field(ge=3, le=999)
+    probe_hits: Hcap11ProbeHits
+    #: lane.sh status passed (both clients mounted, link up) after every run.
+    status_checks_passed: int = Field(ge=0)
+    #: Generation contract held for every run.
+    attributed_generations: int = Field(ge=0)
 
     @model_validator(mode="after")
     def _count(self) -> Self:
-        if len(self.target_hit_counts) != self.completed:
-            raise ValueError("target_hit_counts length differs from completed")
+        for name in HCAP11_PROBES:
+            if len(self.probe_hits.each(name)) != self.completed:
+                raise ValueError(f"{name} length differs from completed")
+        if self.status_checks_passed != self.completed:
+            raise ValueError("a run left the lane fixture unhealthy")
+        if self.attributed_generations != self.completed:
+            raise ValueError("a run lacks one attributed generation")
         return self
 
 
 class Hcap11RunsEvidence(_Spec):
+    #: Neutral control: client0 lane I/O, no lock, partition or recovery.
     control: Hcap11RunEvidence
+    #: client0 read-write open, partition past the lease, client1 open of
+    #: the same file, heal, client0 I/O.
     stimulus: Hcap11RunEvidence
 
 
@@ -140,23 +170,36 @@ class Hcap11GenerationEvidence(_Spec):
     minimum_remote_start_ok: int = Field(ge=1)
 
 
+#: Server trace order of one validated stimulus run: client1's OPEN
+#: recalls the write delegation of the courtesy client0, the laundromat
+#: expires and purges client0 and the OPEN is granted; then client0, healed,
+#: recovers with a fresh EXCHANGE_ID and a CREATE_SESSION that confirms the
+#: new client.
 HCAP11_RECOVERY_ORDER = (
-    "nfsd_clid_admin_expired", "nfsd_clid_fresh", "OP_EXCHANGE_ID",
+    "nfsd_cb_recall", "nfsd_mark_client_expired", "nfsd_clid_purged",
+    "OP_OPEN", "nfsd_clid_fresh", "OP_EXCHANGE_ID",
     "nfsd_slot_seqid_unconf", "nfsd_clid_confirmed", "OP_CREATE_SESSION",
 )
+#: The single fixture's NFSv4 lease and the partition that outlasts it
+#: (syzkaller patch 0032).
+HCAP11_LEASE_TIME_S = 10
+HCAP11_PARTITION_HOLD_S = 15
 
 
 class Hcap11KvmEvidence(_Spec):
     schema_version: Literal["hcap-kvm-evidence.v1"]
     capability_id: Literal["HCAP-11"]
     observed_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
-    scenario: Literal["v41-client-expiry"]
+    scenario: Literal["v41-courtesy-expiry"]
     execution_harness_id: Sha256
     mapping_identity: KernelIdentity
-    target_mapping_sha256: Sha256
+    #: Digest of each public probe mapping, keyed by probe name.
+    probe_mapping_sha256: dict[str, Sha256]
     campaign_result_sha256: Sha256
     guest_lane_script_sha256: Sha256
     guest_nfs_proxy_sha256: Sha256
+    nfsv4_lease_time_s: Literal[10]
+    partition_hold_s: Literal[15]
     runs: Hcap11RunsEvidence
     generation_contract: Hcap11GenerationEvidence
     recovery_order: tuple[str, ...]
@@ -168,10 +211,15 @@ class Hcap11KvmEvidence(_Spec):
     def _validated_campaign(self) -> Self:
         if self.execution_harness_id != self.mapping_identity.execution_harness_id:
             raise ValueError("mapping and campaign harness identities differ")
-        if any(self.runs.control.target_hit_counts):
-            raise ValueError("control run reached the target mapping")
-        if not all(count > 0 for count in self.runs.stimulus.target_hit_counts):
-            raise ValueError("stimulus run missed the target mapping")
+        if tuple(sorted(self.probe_mapping_sha256)) != HCAP11_PROBES:
+            raise ValueError("probe mappings differ from the HCAP-11 probe set")
+        control = self.runs.control.probe_hits
+        if any(any(control.each(name)) for name in HCAP11_PROBES):
+            raise ValueError("control run reached an HCAP-11 probe")
+        stimulus = self.runs.stimulus.probe_hits
+        for name in HCAP11_PROBES:
+            if not all(stimulus.each(name)):
+                raise ValueError(f"stimulus run missed {name}")
         if self.recovery_order != HCAP11_RECOVERY_ORDER:
             raise ValueError("recovery order differs from the validated contract")
         if self.crash_signature_count != 0 or self.raw_artifact_error_count != 0:

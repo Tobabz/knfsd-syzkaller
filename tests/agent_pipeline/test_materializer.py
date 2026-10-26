@@ -13,6 +13,7 @@ from agent_pipeline.admission import (
     CallAdmissionEntry,
     CallAdmissionProfile,
     CallResourceFacts,
+    IntegerFact,
     NeutralControlCatalog,
     NeutralControlEntry,
     ProgramResourceUsage,
@@ -371,82 +372,160 @@ def plan_with_extra_capability(world):
     return plan, put_record(world.store, plan)
 
 
-def test_hcap11_program_contract_accepts_expiry_then_client0_recovery(world):
-    parsed_program = hcap11_parsed(
-        world.identity,
-        ("syz_nfsd_client_ctl$expire_client0",
-         "syz_open_nfs_lane_profile$client0_knfsd_v41", "fsync"),
-        ("nfs-profile:knfsd-v41:client0",))
-    assert _hcap11_program_error(parsed_program) is None
+C0 = "nfs-profile:knfsd-v41:client0"
+C1 = "nfs-profile:knfsd-v41:client1"
+V41_ACQUIRE = "syz_open_nfs_lane_profile$client0_knfsd_v41"
+V41_ACQUIRE1 = "syz_open_nfs_lane_profile$client1_knfsd_v41"
+PARTITION = "syz_nfs_lane_link$partition_client0"
+HEAL = "syz_nfs_lane_link$heal_client0"
+CLIENT0 = (C0,)
 
 
-@pytest.mark.parametrize(("calls", "origins", "reason"), [
-    (("syz_nfsd_client_ctl$expire_client0",
-      "syz_open_nfs_lane_profile$client1_knfsd_v41", "fsync"),
-     ("nfs-profile:knfsd-v41:client1",), "client0_recovery_missing"),
-    (("syz_nfsd_client_ctl$expire_client0",
-      "syz_open_nfs_lane_profile$client0_knfsd_v41",
-      "syz_open_nfs_lane_profile$client1_knfsd_v41"),
-     ("nfs-profile:knfsd-v41:client0",
-      "nfs-profile:knfsd-v41:client1"), "non_client0_acquisition"),
-    (("syz_open_nfs_lane_profile$client0_knfsd_v41",
-      "syz_nfsd_client_ctl$expire_client0"),
-     ("nfs-profile:knfsd-v41:client0",),
-     "client0_recovery_precedes_expiry"),
-    (("syz_nfsd_client_ctl$expire_client0",
-      "syz_nfsd_client_ctl$expire_client0",
-      "syz_open_nfs_lane_profile$client0_knfsd_v41"),
-     ("nfs-profile:knfsd-v41:client0",), "expiry_count"),
-    (("syz_nfsd_client_ctl$expire_client0",
-      "syz_open_nfs_lane_profile$client0_knfsd_v41"),
-     ("nfs-profile:knfsd-v41:client0",), "client0_recovery_io_missing"),
-    (("syz_nfsd_client_ctl$expire_client0",
-      "syz_open_nfs_lane_profile$client0_knfsd_v41", "close"),
-     ("nfs-profile:knfsd-v41:client0",), "client0_recovery_io_missing"),
-    (("syz_nfsd_client_ctl$expire_client0",
-      "syz_open_nfs_lane_profile$client0_knfsd_v41", "lseek"),
-     ("nfs-profile:knfsd-v41:client0",), "client0_recovery_io_missing"),
-    (("syz_nfsd_client_ctl$expire_client0",
-      "syz_open_nfs_lane_profile$client0_knfsd_v41",
-      "syz_open_nfs_lane_profile$client0_knfsd_v41", "fsync"),
-     ("nfs-profile:knfsd-v41:client0",), "client0_acquisition_count"),
-])
-def test_hcap11_program_contract_rejects_cross_client_order_and_count(
-        world, calls, origins, reason):
+def open_facts(origin, *, mode=2):
+    return CallResourceFacts(
+        origins=(ResourceOriginFact(argument_index=0, resource_type="fd",
+                                    origin=origin),),
+        integers=(IntegerFact(argument_index=2, value=mode),))
+
+
+def hcap11_steps(identity, steps, origins=(C0, C1)):
+    program = b"hcap11 contract fixture"
+    return ParsedProgram(
+        identity=identity, program_sha256=digest(program),
+        calls=tuple(ParsedCall(
+            index=index, call=call, availability="available",
+            resource_facts=facts or empty_facts())
+            for index, (call, facts) in enumerate(steps)),
+        usage=ProgramResourceUsage(
+            program_bytes=len(program), call_count=len(steps),
+            resource_count=len(origins)),
+        nfs_acquisitions=tuple(sorted((
+            NfsAcquisition(profile="knfsd-v41", resource_origin=origin)
+            for origin in origins),
+            key=lambda item: (item.profile, item.resource_origin))))
+
+
+#: The validated campaign program, as parser facts.
+HCAP11_PROGRAM = (
+    (V41_ACQUIRE, None),
+    ("syz_open_nlm_lane_file", open_facts(C0)),
+    (PARTITION, None),
+    (V41_ACQUIRE1, None),
+    ("syz_open_nlm_lane_file", open_facts(C1)),
+    (HEAL, None),
+    ("statx", lane_facts(C0)),
+    ("getdents64", lane_facts(C0)),
+)
+
+
+def replace_step(program, index, step):
+    return program[:index] + (step,) + program[index + 1:]
+
+
+def test_hcap11_program_contract_accepts_partition_conflict_recovery(world):
     assert _hcap11_program_error(
-        hcap11_parsed(world.identity, calls, origins)) == reason
+        hcap11_steps(world.identity, HCAP11_PROGRAM)) is None
 
 
-def test_materializer_enforces_hcap11_program_contract_before_call_grants(
-        world):
-    parsed_program = hcap11_parsed(
-        world.identity,
-        ("syz_nfsd_client_ctl$expire_client0",
-         "syz_open_nfs_lane_profile$client1_knfsd_v41", "fsync"),
-        ("nfs-profile:knfsd-v41:client1",))
+@pytest.mark.parametrize(("program", "origins", "reason"), [
+    (HCAP11_PROGRAM[:2] + HCAP11_PROGRAM[3:], (C0, C1), "partition_count"),
+    (HCAP11_PROGRAM[:2] + ((PARTITION, None),) + HCAP11_PROGRAM[2:],
+     (C0, C1), "partition_count"),
+    (HCAP11_PROGRAM[:5] + HCAP11_PROGRAM[6:], (C0, C1), "heal_count"),
+    (HCAP11_PROGRAM[:2] + ((HEAL, None),) + HCAP11_PROGRAM[2:5]
+     + HCAP11_PROGRAM[6:], (C0, C1), "heal_precedes_partition"),
+    (HCAP11_PROGRAM + (("syz_nfs_lane_link$partition_client1", None),),
+     (C0, C1), "non_client0_link_call"),
+    (HCAP11_PROGRAM, (C1,), "non_v41_lane_acquisition"),
+    (HCAP11_PROGRAM, (C0, C1, "nfs-profile:knfsd-v42:client0"),
+     "non_v41_lane_acquisition"),
+    (replace_step(HCAP11_PROGRAM, 1,
+                  ("syz_open_nlm_lane_file", open_facts(C0, mode=0))),
+     (C0, C1), "client0_open_missing"),
+    (replace_step(HCAP11_PROGRAM, 1,
+                  ("syz_open_nlm_lane_file", open_facts(C1))),
+     (C0, C1), "client0_open_missing"),
+    (replace_step(HCAP11_PROGRAM, 1, ("openat", lane_facts(C0))),
+     (C0, C1), "client0_open_missing"),
+    (replace_step(HCAP11_PROGRAM, 4,
+                  ("syz_open_nlm_lane_file", open_facts(C1, mode=1))),
+     (C0, C1), "client1_conflict_missing"),
+    (replace_step(HCAP11_PROGRAM, 4, ("openat", lane_facts(C1))),
+     (C0, C1), "client1_conflict_missing"),
+    (HCAP11_PROGRAM[:5] + (("fsync", lane_facts(C0)),) + HCAP11_PROGRAM[5:],
+     (C0, C1), "client0_io_while_partitioned"),
+    (HCAP11_PROGRAM[:6], (C0, C1), "client0_recovery_io_missing"),
+    (HCAP11_PROGRAM[:6] + (("close", lane_facts(C0)),
+                           ("lseek", lane_facts(C0))),
+     (C0, C1), "client0_recovery_io_missing"),
+    (HCAP11_PROGRAM[:6] + (("fsync", lane_facts(C1)),),
+     (C0, C1), "client0_recovery_io_missing"),
+])
+def test_hcap11_program_contract_rejects_order_count_and_clients(
+        world, program, origins, reason):
+    assert _hcap11_program_error(
+        hcap11_steps(world.identity, program, origins)) == reason
+
+
+def _admit_failure(world, parsed_program, *, role, required):
     from agent_pipeline.admission import CallAdmissionAuthority
     authority = CallAdmissionAuthority(
         hcap_revision=world.hcap_ref, profile_ref=world.profile_ref,
         profile=world.profile)
     with pytest.raises(_Failure) as caught:
         world.materializer._admit(
-            parsed_program, role="scenario", selection=world.runtime,
-            required_capabilities=("HCAP-11",), authority=authority,
+            parsed_program, role=role, selection=world.runtime,
+            required_capabilities=required, authority=authority,
             call_table=world.call_table)
-    assert caught.value.result().reason == CALL_NOT_ADMITTED
-    assert caught.value.result().detail.endswith("client0_recovery_missing")
+    return caught.value.result()
 
 
-V41_EXPIRE = "syz_nfsd_client_ctl$expire_client0"
-V41_ACQUIRE = "syz_open_nfs_lane_profile$client0_knfsd_v41"
-CLIENT0 = ("nfs-profile:knfsd-v41:client0",)
+def test_materializer_enforces_hcap11_program_contract_before_call_grants(
+        world):
+    result = _admit_failure(
+        world, hcap11_steps(world.identity, HCAP11_PROGRAM[:6]),
+        role="scenario", required=("HCAP-11",))
+    assert result.reason == CALL_NOT_ADMITTED
+    assert result.detail == (
+        "scenario_hcap11_program_contract:client0_recovery_io_missing")
+
+
+@pytest.mark.parametrize(("role", "required"), [
+    ("scenario", ("HCAP-01",)),
+    ("neutral", ("HCAP-01", "HCAP-11")),
+])
+def test_materializer_refuses_partition_outside_hcap11_scenario(
+        world, role, required):
+    result = _admit_failure(
+        world, hcap11_steps(world.identity, HCAP11_PROGRAM),
+        role=role, required=required)
+    assert result.reason == CALL_NOT_ADMITTED
+    assert result.detail == (
+        f"{role}_hcap11_program_contract:partition_without_hcap11")
+
+
+@pytest.mark.parametrize(("role", "required", "program"), [
+    ("scenario", ("HCAP-11",),
+     (("syz_nfsd_client_ctl$expire_client0", None),) + HCAP11_PROGRAM),
+    ("neutral", ("HCAP-01",),
+     ((V41_ACQUIRE, None), ("syz_nfsd_client_ctl$expire_client0", None),
+      ("fsync", lane_facts(C0)))),
+])
+def test_materializer_refuses_server_admin_expiry_before_call_grants(
+        world, role, required, program):
+    # The first HCAP-11 wrote expire to the server admin interface; that is
+    # not an NFS client action (#96), so no authority admits it any more.
+    result = _admit_failure(world, hcap11_steps(world.identity, program),
+                            role=role, required=required)
+    assert result.reason == CALL_NOT_ADMITTED
+    assert result.detail == f"{role}_server_admin_control"
 
 
 @pytest.mark.parametrize(("role", "required", "calls"), [
     ("scenario", ("HCAP-11", "HCAP-12"),
-     (V41_EXPIRE, "syz_nfsd_cld_ctl$reconnect", V41_ACQUIRE, "fsync")),
+     (V41_ACQUIRE, "syz_nfsd_cld_ctl$reconnect", "fsync")),
     ("scenario", ("HCAP-11",),
-     (V41_EXPIRE, "syz_nfsd_cld_ctl$daemon_down", V41_ACQUIRE, "fsync")),
+     (V41_ACQUIRE, "syz_nfsd_cld_ctl$daemon_down", "fsync")),
     ("neutral", ("HCAP-01",),
      ("syz_nfsd_cld_ctl$reconnect", V41_ACQUIRE, "fsync")),
 ])

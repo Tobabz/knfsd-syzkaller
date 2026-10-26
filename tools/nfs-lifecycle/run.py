@@ -23,9 +23,12 @@ from agent_pipeline.data import canonical_json, load_record
 from agent_pipeline.hcap import RuntimeSelection
 from agent_pipeline.materializer import (ExecutionHarnessDescriptor,
                                          descriptor_id)
+from agent_pipeline.qemu_accel import from_env as resolve_accel
 from agent_pipeline.q1 import KernelIdentity, TargetPcMapping
+from agent_pipeline.stage1.host.generate import HCAP11_RECOVERY_ORDER
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   guest_cmdline,
+                                                  program_timeout_s,
                                                   verify_pins)
 from agent_pipeline.stage1.host.pins import HostFilePin
 from agent_pipeline.stage1.host.target_pcs import (iter_addr2line,
@@ -40,7 +43,7 @@ CRASH_PATTERNS = (
 )
 SCENARIOS = {
     "v40-lease-expiry": {"version": "4.0", "kind": "lease"},
-    "v41-client-expiry": {"version": "4.1", "kind": "admin"},
+    "v41-courtesy-expiry": {"version": "4.1", "kind": "courtesy"},
     "v41-control-restart": {"version": "4.1", "kind": "control"},
     "v42-control-restart": {"version": "4.2", "kind": "control"},
     "v3-nlm-lock": {"version": "3", "kind": "nlm", "fixture": "nlm-knfsd"},
@@ -69,20 +72,30 @@ CONTROL_ORDER = (
     "nfsd_ctl_threads: newthreads=4",
 )
 ADMIN_EVENTS = (
-    "nfsd/nfsd_clid_admin_expired",
+    "nfsd/nfsd_cb_recall",
+    "nfsd/nfsd_mark_client_expired",
+    "nfsd/nfsd_clid_purged",
     "nfsd/nfsd_clid_fresh",
     "nfsd/nfsd_clid_confirmed",
     "nfsd/nfsd_slot_seqid_unconf",
     "nfsd/nfsd_compound_status",
 )
-ADMIN_PROGRAMS = {
+# "control" is neutral client0 lane I/O.  "stimulus" creates lock0 read-write
+# from client0, which gets it a write delegation, makes client0's link drop
+# everything past the lease (syzkaller patch 0032), opens lock0 from client1,
+# heals the link and does client0 I/O: the courteous server expires client0
+# to grant client1's open, and client0 recovers with a new clientid.  It ends
+# by unlinking lock0: knfsd gives no delegation on a file it recalled one
+# from in the last 30 to 60 s, so the next run must create a new lock0.
+COURTESY_PROGRAMS = {
     "control": ROOT / "tools/nfs-lifecycle/programs/v41-client-io-control.prog",
-    "stimulus": ROOT / "tools/nfs-lifecycle/programs/v41-client-expire.prog",
+    "stimulus": ROOT / "tools/nfs-lifecycle/programs/v41-courtesy-expiry.prog",
 }
 ADMIN_GUEST = "/tmp/nfs-lifecycle-admin"
 ADMIN_GATE = ADMIN_GUEST + "/gate"
 ADMIN_RC = ADMIN_GUEST + "/exec.rc"
 ADMIN_LOG = ADMIN_GUEST + "/exec.log"
+STATUS_STDERR = ADMIN_GUEST + "/lane-status.err"
 STATS_COMMAND = ("for f in /sys/kernel/debug/sunrpc_fuzz/*_stats; do "
                  "echo \"== $f\"; cat \"$f\"; done")
 STATE_COMMAND = "cat /sys/kernel/debug/sunrpc_fuzz/phase4_state"
@@ -95,10 +108,13 @@ LIFECYCLE_RE = re.compile(
     r"clientid=0x([0-9a-fA-F]{16}) minor=1 sessions=([1-9][0-9]*)$",
     re.MULTILINE)
 SHAREABLE_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
-ADMIN_REQUIRED_INTERFACES = frozenset((
+COURTESY_REQUIRED_INTERFACES = frozenset((
     "remote_cover",
-    "syz_nfsd_client_ctl$expire_client0",
+    "syz_nfs_lane_link$heal_client0",
+    "syz_nfs_lane_link$partition_client0",
     "syz_open_nfs_lane_profile$client0_knfsd_v41",
+    "syz_open_nfs_lane_profile$client1_knfsd_v41",
+    "syz_open_nlm_lane_file",
 ))
 NLM_REQUIRED_INTERFACES = frozenset((
     "remote_cover",
@@ -142,6 +158,20 @@ NLM_DIAGNOSTIC_PROBES = {
     "svc_grant_reply": (
         ("fs/lockd/svclock.c", "nlmsvc_grant_reply", "function"),),
 }
+# Public nfsd probes of the courtesy-expiry campaign, in the NLM_PROBES
+# form.  nfsd_break_deleg_cb runs in the nfsd thread serving client1's
+# conflicting OPEN; nfsd4_exchange_id and nfsd4_create_session in the
+# threads serving client0's recovery.  All three are program requests.
+COURTESY_PROBES = {
+    "break_deleg": (
+        ("fs/nfsd/nfs4state.c", "nfsd_break_deleg_cb", "function"),),
+    "create_session": (
+        ("fs/nfsd/nfs4state.c", "nfsd4_create_session", "function"),),
+    "exchange_id": (
+        ("fs/nfsd/nfs4state.c", "nfsd4_exchange_id", "function"),),
+}
+#: The stimulus trace chain validate_courtesy_trace checks, in order.
+COURTESY_ORDER = HCAP11_RECOVERY_ORDER
 RECLAIM_COMPLETE_RE = re.compile(
     r"nfsd_compound_status: .* OP_RECLAIM_COMPLETE status=0(?:\s|$)",
     re.MULTILINE)
@@ -188,15 +218,15 @@ class AdminContext:
 
 
 def load_admin_context(collector_path, descriptor_path, mapping_path, *,
-                       required=ADMIN_REQUIRED_INTERFACES,
+                       required=COURTESY_REQUIRED_INTERFACES,
                        profile="knfsd-v41", nfs_version="4.1",
                        fixture_mode="single"):
     """Load one exact Stage1 harness and bind the target mapping to it.
 
-    ``required`` picks the runtime selection: the client-expiry campaign
+    ``required`` picks the runtime selection: the courtesy-expiry campaign
     uses the HCAP-11 selection, the NLM campaign the nlm-knfsd NFSv3
-    selection.  The NLM campaign maps public probes itself and passes no
-    target mapping.
+    selection.  Both map public probes themselves and pass no target
+    mapping.
     """
     config_bytes = Path(collector_path).read_bytes()
     descriptor_bytes = Path(descriptor_path).read_bytes()
@@ -433,6 +463,10 @@ def shareable_error(error):
     return "%s: %s" % (type(error).__name__, message)
 
 
+def exec_watchdog_s(slowdown):
+    return 300 * slowdown
+
+
 def wait_admin_exec(vm, gate, timeout=300):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -447,16 +481,26 @@ def wait_admin_exec(vm, gate, timeout=300):
                        ("before gate" if gate else "after gate"))
 
 
-def start_admin_exec(vm, guest_program):
+def start_admin_exec(vm, guest_program, slowdown=1, program_budget_s=None):
+    """Start syz-execprog stopped at the gate.
+
+    ``slowdown`` is the collector's execprog slowdown (10 under TCG).
+    ``program_budget_s`` is the raised syzkaller program budget of a
+    program that partitions (collector.program_timeout_s).
+    """
     argv = [ADMIN_GUEST + "/syz-execprog",
             "-executor=" + ADMIN_GUEST + "/syz-executor",
             "-os=linux", "-arch=amd64", "-vmarch=amd64",
             "-sandbox=none", "-procs=1", "-repeat=1", "-threaded=false",
             "-cover=true", "-coverfile=/tmp/cov/cover",
             "-remote-cover=true", "-disable=all", "-debug", "-vv=1",
-            "-slowdown=1", "-gate=" + ADMIN_GATE, guest_program]
-    body = ("timeout 300 %s > %s 2>&1; echo $? > %s" %
-            (shlex.join(argv), ADMIN_LOG, ADMIN_RC))
+            "-slowdown=%d" % slowdown, "-gate=" + ADMIN_GATE]
+    if program_budget_s is not None:
+        argv.append("-program-timeout=%ds" % program_budget_s)
+    argv.append(guest_program)
+    body = ("timeout %d %s > %s 2>&1; echo $? > %s" %
+            (exec_watchdog_s(slowdown), shlex.join(argv), ADMIN_LOG,
+             ADMIN_RC))
     command = (
         "rm -rf /tmp/cov %s.ready %s.go %s; mkdir -p /tmp/cov; "
         "setsid nohup sh -c %s < /dev/null > /dev/null 2>&1 &" %
@@ -471,21 +515,33 @@ def one_trace_match(trace, pattern, description):
     return matches[0]
 
 
-def validate_admin_trace(trace, lifecycle_log):
-    requests = list(LIFECYCLE_RE.finditer(lifecycle_log))
-    if len(requests) != 1:
-        raise RuntimeError("successful lifecycle request count=%d, want 1" %
-                           len(requests))
-    old_value = int(requests[0].group(1), 16)
-    # client_info_show() memcpy()s clientid_t into a native u64 before
-    # printing it. On this tool's fixed linux/amd64 target that reverses the
-    # two 32-bit words relative to the tracepoint's cl_boot:cl_id format.
-    old_client = "%08x:%08x" % (old_value & 0xffffffff, old_value >> 32)
-    admin = one_trace_match(
-        trace, r"nfsd_clid_admin_expired: client " + re.escape(old_client),
-        "admin-expired trace for broker clientid")
+CLIENT_ID = r"([0-9a-f]{8}:[0-9a-f]{8})"
+
+
+def validate_courtesy_trace(trace, lifecycle_log):
+    """Check one stimulus run's server trace.
+
+    client1's OPEN recalls client0's write delegation
+    (``nfsd_cb_recall``), which makes the courteous server expire client0
+    (``nfsd_mark_client_expired``) and purge it in the laundromat; client1's
+    OPEN is then granted.  client0, healed, recovers with a new clientid:
+    EXCHANGE_ID, an unconfirmed CREATE_SESSION slot, and the confirmed
+    client.
+    """
+    if lifecycle_log.strip():
+        raise RuntimeError("courtesy stimulus invoked the lifecycle broker")
+    expired = one_trace_match(
+        trace, r"nfsd_mark_client_expired: .* client " + CLIENT_ID,
+        "courtesy client expiry")
+    old_client = expired.group(1)
+    recall = one_trace_match(
+        trace, r"nfsd_cb_recall: .* client " + re.escape(old_client) +
+        r"(?:\s|$)", "delegation recall of the expired client")
+    purged = one_trace_match(
+        trace, r"nfsd_clid_purged: client " + re.escape(old_client) +
+        r"(?:\s|$)", "purge of the expired client")
     fresh = one_trace_match(
-        trace, r"nfsd_clid_fresh: .* client=([0-9a-f]{8}:[0-9a-f]{8})",
+        trace, r"nfsd_clid_fresh: .* client=" + CLIENT_ID,
         "fresh client trace")
     new_client = fresh.group(1)
     exchange = one_trace_match(
@@ -500,8 +556,15 @@ def validate_admin_trace(trace, lifecycle_log):
     create = one_trace_match(
         trace, r"nfsd_compound_status: .* OP_CREATE_SESSION status=0(?:\s|$)",
         "successful CREATE_SESSION")
-    positions = [item.start() for item in
-                 (admin, fresh, exchange, slot, confirmed, create)]
+    granted = [item for item in re.finditer(
+        r"nfsd_compound_status: .* OP_OPEN status=0(?:\s|$)", trace,
+        re.MULTILINE) if purged.start() < item.start() < fresh.start()]
+    if len(granted) != 1:
+        raise RuntimeError("granted conflicting OPEN count=%d, want 1" %
+                           len(granted))
+    chain = (recall, expired, purged, granted[0], fresh, exchange, slot,
+             confirmed, create)
+    positions = [item.start() for item in chain]
     if positions != sorted(positions):
         raise RuntimeError("lifecycle trace events are out of order")
     if old_client == new_client:
@@ -509,20 +572,17 @@ def validate_admin_trace(trace, lifecycle_log):
     return {
         "expired_clientid": old_client,
         "recovered_clientid": new_client,
-        "session_count_before_expiry": int(requests[0].group(2)),
-        "ordered_events": [
-            "nfsd_clid_admin_expired", "nfsd_clid_fresh",
-            "OP_EXCHANGE_ID", "nfsd_slot_seqid_unconf",
-            "nfsd_clid_confirmed", "OP_CREATE_SESSION",
-        ],
-        "selected_trace_lines": [item.group(0).rstrip() for item in
-                                 (admin, fresh, exchange, slot,
-                                  confirmed, create)],
+        "ordered_events": list(COURTESY_ORDER),
+        # The fresh client's boot verifier is a hex value the shareable
+        # result must not carry.
+        "selected_trace_lines": [
+            SHAREABLE_HEX_RE.sub("(redacted)", item.group(0).strip())
+            for item in chain],
     }
 
 
 def validate_admin_control(trace, lifecycle_log):
-    forbidden = ("nfsd_clid_admin_expired:", "nfsd_clid_fresh:",
+    forbidden = ("nfsd_mark_client_expired:", "nfsd_clid_fresh:",
                  "OP_EXCHANGE_ID", "OP_CREATE_SESSION")
     present = [marker for marker in forbidden if marker in trace]
     if lifecycle_log.strip():
@@ -604,31 +664,6 @@ def _write_admin_raw(output, stem, artifacts, errors):
         (output / (stem + "." + suffix)).write_text(contents)
 
 
-def run_admin_program(vm, output, phase, iteration, tracing, target_pcs):
-    def evaluate(artifacts, pcs):
-        trace = artifacts["trace.txt"]
-        lifecycle_log = artifacts["lifecycle.log"]
-        hits = pcs & target_pcs
-        generation = generation_evidence(
-            artifacts["stats-before.txt"], artifacts["stats-after.txt"])
-        if phase == "control":
-            lineage = validate_admin_control(trace, lifecycle_log)
-            if hits:
-                raise RuntimeError(
-                    "neutral control reached %d target PCs" % len(hits))
-        else:
-            lineage = validate_admin_trace(trace, lifecycle_log)
-            if not hits:
-                raise RuntimeError(
-                    "expiry stimulus did not reach a target PC")
-        return {
-            "generation": generation,
-            "target_hit_count": len(hits),
-            "lineage": lineage,
-        }
-    return run_program(vm, output, phase, iteration, tracing, evaluate)
-
-
 def unpublished_generation_error(meta):
     """Name why a program exported .meta without remote coverage.
 
@@ -650,7 +685,8 @@ def unpublished_generation_error(meta):
         "execution: remote-KCOV generation not published")
 
 
-def run_program(vm, output, phase, iteration, tracing, evaluate):
+def run_program(vm, output, phase, iteration, tracing, evaluate, *,
+                slowdown=1, program_budget_s=None):
     """Run one gated lifecycle program and evaluate its raw artifacts.
 
     Raw artifacts are retained for every outcome; ``evaluate`` receives
@@ -665,9 +701,10 @@ def run_program(vm, output, phase, iteration, tracing, evaluate):
     cover_files = []
     try:
         set_tracing(vm, tracing, ADMIN_EVENTS, False, clear=True)
-        start_admin_exec(vm, guest_program)
+        start_admin_exec(vm, guest_program, slowdown, program_budget_s)
         execution_started = True
-        if wait_admin_exec(vm, True) != "ready":
+        watchdog = exec_watchdog_s(slowdown)
+        if wait_admin_exec(vm, True, watchdog) != "ready":
             raise RuntimeError("syz-execprog exited before the program gate")
         state_before = vm.guest(STATE_COMMAND)
         artifacts["state-before.txt"] = state_before
@@ -682,7 +719,7 @@ def run_program(vm, output, phase, iteration, tracing, evaluate):
             "/tmp/frozen-phase9.manager/lane0/server/lifecycle.log").strip())
         set_tracing(vm, tracing, ADMIN_EVENTS, True, clear=True)
         vm.guest("touch %s.go" % ADMIN_GATE)
-        if wait_admin_exec(vm, False) != "exited":
+        if wait_admin_exec(vm, False, watchdog) != "exited":
             raise RuntimeError("syz-execprog did not exit")
         rc = vm.guest("cat %s" % ADMIN_RC).strip()
         executor_log = vm.guest("cat %s" % ADMIN_LOG, timeout=120)
@@ -728,23 +765,6 @@ def run_program(vm, output, phase, iteration, tracing, evaluate):
         except Exception as error:
             errors.append("disable-tracing: %s" % error)
         _write_admin_raw(output, stem, artifacts, errors)
-
-
-def run_admin(vm, output, repeat, files, target_pcs):
-    tracing = trace_root(vm, ADMIN_EVENTS)
-    vm.guest("mkdir -p %s; dmesg -c >/dev/null" % ADMIN_GUEST)
-    for name in ("syz-executor", "syz-execprog"):
-        vm.put(files[name], ADMIN_GUEST + "/" + name)
-    for phase, path in ADMIN_PROGRAMS.items():
-        vm.put(path, "%s/%s.prog" % (ADMIN_GUEST, phase))
-    vm.guest("chmod 0755 %s/syz-executor %s/syz-execprog" %
-             (ADMIN_GUEST, ADMIN_GUEST))
-    cycles = {"control": [], "stimulus": []}
-    for phase in ("control", "stimulus"):
-        for iteration in range(1, repeat + 1):
-            cycles[phase].append(run_admin_program(
-                vm, output, phase, iteration, tracing, target_pcs))
-    return tracing, cycles
 
 
 def probe_range(source, function, part):
@@ -856,7 +876,7 @@ def build_probes(context, kernel_source, cache, output, table, kind):
 
 
 def run_nlm_program(vm, output, phase, iteration, tracing, probes,
-                    diagnostics):
+                    diagnostics, slowdown=1):
     def evaluate(artifacts, pcs):
         lineage = validate_admin_control(
             artifacts["trace.txt"], artifacts["lifecycle.log"])
@@ -870,23 +890,39 @@ def run_nlm_program(vm, output, phase, iteration, tracing, probes,
                             for name, probe in diagnostics.items()},
         }
 
-    result = run_program(vm, output, phase, iteration, tracing, evaluate)
+    result = run_program(vm, output, phase, iteration, tracing, evaluate,
+                         slowdown=slowdown)
+    check_fixture_after(vm, output, phase, iteration, NLM_FIXTURE)
+    result["status_check"] = "pass"
+    return result
+
+
+def check_fixture_after(vm, output, phase, iteration, fixture_mode):
+    """Require a healthy lane fixture and a clean dmesg after one run."""
     stem = "%s-%03d" % (phase, iteration)
+    # The guest API returns stdout and stderr together; keep them apart so
+    # the status JSON parses and anything on stderr is retained.
     try:
-        status = json.loads(vm.guest(
-            "/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager"))
+        raw = vm.guest(
+            "/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager "
+            "2>%s" % STATUS_STDERR)
+        (output / (stem + ".lane-status.txt")).write_text(raw)
+        stderr = vm.guest("cat %s" % STATUS_STDERR)
+        (output / (stem + ".lane-status.stderr.txt")).write_text(stderr)
+        status = json.loads(raw)
     except Exception as error:
         raise RuntimeError("fixture: lane status failed after %s: %s" %
                            (phase, error)) from error
-    if status.get("fixture_mode") != NLM_FIXTURE:
+    if stderr.strip():
+        raise RuntimeError("fixture: lane status wrote to stderr after %s: %s"
+                           % (phase, stderr.strip().splitlines()[0][:200]))
+    if status.get("fixture_mode") != fixture_mode:
         raise RuntimeError("fixture: lane status changed fixture mode")
     dmesg = vm.guest("dmesg")
     (output / (stem + ".dmesg.txt")).write_text(dmesg)
     crashes = [pattern for pattern in CRASH_PATTERNS if pattern in dmesg]
     if crashes:
         raise RuntimeError("kernel crash signatures: %s" % crashes)
-    result["status_check"] = "pass"
-    return result
 
 
 def check_nlm_run(phase, run):
@@ -908,7 +944,7 @@ def check_nlm_run(phase, run):
         raise RuntimeError("lock run reached a grant callback")
 
 
-def run_nlm(vm, output, repeat, files, probes, diagnostics):
+def run_nlm(vm, output, repeat, files, probes, diagnostics, slowdown=1):
     tracing = trace_root(vm, ADMIN_EVENTS)
     vm.guest("mkdir -p %s" % ADMIN_GUEST)
     for name in ("syz-executor", "syz-execprog"):
@@ -921,7 +957,7 @@ def run_nlm(vm, output, repeat, files, probes, diagnostics):
     for phase in NLM_PROGRAMS:
         for iteration in range(1, repeat + 1):
             run = run_nlm_program(vm, output, phase, iteration, tracing,
-                                  probes, diagnostics)
+                                  probes, diagnostics, slowdown)
             check_nlm_run(phase, run)
             cycles[phase].append(run)
     return tracing, cycles
@@ -974,6 +1010,119 @@ def hcap13_evidence(context, guest_identity, probe_digests, cycles,
         bool(SHAREABLE_HEX_RE.search(result_bytes.decode())),
     }
     return Hcap13KvmEvidence.model_validate(evidence)
+
+
+def run_courtesy_program(vm, output, phase, iteration, tracing, probes,
+                         slowdown=1):
+    def evaluate(artifacts, pcs):
+        trace = artifacts["trace.txt"]
+        lifecycle_log = artifacts["lifecycle.log"]
+        if phase == "control":
+            lineage = validate_admin_control(trace, lifecycle_log)
+        else:
+            lineage = validate_courtesy_trace(trace, lifecycle_log)
+        return {
+            "generation": generation_evidence(
+                artifacts["stats-before.txt"], artifacts["stats-after.txt"]),
+            "probe_hits": {name: len(pcs & probe)
+                           for name, probe in probes.items()},
+            "lineage": lineage,
+        }
+
+    result = run_program(
+        vm, output, phase, iteration, tracing, evaluate, slowdown=slowdown,
+        program_budget_s=program_timeout_s(
+            COURTESY_PROGRAMS[phase].read_bytes(), slowdown))
+    check_fixture_after(vm, output, phase, iteration, "single")
+    result["status_check"] = "pass"
+    return result
+
+
+def check_courtesy_run(phase, run):
+    """Fail closed on a run outside the phase's validated nfsd reach."""
+    hits = run["probe_hits"]
+    for name in sorted(COURTESY_PROBES):
+        if phase == "control" and hits[name]:
+            raise RuntimeError("neutral control reached nfsd probe %s" % name)
+        if phase == "stimulus" and not hits[name]:
+            raise RuntimeError("stimulus run missed %s" % name)
+
+
+def run_courtesy(vm, output, repeat, files, probes, slowdown=1):
+    tracing = trace_root(vm, ADMIN_EVENTS)
+    vm.guest("mkdir -p %s; dmesg -c >/dev/null" % ADMIN_GUEST)
+    for name in ("syz-executor", "syz-execprog"):
+        vm.put(files[name], ADMIN_GUEST + "/" + name)
+    for phase, path in COURTESY_PROGRAMS.items():
+        vm.put(path, "%s/%s.prog" % (ADMIN_GUEST, phase))
+    vm.guest("chmod 0755 %s/syz-executor %s/syz-execprog" %
+             (ADMIN_GUEST, ADMIN_GUEST))
+    cycles = {phase: [] for phase in COURTESY_PROGRAMS}
+    for phase in COURTESY_PROGRAMS:
+        for iteration in range(1, repeat + 1):
+            run = run_courtesy_program(vm, output, phase, iteration, tracing,
+                                       probes, slowdown)
+            check_courtesy_run(phase, run)
+            cycles[phase].append(run)
+    return tracing, cycles
+
+
+def hcap11_evidence(context, guest_identity, probe_digests, cycles,
+                    result_bytes, crash_count, artifact_errors):
+    """Assemble and type-check the HCAP-11 evidence for this campaign."""
+    from agent_pipeline.stage1.host.generate import (HCAP11_LEASE_TIME_S,
+                                                     HCAP11_PARTITION_HOLD_S,
+                                                     Hcap11KvmEvidence)
+
+    runs = {}
+    for phase, items in cycles.items():
+        runs[phase] = {
+            "completed": len(items),
+            "probe_hits": {name: [run["probe_hits"][name] for run in items]
+                           for name in sorted(COURTESY_PROBES)},
+            "status_checks_passed": sum(
+                run["status_check"] == "pass" for run in items),
+            "attributed_generations": sum(
+                bool(run["generation"]) for run in items),
+        }
+    orders = {tuple(run["lineage"]["ordered_events"])
+              for run in cycles["stimulus"]}
+    if len(orders) != 1:
+        raise RuntimeError("stimulus runs disagree on the recovery order")
+    generations = [run["generation"] for items in cycles.values()
+                   for run in items]
+    evidence = {
+        "schema_version": "hcap-kvm-evidence.v1",
+        "capability_id": "HCAP-11",
+        "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "scenario": "v41-courtesy-expiry",
+        "execution_harness_id": context.identity.execution_harness_id,
+        "mapping_identity": context.identity.model_dump(mode="json"),
+        "probe_mapping_sha256": probe_digests,
+        "campaign_result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+        "guest_lane_script_sha256": guest_identity["guest_lane_script_sha256"],
+        "guest_nfs_proxy_sha256": guest_identity["guest_nfs_proxy_sha256"],
+        "nfsv4_lease_time_s": HCAP11_LEASE_TIME_S,
+        "partition_hold_s": HCAP11_PARTITION_HOLD_S,
+        "runs": runs,
+        "generation_contract": {
+            "generation_begin_each": 1,
+            "aggregate_published_each": 1,
+            "generation_aborted_each": 0,
+            "scratch_overflow_each": 0,
+            "merge_truncation_each": 0,
+            "outstanding_tokens_after_each": 0,
+            "remote_refs_after_each": 0,
+            "minimum_remote_start_ok": min(
+                item["remote_start_ok"] for item in generations),
+        },
+        "recovery_order": list(orders.pop()),
+        "crash_signature_count": crash_count,
+        "raw_artifact_error_count": artifact_errors,
+        "shareable_result_contains_target_metadata_or_addresses":
+        bool(SHAREABLE_HEX_RE.search(result_bytes.decode())),
+    }
+    return Hcap11KvmEvidence.model_validate(evidence)
 
 
 def lease_guest_script(path):
@@ -1223,62 +1372,49 @@ def main():
     parser.add_argument("--ssh-key", type=Path,
                         default=ROOT / "artifacts/bookworm.id_rsa")
     parser.add_argument("--collector-config", type=Path,
-                        help="Stage1 collector.json (required by client expiry)")
+                        help="Stage1 collector.json (required by "
+                        "v41-courtesy-expiry and v3-nlm-lock)")
     parser.add_argument("--descriptor", type=Path,
-                        help="exact Stage1 descriptor.json (required by client expiry)")
+                        help="exact Stage1 descriptor.json (required by "
+                        "v41-courtesy-expiry and v3-nlm-lock)")
     parser.add_argument("--target-pcs", type=Path,
-                        help="verified q1 target-PC mapping (required by client expiry)")
+                        help="refused: the probe campaigns map public "
+                        "probes themselves")
     parser.add_argument("--kernel-source", type=Path,
                         default=ROOT / "env/linux",
                         help="kernel git tree holding the descriptor's "
-                        "kernel commit (v3-nlm-lock probes)")
+                        "kernel commit (probe campaigns)")
     parser.add_argument("--boot-timeout", type=int, default=240)
     args = parser.parse_args()
     if args.repeat < 1 or args.repeat > 999:
         parser.error("--repeat must be between 1 and 999")
     definition = SCENARIOS[args.scenario]
     admin_context = None
-    if definition["kind"] == "nlm":
+    if definition["kind"] in ("nlm", "courtesy"):
         if args.repeat < 3:
-            parser.error("v3-nlm-lock evidence needs --repeat >= 3")
+            parser.error("%s evidence needs --repeat >= 3" % args.scenario)
         for option, path in (("--collector-config", args.collector_config),
                              ("--descriptor", args.descriptor)):
             if path is None or not path.resolve().is_file():
-                parser.error("%s is required by v3-nlm-lock" % option)
+                parser.error("%s is required by %s" % (option, args.scenario))
         if args.target_pcs is not None:
-            parser.error("v3-nlm-lock maps public probes itself; "
-                         "do not pass a candidate --target-pcs mapping")
+            parser.error("%s maps public probes itself; do not pass a "
+                         "candidate --target-pcs mapping" % args.scenario)
+        if definition["kind"] == "nlm":
+            selection = dict(required=NLM_REQUIRED_INTERFACES,
+                             profile="knfsd-v3", nfs_version="3",
+                             fixture_mode=NLM_FIXTURE)
+            programs = NLM_PROGRAMS
+        else:
+            selection = dict(required=COURTESY_REQUIRED_INTERFACES)
+            programs = COURTESY_PROGRAMS
         try:
             admin_context = load_admin_context(
                 args.collector_config.resolve(), args.descriptor.resolve(),
-                None, required=NLM_REQUIRED_INTERFACES, profile="knfsd-v3",
-                nfs_version="3", fixture_mode=NLM_FIXTURE)
+                None, **selection)
         except Exception as error:
             parser.error("invalid identity-bound lifecycle inputs: %s" % error)
-        for path in NLM_PROGRAMS.values():
-            if not path.is_file():
-                parser.error("missing lifecycle program: %s" % path)
-    elif definition["kind"] == "admin":
-        required = {
-            "--collector-config": args.collector_config,
-            "--descriptor": args.descriptor,
-            "--target-pcs": args.target_pcs,
-        }
-        for option, path in required.items():
-            if path is None:
-                parser.error("%s is required by v41-client-expiry" % option)
-            path = path.resolve()
-            if not path.is_file():
-                parser.error("missing %s: %s" % (option, path))
-        args.collector_config = args.collector_config.resolve()
-        args.descriptor = args.descriptor.resolve()
-        args.target_pcs = args.target_pcs.resolve()
-        try:
-            admin_context = load_admin_context(
-                args.collector_config, args.descriptor, args.target_pcs)
-        except Exception as error:
-            parser.error("invalid identity-bound lifecycle inputs: %s" % error)
-        for path in ADMIN_PROGRAMS.values():
+        for path in programs.values():
             if not path.is_file():
                 parser.error("missing lifecycle program: %s" % path)
     else:
@@ -1300,17 +1436,20 @@ def main():
               "iterations": args.repeat, "transport": "TCP", "status": "fail"}
     probes = probe_digests = guest_identity = diagnostics = None
     cycles = None
-    if definition["kind"] == "nlm":
+    if definition["kind"] in ("nlm", "courtesy"):
         # Host-only: map the public probes before booting the guest.
+        if definition["kind"] == "nlm":
+            table, kind = NLM_PROBES, "nlm"
+            extra = NLM_DIAGNOSTIC_PROBES
+        else:
+            table, kind, extra = COURTESY_PROBES, "nfsd", {}
         try:
             mapped, digests = build_probes(
                 admin_context, args.kernel_source.resolve(),
-                output / "probe-cache", output,
-                {**NLM_PROBES, **NLM_DIAGNOSTIC_PROBES}, "nlm")
-            probes = {name: mapped[name] for name in NLM_PROBES}
-            probe_digests = {name: digests[name] for name in NLM_PROBES}
-            diagnostics = {name: mapped[name]
-                           for name in NLM_DIAGNOSTIC_PROBES}
+                output / "probe-cache", output, {**table, **extra}, kind)
+            probes = {name: mapped[name] for name in table}
+            probe_digests = {name: digests[name] for name in table}
+            diagnostics = {name: mapped[name] for name in extra}
         except Exception as error:
             result["error"] = shareable_error(error)
             (output / "result.json").write_text(
@@ -1324,7 +1463,8 @@ def main():
     else:
         vm = load_legacy_vm_class()(
             args.image, args.kernel, args.ssh_key,
-            args.boot_timeout, definition["version"])
+            args.boot_timeout, definition["version"],
+            accel=resolve_accel())
     tracing = None
     try:
         vm.start()
@@ -1341,21 +1481,20 @@ def main():
         if definition["kind"] == "lease":
             tracing, cycles = run_lease(vm, output, args.repeat)
             result["complete_lifecycle_chains"] = len(cycles)
-        elif definition["kind"] == "admin":
-            result["evidence_identity"].update(
-                verify_admin_guest(vm, admin_context))
-            vm.guest("test -S /syz-nfs-lanes/proc-0/control/lifecycle.sock")
-            tracing, cycles = run_admin(
-                vm, output, args.repeat, admin_context.files,
-                admin_context.target_pcs)
-            result["complete_control_runs"] = len(cycles["control"])
-            result["complete_stimulus_runs"] = len(cycles["stimulus"])
+        elif definition["kind"] == "courtesy":
+            guest_identity = verify_admin_guest(vm, admin_context)
+            result["evidence_identity"].update(guest_identity)
+            tracing, cycles = run_courtesy(
+                vm, output, args.repeat, admin_context.files, probes,
+                admin_context.config.exec_slowdown)
+            result["complete_runs"] = {
+                phase: len(items) for phase, items in cycles.items()}
         elif definition["kind"] == "nlm":
             guest_identity = verify_admin_guest(vm, admin_context)
             result["evidence_identity"].update(guest_identity)
             tracing, cycles = run_nlm(
                 vm, output, args.repeat, admin_context.files, probes,
-                diagnostics)
+                diagnostics, admin_context.config.exec_slowdown)
             result["complete_runs"] = {
                 phase: len(items) for phase, items in cycles.items()}
         else:
@@ -1385,14 +1524,19 @@ def main():
                    "\n").encode()
         (output / "result.json").write_bytes(encoded)
         print(encoded.decode(), end="", flush=True)
-        if definition["kind"] == "nlm" and result["status"] == "pass":
+        if (definition["kind"] in ("nlm", "courtesy")
+                and result["status"] == "pass"):
             errors = sum(1 for _ in output.glob("*.artifact-errors.txt"))
-            evidence = hcap13_evidence(
+            make, name, capability = (
+                (hcap13_evidence, "hcap13-kvm.json", "HCAP-13")
+                if definition["kind"] == "nlm" else
+                (hcap11_evidence, "hcap11-kvm.json", "HCAP-11"))
+            evidence = make(
                 admin_context, guest_identity, probe_digests, cycles,
                 encoded, len(result["crash_signatures"]), errors)
-            (output / "hcap13-kvm.json").write_text(
+            (output / name).write_text(
                 evidence.model_dump_json(indent=2) + "\n")
-            print("HCAP-13 evidence: %s" % (output / "hcap13-kvm.json"))
+            print("%s evidence: %s" % (capability, output / name))
 
 
 if __name__ == "__main__":

@@ -565,60 +565,91 @@ tools/nfs-proxy/src/delta.h
 tools/nfs-proxy/README.md
 ```
 
-### HCAP-11 — Bounded NFSv4.1 client lifecycle recovery
-
-> 트리거 기준(§3.2) 위반: expiry는 서버 namespace의 broker가 서버 관리 인터페이스
-> `/proc/fs/nfsd/clients/<id>/ctl`에 쓰는 동작이다. Agent 사용 범위에서 빼고 자연 경로(lease 만료와 그 귀속
-> 계측)로 다시 만든다. 아래는 code를 바꾸기 전의 현재 상태다.
+### HCAP-11 — Client-induced NFSv4.1 client expiry recovery
 
 ```text
 id: HCAP-11
-name: bounded NFSv4.1 client lifecycle recovery
+name: client-induced NFSv4.1 client expiry recovery
 usable_stage: [stage1]
 usable_by: [agent_stage1]
 status: validated
-scope: [client0_confirmed_expiry_recovery]
+scope: [client0_courtesy_expiry_recovery]
 
 interface:
-    syz_nfsd_client_ctl$expire_client0(0x0)  # exact admitted invocation
+    syz_open_nlm_lane_file
+    syz_nfs_lane_link$partition_client0(0x0, 0x0)
+    syz_nfs_lane_link$heal_client0(0x0, 0x1)
 
 purpose:
-    lane 0의 확정된 NFSv4.1 클라이언트 하나를 만료시키고
+    lane 0의 client0이 lease보다 오래 서버와 끊겨 courtesy client가 된 뒤,
+    client1의 충돌하는 OPEN으로 서버가 client0을 만료시키게 하고
     일반 client0 profile I/O로 EXCHANGE_ID -> CREATE_SESSION 복구를 유도
 
 constraints:
-    single NFSv4.1 fixture와 SERVER_IMPL=both를 사용
-    client0 selector 인자는 반드시 고정값 0x0을 사용하며 expiry는 정확히 한 번 수행
-    expiry 뒤에 client0 profile을 획득하고 client1 획득이나 선행 client0 획득은 거부
-    lifecycle broker가 정확히 하나의 confirmed minor-version-1 owner를 해석
-    owner는 Linux NFSv4.1 frozen-phase9-lane0-client0/<UTS hostname>과 정확히 일치
-    syz 호출은 client selector만 전달하며 client path, owner, ctl payload를 전달하지 않음
-    broker만 /proc/fs/nfsd/clients/<client>/ctl을 선택하고 literal expire를 기록
-    broker reply의 clientid, minorversion=1, session_count>0을 executor가 검사
-    한 번의 expiry 뒤 client0 profile도 정확히 한 번 획득하고,
-    parser가 client0 FD origin을 증명한 ordinary profile I/O를 수행
-    profile 획득만 하거나 close/lseek만 수행한 프로그램은 recovery I/O로 인정하지 않음
+    single NFSv4.1 fixture, SERVER_IMPL=both, 기본 NFSv4 lease 10 s
+    모든 트리거는 NFS client 행위다(§3.2): client0은 자기 lane network namespace의
+    자기 link에서 보내는 packet만 버리고, 만료는 client1의 OPEN에 대한 서버의 반응이다.
+    서버 namespace에는 아무것도 하지 않는다.
+    순서:
+        r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)
+        r1 = syz_open_nlm_lane_file(r0, name, 0x2)   # read-write, write delegation을 받는다
+        syz_nfs_lane_link$partition_client0(0x0, 0x0) 정확히 한 번
+            # link가 15 s(lease보다 김) 동안 보내는 packet을 모두 버리고, 버리는 채로 돌아온다
+        r2 = syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1)
+        r3 = syz_open_nlm_lane_file(r2, 같은 name, 0x2)
+        syz_nfs_lane_link$heal_client0(0x0, 0x1) 정확히 한 번
+        parser가 client0 FD origin을 증명한 일반 I/O 하나 이상(statx, getdents64 등.
+        close와 lseek는 인정하지 않음)
+    partition과 heal 사이에는 client0 origin call이 없어야 한다(끊긴 link에서 기다린다)
+    두 open이 같은 파일을 가리키는지는 parser fact가 아니다. 다른 파일을 열면 경로에 닿지 못할 뿐이다
+    knfsd는 최근 30~60 s 안에 delegation을 회수한 파일에는 delegation을 주지 않는다. 반복 실행하는
+    프로그램은 스스로 만든 파일에서 시작해야 하므로, 검증된 stimulus는 O_CREAT(mode 0x2)로 열고
+    마지막에 client0이 그 파일을 unlinkat한다
+    partition을 쓰는 프로그램은 syzkaller 기본 프로그램 예산(5 s)을 넘으므로 Stage 1 collector가
+    syz-execprog -program-timeout을 올린다(KVM 90 s, TCG 270 s)
 ```
 
-executor ABI에는 lane 1용 `syz_nfsd_client_ctl$expire_client1`도 존재하지만, HCAP-11과
-CallAdmissionProfile은 실제 KVM에서 검증된 client0만 공개한다. client1은 별도의 runtime 증거가 생기기 전까지
-Agent가 사용할 수 없다. 2026-10-19 실 KVM 검증에서는 neutral control 3회가 승인된 target mapping을 실행하지
-않았고, expiry stimulus 3회는 모두 그 mapping을 실행했다. 각 실행은 remote-KCOV generation begin/publish 1회,
-abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록했다. HCAP-03은 이 실행의
-generation attribution을 계속 담당하며 HCAP-11이 이를 대체하지 않는다. 공유 증거는 실행 descriptor와
-target mapping의 digest 및 전체 mapping identity를 기록하고 후보 source metadata와 target 주소는 포함하지
-않는다. Host generator는 이 typed evidence의 execution harness, kernel/instrumentation/vmlinux/KASLR identity와
-guest lane script digest를 새 descriptor에 대해 다시 검사한 뒤에만 HCAP-11을 promotion한다. fixture status는
-lifecycle broker의 PID start time, server mount/net namespace, 명령행과 정확한 UNIX socket inode 소유권을 함께
-검사하여 stale pathname이나 재사용된 PID를 broker로 인정하지 않는다.
+트리거는 knfsd의 courteous server 동작이다. NFSv4.1 client가 lease 동안 갱신하지 않아도 session이 있으면
+서버는 바로 지우지 않고 `NFSD4_COURTESY`로 남긴다. 다른 client의 요청이 그 client의 state와 충돌할 때에만
+`try_to_expire_client`가 만료시킨다. 검증된 경로에서는 client0이 read-write open으로 write delegation을 받아
+두었고, client1의 OPEN이 그 delegation을 회수하는 `nfsd_break_deleg_cb`(client1 OPEN을 처리하는 nfsd
+thread, 귀속됨)가 courtesy client0을 찾아 laundromat을 깨운다. laundromat의 `mark_client_expired`와 purge는
+workqueue에서 돌아 귀속되지 않는다. client1의 OPEN은 `NFS4ERR_DELAY` 뒤 허가된다. heal 뒤 client0은
+`BADSESSION`과 `STALE_CLIENTID`를 받고 새 clientid로 EXCHANGE_ID, CREATE_SESSION을 한다(nfsd request,
+귀속됨). 첫 HCAP-11이 쓰던 서버 관리 인터페이스 `/proc/fs/nfsd/clients/<id>/ctl` 쓰기
+(`syz_nfsd_client_ctl$expire_client0`)는 NFS client 행위가 아니므로(#96) materializer가 어떤 admission
+authority가 허용하더라도 `syz_nfsd_client_ctl$` call을 `CALL_NOT_ADMITTED`(`<role>_server_admin_control`)로
+거부한다. syzkaller patch 0027의 executor call과 `tools/nfs-proxy/src/lifecycle.c` broker는 fixture 작업용으로
+남는다. `syz_nfs_lane_link$` call은 HCAP-11 scenario 밖에서(neutral control 포함) 거부된다.
+
+KVM 증거는 `tools/nfs-lifecycle/run.py --scenario v41-courtesy-expiry --repeat 3`이 만든다. neutral control
+(client0 lane I/O) 3회와 stimulus 3회를 같은 harness에서 돌린다. 각 실행은 remote-KCOV generation
+begin/publish 1회, abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록하고, 실행 뒤
+`lane.sh status`가 fixture를 정상으로 보고하며 dmesg에 crash가 없어야 한다. public probe 세 개
+(`nfsd_break_deleg_cb`, `nfsd4_exchange_id`, `nfsd4_create_session`)를 pinned vmlinux의 coverage callsite로
+mapping하고, control은 셋 다 놓치고 stimulus는 매번 셋 다 실행해야 한다. stimulus의 서버 trace는
+`nfsd_cb_recall` -> `nfsd_mark_client_expired` -> `nfsd_clid_purged` -> client1 `OP_OPEN` 허가 ->
+`nfsd_clid_fresh` -> `OP_EXCHANGE_ID` -> `nfsd_slot_seqid_unconf` -> `nfsd_clid_confirmed` ->
+`OP_CREATE_SESSION` 순서여야 하고 복구한 clientid는 만료된 것과 달라야 한다. HCAP-03은 이 실행의 generation attribution을 계속 담당한다. 공유 증거는
+probe mapping digest와 전체 mapping identity를 기록하고 target 주소는 포함하지 않는다. Host generator는 이
+typed evidence의 execution harness, kernel/instrumentation/vmlinux/KASLR identity와 guest lane script digest를
+새 descriptor에 대해 다시 검사한 뒤에만 HCAP-11을 promotion한다.
+
+2026-10-25 증거(`capability-evidence/hcap11-kvm.json`)는 KVM이 없는 host에서 TCG(`exec_slowdown` 10)로
+얻었다. control 3회는 세 probe를 모두 놓쳤고, stimulus 3회는 매번 `nfsd_break_deleg_cb` 9개,
+`nfsd4_exchange_id` 22개, `nfsd4_create_session` 55개 PC를 실행했으며 위 순서의 trace를 남겼다. 6회 모두
+lane status 정상, crash 0이었다. 앞선 시도에서 확인한 두 가지가 설계에 반영되어 있다. link를 내리는
+partition은 client에 `ENETUNREACH`를 돌려주고 lane의 정적 경로를 지워 복구가 멈췄으므로, 0032는 link를
+유지한 채 blackhole root qdisc로 packet만 버린다. 같은 `lock0`을 다시 쓰는 반복 실행은 knfsd가 delegation을
+주지 않아 충돌이 생기지 않았으므로, stimulus는 마지막에 `lock0`을 지운다.
 
 source refs:
 
 ```text
-bundle/patches/syzkaller/0027-*
+bundle/patches/syzkaller/0032-*
 bundle/lane/lane.sh
-tools/nfs-proxy/src/lifecycle.c
 tools/nfs-lifecycle/run.py
+tools/nfs-lifecycle/programs/v41-courtesy-expiry.prog
 agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
 ```
 
@@ -800,7 +831,7 @@ STAGE 1
     HCAP-04 lane topology
     HCAP-05 normal-flow seeds
     HCAP-06 flow tracing
-    HCAP-11 bounded NFSv4.1 client lifecycle recovery
+    HCAP-11 client-induced NFSv4.1 client expiry recovery
     HCAP-13 NLM lane locking and raw NLM RPC
 
 STAGE 2

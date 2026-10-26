@@ -391,6 +391,9 @@ func preservesRoots(name string) bool {
 		"ftruncate", "fallocate", "flock", "fchmod", "fchown", "fadvise64", "readahead",
 		"sync_file_range", "copy_file_range", "fsetxattr", "fgetxattr", "flistxattr", "fremovexattr",
 		"openat", "nanosleep", "syz_nfsd_client_ctl", "syz_nfsd_cld_ctl",
+		// A lane client partition (0032) changes the client's link, not
+		// the descriptor table.
+		"syz_nfs_lane_link",
 		// NLM lane calls (0030) and fcntl neither close nor rebind an
 		// existing descriptor; F_DUPFD returns a new, unrooted one.
 		"fcntl", "recvfrom", "syz_socket_connect_nlm", "syz_nlm_lane_fh", "syz_send_nlm_rpc",
