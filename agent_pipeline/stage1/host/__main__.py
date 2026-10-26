@@ -64,7 +64,7 @@ def cmd_generate(args) -> int:
     if args.gap is not None:
         from ...hcap import GapContract
         gap = GapContract.model_validate_json(args.gap.read_bytes())
-    result = generate(args.spec, gap=gap)
+    result = generate(args.spec, gap=gap, base_spec=args.base_spec)
     print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
     return 0
 
@@ -205,6 +205,9 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--gap", type=Path,
                    help="the Controller's GapContract for the gap a Harness "
                         "Generation patch set fills (#100)")
+    g.add_argument("--base-spec", type=Path,
+                   help="with --gap, the host spec the patch set started "
+                        "from")
     c = sub.add_parser("collect")
     c.add_argument("--config", type=Path, required=True)
     c.add_argument("input", type=Path)

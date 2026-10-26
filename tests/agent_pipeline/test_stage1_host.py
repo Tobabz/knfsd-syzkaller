@@ -1932,29 +1932,66 @@ def test_a_new_capability_must_meet_the_promotion_criteria(host):
     assert catalog.gap_contracts[0].missing_capability_id == "lane.partition"
 
     # A Harness Generation patch set can change the spec, so the Controller
-    # passes the gap and its contract: the spec cannot narrow that contract,
-    # and every new or revised capability fills that gap.
+    # passes the gap, its contract and the spec the patch set started from:
+    # the spec cannot narrow that contract, and every capability the patch
+    # set adds or changes fills that gap.
     gap = GapContract.model_validate_json(json.dumps(
         {"missing_capability_id": "lane.partition",
          "contract": PROBE_CONTRACT}))
-    generate(host.spec, gap=gap)
+    base_spec = host.root / "base-spec.json"
+    base_spec.write_text(json.dumps(
+        {**spec, "capabilities": spec["capabilities"][:-1]}, indent=1))
+    with pytest.raises(GenerationError, match="the gap and the base spec"):
+        generate(host.spec, gap=gap)
+    generate(host.spec, gap=gap, base_spec=base_spec)
     narrowed = GapContract.model_validate_json(json.dumps(
         {"missing_capability_id": "lane.partition",
          "contract": {**PROBE_CONTRACT, "time_dependent": True}}))
     with pytest.raises(GenerationError, match="another contract than the "
                        "Controller's"):
-        generate(host.spec, gap=narrowed)
+        generate(host.spec, gap=narrowed, base_spec=base_spec)
     del spec["gap_contracts"]
     host.spec.write_text(json.dumps(spec, indent=1))
     catalog = load_record(ArtifactStore(host.root / "cas"),
-                          generate(host.spec, gap=gap).hcap_revision,
+                          generate(host.spec, gap=gap,
+                                   base_spec=base_spec).hcap_revision,
                           HcapCatalog)
     assert catalog.gap_contracts == (gap,)
+    # Once CAP-new is in the base, a later patch set that leaves it alone
+    # is not held to the later gap, and one that changes nothing fills none.
+    base_spec.write_text(host.spec.read_text())
+    with pytest.raises(GenerationError, match="adds or changes no "
+                       "capability for gap lane.partition"):
+        generate(host.spec, gap=gap, base_spec=base_spec)
     del spec["capabilities"][-1]["fills_gap"]
     host.spec.write_text(json.dumps(spec, indent=1))
     with pytest.raises(GenerationError, match="CAP-new does not fill gap "
                        "lane.partition"):
-        generate(host.spec, gap=gap)
+        generate(host.spec, gap=gap, base_spec=base_spec)
+
+
+def test_a_patch_set_is_held_to_its_own_gap_only():
+    """Capabilities the base already holds, filling another gap or none,
+    are not the patch set's."""
+    base = _capabilities()
+    earlier = base[0].model_copy(update={"id": "CAP-a",
+                                         "fills_gap": "gap.a"})
+    human = base[0].model_copy(update={"id": "CAP-human"})
+    new = base[0].model_copy(update={"id": "CAP-b", "fills_gap": "gap.b"})
+
+    def spec(*capabilities):
+        return SimpleNamespace(capabilities=capabilities)
+
+    changed = generate_module._changed_capabilities(
+        spec(earlier, human, new), spec(earlier, human))
+    assert changed == (new,)
+    generate_module._check_fills(changed, "gap.b")
+    revised = human.model_copy(update={"purpose": "changed by the patch"})
+    changed = generate_module._changed_capabilities(
+        spec(earlier, revised, new), spec(earlier, human))
+    with pytest.raises(GenerationError, match="CAP-human does not fill gap "
+                       "gap.b"):
+        generate_module._check_fills(changed, "gap.b")
 
 
 @needs_gcc

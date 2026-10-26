@@ -668,12 +668,21 @@ def _with_gap(spec: HostSpec, gap: GapContract) -> HostSpec:
         sorted(contracts, key=lambda g: g.missing_capability_id))})
 
 
+def _changed_capabilities(spec: HostSpec,
+                          base: HostSpec) -> tuple[Capability, ...]:
+    """The capabilities ``spec`` adds to ``base`` or changes in it, compared
+    the way the legacy baselines are."""
+    before = {c.id: capability_baseline_sha256(c) for c in base.capabilities}
+    return tuple(c for c in spec.capabilities
+                 if before.get(c.id) != capability_baseline_sha256(c))
+
+
 def _check_fills(capabilities: tuple[Capability, ...], gap_id: str) -> None:
-    """#100: a Harness Generation patch set adds or revises only
+    """#100: a Harness Generation patch set adds or changes only
     capabilities that fill the gap it was generated for."""
     if not capabilities:
         raise GenerationError(
-            f"no new or revised capability fills gap {gap_id}")
+            f"the patch set adds or changes no capability for gap {gap_id}")
     for capability in capabilities:
         if capability.fills_gap != gap_id:
             raise GenerationError(
@@ -955,16 +964,22 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
 
 def generate(spec_path: Path, *, python: str = sys.executable,
              now: str | None = None,
-             gap: GapContract | None = None) -> Generated:
+             gap: GapContract | None = None,
+             base_spec: Path | None = None) -> Generated:
     """``gap`` is the Controller's contract for the gap a Harness
-    Generation patch set fills (#100).  It comes from outside the spec,
-    which the patch set can change: every new or revised capability must
-    fill that gap, and the spec cannot give the gap another contract."""
+    Generation patch set fills (#100), and ``base_spec`` the spec the patch
+    set started from.  Both come from outside the spec, which the patch set
+    can change: every capability the patch set adds or changes must fill
+    that gap, and the spec cannot give the gap another contract."""
+    if (gap is None) != (base_spec is None):
+        raise GenerationError("give the gap and the base spec together")
     spec_path = Path(spec_path).resolve()
     base = spec_path.parent
     spec = HostSpec.model_validate_json(spec_path.read_bytes())
     if gap is not None:
         spec = _with_gap(spec, gap)
+        changed = _changed_capabilities(spec, HostSpec.model_validate_json(
+            Path(base_spec).read_bytes()))
     state = _resolve(base, spec.state_dir)
     root = _resolve(base, spec.artifact_root)
     env = _resolve(base, spec.env_dir)
@@ -1094,7 +1109,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         raise GenerationError("bundle identity.json disagrees with its files")
     judged = promoted_by_criteria(spec)
     if gap is not None:
-        _check_fills(judged, gap.missing_capability_id)
+        _check_fills(changed, gap.missing_capability_id)
     _check_gap_contracts(spec, judged)
     _check_argument_generality(judged, bundle, identity)
 

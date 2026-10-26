@@ -184,14 +184,18 @@ the candidate's programs in `withheld_program_sha256s`.
 
 The spec's `gap_contracts` are the operator's statement. A Harness
 Generation patch set can change the spec, so on that path the Controller
-passes the gap and its contract from its own state:
+passes the gap and its contract from its own state, with the spec the patch
+set started from:
 
 ```sh
-uv run python -m agent_pipeline.stage1.host generate SPEC --gap gap.json
+uv run python -m agent_pipeline.stage1.host generate SPEC \
+    --gap gap.json --base-spec base-host-spec.json
 ```
 
 `gap.json` is a `GapContract`. The spec cannot give that gap another
-contract, and every new or revised capability must fill that gap.
+contract, and every capability the patch set adds or changes relative to
+the base spec must fill that gap. Capabilities the base already holds are
+not the patch set's, whatever gap they fill.
 
 ## How the pieces bind
 

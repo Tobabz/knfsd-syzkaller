@@ -300,8 +300,8 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
    진입점(syz call, pseudo-syscall, Proxy operation, fixture action)과 경계(이 기능이 도달시키는 공개 kernel 함수
    집합)를 적는다. gap을 채우는 capability의 contract는 그 gap key의 vocabulary contract(`gap_contracts`)와 같아야
    한다. 후보의 Q1 target이나 시나리오에서 contract를 만들지 않는다. 생성 patch set은 spec을 바꿀 수 있으므로
-   Controller가 gap과 그 contract를 spec 밖에서 넘기고(`generate --gap`), 새로 추가하거나 바꾼 capability는 모두
-   그 gap을 채워야 한다(`09` §3.2).
+   Controller가 gap과 그 contract, patch set이 시작한 base spec을 spec 밖에서 넘기고(`generate --gap --base-spec`),
+   patch set이 추가하거나 바꾼 capability는 모두 그 gap을 채워야 한다(`09` §3.2).
 2. **probe는 Controller가 정한다.** promotion probe는 contract의 `boundary_functions`다. 후보의 Q1 target은 그
    함수가 경계에 있을 때만 probe가 된다. 생성 Agent의 출력에는 probe가 없고, Agent는 probe를 고를 수 없다.
    evidence의 probe 집합이 경계와 다르면 거부한다.
