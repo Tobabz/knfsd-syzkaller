@@ -1,0 +1,6 @@
+r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)
+r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)
+write$nfs41_exchange_id(r1, &(0x7f0000000000)={AUTO, AUTO, AUTO, {0x42490001, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {"42494e4452434521", AUTO, "62696e646c697665726f756e64000000", 0x0, AUTO, AUTO}}}}, AUTO)
+recvfrom$nfs41_exchange_id(r1, &(0x7f0000001000)={{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, <r2=>0x0, <r3=>0x0, ""/1024}, AUTO, AUTO, AUTO, AUTO)
+close(r1)
+close(r0)

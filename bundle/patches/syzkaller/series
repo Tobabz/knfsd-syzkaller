@@ -30,3 +30,5 @@
 0030-sys-linux-executor-add-NLM-lane-calls.patch
 0031-sys-linux-executor-describe-a-live-NFSv4.1-session-o.patch
 0032-sys-linux-executor-add-a-lane-client-network-partiti.patch
+0033-syz-manager-collect-coverage-in-corpus-run.patch
+0034-rpcserver-capture-target-mode-call-coverage.patch

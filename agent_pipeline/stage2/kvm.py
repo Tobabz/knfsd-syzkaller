@@ -1058,6 +1058,11 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     config.write_text(json.dumps(manager, indent=2, sort_keys=True) + "\n")
     manager_binary = Path(str(manager["syzkaller"])) / "bin" / "syz-manager"
     manager_log = work / "manager-debug.log"
+    # -debug dumps VM output but syz-manager also forces procs=1 with it.
+    # Use it only for a one-proc campaign; multi-lane campaigns need the
+    # configured procs value preserved.
+    manager_argv = [str(manager_binary), "-config", str(config),
+                    "-debug" if manager.get("procs", 1) == 1 else "-vv=1"]
     start_ns = time.time_ns()
     process: subprocess.Popen | None = None
     complete = False
@@ -1066,7 +1071,7 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         try:
             with manager_log.open("wb") as log:
                 process = subprocess.Popen(
-                    [str(manager_binary), "-config", str(config), "-debug"],
+                    manager_argv,
                     stdin=subprocess.DEVNULL, stdout=log,
                     stderr=subprocess.STDOUT, start_new_session=True)
                 deadline = time.monotonic() + options.campaign_timeout_s

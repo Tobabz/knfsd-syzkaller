@@ -58,7 +58,8 @@ from .kvm import (_CRASH, NfsProxyExecution, Stage2StepError,
 
 CANDIDATE_ID = "hcap04-lane-topology"
 DEFAULT_PROGRAM = (Path(__file__).resolve().parents[2] / "tools" /
-                   "nfs-lifecycle" / "programs" / "v41-client-io-control.prog")
+                   "nfs-lifecycle" / "programs" /
+                   "v41-client-io-topology.prog")
 SHAREABLE_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
 POLL_S = 1.0
 MANAGER_STOP_TIMEOUT_S = 45.0
@@ -220,6 +221,18 @@ def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
                               rules, prefixes)
     channels = _JournalChannels(work / "journal", "topology", vm_id, procs,
                                 rules, prefixes)
+    # syz-manager always loads sys/linux/test as extra seeds.  This campaign
+    # is bound to one trusted lane program, so give the manager a view of the
+    # pinned syzkaller tree with an empty test-seed directory; otherwise the
+    # unrelated seeds can satisfy the execution count before the trusted
+    # program ever runs.
+    source_syzkaller = Path(str(manager["syzkaller"]))
+    seedless_syzkaller = work / "syzkaller-seedless"
+    seedless_syzkaller.mkdir(parents=True)
+    (seedless_syzkaller / "bin").symlink_to(
+        source_syzkaller / "bin", target_is_directory=True)
+    (seedless_syzkaller / "sys" / "linux" / "test").mkdir(parents=True)
+    manager["syzkaller"] = str(seedless_syzkaller)
     manager.update({
         "workdir": str(workdir), "workdir_template": str(lane_dir),
         "http": "", "procs": procs, "reproduce": False,
@@ -231,12 +244,18 @@ def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
     config.write_text(json.dumps(manager, indent=2, sort_keys=True) + "\n")
     log_path = work / "manager-debug.log"
     binary = Path(str(manager["syzkaller"])) / "bin" / "syz-manager"
+    # -debug dumps VM output but syz-manager also forces procs=1 with it.
+    # Keep it for a one-proc run and use verbose logging when the campaign
+    # is intentionally multi-proc.
+    manager_argv = [str(binary), "-config", str(config),
+                    "-mode", "corpus-run",
+                    "-debug" if procs == 1 else "-vv=1"]
     exited = False
     process = None
     try:
         with log_path.open("wb") as log:
             process = subprocess.Popen(
-                [str(binary), "-config", str(config), "-debug"],
+                manager_argv,
                 stdin=subprocess.DEVNULL, stdout=log,
                 stderr=subprocess.STDOUT, start_new_session=True)
             deadline = time.monotonic() + timeout_s

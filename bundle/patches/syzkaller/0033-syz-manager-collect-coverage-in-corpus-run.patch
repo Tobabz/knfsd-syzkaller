@@ -1,0 +1,60 @@
+From 215c7fab3c56b32d5e51ba2f0cc432746a5820e4 Mon Sep 17 00:00:00 2001
+From: knfsd bridge builder <bridge@localhost>
+Date: Mon, 26 Oct 2026 18:45:48 +0900
+Subject: [PATCH] syz-manager: collect coverage in corpus-run mode
+
+---
+ pkg/fuzzer/fuzzer.go           | 3 +++
+ syz-manager/manager.go         | 7 +++++++
+ tools/syz-execprog/execprog.go | 3 +++
+ 3 files changed, 13 insertions(+)
+
+diff --git a/pkg/fuzzer/fuzzer.go b/pkg/fuzzer/fuzzer.go
+index efd66fdad..19b827527 100644
+--- a/pkg/fuzzer/fuzzer.go
++++ b/pkg/fuzzer/fuzzer.go
+@@ -477,6 +477,9 @@ func DefaultExecOpts(cfg *mgrconfig.Config, features flatrpc.Feature, debug bool
+ 	if cfg.Cover {
+ 		env |= flatrpc.ExecEnvSignal
+ 	}
++	if cfg.Experimental.RemoteCover {
++		env |= flatrpc.ExecEnvExtraCover
++	}
+ 	sandbox, err := flatrpc.SandboxToFlags(cfg.Sandbox)
+ 	if err != nil {
+ 		panic(fmt.Sprintf("failed to parse sandbox: %v", err))
+diff --git a/syz-manager/manager.go b/syz-manager/manager.go
+index 137e6ecd0..532268260 100644
+--- a/syz-manager/manager.go
++++ b/syz-manager/manager.go
+@@ -1313,6 +1313,13 @@ func (cr *corpusRunner) Next() *queue.Request {
+ 	return &queue.Request{
+ 		Prog:      p,
+ 		Important: true,
++		// corpus-run is also a coverage-producing campaign.  Without these
++		// flags the executor never enables KCOV or publishes the managed
++		// remote-coverage generation, even when remote_cover is configured.
++		ExecOpts: flatrpc.ExecOpts{
++			EnvFlags:  flatrpc.ExecEnvExtraCover,
++			ExecFlags: flatrpc.ExecFlagCollectSignal | flatrpc.ExecFlagCollectCover,
++		},
+ 	}
+ }
+ 
+diff --git a/tools/syz-execprog/execprog.go b/tools/syz-execprog/execprog.go
+index 4f4a4a307..c47d85f59 100644
+--- a/tools/syz-execprog/execprog.go
++++ b/tools/syz-execprog/execprog.go
+@@ -143,6 +143,9 @@ func main() {
+ 	if cover {
+ 		env |= flatrpc.ExecEnvSignal
+ 	}
++	if *flagRemoteCover {
++		env |= flatrpc.ExecEnvExtraCover
++	}
+ 	var exec flatrpc.ExecFlag
+ 	if *flagThreaded {
+ 		exec |= flatrpc.ExecFlagThreaded
+-- 
+2.34.1
+

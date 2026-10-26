@@ -352,9 +352,9 @@ class Hcap13KvmEvidence(_Spec):
 LANE_TOPOLOGY_CAPABILITIES = ("HCAP-01", "HCAP-03", "HCAP-04")
 #: Fewest generation-attributed campaign executions each lane must have.
 LANE_TOPOLOGY_MIN_EXECUTIONS = 8
-# Digest of tools/nfs-lifecycle/programs/v41-client-io-control.prog.
+# Digest of tools/nfs-lifecycle/programs/v41-client-io-topology.prog.
 LANE_TOPOLOGY_PROGRAM_SHA256 = (
-    "d55988221116a08cb77daf1ccda01ae878f3607b779a04172d74359e9ac12d88")
+    "6a25622bc0e62701ec80a40de47f846d2b1e61827a987a294e023fcd6d6c7d25")
 
 
 class LaneTopologyLane(_Spec):
@@ -567,6 +567,7 @@ LEGACY_CAPABILITY_BASELINES: dict[str, frozenset[str]] = {
     "HCAP-04": frozenset({
         "023a636701aeec882c157de3fe6024e4e2476fa4eca18b0d943e4b5b8fb254cb",
         "c9f8ff612235085419c3b91c8acae70322fe0a85719134e10aece2d2528502b1",
+        "9ef22b8308adc7b81b43d10bb733ac430316ae923163560d43f85a35c8699f85",
     }),
     "HCAP-11": frozenset({
         "7315aeedfeb596d88a56e6006008175e53fbd88406c7607a6e2709c11e317f6e",

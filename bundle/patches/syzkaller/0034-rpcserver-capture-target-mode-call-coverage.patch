@@ -1,0 +1,36 @@
+From 85bd911295c29e9bd0fd26d20aafe75ed575c17d Mon Sep 17 00:00:00 2001
+From: knfsd bridge builder <bridge@localhost>
+Date: Mon, 26 Oct 2026 20:40:52 +0900
+Subject: [PATCH] rpcserver: capture target-mode call coverage
+
+---
+ pkg/rpcserver/nfs_proxy_evidence.go | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/pkg/rpcserver/nfs_proxy_evidence.go b/pkg/rpcserver/nfs_proxy_evidence.go
+index f25aef4b8..9eb6d48b4 100644
+--- a/pkg/rpcserver/nfs_proxy_evidence.go
++++ b/pkg/rpcserver/nfs_proxy_evidence.go
+@@ -91,6 +91,19 @@ func (writer *nfsProxyEvidenceWriter) write(vm, lane int, executionID int64,
+ 	if info != nil {
+ 		if info.Extra != nil {
+ 			record.PCs = slices.Clone(info.Extra.Cover)
++		}
++		// Older target-mode executors put the generation aggregate in the
++		// first call result instead of the separate Extra record.  The
++		// target-mode merge is the largest per-call coverage in that case;
++		// keep accepting the normal Extra path when it is present.
++		if len(record.PCs) == 0 {
++			for _, call := range info.Calls {
++				if len(call.Cover) > len(record.PCs) {
++					record.PCs = slices.Clone(call.Cover)
++				}
++			}
++		}
++		if len(record.PCs) != 0 {
+ 			slices.Sort(record.PCs)
+ 			record.PCs = slices.Compact(record.PCs)
+ 			if len(record.PCs) > maxNfsProxyEvidencePCs {
+-- 
+2.34.1
+

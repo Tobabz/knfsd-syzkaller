@@ -538,15 +538,24 @@ def test_template_spec_is_valid():
                for selection in spec.runtime_selections
                for call in selection.enabled_interfaces)
 
-    # #99: every capability is validated on Stage 1's single lane until
-    # lane-topology evidence widens it; Stage 2 inherits HCAP-04's layout.
+    # #99: the lane-topology evidence widens HCAP-01, HCAP-03 and HCAP-04
+    # to four lanes; the remaining capabilities stay on Stage 1's lane 0.
+    widened = {"HCAP-01", "HCAP-03", "HCAP-04"}
     for capability in spec.capabilities:
-        assert capability.layout() == STAGE1_LAYOUT
+        expected = (ExecutionLayout(procs=4, lanes=(0, 1, 2, 3))
+                    if capability.id in widened else STAGE1_LAYOUT)
+        assert capability.layout() == expected
     assert evidence.layout == STAGE1_LAYOUT
-    assert spec.stage2 is not None and spec.stage2.procs is None
+    topology_path = template / spec.capability_evidence["HCAP-04"][0]
+    assert topology_path.is_file()
+    topology = generate_module.LaneTopologyEvidence.model_validate_json(
+        topology_path.read_bytes())
+    assert topology.layout == ExecutionLayout(procs=4, lanes=(0, 1, 2, 3))
+    assert topology.capability_ids == ("HCAP-01", "HCAP-03", "HCAP-04")
+    assert spec.stage2 is not None and spec.stage2.procs == 4
 
-    # #100: the criteria judge new and revised capabilities; the template's
-    # are all unchanged legacy entries.
+    # #100: the #99 four-lane layout is now a legacy entry in the
+    # checked-in specs; it is not a new capability promotion.
     assert generate_module.promoted_by_criteria(spec) == ()
     live = HostSpec.model_validate_json(
         (REPO / "stage1-host-live/host-spec.json").read_bytes())
