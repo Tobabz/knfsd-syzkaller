@@ -24,8 +24,8 @@ from agent_pipeline.stage1.host.collector import CollectorConfig
 from agent_pipeline.stage1.host.pins import pin_file
 from agent_pipeline.stage2.host import (
     KVM_API_VERSION, PreflightError, _ApprovedHarness, _Checks,
-    _check_command, _check_kernel_repo, _check_kvm, _check_manager,
-    _check_policies, _check_runtime, _check_stage2_timeout,
+    _check_accel, _check_command, _check_kernel_repo, _check_kvm,
+    _check_manager, _check_policies, _check_runtime, _check_stage2_timeout,
     _verify_pins_read_only, preflight,
 )
 from agent_pipeline.stage2.kvm import stage2_timeout_budget
@@ -296,6 +296,23 @@ def test_manager_config_binds_approved_assets_and_command(tmp_path):
     path.write_text(json.dumps(manager))
     with pytest.raises(PreflightError, match="approved command line"):
         _manager_check(path, collector, harnesses, command)
+
+
+def test_manager_accelerator_matches_the_collector(tmp_path):
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    tcg = collector.model_copy(update={"accel": "tcg", "exec_slowdown": 10})
+    with pytest.raises(PreflightError, match="collector's tcg"):
+        _manager_check(path, tcg, harnesses, command)
+    manager["vm"]["qemu_args"] = manager["vm"]["qemu_args"].replace(
+        "-enable-kvm", "-accel tcg,thread=multi -cpu max")
+    path.write_text(json.dumps(manager))
+    assert "approved assets" in _manager_check(path, tcg, harnesses, command)
+    with pytest.raises(PreflightError, match="collector's kvm"):
+        _manager_check(path, collector, harnesses, command)
+    assert "TCG" in _check_accel(tcg, tmp_path / "absent-kvm")
+    with pytest.raises(PreflightError, match="unavailable"):
+        _check_accel(collector, tmp_path / "absent-kvm")
 
 
 def test_manager_config_binds_window_lane_script_and_all_proc_journals(

@@ -61,6 +61,8 @@ KCONFIGS = {"kasan": BUNDLE / "kernel.config",
 
 sys.path.insert(0, str(TOOLS))
 import kernel_base  # noqa: E402
+sys.path.insert(0, str(WORK))
+from agent_pipeline import qemu_accel  # noqa: E402  (standard library only)
 
 # The last verified base lives in one file; --kernel-ref overrides the kernel part.
 BASE = kernel_base.read_base(BUNDLE / "BASE")
@@ -231,9 +233,16 @@ def parse_args(argv=None):
     parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument("--update", action="store_true",
                         help="write/update manifest.json after build")
-    parser.add_argument("--boot-timeout", type=int, default=240)
+    parser.add_argument("--boot-timeout", type=int, default=240,
+                        help="KVM-speed seconds; scaled under TCG")
+    parser.add_argument("--accel", choices=("auto", "kvm", "tcg"),
+                        default=os.environ.get(qemu_accel.ENV_OVERRIDE)
+                        or "auto",
+                        help="QEMU accelerator (auto: KVM when /dev/kvm "
+                        "works, else TCG)")
     args = parser.parse_args(argv)
     args.version = args.version or "4." + args.minor
+    args.accel = qemu_accel.resolve(args.accel)
     if args.kernel_ref is None:
         args.kernel_ref = KERNEL_TAG
     elif args.kernel_ref == "latest":
@@ -594,15 +603,16 @@ def stage_bake(args, bzimage, image_out):
          "--lane-script", str(LANE / "lane.sh"),
          "--boot-fixture", str(LANE / "boot-fixture.sh"),
          "--service", str(LANE / "fixture.service"),
-         "--cpus", "4", "--memory", "4096",
-         "--boot-timeout", str(args.boot_timeout)], timeout=3600)
+         "--cpus", "4", "--memory", "4096", "--accel", args.accel,
+         "--boot-timeout", str(args.boot_timeout)],
+        timeout=3600 * qemu_accel.slowdown(args.accel))
     manifest_path = image_out.with_suffix(".json")
     return json.loads(manifest_path.read_text())
 
 
 class VM:
     def __init__(self, image, kernel, ssh_key, boot_timeout, version,
-                 fixture=None):
+                 fixture=None, accel="kvm"):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             self.ssh_port = reservation.getsockname()[1]
@@ -614,7 +624,9 @@ class VM:
                     "root@127.0.0.1"]
         self.scp = ["scp", "-O", *common, "-P", str(self.ssh_port)]
         self.image, self.kernel = image, kernel
-        self.boot_timeout = boot_timeout
+        self.accel = accel
+        self.slowdown = qemu_accel.slowdown(accel)
+        self.boot_timeout = boot_timeout * self.slowdown
         self.version = version
         self.fixture = fixture
         self.process = None
@@ -624,7 +636,7 @@ class VM:
             fixture_arg = "koov.nfs_fixture=%s" % self.fixture
         else:
             fixture_arg = "koov.nfs_version=%s" % self.version
-        cmd = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
+        cmd = ["qemu-system-x86_64", *qemu_accel.qemu_args(self.accel),
                "-m", "4096", "-smp", "4", "-display", "none",
                "-serial", "none", "-no-reboot", "-snapshot",
                "-fsdev", "local,id=koov_lane,path=%s,security_model=none,readonly=on"
@@ -646,8 +658,14 @@ class VM:
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError("QEMU exited before SSH became ready")
-            result = subprocess.run([*self.ssh, "true"], capture_output=True,
-                                    text=True, timeout=8)
+            try:
+                result = subprocess.run([*self.ssh, "true"],
+                                        capture_output=True, text=True,
+                                        timeout=8 * self.slowdown)
+            except subprocess.TimeoutExpired:
+                # Under TCG sshd can accept before it can answer.
+                last_error = "ssh probe timed out"
+                continue
             if result.returncode == 0:
                 return
             last_error = result.stderr.strip()
@@ -660,7 +678,7 @@ class VM:
 
     def guest(self, command, timeout=60):
         result = subprocess.run([*self.ssh, command], capture_output=True,
-                                text=True, timeout=timeout)
+                                text=True, timeout=timeout * self.slowdown)
         if result.returncode:
             raise RuntimeError("guest rc=%d: %s\n%s" % (
                 result.returncode, command, result.stderr[-1500:]))
@@ -726,7 +744,8 @@ def detect_mem_sanitizer(vm, config_path):
 
 def stage_verify_variant(args, image, variant, bzimage):
     started = time.monotonic()
-    vm = VM(image, bzimage, args.ssh_key, args.boot_timeout, args.version)
+    vm = VM(image, bzimage, args.ssh_key, args.boot_timeout, args.version,
+            accel=args.accel)
     try:
         vm.start()
         state = vm.guest("systemctl is-active frozen-phase9-fixture.service",
@@ -794,7 +813,7 @@ def last_good_manifest(target):
 def main(argv=None):
     args = parse_args(argv)
     manifest = {"target": str(args.target), "nfs_version": args.version,
-                "repo": str(BUNDLE.parent)}
+                "repo": str(BUNDLE.parent), "qemu_accel": args.accel}
     # --skip-build reuses existing pinned build outputs; it must never delete them.
     kernel_reuse = args.skip_build
     syz_reuse = args.skip_build

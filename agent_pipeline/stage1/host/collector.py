@@ -41,6 +41,7 @@ from ...data import canonical_json, load_record
 from ...hcap import RuntimeSelection
 from ...materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ...q1 import ExecutionCorrelation, KernelIdentity
+from ...qemu_accel import Accel
 from ...sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE
 from .kcov import (STATE_COMMAND, STATS_COMMAND, LaneRun, capture_records,
                    lane_state_ok, parse_cover_pcs, parse_stats,
@@ -94,6 +95,12 @@ class CollectorConfig(BaseModel):
     grace_s: float = Field(11, ge=0)
     drain_s: float = Field(10, ge=0)
     exec_timeout_s: float = Field(600, gt=0)
+    #: QEMU accelerator the guests run under.  ``generate`` resolves the
+    #: spec's ``auto`` on its host and, for TCG, writes the boot and
+    #: fixture budgets already scaled and the slowdown below.
+    accel: Accel = "kvm"
+    #: syz-execprog ``-slowdown`` and the scale of its watchdog.
+    exec_slowdown: int = Field(1, ge=1, le=1000)
     vmlinux_artifact_name: str = "kernel"
     instrumentation_artifact_name: str = "instrumentation"
     pin_cache: Path | None = None
@@ -433,14 +440,17 @@ def collect(config: CollectorConfig, inp: Path, out: Path, *,
         qemu=config.qemu, bzimage=files["bzimage"], image=files["vm-image"],
         lane_dir=files["lane-script"].parent, ssh_key=config.ssh_key,
         cmdline=cmdline, console_log=console, memory_mb=config.memory_mb,
-        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s))
+        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s,
+        accel=config.accel))
     result: dict = {"schema_version": "stage1-collector-result.v1",
                     "vm_instance_id": vm_instance_id, "cmdline": cmdline,
+                    "qemu_accel": config.accel,
                     "runtime_selection": selection.model_dump(mode="json")}
     started = time.time_ns()
     try:
         run = run_lane(guest, files, inp / "program.syz", selection,
-                       lane_pin.sha256, config, out, result, sleep)
+                       lane_pin.sha256, config, out, result, sleep,
+                       exec_slowdown=config.exec_slowdown)
     finally:
         guest.stop()
     result["elapsed_ns"] = time.time_ns() - started

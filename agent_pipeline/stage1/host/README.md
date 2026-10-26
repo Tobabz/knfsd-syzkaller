@@ -18,10 +18,17 @@ collector with a scripted guest, and mapping on a gcc
 `s1_reached`. They do not exercise a real guest, kernel or model: this
 runbook does.
 
-## What only the KVM host can provide
+## What only the VM host can provide
 
-- `/dev/kvm`, `qemu-system-x86_64`, `ssh`/`scp`, binutils (`objdump`,
-  `addr2line`, `nm`).
+- `qemu-system-x86_64`, `ssh`/`scp`, binutils (`objdump`, `addr2line`,
+  `nm`). `/dev/kvm` is optional: with it the guests run under KVM, without
+  it under TCG (software emulation, about ten times slower). The spec's
+  `collector.accel` is `auto` by default; generation resolves it on the
+  generating host, writes it to `collector.json`, and for TCG scales the
+  boot, fixture and engine budgets and the execprog slowdown by 10. Set it
+  to `kvm` or `tcg` to pin the choice; `KOOV_QEMU_ACCEL` does the same for
+  `tools/bootstrap-kcov-env.py`, the baker and
+  `tools/prepare-live-lane-config.py`.
 - The bootstrap env: the patched kernel tree, `bzImage`, `vmlinux`,
   `.config`, the baked image and the syzkaller binaries
   (`tools/bootstrap-kcov-env.py`).
@@ -33,7 +40,7 @@ runbook does.
 
 ## Run
 
-From the repository root, on the KVM host, at the commit under test:
+From the repository root, on the VM host, at the commit under test:
 
 ```sh
 uv sync --locked --extra agent-openai
