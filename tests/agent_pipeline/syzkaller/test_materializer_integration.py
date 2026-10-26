@@ -19,7 +19,7 @@ from agent_pipeline.materializer import (
     ArtifactHarnessMaterializer, CALL_NOT_ADMITTED, CALL_UNRESOLVED,
     DISALLOWED_OR_UNAVAILABLE_CALL, ExecutionHarnessApproval,
     MaterializationReviewManifest, ParsedProgram, PROFILE_FIXTURE_ROUTE_MISMATCH,
-    StaticExecutionHarnessAuthority, _hcap11_program_error, _hcap12_program_error,
+    StaticExecutionHarnessAuthority, _hcap11_program_error,
     descriptor_id,
 )
 from agent_pipeline.syzkaller import PinnedSyzParser
@@ -29,8 +29,6 @@ from tests.agent_pipeline.test_materializer import world as synthetic_world
 LANE_CALL = "syz_open_nfs_lane_profile$client0_knfsd_v41"
 LANE = f"r0 = {LANE_CALL}(0x2, 0x0)\n".encode()
 EXPIRE = b"syz_nfsd_client_ctl$expire_client0(0x0)\n"
-RECONNECT = b"syz_nfsd_cld_ctl$reconnect(0x2)\n"
-DOWN = b"syz_nfsd_cld_ctl$daemon_down(0x3)\n"
 
 
 @pytest.mark.parametrize("program,reason", [
@@ -164,44 +162,3 @@ def test_real_parser_hcap11_program_contract(program, reason):
     with PinnedSyzParser(bundle, identity=identity) as parser:
         parsed_program = parser.parse(program, identity=identity)
     assert _hcap11_program_error(parsed_program) == reason
-
-
-@pytest.mark.parametrize(("program", "reason"), [
-    (EXPIRE + RECONNECT + LANE + b"fsync(r0)\n", None),
-    (EXPIRE + LANE + b"fsync(r0)\n", "cld_reconnect_count"),
-    (RECONNECT + EXPIRE + LANE + b"fsync(r0)\n", "cld_reconnect_order"),
-    (EXPIRE + LANE + RECONNECT + b"fsync(r0)\n", "cld_reconnect_order"),
-    (EXPIRE + DOWN + LANE + b"fsync(r0)\n", "cld_operation_not_validated"),
-    (EXPIRE + RECONNECT + RECONNECT + LANE + b"fsync(r0)\n",
-     "cld_reconnect_count"),
-    (EXPIRE + RECONNECT + LANE, "hcap11:client0_recovery_io_missing"),
-])
-def test_real_parser_hcap12_program_contract(program, reason):
-    value = os.environ.get("KNFSD_SYZ_BUNDLE")
-    if not value:
-        pytest.skip("build the pinned Go bridge and set KNFSD_SYZ_BUNDLE")
-    bundle = Path(value)
-    identity = SyzkallerTargetIdentity.model_validate_json(
-        (bundle / "identity.json").read_bytes())
-    with PinnedSyzParser(bundle, identity=identity) as parser:
-        parsed_program = parser.parse(program, identity=identity)
-    assert _hcap12_program_error(parsed_program) == reason
-
-
-@pytest.mark.parametrize(("name", "reason"), [
-    ("v41-cld-reconnect.prog", None),
-    ("v41-cld-daemon-down.prog", "cld_operation_not_validated"),
-    ("v41-client-expire.prog", "cld_reconnect_count"),
-])
-def test_real_parser_cld_validation_programs(name, reason):
-    value = os.environ.get("KNFSD_SYZ_BUNDLE")
-    if not value:
-        pytest.skip("build the pinned Go bridge and set KNFSD_SYZ_BUNDLE")
-    bundle = Path(value)
-    identity = SyzkallerTargetIdentity.model_validate_json(
-        (bundle / "identity.json").read_bytes())
-    program = (Path(__file__).resolve().parents[3] /
-               "tools/nfs-lifecycle/programs" / name).read_bytes()
-    with PinnedSyzParser(bundle, identity=identity) as parser:
-        parsed_program = parser.parse(program, identity=identity)
-    assert _hcap12_program_error(parsed_program) == reason

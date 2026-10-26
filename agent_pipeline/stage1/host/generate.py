@@ -181,130 +181,6 @@ class Hcap11KvmEvidence(_Spec):
         return self
 
 
-HCAP12_PROBES = ("cld_create", "cld_create_error", "pipe_wait_for_open")
-
-
-class Hcap12ProbeHits(_Spec):
-    """Per-run counts of attributed PCs in each public CLD probe range."""
-
-    cld_create: tuple[int, ...]
-    cld_create_error: tuple[int, ...]
-    pipe_wait_for_open: tuple[int, ...]
-
-    def each(self, name: str) -> tuple[int, ...]:
-        return getattr(self, name)
-
-
-class Hcap12BrokerDelta(_Spec):
-    """Broker counter deltas across one phase (tools/nfs-proxy/src/cld.h)."""
-
-    reconnect_ok: int = Field(ge=0)
-    reconnect_fail: int = Field(ge=0)
-    down_ok: int = Field(ge=0)
-    down_fail: int = Field(ge=0)
-    daemon_stop_fail: int = Field(ge=0)
-    daemon_start_fail: int = Field(ge=0)
-    refused_busy: int = Field(ge=0)
-    refused_identity: int = Field(ge=0)
-    restore_ok: int = Field(ge=0)
-    restore_fail: int = Field(ge=0)
-
-
-class Hcap12RunEvidence(_Spec):
-    completed: int = Field(ge=3, le=999)
-    probe_hits: Hcap12ProbeHits
-    broker: Hcap12BrokerDelta
-    #: lane.sh status passed (broker-validated idle nfsdcld) after every run.
-    status_checks_passed: int = Field(ge=0)
-    #: Generation contract held for every run (HCAP-11 invariants).
-    attributed_generations: int = Field(ge=0)
-
-    @model_validator(mode="after")
-    def _count(self) -> Self:
-        for name in HCAP12_PROBES:
-            if len(self.probe_hits.each(name)) != self.completed:
-                raise ValueError(f"{name} length differs from completed")
-        if self.status_checks_passed != self.completed:
-            raise ValueError("a run left the lane fixture unhealthy")
-        b = self.broker
-        if (b.reconnect_fail or b.down_fail or b.daemon_stop_fail
-                or b.daemon_start_fail or b.refused_busy
-                or b.refused_identity or b.restore_ok or b.restore_fail):
-            raise ValueError("broker recorded a failed or refused transaction")
-        return self
-
-
-class Hcap12RunsEvidence(_Spec):
-    #: Neutral control: no expiry, no nfsdcld control.
-    control: Hcap12RunEvidence
-    #: A: expiry, then client0 recovery with the daemon untouched.
-    normal: Hcap12RunEvidence
-    #: C: expiry, one bounded reconnect, then client0 recovery.
-    reconnect: Hcap12RunEvidence
-    #: B: expiry, daemon down past the upcall timeout, then recovery.
-    #: Fixture evidence only; it never promotes an admitted call.
-    daemon_down: Hcap12RunEvidence
-
-
-class Hcap12KvmEvidence(_Spec):
-    schema_version: Literal["hcap-kvm-evidence.v1"]
-    capability_id: Literal["HCAP-12"]
-    observed_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
-    scenario: Literal["v41-cld-lifecycle"]
-    execution_harness_id: Sha256
-    mapping_identity: KernelIdentity
-    #: Digest of each public probe TargetPcMapping, keyed by probe name.
-    probe_mapping_sha256: dict[str, Sha256]
-    campaign_result_sha256: Sha256
-    guest_lane_script_sha256: Sha256
-    guest_nfs_proxy_sha256: Sha256
-    runs: Hcap12RunsEvidence
-    generation_contract: Hcap11GenerationEvidence
-    crash_signature_count: int = Field(ge=0)
-    raw_artifact_error_count: int = Field(ge=0)
-    shareable_result_contains_target_metadata_or_addresses: bool
-
-    @model_validator(mode="after")
-    def _validated_campaign(self) -> Self:
-        if self.execution_harness_id != self.mapping_identity.execution_harness_id:
-            raise ValueError("mapping and campaign harness identities differ")
-        if tuple(sorted(self.probe_mapping_sha256)) != HCAP12_PROBES:
-            raise ValueError("probe mappings differ from the CLD probe set")
-        runs = self.runs
-        attributed = (runs.control, runs.normal, runs.reconnect)
-        if any(run.attributed_generations != run.completed
-               for run in attributed):
-            raise ValueError("a run lacks one attributed generation")
-        hits = runs.control.probe_hits
-        if any(any(hits.each(name)) for name in HCAP12_PROBES):
-            raise ValueError("control run reached a CLD probe")
-        if any(runs.control.broker.model_dump().values()):
-            raise ValueError("control run invoked the nfsdcld broker")
-        for name, run in (("normal", runs.normal),
-                          ("reconnect", runs.reconnect)):
-            if not all(run.probe_hits.cld_create):
-                raise ValueError(f"{name} run missed the CLD create upcall")
-            if any(run.probe_hits.cld_create_error):
-                raise ValueError(f"{name} run reached the create error path")
-        if any(runs.normal.probe_hits.pipe_wait_for_open):
-            raise ValueError("normal run queued without a pipe reader")
-        if any(runs.normal.broker.model_dump().values()):
-            raise ValueError("normal run invoked the nfsdcld broker")
-        if not all(runs.reconnect.probe_hits.pipe_wait_for_open):
-            raise ValueError("reconnect run missed the reader-loss requeue")
-        if runs.reconnect.broker.reconnect_ok != runs.reconnect.completed \
-                or runs.reconnect.broker.down_ok:
-            raise ValueError("reconnect broker transactions differ from runs")
-        if runs.daemon_down.broker.down_ok != runs.daemon_down.completed \
-                or runs.daemon_down.broker.reconnect_ok:
-            raise ValueError("daemon-down broker transactions differ from runs")
-        if self.crash_signature_count != 0 or self.raw_artifact_error_count != 0:
-            raise ValueError("campaign contains a crash or artifact error")
-        if self.shareable_result_contains_target_metadata_or_addresses:
-            raise ValueError("shareable campaign evidence contains private target data")
-        return self
-
-
 HCAP13_PROBES = ("clnt_grant", "svc_grant_blocked", "svc_grant_callback",
                  "svc_lock", "svc_share", "svc_testlock", "svc_unlock")
 #: Probes that only a granted blocked lock reaches.
@@ -445,7 +321,6 @@ class VariantSpec(_Spec):
 
 CAPABILITY_EVIDENCE_MODELS = {
     "HCAP-11": Hcap11KvmEvidence,
-    "HCAP-12": Hcap12KvmEvidence,
     "HCAP-13": Hcap13KvmEvidence,
 }
 

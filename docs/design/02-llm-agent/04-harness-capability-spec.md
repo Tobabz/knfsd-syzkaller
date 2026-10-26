@@ -622,37 +622,16 @@ tools/nfs-lifecycle/run.py
 agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
 ```
 
-### HCAP-12 — Bounded nfsdcld reconnect during NFSv4.1 client recovery
+### HCAP-12 — 철회됨 (nfsdcld reconnect)
 
-> 트리거 기준(§3.2) 위반: reconnect는 broker가 서버 데몬 nfsdcld를 SIGSTOP·SIGKILL·재시작하는 동작이고, HCAP-11
-> sequence 위에서만 동작한다. Agent 사용 범위에서 뺀다. 아래는 code를 바꾸기 전의 현재 상태다.
-
-```text
-id: HCAP-12
-name: bounded nfsdcld reconnect during NFSv4.1 client recovery
-usable_stage: [stage1]
-usable_by: [agent_stage1]
-status: validated (KVM evidence 전까지 generator가 template을 거부)
-scope: [client0_recovery_cld_reconnect]
-
-interface:
-    syz_nfsd_cld_ctl$reconnect(0x2)  # exact admitted invocation
-
-purpose:
-    HCAP-11 복구 중 fresh client0의 Cld_Create upcall이 rpc_pipefs CLD pipe reader 교체와
-    겹치도록 하여, nfsd request context의 -EAGAIN 재시도와 reader-less 재queue 경로를 실행
-
-constraints:
-    HCAP-11 sequence 안에서 expire_client0 뒤, client0 profile 획득 전에 reconnect를 정확히 한 번 호출
-    syz_nfsd_cld_ctl$daemon_down은 어떤 HCAP에서도 admit되지 않음 (fixture 검증 전용)
-    syz 호출은 고정 op enum만 전달하며 path, PID, mount option, CLD payload, xid, command를 전달하지 않음
-    broker만 nfsdcld를 netns/mntns, PID start time, comm/cmdline, 실행 파일, 소유한 rpc_pipefs CLD pipe
-    dev:inode로 선택하고, 그 identity가 직전 transaction 종료 시점과 다르면 ESTALE로 거부
-    reconnect는 daemon을 bounded 시간 동안 SIGSTOP한 뒤 SIGKILL과 재시작으로 교체; 겹치는 CLD 작업과
-    그 동안의 client expiry는 EBUSY
-    실패한 transaction은 daemon을 한 번 복구하고, 복구도 실패하면 broker가 failed 상태로 남아 모든 CLD 작업을
-    EIO로 거부하며 lane status가 fixture를 unhealthy로 판정
-```
+HCAP-12는 broker가 서버 데몬 nfsdcld를 SIGSTOP·SIGKILL·재시작해 rpc_pipefs CLD pipe reader 교체와 client0
+복구를 겹치게 하는 capability였다. 어떤 NFS client 행위도 서버 데몬을 재시작시킬 수 없으므로 트리거 기준(§3.2)을
+위반한다. 사람이 구현한 capability와 생성된 capability에 같은 기준을 적용하므로 manual 전용으로도 남기지 않고
+카탈로그에서 삭제했다(#98). host generator template에는 HCAP-12 entry, KVM 증거, `syz_nfsd_cld_ctl$reconnect`
+admission, 그 call을 켜는 runtime selection과 neutral control이 없고, materializer는 어떤 admission authority가
+허용하더라도 `syz_nfsd_cld_ctl$` call을 `CALL_NOT_ADMITTED`(`<role>_server_daemon_control`)로 거부한다. 이전
+`hcap_revision`에 묶인 job은 일반 `hcap_revision` 변경 경로로 다시 평가된다. syzkaller patch 0028의 executor
+call과 `tools/nfs-proxy/src/cld.c` broker는 fixture 작업용으로 남는다.
 
 CLD 작업의 실행 context와 귀속:
 
@@ -666,37 +645,9 @@ CLD 작업의 실행 context와 귀속:
 | `rpc_timeout_upcall_queue` (-ETIMEDOUT) | rpciod workqueue | 귀속 안 됨 |
 | tracking init, version 확인, rpc_pipefs mount notifier | nfsd 시작/관리 | 귀속 안 됨 |
 
-귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.cld` gap이며, 이 capability는 그
-범위를 지원한다고 주장하지 않는다. 그 context의 귀속 계측은 Harness Generation이 `remote_kcov_attribution`
+귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.cld` gap이며, 현재 harness는 그
+범위를 지원하지 않는다. 그 context의 귀속 계측은 Harness Generation이 `remote_kcov_attribution`
 gap으로 생성하고 검증한다(`07` §4, §5). trace, dmesg, daemon log는 진단 정보일 뿐 Q1 근거가 아니다.
-
-Broker 카운터(`server/cld.state`, broker 소유):
-`reconnect_attempts/ok/fail`, `down_attempts/ok/fail`, `daemon_stop_ok/fail`, `daemon_start_ok/fail`,
-`refused_busy`(겹친 요청), `refused_identity`(stale identity), `restore_ok/fail`(실패 뒤 복구). 실행 증거는 run별
-delta를 기록한다.
-
-KVM 증거(`capability-evidence/hcap12-kvm.json`, `Hcap12KvmEvidence`)는 run마다 하나의 귀속 generation과 공개
-CLD probe(`cld_create`, `cld_create_error`, `pipe_wait_for_open`) hit 수를 담는다. promotion 조건은 다음과 같다.
-
-- neutral control은 모든 probe를 miss하고 broker를 쓰지 않는다.
-- 시나리오 A(normal)는 create를 hit하고 reader-less 재queue와 오류 경로는 miss한다.
-- 시나리오 C(reconnect)는 create와 reader-less 재queue를 hit하고 오류 경로는 miss하며, run마다
-  `reconnect_ok`가 1이다.
-- 시나리오 B(daemon-down)는 fixture 증거로만 쓰며, run마다 `down_ok`가 1이고 daemon이 복구되어야 한다.
-- 모든 run 뒤에 lane status가 통과하고, broker 실패·거부·복구 카운터는 모두 0이어야 한다.
-
-Probe는 공개 커널 함수와 줄 범위에서 계산하며 후보 metadata를 쓰지 않는다. Host generator는 HCAP-11과 같은
-identity 결합을 검사한 뒤에만 HCAP-12를 promotion한다.
-
-source refs:
-
-```text
-bundle/patches/syzkaller/0028-*
-bundle/lane/lane.sh
-tools/nfs-proxy/src/cld.c
-tools/nfs-lifecycle/run.py
-agent_pipeline/stage1/host/template/capability-evidence/hcap12-kvm.json
-```
 
 ### HCAP-13 — NLM lane locking and raw NLM RPC
 
@@ -850,7 +801,6 @@ STAGE 1
     HCAP-05 normal-flow seeds
     HCAP-06 flow tracing
     HCAP-11 bounded NFSv4.1 client lifecycle recovery
-    HCAP-12 bounded nfsdcld reconnect during NFSv4.1 client recovery
     HCAP-13 NLM lane locking and raw NLM RPC
 
 STAGE 2
