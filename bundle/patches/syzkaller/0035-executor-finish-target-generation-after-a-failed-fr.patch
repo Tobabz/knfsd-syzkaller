@@ -4,8 +4,9 @@ Date: Mon, 26 Oct 2026 23:36:33 +0900
 Subject: [PATCH] executor: finish target generation after a failed freeze
 
 ---
- executor/executor.cc | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
+ executor/executor.cc                   | 7 ++++++-
+ executor/nfs_proxy_activation_test.go | 2 +-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/executor/executor.cc b/executor/executor.cc
 index 0eb9f544e..a4829a7d2 100644
@@ -30,3 +31,16 @@ index 0eb9f544e..a4829a7d2 100644
 -- 
 2.34.1
 
+diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
+index 3c1da7acf..3115d2a3a 100644
+--- a/executor/nfs_proxy_activation_test.go
++++ b/executor/nfs_proxy_activation_test.go
+@@ -160,7 +160,7 @@ func TestNfsProxyForkServerEndsTheProgram(t *testing.T) {
+ 	end := nfspSection(t, "executor.cc", "static void nfsp_broker_end_program()\n{", "\n}\n")
+ 	nfspRequireOrder(t, "nfsp_broker_end_program", end,
+ 		"nfsp_cg_freeze(kNfspCgroupFd",
+-		"if (frozen && k->done_valid)",
++		"if (k->done_valid)",
+ 		"cover_finish_remote_generation(generation",
+ 		"write_extra_output();",
+ 	)
