@@ -382,9 +382,11 @@ Compiler는 live field offset, current original bytes, runtime XID 또는 Nth-me
 `agent_pipeline/rule_compiler.py`의 `ArtifactMutationRuleCompiler`가 `components.MutationRuleCompiler`를 구현한다.
 한 rule set에 대해 다음 순서로 일한다.
 
-1. `binding.hcap_revision`의 promoted semantic registry(HCAP-10)를 읽는다. 없으면 `unsupported_capability`
-   (`semantic_mutation.unpromoted`)다.
-2. 받은 Proxy binary가 promotion된 build와 정확히 같아야 한다(`04` §7.1). 다르거나, schema가 없거나, runtime이
+1. `binding.hcap_revision`의 promoted semantic registry(HCAP-10)를 읽는다. binding이 Harness Generation의 staged
+   revision이어도 같다. 그 revision에 pin된 registry가 있으면 쓴다. staged revision의 registry는 crash survival이
+   pending일 수 있다(`04` §4, `07` §5.2). 없으면
+   `unsupported_capability`(`semantic_mutation.unpromoted`)다.
+2. 받은 Proxy binary가 binding한 revision이 pin한 build와 정확히 같아야 한다(`04` §7.1). 다르거나, schema가 없거나, runtime이
    Compiler가 쓴 형식을 거부하면 `CompilerUnavailable`을 던진다. rule set을 고쳐서 풀리는 문제가 아니다.
 3. intent마다 bind한다. `traffic_scope`는 Stage 1 harness가 여는 lane profile(`syz_open_nfs_lane_profile$<client>_<backend>_v<N>`)
    중 하나여야 하고, backend는 `knfsd`=0·`ganesha`=1, client는 `client0`=0·`client1`=1로 낮춘다. ProtocolSchema는

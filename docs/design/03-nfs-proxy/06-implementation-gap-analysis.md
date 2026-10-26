@@ -1069,6 +1069,19 @@ M7은 subset 단위로 반복하는 promotion gate다(issue #8). semantic subset
 state value, v4.1+ backchannel correlation, preserve/raw behavior, semantic Delta crash survival,
 dynamic-original semantic replay를 포함해야 한다. 모든 subset은 semantic Delta crash survival과
 semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능에 해당할 때 통과한다.
+crash survival 증거는 campaign에서 자연히 생긴 guest crash로만 얻는다. 검증을 위해 guest를 일부러
+crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지).
+
+그래서 M7은 두 단계다. subset을 누가 구현했는지(사람, Harness Generation)는 구분하지 않는다.
+
+1. staged pin: crash survival을 뺀 항목을 통과하면 registry digest가 crash survival pending 표시와 함께 staged
+   `hcap_revision`의 HCAP-10에 pin된다. 그 revision을 binding한 job은 이 subset을 쓴다.
+2. promotion: 그 subset을 쓴 campaign에서 자연히 생긴 Q2 crash의 sealed evidence가 crash cut 위치의 MutationDelta를
+   담고, 그 delta로 한 replay가 REPLAY_EQUIVALENT이면 공유 HCAP으로 promotion할 수 있다. 그 전에는 promotion하지
+   않는다. 자연 crash에서 delta가 남지 않았으면 그 crash는 replay로 재현할 수 없다는 사실과 함께 기록하고 subset은
+   promotion에서 거부한다.
+
+Harness Generation 쪽 적용은 `../02-llm-agent/07-harness-gap-issue.md` §5.2, §5.3이 따른다.
 
 Validation evidence를 HCAP `evidence_refs`에 추가하고 subset의 registry digest와 scope를 promotion한 뒤에만
 Harness Capability Specification을 갱신한다(§21).
@@ -1099,8 +1112,12 @@ Harness Capability Specification을 갱신한다(§21).
 - 검증: `tests/agent_pipeline/test_semantic_promotion.py`(빌드한 Proxy의 registry가 rule validation과 일치하는지,
   M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI).
 
-남은 것: subset마다 KVM에서 production crash window와 replay를 실행하고 `semantic_promotion record`/`promote`로
-promotion하는 일(사람이 한다, `tools/nfs-proxy/README.md` "Capability registry and promotion"). Mutation Rule
+남은 것:
+
+- M7 1단계(crash survival pending으로 staged pin)는 아직 구현되지 않았다. 지금 `promote`는 guest crash로 끝난
+  run만 센다(#83).
+- subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
+  일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
 한 subset에 맞는지 확인한다(`../02-llm-agent/08-mutation-rule-set.md` §12 "구현").
 

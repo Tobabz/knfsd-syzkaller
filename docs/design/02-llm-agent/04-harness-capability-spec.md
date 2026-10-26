@@ -173,6 +173,26 @@ CallAdmissionProfile              # repository authority artifact, HCAP authorit
   목록은 profile이 소유하며 이 문서에 복제하지 않는다.
 - artifact는 첫 Stage 1 Materializer 통합에서 도입한다(§1.1의 milestone 규칙).
 
+### 3.2 트리거 기준
+
+capability는 실제 위협 모델 안의 시나리오만 지원한다(결정 기록 `../decisions/2026-10-25-natural-trigger.md`).
+
+- **트리거**는 Q1에서 대상 커널 코드를 실행시키려고 프로그램이 실행 중에 일으키는 행위다. 실행 전 환경
+  구성(fixture 설정, 포트, lease·grace 시간, 데몬 기동)은 트리거가 아니다.
+- 트리거는 NFS 클라이언트의 행위여야 한다(요청, syscall, 요청 중단, 연결 끊기. 여러 클라이언트의 조합 포함).
+- 클라이언트의 행위 때문에 서버가 하는 동작(callback, lease 만료와 laundromat 처리, blocked lock grant, 서버
+  데몬으로 가는 upcall)은 허용한다.
+- 실행 중에 harness나 helper가 서버를 직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버 데몬 정지·종료·재시작,
+  서버 설정 변경)는 허용하지 않는다.
+- 같은 대상에 도달하는 자연 경로가 있으면 그 경로를 쓴다. 자연 경로가 RemoteKcovSupportBoundary 밖이면
+  `remote_kcov_attribution` gap으로 계측을 생성한다(`07` §5). 귀속되지 않는다는 이유로 부자연스러운 트리거로
+  우회하거나 대상을 포기하지 않는다.
+- 이 기준은 사람이 만든 capability와 Harness Generation이 만든 capability에 똑같이 적용한다.
+- Proxy 변조는 중간자 행위가 아니다. C2S 변조는 악의적인 클라이언트가, S2C 변조는 악의적인 서버가 보내는
+  메시지를 대신 만든 것이다. Proxy는 변조를 정상 시나리오와 구분하려고 둔 구조다. 따라서 S2C 변조는 서버가
+  protocol로 보낼 수 있는 응답·callback이면 허용하고, 그 대상은 서버 응답을 받는 쪽(kernel NFS client)이다.
+  서버 관리 조작(서버 관리 인터페이스 쓰기, 데몬 정지·재시작)은 S2C 시나리오에서도 트리거가 아니다.
+
 ## 4. 현재 capability catalog
 
 ### HCAP-01 — Lane filesystem access
@@ -547,6 +567,10 @@ tools/nfs-proxy/README.md
 
 ### HCAP-11 — Bounded NFSv4.1 client lifecycle recovery
 
+> 트리거 기준(§3.2) 위반: expiry는 서버 namespace의 broker가 서버 관리 인터페이스
+> `/proc/fs/nfsd/clients/<id>/ctl`에 쓰는 동작이다. Agent 사용 범위에서 빼고 자연 경로(lease 만료와 그 귀속
+> 계측)로 다시 만든다. 아래는 code를 바꾸기 전의 현재 상태다.
+
 ```text
 id: HCAP-11
 name: bounded NFSv4.1 client lifecycle recovery
@@ -600,6 +624,9 @@ agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
 
 ### HCAP-12 — Bounded nfsdcld reconnect during NFSv4.1 client recovery
 
+> 트리거 기준(§3.2) 위반: reconnect는 broker가 서버 데몬 nfsdcld를 SIGSTOP·SIGKILL·재시작하는 동작이고, HCAP-11
+> sequence 위에서만 동작한다. Agent 사용 범위에서 뺀다. 아래는 code를 바꾸기 전의 현재 상태다.
+
 ```text
 id: HCAP-12
 name: bounded nfsdcld reconnect during NFSv4.1 client recovery
@@ -639,9 +666,9 @@ CLD 작업의 실행 context와 귀속:
 | `rpc_timeout_upcall_queue` (-ETIMEDOUT) | rpciod workqueue | 귀속 안 됨 |
 | tracking init, version 확인, rpc_pipefs mount notifier | nfsd 시작/관리 | 귀속 안 됨 |
 
-귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.cld` gap으로 남으며, 이 capability는 그
-범위를 지원한다고 주장하지 않는다. 그 context를 귀속하려면 커널 패치가 필요하며 owner 승인 전에는 적용하지
-않는다. trace, dmesg, daemon log는 진단 정보일 뿐 Q1 근거가 아니다.
+귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.cld` gap이며, 이 capability는 그
+범위를 지원한다고 주장하지 않는다. 그 context의 귀속 계측은 Harness Generation이 `remote_kcov_attribution`
+gap으로 생성하고 검증한다(`07` §4, §5). trace, dmesg, daemon log는 진단 정보일 뿐 Q1 근거가 아니다.
 
 Broker 카운터(`server/cld.state`, broker 소유):
 `reconnect_attempts/ok/fail`, `down_attempts/ok/fail`, `daemon_stop_ok/fail`, `daemon_start_ok/fail`,
@@ -798,6 +825,11 @@ semantic capability registry
   entry는 promoted registry를 `authority_refs`로, 검증된 subset을 `validated_scope`로 참조한다.
 - Agent와 Mutation Rule Compiler는 promoted scope만 쓴다. 실행 중인 binary가 runtime에 광고하는 범위만으로는
   쓰지 않는다(§7.1).
+- 여기서 promoted는 M7 gate를 통과해 job이 binding한 `hcap_revision`에 pin됐다는 뜻이다. 그 revision은 promoted
+  revision일 수도 있고 Harness Generation이 만든 staged revision(§1.1)일 수도 있다. staged revision이 semantic
+  subset을 담으려면 M7 1단계(crash survival을 뺀 항목, `03-nfs-proxy/06` §30)를 통과해야 하고, pin은 crash survival
+  pending으로 표시된다. crash survival은 자연 crash로만 확인하며 인위적으로 crash를 만들지 않는다. 공유 HCAP으로
+  올리는 promotion은 그 확인(M7 2단계) 뒤에만 한다. subset을 사람이 구현했는지 생성했는지는 구분하지 않는다.
 - path, operator, transform 목록을 이 문서나 Agent·Proxy 설계 문서에 복제하지 않는다.
 
 promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다. registry 생성과 promotion gate는
@@ -876,6 +908,8 @@ Harness Capability Specification
 
 Agent는 없는 capability를 있다고 가정하지 않는다.
 Stage 1/2 Agent는 candidate 실행 중에 즉석에서 source를 바꾸지 않는다.
+Planning은 자연 경로가 있으면 그 경로를 고르며, 그 경로가 귀속되지 않으면 서버 직접 조작으로 우회하지 않고
+`remote_kcov_attribution` gap을 낸다(§3.2).
 없는 capability는 Harness Generation이 syzlang, pseudo-syscall/executor, fixture/tool,
 mutation-engine, remote-KCOV 계측으로 생성하고 검증한다.
 
@@ -910,9 +944,10 @@ runtime이 pin된 authority보다 적거나 다르게 보고
     -> INCONCLUSIVE(infra) / 차단
     -> repository maintenance defect
 
-runtime이 promotion되지 않은 capability를 더 노출
+runtime이 pin된 authority에 없는 capability를 더 노출
     -> 사용하지 않는다
-    -> validation / promotion이 authority를 갱신하기 전에는 Agent capability가 아니다
+    -> validation / promotion(M7 gate나 Harness Generation 검증)이 binding한 revision의 authority를
+       갱신하기 전에는 Agent capability가 아니다. staged revision에 pin된 것은 사용한다
 ```
 
 ### 7.2 drift guard

@@ -173,6 +173,7 @@ ownerless/background work
 새 async continuation path
 현재 propagation이 없는 callback/workqueue path
 client-side target without remote attribution
+자연 경로가 workqueue에서 도는 경우 (예: lease 만료의 laundromat, 04 §3.2)
 candidate.kernel_commit용 harness build 없음 (remote_kcov.kernel_revision.<commit>)
 ```
 
@@ -234,9 +235,24 @@ validation (Runner, §5.2)
 - 생성물은 patch set이다: `bundle/` 아래 syzlang, executor, fixture, host spec entry, Proxy/compiler 변경,
   kernel 계측 patch. promoted HCAP과 main branch에는 쓰지 않고 staging 영역(job과 gap key로 이름 붙인 branch나
   artifact)에만 쓴다.
-- 생성 Agent가 쓴 code는 guest와 host 도구에서 실행된다. 그래서 build와 실행은 Runner가 격리된 KVM 환경에서
-  하고, 생성 Agent에는 shell과 network 권한을 주지 않는다(`01` §10). 생성 Agent가 쓸 수 있는 것은 staging
-  영역의 파일과 검증 요청뿐이다.
+- 생성 Agent는 파일과 shell 권한을 가진다(2026-10-25 사용자 결정). 설계 문서와 repository를 직접 읽고, gap
+  key마다 하나인 git worktree(staging)에서 code를 고치고, build와 test를 스스로 돌려 patch set을 다듬는다.
+  container나 VM은 쓰지 않는다. 지킬 것은 두 가지다.
+  - 판정 근거를 쓰지 못한다. 생성 Agent는 별도 OS 사용자로 돌고, Controller state, artifact store, 다른 gap의
+    worktree에 쓸 수 없다(읽기 전용이거나 접근 불가). promoted HCAP과 main branch는 읽기만 한다.
+  - credential을 보지 못한다. LLM API key, GitHub token 같은 secret이 없는 환경 변수와 파일 권한으로 실행한다.
+  network 권한은 주지 않는다.
+- 구현은 pydantic-ai(2.55.0)의 Workspace API를 쓴다. `LocalWorkspace(worktree, env=...)` capability가 tool에
+  `ctx.workspace`(파일 읽기·쓰기, 명령 실행)를 주며, 명령에는 `PATH`, `HOME`, `LANG`, `LC_*`와 넘긴 `env`만
+  전달하므로 이 process의 secret 환경 변수는 새지 않는다. `LocalWorkspace`는 파일 시스템을 격리하지 않으므로
+  위의 OS 사용자 권한이 그 경계다. 모델에 노출할 file·shell tool은 이 API 위에 직접 정의한다(library가 정해 둔
+  tool은 없다). 사람 확인이 필요한 명령이 생기면 `ApprovalRequiredToolset`으로 묶을 수 있다.
+- 생성 Agent가 worktree에서 돌린 build와 test 결과는 판정이 아니다. staged revision을 만드는 판정은 Runner가
+  patch set만 받아 새 격리 VM 환경(기본 KVM)에서 다시 build하고 §5.2를 실행해 낸다. Agent worktree의 산출물(binary,
+  log)은 그 판정에 쓰지 않는다.
+- 생성물의 트리거는 `04` §3.2를 따른다. 클라이언트가 유도한 서버 동작은 허용하지만, 실행 중에 harness가 서버를
+  직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버 데몬 정지·종료·재시작, 서버 설정 변경)를 하는 executor·helper·fixture 동작은 만들지 않는다. 자연 경로가
+  귀속되지 않으면 우회하지 않고 그 context의 귀속 계측을 함께 생성한다.
 - vulnerability fix patch는 생성하지 않는다(§6). target kernel code의 동작을 바꾸는 patch는 계측으로 보지 않고
   거부한다.
 
@@ -247,11 +263,18 @@ validation (Runner, §5.2)
 ```text
 build PASS (선택한 sanitizer variant)
 bootstrap 검증 (기존 harness와 같은 기준)
-proposal의 promotion_evidence (KVM)
+proposal의 promotion_evidence (VM 실행, 기본 KVM)
 새 capability를 쓰는 smoke program과 neutral control
 기존 HCAP capability 회귀 (기존 seed와 lane 경로가 같은 결과)
 remote_kcov_attribution이면: 알려진 target에서 attribution이 성립하고, RemoteKcovSupportBoundary가 그 계측을 기술함
+mutation_engine이면: 생성한 semantic subset이 M7 1단계(staged pin, 03-nfs-proxy/06 §30)를 통과해 그 registry
+    digest가 crash survival pending 표시와 함께 staged revision의 HCAP-10 authority_refs에 들어감
+트리거 기준 (04 §3.2): 새 capability의 실행 중 트리거가 NFS 클라이언트의 행위뿐이고 harness가 서버를 직접 조작하지 않음
 ```
+
+mutation_engine의 crash survival(guest crash 직전 MutationDelta가 남는가)은 여기서 보지 않는다. 이를 보려고
+guest를 일부러 crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지). 실제 campaign에서
+자연히 생긴 crash로만 확인하며, 그 전까지 subset은 staged에 머문다(§5.3).
 
 통과하면 Controller는 staged `hcap_revision`(status `staged`, `04` §1.1)과 build가 바뀌었으면 새
 ExecutionHarnessIdentity를 만든다. 이 revision은 promoted HCAP과 구분되며, 그 위에서 만든 plan, verdict,
@@ -264,6 +287,10 @@ staged harness로 진행 중인 job은 그대로 진행하고, promotion이 끝�
 `hcap_revision` 재평가 규칙이 job들을 promoted revision으로 옮긴다. promotion 검토가 생성물을 거부하면 그
 staged revision으로 만든 결과는 거부 사실과 함께 남기고, 해당 job은 `09` §5의 binding 변경 규칙으로 다시
 gap 경로에 들어간다.
+
+mutation_engine 생성물은 M7 2단계(자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를 통과할 때까지
+promotion하지 않는다. 사람이 구현한 subset과 같은 기준이다. 그 전까지 staged revision으로 job은 계속 진행하고
+issue는 `resolved`가 되지 않는다.
 
 ## 6. Patch 종류의 구분
 
