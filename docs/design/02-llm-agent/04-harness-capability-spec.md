@@ -239,7 +239,9 @@ Capability.fills_gap?           # 이 capability가 채우는 gap ID
 - host spec의 `gap_contracts`는 spec을 승인한 operator의 진술이다. Harness Generation의 patch set은 spec을 바꿀 수
   있으므로 그 경로에서는 Controller가 gap과 contract, patch set이 시작한 base spec을 spec 밖에서 넘긴다(`generate
   --gap --base-spec`, `09` §3.2). 그러면 spec은 그 gap에 다른 contract를 줄 수 없고, patch set이 base spec에 추가하거나
-  바꾼 capability는 모두 그 gap을 `fills_gap`으로 채워야 한다. base에 이미 있던 capability는 판정 대상이 아니다.
+  바꾼 capability는 모두 그 gap을 `fills_gap`으로 채워야 하고, base의 capability를 지울 수 없다. base에 이미 있던
+  capability는 이 gap 판정의 대상이 아니다. 기준선 밖 capability는 승격 기준(evidence)을 generation마다 다시 거친다.
+  evidence가 생성된 harness에 묶이기 때문이다.
 - 기준이 생기기 전에 checked-in spec에 있던 항목의 digest(`validated_layout`과 evidence 참조를 뺀 spec 항목)는
   repository 코드 `LEGACY_CAPABILITY_BASELINES`에 고정한다. spec이 스스로 면제를 선언할 수 없다. digest가 같은
   동안은 contract 없이 남고, 내용이 바뀌면 새 capability와 같이 기준을 거친다(2026-10-26 사용자 결정). 지금은

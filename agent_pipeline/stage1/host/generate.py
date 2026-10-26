@@ -671,8 +671,13 @@ def _with_gap(spec: HostSpec, gap: GapContract) -> HostSpec:
 def _changed_capabilities(spec: HostSpec,
                           base: HostSpec) -> tuple[Capability, ...]:
     """The capabilities ``spec`` adds to ``base`` or changes in it, compared
-    the way the legacy baselines are."""
+    the way the legacy baselines are.  A patch set adds capabilities and
+    never removes one."""
     before = {c.id: capability_baseline_sha256(c) for c in base.capabilities}
+    removed = sorted(set(before) - {c.id for c in spec.capabilities})
+    if removed:
+        raise GenerationError(
+            f"the patch set removes {', '.join(removed)} from the base spec")
     return tuple(c for c in spec.capabilities
                  if before.get(c.id) != capability_baseline_sha256(c))
 

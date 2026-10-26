@@ -1992,6 +1992,10 @@ def test_a_patch_set_is_held_to_its_own_gap_only():
     with pytest.raises(GenerationError, match="CAP-human does not fill gap "
                        "gap.b"):
         generate_module._check_fills(changed, "gap.b")
+    # A patch set cannot drop a base capability for its own.
+    with pytest.raises(GenerationError, match="removes CAP-human"):
+        generate_module._changed_capabilities(spec(earlier, new),
+                                              spec(earlier, human))
 
 
 @needs_gcc

@@ -369,8 +369,9 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
   별개이며 job 상태를 바꾸지 않는다. 결과는 `PromotionProbeEvidence`로 남고 promotion 검토의 입력이 된다.
 - patch set은 host spec도 바꿀 수 있으므로 gap key와 그 contract는 patch set에서 읽지 않는다. Controller가
   자기 state의 `GapContract`와 patch set이 시작한 base spec을 host generator에 `--gap`, `--base-spec`으로 넘기고,
-  generator는 spec이 그 gap에 다른 contract를 주거나 patch set이 base에 추가·변경한 capability가 그 gap을 채우지
-  않으면 거부한다. Controller는 후보 program digest를
+  generator는 spec이 그 gap에 다른 contract를 주거나, patch set이 base에 추가·변경한 capability가 그 gap을 채우지
+  않거나, base의 capability를 지우면 거부한다. base spec은 생성 worktree가 아니라 Controller의 읽기 전용 저장소에서
+  넘긴다(`07` §5.1). Controller는 후보 program digest를
   `withheld_program_sha256s`로 evidence에 넣는다. gap을 채우는 capability의 evidence에 이 값이 없으면 거부된다.
 - `kernel_commit`용 harness가 없는 경우(binding 실패 행)의 생성은 계측 series의 이식과 그 build의 검증이다.
   Q1은 그 build에서 처음부터 세운다.

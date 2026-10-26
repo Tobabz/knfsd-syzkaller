@@ -194,8 +194,15 @@ uv run python -m agent_pipeline.stage1.host generate SPEC \
 
 `gap.json` is a `GapContract`. The spec cannot give that gap another
 contract, and every capability the patch set adds or changes relative to
-the base spec must fill that gap. Capabilities the base already holds are
-not the patch set's, whatever gap they fill.
+the base spec must fill that gap, and it may not remove a base capability.
+Capabilities the base already holds are not the patch set's, whatever gap
+they fill. The base spec must come from the Controller's own read-only
+store, not from the generation worktree.
+
+Outside the legacy baselines, "judged" means every generation: a capability
+promoted after the criteria keeps its promotion only while its spec entry
+lists a probe campaign bound to the generated harness. That is the same
+binding the capability-specific KVM evidence has.
 
 ## How the pieces bind
 
