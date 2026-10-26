@@ -234,6 +234,15 @@ def test_probes_are_the_contract_boundary():
             "probes_not_contract_boundary"]
 
 
+def test_a_gap_filler_names_the_candidate_programs():
+    # A candidate raised the gap, so its programs must be kept out by name.
+    filler = capability(contract(), fills_gap="lane.partition")
+    assert promotion_refusals(filler, [evidence()]) == [
+        "candidate_programs_not_withheld"]
+    assert promotion_refusals(filler, [evidence(
+        withheld_program_sha256s=["ab" * 32])]) == []
+
+
 def test_time_dependent_capabilities_need_kvm():
     timed = contract(time_dependent=True)
     assert promotion_refusals(capability(timed),
@@ -293,3 +302,11 @@ def test_a_catalog_holds_gap_fillers_to_their_contract():
         HcapCatalog(capabilities=(narrowed,),
                     missing_capability_ids=("lane.partition",),
                     gap_contracts=(gap,))
+    # A gap ID outside the gap contracts, or without one, fills nothing.
+    for vocabulary, gaps in ((("lane.partition",), (gap,)),
+                             (("lane.partition", "no.such.gap"), (gap,))):
+        stray = capability(contract(), fills_gap="no.such.gap")
+        with pytest.raises(ValidationError, match="has no gap contract"):
+            HcapCatalog(capabilities=(stray,),
+                        missing_capability_ids=vocabulary,
+                        gap_contracts=gaps)

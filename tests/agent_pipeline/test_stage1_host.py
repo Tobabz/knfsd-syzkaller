@@ -43,7 +43,7 @@ from agent_pipeline.stage1.host import kcov
 from agent_pipeline.stage1.host.__main__ import main as host_main
 import agent_pipeline.stage1.host.generate as generate_module
 from agent_pipeline.hcap import (STAGE1_LAYOUT, Capability, CapabilityContract,
-                                 ExecutionLayout, HcapCatalog)
+                                 ExecutionLayout, GapContract, HcapCatalog)
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
@@ -1920,9 +1920,41 @@ def test_a_new_capability_must_meet_the_promotion_criteria(host):
         generate(host.spec)
     spec["gap_contracts"][0]["contract"] = PROBE_CONTRACT
     host.spec.write_text(json.dumps(spec, indent=1))
+    # A candidate raised the gap; the campaign names its programs.
+    with pytest.raises(GenerationError,
+                       match="candidate_programs_not_withheld"):
+        generate(host.spec)
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-new", PROBE_CONTRACT,
+        withheld_program_sha256s=["7" * 64])))
     catalog = load_record(ArtifactStore(host.root / "cas"),
                           generate(host.spec).hcap_revision, HcapCatalog)
     assert catalog.gap_contracts[0].missing_capability_id == "lane.partition"
+
+    # A Harness Generation patch set can change the spec, so the Controller
+    # passes the gap and its contract: the spec cannot narrow that contract,
+    # and every new or revised capability fills that gap.
+    gap = GapContract.model_validate_json(json.dumps(
+        {"missing_capability_id": "lane.partition",
+         "contract": PROBE_CONTRACT}))
+    generate(host.spec, gap=gap)
+    narrowed = GapContract.model_validate_json(json.dumps(
+        {"missing_capability_id": "lane.partition",
+         "contract": {**PROBE_CONTRACT, "time_dependent": True}}))
+    with pytest.raises(GenerationError, match="another contract than the "
+                       "Controller's"):
+        generate(host.spec, gap=narrowed)
+    del spec["gap_contracts"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          generate(host.spec, gap=gap).hcap_revision,
+                          HcapCatalog)
+    assert catalog.gap_contracts == (gap,)
+    del spec["capabilities"][-1]["fills_gap"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="CAP-new does not fill gap "
+                       "lane.partition"):
+        generate(host.spec, gap=gap)
 
 
 @needs_gcc

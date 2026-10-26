@@ -164,7 +164,8 @@ class PromotionProbeEvidence(_Model):
     distinct syzkaller-generated and mutated programs that each call an
     entry point, and ``neutral`` runs programs of the same fixture that use
     none.  ``withheld_program_sha256s`` are the programs the Controller kept
-    out of the campaign: the candidate's, for a generated capability.
+    out of the campaign: the candidate's.  A capability that fills a gap
+    needs them, since a candidate raised the gap (``promotion_refusals``).
     """
 
     schema_version: Literal["promotion-probe-evidence.v1"]
@@ -253,6 +254,10 @@ def promotion_refusals(capability: Capability,
             problems.append("probes_not_contract_boundary")
         if contract.time_dependent and item.accelerator != "kvm":
             problems.append("time_dependent_needs_kvm")
+        if capability.fills_gap is not None and \
+                not item.withheld_program_sha256s:
+            # A gap is raised by a candidate; its program must be named.
+            problems.append("candidate_programs_not_withheld")
         if not problems:
             return []
         refusals.extend(p for p in problems if p not in refusals)

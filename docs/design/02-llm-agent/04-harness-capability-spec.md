@@ -234,12 +234,17 @@ Capability.fills_gap?           # 이 capability가 채우는 gap ID
 - `fixed_arguments`는 진입점 call의 인자만 가리킨다. 한 값만 허용하는 인자 위치는 여기나 `fixed_types`에 있어야
   한다(`07` §5.3 기준 5). 후보 program에서 온 값을 고정값으로 올리지 않는다.
 - contract의 목록은 집합이다. 순서와 상관없이 같은 contract는 digest가 같다.
-- `fills_gap`이 있는 capability의 contract는 그 gap의 `GapContract`와 같다. HCAP은 이를 검증하고, host
-  generator는 gap contract가 없는 gap을 채우는 capability를 거부한다. 후보에 맞춰 경계를 줄이면 다른 contract다.
-- 기준이 생기기 전에 승격된 항목의 digest(`validated_layout`과 evidence 참조를 뺀 spec 항목)는 repository 코드
-  `LEGACY_CAPABILITY_BASELINES`에 고정한다. spec이 스스로 면제를 선언할 수 없다. digest가 같은 동안은 contract
-  없이 남고, 내용이 바뀌면 새 capability와 같이 기준을 거친다(2026-10-26 사용자 결정). 지금은 template의
-  HCAP-01, 03, 04, 11, 13과 `stage1-host-live`의 HCAP-01, 03, 04, 14가 여기에 있다.
+- `fills_gap`이 있는 capability의 contract는 그 gap의 `GapContract`와 같다. HCAP은 이를 검증하고, gap
+  contract가 없는 gap을 채운다는 capability도 거부한다. 후보에 맞춰 경계를 줄이면 다른 contract다.
+- host spec의 `gap_contracts`는 spec을 승인한 operator의 진술이다. Harness Generation의 patch set은 spec을 바꿀 수
+  있으므로 그 경로에서는 Controller가 gap과 contract를 spec 밖에서 넘긴다(`generate --gap`, `09` §3.2). 그러면 spec은
+  그 gap에 다른 contract를 줄 수 없고, 새로 추가하거나 바꾼 capability는 모두 그 gap을 `fills_gap`으로 채워야 한다.
+- 기준이 생기기 전에 checked-in spec에 있던 항목의 digest(`validated_layout`과 evidence 참조를 뺀 spec 항목)는
+  repository 코드 `LEGACY_CAPABILITY_BASELINES`에 고정한다. spec이 스스로 면제를 선언할 수 없다. digest가 같은
+  동안은 contract 없이 남고, 내용이 바뀌면 새 capability와 같이 기준을 거친다(2026-10-26 사용자 결정). 지금은
+  template의 HCAP-01, 03, 04, 11, 13과 `stage1-host-live`의 HCAP-01, 03, 04, 14가 여기에 있다. HCAP-14는 기준
+  이전(2026-10-23)부터 live spec에 `experimental`로 있던 항목이다. 기준선은 그 status를 바꾸지 않으며, validated로
+  올리거나 내용을 바꾸면 기준을 거친다.
 - `contract`, `fills_gap`, `validated_layout`, `gap_contracts`는 `hcap.v1` 뒤에 생긴 field다. record가 그 field를
   가지고 만들어졌을 때만 직렬화해서, 그 전에 저장된 revision도 canonical bytes가 그대로 유지된다.
 

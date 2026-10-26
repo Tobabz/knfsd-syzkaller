@@ -337,8 +337,12 @@ class HcapCatalog(HcapRecord):
         contracts = {g.missing_capability_id: g.contract
                      for g in self.gap_contracts}
         for cap in self.capabilities:
-            if cap.fills_gap in contracts and \
-                    cap.contract != contracts[cap.fills_gap]:
+            if cap.fills_gap is None:
+                continue
+            if cap.fills_gap not in contracts:
+                raise ValueError(f"{cap.id} fills {cap.fills_gap}, which has "
+                                 "no gap contract")
+            if cap.contract != contracts[cap.fills_gap]:
                 raise ValueError(f"{cap.id} does not declare the contract of "
                                  f"the gap it fills, {cap.fills_gap}")
         _unique_authorities(self.authority_refs)

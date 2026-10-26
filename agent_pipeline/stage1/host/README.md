@@ -156,13 +156,14 @@ Capability evidence must be typed: a `promotion-probe-evidence.v1`
 campaign, or the capability's own KVM evidence model. Untyped evidence is
 refused for every capability.
 
-`generate.LEGACY_CAPABILITY_BASELINES` pins, for each capability promoted
-before the criteria, `capability_baseline_sha256` of its entry in the
-checked-in specs (without `validated_layout` and evidence references). The
+`generate.LEGACY_CAPABILITY_BASELINES` pins, for each capability the
+checked-in specs held before the criteria, `capability_baseline_sha256` of
+its entry (without `validated_layout` and evidence references). The
 repository pins them, so a spec cannot exempt a capability. While an entry
-still matches, it keeps its earlier promotion. A new capability, or one whose entry
-changed, needs all of the following, and `generate` refuses the spec
-otherwise:
+still matches, it keeps its earlier status; that includes the live spec's
+HCAP-14, which has been `experimental` since before the criteria. A new
+capability, or one whose entry changed, needs all of the following, and
+`generate` refuses the spec otherwise:
 
 - a `contract` (entry points, boundary functions, fixed arguments and
   types; `docs/design/02-llm-agent/04-harness-capability-spec.md` §3.3);
@@ -178,7 +179,19 @@ otherwise:
 `gap_contracts` gives the contract a capability filling each gap ID must
 declare; it is copied into the generated HCAP. A capability names the gap
 it fills with `fills_gap`, and `generate` refuses it unless its contract is
-that gap's.
+that gap's. A capability that fills a gap also needs a campaign that names
+the candidate's programs in `withheld_program_sha256s`.
+
+The spec's `gap_contracts` are the operator's statement. A Harness
+Generation patch set can change the spec, so on that path the Controller
+passes the gap and its contract from its own state:
+
+```sh
+uv run python -m agent_pipeline.stage1.host generate SPEC --gap gap.json
+```
+
+`gap.json` is a `GapContract`. The spec cannot give that gap another
+contract, and every new or revised capability must fill that gap.
 
 ## How the pieces bind
 

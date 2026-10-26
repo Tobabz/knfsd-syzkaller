@@ -651,6 +651,36 @@ def _validated_capability_evidence(
     return contents, evidence.layout, probe
 
 
+def _with_gap(spec: HostSpec, gap: GapContract) -> HostSpec:
+    """The spec with the Controller's gap contract, which a contract the
+    spec gives the same gap must equal."""
+    gap_id = gap.missing_capability_id
+    own = [g for g in spec.gap_contracts if g.missing_capability_id == gap_id]
+    if any(g.contract != gap.contract for g in own):
+        raise GenerationError(
+            f"the spec gives gap {gap_id} another contract than the "
+            "Controller's (#100)")
+    if gap_id not in _gap_vocabulary(spec):
+        raise GenerationError(f"gap {gap_id} is not in the spec's vocabulary")
+    contracts = (*(g for g in spec.gap_contracts
+                   if g.missing_capability_id != gap_id), gap)
+    return spec.model_copy(update={"gap_contracts": tuple(
+        sorted(contracts, key=lambda g: g.missing_capability_id))})
+
+
+def _check_fills(capabilities: tuple[Capability, ...], gap_id: str) -> None:
+    """#100: a Harness Generation patch set adds or revises only
+    capabilities that fill the gap it was generated for."""
+    if not capabilities:
+        raise GenerationError(
+            f"no new or revised capability fills gap {gap_id}")
+    for capability in capabilities:
+        if capability.fills_gap != gap_id:
+            raise GenerationError(
+                f"{capability.id} does not fill gap {gap_id}, the gap this "
+                "generation is for (#100)")
+
+
 def _check_gap_contracts(spec: HostSpec,
                          capabilities: tuple[Capability, ...]) -> None:
     """#100: a capability filling a gap declares that gap's vocabulary
@@ -924,10 +954,17 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
 
 
 def generate(spec_path: Path, *, python: str = sys.executable,
-             now: str | None = None) -> Generated:
+             now: str | None = None,
+             gap: GapContract | None = None) -> Generated:
+    """``gap`` is the Controller's contract for the gap a Harness
+    Generation patch set fills (#100).  It comes from outside the spec,
+    which the patch set can change: every new or revised capability must
+    fill that gap, and the spec cannot give the gap another contract."""
     spec_path = Path(spec_path).resolve()
     base = spec_path.parent
     spec = HostSpec.model_validate_json(spec_path.read_bytes())
+    if gap is not None:
+        spec = _with_gap(spec, gap)
     state = _resolve(base, spec.state_dir)
     root = _resolve(base, spec.artifact_root)
     env = _resolve(base, spec.env_dir)
@@ -1056,6 +1093,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             or identity.call_table_sha256 != put_record(store, table)):
         raise GenerationError("bundle identity.json disagrees with its files")
     judged = promoted_by_criteria(spec)
+    if gap is not None:
+        _check_fills(judged, gap.missing_capability_id)
     _check_gap_contracts(spec, judged)
     _check_argument_generality(judged, bundle, identity)
 

@@ -293,13 +293,15 @@ job들을 promoted revision으로 옮긴다. promotion 검토가 생성물을 �
 승격 기준은 capability가 처음 gap을 낸 후보 하나에 맞춰져 있지 않은지 본다. 예를 들어 그 후보의 Q1 target만
 겨냥하거나 그 후보 program의 인자와 상태를 상수로 박아 둔 capability를 거른다. 기준은 사람이 만든 capability와
 Harness Generation이 만든 capability에 똑같이 적용한다. host spec에서는 새로 추가하거나 내용을 바꾼 capability가
-대상이고, 기준이 생기기 전에 승격된 항목은 바뀌지 않는 동안 repository가 고정한 기준선으로 남는다(`04` §3.3,
-사용자 결정 2026-10-26).
+대상이고, 기준이 생기기 전에 checked-in spec에 있던 항목은 바뀌지 않는 동안 repository가 고정한 기준선으로
+남는다(`04` §3.3, 사용자 결정 2026-10-26).
 
 1. **contract가 먼저이고 후보와 분리된다.** capability는 범위를 `CapabilityContract`(`04` §3.3)로 선언한다.
    진입점(syz call, pseudo-syscall, Proxy operation, fixture action)과 경계(이 기능이 도달시키는 공개 kernel 함수
    집합)를 적는다. gap을 채우는 capability의 contract는 그 gap key의 vocabulary contract(`gap_contracts`)와 같아야
-   한다. 후보의 Q1 target이나 시나리오에서 contract를 만들지 않는다.
+   한다. 후보의 Q1 target이나 시나리오에서 contract를 만들지 않는다. 생성 patch set은 spec을 바꿀 수 있으므로
+   Controller가 gap과 그 contract를 spec 밖에서 넘기고(`generate --gap`), 새로 추가하거나 바꾼 capability는 모두
+   그 gap을 채워야 한다(`09` §3.2).
 2. **probe는 Controller가 정한다.** promotion probe는 contract의 `boundary_functions`다. 후보의 Q1 target은 그
    함수가 경계에 있을 때만 probe가 된다. 생성 Agent의 출력에는 probe가 없고, Agent는 probe를 고를 수 없다.
    evidence의 probe 집합이 경계와 다르면 거부한다.
@@ -309,7 +311,8 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
    - syzkaller가 capability의 진입점 call을 포함해 생성하고 변이한 program: 서로 다른 program 16개 이상으로
      32회 이상, 25% 이상의 run이 probe에 도달. 진입점 call이 없는 program은 섞지 않는다
    두 종류 모두 경계의 모든 probe를 한 번 이상 쳐야 한다. Controller는 후보 program의 digest를
-   `withheld_program_sha256s`로 evidence에 남기고, campaign이 그 program을 돌렸으면 거부한다. 비율과 횟수는 repository owner가 정하기 전까지의 임시
+   `withheld_program_sha256s`로 evidence에 남기고, campaign이 그 program을 돌렸으면 거부한다. gap을 채우는
+   capability의 evidence에 이 값이 비어 있으면 거부한다. 비율과 횟수는 repository owner가 정하기 전까지의 임시
    값이다(`agent_pipeline/promotion.py`). evidence에는 실행한 accelerator를 기록한다. `time_dependent` contract는
    KVM evidence로만 승격한다. TCG는 타이밍이 달라 시간 의존 capability의 KVM 결과와 같은 것으로 보지 않는다.
 4. **neutral control.** capability를 쓰지 않는 같은 fixture의 program을 3회 이상 돌려 probe를 모두 놓쳐야 한다.
