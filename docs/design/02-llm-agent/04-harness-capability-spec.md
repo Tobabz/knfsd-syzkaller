@@ -47,7 +47,8 @@ rendered Markdown (이 문서)
   job들이 쓰며, promoted revision을 바꾸지 않는다. plan과 verdict는 어느 쪽인지 기록한다.
 - HCAP data는 `missing_capability_id`의 controlled vocabulary도 담는다(`07` §3, issue #13). 예:
   `state_lineage`, `remote_kcov.context.<context>`, `remote_kcov.kernel_revision.<commit>`,
-  `neutral_control.<profile>`(`05` §11).
+  `neutral_control.<profile>`(`05` §11). vocabulary 항목은 `gap_contracts`로 contract(§3.3)를 가질 수 있고,
+  그 gap을 채우는 capability는 그 contract를 선언한다(#100).
 - Controller는 plan의 `required_capabilities`, `status`, `usable_by`를 이 데이터로 검증한다. Harness
   Materializer는 program의 call을 `CallAdmissionProfile`(§3.1)로 capability에 대조하고, Mutation Rule
   Compiler는 promoted semantic registry(§4)를 쓴다.
@@ -127,6 +128,7 @@ Capability
     validated_layout            # 증거가 돈 실행 배치 (#99)
         procs                   # 생략하면 Stage 1 배치: procs=1, lanes=[0]
         lanes[]
+    contract                    # 승격이 판정하는 범위 (§3.3, #100)
 
     evidence_refs[]             # 검증 기록
     authority_refs[]            # 세부 authority artifact의 digest 참조 (§1.1)
@@ -201,6 +203,38 @@ capability는 실제 위협 모델 안의 시나리오만 지원한다(결정 �
   메시지를 대신 만든 것이다. Proxy는 변조를 정상 시나리오와 구분하려고 둔 구조다. 따라서 S2C 변조는 서버가
   protocol로 보낼 수 있는 응답·callback이면 허용하고, 그 대상은 서버 응답을 받는 쪽(kernel NFS client)이다.
   서버 관리 조작(서버 관리 인터페이스 쓰기, 데몬 정지·재시작)은 S2C 시나리오에서도 트리거가 아니다.
+
+### 3.3 CapabilityContract
+
+capability가 무엇을 도달시키는지는 후보와 상관없이 contract로 먼저 선언한다(#100). 승격 기준(`07` §5.3)은
+contract를 기준으로 판정한다.
+
+```text
+CapabilityContract
+    entry_points[]              # 프로그램이 capability에 들어오는 곳
+        kind                    # syz_call | proxy_operation | fixture_action
+        name
+    boundary_functions[]        # 진입점이 도달시키는 공개 kernel 함수 (export·entry 함수, tracepoint 지점)
+                                # Controller가 promotion probe로 고정한다
+    fixed_arguments[]           # 진입점 syz call 인자 중 contract가 정한 고정값
+        call
+        path                    # 인자와 그 아래 field를 점으로 이은 이름 (client, buf.msg.proc)
+        value?                  # 고정 문자열이면 없다
+    fixed_types[]               # protocol이 상수를 정한 syzlang type. 그 안의 상수는 모두 고정값이다
+    time_dependent              # true면 KVM evidence로만 승격한다
+
+GapContract                     # vocabulary 항목의 contract
+    missing_capability_id
+    contract
+```
+
+- contract의 `syz_call` 진입점은 capability `interface.syz_calls`와 같아야 한다.
+- `fixed_arguments`는 진입점 call의 인자만 가리킨다. 한 값만 허용하는 인자 위치는 여기나 `fixed_types`에 있어야
+  한다(`07` §5.3 기준 5). 후보 program에서 온 값을 고정값으로 올리지 않는다.
+- gap을 채우는 capability의 contract는 그 gap의 `GapContract`와 같다. 후보에 맞춰 경계를 줄이면 다른 contract다.
+- host spec의 `legacy_capabilities`는 기준이 생기기 전에 승격된 항목의 digest(`validated_layout`과 evidence
+  참조를 뺀 spec 항목)다. digest가 같은 동안은 contract 없이 남고, 내용이 바뀌면 새 capability와 같이 기준을
+  거친다(2026-10-26 사용자 결정). 지금은 HCAP-01, 03, 04, 11, 13이 여기에 있다.
 
 ## 4. 현재 capability catalog
 

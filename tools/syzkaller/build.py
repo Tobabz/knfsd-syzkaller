@@ -77,7 +77,8 @@ def build(source: Path, output: Path, go: str) -> Path:
     run([go, "run", "./sys/syz-sysgen"], cwd=checkout, env=env)
     bundle = output / "bundle"
     bundle.mkdir()
-    files = [ROOT / "tools/syzkaller/bridge.go", ROOT / "tools/syzkaller/facts.go"]
+    files = [ROOT / "tools/syzkaller" / name
+             for name in ("bridge.go", "facts.go", "shapes.go")]
     flags = (f"-s -w -X main.sourceCommit={commit} -X main.patchDigest={patch_digest} "
              f"-X main.sourceTree={tree}")
     run([go, "build", "-trimpath", "-buildvcs=false", "-ldflags", flags,

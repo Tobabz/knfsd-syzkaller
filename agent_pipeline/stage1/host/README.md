@@ -150,6 +150,33 @@ files of the lease's descriptor. `probe` and `check-pcs` take
 `--variant kcsan`; a KCSAN harness also reports `BUG: KCSAN:` as a crash. A
 `stage2` section writes one manager config per variant.
 
+## Promotion criteria (#100)
+
+Capability evidence must be typed: a `promotion-probe-evidence.v1`
+campaign, or the capability's own KVM evidence model. Untyped evidence is
+refused for every capability.
+
+`legacy_capabilities` maps each capability promoted before the criteria
+to `capability_baseline_sha256` of its spec entry (without
+`validated_layout` and evidence references). While an entry still matches,
+it keeps its earlier promotion. A new capability, or one whose entry
+changed, needs all of the following, and `generate` refuses the spec
+otherwise:
+
+- a `contract` (entry points, boundary functions, fixed arguments and
+  types; `docs/design/02-llm-agent/04-harness-capability-spec.md` §3.3);
+- a `PromotionProbeEvidence` file in `capability_evidence` whose probes
+  are the contract's boundary functions and whose minimal, generated and
+  neutral run sets meet the thresholds in `agent_pipeline/promotion.py`
+  (KVM only for a `time_dependent` contract);
+- syz call arguments that carry no literal the contract does not fix. The
+  check reads the pinned target's argument shapes through the parser
+  bundle's `describe`, so the bundle must be built from this repository's
+  bridge sources.
+
+`gap_contracts` gives the contract a capability filling each gap ID must
+declare; it is copied into the generated HCAP.
+
 ## How the pieces bind
 
 - **Pins.** The descriptor names each host file (vmlinux as `kernel`,

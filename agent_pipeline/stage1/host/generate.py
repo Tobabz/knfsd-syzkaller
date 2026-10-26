@@ -50,11 +50,13 @@ from ...contracts import (PIPELINE_GAP_IDS, CampaignMode, HarnessBinding,
                           JobPolicy, JudgeVersions, Sanitizer, Sha256)
 from ...data import canonical_json, put_record
 from ...hcap import (STAGE1_LAYOUT, AuthorityRef, Capability, ExecutionLayout,
-                      HcapCatalog, RuntimeSelection, calls_in_layout,
-                      layout_refusals)
+                      GapContract, HcapCatalog, RuntimeSelection,
+                      calls_in_layout, layout_refusals)
 from ...materializer import (ExecutionHarnessApproval,
                              ExecutionHarnessDescriptor, HarnessBuildArtifact,
                              _runtime_key, descriptor_id)
+from ...promotion import (PromotionProbeEvidence,
+                          argument_generality_refusals, promotion_refusals)
 from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
                    RemoteKcovSupportBoundary)
 from ...qemu_accel import Accel, AccelChoice, resolve, slowdown
@@ -503,6 +505,13 @@ class HostSpec(_Spec):
     #: generated HCAP catalog. Paths are relative to this spec.
     capability_evidence: dict[str, tuple[Path, ...]] = Field(
         default_factory=dict)
+    #: Capability ID -> ``capability_baseline_sha256`` of its entry when the
+    #: promotion criteria were introduced (#100).  An entry that still
+    #: matches keeps its earlier promotion; a new capability, or one whose
+    #: entry changed, must pass the criteria (``promotion``).
+    legacy_capabilities: dict[str, Sha256] = Field(default_factory=dict)
+    #: The contract each gap ID's capability must declare (04 §3.3).
+    gap_contracts: tuple[GapContract, ...] = ()
     #: The capability whose constraints list the allowed runtime selections.
     #: The Agent reads capabilities through its HCAP lookup tool and must
     #: plan with one of these selections exactly.
@@ -539,6 +548,28 @@ class HostSpec(_Spec):
             capability_evidence=self.capability_evidence),)
 
 
+def capability_baseline_sha256(capability: Capability) -> str:
+    """The digest ``legacy_capabilities`` pins: the spec entry without its
+    validated layout, which lane-topology evidence widens on its own (#99),
+    and without generated evidence references."""
+    entry = capability.model_dump(
+        mode="json", exclude={"validated_layout", "evidence_refs"})
+    return hashlib.sha256(canonical_json(entry)).hexdigest()
+
+
+def promoted_by_criteria(spec: HostSpec) -> tuple[Capability, ...]:
+    """The capabilities the promotion criteria judge: every one that is not
+    an unchanged legacy entry (#100)."""
+    unknown = sorted(set(spec.legacy_capabilities)
+                     - {c.id for c in spec.capabilities})
+    if unknown:
+        raise GenerationError(
+            f"legacy_capabilities names no capability: {unknown[0]}")
+    return tuple(c for c in spec.capabilities
+                 if spec.legacy_capabilities.get(c.id)
+                 != capability_baseline_sha256(c))
+
+
 def _gap_vocabulary(spec: HostSpec) -> tuple[str, ...]:
     """The spec's gap IDs and the ones the pipeline emits itself (#81 D6),
     so every generated HCAP revision lists them explicitly (04 §1.1)."""
@@ -553,18 +584,31 @@ def _resolve(base: Path, path: Path) -> Path:
 def _validated_capability_evidence(
         capability_id: str, path: Path, *,
         expected_mapping_identity: KernelIdentity,
-        lane_script_sha256: str) -> tuple[bytes, ExecutionLayout | None]:
+        lane_script_sha256: str,
+) -> tuple[bytes, ExecutionLayout, PromotionProbeEvidence | None]:
     """Validate identity-sensitive evidence before it can promote an HCAP.
 
-    Capabilities with a typed KVM evidence model (CAPABILITY_EVIDENCE_MODELS)
-    accept only evidence of that model bound to the generated execution
-    harness, its full mapping identity and the pinned guest lane script.
-    Returns the bytes and the executor layout the typed evidence ran.
+    Evidence is typed: a promotion probe campaign (#100) for any capability,
+    or the capability's own KVM evidence model (CAPABILITY_EVIDENCE_MODELS).
+    Untyped evidence is refused for every capability.  Either kind must be
+    bound to the generated execution harness, its full mapping identity and
+    the pinned guest lane script.  Returns the bytes, the executor layout
+    the evidence ran and the probe campaign, if it is one.
     """
     contents = path.read_bytes()
-    model = CAPABILITY_EVIDENCE_MODELS.get(capability_id)
+    try:
+        schema = json.loads(contents).get("schema_version")
+    except (ValueError, AttributeError) as error:
+        raise GenerationError(
+            f"{capability_id} evidence {path} is not a JSON object") from error
+    if schema == "promotion-probe-evidence.v1":
+        model = PromotionProbeEvidence
+    else:
+        model = CAPABILITY_EVIDENCE_MODELS.get(capability_id)
     if model is None:
-        return contents, None
+        raise GenerationError(
+            f"{capability_id} evidence {path} has no typed evidence model; "
+            "give promotion-probe-evidence.v1 (#100)")
     try:
         evidence = model.model_validate_json(contents)
     except ValidationError as error:
@@ -585,7 +629,31 @@ def _validated_capability_evidence(
                                     (evidence.capability_id,)):
         raise GenerationError(
             f"{capability_id} evidence validates other capabilities")
-    return contents, evidence.layout
+    probe = evidence if isinstance(evidence, PromotionProbeEvidence) else None
+    return contents, evidence.layout, probe
+
+
+def _check_argument_generality(capabilities: tuple[Capability, ...],
+                               bundle: Path,
+                               identity: SyzkallerTargetIdentity) -> None:
+    """#100: the syz call arguments of each capability the promotion
+    criteria judge carry only the literals its contract fixes, read from
+    the pinned target's argument shapes."""
+    contracts = [(c, c.contract) for c in capabilities
+                 if c.contract is not None and c.contract.syz_calls()]
+    if not contracts:
+        return
+    from ...syzkaller.adapter import PinnedSyzParser
+    calls = sorted({call for _, contract in contracts
+                    for call in contract.syz_calls()})
+    with PinnedSyzParser(bundle, identity=identity) as parser:
+        shapes = parser.describe(calls)
+    for capability, contract in contracts:
+        refusals = argument_generality_refusals(contract, shapes)
+        if refusals:
+            raise GenerationError(
+                f"{capability.id} syz call arguments are not general "
+                f"(#100): {', '.join(refusals)}")
 
 
 def _check_layout(capability: Capability,
@@ -951,6 +1019,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     if (identity.build_manifest_sha256 != put_record(store, manifest)
             or identity.call_table_sha256 != put_record(store, table)):
         raise GenerationError("bundle identity.json disagrees with its files")
+    judged = promoted_by_criteria(spec)
+    _check_argument_generality(judged, bundle, identity)
 
     # ---------------------------------------------------- authorities
     capabilities = list(spec.capabilities)
@@ -981,7 +1051,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             "constraints": (*cap.constraints, *listed)})
     admission_draft = HcapCatalog(
         capabilities=tuple(capabilities),
-        missing_capability_ids=_gap_vocabulary(spec))
+        missing_capability_ids=_gap_vocabulary(spec),
+        gap_contracts=spec.gap_contracts)
     with tempfile.TemporaryDirectory() as tmp:
         source_path = Path(tmp) / "source.json"
         hcap_path = Path(tmp) / "hcap.json"
@@ -1071,6 +1142,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             kaslr_enabled=False, kaslr_offset=0)
         variant_capabilities = list(capabilities)
         evidence_layouts: dict[str, list[ExecutionLayout]] = {}
+        probe_evidence: list[PromotionProbeEvidence] = []
         for capability_id, paths in sorted(v.capability_evidence.items()):
             refs = []
             for path in paths:
@@ -1078,13 +1150,13 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                 if not resolved.is_file():
                     raise GenerationError(
                         f"capability evidence is not a file: {resolved}")
-                contents, layout = _validated_capability_evidence(
+                contents, layout, probe = _validated_capability_evidence(
                     capability_id, resolved,
                     expected_mapping_identity=expected_mapping_identity,
                     lane_script_sha256=file_pins["lane-script"].sha256)
-                if layout is not None:
-                    evidence_layouts.setdefault(capability_id, []).append(
-                        layout)
+                evidence_layouts.setdefault(capability_id, []).append(layout)
+                if probe is not None:
+                    probe_evidence.append(probe)
                 refs.append(store.put(contents))
             index = capability_indexes[capability_id]
             capability = variant_capabilities[index]
@@ -1093,9 +1165,16 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                                               | set(refs)))})
         for capability in variant_capabilities:
             _check_layout(capability, evidence_layouts.get(capability.id, []))
+        for capability in judged:
+            refusals = promotion_refusals(capability, probe_evidence)
+            if refusals:
+                raise GenerationError(
+                    f"{capability.id} does not meet the promotion criteria "
+                    f"(#100): {', '.join(refusals)}")
         draft = HcapCatalog(
             capabilities=tuple(variant_capabilities),
-            missing_capability_ids=_gap_vocabulary(spec))
+            missing_capability_ids=_gap_vocabulary(spec),
+            gap_contracts=spec.gap_contracts)
         boundary = RemoteKcovSupportBoundary(
             name=spec.support_boundary.name,
             revision=spec.support_boundary.revision,

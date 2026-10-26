@@ -363,6 +363,10 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
   결과를 함께 쓴다. budget도 그 작업 단위로 센다.
 - staged harness로 얻은 Q1·M1·Q2 verdict와 crash report는 staged `hcap_revision`과 patch set digest를 기록한다.
   promotion(`07` §5.3)이 끝나면 issue resolved 이벤트와 §5의 `hcap_revision` 행이 job을 promoted revision으로 옮긴다.
+- 생성 Agent Task 입력에는 gap key의 vocabulary contract(`04` §3.3)가 들어간다. 출력 patch set은 그 contract를
+  선언해야 하고, probe를 담지 않는다. 검증을 통과하면 Controller가 contract의 `boundary_functions`로 promotion
+  probe를 고정하고 후보 program 없이 probe campaign을 Runner에 맡긴다(`07` §5.3). 이 campaign은 job 진행과
+  별개이며 job 상태를 바꾸지 않는다. 결과는 `PromotionProbeEvidence`로 남고 promotion 검토의 입력이 된다.
 - `kernel_commit`용 harness가 없는 경우(binding 실패 행)의 생성은 계측 series의 이식과 그 build의 검증이다.
   Q1은 그 build에서 처음부터 세운다.
 
@@ -555,8 +559,8 @@ interface, 승격에 필요한 KVM 증거를 담는다. executor가 artifact로 
 넘기며, Controller는 `Job.gap_proposal_ref`에 남긴다(harness_generating이든 gap_id_unknown이든). 값은 가장
 최근 unsupported 답의 제안이며(제안이 없으면 비운다), job의 gap이 지워지거나 다른 gap으로 바뀌면 함께 비운다. 제안은 HCAP
 항목을 직접 만들거나 승격하지 않는다. Harness Generation(§3.2)이 이 제안을 입력으로 harness를 생성하고, 검증을
-통과하면 staged HCAP 항목이 된다. 공유 HCAP으로의 승격은 지금처럼 typed KVM 증거와 owner 승인이 필요하지만
-job을 막지 않는다(`07` §5.3).
+통과하면 staged HCAP 항목이 된다. 공유 HCAP으로의 승격은 승격 기준(contract, Controller가 고정한 probe, 후보 밖
+probe campaign, neutral control, 인자 일반성)과 owner 승인이 필요하지만 job을 막지 않는다(`07` §5.3).
 
 ### 8. 기록과 재시작
 

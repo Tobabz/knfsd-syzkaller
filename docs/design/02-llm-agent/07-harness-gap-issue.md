@@ -202,7 +202,8 @@ HarnessGapIssue 생성/연결 (기록)
    v
 Harness Generation  [AGENT TASK + RUNNER TASK]          job 상태: harness_generating (09 §3.2)
    |
-   |  입력: GapRef, CapabilityProposal(있으면), candidate, CandidateAnalysis, 현재 HCAP
+   |  입력: GapRef, CapabilityProposal(있으면), candidate, CandidateAnalysis, 현재 HCAP,
+   |        gap key의 vocabulary contract (04 §3.3)
    |
    +-- syzlang
    +-- pseudo-syscall/executor
@@ -217,7 +218,8 @@ validation (Runner, §5.2)
    |
    +-- 통과 -> staged hcap_revision (+ 새 ExecutionHarnessIdentity)
    |            -> job을 다시 binding하고 막혔던 지점(resume_point)에서 이어 간다
-   |            -> promotion 검토 (§5.3, job을 막지 않음)
+   |            -> Controller가 contract 경계에서 probe를 고정하고 probe campaign을 돌린다
+   |            -> promotion 기준과 검토 (§5.3, job을 막지 않음)
    |
    +-- 실패 -> 실패 evidence를 넘겨 다시 생성 (harness_generation budget, 09 §6)
    |
@@ -282,15 +284,52 @@ crash report는 staged revision과 생성 patch set의 digest를 기록한다.
 
 ### 5.3 promotion
 
-staged revision을 공유 HCAP으로 올리는 promotion은 사람이 검토한다(`04` §1.1). promotion은 job을 막지 않는다.
-staged harness로 진행 중인 job은 그대로 진행하고, promotion이 끝나면 issue가 `resolved`가 되며 `09` §5의
-`hcap_revision` 재평가 규칙이 job들을 promoted revision으로 옮긴다. promotion 검토가 생성물을 거부하면 그
-staged revision으로 만든 결과는 거부 사실과 함께 남기고, 해당 job은 `09` §5의 binding 변경 규칙으로 다시
-gap 경로에 들어간다.
+staged revision을 공유 HCAP으로 올리는 promotion은 아래 승격 기준(#100)을 모두 통과해야 한다. 사람 검토는
+기준 결과를 보고 승인하는 단계다. 기준을 대신하지 않는다. promotion은 job을 막지 않는다. staged harness로 진행
+중인 job은 그대로 진행하고, promotion이 끝나면 issue가 `resolved`가 되며 `09` §5의 `hcap_revision` 재평가 규칙이
+job들을 promoted revision으로 옮긴다. promotion 검토가 생성물을 거부하면 그 staged revision으로 만든 결과는 거부
+사실과 함께 남기고, 해당 job은 `09` §5의 binding 변경 규칙으로 다시 gap 경로에 들어간다.
 
-mutation_engine 생성물은 M7 2단계(자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를 통과할 때까지
-promotion하지 않는다. 사람이 구현한 subset과 같은 기준이다. 그 전까지 staged revision으로 job은 계속 진행하고
-issue는 `resolved`가 되지 않는다.
+승격 기준은 capability가 처음 gap을 낸 후보 하나에 맞춰져 있지 않은지 본다. 예를 들어 그 후보의 Q1 target만
+겨냥하거나 그 후보 program의 인자와 상태를 상수로 박아 둔 capability를 거른다. 기준은 사람이 만든 capability와
+Harness Generation이 만든 capability에 똑같이 적용한다. host spec에서는 새로 추가하거나 내용을 바꾼 capability가
+대상이고, 기준이 생기기 전에 승격된 항목은 바뀌지 않는 동안 `legacy_capabilities` 기준선으로 남는다(사용자 결정,
+2026-10-26).
+
+1. **contract가 먼저이고 후보와 분리된다.** capability는 범위를 `CapabilityContract`(`04` §3.3)로 선언한다.
+   진입점(syz call, pseudo-syscall, Proxy operation, fixture action)과 경계(이 기능이 도달시키는 공개 kernel 함수
+   집합)를 적는다. gap을 채우는 capability의 contract는 그 gap key의 vocabulary contract(`gap_contracts`)와 같아야
+   한다. 후보의 Q1 target이나 시나리오에서 contract를 만들지 않는다.
+2. **probe는 Controller가 정한다.** promotion probe는 contract의 `boundary_functions`다. 후보의 Q1 target은 그
+   함수가 경계에 있을 때만 probe가 된다. 생성 Agent의 출력에는 probe가 없고, Agent는 probe를 고를 수 없다.
+   evidence의 probe 집합이 경계와 다르면 거부한다.
+3. **후보 밖 program으로 실행한다.** probe campaign은 VM에서 돌린다(기본 KVM, `/dev/kvm`이 없으면 TCG. `01` 설계
+   원칙 7). 후보 program은 쓰지 않고 두 종류로 돌린다.
+   - contract에서 만든 최소 probe program: 3회 이상, 모든 run이 probe에 도달
+   - syzkaller가 capability의 진입점 call을 포함해 생성하고 변이한 program: 32회 이상, 25% 이상의 run이 probe에
+     도달. 진입점 call이 없는 program은 섞지 않는다
+   두 종류 모두 경계의 모든 probe를 한 번 이상 쳐야 한다. 비율과 횟수는 repository owner가 정하기 전까지의 임시
+   값이다(`agent_pipeline/promotion.py`). evidence에는 실행한 accelerator를 기록한다. `time_dependent` contract는
+   KVM evidence로만 승격한다. TCG는 타이밍이 달라 시간 의존 capability의 KVM 결과와 같은 것으로 보지 않는다.
+4. **neutral control.** capability를 쓰지 않는 같은 fixture의 program을 3회 이상 돌려 probe를 모두 놓쳐야 한다.
+   capability가 실제로 필요하다는 것을 보인다(HCAP-13 evidence 방식과 같다).
+5. **인자 일반성.** 진입점 syz call의 인자는 syz-lang 타입으로 열려 있어야 한다. 한 값만 허용하는 위치(const,
+   값 하나인 flags·range·string)는 contract가 `fixed_arguments`나 `fixed_types`(protocol이 상수를 정한 header
+   type)로 고정한 경우에만 허용한다. 이 검사는 정적이다. pinned syzkaller target의 인자 모양(parser bridge의
+   `describe`)으로 기계가 판정하며 VM이 필요 없다.
+6. **회귀와 트리거 기준.** 기존 capability 회귀(§5.2)와 트리거 기준(`04` §3.2)을 통과해야 한다.
+7. **Stage 2(mutation_engine).** probe 도달 대신 M1 APPLIED와 M7 gate 통과로 본다. 이때도 후보 밖 program으로
+   본다. M7 2단계(자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를 통과할 때까지 promotion하지 않는다.
+   사람이 구현한 subset과 같은 기준이다. 그 전까지 staged revision으로 job은 계속 진행하고 issue는 `resolved`가
+   되지 않는다.
+
+1~5는 machine 검사다. host generator는 새로 추가하거나 바꾼 capability마다 contract, `PromotionProbeEvidence`,
+인자 일반성을 확인하고 하나라도 실패하면 HCAP을 만들지 않는다. typed model이 없는 raw evidence는 어떤
+capability의 근거로도 받지 않는다.
+
+기준을 통과하지 못한 capability는 버리지 않는다. staged revision으로 남겨 그 후보의 job은 계속 진행한다. 다만
+공유 HCAP으로는 올라가지 않는다. 같은 gap key의 다른 후보가 staged revision을 재사용해 성공하면 그것도 일반성의
+추가 증거로 기록한다.
 
 ## 6. Patch 종류의 구분
 

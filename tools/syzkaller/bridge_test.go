@@ -283,3 +283,38 @@ func TestTypedRefusals(t *testing.T) {
 		}
 	}
 }
+
+func TestDescribeCallShapes(t *testing.T) {
+	target := targetForTest(t)
+	shapes, err := describeCalls(target, []string{"syz_open_nlm_lane_file", "syz_nfs_lane_link$partition_client0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shapes.Calls) != 2 || shapes.Calls[0].Call != "syz_nfs_lane_link$partition_client0" {
+		t.Fatalf("calls are not sorted: %+v", shapes.Calls)
+	}
+	link := shapes.Calls[0].Leaves
+	if len(link) != 2 || !link[0].Literal || link[0].Path != "client" || *link[0].Value != 0 ||
+		!link[1].Literal || link[1].Path != "op" || *link[1].Value != 0 {
+		t.Fatalf("partition constants: %+v", link)
+	}
+	for _, leaf := range shapes.Calls[1].Leaves {
+		if leaf.Literal {
+			t.Fatalf("open file has a literal: %+v", leaf)
+		}
+	}
+	reply, err := describeCalls(target, []string{"recvfrom$nfs41_exchange_id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaf := range reply.Calls[0].Leaves {
+		if strings.HasPrefix(leaf.Path, "buf.") {
+			t.Fatalf("an output buffer position: %+v", leaf)
+		}
+	}
+	for _, names := range [][]string{nil, {"no_such_call"}, {"open", "open"}} {
+		if _, err := describeCalls(target, names); err == nil {
+			t.Fatalf("describe accepted %v", names)
+		}
+	}
+}

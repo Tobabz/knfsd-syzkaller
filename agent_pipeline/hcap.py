@@ -113,6 +113,69 @@ class ExecutionLayout(HcapRecord):
 STAGE1_LAYOUT = ExecutionLayout(procs=1, lanes=(0,))
 
 
+class EntryPoint(HcapRecord):
+    """Where a program enters a capability (#100)."""
+
+    kind: Literal["syz_call", "proxy_operation", "fixture_action"]
+    name: Text
+
+
+class FixedArgument(HcapRecord):
+    """A literal a syz call argument may carry because the contract fixes it
+    (#100).  ``path`` names the argument and the fields below it, joined by
+    dots (``client``, ``buf.header.proc``).  ``value`` is the fixed number;
+    a fixed string has none."""
+
+    call: Text
+    path: Text
+    value: int | None = Field(default=None, ge=0)
+
+
+class CapabilityContract(HcapRecord):
+    """What a capability brings into reach, declared before any candidate
+    uses it (#100, 04 §3.3).
+
+    ``boundary_functions`` are the public kernel functions (exported or
+    entry functions, tracepoint sites) the entry points reach; the
+    Controller fixes the promotion probes from them.  ``fixed_arguments``
+    and ``fixed_types`` are the only literals the entry points' syz call
+    arguments may carry: a listed argument, or any constant inside a listed
+    syzlang type (a protocol header whose constants the protocol fixes).
+    ``time_dependent`` capabilities are promoted only on KVM evidence.
+    """
+
+    entry_points: tuple[EntryPoint, ...] = Field(min_length=1)
+    boundary_functions: tuple[Identifier, ...] = Field(min_length=1)
+    fixed_arguments: tuple[FixedArgument, ...] = ()
+    fixed_types: tuple[Identifier, ...] = ()
+    time_dependent: bool = False
+
+    @model_validator(mode="after")
+    def _shape(self) -> CapabilityContract:
+        _unique(tuple((e.kind, e.name) for e in self.entry_points),
+                "entry point")
+        _unique(self.boundary_functions, "boundary function")
+        _unique(tuple((f.call, f.path) for f in self.fixed_arguments),
+                "fixed argument")
+        _unique(self.fixed_types, "fixed type")
+        calls = {e.name for e in self.entry_points if e.kind == "syz_call"}
+        if any(f.call not in calls for f in self.fixed_arguments):
+            raise ValueError("a fixed argument of a call that is not an "
+                             "entry point")
+        return self
+
+    def syz_calls(self) -> tuple[str, ...]:
+        return tuple(e.name for e in self.entry_points if e.kind == "syz_call")
+
+
+class GapContract(HcapRecord):
+    """The contract a capability filling ``missing_capability_id`` must
+    declare.  It belongs to the vocabulary, not to any candidate."""
+
+    missing_capability_id: Identifier
+    contract: CapabilityContract
+
+
 class Capability(HcapRecord):
     """04 §3 plus explicit coarse scope labels, not inferred support.
 
@@ -125,6 +188,9 @@ class Capability(HcapRecord):
     ``validated_layout`` is the executor layout of that evidence.  Without
     one the capability is validated only in ``STAGE1_LAYOUT``; a run with
     more procs must not use it (``layout()``).
+
+    ``contract`` is the scope promotion judges (#100).  Its syz call entry
+    points must be the interface's syz calls.
     """
 
     id: Identifier
@@ -145,6 +211,7 @@ class Capability(HcapRecord):
     authority_refs: tuple[AuthorityRef, ...] = ()
     source_refs: tuple[Text, ...] = ()
     validated_layout: ExecutionLayout | None = None
+    contract: CapabilityContract | None = None
 
     def layout(self) -> ExecutionLayout:
         return self.validated_layout or STAGE1_LAYOUT
@@ -162,6 +229,10 @@ class Capability(HcapRecord):
         if (self.status == "validated" and self.validated_scope
                 and set(self.validated_scope) != set(self.scope)):
             raise ValueError("validated must cover all declared scope")
+        if (self.contract is not None and set(self.contract.syz_calls())
+                != set(self.interface.syz_calls)):
+            raise ValueError("contract syz call entry points must be the "
+                             "interface's syz calls")
         return self
 
 
@@ -207,12 +278,17 @@ class HcapCatalog(HcapRecord):
     schema_version: Literal["hcap.v1"] = "hcap.v1"
     capabilities: tuple[Capability, ...]
     missing_capability_ids: tuple[Identifier, ...]
+    gap_contracts: tuple[GapContract, ...] = ()
     authority_refs: tuple[AuthorityRef, ...] = ()
 
     @model_validator(mode="after")
     def _shape(self) -> HcapCatalog:
         _unique(tuple(cap.id for cap in self.capabilities), "capability ID")
         _unique(self.missing_capability_ids, "missing capability ID")
+        gaps = tuple(g.missing_capability_id for g in self.gap_contracts)
+        _unique(gaps, "gap contract")
+        if not set(gaps) <= set(self.missing_capability_ids):
+            raise ValueError("a gap contract outside the vocabulary")
         _unique_authorities(self.authority_refs)
         by_kind: dict[str, str] = {}
         refs = (*self.authority_refs,
