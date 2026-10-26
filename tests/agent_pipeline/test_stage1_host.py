@@ -1630,6 +1630,7 @@ def _lane_topology_evidence(identity, lane_sha256, procs, **lane):
         "execution_harness_id": identity.execution_harness_id,
         "mapping_identity": identity.model_dump(mode="json"),
         "campaign_result_sha256": "b" * 64,
+        "program_sha256": generate_module.LANE_TOPOLOGY_PROGRAM_SHA256,
         "guest_lane_script_sha256": lane_sha256,
         "capability_id": "HCAP-04",
         "capability_ids": list(generate_module.LANE_TOPOLOGY_CAPABILITIES),

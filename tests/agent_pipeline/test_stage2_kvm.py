@@ -15,7 +15,7 @@ import pytest
 
 from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.artifacts import ArtifactStore
-from agent_pipeline.data import put_record
+from agent_pipeline.data import canonical_json, load_record, put_record
 from agent_pipeline.journal_sink import CHANNEL_CLOSE_TIMEOUT_S
 from agent_pipeline.stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
                                                   EXECPROG_EXIT_GRACE_S, POLL_S,
@@ -34,9 +34,11 @@ from agent_pipeline.stage2.kvm import (
     _closed_evidence_channels, _JournalChannels, _journal_artifacts,
     _journal_lane_count, _lane_template,
     _manager_assets, _manager_cmdline, _manager_qemu_args,
-    _evidence_seal_window, _seal_segment, _spool, _stop_manager, StepOptions,
+    _evidence_seal_window, _seal_segment, _spool, _stop_manager,
+    _validate_runtime_authority, StepOptions,
     stage2_timeout_budget,
 )
+from agent_pipeline.materializer import ReachabilityHarness
 
 from .stage2_host import rules_bytes
 
@@ -55,6 +57,41 @@ def execution_record(**updates) -> dict:
     }
     value.update(updates)
     return value
+
+
+def runtime_authority(tmp_path):
+    from tests.agent_pipeline.test_materializer import materializer_world
+
+    world = materializer_world(tmp_path)
+    result = world.materializer.materialize(world.plan_ref, world.binding)
+    harness = load_record(world.store, result.harness_ref, ReachabilityHarness)
+    root = tmp_path / "input"
+    root.mkdir()
+    (root / "hcap.json").write_bytes(canonical_json(world.hcap))
+    (root / "admission.json").write_bytes(canonical_json(world.profile))
+    manager = {
+        "procs": 1,
+        "enable_syscalls": ["close", "openat$lane"],
+        "experimental": {"remote_cover": True},
+    }
+    return world, harness, root, manager
+
+
+def test_runtime_rejects_manager_outside_harness_validated_layout(tmp_path):
+    world, harness, root, manager = runtime_authority(tmp_path)
+    _validate_runtime_authority(root, harness, world.descriptor, manager)
+    manager["procs"] = 2
+    with pytest.raises(Stage2StepError, match="validated layout"):
+        _validate_runtime_authority(root, harness, world.descriptor, manager)
+
+
+@pytest.mark.parametrize("name", ["hcap.json", "admission.json"])
+def test_runtime_rejects_altered_authority_bytes(tmp_path, name):
+    world, harness, root, manager = runtime_authority(tmp_path)
+    path = root / name
+    path.write_bytes(path.read_bytes() + b"\n")
+    with pytest.raises(Stage2StepError, match=f"{name} differs"):
+        _validate_runtime_authority(root, harness, world.descriptor, manager)
 
 
 def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):

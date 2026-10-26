@@ -349,6 +349,9 @@ class Hcap13KvmEvidence(_Spec):
 LANE_TOPOLOGY_CAPABILITIES = ("HCAP-01", "HCAP-03", "HCAP-04")
 #: Fewest generation-attributed campaign executions each lane must have.
 LANE_TOPOLOGY_MIN_EXECUTIONS = 8
+# Digest of tools/nfs-lifecycle/programs/v41-client-io-control.prog.
+LANE_TOPOLOGY_PROGRAM_SHA256 = (
+    "d55988221116a08cb77daf1ccda01ae878f3607b779a04172d74359e9ac12d88")
 
 
 class LaneTopologyLane(_Spec):
@@ -388,6 +391,7 @@ class LaneTopologyEvidence(_Spec):
     execution_harness_id: Sha256
     mapping_identity: KernelIdentity
     campaign_result_sha256: Sha256
+    program_sha256: Sha256
     guest_lane_script_sha256: Sha256
     layout: ExecutionLayout
     min_executions_per_lane: int = Field(ge=LANE_TOPOLOGY_MIN_EXECUTIONS)
@@ -402,6 +406,10 @@ class LaneTopologyEvidence(_Spec):
             raise ValueError("mapping and campaign harness identities differ")
         if self.capability_ids != LANE_TOPOLOGY_CAPABILITIES:
             raise ValueError("lane-topology evidence names other capabilities")
+        if self.program_sha256 != LANE_TOPOLOGY_PROGRAM_SHA256:
+            raise ValueError(
+                "lane-topology evidence did not use the trusted "
+                "lane-topology corpus")
         if self.layout.lanes != tuple(range(self.layout.procs)):
             raise ValueError("a lane-topology campaign exercises every lane "
                              "of its procs")

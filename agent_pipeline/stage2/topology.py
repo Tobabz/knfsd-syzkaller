@@ -49,6 +49,7 @@ from ..rule_compiler import encode_rule_set
 from ..stage1.host.collector import CollectorConfig, verify_pins
 from ..stage1.host.generate import (LANE_TOPOLOGY_CAPABILITIES,
                                     LANE_TOPOLOGY_MIN_EXECUTIONS,
+                                    LANE_TOPOLOGY_PROGRAM_SHA256,
                                     LaneTopologyEvidence)
 from .kvm import (_CRASH, NfsProxyExecution, Stage2StepError,
                   _corpus, _crash_files, _JournalChannels, _lane_template,
@@ -167,9 +168,20 @@ def _enough(records: list[NfsProxyExecution], procs: int,
     return min(counts) >= executions
 
 
+def _validate_manager_mode(manager: dict[str, Any]) -> None:
+    if manager.get("snapshot", False) is not False:
+        raise Stage2StepError(
+            "manager program snapshot mode must be disabled")
+    experimental = manager.get("experimental")
+    if not isinstance(experimental, dict) or \
+            experimental.get("remote_cover") is not True:
+        raise Stage2StepError(
+            "manager must enable experimental.remote_cover")
+
+
 def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
-        output: Path, procs: int, executions: int, timeout_s: float,
-        program_path: Path = DEFAULT_PROGRAM) -> dict[str, Any]:
+        output: Path, procs: int, executions: int, timeout_s: float) \
+        -> dict[str, Any]:
     """Run the campaign; write ``result.json`` and, on a pass, the typed
     evidence.  Returns the result."""
     if output.exists():
@@ -181,6 +193,7 @@ def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
     files = verify_pins(collector, descriptor)
     builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
     manager = json.loads(manager_path.read_text())
+    _validate_manager_mode(manager)
     vm = manager.get("vm")
     if manager.get("type") != "qemu" or not isinstance(vm, dict) or \
             vm.get("count", 1) != 1:
@@ -189,7 +202,11 @@ def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
     selection = _selection(descriptor, str(vm.get("cmdline", "")))
     _manager_cmdline(vm, descriptor, SimpleNamespace(
         runtime_selection=selection), lane_pin.sha256)
-    program = program_path.read_bytes()
+    program = DEFAULT_PROGRAM.read_bytes()
+    program_sha256 = hashlib.sha256(program).hexdigest()
+    if program_sha256 != LANE_TOPOLOGY_PROGRAM_SHA256:
+        raise Stage2StepError(
+            "default program differs from the trusted lane-topology corpus")
     rules = empty_rule_set(selection.nfs_version)
 
     work = output / "work"
@@ -245,7 +262,7 @@ def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
     result: dict[str, Any] = {
         "schema_version": "hcap04-lane-topology-result.v1",
         "procs": procs, "min_executions_per_lane": executions,
-        "program_sha256": hashlib.sha256(program).hexdigest(),
+        "program_sha256": program_sha256,
         "rule_set_sha256": hashlib.sha256(rules).hexdigest(),
         "manager_exited_unexpectedly": exited,
         "crash_signature_count": crashes,
@@ -284,6 +301,7 @@ def topology_evidence(descriptor: ExecutionHarnessDescriptor,
         "execution_harness_id": harness_id,
         "mapping_identity": identity.model_dump(mode="json"),
         "campaign_result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+        "program_sha256": result.get("program_sha256"),
         "guest_lane_script_sha256": lane_sha256,
         "layout": {"procs": procs, "lanes": list(range(procs))},
         "min_executions_per_lane": result["min_executions_per_lane"],
@@ -309,7 +327,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="campaign executions each lane must reach")
     parser.add_argument("--timeout", type=float, default=3600,
                         help="campaign seconds before it stops short")
-    parser.add_argument("--program", type=Path, default=DEFAULT_PROGRAM)
     args = parser.parse_args(argv)
     if not 1 <= args.procs <= 64:
         parser.error("--procs must be in [1, 64]")
@@ -320,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run(manager_path=args.manager, collector_path=args.collector,
                      descriptor_path=args.descriptor, output=args.output,
                      procs=args.procs, executions=args.executions,
-                     timeout_s=args.timeout, program_path=args.program)
+                     timeout_s=args.timeout)
     except (Stage2StepError, ValueError, OSError) as error:
         print(f"lane topology campaign failed: {error}", file=sys.stderr)
         return 1

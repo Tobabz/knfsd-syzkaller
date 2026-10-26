@@ -51,6 +51,7 @@ and `{output}` in argv are replaced with the lease's directories.
 `input/` holds `execution.json` (job, task, step, harness, lease
 generation, `compiled_ref`, `rule_set_id`, `gate_repetitions`,
 `campaign_id`, `crash_bundle_ref`), `harness.json`, `descriptor.json`,
+`hcap.json`, `admission.json`,
 `program.syz`, `neutral.syz`, `rules.nfsprul1` (install these bytes) and
 `compiled.json`. A replay also has `replay/`: `rules.bin` (the bytes the
 crash's journal recorded), `programs.log` (the window, in order, for
@@ -182,7 +183,9 @@ Per lane it requires that every spooled execution is attributed to that
 lane, was acknowledged by the lane's Proxy, reports a healthy lane, and that
 each generation it ran opened on that lane's journal channel with no event
 from another lane. It writes `result.json` and, when every lane passes,
-`hcap04-kvm.json`. Add that file to `capability_evidence` for HCAP-01,
+`hcap04-kvm.json`. Promotable evidence is bound to the repository's fixed
+`v41-client-io-control.prog` digest; the command does not accept another
+corpus. Add that file to `capability_evidence` for HCAP-01,
 HCAP-03 and HCAP-04 and set their `validated_layout` to
 `{"procs": 4, "lanes": [0, 1, 2, 3]}`.
 

@@ -129,6 +129,7 @@ def test_evidence_types_a_passing_campaign(tmp_path):
                                 vmlinux_artifact_name="kernel")
     records, events = clean()
     result = {"procs": 2, "min_executions_per_lane": 8,
+              "program_sha256": topology.LANE_TOPOLOGY_PROGRAM_SHA256,
               "manager_exited_unexpectedly": False,
               "crash_signature_count": 0,
               "lanes": topology.lane_results(records, events, PREFIXES)}
@@ -137,6 +138,7 @@ def test_evidence_types_a_passing_campaign(tmp_path):
                                           result, encoded)
     assert evidence.layout.procs == 2 and evidence.layout.lanes == (0, 1)
     assert evidence.capability_ids == ("HCAP-01", "HCAP-03", "HCAP-04")
+    assert evidence.program_sha256 == topology.LANE_TOPOLOGY_PROGRAM_SHA256
     assert evidence.campaign_result_sha256 == hashlib.sha256(
         encoded).hexdigest()
     assert evidence.mapping_identity.vmlinux_sha256 == builds["kernel"]
@@ -148,3 +150,36 @@ def test_evidence_types_a_passing_campaign(tmp_path):
     with pytest.raises(ValidationError, match="private target data"):
         topology.topology_evidence(descriptor, collector, "c" * 64, result,
                                    b'{"pc": "0xffffffff81000000"}')
+
+
+def test_topology_evidence_requires_the_trusted_corpus(tmp_path):
+    from tests.agent_pipeline.test_materializer import materializer_world
+
+    descriptor = materializer_world(tmp_path).descriptor
+    collector = SimpleNamespace(instrumentation_artifact_name="vm-image",
+                                vmlinux_artifact_name="kernel")
+    records, events = clean()
+    result = {
+        "procs": 2, "min_executions_per_lane": 8,
+        "program_sha256": "f" * 64,
+        "manager_exited_unexpectedly": False, "crash_signature_count": 0,
+        "lanes": topology.lane_results(records, events, PREFIXES),
+    }
+    with pytest.raises(ValidationError, match="trusted lane-topology corpus"):
+        topology.topology_evidence(
+            descriptor, collector, "c" * 64, result, json.dumps(result).encode())
+    del result["program_sha256"]
+    with pytest.raises(ValidationError, match="program_sha256"):
+        topology.topology_evidence(
+            descriptor, collector, "c" * 64, result, json.dumps(result).encode())
+
+
+@pytest.mark.parametrize(("manager", "message"), [
+    ({"snapshot": True, "experimental": {"remote_cover": True}},
+     "snapshot mode must be disabled"),
+    ({"snapshot": False, "experimental": {"remote_cover": False}},
+     "remote_cover"),
+])
+def test_topology_manager_mode_fails_before_launch(manager, message):
+    with pytest.raises(topology.Stage2StepError, match=message):
+        topology._validate_manager_mode(manager)
