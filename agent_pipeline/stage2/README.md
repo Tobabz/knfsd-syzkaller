@@ -184,13 +184,10 @@ lane, was acknowledged by the lane's Proxy, reports a healthy lane, and that
 each generation it ran opened on that lane's journal channel with no event
 from another lane. It writes `result.json` and, when every lane passes,
 `hcap04-kvm.json`. Promotable evidence is bound to the repository's fixed
-`v41-client-io-topology.prog` digest; the command does not accept another
-corpus. The corpus is a shortened NFSv4.1 live-bind program: its first call
-opens the per-proc lane and its generated EXCHANGE_ID request drives the
-server path, so target-mode call coverage is attributable on every lane.
-Add `hcap04-kvm.json` to `capability_evidence` for HCAP-01, HCAP-03 and
-HCAP-04 and set their `validated_layout` to
-`{"procs": 4, "lanes": [0, 1, 2, 3]}`. The Stage 2 default is `procs=4`.
+`v41-client-io-control.prog` digest; the command does not accept another
+corpus. Add that file to `capability_evidence` for HCAP-01,
+HCAP-03 and HCAP-04 and set their `validated_layout` to
+`{"procs": 4, "lanes": [0, 1, 2, 3]}`.
 
 `lane.sh status` runs inside the guest and is not reachable from a manager
 VM, so the per-execution health fields of the spool record stand in for it.

@@ -1050,6 +1050,9 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     manager = json.loads(json.dumps(inputs.manager))
     manager["workdir"] = str(workdir)
     manager["workdir_template"] = str(lane_dir)
+    # The lane target is mounted in the executor's mount namespace at
+    # /nfs-lane; a namespace sandbox would hide it.
+    manager["sandbox"] = "none"
     manager["http"] = ""
     manager.setdefault("experimental", {})["nfs_proxy_evidence"] = str(spool)
     manager["vm"]["qemu_args"] = _manager_qemu_args(
@@ -1058,11 +1061,9 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     config.write_text(json.dumps(manager, indent=2, sort_keys=True) + "\n")
     manager_binary = Path(str(manager["syzkaller"])) / "bin" / "syz-manager"
     manager_log = work / "manager-debug.log"
-    # -debug dumps VM output but syz-manager also forces procs=1 with it.
-    # Use it only for a one-proc campaign; multi-lane campaigns need the
-    # configured procs value preserved.
-    manager_argv = [str(manager_binary), "-config", str(config),
-                    "-debug" if manager.get("procs", 1) == 1 else "-vv=1"]
+    # -debug dumps VM output; the syzkaller patch keeps the configured
+    # procs value, so multi-lane campaigns retain their full width.
+    manager_argv = [str(manager_binary), "-config", str(config), "-debug"]
     start_ns = time.time_ns()
     process: subprocess.Popen | None = None
     complete = False

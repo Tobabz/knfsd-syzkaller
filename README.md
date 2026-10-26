@@ -123,7 +123,7 @@ Start campaigns directly with the syz-manager built in step 2 and a config point
 | `vm.kernel` / `kernel_obj` | `env/images/<variant>/bzImage` / `env/images/<variant>/` (holding `vmlinux`) |
 | `kernel_src` / `syzkaller` | `env/linux/` / `env/syzkaller/` |
 | `image`, `sshkey` | `env/images/bookworm-kcov-fresh.qcow2`, `artifacts/bookworm.id_rsa` |
-| `procs` | the fixture's lane count (4). The agent pipeline's generated manager uses HCAP-04's validated four-lane layout; the Stage 2 default is `procs=4` (`agent_pipeline/stage2/README.md`) |
+| `procs` | the fixture's lane count (4). The agent pipeline's generated manager instead uses HCAP-04's validated layout, which stays at 1 until lane-topology evidence widens it (`agent_pipeline/stage2/README.md`) |
 | `snapshot` (top level) | `false` (or absent). Program snapshot mode runs one program at a time with one proc, so only lane 0 is used |
 | `vm.snapshot` | `true` (default). QEMU's temporary disk writes preserve the baked image; this setting does not select program snapshot mode |
 | `workdir`, `http` | distinct for the broad KNFSD and Ganesha campaigns; each workdir owns its own `corpus.db` |

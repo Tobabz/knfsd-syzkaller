@@ -57,12 +57,9 @@
         "bundle/lane/lane.sh"
       ],
       "validated_layout": {
-        "procs": 4,
+        "procs": 1,
         "lanes": [
-          0,
-          1,
-          2,
-          3
+          0
         ]
       }
     },
@@ -97,49 +94,40 @@
         "bundle/patches/kernel/0006-*"
       ],
       "validated_layout": {
-        "procs": 4,
+        "procs": 1,
         "lanes": [
-          0,
-          1,
-          2,
-          3
+          0
         ]
       }
     },
     {
       "id": "HCAP-04",
       "name": "lane execution topology",
-      "purpose": "Four-lane execution topology; proc i uses lane i",
+      "purpose": "Runtime selections this host executes; one proc on lane 0",
       "usable_stage": [
-        "stage1",
-        "stage2"
+        "stage1"
       ],
       "usable_by": [
-        "agent_stage1",
-        "agent_stage2"
+        "agent_stage1"
       ],
       "interface": {},
       "constraints": [
         "nfs.localio_enabled=N",
         "single fixture, koov.nfs_version from the selection",
         "nlm-knfsd fixture (koov.nfs_fixture=nlm-knfsd) for the NFSv3 HCAP-13 selection",
-        "Stage 2 manager procs are at most the four lanes validated by the 2026-10-26 KVM lane-topology campaign; the Stage 2 default is procs=4"
+        "Stage 2 manager procs are at most what validated_layout covers (one proc on lane 0 until lane-topology evidence widens it); `python -m agent_pipeline.stage2.topology --procs 4` runs that campaign and its hcap04-kvm.json is the evidence for HCAP-01, HCAP-03 and HCAP-04 at {procs 4, lanes 0-3}"
       ],
-      "status": "validated",
+      "status": "partially_validated",
       "scope": [
-        "four_lane"
+        "one_lane"
       ],
       "source_refs": [
-        "bundle/lane/boot-fixture.sh",
-        "capability-evidence/hcap04-kvm.json"
+        "bundle/lane/boot-fixture.sh"
       ],
       "validated_layout": {
-        "procs": 4,
+        "procs": 1,
         "lanes": [
-          0,
-          1,
-          2,
-          3
+          0
         ]
       }
     },
@@ -241,15 +229,6 @@
     ],
     "HCAP-13": [
       "capability-evidence/hcap13-kvm.json"
-    ],
-    "HCAP-01": [
-      "capability-evidence/hcap04-kvm.json"
-    ],
-    "HCAP-03": [
-      "capability-evidence/hcap04-kvm.json"
-    ],
-    "HCAP-04": [
-      "capability-evidence/hcap04-kvm.json"
     ]
   },
   "missing_capability_ids": [
@@ -920,7 +899,6 @@
         "syz_open_nlm_lane_file"
       ],
       "trace_mode": "off"
-    },
-    "procs": 4
+    }
   }
 }

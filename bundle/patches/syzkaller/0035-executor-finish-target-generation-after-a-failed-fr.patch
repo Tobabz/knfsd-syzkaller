@@ -1,0 +1,32 @@
+From 83983d9bd78765a62cd0ebb14cda2941da1296d2 Mon Sep 17 00:00:00 2001
+From: knfsd bridge builder <bridge@localhost>
+Date: Mon, 26 Oct 2026 23:36:33 +0900
+Subject: [PATCH] executor: finish target generation after a failed freeze
+
+---
+ executor/executor.cc | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/executor/executor.cc b/executor/executor.cc
+index 0eb9f544e..a4829a7d2 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -1271,9 +1271,14 @@ static void nfsp_broker_end_program()
+ 	bool frozen = nfsp_cg_freeze(kNfspCgroupFd, syscall_timeout_ms * 10);
+ 	if (!frozen)
+ 		debug("NFS proxy: program did not freeze\n");
++	// The program has already sent DONE and is parked in nfsp_program_done().
++	// FINISH must run before the caller kills the cgroup: a kill closes the
++	// program's KCOV descriptors and makes the pending generation stale.
++	// The target protocol excludes user calls after DONE, so publishing here
++	// cannot include code that runs after FINISH.
+ 	uint64 generation = k->b.generation;
+ 	bool finished = false;
+-	if (frozen && k->done_valid)
++	if (k->done_valid)
+ 		finished = cover_finish_remote_generation(generation, 1000 * slowdown_scale);
+ 	if (finished || cover_abort_remote_generation(generation, false))
+ 		nfsp_broker_kcov_done = true;
+-- 
+2.34.1
+

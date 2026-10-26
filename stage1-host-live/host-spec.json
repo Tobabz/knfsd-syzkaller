@@ -55,16 +55,7 @@
       "source_refs": [
         "bundle/patches/syzkaller/0020-*",
         "bundle/lane/lane.sh"
-      ],
-      "validated_layout": {
-        "procs": 4,
-        "lanes": [
-          0,
-          1,
-          2,
-          3
-        ]
-      }
+      ]
     },
     {
       "id": "HCAP-03",
@@ -95,53 +86,31 @@
         "bundle/patches/kernel/0001-*",
         "bundle/patches/kernel/0002-*",
         "bundle/patches/kernel/0006-*"
-      ],
-      "validated_layout": {
-        "procs": 4,
-        "lanes": [
-          0,
-          1,
-          2,
-          3
-        ]
-      }
+      ]
     },
     {
       "id": "HCAP-04",
       "name": "lane execution topology",
-      "purpose": "Four-lane execution topology; proc i uses lane i",
+      "purpose": "Runtime selections this host executes; one proc on lane 0",
       "usable_stage": [
-        "stage1",
-        "stage2"
+        "stage1"
       ],
       "usable_by": [
-        "agent_stage1",
-        "agent_stage2"
+        "agent_stage1"
       ],
       "interface": {},
       "constraints": [
         "nfs.localio_enabled=N",
         "single fixture, koov.nfs_version from the selection",
-        "nlm-knfsd fixture (koov.nfs_fixture=nlm-knfsd) for the NFSv3 HCAP-13 selection",
-        "Stage 2 manager procs are at most the four lanes validated by the 2026-10-26 KVM lane-topology campaign; the Stage 2 default is procs=4"
+        "nlm-knfsd fixture (koov.nfs_fixture=nlm-knfsd) for the NFSv3 HCAP-13 selection"
       ],
-      "status": "validated",
+      "status": "partially_validated",
       "scope": [
-        "four_lane"
+        "one_lane"
       ],
       "source_refs": [
-        "bundle/lane/boot-fixture.sh",
-        "capability-evidence/hcap04-kvm.json"
-      ],
-      "validated_layout": {
-        "procs": 4,
-        "lanes": [
-          0,
-          1,
-          2,
-          3
-        ]
-      }
+        "bundle/lane/boot-fixture.sh"
+      ]
     },
     {
       "id": "HCAP-14",
@@ -189,17 +158,7 @@
       ]
     }
   ],
-  "capability_evidence": {
-    "HCAP-01": [
-      "capability-evidence/hcap04-kvm.json"
-    ],
-    "HCAP-03": [
-      "capability-evidence/hcap04-kvm.json"
-    ],
-    "HCAP-04": [
-      "capability-evidence/hcap04-kvm.json"
-    ]
-  },
+  "capability_evidence": {},
   "missing_capability_ids": [],
   "admission_source": {
     "schema_version": "call-admission-source.v1",
@@ -635,7 +594,7 @@
     "exec_timeout_s": 600
   },
   "stage2": {
-    "procs": 4,
+    "procs": 1,
     "nfs_proxy_window": 6
   }
 }
