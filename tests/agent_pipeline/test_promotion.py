@@ -112,10 +112,11 @@ def test_open_arguments_and_fixed_types_pass():
     leaves = (ArgumentLeaf(path="fd", literal=False),
               ArgumentLeaf(path="buf.msg.prog", literal=True, value=100003,
                            types=("rpc_nfs41_call_t[42, args]",)),
-              ArgumentLeaf(path="name", literal=True,
+              ArgumentLeaf(path="name", literal=True, text="lane0",
                            types=("lane_name",)))
     value = contract(fixed_types=["rpc_nfs41_call_t"],
-                     fixed_arguments=[{"call": CALL, "path": "name"}])
+                     fixed_arguments=[{"call": CALL, "path": "name",
+                                       "text": "lane0"}])
     assert argument_generality_refusals(value, shapes(*leaves)) == []
     assert argument_generality_refusals(contract(), shapes(*leaves)) == [
         f"literal_argument:{CALL}:buf.msg.prog",
@@ -136,6 +137,9 @@ IDENTITY = KernelIdentity(execution_harness_id="1" * 64,
                           kaslr_enabled=False, kaslr_offset=0)
 
 
+GENERATED = [f"{n:064x}" for n in range(16)]
+
+
 def evidence(value: CapabilityContract | None = None, **change):
     value = value or contract()
     probes = list(value.boundary_functions)
@@ -153,7 +157,7 @@ def evidence(value: CapabilityContract | None = None, **change):
         "probe_mapping_sha256": {p: "6" * 64 for p in probes},
         "minimal": {"program_sha256s": ["7" * 64], "runs": 3,
                     "runs_hitting": 3, "probes_hit": probes},
-        "generated": {"program_sha256s": ["8" * 64], "runs": 40,
+        "generated": {"program_sha256s": GENERATED, "runs": 40,
                       "runs_hitting": 10, "probes_hit": probes},
         "neutral": {"program_sha256s": ["9" * 64], "runs": 3,
                     "runs_hitting": 0, "probes_hit": []},
@@ -169,22 +173,40 @@ def evidence(value: CapabilityContract | None = None, **change):
                   "runs_hitting": 2,
                   "probes_hit": ["nfsd_break_deleg_cb", "nfsd4_exchange_id"]}},
      "minimal runs reached the probes"),
-    ({"generated": {"program_sha256s": ["8" * 64], "runs": 40,
+    ({"generated": {"program_sha256s": GENERATED, "runs": 40,
                     "runs_hitting": 9,
                     "probes_hit": ["nfsd_break_deleg_cb",
                                    "nfsd4_exchange_id"]}},
      "generated runs reached the probes"),
-    ({"generated": {"program_sha256s": ["8" * 64], "runs": 31,
+    ({"generated": {"program_sha256s": GENERATED, "runs": 31,
                     "runs_hitting": 31,
                     "probes_hit": ["nfsd_break_deleg_cb",
                                    "nfsd4_exchange_id"]}},
      "fewer than 32 generated runs"),
-    ({"generated": {"program_sha256s": ["8" * 64], "runs": 40,
+    ({"generated": {"program_sha256s": GENERATED, "runs": 40,
                     "runs_hitting": 40, "probes_hit": ["nfsd4_exchange_id"]}},
      "generated runs missed a probe"),
     ({"neutral": {"program_sha256s": ["9" * 64], "runs": 3,
                   "runs_hitting": 1, "probes_hit": ["nfsd4_exchange_id"]}},
      "neutral control run reached a probe"),
+    # One program repeated is no generality evidence.
+    ({"generated": {"program_sha256s": ["8" * 64], "runs": 40,
+                    "runs_hitting": 40,
+                    "probes_hit": ["nfsd_break_deleg_cb",
+                                   "nfsd4_exchange_id"]}},
+     "fewer than 16 distinct generated programs"),
+    ({"generated": {"program_sha256s": GENERATED + GENERATED[:1], "runs": 40,
+                    "runs_hitting": 40,
+                    "probes_hit": ["nfsd_break_deleg_cb",
+                                   "nfsd4_exchange_id"]}},
+     "duplicate program"),
+    ({"generated": {"program_sha256s": GENERATED, "runs": 15,
+                    "runs_hitting": 15,
+                    "probes_hit": ["nfsd_break_deleg_cb",
+                                   "nfsd4_exchange_id"]}},
+     "more programs than runs"),
+    ({"withheld_program_sha256s": [GENERATED[3]]},
+     "ran a withheld program"),
     ({"generated_without_entry_call": 1}, "call no entry point"),
     ({"crash_signature_count": 1}, "contains a crash"),
     ({"probe_mapping_sha256": {"nfsd4_exchange_id": "6" * 64}},
@@ -223,3 +245,51 @@ def test_time_dependent_capabilities_need_kvm():
         evidence(timed)]) == []
     assert promotion_refusals(capability(contract()), [
         evidence(accelerator="tcg", exec_slowdown=10)]) == []
+
+
+def test_fixed_strings_compare_their_text():
+    leaf = ArgumentLeaf(path="name", literal=True, text="candidate-file")
+    value = contract(fixed_arguments=[{"call": CALL, "path": "name",
+                                       "text": "lane0"}])
+    assert argument_generality_refusals(value, shapes(leaf)) == [
+        f"literal_argument:{CALL}:name",
+        f"fixed_argument_not_literal:{CALL}:name"]
+    with pytest.raises(ValidationError, match="a value or a text"):
+        contract(fixed_arguments=[{"call": CALL, "path": "name"}])
+
+
+def test_a_recursion_needs_a_fixed_type():
+    leaf = ArgumentLeaf(path="buf.next", literal=False, recursive=True,
+                        types=("list_node", "list_node"))
+    assert argument_generality_refusals(contract(), shapes(leaf)) == [
+        f"recursive_argument:{CALL}:buf.next"]
+    assert argument_generality_refusals(
+        contract(fixed_types=["list_node"]), shapes(leaf)) == []
+
+
+def test_contract_order_does_not_change_its_digest():
+    one = contract(boundary_functions=["b", "a"], fixed_types=["y", "x"])
+    other = contract(boundary_functions=["a", "b"], fixed_types=["x", "y"])
+    assert one == other and contract_sha256(one) == contract_sha256(other)
+
+
+def test_hcap_v1_records_keep_their_bytes():
+    from agent_pipeline.data import canonical_json
+    cap = json.loads(canonical_json(capability()))
+    for entry in (cap, {**cap, "validated_layout": None}):
+        raw = canonical_json({"schema_version": "hcap.v1",
+                              "capabilities": [entry],
+                              "missing_capability_ids": [],
+                              "authority_refs": []})
+        assert canonical_json(HcapCatalog.model_validate_json(raw)) == raw
+
+
+def test_a_catalog_holds_gap_fillers_to_their_contract():
+    gap = GapContract(missing_capability_id="lane.partition",
+                      contract=contract())
+    narrowed = capability(contract(boundary_functions=["nfsd4_exchange_id"]),
+                          fills_gap="lane.partition")
+    with pytest.raises(ValidationError, match="contract of the gap it fills"):
+        HcapCatalog(capabilities=(narrowed,),
+                    missing_capability_ids=("lane.partition",),
+                    gap_contracts=(gap,))

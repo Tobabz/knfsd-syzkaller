@@ -10,14 +10,16 @@ person wrote and one Harness Generation produced:
 * the promotion probes are the contract's boundary functions, fixed by the
   Controller; whoever made the capability cannot choose them;
 * ``PromotionProbeEvidence`` shows the probes reached by minimal programs
-  built from the contract and by syzkaller-generated programs that call an
-  entry point, and missed by a neutral control, all without the candidate's
-  program;
+  built from the contract and by distinct syzkaller-generated programs that
+  call an entry point, and missed by a neutral control, none of them a
+  program the Controller withheld (the candidate's);
 * the entry points' syz call arguments carry no literal the contract does
   not fix (``argument_generality_refusals``), a static check on the pinned
   target's argument shapes.
 
 Regression and the trigger rule (07 §5.2, 04 §3.2) are separate gates.
+A promoted semantic mutation subset (Stage 2) is judged by the M7 gate
+instead (``semantic_promotion.promote``, 07 §5.3 item 7).
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from .q1 import KernelIdentity
 MIN_MINIMAL_RUNS = 3
 MIN_MINIMAL_HIT_RATIO = 1.0
 MIN_GENERATED_RUNS = 32
+MIN_GENERATED_PROGRAMS = 16
 MIN_GENERATED_HIT_RATIO = 0.25
 MIN_NEUTRAL_RUNS = 3
 
@@ -56,14 +59,18 @@ class ArgumentLeaf(_Model):
     """One scalar position of a syz call's arguments.
 
     ``literal`` is true when the pinned description admits a single value
-    there (a constant, a one-value flag set or range, a one-value string),
-    so every program carries the same literal.  ``types`` names the syzlang
-    struct and union types enclosing the position, outermost first.
+    there (a constant, a one-value range, a one-value string), so every
+    program carries the same literal: ``value`` for a number, ``text`` for
+    a string.  ``recursive`` marks where a type recurs and the walk stopped;
+    what lies below is unknown.  ``types`` names the syzlang struct and
+    union types enclosing the position, outermost first.
     """
 
     path: str = Field(min_length=1)
     literal: bool
     value: int | None = None
+    text: str | None = None
+    recursive: bool = False
     types: tuple[str, ...] = ()
 
 
@@ -88,8 +95,10 @@ class CallShapes(_Model):
 def argument_generality_refusals(contract: CapabilityContract,
                                  shapes: CallShapes) -> list[str]:
     """Literals in the entry points' arguments that the contract does not
-    fix, and fixed arguments that are no literal (a stale contract)."""
-    fixed = {(f.call, f.path): f.value for f in contract.fixed_arguments}
+    fix, recursions it does not cover with a fixed type, and fixed
+    arguments that are no literal (a stale contract)."""
+    fixed = {(f.call, f.path): (f.value, f.text)
+             for f in contract.fixed_arguments}
     fixed_types = set(contract.fixed_types)
     refusals = []
     used = set()
@@ -101,11 +110,14 @@ def argument_generality_refusals(contract: CapabilityContract,
         for leaf in shape.leaves:
             # A template type matches by its full or its base name.
             enclosing = {*leaf.types, *(t.split("[", 1)[0] for t in leaf.types)}
-            if not leaf.literal or fixed_types & enclosing:
+            if fixed_types & enclosing:
                 continue
-            if (call, leaf.path) in fixed and \
-                    fixed[(call, leaf.path)] == leaf.value:
-                # A fixed string has no value on either side.
+            if leaf.recursive:
+                refusals.append(f"recursive_argument:{call}:{leaf.path}")
+                continue
+            if not leaf.literal:
+                continue
+            if fixed.get((call, leaf.path)) == (leaf.value, leaf.text):
                 used.add((call, leaf.path))
                 continue
             refusals.append(f"literal_argument:{call}:{leaf.path}")
@@ -129,6 +141,10 @@ class ProbeRunSet(_Model):
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
+        if len(set(self.program_sha256s)) != len(self.program_sha256s):
+            raise ValueError("duplicate program")
+        if len(self.program_sha256s) > self.runs:
+            raise ValueError("more programs than runs")
         if self.runs_hitting > self.runs:
             raise ValueError("more hitting runs than runs")
         if len(set(self.probes_hit)) != len(self.probes_hit):
@@ -145,8 +161,10 @@ class PromotionProbeEvidence(_Model):
     """A probe campaign that never ran the candidate's program (#100).
 
     ``minimal`` runs programs built from the contract, ``generated`` runs
-    syzkaller-generated and mutated programs that each call an entry point,
-    and ``neutral`` runs programs of the same fixture that use none.
+    distinct syzkaller-generated and mutated programs that each call an
+    entry point, and ``neutral`` runs programs of the same fixture that use
+    none.  ``withheld_program_sha256s`` are the programs the Controller kept
+    out of the campaign: the candidate's, for a generated capability.
     """
 
     schema_version: Literal["promotion-probe-evidence.v1"]
@@ -166,6 +184,7 @@ class PromotionProbeEvidence(_Model):
     minimal: ProbeRunSet
     generated: ProbeRunSet
     neutral: ProbeRunSet
+    withheld_program_sha256s: tuple[Sha256, ...] = ()
     #: Generated programs dropped because they called no entry point.
     generated_without_entry_call: int = Field(ge=0)
     crash_signature_count: int = Field(ge=0)
@@ -191,6 +210,13 @@ class PromotionProbeEvidence(_Model):
                                  f"than {ratio:.0%} of runs")
             if set(run_set.probes_hit) != probes:
                 raise ValueError(f"{name} runs missed a probe")
+        if len(self.generated.program_sha256s) < MIN_GENERATED_PROGRAMS:
+            raise ValueError(f"fewer than {MIN_GENERATED_PROGRAMS} distinct "
+                             "generated programs")
+        ran = {*self.minimal.program_sha256s, *self.generated.program_sha256s,
+               *self.neutral.program_sha256s}
+        if ran & set(self.withheld_program_sha256s):
+            raise ValueError("the campaign ran a withheld program")
         if self.neutral.runs < MIN_NEUTRAL_RUNS:
             raise ValueError(f"fewer than {MIN_NEUTRAL_RUNS} neutral runs")
         if self.neutral.runs_hitting:

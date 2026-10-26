@@ -312,6 +312,23 @@ func TestDescribeCallShapes(t *testing.T) {
 			t.Fatalf("an output buffer position: %+v", leaf)
 		}
 	}
+	// A one-value flag set still admits 0, so it is no literal.
+	walker := &shapeWalker{}
+	flags := &prog.FlagsType{Vals: []uint64{4}}
+	if err := walker.walk(flags, prog.DirIn, "f", nil, 0); err != nil || walker.leaves[0].Literal {
+		t.Fatalf("one-value flags: %+v %v", walker.leaves, err)
+	}
+	// A one-value string carries its text.
+	walker = &shapeWalker{}
+	text := &prog.BufferType{Kind: prog.BufferString, Values: []string{"syzkaller"}}
+	if err := walker.walk(text, prog.DirIn, "s", nil, 0); err != nil ||
+		!walker.leaves[0].Literal || *walker.leaves[0].Text != "syzkaller" {
+		t.Fatalf("one-value string: %+v %v", walker.leaves, err)
+	}
+	// Past the depth limit the walk refuses instead of dropping leaves.
+	if err := (&shapeWalker{}).walk(flags, prog.DirIn, "f", nil, maxShapeDepth+1); err == nil {
+		t.Fatal("deep shape accepted")
+	}
 	for _, names := range [][]string{nil, {"no_such_call"}, {"open", "open"}} {
 		if _, err := describeCalls(target, names); err == nil {
 			t.Fatalf("describe accepted %v", names)

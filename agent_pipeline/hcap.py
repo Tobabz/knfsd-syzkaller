@@ -17,7 +17,8 @@ from __future__ import annotations
 import re
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import (ConfigDict, Field, JsonValue, field_validator,
+                      model_serializer, model_validator)
 
 from .artifacts import ArtifactStore
 from .contracts import CandidateLocation, HcapCheck, JudgeVersions, Record, Sha256
@@ -42,6 +43,16 @@ class HcapRecord(Record):
     """Strict scalar types; JSON arrays deserialize to immutable tuples."""
 
     model_config = ConfigDict(strict=True)
+
+
+def _omit_unset(record: HcapRecord, data: dict, names: tuple[str, ...]) -> dict:
+    """Serialize fields added after ``hcap.v1`` only when the record was
+    built with them, so revisions stored before they existed keep their
+    canonical bytes (``load_record``) and later ones keep theirs."""
+    for name in names:
+        if name not in record.model_fields_set:
+            data.pop(name, None)
+    return data
 
 
 def _unique(values: tuple, name: str) -> None:
@@ -123,12 +134,19 @@ class EntryPoint(HcapRecord):
 class FixedArgument(HcapRecord):
     """A literal a syz call argument may carry because the contract fixes it
     (#100).  ``path`` names the argument and the fields below it, joined by
-    dots (``client``, ``buf.header.proc``).  ``value`` is the fixed number;
-    a fixed string has none."""
+    dots (``client``, ``buf.header.proc``).  Exactly one of ``value`` (a
+    fixed number) and ``text`` (a fixed string) is given."""
 
     call: Text
     path: Text
     value: int | None = Field(default=None, ge=0)
+    text: str | None = None
+
+    @model_validator(mode="after")
+    def _one(self) -> FixedArgument:
+        if (self.value is None) == (self.text is None):
+            raise ValueError("a fixed argument has a value or a text")
+        return self
 
 
 class CapabilityContract(HcapRecord):
@@ -149,6 +167,22 @@ class CapabilityContract(HcapRecord):
     fixed_arguments: tuple[FixedArgument, ...] = ()
     fixed_types: tuple[Identifier, ...] = ()
     time_dependent: bool = False
+
+    # The lists are sets: keep them sorted so one contract has one digest.
+    @field_validator("entry_points", mode="after")
+    @classmethod
+    def _sorted_entries(cls, value):
+        return tuple(sorted(value, key=lambda e: (e.kind, e.name)))
+
+    @field_validator("fixed_arguments", mode="after")
+    @classmethod
+    def _sorted_fixed(cls, value):
+        return tuple(sorted(value, key=lambda f: (f.call, f.path)))
+
+    @field_validator("boundary_functions", "fixed_types", mode="after")
+    @classmethod
+    def _sorted_names(cls, value):
+        return tuple(sorted(value))
 
     @model_validator(mode="after")
     def _shape(self) -> CapabilityContract:
@@ -212,6 +246,13 @@ class Capability(HcapRecord):
     source_refs: tuple[Text, ...] = ()
     validated_layout: ExecutionLayout | None = None
     contract: CapabilityContract | None = None
+    #: The gap ID this capability fills; its contract is that gap's.
+    fills_gap: Identifier | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        return _omit_unset(self, handler(self),
+                           ("validated_layout", "contract", "fills_gap"))
 
     def layout(self) -> ExecutionLayout:
         return self.validated_layout or STAGE1_LAYOUT
@@ -281,6 +322,10 @@ class HcapCatalog(HcapRecord):
     gap_contracts: tuple[GapContract, ...] = ()
     authority_refs: tuple[AuthorityRef, ...] = ()
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        return _omit_unset(self, handler(self), ("gap_contracts",))
+
     @model_validator(mode="after")
     def _shape(self) -> HcapCatalog:
         _unique(tuple(cap.id for cap in self.capabilities), "capability ID")
@@ -289,6 +334,13 @@ class HcapCatalog(HcapRecord):
         _unique(gaps, "gap contract")
         if not set(gaps) <= set(self.missing_capability_ids):
             raise ValueError("a gap contract outside the vocabulary")
+        contracts = {g.missing_capability_id: g.contract
+                     for g in self.gap_contracts}
+        for cap in self.capabilities:
+            if cap.fills_gap in contracts and \
+                    cap.contract != contracts[cap.fills_gap]:
+                raise ValueError(f"{cap.id} does not declare the contract of "
+                                 f"the gap it fills, {cap.fills_gap}")
         _unique_authorities(self.authority_refs)
         by_kind: dict[str, str] = {}
         refs = (*self.authority_refs,

@@ -231,13 +231,6 @@
       "capability-evidence/hcap13-kvm.json"
     ]
   },
-  "legacy_capabilities": {
-    "HCAP-01": "6a0106656cb1d720ffe4e0bdc11e73b7db8bd4acadff1c00e6b7fe70770491fb",
-    "HCAP-03": "801a89983bfeb24f261f0b10f4127061fded803cacec96bfab6bcbe341ed5d43",
-    "HCAP-04": "236db6e2802ab0a140bbdf3f0dd1dc455b9f778720115d1db640994a49413d98",
-    "HCAP-11": "4b276ea5e4734bf47519d21f6341956a71281abc8577864617639d83d990aff3",
-    "HCAP-13": "719af9296ba628182803fa66d6c34fe9a327136acc766a41293e0a9ba91a0fab"
-  },
   "missing_capability_ids": [
     "remote_kcov.context.cld",
     "remote_kcov.context.client",

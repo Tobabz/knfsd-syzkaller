@@ -10,17 +10,22 @@ import (
 
 // Argument shapes for the promotion criteria's argument-generality check
 // (#100). A leaf is literal when the description admits one input value
-// there, so every generated program carries the same literal.
+// there (a constant, a one-value range or string), so every generated
+// program carries the same literal. The walk fails closed: past the depth
+// limit it refuses, and where a type recurs it records a recursive leaf
+// rather than dropping what lies below.
 
 const maxShapeCalls = 256
 const maxShapeLeaves = 1 << 16
 const maxShapeDepth = 32
 
 type argumentLeaf struct {
-	Path    string   `json:"path"`
-	Literal bool     `json:"literal"`
-	Value   *uint64  `json:"value"`
-	Types   []string `json:"types"`
+	Path      string   `json:"path"`
+	Literal   bool     `json:"literal"`
+	Value     *uint64  `json:"value"`
+	Text      *string  `json:"text"`
+	Recursive bool     `json:"recursive"`
+	Types     []string `json:"types"`
 }
 
 type callShape struct {
@@ -39,16 +44,13 @@ type shapeWalker struct {
 	leaves []argumentLeaf
 }
 
-func (w *shapeWalker) add(path string, types []string, literal bool, value *uint64) error {
+func (w *shapeWalker) add(leaf argumentLeaf, types []string) error {
 	if len(w.leaves) >= maxShapeLeaves {
 		return errors.New("argument shape leaf limit exceeded")
 	}
-	w.leaves = append(w.leaves, argumentLeaf{path, literal, value, append([]string{}, types...)})
+	leaf.Types = append([]string{}, types...)
+	w.leaves = append(w.leaves, leaf)
 	return nil
-}
-
-func number(v uint64) *uint64 {
-	return &v
 }
 
 func join(path, name string) string {
@@ -59,10 +61,10 @@ func join(path, name string) string {
 }
 
 // walk records the scalar positions below typ. Output positions carry no
-// program literal; recursive types stop at the first repetition.
+// program literal.
 func (w *shapeWalker) walk(typ prog.Type, dir prog.Dir, path string, types []string, depth int) error {
 	if depth > maxShapeDepth {
-		return nil
+		return errors.New("argument shape depth limit exceeded")
 	}
 	if dir == prog.DirOut {
 		return nil
@@ -72,59 +74,49 @@ func (w *shapeWalker) walk(typ prog.Type, dir prog.Dir, path string, types []str
 		if t.IsPad {
 			return nil
 		}
-		return w.add(path, types, true, number(t.Val))
-	case *prog.FlagsType:
-		if len(t.Vals) == 1 {
-			return w.add(path, types, true, number(t.Vals[0]))
-		}
-		return w.add(path, types, false, nil)
+		v := t.Val
+		return w.add(argumentLeaf{Path: path, Literal: true, Value: &v}, types)
 	case *prog.IntType:
 		if t.Kind == prog.IntRange && t.RangeBegin == t.RangeEnd {
-			return w.add(path, types, true, number(t.RangeBegin))
+			v := t.RangeBegin
+			return w.add(argumentLeaf{Path: path, Literal: true, Value: &v}, types)
 		}
-		return w.add(path, types, false, nil)
+		return w.add(argumentLeaf{Path: path}, types)
 	case *prog.BufferType:
 		if t.Kind == prog.BufferString && len(t.Values) == 1 {
-			// A fixed string is a literal without a numeric value.
-			return w.add(path, types, true, nil)
+			text := t.Values[0]
+			return w.add(argumentLeaf{Path: path, Literal: true, Text: &text}, types)
 		}
-		return w.add(path, types, false, nil)
+		return w.add(argumentLeaf{Path: path}, types)
 	case *prog.PtrType:
 		return w.walk(t.Elem, t.ElemDir, path, types, depth+1)
 	case *prog.ArrayType:
 		return w.walk(t.Elem, dir, path, types, depth+1)
 	case *prog.StructType:
-		for _, name := range types {
-			if name == t.Name() {
-				return nil
-			}
-		}
-		inner := append(append([]string{}, types...), t.Name())
-		for i := range t.Fields {
-			field := &t.Fields[i]
-			if err := w.walk(field.Type, field.Dir(dir), join(path, field.Name), inner, depth+1); err != nil {
-				return err
-			}
-		}
-		return nil
+		return w.fields(t.Name(), t.Fields, dir, path, types, depth)
 	case *prog.UnionType:
-		for _, name := range types {
-			if name == t.Name() {
-				return nil
-			}
-		}
-		inner := append(append([]string{}, types...), t.Name())
-		for i := range t.Fields {
-			field := &t.Fields[i]
-			if err := w.walk(field.Type, field.Dir(dir), join(path, field.Name), inner, depth+1); err != nil {
-				return err
-			}
-		}
-		return nil
+		return w.fields(t.Name(), t.Fields, dir, path, types, depth)
 	default:
-		// Resources, lengths, procs, vmas, checksums: chosen by syzkaller.
-		return w.add(path, types, false, nil)
+		// Flags (always 0 as well as their values), resources, lengths,
+		// procs, vmas and checksums: chosen by syzkaller.
+		return w.add(argumentLeaf{Path: path}, types)
 	}
+}
+
+func (w *shapeWalker) fields(name string, fields []prog.Field, dir prog.Dir, path string, types []string, depth int) error {
+	inner := append(append([]string{}, types...), name)
+	for _, outer := range types {
+		if outer == name {
+			return w.add(argumentLeaf{Path: path, Recursive: true}, inner)
+		}
+	}
+	for i := range fields {
+		field := &fields[i]
+		if err := w.walk(field.Type, field.Dir(dir), join(path, field.Name), inner, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func describeCalls(target *prog.Target, names []string) (callShapes, error) {

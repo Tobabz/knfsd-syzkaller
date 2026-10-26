@@ -56,7 +56,8 @@ from ...materializer import (ExecutionHarnessApproval,
                              ExecutionHarnessDescriptor, HarnessBuildArtifact,
                              _runtime_key, descriptor_id)
 from ...promotion import (PromotionProbeEvidence,
-                          argument_generality_refusals, promotion_refusals)
+                          argument_generality_refusals,
+                          gap_contract_refusals, promotion_refusals)
 from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
                    RemoteKcovSupportBoundary)
 from ...qemu_accel import Accel, AccelChoice, resolve, slowdown
@@ -505,11 +506,6 @@ class HostSpec(_Spec):
     #: generated HCAP catalog. Paths are relative to this spec.
     capability_evidence: dict[str, tuple[Path, ...]] = Field(
         default_factory=dict)
-    #: Capability ID -> ``capability_baseline_sha256`` of its entry when the
-    #: promotion criteria were introduced (#100).  An entry that still
-    #: matches keeps its earlier promotion; a new capability, or one whose
-    #: entry changed, must pass the criteria (``promotion``).
-    legacy_capabilities: dict[str, Sha256] = Field(default_factory=dict)
     #: The contract each gap ID's capability must declare (04 §3.3).
     gap_contracts: tuple[GapContract, ...] = ()
     #: The capability whose constraints list the allowed runtime selections.
@@ -557,17 +553,39 @@ def capability_baseline_sha256(capability: Capability) -> str:
     return hashlib.sha256(canonical_json(entry)).hexdigest()
 
 
+#: ``capability_baseline_sha256`` of each capability promoted before the
+#: promotion criteria (#100), as the checked-in specs declare it
+#: (``template/host-spec.json``, ``stage1-host-live/host-spec.json``).  The
+#: repository pins them here, so a spec cannot exempt a capability itself.
+LEGACY_CAPABILITY_BASELINES: dict[str, frozenset[str]] = {
+    "HCAP-01": frozenset({
+        "7eda8c8105255246dfd25dc06c65e42461d88782000497f41a969d20ef7a9ff3",
+    }),
+    "HCAP-03": frozenset({
+        "bd33c79879dfaddb358acf7bb2ffbd8c0d00c604c52645adb07b0fb777518eee",
+    }),
+    "HCAP-04": frozenset({
+        "023a636701aeec882c157de3fe6024e4e2476fa4eca18b0d943e4b5b8fb254cb",
+        "c9f8ff612235085419c3b91c8acae70322fe0a85719134e10aece2d2528502b1",
+    }),
+    "HCAP-11": frozenset({
+        "7315aeedfeb596d88a56e6006008175e53fbd88406c7607a6e2709c11e317f6e",
+    }),
+    "HCAP-13": frozenset({
+        "499b5103293c9b078d58e2ae25ccc20f139d5526538005093c55f1950c222f81",
+    }),
+    "HCAP-14": frozenset({
+        "096aa8aa37724038105100a892507e68f7834cb94311aeaa1289cd9c62a6bca3",
+    }),
+}
+
+
 def promoted_by_criteria(spec: HostSpec) -> tuple[Capability, ...]:
     """The capabilities the promotion criteria judge: every one that is not
     an unchanged legacy entry (#100)."""
-    unknown = sorted(set(spec.legacy_capabilities)
-                     - {c.id for c in spec.capabilities})
-    if unknown:
-        raise GenerationError(
-            f"legacy_capabilities names no capability: {unknown[0]}")
     return tuple(c for c in spec.capabilities
-                 if spec.legacy_capabilities.get(c.id)
-                 != capability_baseline_sha256(c))
+                 if capability_baseline_sha256(c)
+                 not in LEGACY_CAPABILITY_BASELINES.get(c.id, frozenset()))
 
 
 def _gap_vocabulary(spec: HostSpec) -> tuple[str, ...]:
@@ -631,6 +649,24 @@ def _validated_capability_evidence(
             f"{capability_id} evidence validates other capabilities")
     probe = evidence if isinstance(evidence, PromotionProbeEvidence) else None
     return contents, evidence.layout, probe
+
+
+def _check_gap_contracts(spec: HostSpec,
+                         capabilities: tuple[Capability, ...]) -> None:
+    """#100: a capability filling a gap declares that gap's vocabulary
+    contract, not one fitted to the candidate that raised it."""
+    gaps = HcapCatalog(capabilities=(),
+                       missing_capability_ids=_gap_vocabulary(spec),
+                       gap_contracts=spec.gap_contracts)
+    for capability in capabilities:
+        if capability.fills_gap is None:
+            continue
+        refusals = gap_contract_refusals(gaps, capability.fills_gap,
+                                         capability)
+        if refusals:
+            raise GenerationError(
+                f"{capability.id} does not meet the promotion criteria "
+                f"(#100): {', '.join(refusals)}")
 
 
 def _check_argument_generality(capabilities: tuple[Capability, ...],
@@ -1020,6 +1056,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             or identity.call_table_sha256 != put_record(store, table)):
         raise GenerationError("bundle identity.json disagrees with its files")
     judged = promoted_by_criteria(spec)
+    _check_gap_contracts(spec, judged)
     _check_argument_generality(judged, bundle, identity)
 
     # ---------------------------------------------------- authorities

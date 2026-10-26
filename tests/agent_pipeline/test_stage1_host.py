@@ -172,7 +172,7 @@ def _write_syz_record(env: Path, **override) -> None:
 
 
 @pytest.fixture
-def host(tmp_path):
+def host(tmp_path, monkeypatch):
     """A bootstrap env, a parser bundle and a host spec over them."""
     env = tmp_path / "env"
     linux = env / "linux"
@@ -207,8 +207,6 @@ def host(tmp_path):
         "variant": "kasan", "ssh_key": "artifacts/id_rsa",
         "syzkaller_bundle": "syz-build/bundle",
         "capabilities": [c.model_dump(mode="json") for c in _capabilities()],
-        "legacy_capabilities": {
-            c.id: capability_baseline_sha256(c) for c in _capabilities()},
         "missing_capability_ids": [],
         "runtime_selection_capability": "CAP-lane",
         "admission_source": {
@@ -242,7 +240,9 @@ def host(tmp_path):
     }
     path = tmp_path / "host-spec.json"
     path.write_text(json.dumps(spec, indent=1))
-    return SimpleNamespace(root=tmp_path, spec=path, env=env,
+    # The synthetic capabilities stand for ones promoted before #100.
+    _mark_legacy(monkeypatch, spec)
+    return SimpleNamespace(root=tmp_path, spec=path, env=env, monkeypatch=monkeypatch,
                            kernel_commit=kernel_commit, identity=identity,
                            selection=selection)
 
@@ -430,7 +430,7 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         "status": "validated", "scope": ["client0_recovery"],
     })
     spec["capability_evidence"] = {"HCAP-11": [evidence.name]}
-    _mark_legacy(spec)
+    _mark_legacy(host.monkeypatch, spec)
     host.spec.write_text(json.dumps(spec, indent=1))
 
     result = generate(host.spec)
@@ -547,8 +547,10 @@ def test_template_spec_is_valid():
 
     # #100: the criteria judge new and revised capabilities; the template's
     # are all unchanged legacy entries.
-    assert set(spec.legacy_capabilities) == {c.id for c in spec.capabilities}
     assert generate_module.promoted_by_criteria(spec) == ()
+    live = HostSpec.model_validate_json(
+        (REPO / "stage1-host-live/host-spec.json").read_bytes())
+    assert generate_module.promoted_by_criteria(live) == ()
     assert all(not call.startswith("syz_nfsd_cld_ctl$")
                for item in spec.neutral_controls
                for call in item.runtime_selection.enabled_interfaces)
@@ -1812,12 +1814,12 @@ def test_live_spec_manager_enables_the_live_bind_calls():
 
 # ------------------------------------------------------------ promotion (#100)
 
-def _mark_legacy(spec):
+def _mark_legacy(monkeypatch, spec):
     """Every capability of ``spec`` keeps its earlier promotion."""
-    spec["legacy_capabilities"] = {
-        c["id"]: capability_baseline_sha256(
-            Capability.model_validate_json(json.dumps(c)))
-        for c in spec["capabilities"]}
+    monkeypatch.setattr(generate_module, "LEGACY_CAPABILITY_BASELINES", {
+        c["id"]: frozenset({capability_baseline_sha256(
+            Capability.model_validate_json(json.dumps(c)))})
+        for c in spec["capabilities"]})
 
 
 PROBE_CONTRACT = {
@@ -1843,8 +1845,8 @@ def _probe_evidence(identity, lane_sha256, capability_id, contract, **change):
         "probe_mapping_sha256": {name: "c" * 64 for name in probes},
         "minimal": {"program_sha256s": ["d" * 64], "runs": 3,
                     "runs_hitting": 3, "probes_hit": probes},
-        "generated": {"program_sha256s": ["e" * 64], "runs": 40,
-                      "runs_hitting": 12, "probes_hit": probes},
+        "generated": {"program_sha256s": [f"{n:064x}" for n in range(16)],
+                      "runs": 40, "runs_hitting": 12, "probes_hit": probes},
         "neutral": {"program_sha256s": ["f" * 64], "runs": 3,
                     "runs_hitting": 0, "probes_hit": []},
         "generated_without_entry_call": 0, "crash_signature_count": 0,
@@ -1902,10 +1904,29 @@ def test_a_new_capability_must_meet_the_promotion_criteria(host):
     assert promoted.contract == CapabilityContract.model_validate_json(
         json.dumps(PROBE_CONTRACT))
     assert len(promoted.evidence_refs) == 1
+    # A gap filler declares the vocabulary's contract for its gap.
+    spec["capabilities"][-1]["fills_gap"] = "lane.partition"
+    spec["missing_capability_ids"] = ["lane.partition"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="gap_contract_missing:lane.partition"):
+        generate(host.spec)
+    spec["gap_contracts"] = [{"missing_capability_id": "lane.partition",
+                              "contract": {**PROBE_CONTRACT,
+                                           "time_dependent": True}}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="contract_differs_from_gap:lane.partition"):
+        generate(host.spec)
+    spec["gap_contracts"][0]["contract"] = PROBE_CONTRACT
+    host.spec.write_text(json.dumps(spec, indent=1))
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          generate(host.spec).hcap_revision, HcapCatalog)
+    assert catalog.gap_contracts[0].missing_capability_id == "lane.partition"
 
 
 @needs_gcc
-def test_a_changed_legacy_capability_is_judged_again(host):
+def test_a_changed_legacy_capability_is_judged_again(host, monkeypatch):
     spec = json.loads(host.spec.read_text())
     spec["capabilities"][0]["purpose"] = "a revised purpose"
     host.spec.write_text(json.dumps(spec, indent=1))
@@ -1913,11 +1934,17 @@ def test_a_changed_legacy_capability_is_judged_again(host):
     with pytest.raises(GenerationError, match=f"{name} does not meet the "
                        "promotion criteria.*contract_missing"):
         generate(host.spec)
-    # Widening the validated layout is not a revision (#99).
+
+    # The baselines are the repository's: a capability the spec adds is
+    # judged even under a legacy ID.
     spec["capabilities"][0]["purpose"] = _capabilities()[0].purpose
-    spec["legacy_capabilities"]["CAP-gone"] = "0" * 64
+    spec["capabilities"].append(_new_capability())
+    spec["capabilities"][-1]["id"] = "HCAP-01"
     host.spec.write_text(json.dumps(spec, indent=1))
-    with pytest.raises(GenerationError, match="names no capability: CAP-gone"):
+    monkeypatch.setattr(generate_module, "LEGACY_CAPABILITY_BASELINES", {
+        **generate_module.LEGACY_CAPABILITY_BASELINES,
+        "HCAP-01": frozenset({"0" * 64})})
+    with pytest.raises(GenerationError, match="HCAP-01 does not meet"):
         generate(host.spec)
 
 

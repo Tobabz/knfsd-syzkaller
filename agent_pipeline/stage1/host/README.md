@@ -156,10 +156,11 @@ Capability evidence must be typed: a `promotion-probe-evidence.v1`
 campaign, or the capability's own KVM evidence model. Untyped evidence is
 refused for every capability.
 
-`legacy_capabilities` maps each capability promoted before the criteria
-to `capability_baseline_sha256` of its spec entry (without
-`validated_layout` and evidence references). While an entry still matches,
-it keeps its earlier promotion. A new capability, or one whose entry
+`generate.LEGACY_CAPABILITY_BASELINES` pins, for each capability promoted
+before the criteria, `capability_baseline_sha256` of its entry in the
+checked-in specs (without `validated_layout` and evidence references). The
+repository pins them, so a spec cannot exempt a capability. While an entry
+still matches, it keeps its earlier promotion. A new capability, or one whose entry
 changed, needs all of the following, and `generate` refuses the spec
 otherwise:
 
@@ -175,7 +176,9 @@ otherwise:
   bridge sources.
 
 `gap_contracts` gives the contract a capability filling each gap ID must
-declare; it is copied into the generated HCAP.
+declare; it is copied into the generated HCAP. A capability names the gap
+it fills with `fills_gap`, and `generate` refuses it unless its contract is
+that gap's.
 
 ## How the pieces bind
 
