@@ -285,6 +285,11 @@ def test_manager_config_binds_approved_assets_and_command(tmp_path):
     with pytest.raises(PreflightError, match="approved linux/amd64"):
         _manager_check(path, collector, harnesses, command)
     manager["target"] = "linux/amd64"
+    manager["sandbox"] = "namespace"
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="sandbox must be none"):
+        _manager_check(path, collector, harnesses, command)
+    del manager["sandbox"]
     approved_cmdline = manager["vm"]["cmdline"]
     manager["vm"]["cmdline"] += " sunrpc.lane_attribution=0"
     path.write_text(json.dumps(manager))

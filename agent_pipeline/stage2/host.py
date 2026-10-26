@@ -568,6 +568,11 @@ def _check_manager(
         raise PreflightError("manager config is not a JSON object")
     if value.get("type") != "qemu":
         raise PreflightError("manager config type must be qemu")
+    # The lane target is mounted in the executor's mount namespace at
+    # /nfs-lane.  The mgrconfig default is already "none"; a manager that
+    # explicitly selects another sandbox must not silently bypass that.
+    if value.get("sandbox", "none") != "none":
+        raise PreflightError("manager sandbox must be none for the NFS lane")
     if "snapshot" in value and value["snapshot"] is not False:
         raise PreflightError("manager program snapshot mode must be false")
     experimental = value.get("experimental")
