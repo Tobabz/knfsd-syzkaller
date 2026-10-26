@@ -20,6 +20,12 @@
   "campaign_result_sha256": "aff1e6b0a64ab693f0bef009ab74a008fe06b2368283c9af34b669fabe2147cd",
   "guest_lane_script_sha256": "318e79ea7d288e02efdfc357a26ddcff4f80cd6605fb50d4178e95bf2e89a104",
   "guest_nfs_proxy_sha256": "df9134f9432ae158cb4aa342925b4f5fefc12c022135744d9bb30a10d2369c36",
+  "layout": {
+    "procs": 1,
+    "lanes": [
+      0
+    ]
+  },
   "nfsv4_lease_time_s": 10,
   "partition_hold_s": 15,
   "runs": {

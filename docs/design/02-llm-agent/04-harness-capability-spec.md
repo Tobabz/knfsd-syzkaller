@@ -124,6 +124,9 @@ Capability
         partially_validated
         experimental
     validated_scope             # status=validated_subset이면 필수
+    validated_layout            # 증거가 돈 실행 배치 (#99)
+        procs                   # 생략하면 Stage 1 배치: procs=1, lanes=[0]
+        lanes[]
 
     evidence_refs[]             # 검증 기록
     authority_refs[]            # 세부 authority artifact의 digest 참조 (§1.1)
@@ -134,6 +137,12 @@ Capability
 `validated_scope`에 데이터로 둔다(issue #14).
 Agent는 기본적으로 `validated` capability와 `validated_subset`의 scope 안을 우선 사용하고,
 `partially_validated` / `experimental` 사용과 scope 밖 사용은 plan에 명시한다.
+
+`validated_layout`은 검증이 성립한 proc 수와 proc lane이다(proc i는 lane i). Stage 1 plan은 lane 0에서
+실행되므로 그 배치를 덮지 않는 capability를 쓰면 거부된다(`layout_not_validated`). Stage 1보다 넓은 배치는
+typed capability evidence의 `layout`이 같은 값일 때만 선언할 수 있다. Stage 2 manager의 `procs`는 runtime
+selection capability(HCAP-04)의 배치를 넘지 못하고, 그 `procs`를 덮지 않는 capability의 call은
+`enable_syscalls`에서 빠진다. 사람이 만든 capability와 생성된 capability에 똑같이 적용한다.
 
 `usable_stage`는 capability가 기능상 어느 stage에 속하는지를, `usable_by`는 누가 그것을 쓸 수 있는지를
 나타낸다. `usable_by`에 `agent_stage1`이나 `agent_stage2`가 없는 capability는 Agent pipeline이 쓰지 않는다.
@@ -348,9 +357,19 @@ constraints:
         SERVER_IMPL=both 필요, knfsd lease 기본 90초
     koov.nfs_trace=0 (default) | 1 (lane NFS tracing opt-in)
 
+validated_layout:
+    procs=1, lanes=[0] (Stage 1 layout)
+    Stage 2 manager procs의 기본값이며 상한 (#99)
+
 verification_note:
     lane 구조 자체는 구현되어 있으나
-    현재 문서에는 four-lane parallel manager topology의 미검증 범위가 남아 있음
+    four-lane parallel manager topology는 아직 증거가 없음
+    python -m agent_pipeline.stage2.topology가 bounded syz-manager campaign으로
+    lane별 spool 귀속, Proxy ack, health, generation journal을 확인하고
+    hcap04-kvm.json(LaneTopologyEvidence)을 쓴다
+    이 증거가 HCAP-01, HCAP-03, HCAP-04의 validated_layout을 함께 넓힌다
+    lane.sh status는 manager VM 안에서 부를 수 없어 spool record의
+    per-execution health 필드로 대신한다
 ```
 
 source refs:

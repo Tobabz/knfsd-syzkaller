@@ -49,7 +49,9 @@ from ...artifacts import ArtifactStore
 from ...contracts import (PIPELINE_GAP_IDS, CampaignMode, HarnessBinding,
                           JobPolicy, JudgeVersions, Sanitizer, Sha256)
 from ...data import canonical_json, put_record
-from ...hcap import (AuthorityRef, Capability, HcapCatalog, RuntimeSelection)
+from ...hcap import (STAGE1_LAYOUT, AuthorityRef, Capability, ExecutionLayout,
+                      HcapCatalog, RuntimeSelection, calls_in_layout,
+                      layout_refusals)
 from ...materializer import (ExecutionHarnessApproval,
                              ExecutionHarnessDescriptor, HarnessBuildArtifact,
                              _runtime_key, descriptor_id)
@@ -200,6 +202,8 @@ class Hcap11KvmEvidence(_Spec):
     guest_nfs_proxy_sha256: Sha256
     nfsv4_lease_time_s: Literal[10]
     partition_hold_s: Literal[15]
+    #: The Stage 1 collector's layout: one proc on lane 0.
+    layout: ExecutionLayout
     runs: Hcap11RunsEvidence
     generation_contract: Hcap11GenerationEvidence
     recovery_order: tuple[str, ...]
@@ -307,6 +311,8 @@ class Hcap13KvmEvidence(_Spec):
     campaign_result_sha256: Sha256
     guest_lane_script_sha256: Sha256
     guest_nfs_proxy_sha256: Sha256
+    #: The Stage 1 collector's layout: one proc on lane 0.
+    layout: ExecutionLayout
     runs: Hcap13RunsEvidence
     generation_contract: Hcap11GenerationEvidence
     crash_signature_count: int = Field(ge=0)
@@ -337,6 +343,92 @@ class Hcap13KvmEvidence(_Spec):
         return self
 
 
+#: Capabilities one lane-topology campaign validates together: the lane
+#: syscalls it runs on every lane, their remote-KCOV generation attribution
+#: and the topology itself.
+LANE_TOPOLOGY_CAPABILITIES = ("HCAP-01", "HCAP-03", "HCAP-04")
+#: Fewest generation-attributed campaign executions each lane must have.
+LANE_TOPOLOGY_MIN_EXECUTIONS = 8
+
+
+class LaneTopologyLane(_Spec):
+    """One lane of a lane-topology campaign (``agent_pipeline.stage2.topology``)."""
+
+    lane: int = Field(ge=0)
+    #: Campaign executions syz-manager's evidence spool recorded on the lane.
+    executions: int = Field(ge=0)
+    #: Of those, executions with a remote-KCOV generation and attributed PCs.
+    attributed_executions: int = Field(ge=0)
+    #: Distinct generations among them (a reused one is a restart).
+    distinct_generations: int = Field(ge=0)
+    #: Executions whose NFS proxy activation and deactivation were acked.
+    proxy_acked_executions: int = Field(ge=0)
+    #: Executions that ran, cleared their lease, did not hang and had no error.
+    healthy_executions: int = Field(ge=0)
+    #: GENERATION_OPEN events on the lane's own journal channel.
+    journal_generations: int = Field(ge=0)
+    #: Attributed generations with no GENERATION_OPEN on the lane's channel.
+    generations_missing_from_journal: int = Field(ge=0)
+    #: Journal events on the lane's channel that name another lane or
+    #: belong to another lane's session series.
+    foreign_journal_events: int = Field(ge=0)
+
+
+class LaneTopologyEvidence(_Spec):
+    """A bounded Stage 2 manager campaign at ``layout.procs`` procs (#99):
+    every lane has its own generation-attributed remote KCOV, NFS proxy
+    activation and journal stream, and nothing is attributed across lanes."""
+
+    schema_version: Literal["hcap-kvm-evidence.v1"]
+    capability_id: Literal["HCAP-04"]
+    #: The capabilities this campaign validates, LANE_TOPOLOGY_CAPABILITIES.
+    capability_ids: tuple[str, ...]
+    observed_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    scenario: Literal["stage2-lane-topology"]
+    execution_harness_id: Sha256
+    mapping_identity: KernelIdentity
+    campaign_result_sha256: Sha256
+    guest_lane_script_sha256: Sha256
+    layout: ExecutionLayout
+    min_executions_per_lane: int = Field(ge=LANE_TOPOLOGY_MIN_EXECUTIONS)
+    lanes: tuple[LaneTopologyLane, ...]
+    manager_exited_unexpectedly: bool
+    crash_signature_count: int = Field(ge=0)
+    shareable_result_contains_target_metadata_or_addresses: bool
+
+    @model_validator(mode="after")
+    def _validated_campaign(self) -> Self:
+        if self.execution_harness_id != self.mapping_identity.execution_harness_id:
+            raise ValueError("mapping and campaign harness identities differ")
+        if self.capability_ids != LANE_TOPOLOGY_CAPABILITIES:
+            raise ValueError("lane-topology evidence names other capabilities")
+        if self.layout.lanes != tuple(range(self.layout.procs)):
+            raise ValueError("a lane-topology campaign exercises every lane "
+                             "of its procs")
+        if tuple(item.lane for item in self.lanes) != self.layout.lanes:
+            raise ValueError("lane results differ from the layout")
+        for item in self.lanes:
+            if item.executions < self.min_executions_per_lane:
+                raise ValueError(f"lane {item.lane} ran too few executions")
+            if not (item.executions == item.attributed_executions
+                    == item.distinct_generations
+                    == item.proxy_acked_executions
+                    == item.healthy_executions):
+                raise ValueError(f"lane {item.lane} has an unattributed, "
+                                 "repeated, unacked or unhealthy execution")
+            if item.journal_generations < item.distinct_generations or \
+                    item.generations_missing_from_journal:
+                raise ValueError(f"lane {item.lane} journal lacks a generation")
+            if item.foreign_journal_events:
+                raise ValueError(f"lane {item.lane} journal has another "
+                                 "lane's events")
+        if self.manager_exited_unexpectedly or self.crash_signature_count:
+            raise ValueError("campaign contains a crash or a manager exit")
+        if self.shareable_result_contains_target_metadata_or_addresses:
+            raise ValueError("shareable campaign evidence contains private target data")
+        return self
+
+
 class Stage2ManagerSpec(_Spec):
     """``stage2``: the syz-manager config a Stage 2 lease runs (#81 D17).
     Generation writes it from each variant's descriptor, so its kernel,
@@ -346,7 +438,10 @@ class Stage2ManagerSpec(_Spec):
     #: The runtime selection the manager boots; it may be left out when
     #: the spec has one.  A Stage 2 lease checks it against its harness.
     runtime_selection: RuntimeSelection | None = None
-    procs: int = Field(default=1, ge=1, le=64)
+    #: Left out, the procs ``runtime_selection_capability`` (HCAP-04) is
+    #: validated for: its ``validated_layout`` (#99), one proc without it.
+    #: Given, it must not exceed them.
+    procs: int | None = Field(default=None, ge=1, le=64)
     #: ``experimental.nfs_proxy_window``; the Stage 2 preflight requires
     #: at least ``Stage2Config.crash_window_bound``.
     nfs_proxy_window: int = Field(default=6, ge=1, le=64)
@@ -368,6 +463,8 @@ class VariantSpec(_Spec):
 
 
 CAPABILITY_EVIDENCE_MODELS = {
+    **{capability_id: LaneTopologyEvidence
+       for capability_id in LANE_TOPOLOGY_CAPABILITIES},
     "HCAP-11": Hcap11KvmEvidence,
     "HCAP-13": Hcap13KvmEvidence,
 }
@@ -448,17 +545,18 @@ def _resolve(base: Path, path: Path) -> Path:
 def _validated_capability_evidence(
         capability_id: str, path: Path, *,
         expected_mapping_identity: KernelIdentity,
-        lane_script_sha256: str) -> bytes:
+        lane_script_sha256: str) -> tuple[bytes, ExecutionLayout | None]:
     """Validate identity-sensitive evidence before it can promote an HCAP.
 
     Capabilities with a typed KVM evidence model (CAPABILITY_EVIDENCE_MODELS)
     accept only evidence of that model bound to the generated execution
     harness, its full mapping identity and the pinned guest lane script.
+    Returns the bytes and the executor layout the typed evidence ran.
     """
     contents = path.read_bytes()
     model = CAPABILITY_EVIDENCE_MODELS.get(capability_id)
     if model is None:
-        return contents
+        return contents, None
     try:
         evidence = model.model_validate_json(contents)
     except ValidationError as error:
@@ -475,7 +573,29 @@ def _validated_capability_evidence(
     if evidence.guest_lane_script_sha256 != lane_script_sha256:
         raise GenerationError(
             f"{capability_id} evidence names another guest lane script")
-    return contents
+    if capability_id not in getattr(evidence, "capability_ids",
+                                    (evidence.capability_id,)):
+        raise GenerationError(
+            f"{capability_id} evidence validates other capabilities")
+    return contents, evidence.layout
+
+
+def _check_layout(capability: Capability,
+                  layouts: list[ExecutionLayout]) -> None:
+    """A capability's ``validated_layout`` is the layout its typed evidence
+    ran (#99): every typed evidence file must have run exactly it, and a
+    layout beyond Stage 1's needs one."""
+    declared = capability.layout()
+    for layout in layouts:
+        if layout != declared:
+            raise GenerationError(
+                f"{capability.id} evidence ran {layout.procs} proc(s) on "
+                f"lanes {list(layout.lanes)}, not its validated_layout "
+                f"({declared.procs} proc(s), lanes {list(declared.lanes)})")
+    if declared != STAGE1_LAYOUT and not layouts:
+        raise GenerationError(
+            f"{capability.id} validated_layout needs typed evidence that "
+            "ran it")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -582,12 +702,51 @@ def _stage2_selection(spec: HostSpec) -> RuntimeSelection:
     return match[0]
 
 
+def _stage2_procs(spec: HostSpec) -> int:
+    """The manager's procs: at most what the topology capability's
+    validated layout covers (#99)."""
+    if spec.runtime_selection_capability is None:
+        raise GenerationError("stage2 needs runtime_selection_capability: "
+                              "its validated_layout bounds the procs")
+    topology = next(c for c in spec.capabilities
+                    if c.id == spec.runtime_selection_capability)
+    layout = topology.layout()
+    validated = max(n for n in range(1, layout.procs + 1)
+                    if layout.covers(n))
+    wanted = spec.stage2.procs
+    if wanted is None:
+        return validated
+    if wanted > validated:
+        raise GenerationError(
+            f"stage2.procs {wanted} exceeds the {validated} proc(s) "
+            f"{topology.id} is validated for")
+    return wanted
+
+
 def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
-                  selection: RuntimeSelection) -> tuple[str, ...]:
-    approved = _approved_calls(profile, table, selection)
+                  selection: RuntimeSelection,
+                  procs: int) -> tuple[str, ...]:
+    """The approved calls, less the admitted calls no capability is
+    validated for at ``procs`` procs (#99).  Given calls must include the
+    rest and none of those."""
+    catalog = HcapCatalog(capabilities=spec.capabilities,
+                          missing_capability_ids=())
+    refusals = layout_refusals(catalog, profile.entries, enabled_calls=(),
+                               runtime_features=("remote_cover",),
+                               procs=procs)
+    if refusals:
+        raise GenerationError(f"stage2 at {procs} proc(s): {refusals[0]}")
+    outside = ({e.call for e in profile.entries}
+               - calls_in_layout(catalog, profile.entries, procs))
+    approved = _approved_calls(profile, table, selection) - outside
     given = spec.stage2.enable_syscalls
     if given is None:
         return tuple(sorted(approved))
+    refusals = layout_refusals(catalog, profile.entries, enabled_calls=given,
+                               runtime_features=(), procs=procs)
+    if refusals:
+        raise GenerationError(f"stage2.enable_syscalls at {procs} proc(s): "
+                              + refusals[0])
     missing = sorted(approved - set(given))
     if missing:
         raise GenerationError("stage2.enable_syscalls lacks approved calls: "
@@ -604,6 +763,7 @@ def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
 def _stage2_manager(spec: HostSpec, *, accel: Accel,
                     descriptor: ExecutionHarnessDescriptor,
                     selection: RuntimeSelection, calls: tuple[str, ...],
+                    procs: int,
                     files: dict[str, Path], template: Path, lane_sha256: str,
                     syzkaller: Path, ssh_key: Path, state: Path) -> dict:
     """The syz-manager config of one variant, in the shape the Stage 2
@@ -623,7 +783,7 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
                    "security_model=none,readonly=on"),
         "-device", "virtio-9p-pci,fsdev=koov_lane,mount_tag=koov-lane",
         "-device", "virtio-serial-pci,id=nfspser"]
-    for lane in range(max(GUEST_LANES, s2.procs)):
+    for lane in range(max(GUEST_LANES, procs)):
         qemu_args += [
             "-chardev", (f"socket,id=nfspj{lane},"
                          f"path={sockets / f'lane{lane}.sock'},server=off"),
@@ -639,7 +799,7 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
         "image": str(files["vm-image"]),
         "sshkey": str(ssh_key),
         "syzkaller": str(syzkaller),
-        "procs": s2.procs,
+        "procs": procs,
         "type": "qemu",
         "enable_syscalls": list(calls),
         "experimental": {"remote_cover": True,
@@ -866,7 +1026,9 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     digests["neutral_control_catalog"] = neutral_ref
     if spec.stage2 is not None:
         stage2_selection = _stage2_selection(spec)
-        stage2_calls = _stage2_calls(spec, profile, table, stage2_selection)
+        stage2_procs = _stage2_procs(spec)
+        stage2_calls = _stage2_calls(spec, profile, table, stage2_selection,
+                                     stage2_procs)
     judge_profile_ref = put_record(store, spec.judge_profile)
     digests["q1_admissibility_profile"] = judge_profile_ref
     if "nokaslr" not in spec.guest_kernel_command_line.split():
@@ -900,6 +1062,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             vmlinux_sha256=build_refs["kernel"],
             kaslr_enabled=False, kaslr_offset=0)
         variant_capabilities = list(capabilities)
+        evidence_layouts: dict[str, list[ExecutionLayout]] = {}
         for capability_id, paths in sorted(v.capability_evidence.items()):
             refs = []
             for path in paths:
@@ -907,16 +1070,21 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                 if not resolved.is_file():
                     raise GenerationError(
                         f"capability evidence is not a file: {resolved}")
-                contents = _validated_capability_evidence(
+                contents, layout = _validated_capability_evidence(
                     capability_id, resolved,
                     expected_mapping_identity=expected_mapping_identity,
                     lane_script_sha256=file_pins["lane-script"].sha256)
+                if layout is not None:
+                    evidence_layouts.setdefault(capability_id, []).append(
+                        layout)
                 refs.append(store.put(contents))
             index = capability_indexes[capability_id]
             capability = variant_capabilities[index]
             variant_capabilities[index] = capability.model_copy(update={
                 "evidence_refs": tuple(sorted(set(capability.evidence_refs)
                                               | set(refs)))})
+        for capability in variant_capabilities:
+            _check_layout(capability, evidence_layouts.get(capability.id, []))
         draft = HcapCatalog(
             capabilities=tuple(variant_capabilities),
             missing_capability_ids=_gap_vocabulary(spec))
@@ -1042,6 +1210,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             manager = _stage2_manager(
                 spec, accel=accel, descriptor=descriptors[v.sanitizer],
                 selection=stage2_selection, calls=stage2_calls,
+                procs=stage2_procs,
                 files={n: p.resolve() for n, p in
                        {**common, **variant_files[v.sanitizer]}.items()},
                 template=template, lane_sha256=lane.sha256,

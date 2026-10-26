@@ -41,6 +41,8 @@ from agent_pipeline.stage1.cli import STOP_STATES, open_stage1
 from agent_pipeline.stage1.config import EngineConfig, Stage1Config
 from agent_pipeline.stage1.host import kcov
 from agent_pipeline.stage1.host.__main__ import main as host_main
+import agent_pipeline.stage1.host.generate as generate_module
+from agent_pipeline.hcap import STAGE1_LAYOUT, HcapCatalog
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
@@ -463,6 +465,7 @@ def _kvm_evidence(identity, lane_sha256):
         "campaign_result_sha256": "b" * 64,
         "guest_lane_script_sha256": lane_sha256,
         "guest_nfs_proxy_sha256": "c" * 64,
+        "layout": {"procs": 1, "lanes": [0]},
         "generation_contract": {
             "generation_begin_each": 1,
             "aggregate_published_each": 1,
@@ -535,6 +538,13 @@ def test_template_spec_is_valid():
     assert all(not call.startswith("syz_nfsd_cld_ctl$")
                for selection in spec.runtime_selections
                for call in selection.enabled_interfaces)
+
+    # #99: every capability is validated on Stage 1's single lane until
+    # lane-topology evidence widens it; Stage 2 inherits HCAP-04's layout.
+    for capability in spec.capabilities:
+        assert capability.layout() == STAGE1_LAYOUT
+    assert evidence.layout == STAGE1_LAYOUT
+    assert spec.stage2 is not None and spec.stage2.procs is None
     assert all(not call.startswith("syz_nfsd_cld_ctl$")
                for item in spec.neutral_controls
                for call in item.runtime_selection.enabled_interfaces)
@@ -1507,14 +1517,15 @@ def _preflight_manager(host, result, path: Path) -> str:
 @needs_gcc
 def test_generate_writes_a_stage2_manager_the_preflight_accepts(host):
     # #81 D17: the manager is pinned to the Stage 1 collector's descriptor.
-    _with_stage2(host, procs=2, nfs_proxy_window=6)
+    _with_stage2(host, nfs_proxy_window=6)
     result = generate(host.spec)
     path = result.stage2_managers["kasan"]
     assert path == host.root / "state" / "stage2-manager.json"
     manager = json.loads(path.read_text())
     # Every admitted call and every call the selection enables.
     assert manager["enable_syscalls"] == ["close", "openat$lane", "read$extra"]
-    assert manager["procs"] == 2
+    # No validated_layout on the topology capability: one proc (#99).
+    assert manager["procs"] == 1
     assert manager["experimental"] == {"remote_cover": True,
                                        "nfs_proxy_window": 6}
     collector = CollectorConfig.load(result.collector_config)
@@ -1531,7 +1542,7 @@ def test_generate_writes_a_stage2_manager_the_preflight_accepts(host):
             "koov.nfs_target=1"} <= set(cmdline)
     assert result.digests["stage2_manager"] == hashlib.sha256(
         path.read_bytes()).hexdigest()
-    assert "2 proc(s)" in _preflight_manager(host, result, path)
+    assert "1 proc(s)" in _preflight_manager(host, result, path)
     # Generating again keeps the frozen lane template.
     assert generate(host.spec).stage2_managers["kasan"].read_bytes() == \
         path.read_bytes()
@@ -1578,6 +1589,167 @@ def test_stage2_manager_calls_include_the_approved_calls(host):
     manager = json.loads(generate(host.spec).stage2_managers["kasan"]
                          .read_text())
     assert manager["enable_syscalls"][-1] == "write$known"
+
+
+def _generated_identity(host):
+    """The mapping identity and lane script digest of the host's harness,
+    which typed KVM evidence must name."""
+    initial = generate(host.spec)
+    config = Stage1Config.load(initial.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    from agent_pipeline.materializer import ExecutionHarnessApproval
+    from agent_pipeline.stage1.host.pins import HostFilePin
+    descriptor = load_record(store, config.execution_harness_approvals[0],
+                             ExecutionHarnessApproval).descriptor
+    builds = {item.name: item.artifact_ref
+              for item in descriptor.build_artifacts}
+    identity = KernelIdentity(
+        execution_harness_id=initial.execution_harness_id,
+        kernel_commit=descriptor.kernel_commit,
+        instrumentation_sha256=builds["instrumentation"],
+        vmlinux_sha256=builds["kernel"],
+        kaslr_enabled=False, kaslr_offset=0)
+    return identity, load_record(store, builds["lane-script"],
+                                 HostFilePin).sha256
+
+
+def _lane_topology_evidence(identity, lane_sha256, procs, **lane):
+    executions = 8
+    lanes = [{"lane": n, "executions": executions,
+              "attributed_executions": executions,
+              "distinct_generations": executions,
+              "proxy_acked_executions": executions,
+              "healthy_executions": executions,
+              "journal_generations": executions,
+              "generations_missing_from_journal": 0,
+              "foreign_journal_events": 0, **lane}
+             for n in range(procs)]
+    return {
+        "schema_version": "hcap-kvm-evidence.v1",
+        "observed_at": "2026-10-26",
+        "execution_harness_id": identity.execution_harness_id,
+        "mapping_identity": identity.model_dump(mode="json"),
+        "campaign_result_sha256": "b" * 64,
+        "guest_lane_script_sha256": lane_sha256,
+        "capability_id": "HCAP-04",
+        "capability_ids": list(generate_module.LANE_TOPOLOGY_CAPABILITIES),
+        "scenario": "stage2-lane-topology",
+        "layout": {"procs": procs, "lanes": list(range(procs))},
+        "min_executions_per_lane": 8, "lanes": lanes,
+        "manager_exited_unexpectedly": False, "crash_signature_count": 0,
+        "shareable_result_contains_target_metadata_or_addresses": False,
+    }
+
+
+@needs_gcc
+def test_stage2_procs_stay_inside_the_topology_layout(host):
+    # #99: without a validated_layout CAP-lane is validated for one proc.
+    _with_stage2(host, procs=2)
+    with pytest.raises(GenerationError, match=r"stage2\.procs 2 exceeds the "
+                       r"1 proc\(s\) CAP-lane is validated for"):
+        generate(host.spec)
+
+
+@needs_gcc
+def test_lane_topology_evidence_widens_the_stage2_layout(host, monkeypatch):
+    # The synthetic host's lane and topology capability is CAP-lane, its
+    # remote KCOV CAP-observe.
+    monkeypatch.setattr(generate_module, "LANE_TOPOLOGY_CAPABILITIES",
+                        ("CAP-lane", "CAP-observe"))
+    for name in ("CAP-lane", "CAP-observe"):
+        monkeypatch.setitem(generate_module.CAPABILITY_EVIDENCE_MODELS,
+                            name, generate_module.LaneTopologyEvidence)
+    identity, lane_sha256 = _generated_identity(host)
+    evidence = host.root / "topology.json"
+    evidence.write_text(json.dumps(
+        _lane_topology_evidence(identity, lane_sha256, 2)))
+    spec = json.loads(host.spec.read_text())
+    widened = [c for c in spec["capabilities"]
+               if c["id"] in ("CAP-lane", "CAP-observe")]
+    spec["capability_evidence"] = {"CAP-lane": [evidence.name],
+                                   "CAP-observe": [evidence.name]}
+    spec["stage2"] = {}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    # The declared layout is what the evidence ran.
+    with pytest.raises(GenerationError, match="not its validated_layout"):
+        generate(host.spec)
+    for capability in widened:
+        capability["validated_layout"] = {"procs": 2, "lanes": [0, 1]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    result = generate(host.spec)
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          result.hcap_revision, HcapCatalog)
+    assert next(c for c in catalog.capabilities
+                if c.id == "CAP-lane").validated_layout.procs == 2
+    manager = json.loads(result.stage2_managers["kasan"].read_text())
+    assert manager["procs"] == 2
+    # CAP-extra is still validated on lane 0 only, so read$extra is out.
+    assert manager["enable_syscalls"] == ["close", "openat$lane"]
+    assert "2 proc(s)" in _preflight_manager(
+        host, result, result.stage2_managers["kasan"])
+    spec["stage2"] = {"procs": 1}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    manager = json.loads(generate(host.spec).stage2_managers["kasan"]
+                         .read_text())
+    assert manager["procs"] == 1
+    assert manager["enable_syscalls"] == ["close", "openat$lane", "read$extra"]
+    spec["stage2"] = {"enable_syscalls": ["close", "openat$lane",
+                                          "read$extra"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match=r"call_outside_validated_layout:"
+                       r"read\$extra"):
+        generate(host.spec)
+    # A layout beyond Stage 1's needs typed evidence that ran it.
+    spec["capability_evidence"] = {}
+    spec["stage2"] = {}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="needs typed evidence"):
+        generate(host.spec)
+
+
+@pytest.mark.parametrize(("lane", "message"), [
+    ({"executions": 7, "attributed_executions": 7, "distinct_generations": 7,
+      "proxy_acked_executions": 7, "healthy_executions": 7},
+     "too few executions"),
+    ({"attributed_executions": 7}, "unattributed"),
+    ({"distinct_generations": 7}, "repeated"),
+    ({"proxy_acked_executions": 7}, "unacked"),
+    ({"healthy_executions": 7}, "unhealthy"),
+    ({"journal_generations": 7}, "journal lacks a generation"),
+    ({"generations_missing_from_journal": 1}, "journal lacks a generation"),
+    ({"foreign_journal_events": 1}, "another lane's events"),
+])
+def test_lane_topology_evidence_rejects_unvalidated_lanes(lane, message):
+    identity = KernelIdentity(
+        execution_harness_id="a" * 64, kernel_commit="b" * 40,
+        instrumentation_sha256="c" * 64, vmlinux_sha256="d" * 64,
+        kaslr_enabled=False, kaslr_offset=0)
+    value = _lane_topology_evidence(identity, "e" * 64, 4)
+    assert generate_module.LaneTopologyEvidence.model_validate(
+        value).layout.procs == 4
+    value["lanes"][2].update(lane)
+    with pytest.raises(ValidationError, match=message):
+        generate_module.LaneTopologyEvidence.model_validate(value)
+
+
+@pytest.mark.parametrize(("field", "value", "message"), [
+    ("capability_ids", ["HCAP-04"], "names other capabilities"),
+    ("layout", {"procs": 4, "lanes": [0, 1]}, "every lane of its procs"),
+    ("manager_exited_unexpectedly", True, "manager exit"),
+    ("crash_signature_count", 1, "crash"),
+    ("shareable_result_contains_target_metadata_or_addresses", True,
+     "private target data"),
+])
+def test_lane_topology_evidence_rejects_unvalidated_campaigns(
+        field, value, message):
+    identity = KernelIdentity(
+        execution_harness_id="a" * 64, kernel_commit="b" * 40,
+        instrumentation_sha256="c" * 64, vmlinux_sha256="d" * 64,
+        kaslr_enabled=False, kaslr_offset=0)
+    evidence = _lane_topology_evidence(identity, "e" * 64, 4)
+    evidence[field] = value
+    with pytest.raises(ValidationError, match=message):
+        generate_module.LaneTopologyEvidence.model_validate(evidence)
 
 
 @needs_gcc
