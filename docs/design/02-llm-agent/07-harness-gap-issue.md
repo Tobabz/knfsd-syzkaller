@@ -337,7 +337,9 @@ crash report는 staged revision과 생성 patch set의 digest를 기록한다.
 ### 5.3 promotion
 
 staged revision을 공유 HCAP으로 올리는 promotion은 아래 승격 기준(#100)을 모두 통과해야 한다. 사람 검토는
-기준 결과를 보고 승인하는 단계다. 기준을 대신하지 않는다. promotion은 job을 막지 않는다. staged harness로 진행
+기준 결과를 보고 승인하는 단계다. 기준을 대신하지 않는다. 사람은 stage 중간에서 결정하지 않는다. staged
+harness로 진행한 job이 Stage 1 끝(`s1_reached` 또는 그 뒤)에 이르렀을 때 그 job의 결과와 함께 결정한다(사용자
+결정 2026-10-27). promotion은 job을 막지 않는다. staged harness로 진행
 중인 job은 그대로 진행하고, promotion이 끝나면 issue가 `resolved`가 되며 `09` §5의 `hcap_revision` 재평가 규칙이
 job들을 promoted revision으로 옮긴다. promotion 검토가 생성물을 거부하면 그 staged revision으로 만든 결과는 거부
 사실과 함께 남기고, 해당 job은 `09` §5의 binding 변경 규칙으로 다시 gap 경로에 들어간다.
@@ -399,7 +401,23 @@ capability의 근거로도 받지 않는다.
     `crash_signature_count`로 남아 기준에서 거부된다.
   - 진입점에 syz call이 없는 contract(fixture action, Proxy operation뿐)는 거부한다. 생성 program을 진입점 call로
     정의하기 때문이다.
-  - Controller가 staged 통과 뒤 이 명령을 task로 걸고 후보 program을 넘기는 연결은 아직 없다(#83 PR 4b).
+- Controller 연결(`agent_pipeline/controller/promotion.py`, `agent_pipeline/stage1/campaigns.py`):
+  - 생성이 `passed`로 끝나면 promotion 기록을 만든다. 대상은 staged HCAP이 base HCAP에 추가하거나 바꾼
+    capability 중 그 gap을 채우는 것이다. Stage 2 gap(`mutation_engine`)은 7번 기준을 따르므로 campaign을 걸지
+    않는다.
+  - 후보 program: staged binding에 있는 job들의 plan program digest다. 살아 있는 job 중 plan이 없는 job이 없고
+    digest가 하나 이상 모이면 campaign을 시작한다. 그 뒤에 알게 된 후보 program을 campaign이 돌렸으면 `not_met`이다.
+  - campaign: capability마다 Runner task 하나다(`CommandCampaigner`, host 명령은 `probe-campaign`).
+    `inconclusive`는 생성의 `runtime_retry_limit`까지 다시 돌리고, 넘으면 `failed`다. `refused`가 있으면
+    `not_met`이다. staged binding은 남고, operator가 campaign을 다시 돌릴 수 있다.
+  - 모든 capability에 evidence가 있으면 `review`다. 결정은 staged binding의 job 하나가 Stage 1 끝에 이른 뒤에만
+    받는다. 그 전의 승인과 거부는 거부되고, job의 status가 결정할 promotion을 보여 준다. 결정 기록에는 그때
+    Stage 1 끝에 있던 job을 남긴다. 승인하면 `approved`다. host가
+    capability와 evidence를 host spec에 넣어 promotion하고, registry의 binding이 각 capability를 그 evidence와 함께
+    가지면 `promoted`가 된다. 이때 issue를 `resolved`로 바꾸고, registry 변경이 job을 옮긴다(`09` §5).
+  - 사람이 Stage 1 끝에서 거부하면 `rejected`다(`review`, `not_met`, `failed`에서. campaign이 도는 동안은 받지
+    않는다). staged binding의 job은 registry binding으로 돌아간다. 그 gap을 다시 만난 job은
+    `blocked_harness_gap`(`generation_promotion_rejected`)에서 operator의 `retry_generation`을 기다린다.
 
 기준을 통과하지 못한 capability는 버리지 않는다. staged revision으로 남겨 그 후보의 job은 계속 진행한다. 다만
 공유 HCAP으로는 올라가지 않는다. 같은 gap key의 다른 후보가 staged revision을 재사용해 성공하면 그것도 일반성의

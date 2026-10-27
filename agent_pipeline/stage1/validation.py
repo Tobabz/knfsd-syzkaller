@@ -146,7 +146,13 @@ class ValidationStore:
     """Validation tasks and the staged approvals of the passed ones.
 
     Readable by any process (the Materializer's authority reads it);
-    written by the one ``CommandValidator`` that owns it."""
+    written by the one ``CommandValidator`` that owns it.  A subclass
+    keeps other host command tasks (``campaigns.CampaignStore``) in a
+    table of its own."""
+
+    TABLE = "validations"
+    INPUT: type[Record] = ValidationInput
+    STATUS: type[Record] = ValidationStatus
 
     def __init__(self, path: Path | str) -> None:
         self._lock = threading.RLock()
@@ -156,7 +162,7 @@ class ValidationStore:
         self._db.execute("PRAGMA journal_mode = WAL")
         self._db.execute("PRAGMA synchronous = FULL")
         self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS validations (
+            CREATE TABLE IF NOT EXISTS {t} (
                 task_id TEXT PRIMARY KEY,
                 input TEXT NOT NULL,
                 state TEXT NOT NULL,
@@ -166,11 +172,9 @@ class ValidationStore:
                 boot_id TEXT,
                 descriptor_id TEXT,
                 approval_ref TEXT);
-            CREATE INDEX IF NOT EXISTS validations_state
-                ON validations (state);
-            CREATE INDEX IF NOT EXISTS validations_descriptor
-                ON validations (descriptor_id);
-        """)
+            CREATE INDEX IF NOT EXISTS {t}_state ON {t} (state);
+            CREATE INDEX IF NOT EXISTS {t}_descriptor ON {t} (descriptor_id);
+        """.format(t=self.TABLE))
 
     def close(self) -> None:
         with self._lock:
@@ -180,44 +184,44 @@ class ValidationStore:
         with self._lock:
             return self._db.execute(sql, args).fetchone()
 
-    def status(self, task_id: str) -> ValidationStatus:
-        row = self._one("SELECT status FROM validations WHERE task_id = ?",
+    def status(self, task_id: str):
+        row = self._one(f"SELECT status FROM {self.TABLE} WHERE task_id = ?",
                         (task_id,))
         if row is None:
-            return ValidationStatus(state="unknown")
-        return ValidationStatus.model_validate_json(row[0])
+            return self.STATUS(state="unknown")
+        return self.STATUS.model_validate_json(row[0])
 
-    def insert(self, task_id: str, task_input: ValidationInput) -> bool:
+    def insert(self, task_id: str, task_input) -> bool:
         """False when the task is already recorded."""
         with self._lock:
             cur = self._db.execute(
-                "INSERT OR IGNORE INTO validations (task_id, input, state, "
+                f"INSERT OR IGNORE INTO {self.TABLE} (task_id, input, state, "
                 "status) VALUES (?, ?, 'running', ?)",
                 (task_id, task_input.model_dump_json(),
-                 ValidationStatus(state="running").model_dump_json()))
+                 self.STATUS(state="running").model_dump_json()))
             return cur.rowcount == 1
 
-    def input(self, task_id: str) -> ValidationInput:
-        row = self._one("SELECT input FROM validations WHERE task_id = ?",
+    def input(self, task_id: str):
+        row = self._one(f"SELECT input FROM {self.TABLE} WHERE task_id = ?",
                         (task_id,))
-        return ValidationInput.model_validate_json(row[0])
+        return self.INPUT.model_validate_json(row[0])
 
     def started(self, task_id: str, session: int, ticks: int | None,
                 boot_id: str) -> None:
         with self._lock:
             self._db.execute(
-                "UPDATE validations SET session = ?, started_ticks = ?, "
+                f"UPDATE {self.TABLE} SET session = ?, started_ticks = ?, "
                 "boot_id = ? WHERE task_id = ? AND state = 'running'",
                 (session, ticks, boot_id, task_id))
 
-    def finish(self, task_id: str, status: ValidationStatus, *,
+    def finish(self, task_id: str, status, *,
                descriptor: str | None = None,
                approval_ref: str | None = None) -> None:
         """The task's end; a passed one with its staged approval, in one
         write, so a passed status always has its approval."""
         with self._lock:
             self._db.execute(
-                "UPDATE validations SET state = ?, status = ?, "
+                f"UPDATE {self.TABLE} SET state = ?, status = ?, "
                 "descriptor_id = ?, approval_ref = ?, session = NULL "
                 "WHERE task_id = ? AND state = 'running'",
                 (status.state, status.model_dump_json(), descriptor,
@@ -227,12 +231,12 @@ class ValidationStore:
         with self._lock:
             return self._db.execute(
                 "SELECT task_id, session, started_ticks, boot_id "
-                "FROM validations WHERE state = 'running'").fetchall()
+                f"FROM {self.TABLE} WHERE state = 'running'").fetchall()
 
     def approval_refs(self, execution_harness_id: str) -> list[str]:
         with self._lock:
             return [r[0] for r in self._db.execute(
-                "SELECT approval_ref FROM validations WHERE state = "
+                f"SELECT approval_ref FROM {self.TABLE} WHERE state = "
                 "'passed' AND descriptor_id = ? ORDER BY task_id",
                 (execution_harness_id,))]
 
@@ -331,7 +335,12 @@ class _Inconclusive(Exception):
 
 
 class CommandValidator:
-    """``HarnessValidator`` over one host command per task."""
+    """``HarnessValidator`` over one host command per task.  A subclass
+    runs another kind of host command task over the same machinery by
+    overriding ``_validate`` (``campaigns.CommandCampaigner``)."""
+
+    #: Names the task's thread and the store's owner in errors.
+    KIND = "validation"
 
     def __init__(self, config: CommandValidatorConfig, store: ValidationStore,
                  artifacts: ArtifactStore, lock_path: Path, *,
@@ -347,7 +356,7 @@ class CommandValidator:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(self._lock_fd)
-            raise ValidatorBusy("another process owns the validation "
+            raise ValidatorBusy(f"another process owns the {self.KIND} "
                                 "store") from None
         self._stop = threading.Event()
         self._threads: dict[str, threading.Thread] = {}
@@ -356,23 +365,22 @@ class CommandValidator:
         for task_id, session, ticks, boot in store.running():
             if session is not None:
                 kill_session(session, ticks, boot)
-            store.finish(task_id, ValidationStatus(
+            store.finish(task_id, store.STATUS(
                 state="inconclusive", reason="runner_restart"))
 
-    def submit(self, task_id: str,
-               task_input: ValidationInput) -> ValidationStatus:
+    def submit(self, task_id: str, task_input):
         if not _TASK_ID.match(task_id):
-            raise ValueError(f"bad validation task id {task_id!r}")
+            raise ValueError(f"bad {self.KIND} task id {task_id!r}")
         if self.store.insert(task_id, task_input):
             thread = threading.Thread(
                 target=self._execute, args=(task_id, task_input),
-                daemon=True, name=f"harness-validation-{task_id}")
+                daemon=True, name=f"harness-{self.KIND}-{task_id}")
             with self._mutex:
                 self._threads[task_id] = thread
             thread.start()
         return self.store.status(task_id)
 
-    def status(self, task_id: str) -> ValidationStatus:
+    def status(self, task_id: str):
         return self.store.status(task_id)
 
     def wait(self, timeout_s: float | None = None) -> bool:
@@ -402,12 +410,12 @@ class CommandValidator:
 
     # ------------------------------------------------------------ internals
 
-    def _execute(self, task_id: str, task_input: ValidationInput) -> None:
+    def _execute(self, task_id: str, task_input) -> None:
         started = time.time_ns()
         try:
             status, extra = self._validate(task_id, task_input, started)
         except Exception as exc:          # never leave a task running
-            status, extra = ValidationStatus(
+            status, extra = self.store.STATUS(
                 state="inconclusive",
                 reason=f"validator_error:{type(exc).__name__}:{exc}"
                 [:MAX_REASON_CHARS]), {}

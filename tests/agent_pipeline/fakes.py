@@ -379,6 +379,46 @@ class FakeValidator:
 VERSIONS = JudgeVersions(judge_profile_id="jp-1", support_boundary_id="sb-1")
 
 
+class FakeCampaigner(FakeValidator):
+    """Probe campaign tasks by task_id; a test finishes them."""
+
+    def submit(self, task_id, task_input):
+        from agent_pipeline.controller.promotion import CampaignStatus
+        self.submitted.append(task_id)
+        self.inputs.setdefault(task_id, task_input)
+        return self.tasks.setdefault(task_id,
+                                     CampaignStatus(state="running"))
+
+    def status(self, task_id):
+        from agent_pipeline.controller.promotion import CampaignStatus
+        return self.tasks.get(task_id, CampaignStatus(state="unknown"))
+
+    def finish(self, task_id, state, **kw) -> None:
+        from agent_pipeline.controller.promotion import CampaignStatus
+        self.tasks[task_id] = CampaignStatus(state=state, **kw)
+
+
+class FakePromotionInputs:
+    """The capabilities a staged HCAP changed, by its revision; a plan's
+    program, by plan digest; what each registry HCAP carries."""
+
+    def __init__(self) -> None:
+        self.changed: dict[str, tuple[str, ...]] = {}
+        self.plan_programs: dict[str, tuple[str, ...]] = {}
+        #: hcap_revision -> {(capability_id, evidence_ref)}
+        self.carried: dict[str, set] = {}
+
+    def capabilities(self, g):
+        return self.changed.get(g.staged_binding.hcap_revision, ())
+
+    def programs(self, plan_ref):
+        return self.plan_programs.get(plan_ref, (sha("program", plan_ref),))
+
+    def carries(self, binding, capability_id, evidence_ref):
+        return (capability_id, evidence_ref) in \
+            self.carried.get(binding.hcap_revision, set())
+
+
 def binding(execution: str = "build-1", hcap: str = "hcap-1",
             commit: str = COMMIT,
             sanitizer: Sanitizer = Sanitizer.KASAN) -> HarnessBinding:
@@ -424,6 +464,9 @@ class World:
         #: None: no Harness Generation is configured.
         self.generator: FakeGenerator | None = None
         self.validator: FakeValidator | None = None
+        #: None: no probe campaign Runner is configured.
+        self.campaigner: FakeCampaigner | None = None
+        self.promotion_inputs = FakePromotionInputs()
         self.issues = InMemoryIssues()
         self.registry = InMemoryRegistry()
         if bound:
@@ -448,7 +491,9 @@ class World:
                           self.artifacts, VERSIONS,
                           clock=lambda: "2026-10-13T00:00:00+00:00",
                           new_id=self._new_id, generator=self.generator,
-                          validator=self.validator)
+                          validator=self.validator,
+                          campaigner=self.campaigner,
+                          promotion_inputs=self.promotion_inputs)
 
     def restart(self) -> Controller:
         # A fresh Controller with the configured default: adopted judge

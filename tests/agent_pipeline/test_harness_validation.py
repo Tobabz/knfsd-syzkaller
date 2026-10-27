@@ -421,6 +421,20 @@ def test_config_carries_the_generation_section():
         "validation": {"argv": ["/srv/validate"], "cwd": "/srv",
                        "resource_key": "validate"}})
     assert c.validation.timeout_s == 14_400 and c.workers == 1
+    assert c.campaign is None
+    c = HarnessGenerationConfig.model_validate({
+        "repo": "/r", "worktree_root": "/w", "launcher": ["/usr/bin/env"],
+        "validation": {"argv": ["/v"], "cwd": "/", "resource_key": "k"},
+        "campaign": {"argv": ["/c"], "cwd": "/", "resource_key": "kvm",
+                     "stage1": "/srv/state/stage1.json",
+                     "campaign": {"selection": 1}}})
+    assert c.campaign.timeout_s == 14_400 and c.campaign.collector is None
+    with pytest.raises(ValueError):
+        HarnessGenerationConfig.model_validate({
+            "repo": "/r", "worktree_root": "/w", "launcher": ["/usr/bin/env"],
+            "validation": {"argv": ["/v"], "cwd": "/", "resource_key": "k"},
+            "campaign": {"argv": ["c"], "cwd": "/", "resource_key": "kvm",
+                         "stage1": "/s"}})
     with pytest.raises(ValueError):
         HarnessGenerationConfig.model_validate({
             "repo": "/r", "worktree_root": "/w", "launcher": ["sudo"],

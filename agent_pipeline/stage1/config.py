@@ -114,6 +114,30 @@ class ValidationCommandConfig(_Config):
         return argv
 
 
+class PromotionCampaignConfig(_Config):
+    """The host command that runs one promotion probe campaign (07 §5.3);
+    see ``stage1.campaigns`` for its contract.  ``stage1`` and
+    ``collector`` are what the campaign reads; ``campaign`` sets other
+    ``CampaignConfig`` fields (selection, run counts)."""
+
+    argv: tuple[str, ...] = Field(min_length=1)
+    cwd: Path
+    env: dict[str, str] = Field(default_factory=lambda: {"LANG": "C.UTF-8"})
+    resource_key: str = Field(min_length=1, max_length=256)
+    stage1: Path
+    collector: Path | None = None
+    campaign: dict[str, int] = Field(default_factory=dict)
+    #: About 40 guest boots.
+    timeout_s: float = Field(default=14_400, gt=0, le=86_400)
+
+    @field_validator("argv")
+    @classmethod
+    def _absolute(cls, argv: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError("argv[0] must be an absolute path")
+        return argv
+
+
 class HarnessGenerationConfig(_Config):
     """Harness Generation (07 §5): the Agent's sandbox and the validation
     command.  Unset, a gap a policy would generate for ends
@@ -131,6 +155,8 @@ class HarnessGenerationConfig(_Config):
     allowed_paths: tuple[str, ...] | None = None
     workers: int = Field(default=1, ge=1, le=8)
     validation: ValidationCommandConfig
+    #: Unset: a passed generation's staged harness is not promoted.
+    campaign: PromotionCampaignConfig | None = None
 
     @field_validator("launcher")
     @classmethod

@@ -77,7 +77,7 @@ processes at once, or after a later one is ignored.
 | `judge_versions` | fallback `Q1AdmissibilityProfile` / `RemoteKcovSupportBoundary` digests |
 | `vmlinux_artifact_name`, `instrumentation_artifact_name` | descriptor build-artifact names used for the kernel identity |
 | `engine` | the host command, its cwd, environment, resource key and timeout |
-| `generation` | optional Harness Generation (07 §5): the Agent's sandbox (`repo`, `worktree_root`, `base_ref`, `launcher`, `env`, `allowed_paths`, `workers`) and the `validation` command; see below |
+| `generation` | optional Harness Generation (07 §5): the Agent's sandbox (`repo`, `worktree_root`, `base_ref`, `launcher`, `env`, `allowed_paths`, `workers`), the `validation` command and the optional promotion probe `campaign` command; see below |
 
 Keep `state_dir` and `artifact_root` together: Controller history, Runner
 receipts and Q1 publications are needed for replay.
@@ -143,6 +143,54 @@ ends `inconclusive`, and the Controller runs it again as a new task after
 restart. With `slots`, a validation takes a KVM slot from the same pool as
 the Runner workers; without, it runs on its own `resource_key`, so the host
 needs room for both.
+
+### Promotion of a staged harness
+
+With `generation.campaign` set (`generate` writes it from the host spec's
+`generation` section), a passed generation's staged harness goes to
+promotion (07 §5.3, `controller/promotion.py`). Promotion never changes a
+job's state; the jobs keep running on the staged binding.
+
+1. **Candidate programs.** The Controller collects the plan program of
+   every job on the staged binding. Once no live job there is still
+   without a plan, it starts the campaigns with those digests withheld.
+2. **Campaigns.** One task per capability the staged HCAP added or changed
+   for the gap (a Stage 2 gap has none: its promotion is the M7 gate's).
+   `CommandCampaigner` runs `generation.campaign.argv` with `{input}`,
+   `{output}` and `{resource}` replaced (the contract is in
+   `campaigns.py`): `input/campaign.json` is a `CampaignConfig` for the
+   staged binding, and the command is `agent_pipeline.stage1.host
+   probe-campaign`. Evidence is stored in the CAS. An `inconclusive`
+   campaign runs again up to the generation's `runtime_retry_limit`.
+   Tasks are in `state_dir/campaigns.sqlite`; runs are in
+   `campaign-runs/`.
+3. **Review.** With evidence for every capability the promotion waits in
+   `review`. A person decides only at the end of Stage 1 of a job on the
+   staged harness (`s1_reached` or later), never in the middle of a stage:
+   until then `approve-promotion` and `reject-promotion` are refused, and
+   from then the job's `status` shows `promotion_due`. A refused campaign, or a candidate program known later that
+   a campaign ran, makes it `not_met`: the staged binding stays and
+   `retry-promotion` runs the campaigns again.
+
+   ```sh
+   uv run python -m agent_pipeline.stage1 --config stage1.json promotions
+   uv run python -m agent_pipeline.stage1 --config stage1.json \
+       approve-promotion gen-0003.p review-1 --note "..."
+   uv run python -m agent_pipeline.stage1 --config stage1.json \
+       export-promotion gen-0003.p evidence/
+   ```
+
+4. **Promotion.** After approval the host promotes. The capability and
+   the exported evidence go into the host spec (`capability_evidence`),
+   `generate` runs, and the service runs on the new `harness_catalog_ref`.
+   The promotion becomes `promoted` once the registry's binding for the
+   build key carries each capability with its campaign evidence. The gap's
+   issue is then resolved, and the registry change moves the jobs (09 §5).
+
+`reject-promotion` (at a Stage 1 end, not while campaigns run) sends the jobs on the staged binding back to the
+registry's binding. A job that meets the gap again ends in
+`blocked_harness_gap(generation_promotion_rejected)` until an operator
+sends `retry_generation`.
 
 ## Q1 authority
 

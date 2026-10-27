@@ -13,6 +13,11 @@ Commands:
 ``issues`` / ``resolve-issue``  list harness gap issues; record a status
                  change (resolved, deferred, reopened, wont_fix) for its jobs
 ``replay``       re-run a job's stored events and compare (09 §8)
+``promotions``   list staged harness promotions (07 §5.3)
+``approve-promotion`` / ``reject-promotion``  a person's review of one in
+                 ``review``; ``retry-promotion`` runs its campaigns again
+``export-promotion``  write its evidence files for the host spec's
+                 ``capability_evidence``
 """
 
 from __future__ import annotations
@@ -43,6 +48,8 @@ from .engine import CommandEngineConfig, CommandExecutionEngine
 from ..stage2.authority import Stage2Profiles
 from ..stage2.engine import Stage2CommandEngine, Stage2EngineConfig
 from .service import GenerationParts, Stage1Parts, Stage1Service, Stage2Parts
+from .campaigns import (CampaignStore, CommandCampaigner,
+                        CommandCampaignerConfig)
 from .validation import (CommandValidator, CommandValidatorConfig,
                          DeferredValidator, StagedExecutionHarnessAuthority,
                          ValidationStore)
@@ -171,6 +178,20 @@ def _generation(config: Stage1Config, stack: ExitStack,
             store, artifacts, state / "validation.lock", slots=slots)
     else:
         validator = DeferredValidator(store)
+    campaigner = None
+    if g.campaign is not None:
+        campaigns = stack.enter_context(closing(
+            CampaignStore(state / "campaigns.sqlite")))
+        if run:
+            c = g.campaign
+            campaigner = CommandCampaigner(CommandCampaignerConfig(
+                argv=c.argv, cwd=c.cwd, work_root=state / "campaign-runs",
+                resource_key=c.resource_key, stage1=c.stage1,
+                collector=c.collector, env=c.env, timeout_s=c.timeout_s,
+                campaign=c.campaign),
+                campaigns, artifacts, state / "campaign.lock", slots=slots)
+        else:
+            campaigner = DeferredValidator(campaigns)
     if runtime is None and run:
         from ..agent_tasks.pydantic_ai_generation import (
             PydanticAIGenerationRuntime)
@@ -185,7 +206,8 @@ def _generation(config: Stage1Config, stack: ExitStack,
         runtime, artifacts, sandbox, None,
         contract_for=lambda gap, revision: gap_contract(hcap, gap, revision))
     return authority, GenerationParts(executor=executor, validator=validator,
-                                      workers=g.workers)
+                                      workers=g.workers,
+                                      campaigner=campaigner)
 
 
 def gap_contract(hcap: ArtifactHcapChecker, gap, revision: str | None):
@@ -258,10 +280,46 @@ def _job_summary(service: Stage1Service, job_id: str) -> dict:
         out["replay"] = {"crash_bundle_ref": job.replay.crash.bundle_ref,
                          "outcome": None if job.replay.outcome is None else
                          job.replay.outcome.model_dump(mode="json")}
+    due = service.controller.promotion_due(job)
+    if due is not None:
+        # 07 §5.3: decided with this Stage 1 end (approve-promotion).
+        out["promotion_due"] = {"promotion_id": due.promotion_id,
+                                "state": due.state.value,
+                                "reason": due.reason,
+                                "evidence_refs": list(due.evidence_refs)}
     failures = service.store.effect_failures(job_id)
     if failures:
         out["last_effect_failure"] = list(failures[-1])
     return out
+
+
+def _promotion_summary(p) -> dict:
+    return {"promotion_id": p.promotion_id, "generation_id": p.generation_id,
+            "gap": p.gap.model_dump(mode="json"), "state": p.state.value,
+            "reason": p.reason,
+            "staged_binding": p.staged_binding.model_dump(mode="json"),
+            "capabilities": [c.model_dump(mode="json")
+                             for c in p.capabilities],
+            "withheld_program_sha256s": list(p.withheld_program_sha256s),
+            "review": None if p.review is None
+            else p.review.model_dump(mode="json"),
+            "issue_resolved": p.issue_resolved}
+
+
+def export_promotion(service: Stage1Service, promotion_id: str,
+                     out: Path) -> dict[str, str]:
+    """Each capability's campaign evidence as ``<capability>.evidence.json``
+    in ``out``, for the host spec's ``capability_evidence``."""
+    p = service.store.promotion(promotion_id)
+    out.mkdir(parents=True, exist_ok=True)
+    written = {}
+    for c in p.capabilities:
+        if c.evidence_ref is None:
+            continue
+        path = out / f"{c.capability_id}.evidence.json"
+        path.write_bytes(service.artifacts.get(c.evidence_ref))
+        written[c.capability_id] = str(path)
+    return written
 
 
 def _print(value) -> None:
@@ -336,6 +394,18 @@ def main(argv: list[str] | None = None) -> int:
     rp = sub.add_parser("replay")
     rp.add_argument("job")
 
+    sub.add_parser("promotions")
+    for name in ("approve-promotion", "reject-promotion"):
+        pr = sub.add_parser(name)
+        pr.add_argument("promotion")
+        pr.add_argument("decision_id")
+        pr.add_argument("--note", default="")
+    rtp = sub.add_parser("retry-promotion")
+    rtp.add_argument("promotion")
+    ep = sub.add_parser("export-promotion")
+    ep.add_argument("promotion")
+    ep.add_argument("out", type=Path)
+
     args = ap.parse_args(argv)
     config = Stage1Config.load(args.config)
     with ExitStack() as stack:
@@ -406,6 +476,26 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "operator":
             service.controller.operator(args.job, args.action)
             _print(_job_summary(service, args.job))
+        elif args.command == "promotions":
+            _print([_promotion_summary(p)
+                    for p in service.store.promotions()])
+        elif args.command in ("approve-promotion", "reject-promotion",
+                              "retry-promotion"):
+            c = service.controller
+            try:
+                if args.command == "retry-promotion":
+                    p = c.retry_promotion(args.promotion)
+                else:
+                    p = (c.approve_promotion
+                         if args.command == "approve-promotion"
+                         else c.reject_promotion)(
+                        args.promotion, args.decision_id, args.note)
+            except (KeyError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            _print(_promotion_summary(p))
+        elif args.command == "export-promotion":
+            _print(export_promotion(service, args.promotion, args.out))
         elif args.command == "add-mapping":
             mapping = TargetPcMapping.model_validate_json(args.file.read_bytes())
             print(service.mappings.add(mapping))
