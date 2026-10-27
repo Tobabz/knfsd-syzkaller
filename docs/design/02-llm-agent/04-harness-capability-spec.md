@@ -143,8 +143,12 @@ Agent는 기본적으로 `validated` capability와 `validated_subset`의 scope �
 `validated_layout`은 검증이 성립한 proc 수와 proc lane이다(proc i는 lane i). Stage 1 plan은 lane 0에서
 실행되므로 그 배치를 덮지 않는 capability를 쓰면 거부된다(`layout_not_validated`). Stage 1보다 넓은 배치는
 typed capability evidence의 `layout`이 같은 값일 때만 선언할 수 있다. Stage 2 manager의 `procs`는 runtime
-selection capability(HCAP-04)의 배치를 넘지 못하고, 그 `procs`를 덮지 않는 capability의 call은
-`enable_syscalls`에서 빠진다. 사람이 만든 capability와 생성된 capability에 똑같이 적용한다.
+selection capability(HCAP-04)의 배치를 넘지 못한다. 그 `procs`를 덮는 capability가 없는 admitted call은
+enable하지 않으며, 조용히 빼지도 않는다. host spec이 `stage2.enable_syscalls`에서 그 call을 이름으로 빼지 않았으면
+generation이 거부한다. 빠진 call은 candidate program에서도 잘려 나가기 때문이다(pinned syzkaller가 비활성 call을
+seed에서 지운다). `stage2.procs`를 비워 두면 모든 admitted call이 enable되는 가장 큰 `procs`를 쓴다. 지금 HCAP-11,
+HCAP-13, HCAP-14는 lane 0에서만 검증됐으므로 template과 live spec은 `procs=1`이다(#124 검토). 사람이 만든
+capability와 생성된 capability에 똑같이 적용한다.
 
 `usable_stage`는 capability가 기능상 어느 stage에 속하는지를, `usable_by`는 누가 그것을 쓸 수 있는지를
 나타낸다. `usable_by`에 `agent_stage1`이나 `agent_stage2`가 없는 capability는 Agent pipeline이 쓰지 않는다.
@@ -412,7 +416,8 @@ constraints:
 
 validated_layout:
     procs=4, lanes=[0,1,2,3] (2026-10-27 KVM lane-topology evidence)
-    Stage 2 manager procs의 기본값이며 상한 (#99)
+    Stage 2 manager procs의 상한 (#99). lane 0에서만 검증된 capability가
+    있으면 그 call을 잃지 않는 procs까지만 쓴다(위 validated_layout 설명)
 
 verification_note:
     2026-10-27 KVM campaign (agent_pipeline.stage2.topology)에서

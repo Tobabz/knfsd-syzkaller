@@ -631,7 +631,7 @@
     "exec_timeout_s": 600
   },
   "stage2": {
-    "procs": 4,
+    "procs": 1,
     "nfs_proxy_window": 6
   }
 }

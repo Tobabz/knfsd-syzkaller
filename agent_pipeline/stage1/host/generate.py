@@ -492,9 +492,12 @@ class Stage2ManagerSpec(_Spec):
     #: The runtime selection the manager boots; it may be left out when
     #: the spec has one.  A Stage 2 lease checks it against its harness.
     runtime_selection: RuntimeSelection | None = None
-    #: Left out, the procs ``runtime_selection_capability`` (HCAP-04) is
-    #: validated for: its ``validated_layout`` (#99), one proc without it.
-    #: Given, it must not exceed them.
+    #: Left out, the most procs at which every admitted call stays
+    #: enabled, within what ``runtime_selection_capability`` (HCAP-04) is
+    #: validated for (its ``validated_layout``, #99; one proc without it).
+    #: Given, it must not exceed the topology, and an admitted call no
+    #: capability is validated for at that many procs is refused unless
+    #: ``enable_syscalls`` leaves it out by name.
     procs: int | None = Field(default=None, ge=1, le=64)
     #: ``experimental.nfs_proxy_window``; the Stage 2 preflight requires
     #: at least ``Stage2Config.crash_window_bound``.
@@ -922,9 +925,10 @@ def _stage2_selection(spec: HostSpec) -> RuntimeSelection:
     return match[0]
 
 
-def _stage2_procs(spec: HostSpec) -> int:
+def _stage2_procs(spec: HostSpec, profile) -> int:
     """The manager's procs: at most what the topology capability's
-    validated layout covers (#99)."""
+    validated layout covers (#99).  Left out, no admitted call is lost:
+    the most procs at which every one is in a validated layout."""
     if spec.runtime_selection_capability is None:
         raise GenerationError("stage2 needs runtime_selection_capability: "
                               "its validated_layout bounds the procs")
@@ -935,7 +939,12 @@ def _stage2_procs(spec: HostSpec) -> int:
                     if layout.covers(n))
     wanted = spec.stage2.procs
     if wanted is None:
-        return validated
+        catalog = HcapCatalog(capabilities=spec.capabilities,
+                              missing_capability_ids=())
+        admitted = {e.call for e in profile.entries}
+        return max(n for n in range(1, validated + 1)
+                   if n == 1 or calls_in_layout(catalog, profile.entries, n)
+                   >= admitted)
     if wanted > validated:
         raise GenerationError(
             f"stage2.procs {wanted} exceeds the {validated} proc(s) "
@@ -946,9 +955,11 @@ def _stage2_procs(spec: HostSpec) -> int:
 def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
                   selection: RuntimeSelection,
                   procs: int) -> tuple[str, ...]:
-    """The approved calls, less the admitted calls no capability is
-    validated for at ``procs`` procs (#99).  Given calls must include the
-    rest and none of those."""
+    """The approved calls at ``procs`` procs (#99).  An admitted call no
+    capability is validated for at that many procs is never enabled; it is
+    refused unless the given calls leave it out by name, so a candidate
+    program's call is not dropped from the manager unnoticed.  Given calls
+    must include the rest and none of those."""
     catalog = HcapCatalog(capabilities=spec.capabilities,
                           missing_capability_ids=())
     refusals = layout_refusals(catalog, profile.entries, enabled_calls=(),
@@ -961,6 +972,15 @@ def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
     approved = _approved_calls(profile, table, selection) - outside
     given = spec.stage2.enable_syscalls
     if given is None:
+        if outside:
+            caps = sorted({c for e in profile.entries if e.call in outside
+                           for c in e.capability_ids})
+            raise GenerationError(
+                f"stage2 at {procs} proc(s) would not enable "
+                f"{', '.join(sorted(outside))}: {', '.join(caps)} "
+                "is not validated for that many procs; lower stage2.procs, "
+                "validate the capability on more lanes, or list "
+                "stage2.enable_syscalls without those calls")
         return tuple(sorted(approved))
     refusals = layout_refusals(catalog, profile.entries, enabled_calls=given,
                                runtime_features=(), procs=procs)
@@ -1356,7 +1376,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     digests["neutral_control_catalog"] = neutral_ref
     if spec.stage2 is not None:
         stage2_selection = _stage2_selection(spec)
-        stage2_procs = _stage2_procs(spec)
+        stage2_procs = _stage2_procs(spec, profile)
         stage2_calls = _stage2_calls(spec, profile, table, stage2_selection,
                                      stage2_procs)
     judge_profile_ref = put_record(store, spec.judge_profile)
