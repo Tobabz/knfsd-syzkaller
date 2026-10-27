@@ -4,6 +4,8 @@
 ``collect --config C IN OUT``  the engine's host command (one lease)
 ``validate --config V IN OUT``  the validation command of a Harness
                             Generation patch set (07 §5.2)
+``probe-campaign --config C OUT``  the promotion probe campaign of a
+                            capability (07 §5.3)
 ``probe --stage1 S --program P --out D``  boot and run one program, no service
 ``target-pcs --stage1 S --job J --out F``  verified TargetPcMapping for a job
 ``check-pcs --stage1 S --coverage F``  are published PCs coverage call sites?
@@ -91,6 +93,13 @@ def cmd_validate(args) -> int:
                       args.output)
     print(json.dumps({k: report.get(k) for k in ("result", "reason")}))
     return 0
+
+
+def cmd_probe_campaign(args) -> int:
+    from .campaign import CampaignConfig, probe_campaign
+    report = probe_campaign(CampaignConfig.load(args.config), args.output)
+    print(json.dumps({k: report.get(k) for k in ("result", "reason")}))
+    return 0 if report["result"] == "evidence" else 1
 
 
 def cmd_probe(args) -> int:
@@ -228,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--resource", help="the KVM slot the validator holds")
     v.add_argument("input", type=Path)
     v.add_argument("output", type=Path)
+    pc = sub.add_parser("probe-campaign")
+    pc.add_argument("--config", type=Path, required=True,
+                    help="a campaign.CampaignConfig")
+    pc.add_argument("output", type=Path)
     for name in ("probe", "target-pcs", "check-pcs"):
         p = sub.add_parser(name)
         p.add_argument("--stage1", type=Path, required=True)
@@ -252,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--cache", type=Path)
     args = ap.parse_args(argv)
     return {"generate": cmd_generate, "collect": cmd_collect,
-            "validate": cmd_validate,
+            "validate": cmd_validate, "probe-campaign": cmd_probe_campaign,
             "probe": cmd_probe, "target-pcs": cmd_target_pcs,
             "check-pcs": cmd_check_pcs}[args.command](args)
 

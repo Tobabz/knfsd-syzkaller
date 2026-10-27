@@ -177,33 +177,50 @@ def target_callsites(vmlinux: Path, pcs: list[int],
     return hits
 
 
+def function_callsite_map(vmlinux: Path, functions: Iterable[str], *,
+                          cache: Path | None = None,
+                          vmlinux_file_sha256: str | None = None,
+                          objdump: str = "objdump",
+                          addr2line: str = "addr2line"
+                          ) -> dict[str, tuple[int, ...]]:
+    """The coverage call sites in each of ``functions``, inline frames
+    included: the PCs that show it ran (07 section 5.2's boundary probes,
+    section 5.3's promotion probes).  A function no call site is in maps to
+    an empty tuple."""
+    names = frozenset(functions)
+    hits: dict[str, set[int]] = {name: set() for name in names}
+    found = vmlinux_callsites(vmlinux, cache if vmlinux_file_sha256 else None,
+                              vmlinux_file_sha256 or "", objdump)
+    if found.callsites:
+        with tempfile.TemporaryFile("w+") as addresses:
+            addresses.write("".join(f"{pc:#x}\n" for pc in found.callsites))
+            addresses.seek(0)
+            proc = subprocess.Popen(
+                [addr2line, "-a", "-f", "-i", "-e", str(vmlinux)],
+                stdin=addresses, stdout=subprocess.PIPE, text=True,
+                bufsize=1 << 20)
+            assert proc.stdout is not None
+            with proc.stdout:
+                for pc, chain in iter_addr2line(proc.stdout):
+                    for frame in chain:
+                        if frame.function in names:
+                            hits[frame.function].add(pc)
+            if proc.wait() != 0:
+                raise RuntimeError(f"addr2line failed on {vmlinux}")
+    return {name: tuple(sorted(pcs)) for name, pcs in sorted(hits.items())}
+
+
 def function_callsites(vmlinux: Path, functions: Iterable[str], *,
                        cache: Path | None = None,
                        vmlinux_file_sha256: str | None = None,
                        objdump: str = "objdump",
                        addr2line: str = "addr2line") -> tuple[int, ...]:
-    """The coverage call sites in ``functions``, inline frames included:
-    the PCs that show one of them ran (07 section 5.2's boundary probes)."""
-    names = frozenset(functions)
-    found = vmlinux_callsites(vmlinux, cache if vmlinux_file_sha256 else None,
-                              vmlinux_file_sha256 or "", objdump)
-    if not found.callsites:
-        return ()
-    with tempfile.TemporaryFile("w+") as addresses:
-        addresses.write("".join(f"{pc:#x}\n" for pc in found.callsites))
-        addresses.seek(0)
-        proc = subprocess.Popen(
-            [addr2line, "-a", "-f", "-i", "-e", str(vmlinux)],
-            stdin=addresses, stdout=subprocess.PIPE, text=True,
-            bufsize=1 << 20)
-        assert proc.stdout is not None
-        with proc.stdout:
-            hits = tuple(sorted(pc for pc, chain in
-                                iter_addr2line(proc.stdout)
-                                if any(f.function in names for f in chain)))
-        if proc.wait() != 0:
-            raise RuntimeError(f"addr2line failed on {vmlinux}")
-    return hits
+    """The coverage call sites in any of ``functions``."""
+    found = function_callsite_map(
+        vmlinux, functions, cache=cache,
+        vmlinux_file_sha256=vmlinux_file_sha256, objdump=objdump,
+        addr2line=addr2line)
+    return tuple(sorted({pc for pcs in found.values() for pc in pcs}))
 
 
 def build_mapping(vmlinux: Path, target: CandidateTarget,

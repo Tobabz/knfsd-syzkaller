@@ -54,8 +54,9 @@ from ...contracts import Sanitizer
 from ...data import canonical_json, load_record
 from ...hcap import GapContract, HcapCatalog, RuntimeSelection
 from ...materializer import ExecutionHarnessDescriptor, _runtime_key
-from .collector import (CollectorConfig, CollectorError, crash_report,
-                        guest_cmdline, run_lane, staged_path, verify_pins)
+from .collector import (CollectorConfig, CollectorError, staged_path,
+                        verify_pins)
+from .guest_run import run_program
 from .generate import GenerationError, HostSpec, StagedBase, generate
 from .pins import HostFilePin, PinCache, PinError, verify_file
 from .target_pcs import function_callsites
@@ -467,44 +468,25 @@ class Validation:
     def _run(self, label: str, program: Path, selection: RuntimeSelection,
              descriptor: ExecutionHarnessDescriptor, built: CollectorConfig,
              files: dict[str, Path], probes: set[int]) -> dict:
-        out = self.work / "runs" / label
-        out.mkdir(parents=True)
-        builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
-        lane = load_record(ArtifactStore(built.artifact_root),
-                           builds["lane-script"], HostFilePin)
         try:
-            cmdline = guest_cmdline(descriptor, selection, lane.sha256)
+            done = run_program(program, selection, descriptor, built, files,
+                               self.work / "runs" / label,
+                               guest_factory=self.guest_factory,
+                               sleep=self.sleep)
         except CollectorError as exc:
             raise _reject("guest_cmdline", str(exc)) from exc
-        console = out / "console.log"
-        guest = self.guest_factory(VmConfig(
-            qemu=built.qemu, bzimage=files["bzimage"],
-            image=files["vm-image"], lane_dir=files["lane-script"].parent,
-            ssh_key=built.ssh_key, cmdline=cmdline, console_log=console,
-            memory_mb=built.memory_mb, cpus=built.cpus,
-            boot_timeout_s=built.boot_timeout_s, accel=built.accel))
-        result: dict = {}
-        try:
-            lane_run = run_lane(guest, files, program, selection,
-                                lane.sha256, built, out, result, self.sleep,
-                                exec_slowdown=built.exec_slowdown)
-        finally:
-            guest.stop()
-        crash = crash_report(out, console, descriptor)
+        lane_run = done.lane
         run = {"label": label, "program": program.name,
                "selection": selection.model_dump(mode="json"),
-               "facts": {k: getattr(lane_run, k) for k in (
-                   "boot_ok", "fixture_ok", "lane_ok", "runner_completed",
-                   "collection_started", "collection_completed",
-                   "extra_present")},
+               "facts": done.facts,
                "runtime_errors": lane_run.runtime_errors,
                "published_pcs": len(lane_run.pcs),
                "boundary_hits": len(lane_run.pcs & probes),
-               "crash": None if crash is None
-               else crash.model_dump(mode="json")}
+               "crash": done.crash}
         self.runs.append(run)
-        if console.is_file():
-            _write_log(self.out / f"{label}.console.log", console.read_bytes())
+        if done.console.is_file():
+            _write_log(self.out / f"{label}.console.log",
+                       done.console.read_bytes())
             self._evidence(f"{label}-console", LOG_TYPE,
                            f"{label}.console.log")
         if not lane_run.boot_ok:

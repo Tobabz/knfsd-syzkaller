@@ -78,7 +78,7 @@ def build(source: Path, output: Path, go: str) -> Path:
     bundle = output / "bundle"
     bundle.mkdir()
     files = [ROOT / "tools/syzkaller" / name
-             for name in ("bridge.go", "facts.go", "shapes.go")]
+             for name in ("bridge.go", "facts.go", "generate.go", "shapes.go")]
     flags = (f"-s -w -X main.sourceCommit={commit} -X main.patchDigest={patch_digest} "
              f"-X main.sourceTree={tree}")
     run([go, "build", "-trimpath", "-buildvcs=false", "-ldflags", flags,
