@@ -401,6 +401,8 @@ class LaneTopologyLane(_Spec):
     lane: int = Field(ge=0)
     #: Campaign executions syz-manager's evidence spool recorded on the lane.
     executions: int = Field(ge=0)
+    #: Of those, executions of a program other than the trusted lane corpus.
+    foreign_program_executions: int = Field(ge=0)
     #: Of those, executions with a remote-KCOV generation and attributed PCs.
     attributed_executions: int = Field(ge=0)
     #: Distinct generations among them (a reused one is a restart).
@@ -459,6 +461,9 @@ class LaneTopologyEvidence(_Spec):
         for item in self.lanes:
             if item.executions < self.min_executions_per_lane:
                 raise ValueError(f"lane {item.lane} ran too few executions")
+            if item.foreign_program_executions:
+                raise ValueError(f"lane {item.lane} ran a program outside "
+                                 "the trusted lane-topology corpus")
             if not (item.executions == item.attributed_executions
                     == item.distinct_generations
                     == item.proxy_acked_executions
