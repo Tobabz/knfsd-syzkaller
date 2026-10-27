@@ -35,3 +35,4 @@
 0036-syz-manager-keep-configured-procs-with-debug.patch
 0037-executor-mount-lane-profile-aliases-without-a-contro.patch
 0038-executor-log-profile-opens-and-target-FINISH-outcome.patch
+0039-sys-linux-spell-the-plain-TCP-record-marker-as-bytes.patch
