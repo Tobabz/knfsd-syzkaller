@@ -127,6 +127,47 @@ def argument_generality_refusals(contract: CapabilityContract,
     return refusals
 
 
+# --- probe campaign programs --------------------------------------------
+
+class GeneratedProgram(_Model):
+    """One program of a probe campaign, from the parser bridge's
+    ``generate``.  ``entry_call`` names the entry call a minimal program
+    ends in."""
+
+    entry_call: str | None = None
+    text: str = Field(min_length=1, max_length=256 * 1024)
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def _digest(self) -> Self:
+        if hashlib.sha256(self.text.encode()).hexdigest() != self.sha256:
+            raise ValueError("program digest differs from its text")
+        return self
+
+
+class GeneratedPrograms(_Model):
+    """The bridge's programs for one campaign: ``minimal`` per entry call,
+    ``generated`` distinct programs that each call an entry point."""
+
+    schema_version: Literal["syz-generated-programs.v1"]
+    syzkaller_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    target: Literal["linux/amd64"] = "linux/amd64"
+    seed: int
+    minimal: tuple[GeneratedProgram, ...] = Field(min_length=1)
+    generated: tuple[GeneratedProgram, ...] = ()
+    dropped_without_entry_call: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _shape(self) -> Self:
+        if any(p.entry_call is None for p in self.minimal) or \
+                any(p.entry_call is not None for p in self.generated):
+            raise ValueError("only minimal programs name an entry call")
+        digests = [p.sha256 for p in (*self.minimal, *self.generated)]
+        if len(set(digests)) != len(digests):
+            raise ValueError("duplicate program")
+        return self
+
+
 # --- probe campaign evidence --------------------------------------------
 
 class ProbeRunSet(_Model):

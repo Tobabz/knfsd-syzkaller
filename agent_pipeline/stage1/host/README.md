@@ -182,6 +182,31 @@ capability, or one whose entry changed, needs all of the following, and
   bundle's `describe`, so the bundle must be built from this repository's
   bridge sources.
 
+`probe-campaign` runs the campaign and writes the evidence:
+
+```sh
+uv run python -m agent_pipeline.stage1.host probe-campaign \
+    --config campaign.json campaign-out
+```
+
+`campaign.json` is a `campaign.CampaignConfig`: `stage1` (and optionally
+`collector`), the binding (`execution_harness_id`, `hcap_revision`; a
+staged one boots from `staged_files`), `capability_id`, the candidate's
+`withheld_program_sha256s`, the runtime `selection` index and `seed`. The
+probes are the contract's boundary functions mapped to the binding's
+coverage call sites (`probe-<name>.json`). The parser bundle's `generate`
+makes a minimal program per entry syz call and distinct generated and
+mutated programs over the admission profile's calls; each is parsed and
+admitted as the Materializer would, and withheld or refused ones are
+dropped. Each run boots a fresh guest: the minimal programs (3 runs), 16
+generated programs twice each, and the selection's neutral control 3
+times. `campaign-out/campaign.json` is `evidence` (then
+`campaign-out/evidence.json` goes into `capability_evidence`), `refused`
+(the criteria are not met, or the contract has no entry syz call) or
+`inconclusive` (a guest did not boot or a run did not finish). The parser
+bundle must be built from this repository's bridge sources, `generate.go`
+included.
+
 `gap_contracts` gives the contract a capability filling each gap ID must
 declare; it is copied into the generated HCAP. A capability names the gap
 it fills with `fills_gap`, and `generate` refuses it unless its contract is

@@ -37,6 +37,22 @@ to a broken bundle fails the tests. The tests cover actual disabled and unknown
 calls, malformed programs, changed identity axes and build bytes, sealed binary
 replacement, stream/time limits, large allocations, and conservative NFS facts.
 
+## Campaign programs (`generate`)
+
+`bridge generate` makes the programs of a promotion probe campaign (#100,
+`docs/design/02-llm-agent/07-harness-gap-issue.md` §5.3) with the same
+target. The request (`syz-generate-request.v1`) names the enabled calls
+(the HCAP's admission profile), the contract's entry syz calls, a seed and
+counts. The answer holds, per entry call, minimal programs that end in that
+call with the constructors of its resources before it, and distinct
+programs generated from them and mutated with `prog.Mutate` over the
+enabled calls; a mutation that lost every entry call is dropped and
+counted. One seed gives one answer for one bridge build. An entry call
+whose resources no enabled call makes is refused
+(`entry_call_not_generatable`). `PinnedSyzParser.generate` checks the
+answer; the host's `probe-campaign` parses and admits every program before
+it runs one.
+
 ## Authority and artifact identity
 
 The output `bundle/` contains:

@@ -385,6 +385,22 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
 인자 일반성을 확인하고 하나라도 실패하면 HCAP을 만들지 않는다. typed model이 없는 raw evidence는 어떤
 capability의 근거로도 받지 않는다.
 
+- probe campaign 실행기(`python -m agent_pipeline.stage1.host probe-campaign`, `agent_pipeline/stage1/host/campaign.py`):
+  binding 하나(승인된 harness나 §5.2를 통과한 staged harness)와 capability 하나를 받아 `PromotionProbeEvidence`를
+  쓴다.
+  - probe: contract의 `boundary_functions`를 그 binding vmlinux의 coverage callsite로 매핑한다. probe마다 매핑
+    기록을 남기고 그 digest를 evidence에 넣는다. callsite가 없는 경계 함수가 있으면 거부한다.
+  - program: parser bridge의 `generate`가 contract의 진입점 syz call로 만든다. 진입점 call마다 그 call로 끝나는
+    최소 program(resource를 만드는 call 포함)과, 그것을 admission profile의 call로 생성·변이한 서로 다른 program이다.
+    모든 program은 Materializer와 같은 방식으로 parse하고 admission을 거친다. admission이 거부하거나 Controller가
+    제외한 digest(후보 program)는 쓰지 않는다.
+  - 실행: guest마다 새로 boot한다. 최소 program, 생성 program(각 `runs_per_generated`회), 그 selection의 neutral
+    control을 돌린다. guest가 boot하지 못하거나 crash 없이 run이 끝나지 않으면 `inconclusive`다. crash는 evidence의
+    `crash_signature_count`로 남아 기준에서 거부된다.
+  - 진입점에 syz call이 없는 contract(fixture action, Proxy operation뿐)는 거부한다. 생성 program을 진입점 call로
+    정의하기 때문이다.
+  - Controller가 staged 통과 뒤 이 명령을 task로 걸고 후보 program을 넘기는 연결은 아직 없다(#83 PR 4b).
+
 기준을 통과하지 못한 capability는 버리지 않는다. staged revision으로 남겨 그 후보의 job은 계속 진행한다. 다만
 공유 HCAP으로는 올라가지 않는다. 같은 gap key의 다른 후보가 staged revision을 재사용해 성공하면 그것도 일반성의
 추가 증거로 기록한다.

@@ -25,7 +25,7 @@ def bundle():
     root = Path(value)
     provenance = json.loads((root / "provenance.json").read_bytes())
     sources = provenance["bridge_sources"]
-    for name in ("bridge.go", "facts.go", "shapes.go"):
+    for name in ("bridge.go", "facts.go", "generate.go", "shapes.go"):
         current = Path(__file__).parents[3] / "tools" / "syzkaller" / name
         assert sources[name] == hashlib.sha256(current.read_bytes()).hexdigest(), (
             f"bundle {name} differs from the checked-in source")
@@ -337,3 +337,25 @@ def test_describe_reports_the_literal_arguments(parser):
     assert not any(l.literal for l in shapes.get("syz_open_nlm_lane_file").leaves)
     with pytest.raises(SyzParseFailure):
         parser.describe(["no_such_call"])
+
+
+def test_generate_makes_campaign_programs_the_parser_takes(parser, identity):
+    lane = "syz_open_nfs_lane_profile$client0_knfsd_v41"
+    enabled = [lane, "getdents64", "mkdirat", "close"]
+    programs = parser.generate(enabled=enabled, entry=["getdents64"], seed=3,
+                               generated=16)
+    assert [p.entry_call for p in programs.minimal] == ["getdents64"]
+    assert len(programs.generated) == 16
+    minimal = programs.minimal[0].text
+    assert minimal.splitlines()[-1].startswith("getdents64(r")
+    for program in (*programs.minimal, *programs.generated):
+        parsed = parser.parse(program.text.encode(), identity=identity)
+        calls = [c.call for c in parsed.calls]
+        assert "getdents64" in calls and set(calls) <= set(enabled)
+    again = parser.generate(enabled=enabled, entry=["getdents64"], seed=3,
+                            generated=16)
+    assert again == programs
+    with pytest.raises(SyzParseFailure, match="entry_call_not_generatable"):
+        parser.generate(enabled=["getdents64"], entry=["getdents64"], seed=3)
+    with pytest.raises(SyzParseFailure):
+        parser.generate(enabled=enabled, entry=["no_such_call"], seed=3)
