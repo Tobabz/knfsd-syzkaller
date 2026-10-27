@@ -342,6 +342,40 @@ class FakeAgents:
         self.requests.append(request)
 
 
+class FakeGenerator:
+    """A Harness Generation Agent that only records its requests."""
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    def start(self, request) -> None:
+        self.requests.append(request)
+
+
+class FakeValidator:
+    """Validation tasks by task_id; a test finishes them with finish()."""
+
+    def __init__(self) -> None:
+        self.tasks: dict[str, object] = {}
+        self.inputs: dict[str, object] = {}
+        self.submitted: list[str] = []
+
+    def submit(self, task_id, task_input):
+        from agent_pipeline.controller.generation import ValidationStatus
+        self.submitted.append(task_id)
+        self.inputs.setdefault(task_id, task_input)
+        return self.tasks.setdefault(task_id,
+                                     ValidationStatus(state="running"))
+
+    def status(self, task_id):
+        from agent_pipeline.controller.generation import ValidationStatus
+        return self.tasks.get(task_id, ValidationStatus(state="unknown"))
+
+    def finish(self, task_id, state, **kw) -> None:
+        from agent_pipeline.controller.generation import ValidationStatus
+        self.tasks[task_id] = ValidationStatus(state=state, **kw)
+
+
 VERSIONS = JudgeVersions(judge_profile_id="jp-1", support_boundary_id="sb-1")
 
 
@@ -384,6 +418,9 @@ class World:
         self.compiler: FakeCompiler | None = None
         #: None: no Stage 2 execution backend is configured.
         self.stage2: FakeStage2 | None = None
+        #: None: no Harness Generation is configured.
+        self.generator: FakeGenerator | None = None
+        self.validator: FakeValidator | None = None
         self.issues = InMemoryIssues()
         self.registry = InMemoryRegistry()
         if bound:
@@ -407,7 +444,8 @@ class World:
                           self.issues, self.registry, self.tree,
                           self.artifacts, VERSIONS,
                           clock=lambda: "2026-10-13T00:00:00+00:00",
-                          new_id=self._new_id)
+                          new_id=self._new_id, generator=self.generator,
+                          validator=self.validator)
 
     def restart(self) -> Controller:
         # A fresh Controller with the configured default: adopted judge

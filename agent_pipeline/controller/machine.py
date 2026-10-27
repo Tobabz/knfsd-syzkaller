@@ -30,7 +30,8 @@ from ..contracts import (COMPILER_AGENT_FIXABLE, COMPILER_GAP,
                          MaterializationHcapAuthority, MaterializeRejected,
                          Q1Result, Q1Status, kernel_revision_gap)
 from . import events as ev
-from .records import (STAGE2_CAUSES, TERMINAL, WAITING, BlockedReason,
+from .records import (GAP_STATES, HOLDING, STAGE2_CAUSES, TERMINAL,
+                      BlockedReason, StagedHarness,
                       BundleCursor, Campaign, CampaignTally, ConsumedVerdict,
                       AttemptTask, CrashFinding, CrashRef, FixedCampaign,
                       Job, JobState, PendingTask, RepairCause, RepairInput,
@@ -152,6 +153,12 @@ class Machine:
             j.stage2_input = None
         if j.s1_replay is not None and not self._in_s1_replay(j):
             self._abandon_s1_replay(j)
+        if j.staged is not None and j.state is not JobState.RETRY_PENDING \
+                and j.binding != j.staged.binding:
+            j.staged = None
+        if j.state not in GAP_STATES:
+            j.generation_refused = None
+            j.generation_retry = None
         j.seq += 1
         return Outcome(j, c.reason, c.consumed, c.verdicts, c.abandoned)
 
@@ -380,14 +387,14 @@ class Machine:
 
     def _on_issue_changed(self, c: _Call, e: ev.IssueChanged) -> bool:
         j = c.job
-        if j.state not in (JobState.BLOCKED_HARNESS_GAP, JobState.PARKED) \
-                or j.gap != e.gap:
+        if j.state not in GAP_STATES or j.gap != e.gap:
             return False
         c.reason = f"issue_{e.status}"
         if e.status == "resolved":
+            # A generation in progress goes on for the other jobs of the
+            # gap key (09 §3.2).
             j.state = JobState.RETRY_PENDING
-        elif e.status == "deferred" and \
-                j.state is JobState.BLOCKED_HARNESS_GAP:
+        elif e.status == "deferred" and j.state is not JobState.PARKED:
             j.state = JobState.PARKED
         elif e.status == "reopened" and j.state is JobState.PARKED:
             j.state = JobState.BLOCKED_HARNESS_GAP
@@ -442,7 +449,7 @@ class Machine:
         if new == j.binding and (not rematerialize_authority or
                                  not harness_authority_stale(j, new)):
             return False
-        base = self._waiting_base(j) if j.state in WAITING else None
+        base = self._waiting_base(j) if j.state in HOLDING else None
         if j.state is JobState.S2_REPLAYING or (
                 j.replay is not None and base is not None and
                 base.kind is TargetKind.REPLAY):
@@ -455,7 +462,7 @@ class Machine:
                 authority_current=authority_current)})
             c.reason = "binding_changed"
             return True
-        if j.state in WAITING:
+        if j.state in HOLDING:
             base = self._waiting_base(j)
             self._set_resume(c, self._rebind(
                 c, new, base,
@@ -581,7 +588,7 @@ class Machine:
             # The crash's replay finishes; the re-judge decides the row
             # the run goes to after it (09 §3.1).
             j.s1_replay = j.s1_replay.model_copy(update={"after": t})
-        elif j.state in WAITING or j.state is JobState.RETRY_PENDING:
+        elif j.state in HOLDING or j.state is JobState.RETRY_PENDING:
             self._set_resume(c, t, self._waiting_base(j))
         else:
             self._goto(c, t)
@@ -638,6 +645,17 @@ class Machine:
             return True
         if e.action in ("route_gate", "route_strategy"):
             return self._route(c, e.action)
+        if e.action == "retry_generation":
+            if j.state not in (JobState.BLOCKED_HARNESS_GAP,
+                               JobState.PARKED) or \
+                    not c.policy.harness_generation_budget:
+                return False
+            # The service starts a new generation only when the latest one
+            # of the gap key is the one that refused this job (09 §3.2).
+            j.state = JobState.HARNESS_GENERATING
+            j.generation_retry = j.generation_refused
+            c.reason = "operator_retry_generation"
+            return True
         if e.action == "resume" and j.state is JobState.CRASH_REVIEW:
             t = j.resume_point
             if t is None:
@@ -691,6 +709,28 @@ class Machine:
         c.reason = j.state_reason
         return True
 
+    def _on_generation_ended(self, c: _Call, e: ev.GenerationEnded) -> bool:
+        """09 §3.2.  A passed generation rebinds the job like a resolved
+        issue (retry_pending), on the staged binding; any other end leaves
+        it on the issue, with its resume_point."""
+        j = c.job
+        if j.state is not JobState.HARNESS_GENERATING or j.gap != e.gap:
+            return False
+        c.reason = f"generation_{e.outcome}"
+        if e.outcome == "passed":
+            if e.generation_id is None or self._usable(c, e.binding) is None:
+                return self._unexpected(c, Target(
+                    kind=TargetKind.BLOCKED_HARNESS_GAP, gap=j.gap,
+                    inner=j.resume_point))
+            j.state = JobState.RETRY_PENDING
+            j.staged = StagedHarness(generation_id=e.generation_id,
+                                     binding=e.binding)
+            return True
+        j.state = JobState.BLOCKED_HARNESS_GAP
+        j.generation_refused = e.generation_id
+        j.generation_retry = None
+        return True
+
     def _on_cancel_confirmed(self, c: _Call, e: ev.CancelConfirmed) -> bool:
         j = c.job
         if e.task_id not in j.cancelling_tasks:
@@ -727,7 +767,7 @@ class Machine:
         if task_id not in j.uncleaned_tasks:
             j.uncleaned_tasks = j.uncleaned_tasks + (task_id,)
         c.reason = "cleanup_unconfirmed"
-        if j.state not in TERMINAL and j.state not in WAITING:
+        if j.state not in TERMINAL and j.state not in HOLDING:
             self._block(c, BlockedReason.EXECUTION_CLEANUP, self._here(j))
 
     # ------------------------------------------------------------ targets
@@ -827,7 +867,14 @@ class Machine:
             j.resume_point = t.inner
         else:
             self._drop_task(c)
-            j.state = JobState.BLOCKED_HARNESS_GAP
+            if t.gap != j.gap:
+                j.generation_refused = None
+                j.generation_retry = None
+            # 09 §3.2: a gap starts Harness Generation when the policy asks
+            # for it; blocked_harness_gap is the fallback.
+            j.state = JobState.HARNESS_GENERATING \
+                if c.policy.harness_generation_budget else \
+                JobState.BLOCKED_HARNESS_GAP
             j.state_reason = t.gap.gap_class.value
             if t.gap != c.proposed_gap:
                 j.gap_proposal_ref = None
@@ -1229,7 +1276,7 @@ class Machine:
         """The job replays, or waits to replay again."""
         if j.state is JobState.S1_REPLAYING:
             return True
-        t = j.resume_point if j.state in WAITING or \
+        t = j.resume_point if j.state in HOLDING or \
             j.state is JobState.RETRY_PENDING else None
         while t is not None:
             if t.kind is TargetKind.S1_REPLAY:

@@ -30,6 +30,7 @@ class JobState(str, enum.Enum):
     S2_CAMPAIGN = "s2_campaign"
     S2_REPLAYING = "s2_replaying"
     CRASH_REVIEW = "crash_review"
+    HARNESS_GENERATING = "harness_generating"
     BLOCKED_HARNESS_GAP = "blocked_harness_gap"
     RETRY_PENDING = "retry_pending"
     PARKED = "parked"
@@ -43,6 +44,13 @@ class JobState(str, enum.Enum):
 #: event; re-evaluation events only move their resume_point (09 §1, §5).
 WAITING = frozenset({JobState.BLOCKED_OPERATOR, JobState.BLOCKED_HARNESS_GAP,
                      JobState.PARKED, JobState.CRASH_REVIEW})
+#: harness_generating is not a waiting state: its generation works (09
+#: §3.2).  The job holds no task of its own there, so a re-evaluation event
+#: only moves its resume_point, as in a waiting state.
+HOLDING = WAITING | {JobState.HARNESS_GENERATING}
+#: The states of a job that waits on its gap (07 §2, §7).
+GAP_STATES = frozenset({JobState.HARNESS_GENERATING,
+                        JobState.BLOCKED_HARNESS_GAP, JobState.PARKED})
 TERMINAL = frozenset({JobState.REJECTED, JobState.CLOSED_UNSUPPORTED,
                       JobState.CLOSED})
 
@@ -421,6 +429,14 @@ class SeedPlan(Record):
     plan_ref: str
 
 
+class StagedHarness(Record):
+    """The staged binding a passed Harness Generation gave the job (09
+    §3.2).  Kept while the job is on that binding."""
+
+    generation_id: str
+    binding: HarnessBinding
+
+
 class Job(BaseModel):
     """09 §8.  Not frozen: the machine works on a deep copy."""
 
@@ -475,6 +491,14 @@ class Job(BaseModel):
     #: ends until the job leaves that harness.
     fixed: FixedCampaign | None = None
     s1_replay: S1Replay | None = None
+    #: 09 §3.2: the staged binding the job runs on, until a binding change
+    #: moves it elsewhere.
+    staged: StagedHarness | None = None
+    #: The Harness Generation that ended the job's generating wait without
+    #: a harness, and the one an operator retry_generation asked to start
+    #: again.  Both are cleared when the job stops waiting on its gap.
+    generation_refused: str | None = None
+    generation_retry: str | None = None
     seq: int = 0
     task_seq: int = 0
 

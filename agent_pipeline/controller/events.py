@@ -155,9 +155,29 @@ class OperatorAction(Record):
     #: route_gate / route_strategy are 09 §5 route(to) on
     #: blocked_operator(gate_regression); start_fixed is the 09 §3.1
     #: fixed start by operator on s1_reached.
+    #: retry_generation is the 09 §3.2 operator restart of Harness
+    #: Generation on blocked_harness_gap or parked.
     action: Literal["resume", "close", "cancel", "start_stage2",
-                    "start_fixed", "route_gate", "route_strategy"]
+                    "start_fixed", "route_gate", "route_strategy",
+                    "retry_generation"]
     action_id: str
+
+
+class GenerationEnded(Record):
+    """The Harness Generation of the job's gap key ended, looked up by the
+    service (09 §3.2).  ``passed`` carries the staged binding; the others
+    leave the job on its issue.  ``unavailable``: the policy asks for
+    generation but the host has no generator configured, or the job's
+    policy no longer does.  ``not_filled``: the job already runs on the
+    generation's staged binding and still meets the gap."""
+
+    type: Literal["generation_ended"] = "generation_ended"
+    gap: GapRef
+    generation_id: str | None = None
+    outcome: Literal["passed", "infeasible", "exhausted", "failed",
+                     "unavailable", "not_filled"]
+    binding: HarnessBinding | None = None
+    reason: str | None = None
 
 
 class CancelConfirmed(Record):
@@ -184,7 +204,7 @@ Event = Annotated[
           RunnerFinished, RunnerBundleSealed, RunnerInputDigestMigrated,
           ApprovalGiven, ApprovalDenied, IssueChanged, BindingChanged,
           JudgeVersionsChanged,
-          PolicyChanged, OperatorAction, CancelConfirmed,
+          PolicyChanged, OperatorAction, GenerationEnded, CancelConfirmed,
           CleanupUnconfirmed],
     Field(discriminator="type"),
 ]

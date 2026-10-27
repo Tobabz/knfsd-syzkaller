@@ -13,8 +13,11 @@ from pathlib import Path
 from typing import Iterator
 
 from ..contracts import (GapRef, JobPolicy, JudgeVersions, Q1Result,
-                         VulnerabilityCandidate)
-from .records import AgentAttempt, Job, JobState, Transition
+                         Sanitizer, VulnerabilityCandidate)
+from .generation import (GenerationState, GenerationTransition,
+                         HarnessGeneration)
+from .records import (GAP_STATES, AgentAttempt, Job, JobState,
+                      Transition)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS policies (
@@ -46,6 +49,14 @@ CREATE TABLE IF NOT EXISTS issue_marks (
     job_id TEXT PRIMARY KEY, event_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS controller_settings (
     key TEXT PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS generations (
+    generation_id TEXT PRIMARY KEY, gap_class TEXT NOT NULL,
+    missing_capability_id TEXT NOT NULL, kernel_commit TEXT NOT NULL,
+    sanitizer TEXT NOT NULL, state TEXT NOT NULL, seq INTEGER NOT NULL,
+    body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS generation_transitions (
+    generation_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
+    PRIMARY KEY (generation_id, seq));
 CREATE TABLE IF NOT EXISTS effect_failures (
     job_id TEXT NOT NULL, effect TEXT NOT NULL, error TEXT NOT NULL,
     at TEXT NOT NULL);
@@ -171,8 +182,7 @@ class Store:
                 raise StaleJob(job.job_id)
             # A job's issue link lasts while it waits on that gap; the same
             # gap later is a new wait that is linked again (07 §2).
-            waiting = job.state in (JobState.BLOCKED_HARNESS_GAP,
-                                    JobState.PARKED) and job.gap is not None
+            waiting = job.state in GAP_STATES and job.gap is not None
             self.db.execute(
                 "DELETE FROM gap_links WHERE job_id = ? AND NOT "
                 "(? AND gap_class = ? AND missing_capability_id = ?)",
@@ -237,6 +247,83 @@ class Store:
         rows = self.db.execute("SELECT body FROM attempts WHERE job_id = ? "
                                "ORDER BY rowid", (job_id,)).fetchall()
         return [AgentAttempt.model_validate_json(b) for (b,) in rows]
+
+    # ---------------------------------------------------------- generations
+
+    def create_generation(self, g: HarnessGeneration,
+                          transition: GenerationTransition,
+                          after: str | None) -> HarnessGeneration:
+        """Store `g` as the latest generation of its key, only while the
+        latest one is still `after` (None: there is none).  Otherwise the
+        latest one is returned: another job started it first (09 §3.2)."""
+        with self._tx():
+            latest = self._latest_generation(g.gap, g.kernel_commit,
+                                             g.sanitizer)
+            if (latest.generation_id if latest else None) != after:
+                return latest
+            self.db.execute(
+                "INSERT INTO generations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (g.generation_id, g.gap.gap_class.value,
+                 g.gap.missing_capability_id, g.kernel_commit,
+                 g.sanitizer.value, g.state.value, g.seq,
+                 g.model_dump_json()))
+            self._append_generation(transition)
+        return g
+
+    def commit_generation(self, prev_seq: int, g: HarnessGeneration,
+                          transition: GenerationTransition) -> None:
+        with self._tx():
+            cur = self.db.execute(
+                "UPDATE generations SET state = ?, seq = ?, body = ? "
+                "WHERE generation_id = ? AND seq = ?",
+                (g.state.value, g.seq, g.model_dump_json(),
+                 g.generation_id, prev_seq))
+            if cur.rowcount != 1:
+                raise StaleJob(g.generation_id)
+            self._append_generation(transition)
+
+    def _append_generation(self, t: GenerationTransition) -> None:
+        self.db.execute("INSERT INTO generation_transitions VALUES "
+                        "(?, ?, ?)", (t.generation_id, t.seq,
+                                      t.model_dump_json()))
+
+    def generation(self, generation_id: str) -> HarnessGeneration:
+        row = self.db.execute("SELECT body FROM generations WHERE "
+                              "generation_id = ?",
+                              (generation_id,)).fetchone()
+        if row is None:
+            raise KeyError(generation_id)
+        return HarnessGeneration.model_validate_json(row[0])
+
+    def _latest_generation(self, gap: GapRef, kernel_commit: str,
+                           sanitizer: Sanitizer
+                           ) -> HarnessGeneration | None:
+        row = self.db.execute(
+            "SELECT body FROM generations WHERE gap_class = ? AND "
+            "missing_capability_id = ? AND kernel_commit = ? AND "
+            "sanitizer = ? ORDER BY rowid DESC LIMIT 1",
+            (gap.gap_class.value, gap.missing_capability_id, kernel_commit,
+             sanitizer.value)).fetchone()
+        return HarnessGeneration.model_validate_json(row[0]) if row else None
+
+    def latest_generation(self, gap: GapRef, kernel_commit: str,
+                          sanitizer: Sanitizer) -> HarnessGeneration | None:
+        """The gap key's latest generation for that build key."""
+        return self._latest_generation(gap, kernel_commit, sanitizer)
+
+    def generations(self, states: set[GenerationState] | None = None
+                    ) -> list[HarnessGeneration]:
+        rows = self.db.execute("SELECT body FROM generations ORDER BY rowid"
+                               ).fetchall()
+        out = [HarnessGeneration.model_validate_json(b) for (b,) in rows]
+        return [g for g in out if states is None or g.state in states]
+
+    def generation_transitions(self, generation_id: str
+                               ) -> list[GenerationTransition]:
+        rows = self.db.execute("SELECT body FROM generation_transitions "
+                               "WHERE generation_id = ? ORDER BY seq",
+                               (generation_id,)).fetchall()
+        return [GenerationTransition.model_validate_json(b) for (b,) in rows]
 
     # ---------------------------------------------------------- gap issues
 
