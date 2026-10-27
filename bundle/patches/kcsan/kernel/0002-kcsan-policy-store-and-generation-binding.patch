@@ -1,0 +1,1184 @@
+From ef2cc4679194f955c6df5a9eb641a67a1e8ff2b2 Mon Sep 17 00:00:00 2001
+From: HYUNSOL MUN <muumthf@gmail.com>
+Date: Fri, 16 Oct 2026 15:22:16 +0900
+Subject: [PATCH 2/2] kcsan: register candidate policies and bind them to
+ generations
+
+---
+ include/linux/kcov.h         |  17 ++
+ include/linux/kcsan.h        |   6 +
+ include/linux/kcsan_policy.h |  40 +++++
+ include/uapi/linux/kcov.h    |  11 ++
+ kernel/kcov.c                |  48 +++++-
+ kernel/kcov_request.c        |  53 ++++++
+ kernel/kcsan/Makefile        |   2 +-
+ kernel/kcsan/core.c          | 108 ++++++++++--
+ kernel/kcsan/debugfs.c       |  64 +++++++
+ kernel/kcsan/kcsan.h         |   9 +-
+ kernel/kcsan/policy.c        | 316 +++++++++++++++++++++++++++++++++++
+ kernel/kcsan/policy.h        |  87 ++++++++++
+ 12 files changed, 742 insertions(+), 19 deletions(-)
+ create mode 100644 include/linux/kcsan_policy.h
+ create mode 100644 kernel/kcsan/policy.c
+ create mode 100644 kernel/kcsan/policy.h
+
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+index b8c5c3782..0a961690b 100644
+--- a/include/linux/kcov.h
++++ b/include/linux/kcov.h
+@@ -32,6 +32,7 @@ enum kcov_request_token_type {
+ };
+ 
+ struct kcov_request_generation;
++struct kcsan_policy;
+ 
+ struct kcov_request_token {
+ 	struct kcov_request_generation *generation;
+@@ -296,6 +297,11 @@ kcov_request_handle_id(u64 handle, u64 generation)
+ 
+ struct kcov_request_generation *
+ kcov_request_generation_begin(u64 owner, u64 *generation);
++int kcov_request_generation_set_policy(
++		struct kcov_request_generation *generation,
++		const char *candidate_id);
++struct kcsan_policy *kcov_request_generation_policy(
++		struct kcov_request_generation *generation);
+ int kcov_request_generation_bind(u64 owner, u64 generation);
+ void kcov_request_generation_note_stale_bind(void);
+ void kcov_request_generation_abort_bound(u64 owner, u64 generation);
+@@ -480,6 +486,17 @@ kcov_request_generation_begin(u64 owner, u64 *generation)
+ {
+ 	return ERR_PTR(-EOPNOTSUPP);
+ }
++static inline int kcov_request_generation_set_policy(
++		struct kcov_request_generation *generation,
++		const char *candidate_id)
++{
++	return -EOPNOTSUPP;
++}
++static inline struct kcsan_policy *kcov_request_generation_policy(
++		struct kcov_request_generation *generation)
++{
++	return NULL;
++}
+ static inline int kcov_request_generation_bind(u64 owner, u64 generation)
+ {
+ 	return -EOPNOTSUPP;
+diff --git a/include/linux/kcsan.h b/include/linux/kcsan.h
+index c07c71f5b..d076ccbf5 100644
+--- a/include/linux/kcsan.h
++++ b/include/linux/kcsan.h
+@@ -15,11 +15,17 @@
+ 
+ #ifdef CONFIG_KCSAN
+ 
++struct kcsan_policy;
++
+ /*
+  * Context for each thread of execution: for tasks, this is stored in
+  * task_struct, and interrupts access internal per-CPU storage.
+  */
+ struct kcsan_ctx {
++	/* Borrowed from the immutable Policy Store; see kcsan_policy.h. */
++	struct kcsan_policy *policy;
++	u64 policy_generation;
++	bool policy_remote;
+ 	int disable_count; /* disable counter */
+ 	int disable_scoped; /* disable scoped access counter */
+ 	int atomic_next; /* number of following atomic ops */
+diff --git a/include/linux/kcsan_policy.h b/include/linux/kcsan_policy.h
+new file mode 100644
+index 000000000..5c04ca181
+--- /dev/null
++++ b/include/linux/kcsan_policy.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_KCSAN_POLICY_H
++#define _LINUX_KCSAN_POLICY_H
++
++#include <linux/types.h>
++
++struct kcsan_policy;
++
++struct kcsan_policy_context {
++	struct kcsan_policy *policy;
++	u64 generation;
++	bool remote;
++};
++
++#ifdef CONFIG_KCSAN
++/* A successful lookup holds a reference until kcsan_policy_put(). */
++struct kcsan_policy *kcsan_policy_get(const char *candidate_id);
++void kcsan_policy_put(struct kcsan_policy *policy);
++void kcsan_policy_context_bind(struct kcsan_policy *policy, u64 generation);
++void kcsan_policy_context_remote_enter(struct kcsan_policy *policy,
++		struct kcsan_policy_context *saved);
++void kcsan_policy_context_remote_exit(
++		const struct kcsan_policy_context *saved);
++#else
++static inline struct kcsan_policy *kcsan_policy_get(const char *candidate_id)
++{
++	return NULL;
++}
++
++static inline void kcsan_policy_put(struct kcsan_policy *policy) {}
++static inline void kcsan_policy_context_bind(struct kcsan_policy *policy,
++		u64 generation) {}
++static inline void kcsan_policy_context_remote_enter(
++		struct kcsan_policy *policy,
++		struct kcsan_policy_context *saved) {}
++static inline void kcsan_policy_context_remote_exit(
++		const struct kcsan_policy_context *saved) {}
++#endif
++
++#endif /* _LINUX_KCSAN_POLICY_H */
+diff --git a/include/uapi/linux/kcov.h b/include/uapi/linux/kcov.h
+index 6e2c52c58..aca4d2a45 100644
+--- a/include/uapi/linux/kcov.h
++++ b/include/uapi/linux/kcov.h
+@@ -23,6 +23,16 @@ struct kcov_remote_generation {
+ 	__u32		flags;
+ };
+ 
++#define KCOV_POLICY_CANDIDATE_ID_LEN	128
++
++/* Policy BEGIN selects a candidate; the original generation commands remain unchanged. */
++struct kcov_remote_generation_policy {
++	__aligned_u64	generation;
++	__u32		timeout_ms;
++	__u32		flags;
++	char		candidate_id[KCOV_POLICY_CANDIDATE_ID_LEN];
++};
++
+ #define KCOV_REMOTE_MAX_HANDLES		0x100
+ 
+ #define KCOV_INIT_TRACE			_IOR('c', 1, unsigned long)
+@@ -33,6 +43,7 @@ struct kcov_remote_generation {
+ #define KCOV_REMOTE_GENERATION_BIND	_IOW('c', 110, struct kcov_remote_generation)
+ #define KCOV_REMOTE_GENERATION_FINISH	_IOW('c', 111, struct kcov_remote_generation)
+ #define KCOV_REMOTE_GENERATION_ABORT	_IOW('c', 112, struct kcov_remote_generation)
++#define KCOV_REMOTE_GENERATION_BEGIN_POLICY _IOWR('c', 113, struct kcov_remote_generation_policy)
+ 
+ enum {
+ 	/*
+diff --git a/kernel/kcov.c b/kernel/kcov.c
+index 9aad23001..3586211ef 100644
+--- a/kernel/kcov.c
++++ b/kernel/kcov.c
+@@ -13,6 +13,7 @@
+ #include <linux/init.h>
+ #include <linux/jiffies.h>
+ #include <linux/kmsan-checks.h>
++#include <linux/kcsan_policy.h>
+ #include <linux/mm.h>
+ #include <linux/preempt.h>
+ #include <linux/printk.h>
+@@ -98,6 +99,7 @@ enum kcov_request_ticket_state {
+ 
+ struct kcov_request_remote_ticket {
+ 	refcount_t refs;
++	struct kcsan_policy_context saved_policy_context;
+ 	struct kcov_request_generation *generation;
+ 	struct kcov_request_token *token;
+ 	struct kcov *kcov;
+@@ -500,6 +502,15 @@ void kcov_task_init(struct task_struct *t)
+ 	/* Generation binding inherits, whole-generation ABORT authority does not. */
+ 	t->kcov_request_generation_controller = false;
+ 	t->kcov_request_remote_ticket = NULL;
++#ifdef CONFIG_KCSAN
++	/* A fork inherits a program bind, never an active remote section. */
++	if (t->kcsan_ctx.policy_remote || !t->kcsan_ctx.policy_generation ||
++	    t->kcsan_ctx.policy_generation != t->kcov_handle_generation) {
++		t->kcsan_ctx.policy = NULL;
++		t->kcsan_ctx.policy_generation = 0;
++	}
++	t->kcsan_ctx.policy_remote = false;
++#endif
+ 	t->kcov_softirq = 0;
+ 	t->kcov_saved_mode = 0;
+ 	t->kcov_saved_size = 0;
+@@ -570,6 +581,7 @@ static void kcov_disable(struct task_struct *t, struct kcov *kcov)
+ 	__must_hold(&kcov->lock)
+ {
+ 	if (kcov->remote) {
++		kcsan_policy_context_bind(NULL, 0);
+ 		t->kcov_handle = 0;
+ 		t->kcov_handle_generation = 0;
+ 		t->kcov_request_generation_controller = false;
+@@ -621,6 +633,7 @@ void kcov_task_exit(struct task_struct *t)
+ 				t->kcov_handle_generation);
+ 	t->kcov_request_generation_controller = false;
+ 	t->kcov_handle_generation = 0;
++	kcsan_policy_context_bind(NULL, 0);
+ 
+ 	kcov = t->kcov;
+ 	if (kcov) {
+@@ -1031,18 +1044,30 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		unsigned int cmd, void __user *uarg)
+ {
+ 	struct kcov_remote_generation arg;
++	struct kcov_remote_generation_policy policy_arg;
+ 	struct kcov_request_generation *gen = NULL, *old = NULL;
+ 	unsigned long flags;
+ 	unsigned int generation_mode = 0, generation_size = 0;
+ 	u64 owner;
+ 	bool request_busy;
++	bool with_policy = cmd == KCOV_REMOTE_GENERATION_BEGIN_POLICY;
+ 	int ret;
+ 
+ 	/* BIND workers never own whole-generation exit-time ABORT authority. */
+ 	if (cmd == KCOV_REMOTE_GENERATION_BIND)
+ 		current->kcov_request_generation_controller = false;
+ 
+-	if (copy_from_user(&arg, uarg, sizeof(arg))) {
++	if (with_policy) {
++		if (copy_from_user(&policy_arg, uarg, sizeof(policy_arg)))
++			return -EFAULT;
++		arg.generation = policy_arg.generation;
++		arg.timeout_ms = policy_arg.timeout_ms;
++		arg.flags = policy_arg.flags;
++		if (!policy_arg.candidate_id[0] ||
++		    !memchr(policy_arg.candidate_id, '\0',
++			    sizeof(policy_arg.candidate_id)))
++			return -EINVAL;
++	} else if (copy_from_user(&arg, uarg, sizeof(arg))) {
+ 		/* BIND failures must never leave an earlier window attached. */
+ 		if (cmd == KCOV_REMOTE_GENERATION_BIND)
+ 			current->kcov_handle_generation = 0;
+@@ -1054,7 +1079,7 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		return -EINVAL;
+ 	}
+ 
+-	if (cmd == KCOV_REMOTE_GENERATION_BEGIN) {
++	if (cmd == KCOV_REMOTE_GENERATION_BEGIN || with_policy) {
+ 		if (arg.generation || arg.timeout_ms)
+ 			return -EINVAL;
+ 		spin_lock_irqsave(&kcov->lock, flags);
+@@ -1088,6 +1113,12 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 			gen = NULL;
+ 			goto begin_done;
+ 		}
++		if (with_policy) {
++			ret = kcov_request_generation_set_policy(gen,
++					policy_arg.candidate_id);
++			if (ret)
++				goto begin_done;
++		}
+ 		ret = kcov_request_generation_remote_open(gen, generation_mode,
+ 				generation_size);
+ 		if (ret)
+@@ -1095,8 +1126,14 @@ static long kcov_request_generation_ioctl(struct kcov *kcov,
+ 		ret = kcov_request_generation_bind(owner, arg.generation);
+ 		if (ret)
+ 			goto begin_done;
+-		if (copy_to_user(uarg, &arg, sizeof(arg)))
++		if (with_policy) {
++			policy_arg.generation = arg.generation;
++			if (copy_to_user(uarg, &policy_arg,
++					sizeof(policy_arg)))
++				ret = -EFAULT;
++		} else if (copy_to_user(uarg, &arg, sizeof(arg))) {
+ 			ret = -EFAULT;
++		}
+ begin_done:
+ 		spin_lock_irqsave(&kcov->lock, flags);
+ 		kcov->request_generation_busy = false;
+@@ -1268,6 +1305,7 @@ static long kcov_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+ 	kcov = filep->private_data;
+ 	switch (cmd) {
+ 	case KCOV_REMOTE_GENERATION_BEGIN:
++	case KCOV_REMOTE_GENERATION_BEGIN_POLICY:
+ 	case KCOV_REMOTE_GENERATION_BIND:
+ 	case KCOV_REMOTE_GENERATION_FINISH:
+ 	case KCOV_REMOTE_GENERATION_ABORT:
+@@ -2008,6 +2046,9 @@ enum kcov_request_remote_start_result kcov_request_remote_start_checked(
+ 	t->kcov_request_remote_ticket = ticket;
+ 	kcov_start(t, ticket->kcov, ticket->scratch_size, ticket->scratch,
+ 		ticket->mode, ticket->sequence);
++	kcsan_policy_context_remote_enter(
++		kcov_request_generation_policy(ticket->generation),
++		&ticket->saved_policy_context);
+ 	local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
+ 	if (ticket->phase6_section_accounted)
+ 		kcov_request_phase6_note(KCOV_REQUEST_P6_SCRATCH_ACTIVE);
+@@ -2068,6 +2109,7 @@ void kcov_request_remote_stop_checked(
+ 		return;
+ 	}
+ 	kcov_stop(t);
++	kcsan_policy_context_remote_exit(&ticket->saved_policy_context);
+ 	t->kcov_request_remote_ticket = NULL;
+ 	local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
+ 	kcov_request_phase5_note(KCOV_REQUEST_P5_STOP_OK);
+diff --git a/kernel/kcov_request.c b/kernel/kcov_request.c
+index a37872547..146ef6878 100644
+--- a/kernel/kcov_request.c
++++ b/kernel/kcov_request.c
+@@ -5,6 +5,7 @@
+ #include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/jiffies.h>
++#include <linux/kcsan_policy.h>
+ #include <linux/kcov.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -23,6 +24,9 @@ enum request_stat {
+ 	REQUEST_GENERATION_BIND_OK,
+ 	REQUEST_GENERATION_BIND_UNBOUND,
+ 	REQUEST_GENERATION_BIND_STALE,
++	REQUEST_GENERATION_POLICY_BIND_OK,
++	REQUEST_GENERATION_POLICY_BIND_MISS,
++	REQUEST_GENERATION_POLICY_RELEASE,
+ 	REQUEST_GENERATION_EXIT_ABORT,
+ 	REQUEST_GENERATION_ABORT_FD_CURRENT,
+ 	REQUEST_GENERATION_BEGIN_GAP_ENTERED,
+@@ -87,6 +91,9 @@ static const char *const request_stat_names[REQUEST_STAT_COUNT] = {
+ 	[REQUEST_GENERATION_BIND_OK] = "generation_bind_ok",
+ 	[REQUEST_GENERATION_BIND_UNBOUND] = "generation_bind_unbound",
+ 	[REQUEST_GENERATION_BIND_STALE] = "generation_bind_stale",
++	[REQUEST_GENERATION_POLICY_BIND_OK] = "generation_policy_bind_ok",
++	[REQUEST_GENERATION_POLICY_BIND_MISS] = "generation_policy_bind_miss",
++	[REQUEST_GENERATION_POLICY_RELEASE] = "generation_policy_release",
+ 	[REQUEST_GENERATION_EXIT_ABORT] = "generation_exit_abort",
+ 	[REQUEST_GENERATION_ABORT_FD_CURRENT] = "generation_abort_fd_current",
+ 	[REQUEST_GENERATION_BEGIN_GAP_ENTERED] =
+@@ -173,6 +180,7 @@ struct kcov_request_generation {
+ 	struct list_head all;
+ 	spinlock_t lock;
+ 	refcount_t object_refs;
++	struct kcsan_policy *policy;
+ 	struct list_head roots;
+ 	struct list_head tokens;
+ 	wait_queue_head_t drain_wait;
+@@ -558,6 +566,10 @@ void kcov_request_generation_put(struct kcov_request_generation *gen)
+ 	gen->aggregate_area = NULL;
+ 	request_stat_inc(REQUEST_GENERATION_DEAD);
+ 	request_aggregate_free(aggregate_buffer);
++	if (gen->policy) {
++		kcsan_policy_put(gen->policy);
++		request_stat_inc(REQUEST_GENERATION_POLICY_RELEASE);
++	}
+ 	kfree(gen);
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_generation_put);
+@@ -618,6 +630,44 @@ kcov_request_generation_begin(u64 owner, u64 *generation)
+ }
+ EXPORT_SYMBOL_GPL(kcov_request_generation_begin);
+ 
++int kcov_request_generation_set_policy(struct kcov_request_generation *gen,
++		const char *candidate_id)
++{
++	struct kcsan_policy *policy;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!gen || !candidate_id || !*candidate_id)
++		return -EINVAL;
++	if (!IS_ENABLED(CONFIG_KCSAN))
++		return -EOPNOTSUPP;
++	policy = kcsan_policy_get(candidate_id);
++	if (!policy) {
++		request_stat_inc(REQUEST_GENERATION_POLICY_BIND_MISS);
++		return -ENOENT;
++	}
++	spin_lock_irqsave(&gen->lock, flags);
++	if (gen->state != KCOV_REQUEST_GEN_OPEN || gen->policy)
++		ret = -EBUSY;
++	else
++		gen->policy = policy;
++	spin_unlock_irqrestore(&gen->lock, flags);
++	if (ret)
++		kcsan_policy_put(policy);
++	else
++		request_stat_inc(REQUEST_GENERATION_POLICY_BIND_OK);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(kcov_request_generation_set_policy);
++
++/* Borrowed pointer: the immutable Store owns a reference until reboot. */
++struct kcsan_policy *kcov_request_generation_policy(
++		struct kcov_request_generation *gen)
++{
++	return gen ? READ_ONCE(gen->policy) : NULL;
++}
++EXPORT_SYMBOL_GPL(kcov_request_generation_policy);
++
+ u64 kcov_request_generation_id(struct kcov_request_generation *gen)
+ {
+ 	return gen ? gen->id : 0;
+@@ -986,6 +1036,7 @@ int kcov_request_generation_bind(u64 owner, u64 generation)
+ 	struct kcov_request_generation *gen;
+ 	int ret = 0;
+ 
++	kcsan_policy_context_bind(NULL, 0);
+ 	current->kcov_request_generation_controller = false;
+ 	if (!owner) {
+ 		current->kcov_handle_generation = 0;
+@@ -1014,6 +1065,7 @@ int kcov_request_generation_bind(u64 owner, u64 generation)
+ 	} else {
+ 		current->kcov_handle = owner;
+ 		current->kcov_handle_generation = generation;
++		kcsan_policy_context_bind(gen->policy, generation);
+ 		request_stat_inc(REQUEST_GENERATION_BIND_OK);
+ 	}
+ 	kcov_request_generation_put(gen);
+@@ -1023,6 +1075,7 @@ EXPORT_SYMBOL_GPL(kcov_request_generation_bind);
+ 
+ void kcov_request_generation_note_stale_bind(void)
+ {
++	kcsan_policy_context_bind(NULL, 0);
+ 	current->kcov_handle_generation = 0;
+ 	request_stat_inc(REQUEST_GENERATION_BIND_STALE);
+ }
+diff --git a/kernel/kcsan/Makefile b/kernel/kcsan/Makefile
+index 824f30c93..6f8da88e8 100644
+--- a/kernel/kcsan/Makefile
++++ b/kernel/kcsan/Makefile
+@@ -13,7 +13,7 @@ CFLAGS_core.o := $(call cc-option,-fno-conserve-stack) \
+ 	$(call cc-option,-mno-outline-atomics) \
+ 	-fno-stack-protector -DDISABLE_BRANCH_PROFILING
+ 
+-obj-y := core.o debugfs.o report.o
++obj-y := core.o debugfs.o policy.o report.o
+ 
+ KCSAN_INSTRUMENT_BARRIERS_selftest.o := y
+ obj-$(CONFIG_KCSAN_SELFTEST) += selftest.o
+diff --git a/kernel/kcsan/core.c b/kernel/kcsan/core.c
+index 338a177d4..28847724d 100644
+--- a/kernel/kcsan/core.c
++++ b/kernel/kcsan/core.c
+@@ -25,11 +25,13 @@
+ #include "encoding.h"
+ #include "kcsan.h"
+ #include "permissive.h"
++#include "policy.h"
+ 
+ /*
+- * The NFS/RPC scope brackets built-in NFS client, shared NFS, lockd, SUNRPC
+- * and NFSD text.
+- * Weak references keep KCSAN linkable if a directory is absent or modular.
++ * The NFS/RPC watchpoint scope brackets
++ * built-in code from the NFS client, shared NFS, lockd, SUNRPC and NFSD
++ * directories. Weak references keep KCSAN linkable when any of them is absent
++ * or built as a module (a module cannot be covered by built-in text markers).
+  */
+ #define KCSAN_NFS_SCOPE_DECLARE(scope, section) \
+ 	extern char __kcsan_nfs_scope_##scope##_##section##_start[] __weak; \
+@@ -72,6 +74,8 @@ static bool kcsan_early_enable = IS_ENABLED(CONFIG_KCSAN_EARLY_ENABLE);
+ unsigned int kcsan_udelay_task = CONFIG_KCSAN_UDELAY_TASK;
+ unsigned int kcsan_udelay_interrupt = CONFIG_KCSAN_UDELAY_INTERRUPT;
+ static long kcsan_skip_watch = CONFIG_KCSAN_SKIP_WATCH;
++/* Policy reference rate; independent of the no-policy KCSAN skip counter. */
++static unsigned int kcsan_policy_skip_watch = 38;
+ static bool kcsan_interrupt_watcher = IS_ENABLED(CONFIG_KCSAN_INTERRUPT_WATCHER);
+ 
+ #ifdef MODULE_PARAM_PREFIX
+@@ -82,6 +86,7 @@ module_param_named(early_enable, kcsan_early_enable, bool, 0);
+ module_param_named(udelay_task, kcsan_udelay_task, uint, 0644);
+ module_param_named(udelay_interrupt, kcsan_udelay_interrupt, uint, 0644);
+ module_param_named(skip_watch, kcsan_skip_watch, long, 0644);
++module_param_named(policy_skip_watch, kcsan_policy_skip_watch, uint, 0644);
+ module_param_named(interrupt_watcher, kcsan_interrupt_watcher, bool, 0444);
+ 
+ #ifdef CONFIG_KCSAN_WEAK_MEMORY
+@@ -248,6 +253,20 @@ static __always_inline struct kcsan_ctx *get_ctx(void)
+ 	return in_task() ? &current->kcsan_ctx : raw_cpu_ptr(&kcsan_cpu_ctx);
+ }
+ 
++static __always_inline struct kcsan_policy *
++kcsan_current_policy(struct kcsan_ctx *ctx)
++{
++#ifdef CONFIG_KCOV
++	if (in_task() && READ_ONCE(ctx->policy) &&
++	    (READ_ONCE(ctx->policy_remote) ||
++	     (READ_ONCE(ctx->policy_generation) &&
++	      READ_ONCE(ctx->policy_generation) ==
++		READ_ONCE(current->kcov_handle_generation))))
++		return READ_ONCE(ctx->policy);
++#endif
++	return NULL;
++}
++
+ static __always_inline void
+ check_access(const volatile void *ptr, size_t size, int type, unsigned long ip);
+ 
+@@ -345,6 +364,35 @@ static u32 kcsan_prandom_u32_max(u32 ep_ro)
+ 	return state % ep_ro;
+ }
+ 
++/* Policy mode samples every eligible NFS/RPC access without pre-thinning. */
++static __always_inline bool
++should_watch_policy(struct kcsan_ctx *ctx, const volatile void *ptr,
++		    size_t size, int type, unsigned long ip,
++		    struct kcsan_policy *policy,
++		    struct kcsan_policy_decision *decision)
++{
++	u32 skip, base, threshold;
++
++	if (is_atomic(ctx, ptr, size, type) || !kcsan_nfs_scope_contains(ip))
++		return false;
++	kcsan_policy_decide(policy, ip, decision);
++	/* p0 ~= 2/(skip+3) with randomized skip, otherwise 1/(skip+1). */
++	skip = clamp_val(READ_ONCE(kcsan_policy_skip_watch), 1U, 1000000U);
++	base = IS_ENABLED(CONFIG_KCSAN_SKIP_WATCH_RANDOMIZE) ?
++		2000000U / (skip + 3) : 1000000U / (skip + 1);
++	decision->weighted = kcsan_prandom_u32_max(10) >= 3;
++	/* The 30% uniform lane retains baseline sampling in the NFS/RPC scope. */
++	if (!decision->weighted)
++		threshold = base;
++	else if (decision->matched)
++		/* Priority lane: weights 4 and 2 mean 40% and 20%. */
++		threshold = min_t(u32, 400000U,
++				      (u32)decision->weight * 100000U);
++	else
++		threshold = 0;
++	return kcsan_prandom_u32_max(1000000U) < threshold;
++}
++
+ static inline void reset_kcsan_skip(void)
+ {
+ 	long skip_count = kcsan_skip_watch -
+@@ -360,17 +408,21 @@ static __always_inline bool kcsan_is_enabled(struct kcsan_ctx *ctx)
+ }
+ 
+ /* Introduce delay depending on context and configuration. */
+-static void delay_access(int type)
++static void delay_access(int type,
++			 const struct kcsan_policy_decision *decision)
+ {
+-	unsigned int delay = in_task() ? kcsan_udelay_task : kcsan_udelay_interrupt;
++	unsigned int delay = in_task() ?
++		(decision ? decision->task_delay_us : kcsan_udelay_task) :
++		(decision ? decision->interrupt_delay_us : kcsan_udelay_interrupt);
+ 	/* For certain access types, skew the random delay to be longer. */
+ 	unsigned int skew_delay_order =
+ 		(type & (KCSAN_ACCESS_COMPOUND | KCSAN_ACCESS_ASSERT)) ? 1 : 0;
+ 
+-	delay -= IS_ENABLED(CONFIG_KCSAN_DELAY_RANDOMIZE) ?
+-			       kcsan_prandom_u32_max(delay >> skew_delay_order) :
+-			       0;
+-	udelay(delay);
++	if (IS_ENABLED(CONFIG_KCSAN_DELAY_RANDOMIZE) &&
++	    (delay >> skew_delay_order))
++		delay -= kcsan_prandom_u32_max(delay >> skew_delay_order);
++	if (delay)
++		udelay(delay);
+ }
+ 
+ /*
+@@ -566,7 +618,9 @@ static noinline void kcsan_found_watchpoint(const volatile void *ptr,
+ }
+ 
+ static noinline void
+-kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type, unsigned long ip)
++kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type,
++		       unsigned long ip,
++		       const struct kcsan_policy_decision *decision)
+ {
+ 	const bool is_write = (type & KCSAN_ACCESS_WRITE) != 0;
+ 	const bool is_assert = (type & KCSAN_ACCESS_ASSERT) != 0;
+@@ -585,11 +639,23 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type, unsigned
+ 	 * should_watch().
+ 	 */
+ 	reset_kcsan_skip();
++
++	/* The NFS/RPC scope applies even without a selected dynamic policy. */
+ 	if (!kcsan_nfs_scope_contains(ip)) {
+ 		atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_NFS_SCOPE_REJECTED]);
+ 		goto out;
+ 	}
+ 	atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_NFS_SCOPE_ALLOWED]);
++	if (decision) {
++		atomic_long_inc(&kcsan_counters[decision->weighted ?
++			KCSAN_COUNTER_POLICY_WEIGHTED_SELECTED :
++			KCSAN_COUNTER_POLICY_UNIFORM_SELECTED]);
++		if (decision->matched)
++			atomic_long_inc(&kcsan_counters[
++				KCSAN_COUNTER_POLICY_RULE_SELECTED]);
++		if (decision->rule)
++			atomic_long_inc(&decision->rule->selected);
++	}
+ 
+ 	if (!kcsan_is_enabled(ctx))
+ 		goto out;
+@@ -654,6 +720,10 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type, unsigned
+ 
+ 	atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_SETUP_WATCHPOINTS]);
+ 	atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_USED_WATCHPOINTS]);
++	if (decision)
++		atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_POLICY_SETUP]);
++	if (decision && decision->rule)
++		atomic_long_inc(&decision->rule->setup);
+ 
+ 	/*
+ 	 * Read the current value, to later check and infer a race if the data
+@@ -665,7 +735,11 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type, unsigned
+ 	 * Delay this thread, to increase probability of observing a racy
+ 	 * conflicting access.
+ 	 */
+-	delay_access(type);
++	if (decision)
++		atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_POLICY_DELAY]);
++	if (decision && decision->rule)
++		atomic_long_inc(&decision->rule->delay);
++	delay_access(type, decision);
+ 
+ 	/*
+ 	 * Re-read value, and check if it is as expected; if not, we infer a
+@@ -803,9 +877,15 @@ check_access(const volatile void *ptr, size_t size, int type, unsigned long ip)
+ 		kcsan_found_watchpoint(ptr, size, type, ip, watchpoint, encoded_watchpoint);
+ 	else {
+ 		struct kcsan_ctx *ctx = get_ctx(); /* Call only once in fast-path. */
+-
+-		if (unlikely(should_watch(ctx, ptr, size, type))) {
+-			kcsan_setup_watchpoint(ptr, size, type, ip);
++		struct kcsan_policy *policy = kcsan_current_policy(ctx);
++		struct kcsan_policy_decision decision;
++
++		if (unlikely(policy ?
++			     should_watch_policy(ctx, ptr, size, type, ip,
++					 policy, &decision) :
++			     should_watch(ctx, ptr, size, type))) {
++			kcsan_setup_watchpoint(ptr, size, type, ip,
++					       policy ? &decision : NULL);
+ 			return;
+ 		}
+ 
+diff --git a/kernel/kcsan/debugfs.c b/kernel/kcsan/debugfs.c
+index 139583e27..5b7bb5761 100644
+--- a/kernel/kcsan/debugfs.c
++++ b/kernel/kcsan/debugfs.c
+@@ -10,6 +10,7 @@
+ #include <linux/atomic.h>
+ #include <linux/bsearch.h>
+ #include <linux/bug.h>
++#include <linux/capability.h>
+ #include <linux/debugfs.h>
+ #include <linux/init.h>
+ #include <linux/kallsyms.h>
+@@ -21,6 +22,7 @@
+ #include <linux/uaccess.h>
+ 
+ #include "kcsan.h"
++#include "policy.h"
+ 
+ atomic_long_t kcsan_counters[KCSAN_COUNTER_COUNT];
+ static const char *const counter_names[] = {
+@@ -35,6 +37,13 @@ static const char *const counter_names[] = {
+ 	[KCSAN_COUNTER_ENCODING_FALSE_POSITIVES]	= "encoding_false_positives",
+ 	[KCSAN_COUNTER_NFS_SCOPE_ALLOWED]		= "nfs_scope_allowed",
+ 	[KCSAN_COUNTER_NFS_SCOPE_REJECTED]	= "nfs_scope_rejected",
++	[KCSAN_COUNTER_POLICY_UNIFORM_SELECTED]	= "policy_uniform_selected",
++	[KCSAN_COUNTER_POLICY_WEIGHTED_SELECTED]	= "policy_weighted_selected",
++	[KCSAN_COUNTER_POLICY_RULE_SELECTED]	= "policy_rule_selected",
++	[KCSAN_COUNTER_POLICY_SETUP]		= "policy_setup",
++	[KCSAN_COUNTER_POLICY_DELAY]		= "policy_delay",
++	[KCSAN_COUNTER_POLICY_CONTEXT_BIND]	= "policy_context_bind",
++	[KCSAN_COUNTER_POLICY_REMOTE_ENTER]	= "policy_remote_enter",
+ };
+ static_assert(ARRAY_SIZE(counter_names) == KCSAN_COUNTER_COUNT);
+ 
+@@ -265,9 +274,64 @@ static const struct file_operations debugfs_ops =
+ 	.release = single_release
+ };
+ 
++static ssize_t policy_register_write(struct file *file,
++				     const char __user *buf, size_t count,
++				     loff_t *ppos)
++{
++	char *payload;
++	int ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	if (*ppos)
++		return -EINVAL;
++	if (!count || count > KCSAN_POLICY_MAX_PAYLOAD)
++		return -E2BIG;
++
++	payload = memdup_user_nul(buf, count);
++	if (IS_ERR(payload))
++		return PTR_ERR(payload);
++
++	ret = kcsan_policy_register_payload(payload, count);
++	kfree(payload);
++	if (ret)
++		return ret;
++
++	*ppos += count;
++	return count;
++}
++
++static const struct file_operations policy_register_ops = {
++	.write = policy_register_write,
++	.llseek = noop_llseek,
++};
++
++static int policy_store_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, kcsan_policy_show, NULL);
++}
++
++static const struct file_operations policy_store_ops = {
++	.open = policy_store_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ static int __init kcsan_debugfs_init(void)
+ {
++	struct dentry *policy_dir;
++
+ 	debugfs_create_file("kcsan", 0644, NULL, NULL, &debugfs_ops);
++	policy_dir = debugfs_create_dir("kcsan_policy", NULL);
++	if (IS_ERR_OR_NULL(policy_dir)) {
++		pr_warn("could not create policy debugfs directory\n");
++		return 0;
++	}
++	debugfs_create_file("register", 0200, policy_dir, NULL,
++			    &policy_register_ops);
++	debugfs_create_file("policies", 0400, policy_dir, NULL,
++			    &policy_store_ops);
+ 	return 0;
+ }
+ 
+diff --git a/kernel/kcsan/kcsan.h b/kernel/kcsan/kcsan.h
+index a5feca526..0f5f9efd4 100644
+--- a/kernel/kcsan/kcsan.h
++++ b/kernel/kcsan/kcsan.h
+@@ -85,9 +85,16 @@ enum kcsan_counter_id {
+ 	 */
+ 	KCSAN_COUNTER_ENCODING_FALSE_POSITIVES,
+ 
+-	/* Watchpoint candidates admitted or rejected by the NFS/RPC scope. */
++	/* Watchpoint candidates admitted/rejected by the NFS/RPC scope. */
+ 	KCSAN_COUNTER_NFS_SCOPE_ALLOWED,
+ 	KCSAN_COUNTER_NFS_SCOPE_REJECTED,
++	KCSAN_COUNTER_POLICY_UNIFORM_SELECTED,
++	KCSAN_COUNTER_POLICY_WEIGHTED_SELECTED,
++	KCSAN_COUNTER_POLICY_RULE_SELECTED,
++	KCSAN_COUNTER_POLICY_SETUP,
++	KCSAN_COUNTER_POLICY_DELAY,
++	KCSAN_COUNTER_POLICY_CONTEXT_BIND,
++	KCSAN_COUNTER_POLICY_REMOTE_ENTER,
+ 
+ 	KCSAN_COUNTER_COUNT, /* number of counters */
+ };
+diff --git a/kernel/kcsan/policy.c b/kernel/kcsan/policy.c
+new file mode 100644
+index 000000000..2d0a0f622
+--- /dev/null
++++ b/kernel/kcsan/policy.c
+@@ -0,0 +1,316 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * KCSAN immutable Policy Store and symbol resolver.
++ *
++ * Policies are registered from process context through the experimental
++ * debugfs interface. Registration resolves every rule before publishing the
++ * object in the Store, so readers can only observe complete policies.
++ */
++#define pr_fmt(fmt) "kcsan: policy: " fmt
++
++#include <linux/errno.h>
++#include <linux/ctype.h>
++#include <linux/kallsyms.h>
++#include <linux/kernel.h>
++#include <linux/mutex.h>
++#include <linux/overflow.h>
++#include <linux/refcount.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#include "kcsan.h"
++#include "policy.h"
++
++static LIST_HEAD(kcsan_policy_store);
++static DEFINE_MUTEX(kcsan_policy_store_lock);
++
++static char *next_token(char **line)
++{
++	char *token;
++
++	while ((token = strsep(line, " \t\r")) != NULL) {
++		if (*token)
++			return token;
++	}
++	return NULL;
++}
++
++static char *next_line(char **payload)
++{
++	char *line;
++
++	while ((line = strsep(payload, "\n")) != NULL) {
++		line = strim(line);
++		if (*line)
++			return line;
++	}
++	return NULL;
++}
++
++static int parse_u32(char **line, u32 *value)
++{
++	char *token = next_token(line);
++
++	if (!token)
++		return -EINVAL;
++	return kstrtou32(token, 10, value);
++}
++
++static bool has_extra_token(char **line)
++{
++	return next_token(line) != NULL;
++}
++
++static int resolve_rule(struct kcsan_policy_rule *rule)
++{
++	unsigned long symbol_size, offset;
++	unsigned long start;
++
++	start = kallsyms_lookup_name(rule->symbol);
++	if (!start)
++		return -ENOENT;
++	if (!kallsyms_lookup_size_offset(start, &symbol_size, &offset) ||
++	    !symbol_size || offset)
++		return -ENOENT;
++	if (check_add_overflow(start, symbol_size, &rule->end_ip))
++		return -EOVERFLOW;
++	rule->start_ip = start;
++	return rule->start_ip < rule->end_ip ? 0 : -EINVAL;
++}
++
++static int parse_rule(char *line, struct kcsan_policy_rule *rule,
++		      struct kcsan_policy *policy, u32 index)
++{
++	char *kind = next_token(&line);
++	char *symbol = next_token(&line);
++	char *subsystem = next_token(&line);
++	u32 weight, delay_us;
++	u32 i;
++	int ret;
++
++	if (!kind || strcmp(kind, "rule") || !symbol || !subsystem)
++		return -EINVAL;
++	if (strscpy(rule->symbol, symbol, sizeof(rule->symbol)) < 0 ||
++	    strscpy(rule->subsystem, subsystem, sizeof(rule->subsystem)) < 0)
++		return -E2BIG;
++	if (parse_u32(&line, &weight) || weight > U8_MAX ||
++	    parse_u32(&line, &delay_us) ||
++	    delay_us > KCSAN_POLICY_MAX_DELAY_US || has_extra_token(&line))
++		return -EINVAL;
++
++	for (i = 0; i < index; i++) {
++		if (!strcmp(policy->rules[i].symbol, rule->symbol))
++			return -EEXIST;
++	}
++
++	rule->weight = weight;
++	rule->delay_us = delay_us;
++	ret = resolve_rule(rule);
++	if (ret)
++		pr_err("cannot resolve policy symbol '%s' (error %d)\n",
++		       rule->symbol, ret);
++	return ret;
++}
++
++static int parse_policy_header(char *line, struct kcsan_policy *policy)
++{
++	char *kind = next_token(&line);
++	char *candidate_id;
++	u32 default_weight;
++
++	candidate_id = next_token(&line);
++	if (!kind || strcmp(kind, "policy") || !candidate_id ||
++	    strscpy(policy->candidate_id, candidate_id,
++		    sizeof(policy->candidate_id)) < 0 ||
++	    parse_u32(&line, &policy->schema_version) ||
++	    policy->schema_version != KCSAN_POLICY_SCHEMA_VERSION)
++		return -EINVAL;
++	for (candidate_id = policy->candidate_id; *candidate_id; candidate_id++) {
++		if (!isalnum(*candidate_id) && *candidate_id != '_' &&
++		    *candidate_id != '-' && *candidate_id != '.')
++			return -EINVAL;
++	}
++	if (parse_u32(&line, &default_weight) || default_weight > U8_MAX ||
++	    parse_u32(&line, &policy->default_task_delay_us) ||
++	    policy->default_task_delay_us > KCSAN_POLICY_MAX_DELAY_US ||
++	    parse_u32(&line, &policy->default_interrupt_delay_us) ||
++	    policy->default_interrupt_delay_us > KCSAN_POLICY_MAX_DELAY_US ||
++	    parse_u32(&line, &policy->nr_rules) || !policy->nr_rules ||
++	    policy->nr_rules > KCSAN_POLICY_MAX_RULES || has_extra_token(&line))
++		return -EINVAL;
++	policy->default_weight = default_weight;
++	return 0;
++}
++
++int kcsan_policy_register_payload(const char *payload, size_t len)
++{
++	struct kcsan_policy *policy;
++	char *copy, *cursor, *line;
++	u32 i;
++	int ret;
++
++	if (!payload || !len || len > KCSAN_POLICY_MAX_PAYLOAD)
++		return -EINVAL;
++	copy = kmemdup_nul(payload, len, GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++	cursor = copy;
++	line = next_line(&cursor);
++	if (!line) {
++		ret = -EINVAL;
++		goto out_free_copy;
++	}
++
++	/* Allocate after parsing a bounded rule count from a temporary header. */
++	{
++		struct kcsan_policy header = {};
++
++		ret = parse_policy_header(line, &header);
++		if (ret)
++			goto out_free_copy;
++		policy = kzalloc(struct_size(policy, rules, header.nr_rules),
++				 GFP_KERNEL);
++		if (!policy) {
++			ret = -ENOMEM;
++			goto out_free_copy;
++		}
++		/* parse_policy_header() tokenizes line in place. */
++		memcpy(policy, &header, sizeof(header));
++	}
++
++	for (i = 0; i < policy->nr_rules; i++) {
++		line = next_line(&cursor);
++		if (!line) {
++			ret = -EINVAL;
++			goto out_free_policy;
++		}
++		ret = parse_rule(line, &policy->rules[i], policy, i);
++		if (ret)
++			goto out_free_policy;
++	}
++	if (next_line(&cursor)) {
++		ret = -EINVAL;
++		goto out_free_policy;
++	}
++
++	refcount_set(&policy->refs, 1); /* Store-owned reference. */
++	mutex_lock(&kcsan_policy_store_lock);
++	{
++		struct kcsan_policy *existing;
++
++		list_for_each_entry(existing, &kcsan_policy_store, node) {
++			if (!strcmp(existing->candidate_id, policy->candidate_id)) {
++				ret = -EBUSY;
++				break;
++			}
++		}
++		if (!ret)
++			list_add_tail(&policy->node, &kcsan_policy_store);
++	}
++	mutex_unlock(&kcsan_policy_store_lock);
++	if (ret)
++		goto out_free_policy;
++
++	pr_info("registered candidate_id=%s rules=%u\n",
++		policy->candidate_id, policy->nr_rules);
++	kfree(copy);
++	return 0;
++
++out_free_policy:
++	kfree(policy);
++out_free_copy:
++	kfree(copy);
++	return ret;
++}
++
++struct kcsan_policy *kcsan_policy_get(const char *candidate_id)
++{
++	struct kcsan_policy *policy;
++
++	if (!candidate_id || !*candidate_id)
++		return NULL;
++	mutex_lock(&kcsan_policy_store_lock);
++	list_for_each_entry(policy, &kcsan_policy_store, node) {
++		if (!strcmp(policy->candidate_id, candidate_id)) {
++			refcount_inc(&policy->refs);
++			mutex_unlock(&kcsan_policy_store_lock);
++			return policy;
++		}
++	}
++	mutex_unlock(&kcsan_policy_store_lock);
++	return NULL;
++}
++
++void kcsan_policy_put(struct kcsan_policy *policy)
++{
++	if (policy && refcount_dec_and_test(&policy->refs))
++		kfree(policy);
++}
++
++/* Store entries are immutable and retain a store-owned ref until reboot. */
++void kcsan_policy_context_bind(struct kcsan_policy *policy, u64 generation)
++{
++	if (policy)
++		atomic_long_inc(&kcsan_counters[
++			KCSAN_COUNTER_POLICY_CONTEXT_BIND]);
++	WRITE_ONCE(current->kcsan_ctx.policy, policy);
++	WRITE_ONCE(current->kcsan_ctx.policy_generation,
++		policy ? generation : 0);
++	WRITE_ONCE(current->kcsan_ctx.policy_remote, false);
++}
++
++void kcsan_policy_context_remote_enter(struct kcsan_policy *policy,
++		struct kcsan_policy_context *saved)
++{
++	if (policy)
++		atomic_long_inc(&kcsan_counters[
++			KCSAN_COUNTER_POLICY_REMOTE_ENTER]);
++	saved->policy = READ_ONCE(current->kcsan_ctx.policy);
++	saved->generation = READ_ONCE(current->kcsan_ctx.policy_generation);
++	saved->remote = READ_ONCE(current->kcsan_ctx.policy_remote);
++	WRITE_ONCE(current->kcsan_ctx.policy, policy);
++	WRITE_ONCE(current->kcsan_ctx.policy_generation, 0);
++	WRITE_ONCE(current->kcsan_ctx.policy_remote, true);
++}
++
++void kcsan_policy_context_remote_exit(
++		const struct kcsan_policy_context *saved)
++{
++	WRITE_ONCE(current->kcsan_ctx.policy, saved->policy);
++	WRITE_ONCE(current->kcsan_ctx.policy_generation, saved->generation);
++	WRITE_ONCE(current->kcsan_ctx.policy_remote, saved->remote);
++}
++
++int kcsan_policy_show(struct seq_file *file, void *unused)
++{
++	struct kcsan_policy *policy;
++	u32 i;
++
++	mutex_lock(&kcsan_policy_store_lock);
++	list_for_each_entry(policy, &kcsan_policy_store, node) {
++		seq_printf(file,
++			   "policy candidate_id=%s schema_version=%u default_weight=%u "
++			   "task_delay_us=%u interrupt_delay_us=%u nr_rules=%u\n",
++			   policy->candidate_id, policy->schema_version,
++			   policy->default_weight, policy->default_task_delay_us,
++			   policy->default_interrupt_delay_us, policy->nr_rules);
++		for (i = 0; i < policy->nr_rules; i++) {
++			const struct kcsan_policy_rule *rule = &policy->rules[i];
++
++			seq_printf(file,
++				   " rule candidate_id=%s symbol=%s subsystem=%s "
++				   "start=0x%lx end=0x%lx weight=%u delay_us=%u "
++				   "candidates=%ld selected=%ld setup=%ld delay=%ld\n",
++				   policy->candidate_id, rule->symbol, rule->subsystem,
++				   rule->start_ip, rule->end_ip, rule->weight,
++				   rule->delay_us,
++				   atomic_long_read(&rule->candidates),
++				   atomic_long_read(&rule->selected),
++				   atomic_long_read(&rule->setup),
++				   atomic_long_read(&rule->delay));
++		}
++	}
++	mutex_unlock(&kcsan_policy_store_lock);
++	return 0;
++}
+diff --git a/kernel/kcsan/policy.h b/kernel/kcsan/policy.h
+new file mode 100644
+index 000000000..b17144a3a
+--- /dev/null
++++ b/kernel/kcsan/policy.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _KERNEL_KCSAN_POLICY_H
++#define _KERNEL_KCSAN_POLICY_H
++
++#include <linux/kallsyms.h>
++#include <linux/kcsan_policy.h>
++#include <linux/atomic.h>
++#include <linux/list.h>
++#include <linux/refcount.h>
++#include <linux/seq_file.h>
++#include <linux/types.h>
++#include <uapi/linux/kcov.h>
++
++#define KCSAN_POLICY_SCHEMA_VERSION	5
++#define KCSAN_POLICY_MAX_RULES		64
++#define KCSAN_POLICY_MAX_DELAY_US	30000U
++#define KCSAN_POLICY_MAX_PAYLOAD	4096U
++#define KCSAN_POLICY_CANDIDATE_ID_LEN	KCOV_POLICY_CANDIDATE_ID_LEN
++#define KCSAN_POLICY_SUBSYSTEM_LEN	64
++
++struct kcsan_policy_rule {
++	char symbol[KSYM_NAME_LEN];
++	char subsystem[KCSAN_POLICY_SUBSYSTEM_LEN];
++	unsigned long start_ip;
++	unsigned long end_ip;	/* exclusive */
++	u8 weight;
++	u32 delay_us;
++	atomic_long_t candidates;
++	atomic_long_t selected;
++	atomic_long_t setup;
++	atomic_long_t delay;
++};
++
++struct kcsan_policy {
++	struct list_head node;
++	refcount_t refs;
++	u32 schema_version;
++	char candidate_id[KCSAN_POLICY_CANDIDATE_ID_LEN];
++	u8 default_weight;
++	u32 default_task_delay_us;
++	u32 default_interrupt_delay_us;
++	u32 nr_rules;
++	struct kcsan_policy_rule rules[];
++};
++
++struct kcsan_policy_decision {
++	u8 weight;
++	u32 task_delay_us;
++	u32 interrupt_delay_us;
++	bool matched;
++	bool weighted;
++	struct kcsan_policy_rule *rule;
++};
++
++static __always_inline void
++kcsan_policy_decide(struct kcsan_policy *policy, unsigned long ip,
++		    struct kcsan_policy_decision *decision)
++{
++	u32 i;
++
++	decision->matched = false;
++	decision->rule = NULL;
++	decision->weight = policy->default_weight;
++	decision->task_delay_us = policy->default_task_delay_us;
++	decision->interrupt_delay_us = policy->default_interrupt_delay_us;
++	for (i = 0; i < policy->nr_rules; i++) {
++		struct kcsan_policy_rule *rule = &policy->rules[i];
++
++		if (ip >= rule->start_ip && ip < rule->end_ip) {
++			decision->matched = true;
++			decision->rule = rule;
++			atomic_long_inc(&rule->candidates);
++			decision->weight = rule->weight;
++			decision->task_delay_us = rule->delay_us ?
++				rule->delay_us : policy->default_task_delay_us;
++			return;
++		}
++	}
++}
++
++/* Register one complete transfer payload; duplicate IDs are rejected. */
++int kcsan_policy_register_payload(const char *payload, size_t len);
++
++/* Print all committed policies for the read-only debugfs status file. */
++int kcsan_policy_show(struct seq_file *file, void *unused);
++
++#endif /* _KERNEL_KCSAN_POLICY_H */
+-- 
+2.55.0.windows.3
+

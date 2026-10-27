@@ -32,6 +32,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..admission import CallAdmissionProfile
 from ..artifacts import ArtifactStore
+from ..contracts import Sanitizer
+from ..controller.store import Store
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ExecutionCorrelation as EvidenceCorrelation
 from ..hcap import HcapCatalog, layout_refusals
@@ -64,6 +66,7 @@ from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
                        NEUTRAL_COVERAGE_TYPE, NEUTRAL_EXECPROG_ID,
                        REPLAY_EXECPROG_ID, SCENARIO_EXECPROG_ID,
                        journal_identity)
+from kcsan_pipeline import ProgramPolicyPipeline
 
 
 class Stage2StepError(RuntimeError):
@@ -95,6 +98,7 @@ class _Execution(BaseModel):
     gate_repetitions: int | None
     campaign_id: str | None
     crash_bundle_ref: str | None
+    state_dir: str | None = None
 
 
 class NfsProxyExecution(BaseModel):
@@ -337,8 +341,25 @@ class _Inputs:
             vm_instance_id=vm, lane=lane, generation_id=max(1, generation))
 
 
+# KCSAN reports are non-fatal signals, not proof that the guest VM stopped.
+# Keep them in campaign report detection, but out of the fatal-console test.
 _CRASH = re.compile(
-    rb"BUG:(?! KCSAN:)|KASAN:|kernel BUG|Kernel panic|Oops:|general protection fault")
+    rb"BUG:(?![ \t]+KCSAN:)|KASAN:|kernel BUG|Kernel panic|Oops:|general protection fault")
+_KCSAN_REPORT = re.compile(rb"BUG:[ \t]+KCSAN:")
+
+
+def _campaign_report_state(reports: list[Path], crash_log: Path | None,
+                           console: bytes) -> tuple[bool, bool]:
+    """Return (report_seen, guest_crashed) without conflating the two.
+
+    syz-manager saves non-fatal sanitizer reports under ``crashes/`` too.
+    Only a fatal signature in the host-captured console establishes the
+    guest-crashed termination; a report or crash-log artifact alone does not.
+    """
+    guest_crashed = bool(_CRASH.search(console))
+    report_seen = bool(reports or crash_log is not None or guest_crashed or
+                       _KCSAN_REPORT.search(console))
+    return report_seen, guest_crashed
 
 
 def _object(path: Path) -> dict[str, Any]:
@@ -1102,7 +1123,39 @@ def _stop_manager(process: subprocess.Popen, timeout_s: float) -> bool:
         return False
 
 
+def _campaign_manager(inputs: _Inputs) -> dict[str, Any]:
+    manager = json.loads(json.dumps(inputs.manager))
+    kcsan = inputs.descriptor.sanitizer is Sanitizer.KCSAN
+    if not kcsan and ("kcsan_policy_file" in manager or
+                      "kcsan_policy" in manager):
+        raise Stage2StepError("non-KCSAN campaign selects a KCSAN policy")
+    if not kcsan:
+        return manager
+    state_dir = inputs.execution.state_dir
+    if state_dir is None:
+        raise Stage2StepError("KCSAN campaign lacks Controller state")
+
+    state = Path(state_dir)
+    database = state / "controller.sqlite"
+    if not database.is_file():
+        raise Stage2StepError(f"Controller job store is absent: {database}")
+    store = Store(database)
+    try:
+        job = store.job(inputs.execution.job_id)
+        if job.candidate is None or job.candidate.candidate_id != inputs.harness.candidate_id:
+            raise Stage2StepError("campaign job and harness select different candidates")
+        if job.candidate.kernel_commit != inputs.descriptor.kernel_commit:
+            raise Stage2StepError("campaign candidate and kernel commit differ")
+        if store.policy(job.job_policy_id).sanitizer is not inputs.descriptor.sanitizer:
+            raise Stage2StepError("campaign job and harness sanitizer differ")
+        return ProgramPolicyPipeline(
+            store, state / "kcsan-policies").manager_config(job.job_id, manager)
+    finally:
+        store.close()
+
+
 def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
+    manager = _campaign_manager(inputs)
     work = output / "work"
     work.mkdir()
     workdir, spool = work / "manager-workdir", work / "executions"
@@ -1118,7 +1171,6 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
                               prefixes)
     channels = _JournalChannels(work / "journal", "campaign", vm,
                                 inputs.lanes, inputs.rules, prefixes)
-    manager = json.loads(json.dumps(inputs.manager))
     manager["workdir"] = str(workdir)
     manager["workdir_template"] = str(lane_dir)
     manager["http"] = ""
@@ -1174,14 +1226,15 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         _check_evidence_deadline(seal_deadline)
         if b"failed to store NFS proxy evidence" in console:
             raise Stage2StepError("syz-manager reported an evidence spool failure")
-        crashed = bool(reports or crash_log or _CRASH.search(console))
+        report_seen, guest_crashed = _campaign_report_state(
+            reports, crash_log, console)
         campaign_span, correlated = _campaign_records(records)
         if any(record.vm != 0 or record.lane >= inputs.lanes for record in records):
             raise Stage2StepError("syz-manager evidence has an invalid VM or lane")
         execution_ids = [record.execution_id for record in records]
         if len(execution_ids) != len(set(execution_ids)):
             raise Stage2StepError("syz-manager evidence reuses an execution ID")
-        if not correlated and not crashed:
+        if not correlated and not report_seen:
             raise Stage2StepError(
                 "syz-manager produced no generation-attributed campaign execution")
         seen: set[tuple[int, int]] = set()
@@ -1216,16 +1269,21 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         window = Q2CollectionWindow(
             start_marker=f"host-ns:{start_ns}", end_marker=f"host-ns:{end_ns}")
         internal = []
-        if unexpected_exit and not crashed:
+        if unexpected_exit and not guest_crashed:
             returncode = process.returncode if process is not None else None
             internal.append(f"manager_exited_unexpectedly:{returncode}")
         if not correlated:
-            internal.append("crash_before_generation_attributed_campaign_execution")
+            internal.append(
+                "crash_before_generation_attributed_campaign_execution"
+                if guest_crashed else
+                "report_before_generation_attributed_campaign_execution")
+        if _KCSAN_REPORT.search(console) and not reports:
+            internal.append("kcsan_console_report_missing_from_manager_reports")
         uncorrelated = len(campaign_span) - len(correlated)
         if uncorrelated:
             internal.append(f"uncorrelated_program_results:{uncorrelated}")
         completeness = "complete" if complete else "truncated"
-        termination = "guest_crashed" if crashed else (
+        termination = "guest_crashed" if guest_crashed else (
             "lost" if unexpected_exit else
             ("runner_stopped" if complete else "lost"))
         q2_correlation = EvidenceCorrelation.model_validate(

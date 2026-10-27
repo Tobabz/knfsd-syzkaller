@@ -128,10 +128,14 @@ def _bundle(root: Path) -> SyzkallerTargetIdentity:
     (bundle / "provenance.json").write_bytes(canonical_json({
         "source_commit": commit,
         "source_tree": _git(checkout, "rev-parse", "HEAD^{tree}")}))
-    # tools/syzkaller/build.py's patch-series.bin of the checked-in series.
+    # tools/syzkaller/build.py's patch-series.bin of the base series followed
+    # by the KCSAN overlay, in their application order.
+    patch_root = REPO / "bundle" / "patches"
     patches = b"".join(
-        p.name.encode() + b"\0" + p.read_bytes() + b"\0" for p in sorted(
-            (REPO / "bundle" / "patches" / "syzkaller").glob("*.patch")))
+        p.name.encode() + b"\0" + p.read_bytes() + b"\0"
+        for directory in (patch_root / "syzkaller",
+                          patch_root / "kcsan" / "syzkaller")
+        for p in sorted(directory.glob("*.patch")))
     (bundle / "patch-series.bin").write_bytes(patches)
     import hashlib
     sha = lambda b: hashlib.sha256(b).hexdigest()  # noqa: E731
@@ -1351,6 +1355,77 @@ def test_kernel_series_apply_is_deterministic(tmp_path):
             ["git", "-C", str(tree), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True).stdout.strip())
     assert heads[0] == heads[1] != commit
+
+
+def test_fport_applies_kcsan_overlay_and_rolls_back_failure(tmp_path):
+    git = ["git", "-c", "user.name=test", "-c", "user.email=test@example.com"]
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run([*git, "-C", str(source), "init", "-q"], check=True)
+    (source / "f").write_text("base\n")
+    subprocess.run([*git, "-C", str(source), "add", "f"], check=True)
+    subprocess.run([*git, "-C", str(source), "commit", "-q", "-m", "base"],
+                   check=True)
+    base = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                          capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+    bundle = tmp_path / "bundle"
+    common = bundle / "syzkaller"
+    overlay = bundle / "kcsan" / "syzkaller"
+    common.mkdir(parents=True)
+    overlay.mkdir(parents=True)
+    (source / "f").write_text("common patch\n")
+    subprocess.run([*git, "-C", str(source), "add", "f"], check=True)
+    subprocess.run([*git, "-C", str(source), "commit", "-q", "-m", "common"],
+                   check=True, env={**os.environ,
+                                    "GIT_AUTHOR_DATE": "2026-10-01T00:00:00+0000",
+                                    "GIT_COMMITTER_DATE": "2026-10-01T00:00:00+0000"})
+    subprocess.run(["git", "-C", str(source), "format-patch", "-q", "-1",
+                    "-o", str(common)], check=True)
+    common_names = sorted(path.name for path in common.glob("*.patch"))
+    (common / "series").write_text("\n".join(common_names) + "\n")
+
+    (source / "f").write_text("KCSAN overlay\n")
+    subprocess.run([*git, "-C", str(source), "add", "f"], check=True)
+    subprocess.run([*git, "-C", str(source), "commit", "-q", "-m", "overlay"],
+                   check=True, env={**os.environ,
+                                    "GIT_AUTHOR_DATE": "2026-10-02T00:00:00+0000",
+                                    "GIT_COMMITTER_DATE": "2026-10-02T00:00:00+0000"})
+    subprocess.run(["git", "-C", str(source), "format-patch", "-q", "-1",
+                    "-o", str(overlay)], check=True)
+    overlay_patch = next(overlay.glob("*.patch"))
+    (overlay / "series").write_text(overlay_patch.name + "\n")
+    (bundle / "BASE").write_text(f"syzkaller_commit={base}\n")
+
+    def target(name):
+        path = tmp_path / name
+        subprocess.run(["git", "clone", "-q", str(source), str(path)], check=True)
+        subprocess.run(["git", "-C", str(path), "checkout", "-q", base], check=True)
+        return path
+
+    applied = target("applied")
+    subprocess.run([str(REPO / "tools" / "fport-apply.sh"), "syzkaller",
+                    str(applied)], check=True, capture_output=True,
+                   env={**os.environ, "KOOV_BUNDLE": str(bundle)})
+    assert (applied / "f").read_text() == "KCSAN overlay\n"
+    assert subprocess.run(["git", "-C", str(applied), "rev-list", "--count",
+                           f"{base}..HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip() == "2"
+
+    overlay_patch.write_text("not a valid git-mail patch\n")
+    rejected = target("rejected")
+    result = subprocess.run([str(REPO / "tools" / "fport-apply.sh"),
+                             "syzkaller", str(rejected)], capture_output=True,
+                            text=True, env={**os.environ,
+                                            "KOOV_BUNDLE": str(bundle)})
+    assert result.returncode == 1
+    assert subprocess.run(["git", "-C", str(rejected), "rev-parse", "HEAD"],
+                          capture_output=True, text=True,
+                          check=True).stdout.strip() == base
+    assert not subprocess.run(["git", "-C", str(rejected), "status", "--porcelain"],
+                              capture_output=True, text=True,
+                              check=True).stdout.strip()
 
 
 # ------------------------------------------------------------ KCSAN variant

@@ -20,6 +20,8 @@ The **base image and keypair are generated per site**
 | guest keypair (site-generated) | same run: `artifacts/bookworm.id_rsa[.pub]` (pairs with your base) | — |
 | `patches/kernel/` | kernel patches, listed in [series](patches/kernel/series) | — |
 | `patches/syzkaller/` | syzkaller patches, listed in [series](patches/syzkaller/series) | — |
+| `patches/kcsan/kernel/` | KCSAN Policy scope, Store and candidate-sampling overlay applied after `patches/kernel/` | — |
+| `patches/kcsan/syzkaller/` | KCSAN campaign loader and executor candidate-ID overlay applied after `patches/syzkaller/` | — |
 | `patches/BASE` | last base the series applies to (kernel tag + commit, syzkaller commit); updated by `tools/bump-kernel.py` | — |
 | `patches/kernel.config` | kernel build config used by bootstrap | — |
 | `patches/kernel-kcsan.config` | KCSAN variant config (KASAN off, `CONFIG_KCSAN=y`); built by `bootstrap-kcov-env.py --variant kcsan` | — |
@@ -29,8 +31,7 @@ The **base image and keypair are generated per site**
 
 
 
-`patches/*/series` lists the patches in apply order. The apply script uses filename order;
-bootstrap records a combined filename/content hash per series in `env/manifest.json`.
+Each `patches/*/series` lists its patches in apply order. `fport-apply.sh` applies the base `kernel/` or `syzkaller/` series first, then the corresponding `kcsan/` overlay. Bootstrap records a combined filename/content hash for both stacks in `env/manifest.json`; this keeps the KCSAN kernel and syzkaller support in the standard build path.
 
 ## Base image provenance
 

@@ -1,0 +1,233 @@
+From 182bc6ae4080f9f5177a58049ea1ada89f846660 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Thu, 22 Oct 2026 19:43:11 +0900
+Subject: [PATCH 3/3] kcsan: limit watchpoints to candidate subsystem
+
+Derive the active NFS/RPC scope from a candidate policy and verify
+that each target symbol belongs to that scope. Reject registration
+of a different subsystem while the VM-wide installation scope is
+active.
+
+Gate new watchpoint installation on that scope. Keep the watchpoint
+lookup for all accesses, so accesses from other subsystems still
+detect conflicts with installed watchpoints.
+
+Tests: x86_64 bzImage build and KVM scope counter checks on the
+identical source tree.
+
+Co-authored-by: Codex <codex@openai.com>
+---
+ kernel/kcsan/core.c   | 44 ++++++++++++++++++++++++++++----------
+ kernel/kcsan/policy.c | 49 ++++++++++++++++++++++++++++++++++++++++---
+ kernel/kcsan/policy.h | 13 ++++++++++++
+ 3 files changed, 92 insertions(+), 14 deletions(-)
+
+diff --git a/kernel/kcsan/core.c b/kernel/kcsan/core.c
+index 28847724d..a9327f010 100644
+--- a/kernel/kcsan/core.c
++++ b/kernel/kcsan/core.c
+@@ -61,13 +61,34 @@ KCSAN_NFS_SCOPE_DECLARE_ALL(nfsd);
+ 	 KCSAN_NFS_SCOPE_IN_RANGE(scope, unlikely, ip) || \
+ 	 KCSAN_NFS_SCOPE_IN_RANGE(scope, split, ip))
+ 
+-static __always_inline bool kcsan_nfs_scope_contains(unsigned long ip)
++static __always_inline bool
++kcsan_nfs_scope_contains_inline(enum kcsan_nfs_scope scope, unsigned long ip)
++{
++	switch (scope) {
++	case KCSAN_NFS_SCOPE_NFS:
++		return KCSAN_NFS_SCOPE_CONTAINS(nfs, ip);
++	case KCSAN_NFS_SCOPE_NFS_COMMON:
++		return KCSAN_NFS_SCOPE_CONTAINS(nfs_common, ip);
++	case KCSAN_NFS_SCOPE_LOCKD:
++		return KCSAN_NFS_SCOPE_CONTAINS(lockd, ip);
++	case KCSAN_NFS_SCOPE_SUNRPC:
++		return KCSAN_NFS_SCOPE_CONTAINS(sunrpc, ip);
++	case KCSAN_NFS_SCOPE_NFSD:
++		return KCSAN_NFS_SCOPE_CONTAINS(nfsd, ip);
++	case KCSAN_NFS_SCOPE_ALL:
++		return KCSAN_NFS_SCOPE_CONTAINS(nfs, ip) ||
++		       KCSAN_NFS_SCOPE_CONTAINS(nfs_common, ip) ||
++		       KCSAN_NFS_SCOPE_CONTAINS(lockd, ip) ||
++		       KCSAN_NFS_SCOPE_CONTAINS(sunrpc, ip) ||
++		       KCSAN_NFS_SCOPE_CONTAINS(nfsd, ip);
++	default:
++		return false;
++	}
++}
++
++bool kcsan_nfs_scope_contains(enum kcsan_nfs_scope scope, unsigned long ip)
+ {
+-	return KCSAN_NFS_SCOPE_CONTAINS(nfs, ip) ||
+-	       KCSAN_NFS_SCOPE_CONTAINS(nfs_common, ip) ||
+-	       KCSAN_NFS_SCOPE_CONTAINS(lockd, ip) ||
+-	       KCSAN_NFS_SCOPE_CONTAINS(sunrpc, ip) ||
+-	       KCSAN_NFS_SCOPE_CONTAINS(nfsd, ip);
++        return kcsan_nfs_scope_contains_inline(scope, ip);
+ }
+ 
+ static bool kcsan_early_enable = IS_ENABLED(CONFIG_KCSAN_EARLY_ENABLE);
+@@ -364,7 +385,7 @@ static u32 kcsan_prandom_u32_max(u32 ep_ro)
+ 	return state % ep_ro;
+ }
+ 
+-/* Policy mode samples every eligible NFS/RPC access without pre-thinning. */
++/* Policy mode samples accesses in the candidate subsystem. */
+ static __always_inline bool
+ should_watch_policy(struct kcsan_ctx *ctx, const volatile void *ptr,
+ 		    size_t size, int type, unsigned long ip,
+@@ -373,7 +394,8 @@ should_watch_policy(struct kcsan_ctx *ctx, const volatile void *ptr,
+ {
+ 	u32 skip, base, threshold;
+ 
+-	if (is_atomic(ctx, ptr, size, type) || !kcsan_nfs_scope_contains(ip))
++	if (is_atomic(ctx, ptr, size, type) ||
++	    !kcsan_nfs_scope_contains_inline(policy->scope, ip))
+ 		return false;
+ 	kcsan_policy_decide(policy, ip, decision);
+ 	/* p0 ~= 2/(skip+3) with randomized skip, otherwise 1/(skip+1). */
+@@ -381,7 +403,7 @@ should_watch_policy(struct kcsan_ctx *ctx, const volatile void *ptr,
+ 	base = IS_ENABLED(CONFIG_KCSAN_SKIP_WATCH_RANDOMIZE) ?
+ 		2000000U / (skip + 3) : 1000000U / (skip + 1);
+ 	decision->weighted = kcsan_prandom_u32_max(10) >= 3;
+-	/* The 30% uniform lane retains baseline sampling in the NFS/RPC scope. */
++	/* The 30% uniform lane retains sampling across the candidate scope. */
+ 	if (!decision->weighted)
+ 		threshold = base;
+ 	else if (decision->matched)
+@@ -640,8 +662,8 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type,
+ 	 */
+ 	reset_kcsan_skip();
+ 
+-	/* The NFS/RPC scope applies even without a selected dynamic policy. */
+-	if (!kcsan_nfs_scope_contains(ip)) {
++	/* A registered candidate narrows installations in every context. */
++	if (!kcsan_nfs_scope_contains_inline(kcsan_policy_watch_scope(), ip)) {
+ 		atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_NFS_SCOPE_REJECTED]);
+ 		goto out;
+ 	}
+diff --git a/kernel/kcsan/policy.c b/kernel/kcsan/policy.c
+index 2d0a0f622..1cd9113f5 100644
+--- a/kernel/kcsan/policy.c
++++ b/kernel/kcsan/policy.c
+@@ -24,6 +24,29 @@
+ 
+ static LIST_HEAD(kcsan_policy_store);
+ static DEFINE_MUTEX(kcsan_policy_store_lock);
++static enum kcsan_nfs_scope active_scope;
++
++enum kcsan_nfs_scope kcsan_policy_watch_scope(void)
++{
++	return READ_ONCE(active_scope);
++}
++
++static enum kcsan_nfs_scope parse_subsystem(const char *name)
++{
++	static const char * const names[] = {
++		[KCSAN_NFS_SCOPE_NFS] = "fs/nfs",
++		[KCSAN_NFS_SCOPE_NFS_COMMON] = "fs/nfs_common",
++		[KCSAN_NFS_SCOPE_LOCKD] = "fs/lockd",
++		[KCSAN_NFS_SCOPE_SUNRPC] = "net/sunrpc",
++		[KCSAN_NFS_SCOPE_NFSD] = "fs/nfsd",
++	};
++	enum kcsan_nfs_scope scope;
++
++	for (scope = KCSAN_NFS_SCOPE_NFS; scope < ARRAY_SIZE(names); scope++)
++		if (!strcmp(name, names[scope]))
++			return scope;
++	return KCSAN_NFS_SCOPE_ALL;
++}
+ 
+ static char *next_token(char **line)
+ {
+@@ -86,6 +109,7 @@ static int parse_rule(char *line, struct kcsan_policy_rule *rule,
+ 	char *symbol = next_token(&line);
+ 	char *subsystem = next_token(&line);
+ 	u32 weight, delay_us;
++	enum kcsan_nfs_scope scope;
+ 	u32 i;
+ 	int ret;
+ 
+@@ -94,6 +118,10 @@ static int parse_rule(char *line, struct kcsan_policy_rule *rule,
+ 	if (strscpy(rule->symbol, symbol, sizeof(rule->symbol)) < 0 ||
+ 	    strscpy(rule->subsystem, subsystem, sizeof(rule->subsystem)) < 0)
+ 		return -E2BIG;
++	scope = parse_subsystem(rule->subsystem);
++	if (scope == KCSAN_NFS_SCOPE_ALL ||
++	    (index && scope != policy->scope))
++		return -EINVAL;
+ 	if (parse_u32(&line, &weight) || weight > U8_MAX ||
+ 	    parse_u32(&line, &delay_us) ||
+ 	    delay_us > KCSAN_POLICY_MAX_DELAY_US || has_extra_token(&line))
+@@ -107,10 +135,19 @@ static int parse_rule(char *line, struct kcsan_policy_rule *rule,
+ 	rule->weight = weight;
+ 	rule->delay_us = delay_us;
+ 	ret = resolve_rule(rule);
+-	if (ret)
++	if (ret) {
+ 		pr_err("cannot resolve policy symbol '%s' (error %d)\n",
+ 		       rule->symbol, ret);
+-	return ret;
++		return ret;
++	}
++	if (!kcsan_nfs_scope_contains(scope, rule->start_ip) ||
++	    !kcsan_nfs_scope_contains(scope, rule->end_ip - 1)) {
++		pr_err("policy symbol '%s' is outside %s\n",
++		       rule->symbol, rule->subsystem);
++		return -EINVAL;
++	}
++	policy->scope = scope;
++	return 0;
+ }
+ 
+ static int parse_policy_header(char *line, struct kcsan_policy *policy)
+@@ -205,8 +242,14 @@ int kcsan_policy_register_payload(const char *payload, size_t len)
+ 				break;
+ 			}
+ 		}
+-		if (!ret)
++		/* One VM can install watchpoints in only one candidate scope. */
++		if (!ret && active_scope != KCSAN_NFS_SCOPE_ALL &&
++		    active_scope != policy->scope)
++			ret = -EBUSY;
++		if (!ret) {
+ 			list_add_tail(&policy->node, &kcsan_policy_store);
++			WRITE_ONCE(active_scope, policy->scope);
++		}
+ 	}
+ 	mutex_unlock(&kcsan_policy_store_lock);
+ 	if (ret)
+diff --git a/kernel/kcsan/policy.h b/kernel/kcsan/policy.h
+index b17144a3a..4ca8e58f6 100644
+--- a/kernel/kcsan/policy.h
++++ b/kernel/kcsan/policy.h
+@@ -18,6 +18,18 @@
+ #define KCSAN_POLICY_CANDIDATE_ID_LEN	KCOV_POLICY_CANDIDATE_ID_LEN
+ #define KCSAN_POLICY_SUBSYSTEM_LEN	64
+ 
++enum kcsan_nfs_scope {
++	KCSAN_NFS_SCOPE_ALL,
++	KCSAN_NFS_SCOPE_NFS,
++	KCSAN_NFS_SCOPE_NFS_COMMON,
++	KCSAN_NFS_SCOPE_LOCKD,
++	KCSAN_NFS_SCOPE_SUNRPC,
++	KCSAN_NFS_SCOPE_NFSD,
++};
++
++bool kcsan_nfs_scope_contains(enum kcsan_nfs_scope scope, unsigned long ip);
++enum kcsan_nfs_scope kcsan_policy_watch_scope(void);
++
+ struct kcsan_policy_rule {
+ 	char symbol[KSYM_NAME_LEN];
+ 	char subsystem[KCSAN_POLICY_SUBSYSTEM_LEN];
+@@ -40,6 +52,7 @@ struct kcsan_policy {
+ 	u32 default_task_delay_us;
+ 	u32 default_interrupt_delay_us;
+ 	u32 nr_rules;
++	enum kcsan_nfs_scope scope;
+ 	struct kcsan_policy_rule rules[];
+ };
+ 
+-- 
+2.43.0
+

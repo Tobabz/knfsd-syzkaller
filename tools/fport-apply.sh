@@ -66,34 +66,51 @@ fi
 
 if test "$DRY_RUN" -eq 1; then
     echo "[fport-apply] dry-run: would run git am -3 on $bundle/*.patch"
-    exit 0
-fi
-
-fails=0
-for p in "$bundle"/*.patch; do
-    name=$(basename "$p")
-    # Stable committer identity and date: the same base and patch bytes always
-    # yield the same commits, so re-applying an unchanged series reproduces the
-    # kernel commit that harness descriptors and target mappings are bound to.
-    if GIT_COMMITTER_NAME=knfsd-fuzz GIT_COMMITTER_EMAIL=knfsd-fuzz@localhost \
-        git -C "$target" am -3 --committer-date-is-author-date "$p"; then
-        echo "[fport-apply] applied: $name"
-    else
-        fails=$((fails + 1))
-        echo "[fport-apply] FAILED: $name" >&2
-        git -C "$target" am --show-current-patch > /tmp/apply-failing.patch 2>/dev/null || true
-        echo "[fport-apply] failing hunk preview:" >&2
-        grep -n -m 10 '^@@' /tmp/apply-failing.patch 2>/dev/null >&2 || true
-        git -C "$target" am --abort
-        echo "[fport-apply] aborted am; tree restored. For a newer kernel, resolve the" >&2
-        echo "[fport-apply] conflict with tools/bump-kernel.py, then re-run." >&2
-        break
+    if test -d "$bundle_root/kcsan/$kind"; then
+        echo "[fport-apply] dry-run: would then apply $bundle_root/kcsan/$kind/*.patch"
     fi
-done
-
-if test "$fails" -eq 0; then
-    echo "[fport-apply] series applied cleanly ($(git -C "$target" log --oneline "$actual_base"..HEAD | wc -l) commits)"
-    echo "[fport-apply] applied HEAD=$(git -C "$target" rev-parse HEAD)"
     exit 0
 fi
-exit 1
+
+apply_series() {
+    patch_dir=$1
+    label=$2
+    found=0
+    for p in "$patch_dir"/*.patch; do
+        test -f "$p" || continue
+        found=1
+        name=$(basename "$p")
+        # Stable committer identity and date makes a base plus both ordered
+        # series reproducible, regardless of the applying host's clock.
+        if GIT_COMMITTER_NAME=knfsd-fuzz GIT_COMMITTER_EMAIL=knfsd-fuzz@localhost \
+            git -C "$target" am -3 --committer-date-is-author-date "$p"; then
+            echo "[fport-apply] applied ($label): $name"
+        else
+            echo "[fport-apply] FAILED ($label): $name" >&2
+            git -C "$target" am --show-current-patch > /tmp/apply-failing.patch 2>/dev/null || true
+            echo "[fport-apply] failing hunk preview:" >&2
+            grep -n -m 10 '^@@' /tmp/apply-failing.patch 2>/dev/null >&2 || true
+            git -C "$target" am --abort >/dev/null 2>&1 || true
+            git -C "$target" reset --hard "$actual_base" >/dev/null
+            echo "[fport-apply] aborted am and restored the starting commit." >&2
+            echo "[fport-apply] For a newer kernel, resolve the conflict with" >&2
+            echo "[fport-apply] tools/bump-kernel.py, then re-run." >&2
+            return 1
+        fi
+    done
+    if test "$found" -eq 0; then
+        echo "[fport-apply] no patches in $patch_dir" >&2
+        git -C "$target" reset --hard "$actual_base" >/dev/null
+        return 1
+    fi
+}
+
+apply_series "$bundle" "$kind" || exit 1
+kcsan_bundle=$bundle_root/kcsan/$kind
+if test -d "$kcsan_bundle"; then
+    apply_series "$kcsan_bundle" "kcsan/$kind" || exit 1
+fi
+
+echo "[fport-apply] series applied cleanly ($(git -C "$target" log --oneline "$actual_base"..HEAD | wc -l) commits)"
+echo "[fport-apply] applied HEAD=$(git -C "$target" rev-parse HEAD)"
+exit 0

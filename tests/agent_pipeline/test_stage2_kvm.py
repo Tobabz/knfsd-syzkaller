@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import signal
 import struct
 import time
@@ -15,6 +16,7 @@ import pytest
 
 from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.artifacts import ArtifactStore
+from agent_pipeline.contracts import Sanitizer
 from agent_pipeline.data import canonical_json, load_record, put_record
 from agent_pipeline.journal_sink import CHANNEL_CLOSE_TIMEOUT_S
 from agent_pipeline.stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
@@ -34,14 +36,86 @@ from agent_pipeline.stage2.kvm import (
     _barrier_generation, _campaign_records, _corpus, _correlated,
     _closed_evidence_channels, _JournalChannels, _journal_artifacts,
     _journal_lane_count, _lane_template,
-    _manager_assets, _manager_cmdline, _manager_qemu_args, _staged_manager,
-    _evidence_seal_window, _seal_segment, _spool, _stop_manager,
-    _validate_runtime_authority, StepOptions,
+    _campaign_manager, _campaign_report_state, _CRASH, _KCSAN_REPORT,
+    _manager_assets, _manager_cmdline, _manager_qemu_args,
+    _staged_manager, _evidence_seal_window, _seal_segment, _spool,
+    _stop_manager, _validate_runtime_authority, StepOptions,
     stage2_timeout_budget,
 )
 from agent_pipeline.materializer import ReachabilityHarness
-
 from .stage2_host import rules_bytes
+from .fakes import COMMIT, World
+
+
+@pytest.mark.parametrize("sanitizer", [Sanitizer.KASAN, Sanitizer.KCSAN])
+def test_campaign_selects_policy_from_job_candidate(tmp_path, sanitizer, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    world = World(state, bound=False, sanitizer=sanitizer)
+    job_id = world.submit()
+    candidate_id = world.job(job_id).candidate.candidate_id
+    payload = state / "kcsan-policies" / f"{candidate_id}_policy.payload"
+    assert not payload.exists()
+    with sqlite3.connect(state / "controller.sqlite") as database:
+        world.store.db.backup(database)
+    inputs = SimpleNamespace(
+        manager={"name": "campaign"},
+        execution=SimpleNamespace(job_id=job_id, state_dir=str(state)),
+        harness=SimpleNamespace(candidate_id=candidate_id),
+        descriptor=SimpleNamespace(sanitizer=sanitizer, kernel_commit=COMMIT))
+
+    if sanitizer is Sanitizer.KASAN:
+        def unexpected_kcsan_pipeline(*args, **kwargs):
+            pytest.fail("KASAN campaign invoked the KCSAN pipeline")
+
+        monkeypatch.setattr("agent_pipeline.stage2.kvm.ProgramPolicyPipeline",
+                            unexpected_kcsan_pipeline)
+        inputs.execution.state_dir = str(state / "missing")
+    selected = _campaign_manager(inputs)
+    if sanitizer is Sanitizer.KASAN:
+        assert selected == {"name": "campaign"}
+        assert not (state / "kcsan-policies").exists()
+        for key in ("kcsan_policy_file", "kcsan_policy"):
+            inputs.manager = {key: ""}
+            with pytest.raises(Stage2StepError, match="non-KCSAN campaign"):
+                _campaign_manager(inputs)
+    else:
+        assert selected == {"name": "campaign", "kcsan_policy_file": str(payload)}
+        contents = payload.read_bytes()
+        assert contents.startswith(f"policy {candidate_id} 5 ".encode())
+        assert _campaign_manager(inputs) == selected
+        assert payload.read_bytes() == contents
+        payload.unlink()
+        assert _campaign_manager(inputs) == selected
+        assert payload.read_bytes() == contents
+        inputs.harness.candidate_id = "different-candidate"
+        with pytest.raises(Stage2StepError, match="different candidates"):
+            _campaign_manager(inputs)
+
+
+def test_kcsan_campaign_requires_controller_state():
+    inputs = SimpleNamespace(
+        manager={}, execution=SimpleNamespace(job_id="job", state_dir=None),
+        descriptor=SimpleNamespace(sanitizer=Sanitizer.KCSAN))
+    with pytest.raises(Stage2StepError, match="lacks Controller state"):
+        _campaign_manager(inputs)
+
+
+def test_kcsan_report_is_not_misclassified_as_guest_termination():
+    console = b"[  5.0] BUG: KCSAN: data-race in nfsd_svc / nfsd_svc\n"
+    assert _KCSAN_REPORT.search(console)
+    assert not _CRASH.search(console)
+    assert _campaign_report_state([], None, console) == (True, False)
+
+
+def test_fatal_console_is_distinct_from_nonfatal_manager_report(tmp_path):
+    report = tmp_path / "report0"
+    report.write_text("WARNING: recoverable warning\n")
+    log = tmp_path / "log0"
+    log.write_text("last executing program\n")
+    assert _campaign_report_state([report], log, b"") == (True, False)
+    assert _campaign_report_state([], None, b"BUG: KASAN: slab-use-after-free\n") \
+        == (True, True)
 
 
 def execution_record(**updates) -> dict:

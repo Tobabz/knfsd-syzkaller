@@ -2,9 +2,10 @@
 
 This is a host parser adapter for `agent_pipeline.materializer.PinnedSyzParser`.
 It uses the real `prog.GetTarget("linux", "amd64")` generated target and
-`target.Deserialize(data, prog.Strict)` from the exact repository pin and patch
-series. It never executes a program or infers calls from source text. No new
-syzkaller patch is needed: the public `prog` API exposes the required data.
+`target.Deserialize(data, prog.Strict)` from the exact repository pin and
+patch stacks. It never executes a program or infers calls from source text.
+The parser itself needs no special KCSAN behavior; the standard syzkaller build
+also applies the separate KCSAN campaign overlay for manager/executor policy loading.
 
 ## Build and test
 
@@ -22,9 +23,11 @@ KNFSD_SYZ_BUNDLE=/tmp/new-syz-parser-build/bundle \
   python -m pytest -q tests/agent_pipeline/syzkaller
 ```
 
-The builder creates a fresh checkout, checks out BASE, reapplies **all** patches
-in the checked-in `series` and filename order, and regenerates descriptions with
-`sys/syz-sysgen`. It builds and tests the bridge inside that module, so its
+The builder creates a fresh checkout, checks out BASE, applies the regular
+`bundle/patches/syzkaller` series followed by
+`bundle/patches/kcsan/syzkaller`, and regenerates descriptions with
+`sys/syz-sysgen`. The combined patch bytes are recorded in the identity. It
+builds and tests the bridge inside that module, so its
 dependencies are the pinned `go.mod`/`go.sum`. The source repository is read-only;
 the checkout and Go compilation cache are under the new output directory.
 The normal Go module cache is used for dependency downloads. Network access is

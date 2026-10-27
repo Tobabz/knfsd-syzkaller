@@ -102,6 +102,7 @@ class Stage2EngineConfig:
     collector_id: str
     #: The Proxy binary that will replay, for the ``--check-rules`` gate.
     replay_proxy: Path
+    state_dir: Path
     #: CrashContextWindow bound (01 §8.1): at most the syzkaller ring
     #: (``experimental.nfs_proxy_window``, 6 by default, 64 at most).
     crash_window_bound: int = 4
@@ -199,7 +200,8 @@ class Stage2CommandEngine:
             "rule_set_id": compiled.nfsprul1_ref,
             "gate_repetitions": t.gate_repetitions,
             "campaign_id": t.campaign_id,
-            "crash_bundle_ref": t.crash_bundle_ref}))
+            "crash_bundle_ref": t.crash_bundle_ref,
+            "state_dir": str(self.config.state_dir)}))
         _write(inp / "harness.json", canonical_json(harness))
         _write(inp / "descriptor.json", canonical_json(descriptor))
         _write(inp / "hcap.json", canonical_json(hcap))

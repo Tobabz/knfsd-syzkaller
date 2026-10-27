@@ -803,13 +803,17 @@ def _read_json(path: Path) -> dict:
 
 
 def series_fingerprint(kind: str, repo: Path = REPO) -> str:
-    """The checked-in ``bundle/patches/<kind>`` series digest.  It is the
-    ``series_sha256`` ``tools/bootstrap-kcov-env.py`` records for a build,
-    and, for syzkaller, the ``patch_series_sha256`` of the parser bundle
-    ``tools/syzkaller/build.py`` makes (same bytes: name, NUL, patch, NUL)."""
+    """Digest the base patch series followed by its KCSAN overlay.
+
+    It is the ``series_sha256`` recorded by bootstrap and, for syzkaller,
+    the ``patch_series_sha256`` in the parser bundle.  The byte encoding is
+    name, NUL, patch, NUL for each patch in application order.
+    """
     digest = hashlib.sha256()
-    for path in sorted((repo / "bundle" / "patches" / kind).glob("*.patch")):
-        digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    patch_root = repo / "bundle" / "patches"
+    for directory in (patch_root / kind, patch_root / "kcsan" / kind):
+        for path in sorted(directory.glob("*.patch")):
+            digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
     return digest.hexdigest()
 
 
