@@ -1,0 +1,86 @@
+{
+  "schema_version": "hcap-kvm-evidence.v1",
+  "capability_id": "HCAP-04",
+  "capability_ids": [
+    "HCAP-01",
+    "HCAP-03",
+    "HCAP-04"
+  ],
+  "observed_at": "2026-10-27",
+  "scenario": "stage2-lane-topology",
+  "execution_harness_id": "3579138bf5a438105a6c0a86ef7abadacbdb0225693d3c8d2af3724bb60970d7",
+  "mapping_identity": {
+    "execution_harness_id": "3579138bf5a438105a6c0a86ef7abadacbdb0225693d3c8d2af3724bb60970d7",
+    "kernel_commit": "2add9323103abbd7f789ced96eaf7374d687fd0d",
+    "instrumentation_sha256": "e5a999b9c38ece4b9faa0a1f318735f9edb54a84acbfbfe0b44e68e468fe6ded",
+    "vmlinux_sha256": "0a939efefddfbe1b24736a03d365902c2720db3fedccf79c49a051a221f2b4ea",
+    "kaslr_enabled": false,
+    "kaslr_offset": 0
+  },
+  "campaign_result_sha256": "596ba39dd355ccba645db56bc9e76031a159092fd4da8f1ee081292834e19f45",
+  "program_sha256": "d55988221116a08cb77daf1ccda01ae878f3607b779a04172d74359e9ac12d88",
+  "guest_lane_script_sha256": "16e0bcfa719ae8af2f75d861fddd27385b7605f5901a89dcf76fe2ff0964b665",
+  "layout": {
+    "procs": 4,
+    "lanes": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "min_executions_per_lane": 8,
+  "lanes": [
+    {
+      "lane": 0,
+      "executions": 9,
+      "foreign_program_executions": 0,
+      "attributed_executions": 9,
+      "distinct_generations": 9,
+      "proxy_acked_executions": 9,
+      "healthy_executions": 9,
+      "journal_generations": 11,
+      "generations_missing_from_journal": 0,
+      "foreign_journal_events": 0
+    },
+    {
+      "lane": 1,
+      "executions": 9,
+      "foreign_program_executions": 0,
+      "attributed_executions": 9,
+      "distinct_generations": 9,
+      "proxy_acked_executions": 9,
+      "healthy_executions": 9,
+      "journal_generations": 10,
+      "generations_missing_from_journal": 0,
+      "foreign_journal_events": 0
+    },
+    {
+      "lane": 2,
+      "executions": 8,
+      "foreign_program_executions": 0,
+      "attributed_executions": 8,
+      "distinct_generations": 8,
+      "proxy_acked_executions": 8,
+      "healthy_executions": 8,
+      "journal_generations": 9,
+      "generations_missing_from_journal": 0,
+      "foreign_journal_events": 0
+    },
+    {
+      "lane": 3,
+      "executions": 9,
+      "foreign_program_executions": 0,
+      "attributed_executions": 9,
+      "distinct_generations": 9,
+      "proxy_acked_executions": 9,
+      "healthy_executions": 9,
+      "journal_generations": 10,
+      "generations_missing_from_journal": 0,
+      "foreign_journal_events": 0
+    }
+  ],
+  "manager_exited_unexpectedly": false,
+  "crash_signature_count": 0,
+  "shareable_result_contains_target_metadata_or_addresses": false
+}

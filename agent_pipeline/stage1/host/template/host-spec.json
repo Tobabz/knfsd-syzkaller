@@ -57,9 +57,12 @@
         "bundle/lane/lane.sh"
       ],
       "validated_layout": {
-        "procs": 1,
+        "procs": 4,
         "lanes": [
-          0
+          0,
+          1,
+          2,
+          3
         ]
       }
     },
@@ -94,9 +97,12 @@
         "bundle/patches/kernel/0006-*"
       ],
       "validated_layout": {
-        "procs": 1,
+        "procs": 4,
         "lanes": [
-          0
+          0,
+          1,
+          2,
+          3
         ]
       }
     },
@@ -125,9 +131,12 @@
         "bundle/lane/boot-fixture.sh"
       ],
       "validated_layout": {
-        "procs": 1,
+        "procs": 4,
         "lanes": [
-          0
+          0,
+          1,
+          2,
+          3
         ]
       }
     },
@@ -229,6 +238,15 @@
     ],
     "HCAP-13": [
       "capability-evidence/hcap13-kvm.json"
+    ],
+    "HCAP-01": [
+      "capability-evidence/hcap04-kvm.json"
+    ],
+    "HCAP-03": [
+      "capability-evidence/hcap04-kvm.json"
+    ],
+    "HCAP-04": [
+      "capability-evidence/hcap04-kvm.json"
     ]
   },
   "missing_capability_ids": [
@@ -899,6 +917,7 @@
         "syz_open_nlm_lane_file"
       ],
       "trace_mode": "off"
-    }
+    },
+    "procs": 4
   }
 }
