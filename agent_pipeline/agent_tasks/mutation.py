@@ -14,8 +14,9 @@ from typing import Annotated, Literal, Union
 
 from pydantic import ConfigDict, Field, RootModel, model_validator
 
-from ..contracts import GapClass, Record
+from ..contracts import MUTATION_UNLISTED_GAP_ID, GapClass, Record
 from .analysis import LongText, ShortText
+from .planning import CapabilityProposal
 
 #: NFSPRUL1 id and semantic_path (03-nfs-proxy/04 §35): visible ASCII.
 SemanticId = Annotated[str, Field(min_length=1, max_length=128,
@@ -280,15 +281,32 @@ class RuleSetDecision(Record):
     rule_set: MutationRuleSet
 
 
+#: CapabilityProposal layers a Mutation Strategy proposal may name.
+MUTATION_LAYERS = ("semantic_subset", "proxy", "compiler_lowering")
+
+
 class MutationUnsupported(Record):
-    """08 §15.  ``missing_capability_id`` comes from the HCAP vocabulary; when
-    none fits it stays empty and ``reason`` names the capability (09 Agent
-    guidance)."""
+    """08 §15.  ``missing_capability_id`` comes from the HCAP vocabulary;
+    when none fits it is ``mutation_engine.unlisted`` with a proposal (#81
+    D5).  The executor refuses an empty ID as an output defect."""
 
     variant: Literal["unsupported"] = "unsupported"
     gap_class: Literal[GapClass.MUTATION_ENGINE]
     missing_capability_id: str = Field(max_length=256)
     reason: LongText
+    proposal: CapabilityProposal | None = None
+
+    @model_validator(mode="after")
+    def _proposal(self) -> MutationUnsupported:
+        if self.proposal is not None and \
+                self.proposal.layer not in MUTATION_LAYERS:
+            raise ValueError("a Mutation Strategy proposal names a "
+                             "semantic_subset, proxy or compiler_lowering "
+                             "layer")
+        if self.missing_capability_id == MUTATION_UNLISTED_GAP_ID and \
+                self.proposal is None:
+            raise ValueError(f"{MUTATION_UNLISTED_GAP_ID} needs a proposal")
+        return self
 
 
 MutationDecision = Annotated[

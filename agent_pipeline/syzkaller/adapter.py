@@ -23,6 +23,7 @@ from ..admission import (
     SyzkallerBuildManifest, SyzkallerCallTable, SyzkallerTargetIdentity,
 )
 from ..data import canonical_json, parse_json
+from ..promotion import CallShapes
 from ..materializer import (
     PARSER_CALL_NAME, PARSER_REFUSALS, ParsedProgram, SyzParseFailure,
 )
@@ -193,6 +194,25 @@ class PinnedSyzParser:
         if table != self._table:
             raise SyzParseFailure("generated target call table mismatch")
         return table
+
+    def describe(self, calls: list[str]) -> CallShapes:
+        """The pinned target's argument shapes for ``calls`` (#100)."""
+        names = sorted(set(calls))
+        if not names or any(n not in self._call_names for n in names):
+            raise SyzParseFailure("describe takes calls of the pinned table")
+        value = self._invoke("describe", "\n".join(names).encode())
+        try:
+            if set(value) != {"bridge", "call_shapes"}:
+                raise ValueError("invalid describe response")
+            shapes = CallShapes.model_validate_json(
+                canonical_json(value["call_shapes"]))
+            if (shapes.syzkaller_commit != self.identity.syzkaller_commit
+                    or shapes.target != self.identity.target
+                    or [c.call for c in shapes.calls] != names):
+                raise ValueError("inconsistent call shapes")
+            return shapes
+        except (ValueError, TypeError, KeyError, RecursionError) as error:
+            raise SyzParseFailure("invalid call shapes") from error
 
     def parse(self, program: bytes, *, identity: SyzkallerTargetIdentity) -> ParsedProgram:
         if identity != self.identity:

@@ -1,37 +1,77 @@
 {
   "schema_version": "hcap-kvm-evidence.v1",
   "capability_id": "HCAP-11",
-  "observed_at": "2026-10-20",
-  "scenario": "v41-client-expiry",
-  "execution_harness_id": "13c965c1dc8661616df0fdbc45b706383a82bab05ab79223afd5e4598827798d",
+  "observed_at": "2026-10-25",
+  "scenario": "v41-courtesy-expiry",
+  "execution_harness_id": "a9bcc791b27ef43fc58e8deeab8a7a1a4bd8b75e85cf03108972d884402aad44",
   "mapping_identity": {
-    "execution_harness_id": "13c965c1dc8661616df0fdbc45b706383a82bab05ab79223afd5e4598827798d",
-    "kernel_commit": "2add9323103abbd7f789ced96eaf7374d687fd0d",
-    "instrumentation_sha256": "e5a999b9c38ece4b9faa0a1f318735f9edb54a84acbfbfe0b44e68e468fe6ded",
-    "vmlinux_sha256": "822e7220f79a8c9fa308e1519d4545aae8fb9f7505535851849fd14c8c9fc1c2",
+    "execution_harness_id": "a9bcc791b27ef43fc58e8deeab8a7a1a4bd8b75e85cf03108972d884402aad44",
+    "kernel_commit": "f709cc123945dbcc5d012352d8659f9d4d01b5ed",
+    "instrumentation_sha256": "1a5cfabacd5ac03aaad6d834b7317def1278de294cf3e4fb5ea4b4a49aa49290",
+    "vmlinux_sha256": "82ee5d4ccf636cb573eb9fae9adc6d3a97077639a853e38ee3894519cd47db69",
     "kaslr_enabled": false,
     "kaslr_offset": 0
   },
-  "target_mapping_sha256": "4deb75455ddc7a1c2cff2ffcbe994f24c8fbdc5cc8345d167b514f431e29eb72",
-  "campaign_result_sha256": "5bbb36283061cf0616712621b47b44acb087648d4ecf8951f41592f5cb46dad0",
+  "probe_mapping_sha256": {
+    "break_deleg": "365041605b69ffa1af919e3c02b5e184a343318e5da5fd9eef018885f81045a4",
+    "create_session": "731aea91a6948e0598568d640a9af61c1105476900a1eae27243f5f976a0e605",
+    "exchange_id": "0daea62d9dc75b0a58f7113d1d93a9978582d46923ff66906e2d4b70de169168"
+  },
+  "campaign_result_sha256": "aff1e6b0a64ab693f0bef009ab74a008fe06b2368283c9af34b669fabe2147cd",
   "guest_lane_script_sha256": "318e79ea7d288e02efdfc357a26ddcff4f80cd6605fb50d4178e95bf2e89a104",
   "guest_nfs_proxy_sha256": "df9134f9432ae158cb4aa342925b4f5fefc12c022135744d9bb30a10d2369c36",
+  "layout": {
+    "procs": 1,
+    "lanes": [
+      0
+    ]
+  },
+  "nfsv4_lease_time_s": 10,
+  "partition_hold_s": 15,
   "runs": {
     "control": {
       "completed": 3,
-      "target_hit_counts": [
-        0,
-        0,
-        0
-      ]
+      "probe_hits": {
+        "break_deleg": [
+          0,
+          0,
+          0
+        ],
+        "create_session": [
+          0,
+          0,
+          0
+        ],
+        "exchange_id": [
+          0,
+          0,
+          0
+        ]
+      },
+      "status_checks_passed": 3,
+      "attributed_generations": 3
     },
     "stimulus": {
       "completed": 3,
-      "target_hit_counts": [
-        8,
-        8,
-        8
-      ]
+      "probe_hits": {
+        "break_deleg": [
+          9,
+          9,
+          9
+        ],
+        "create_session": [
+          55,
+          55,
+          55
+        ],
+        "exchange_id": [
+          22,
+          22,
+          22
+        ]
+      },
+      "status_checks_passed": 3,
+      "attributed_generations": 3
     }
   },
   "generation_contract": {
@@ -45,7 +85,10 @@
     "minimum_remote_start_ok": 5
   },
   "recovery_order": [
-    "nfsd_clid_admin_expired",
+    "nfsd_cb_recall",
+    "nfsd_mark_client_expired",
+    "nfsd_clid_purged",
+    "OP_OPEN",
     "nfsd_clid_fresh",
     "OP_EXCHANGE_ID",
     "nfsd_slot_seqid_unconf",

@@ -12,6 +12,11 @@ Stage 2 실행 컴포넌트다. Proxy가 live record를 decode해서 target fiel
 runtime에 resolve하고, 실제 적용 결과를 durable delta로 남긴다. 이 계층이 잘못되면
 M1이 잘못 판정되고 crash 재현이 다른 record를 변조할 수 있다.
 
+Proxy는 위협 모델의 공격자를 대신한다. 실제 취약점 시나리오에서 C2S 변조는 악의적인 클라이언트가, S2C 변조는
+악의적인 서버가 직접 만든 메시지다. 이 환경은 변조를 정상 시나리오(Stage 1)와 구분하려고 클라이언트와 서버
+사이에 Proxy를 두며, Proxy가 만든 C2S record는 클라이언트가, S2C record는 서버가 보낸 것으로 본다. 그래서
+변조는 그 방향의 송신자가 protocol로 보낼 수 있는 메시지여야 한다(`../02-llm-agent/04` §3.2).
+
 용어: NFS Proxy(`tools/nfs-proxy`)는 운영 문서의 NFS 특화 Mutation Engine과 같은 컴포넌트이고,
 **Edit Applier**는 그 내부에서 resolve된 concrete edit를 검증하고 적용하는 단계다(§10).
 

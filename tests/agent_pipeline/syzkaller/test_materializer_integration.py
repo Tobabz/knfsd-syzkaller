@@ -19,7 +19,7 @@ from agent_pipeline.materializer import (
     ArtifactHarnessMaterializer, CALL_NOT_ADMITTED, CALL_UNRESOLVED,
     DISALLOWED_OR_UNAVAILABLE_CALL, ExecutionHarnessApproval,
     MaterializationReviewManifest, ParsedProgram, PROFILE_FIXTURE_ROUTE_MISMATCH,
-    StaticExecutionHarnessAuthority, _hcap11_program_error, _hcap12_program_error,
+    StaticExecutionHarnessAuthority, _hcap11_program_error,
     descriptor_id,
 )
 from agent_pipeline.syzkaller import PinnedSyzParser
@@ -28,9 +28,21 @@ from tests.agent_pipeline.test_materializer import world as synthetic_world
 
 LANE_CALL = "syz_open_nfs_lane_profile$client0_knfsd_v41"
 LANE = f"r0 = {LANE_CALL}(0x2, 0x0)\n".encode()
-EXPIRE = b"syz_nfsd_client_ctl$expire_client0(0x0)\n"
-RECONNECT = b"syz_nfsd_cld_ctl$reconnect(0x2)\n"
-DOWN = b"syz_nfsd_cld_ctl$daemon_down(0x3)\n"
+REPO = Path(__file__).resolve().parents[3]
+#: The validated HCAP-11 stimulus of the courtesy-expiry campaign.
+HCAP11 = (REPO / "tools/nfs-lifecycle/programs/"
+          "v41-courtesy-expiry.prog").read_bytes()
+
+
+def _hcap11_edit(old: bytes, new: bytes) -> bytes:
+    assert HCAP11.count(old) == 1, old
+    return HCAP11.replace(old, new)
+
+
+PARTITION = b"syz_nfs_lane_link$partition_client0(0x0, 0x0)\n"
+HEAL = b"syz_nfs_lane_link$heal_client0(0x0, 0x1)\n"
+CLIENT1_OPEN = (b"r3 = syz_open_nlm_lane_file(r2, &(0x7f0000000000)="
+                b"'lock0\\x00', 0x2)\n")
 
 
 @pytest.mark.parametrize("program,reason", [
@@ -139,20 +151,24 @@ def test_real_parser_materializer_handoff(tmp_path, program, reason):
 
 
 @pytest.mark.parametrize(("program", "reason"), [
-    (EXPIRE + LANE + b"fsync(r0)\n", None),
-    (EXPIRE +
-     b"r0 = syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1)\n"
-     b"fsync(r0)\n", "client0_recovery_missing"),
-    (LANE + EXPIRE + b"fsync(r0)\n",
-     "client0_recovery_precedes_expiry"),
-    (EXPIRE + EXPIRE + LANE + b"fsync(r0)\n", "expiry_count"),
-    (EXPIRE + LANE, "client0_recovery_io_missing"),
-    (EXPIRE + LANE + b"close(r0)\n", "client0_recovery_io_missing"),
-    (EXPIRE + LANE + b"lseek(r0, 0x0, 0x0)\n",
-     "client0_recovery_io_missing"),
-    (EXPIRE + LANE +
-     b"r1 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)\n"
-     b"fsync(r0)\n", "client0_acquisition_count"),
+    (HCAP11, None),
+    (_hcap11_edit(PARTITION, b""), "partition_count"),
+    (_hcap11_edit(HEAL, b""), "heal_count"),
+    (_hcap11_edit(HEAL, HEAL + HEAL), "heal_count"),
+    (_hcap11_edit(PARTITION, b"@").replace(HEAL, PARTITION).replace(
+        b"@", HEAL), "heal_precedes_partition"),
+    (_hcap11_edit(b"'lock0\\x00', 0x2)\nsyz_nfs_lane_link$partition",
+                  b"'lock0\\x00', 0x0)\nsyz_nfs_lane_link$partition"),
+     "client0_open_missing"),
+    (_hcap11_edit(CLIENT1_OPEN, b"").replace(b"close(r3)\n", b""),
+     "client1_conflict_missing"),
+    (_hcap11_edit(CLIENT1_OPEN, CLIENT1_OPEN + b"fsync(r0)\n"),
+     "client0_io_while_partitioned"),
+    (_hcap11_edit(b"statx(r0,", b"statx(r2,").replace(
+        b"getdents64(r0,", b"getdents64(r2,"), "client0_recovery_io_missing"),
+    (_hcap11_edit(b"syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1)",
+                  b"syz_open_nfs_lane_profile$client1_knfsd_v42(0x3, 0x1)"),
+     "non_v41_lane_acquisition"),
 ])
 def test_real_parser_hcap11_program_contract(program, reason):
     value = os.environ.get("KNFSD_SYZ_BUNDLE")
@@ -164,44 +180,3 @@ def test_real_parser_hcap11_program_contract(program, reason):
     with PinnedSyzParser(bundle, identity=identity) as parser:
         parsed_program = parser.parse(program, identity=identity)
     assert _hcap11_program_error(parsed_program) == reason
-
-
-@pytest.mark.parametrize(("program", "reason"), [
-    (EXPIRE + RECONNECT + LANE + b"fsync(r0)\n", None),
-    (EXPIRE + LANE + b"fsync(r0)\n", "cld_reconnect_count"),
-    (RECONNECT + EXPIRE + LANE + b"fsync(r0)\n", "cld_reconnect_order"),
-    (EXPIRE + LANE + RECONNECT + b"fsync(r0)\n", "cld_reconnect_order"),
-    (EXPIRE + DOWN + LANE + b"fsync(r0)\n", "cld_operation_not_validated"),
-    (EXPIRE + RECONNECT + RECONNECT + LANE + b"fsync(r0)\n",
-     "cld_reconnect_count"),
-    (EXPIRE + RECONNECT + LANE, "hcap11:client0_recovery_io_missing"),
-])
-def test_real_parser_hcap12_program_contract(program, reason):
-    value = os.environ.get("KNFSD_SYZ_BUNDLE")
-    if not value:
-        pytest.skip("build the pinned Go bridge and set KNFSD_SYZ_BUNDLE")
-    bundle = Path(value)
-    identity = SyzkallerTargetIdentity.model_validate_json(
-        (bundle / "identity.json").read_bytes())
-    with PinnedSyzParser(bundle, identity=identity) as parser:
-        parsed_program = parser.parse(program, identity=identity)
-    assert _hcap12_program_error(parsed_program) == reason
-
-
-@pytest.mark.parametrize(("name", "reason"), [
-    ("v41-cld-reconnect.prog", None),
-    ("v41-cld-daemon-down.prog", "cld_operation_not_validated"),
-    ("v41-client-expire.prog", "cld_reconnect_count"),
-])
-def test_real_parser_cld_validation_programs(name, reason):
-    value = os.environ.get("KNFSD_SYZ_BUNDLE")
-    if not value:
-        pytest.skip("build the pinned Go bridge and set KNFSD_SYZ_BUNDLE")
-    bundle = Path(value)
-    identity = SyzkallerTargetIdentity.model_validate_json(
-        (bundle / "identity.json").read_bytes())
-    program = (Path(__file__).resolve().parents[3] /
-               "tools/nfs-lifecycle/programs" / name).read_bytes()
-    with PinnedSyzParser(bundle, identity=identity) as parser:
-        parsed_program = parser.parse(program, identity=identity)
-    assert _hcap12_program_error(parsed_program) == reason

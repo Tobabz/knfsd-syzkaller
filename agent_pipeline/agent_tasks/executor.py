@@ -11,8 +11,8 @@ from typing import Protocol, Sequence
 from pydantic import BaseModel
 
 from ..artifacts import ArtifactStore
-from ..contracts import (AgentOutput, AgentTask, AgentUsage, AnalysisOutput,
-                         GapClass,
+from ..contracts import (MUTATION_UNLISTED_GAP_ID, AgentOutput, AgentTask,
+                         AgentUsage, AnalysisOutput, GapClass,
                          HarnessBinding, MaterializeRejected, PlanOutput,
                          Q1Result, Q1Status,
                          ReanalysisRequired as ControllerReanalysis,
@@ -125,8 +125,14 @@ query until the result is complete before choosing a path; never infer an
 omitted path. If the change needs a value from an earlier
 transaction, return the unsupported variant with gap_class mutation_engine
 and missing_capability_id state_lineage; if no promoted subset can express
-it, use semantic_mutation.unpromoted when the HCAP vocabulary lists it. Leave
-the id empty when none fits and name the capability in the reason.\
+it, use semantic_mutation.unpromoted. When no HCAP vocabulary ID fits, use
+mutation_engine.unlisted; never leave the ID empty or pick a nearby ID that
+does not fit. With unsupported, also return a proposal: the missing layer
+(semantic_subset, proxy or compiler_lowering), the condition the mutation
+needs, kernel source evidence for it, why each promoted capability you
+considered cannot express it, the interface to add, and the KVM evidence
+that would promote it. mutation_engine.unlisted requires the proposal. A
+proposal never creates or promotes a capability.\
 """
 
 
@@ -408,6 +414,13 @@ class Stage1AgentExecutor:
                     decision.rule_set.candidate_id != candidate_id:
                 raise OutputRejected(
                     "rule set candidate_id differs from trusted request")
+            if isinstance(decision, MutationUnsupported) and \
+                    not decision.missing_capability_id:
+                # #81 D5: an output defect, repaired within this run; it
+                # charges no Stage 2 repair.
+                raise OutputRejected(
+                    "missing_capability_id is empty; use an HCAP vocabulary "
+                    f"ID, or {MUTATION_UNLISTED_GAP_ID} with a proposal")
             return value
 
         extra = [
@@ -429,10 +442,12 @@ class Stage1AgentExecutor:
             output_type=MutationStrategyOutput, validate=validate)
         decision = validate(result.output).root
         if isinstance(decision, MutationUnsupported):
+            proposal = None if decision.proposal is None else \
+                put_record(self.artifacts, decision.proposal)
             return result, UnsupportedOutput(
                 gap_class=GapClass.MUTATION_ENGINE,
                 missing_capability_id=decision.missing_capability_id,
-                reason=decision.reason)
+                reason=decision.reason, proposal_ref=proposal)
         if not isinstance(decision, RuleSetDecision):
             raise AssertionError("unhandled Mutation Strategy output")
         return result, RuleSetOutput(

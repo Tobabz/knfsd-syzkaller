@@ -107,6 +107,25 @@ func TestCldControlPreservesDirectFD(t *testing.T) {
 	}
 }
 
+func TestLanePartitionPreservesDirectFD(t *testing.T) {
+	source := lane +
+		"r1 = syz_open_nlm_lane_file(r0, &(0x7f0000000000)='lock0\\x00', 0x2)\n" +
+		"fcntl$lock(r1, 0x6, &(0x7f0000000300)={0x1, 0x0, 0x0, 0x1000, 0x0})\n" +
+		"syz_nfs_lane_link$partition_client0(0x0, 0x0)\n" +
+		"syz_nfs_lane_link$heal_client0(0x0, 0x1)\n" +
+		"fsync(r1)\nstatx(r0, &(0x7f0000000100)='lock0\\x00', 0x0, 0x7ff, &(0x7f0000000200))\n"
+	r := mustParse(t, source)
+	origin := "nfs-profile:knfsd-v41:client0"
+	for _, index := range []int{5, 6} {
+		if len(r.Calls[index].Facts.Origins) != 1 || r.Calls[index].Facts.Origins[0].Origin != origin {
+			t.Fatalf("call %d lost lane provenance across the partition: %+v", index, r.Calls[index].Facts)
+		}
+	}
+	if r.Calls[2].Facts.Flock == nil || r.Calls[2].Facts.Flock.LockType != 1 {
+		t.Fatalf("lock type fact missing: %+v", r.Calls[2].Facts)
+	}
+}
+
 func TestNLMLaneFileKeepsLaneOrigin(t *testing.T) {
 	source := "r0 = syz_open_nfs_lane_profile$client1_knfsd_v3(0x0, 0x1)\n" +
 		"r1 = syz_open_nlm_lane_file(r0, &(0x7f0000000000)='lock0\\x00', 0x2)\n" +
@@ -131,6 +150,36 @@ func TestNLMLaneFileKeepsLaneOrigin(t *testing.T) {
 		"fcntl$lock(r1, 0x6, &(0x7f0000000300)={0x1, 0x0, 0x0, 0x1, 0x0})\n")
 	if len(r.Calls[2].Facts.Origins) != 0 {
 		t.Fatal("unrooted NLM lane file gained an origin")
+	}
+}
+
+func TestLiveSessionSocketKeepsLaneOrigin(t *testing.T) {
+	source := lane +
+		"r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)\n" +
+		"recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000000200)=\"\"/16, 0x10, 0x0, 0x0, 0x0)\n" +
+		"setsockopt$sock_linger(r1, 0x1, 0xd, &(0x7f0000000000)={0x1, 0x0}, 0x8)\n" +
+		"close(r1)\n" +
+		"fsync(r0)\n" +
+		"recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000000200)=\"\"/16, 0x10, 0x0, 0x0, 0x0)\n"
+	r := mustParse(t, source)
+	origin := "nfs-profile:knfsd-v41:client0"
+	for _, index := range []int{1, 2, 3, 4, 5} {
+		if len(r.Calls[index].Facts.Origins) != 1 || r.Calls[index].Facts.Origins[0].Origin != origin {
+			t.Fatalf("call %d lost the lane origin: %+v", index, r.Calls[index].Facts)
+		}
+	}
+	if len(r.Calls[6].Facts.Origins) != 0 {
+		t.Fatal("closed lane socket retains origin")
+	}
+	if len(r.Acquisitions) != 1 {
+		t.Fatalf("the lane socket is not an acquisition: %+v", r.Acquisitions)
+	}
+	// A socket connected through an unrooted directory stays unrooted.
+	r = mustParse(t, "r0 = openat(0xffffffffffffff9c, &(0x7f0000000000)='./file0\\x00', 0x0, 0x0)\n"+
+		"r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)\n"+
+		"recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000000200)=\"\"/16, 0x10, 0x0, 0x0, 0x0)\n")
+	if len(r.Calls[2].Facts.Origins) != 0 {
+		t.Fatal("unrooted lane socket gained an origin")
 	}
 }
 
@@ -231,6 +280,58 @@ func TestTypedRefusals(t *testing.T) {
 		var got *refusal
 		if _, err := parseProgram(targetForTest(t), []byte(source)); err == nil || errors.As(err, &got) {
 			t.Fatalf("%q: %v", source, err)
+		}
+	}
+}
+
+func TestDescribeCallShapes(t *testing.T) {
+	target := targetForTest(t)
+	shapes, err := describeCalls(target, []string{"syz_open_nlm_lane_file", "syz_nfs_lane_link$partition_client0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shapes.Calls) != 2 || shapes.Calls[0].Call != "syz_nfs_lane_link$partition_client0" {
+		t.Fatalf("calls are not sorted: %+v", shapes.Calls)
+	}
+	link := shapes.Calls[0].Leaves
+	if len(link) != 2 || !link[0].Literal || link[0].Path != "client" || *link[0].Value != 0 ||
+		!link[1].Literal || link[1].Path != "op" || *link[1].Value != 0 {
+		t.Fatalf("partition constants: %+v", link)
+	}
+	for _, leaf := range shapes.Calls[1].Leaves {
+		if leaf.Literal {
+			t.Fatalf("open file has a literal: %+v", leaf)
+		}
+	}
+	reply, err := describeCalls(target, []string{"recvfrom$nfs41_exchange_id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaf := range reply.Calls[0].Leaves {
+		if strings.HasPrefix(leaf.Path, "buf.") {
+			t.Fatalf("an output buffer position: %+v", leaf)
+		}
+	}
+	// A one-value flag set still admits 0, so it is no literal.
+	walker := &shapeWalker{}
+	flags := &prog.FlagsType{Vals: []uint64{4}}
+	if err := walker.walk(flags, prog.DirIn, "f", nil, 0); err != nil || walker.leaves[0].Literal {
+		t.Fatalf("one-value flags: %+v %v", walker.leaves, err)
+	}
+	// A one-value string carries its text.
+	walker = &shapeWalker{}
+	text := &prog.BufferType{Kind: prog.BufferString, Values: []string{"syzkaller"}}
+	if err := walker.walk(text, prog.DirIn, "s", nil, 0); err != nil ||
+		!walker.leaves[0].Literal || *walker.leaves[0].Text != "syzkaller" {
+		t.Fatalf("one-value string: %+v %v", walker.leaves, err)
+	}
+	// Past the depth limit the walk refuses instead of dropping leaves.
+	if err := (&shapeWalker{}).walk(flags, prog.DirIn, "f", nil, maxShapeDepth+1); err == nil {
+		t.Fatal("deep shape accepted")
+	}
+	for _, names := range [][]string{nil, {"no_such_call"}, {"open", "open"}} {
+		if _, err := describeCalls(target, names); err == nil {
+			t.Fatalf("describe accepted %v", names)
 		}
 	}
 }

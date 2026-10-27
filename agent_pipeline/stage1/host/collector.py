@@ -11,8 +11,12 @@ Failures are split the same way the Controller splits them:
   descriptor lacks ``nokaslr``, QEMU is missing): exit nonzero, which the
   engine records as ``capture_failed``, a runtime failure;
 * the guest ran but something failed (no boot, fixture or lane not ready,
-  executor error, guest oops): the capture is written with those facts
-  false or listed as runtime errors, and the Judge returns INCONCLUSIVE.
+  executor error): the capture is written with those facts false or
+  listed as runtime errors, and the Judge returns INCONCLUSIVE.
+
+A kernel crash is neither: it is sealed as a ``crash-report`` artifact
+(``agent_pipeline.crash``) and is not a runtime error.  A run it did not
+stop is judged as usual; a panic leaves the run incomplete.
 """
 
 from __future__ import annotations
@@ -31,13 +35,16 @@ from typing import Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...artifacts import ArtifactStore
+from ...contracts import Sanitizer
+from ...crash import CRASH_REPORT_ID, CRASH_REPORT_TYPE, CrashReport, classify
 from ...data import canonical_json, load_record
 from ...hcap import RuntimeSelection
 from ...materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ...q1 import ExecutionCorrelation, KernelIdentity
+from ...qemu_accel import Accel
 from ...sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE
 from .kcov import (STATE_COMMAND, STATS_COMMAND, LaneRun, capture_records,
-                   fatal_dmesg, lane_state_ok, parse_cover_pcs, parse_stats,
+                   lane_state_ok, parse_cover_pcs, parse_stats,
                    unsettled_generations)
 from .pins import HostFilePin, PinCache, verify_file
 from .vm import GUEST_COMMAND_TIMEOUT_S, Guest, QemuGuest, VmConfig
@@ -57,6 +64,11 @@ FIXTURE_POLL_S = 3.0
 LANE = 0
 LOG_LIMIT = 4 * 1024 * 1024
 EXECPROG_EXIT_GRACE_S = 60
+#: syzkaller program budget, in KVM seconds, for a program that holds a lane
+#: client partition (syzkaller patch 0032): the 15 s hold past the lease,
+#: the client's TCP reconnect backoff after heal, and the recovery.
+PARTITION_PROGRAM_TIMEOUT_S = 90
+PARTITION_CALL = "syz_nfs_lane_link$partition_"
 EVIDENCE_COMMAND_TIMEOUT_S = 120
 RESULT_TYPE = "application/vnd.knfsd.collector-result+json"
 LOG_TYPE = "text/plain"
@@ -76,6 +88,9 @@ class CollectorConfig(BaseModel):
     artifact_root: Path
     #: Descriptor build-artifact name -> host file pinned under that name.
     files: dict[str, Path]
+    #: Per sanitizer, the files of that variant's build (its bzImage and
+    #: vmlinux, #81 D10); they override ``files`` for its descriptors.
+    variant_files: dict[Sanitizer, dict[str, Path]] = {}
     ssh_key: Path
     qemu: str = "qemu-system-x86_64"
     memory_mb: int = Field(4096, ge=512)
@@ -85,6 +100,12 @@ class CollectorConfig(BaseModel):
     grace_s: float = Field(11, ge=0)
     drain_s: float = Field(10, ge=0)
     exec_timeout_s: float = Field(600, gt=0)
+    #: QEMU accelerator the guests run under.  ``generate`` resolves the
+    #: spec's ``auto`` on its host and, for TCG, writes the boot and
+    #: fixture budgets already scaled and the slowdown below.
+    accel: Accel = "kvm"
+    #: syz-execprog ``-slowdown`` and the scale of its watchdog.
+    exec_slowdown: int = Field(1, ge=1, le=1000)
     vmlinux_artifact_name: str = "kernel"
     instrumentation_artifact_name: str = "instrumentation"
     pin_cache: Path | None = None
@@ -92,6 +113,10 @@ class CollectorConfig(BaseModel):
     @classmethod
     def load(cls, path: Path) -> CollectorConfig:
         return cls.model_validate_json(Path(path).read_bytes())
+
+    def files_for(self, sanitizer: Sanitizer) -> dict[str, Path]:
+        """The host files a descriptor of ``sanitizer`` boots from."""
+        return {**self.files, **self.variant_files.get(sanitizer, {})}
 
 
 def verify_pins(config: CollectorConfig,
@@ -101,19 +126,20 @@ def verify_pins(config: CollectorConfig,
     store = ArtifactStore(config.artifact_root)
     cache = PinCache(config.pin_cache)
     builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
+    files = config.files_for(descriptor.sanitizer)
     missing = [n for n in (*RUN_FILES, config.vmlinux_artifact_name)
-               if n not in builds or n not in config.files]
+               if n not in builds or n not in files]
     if missing:
         raise CollectorError(f"descriptor or collector config lacks: "
                              f"{', '.join(missing)}")
-    for name, path in config.files.items():
+    for name, path in files.items():
         if name not in builds:
             raise CollectorError(f"{name} is not a descriptor build artifact")
         pin = load_record(store, builds[name], HostFilePin)
         if pin.name != name:
             raise CollectorError(f"pin for {name} names {pin.name}")
         verify_file(pin, path, cache)
-    return dict(config.files)
+    return files
 
 
 def guest_cmdline(descriptor: ExecutionHarnessDescriptor,
@@ -201,17 +227,37 @@ def execprog_timeout(timeout_s: float, slowdown: int = 1) -> int:
     return math.ceil(timeout_s * slowdown)
 
 
-def execprog_argv(timeout_s: float, slowdown: int = 1) -> str:
+def program_timeout_s(program: bytes, slowdown: int = 1) -> int | None:
+    """The raised syzkaller program budget a program needs, or None.
+
+    syzkaller's default budget is 5 s scaled by min(slowdown, 3); a program
+    that partitions a lane client waits past the lease, so it gets
+    ``PARTITION_PROGRAM_TIMEOUT_S`` under the same scale.
+    """
+    if PARTITION_CALL.encode() not in program:
+        return None
+    return PARTITION_PROGRAM_TIMEOUT_S * min(slowdown, 3)
+
+
+def execprog_argv(timeout_s: float, slowdown: int = 1,
+                  program_timeout: int | None = None) -> str:
     """Start execprog in the background.  It stops at the gate after the
-    machine check; ``EXEC_RC`` holds its exit status once it is done."""
+    machine check; ``EXEC_RC`` holds its exit status once it is done.
+    ``program_timeout`` (seconds) raises the syzkaller program budget."""
     watchdog_s = execprog_timeout(timeout_s, slowdown)
+    if program_timeout is not None and not (
+            0 < program_timeout < watchdog_s):
+        raise ValueError("program timeout must be inside the watchdog")
     argv = [f"{GUEST_DIR}/syz-execprog",
             f"-executor={GUEST_DIR}/syz-executor", "-os=linux",
             "-arch=amd64", "-vmarch=amd64", "-sandbox=none", "-procs=1",
             "-repeat=1", "-threaded=false", "-cover=true",
             "-coverfile=/tmp/cov/cover", "-remote-cover=true",
             "-disable=all", "-debug", "-vv=1", f"-slowdown={slowdown}",
-            f"-gate={GATE}", f"{GUEST_DIR}/program.syz"]
+            f"-gate={GATE}"]
+    if program_timeout is not None:
+        argv.append(f"-program-timeout={program_timeout}s")
+    argv.append(f"{GUEST_DIR}/program.syz")
     body = (f"timeout --kill-after={EXECPROG_EXIT_GRACE_S} "
             f"{watchdog_s} {shlex.join(argv)} > {EXEC_LOG} 2>&1; "
             f"echo $? > {EXEC_RC}")
@@ -281,7 +327,9 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
                         f"{GUEST_DIR}/syz-execprog")
         sleep(config.grace_s)
         timeout_s = execprog_timeout(config.exec_timeout_s, exec_slowdown)
-        _checked(guest, execprog_argv(config.exec_timeout_s, exec_slowdown))
+        _checked(guest, execprog_argv(
+            config.exec_timeout_s, exec_slowdown,
+            program_timeout_s(program.read_bytes(), exec_slowdown)))
         exec_deadline = (time.monotonic() + timeout_s
                          + EXECPROG_EXIT_GRACE_S)
         gate = _wait_execprog(guest, True, exec_deadline, sleep)
@@ -329,8 +377,6 @@ def run_lane(guest: Guest, files: dict[str, Path], program: Path,
         _, dmesg = guest.run(
             "dmesg", timeout=EVIDENCE_COMMAND_TIMEOUT_S)
         _write_log(out / "dmesg.log", dmesg)
-        for line in fatal_dmesg(dmesg)[:16]:
-            run.runtime_errors.append(f"guest: {line.strip()[:200]}")
         _collect_cover(guest, run, result)
     except Exception as exc:     # the guest side failed; keep the facts
         run.runtime_errors.append(f"{type(exc).__name__}: {str(exc)[:300]}")
@@ -366,6 +412,18 @@ def _write_log(path: Path, text: str) -> None:
     if len(data) > LOG_LIMIT:
         data = b"[truncated]\n" + data[-LOG_LIMIT:]
     path.write_bytes(data)
+
+
+def crash_report(out: Path, console: Path, descriptor:
+                 ExecutionHarnessDescriptor) -> CrashReport | None:
+    """The run's crash, from the whole console log (read after the guest
+    stopped), else from the ``dmesg`` the collector fetched."""
+    dmesg = out / "dmesg.log"
+    return classify(
+        console.read_bytes().decode("utf-8", "replace")
+        if console.is_file() else "",
+        dmesg.read_bytes().decode("utf-8", "replace")
+        if dmesg.is_file() else None, descriptor.sanitizer)
 
 
 def _tail(path: Path) -> bytes:
@@ -409,14 +467,17 @@ def collect(config: CollectorConfig, inp: Path, out: Path, *,
         qemu=config.qemu, bzimage=files["bzimage"], image=files["vm-image"],
         lane_dir=files["lane-script"].parent, ssh_key=config.ssh_key,
         cmdline=cmdline, console_log=console, memory_mb=config.memory_mb,
-        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s))
+        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s,
+        accel=config.accel))
     result: dict = {"schema_version": "stage1-collector-result.v1",
                     "vm_instance_id": vm_instance_id, "cmdline": cmdline,
+                    "qemu_accel": config.accel,
                     "runtime_selection": selection.model_dump(mode="json")}
     started = time.time_ns()
     try:
         run = run_lane(guest, files, inp / "program.syz", selection,
-                       lane_pin.sha256, config, out, result, sleep)
+                       lane_pin.sha256, config, out, result, sleep,
+                       exec_slowdown=config.exec_slowdown)
     finally:
         guest.stop()
     result["elapsed_ns"] = time.time_ns() - started
@@ -425,6 +486,8 @@ def collect(config: CollectorConfig, inp: Path, out: Path, *,
         "collection_started", "collection_completed", "extra_present")}
     result["published_pc_count"] = len(run.pcs)
     result["runtime_errors"] = run.runtime_errors
+    crash = crash_report(out, console, descriptor)
+    result["crash"] = None if crash is None else crash.model_dump(mode="json")
     observation, coverage = capture_records(
         run, candidate_id=harness.candidate_id, identity=identity,
         correlation=correlation, trace_mode=selection.trace_mode)
@@ -440,6 +503,11 @@ def collect(config: CollectorConfig, inp: Path, out: Path, *,
         {"identity": "collector-result", "type": RESULT_TYPE,
          "path": "collector-result.json"},
         {"identity": "console-log", "type": LOG_TYPE, "path": "console.log"}]
+    if crash is not None:
+        (out / "crash-report.json").write_bytes(canonical_json(crash))
+        artifacts.append({"identity": CRASH_REPORT_ID,
+                          "type": CRASH_REPORT_TYPE,
+                          "path": "crash-report.json"})
     for name in ("executor.log", "dmesg.log"):
         if (out / name).is_file():
             artifacts.append({"identity": name.removesuffix(".log") + "-log",

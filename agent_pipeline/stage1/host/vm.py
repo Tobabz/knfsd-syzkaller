@@ -1,9 +1,10 @@
-"""One disposable KVM guest booted from the pinned kernel and image.
+"""One disposable QEMU guest booted from the pinned kernel and image.
 
 Same boot as ``tools/bootstrap-kcov-env.py`` (``-snapshot`` disk overlay,
 the lane script over 9p, SSH on a loopback port), but the kernel command
 line is the approved descriptor's, and the serial console is kept as a
-file so a crash leaves evidence.
+file so a crash leaves evidence.  The guest runs under KVM or, on a host
+without it, TCG (``agent_pipeline.qemu_accel``).
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+from ...qemu_accel import Accel, AccelError, check_kvm, qemu_args
 
 GUEST_COMMAND_TIMEOUT_S = 60
 GUEST_TRANSFER_TIMEOUT_S = 300
@@ -47,6 +50,7 @@ class VmConfig:
     memory_mb: int = 4096
     cpus: int = 4
     boot_timeout_s: float = 300
+    accel: Accel = "kvm"
     #: Trusted host-only QEMU arguments, used by Stage 2 journal channels.
     extra_args: tuple[str, ...] = ()
 
@@ -68,7 +72,7 @@ class QemuGuest:
     def qemu_argv(self) -> list[str]:
         c = self.config
         return [
-            c.qemu, "-enable-kvm", "-cpu", "host",
+            c.qemu, *qemu_args(c.accel),
             "-m", str(c.memory_mb), "-smp", str(c.cpus), "-display", "none",
             "-serial", f"file:{c.console_log}", "-no-reboot", "-snapshot",
             "-fsdev", f"local,id=koov_lane,path={c.lane_dir},"
@@ -82,6 +86,12 @@ class QemuGuest:
             *c.extra_args]
 
     def start(self) -> None:
+        if self.config.accel == "kvm":
+            try:
+                check_kvm()
+            except AccelError as exc:
+                raise GuestError(
+                    f"{exc}; this host needs accel tcg") from exc
         self.process = subprocess.Popen(
             self.qemu_argv(), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

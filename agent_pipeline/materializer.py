@@ -49,6 +49,7 @@ from .hcap import (
     Q1Observation,
     ReachabilityPlan,
     RuntimeSelection,
+    STAGE1_LAYOUT,
 )
 
 
@@ -233,103 +234,116 @@ class ParsedProgram(MaterializerRecord):
 
 
 HCAP11_ID = "HCAP-11"
-HCAP11_EXPIRE = "syz_nfsd_client_ctl$expire_client0"
-HCAP11_ACQUIRE = "syz_open_nfs_lane_profile$client0_knfsd_v41"
+HCAP11_PARTITION = "syz_nfs_lane_link$partition_client0"
+HCAP11_HEAL = "syz_nfs_lane_link$heal_client0"
+HCAP11_LINK_PREFIX = "syz_nfs_lane_link$"
+HCAP11_OPEN = "syz_open_nlm_lane_file"
+#: syz_open_nlm_lane_file mode the campaign validated: read-write, which
+#: gets client0 a write delegation.
+HCAP11_OPEN_RDWR = 2
 HCAP11_ORIGIN = "nfs-profile:knfsd-v41:client0"
+HCAP11_CLIENT1_ORIGIN = "nfs-profile:knfsd-v41:client1"
+HCAP11_ORIGINS = frozenset({HCAP11_ORIGIN, HCAP11_CLIENT1_ORIGIN})
 HCAP11_RECOVERY_IO = frozenset({
     "flock", "fsync", "getdents64", "openat", "read", "renameat2",
     "statx", "unlinkat", "write",
 })
 
 
+def _call_origins(call: ParsedCall) -> set[str]:
+    return {fact.origin for fact in call.resource_facts.origins}
+
+
+def _rdwr_open(call: ParsedCall, origin: str) -> bool:
+    """A read-write syz_open_nlm_lane_file beneath a lane dir of ``origin``."""
+    if call.call != HCAP11_OPEN or origin not in _call_origins(call):
+        return False
+    mode = next((fact.value for fact in call.resource_facts.integers
+                 if fact.argument_index == 2), None)
+    return mode == HCAP11_OPEN_RDWR
+
+
 def _hcap11_program_error(parsed: ParsedProgram) -> str | None:
     """Return why a program is outside HCAP-11's validated sequence.
 
-    Per-call admission proves that each individual pseudo-syscall and fd use
-    is allowed.  It cannot prove the cross-call contract validated by the KVM
-    campaign: one client0 expiry, followed by a fresh client0 profile
-    acquisition.  Keep that small temporal/client constraint at the
-    Materializer trust boundary.
-    """
-    expiry = [call.index for call in parsed.calls
-              if call.call == HCAP11_EXPIRE]
-    if len(expiry) != 1:
-        return "expiry_count"
+    Per-call admission proves that each individual call and fd use is
+    allowed.  It cannot prove the cross-call contract validated by the KVM
+    campaign, which every trigger in it is an NFS client action:
 
-    acquisitions = [call.index for call in parsed.calls
-                    if call.call == HCAP11_ACQUIRE]
-    if not acquisitions:
-        return "client0_recovery_missing"
-    if len(acquisitions) != 1:
-        return "client0_acquisition_count"
-    if any(index <= expiry[0] for index in acquisitions):
-        return "client0_recovery_precedes_expiry"
+    1. client0 opens a lane file read-write, and the server gives it a write
+       delegation;
+    2. client0 partitions itself from the server past the NFSv4 lease, so
+       the server keeps it only as a courtesy client;
+    3. client1 opens the same file read-write; the delegation break finds
+       the courtesy client0, and the server expires it to grant the open;
+    4. client0 heals and does ordinary I/O, which drives its EXCHANGE_ID
+       then CREATE_SESSION recovery.
+
+    Keep that small temporal/client constraint at the Materializer trust
+    boundary.  Which lane file each open names is not a parser fact; a
+    program that opens different files only fails to reach the path.
+    """
+    partitions = [call.index for call in parsed.calls
+                  if call.call == HCAP11_PARTITION]
+    heals = [call.index for call in parsed.calls if call.call == HCAP11_HEAL]
+    if len(partitions) != 1:
+        return "partition_count"
+    if len(heals) != 1:
+        return "heal_count"
+    partition, heal = partitions[0], heals[0]
+    if heal < partition:
+        return "heal_precedes_partition"
+    if any(call.call.startswith(HCAP11_LINK_PREFIX)
+           and call.call not in (HCAP11_PARTITION, HCAP11_HEAL)
+           for call in parsed.calls):
+        return "non_client0_link_call"
 
     origins = {item.resource_origin for item in parsed.nfs_acquisitions}
-    if origins != {HCAP11_ORIGIN}:
-        return "non_client0_acquisition"
+    if not origins <= HCAP11_ORIGINS or HCAP11_ORIGIN not in origins:
+        return "non_v41_lane_acquisition"
 
-    # Reject another lane-profile selector even if a future admission profile
-    # happens to grant it through a different capability.
-    if any(call.call.startswith("syz_open_nfs_lane_profile$")
-           and call.call != HCAP11_ACQUIRE for call in parsed.calls):
-        return "non_client0_profile_call"
+    if not any(_rdwr_open(call, HCAP11_ORIGIN)
+               for call in parsed.calls if call.index < partition):
+        return "client0_open_missing"
+    if not any(_rdwr_open(call, HCAP11_CLIENT1_ORIGIN)
+               for call in parsed.calls if partition < call.index < heal):
+        return "client1_conflict_missing"
+    # Only client1 runs while client0 is partitioned: a client0 request then
+    # would wait on the dead link and could renew the lease once it heals.
+    if any(HCAP11_ORIGIN in _call_origins(call)
+           for call in parsed.calls if partition < call.index < heal):
+        return "client0_io_while_partitioned"
 
-    # Acquiring the profile alone does not establish the validated recovery
-    # path.  Require a later ordinary operation whose FD provenance still
-    # names client0.  close and lseek are deliberately excluded because they
-    # need not drive an NFS request.
-    first_acquisition = acquisitions[0]
+    # Healing alone does not establish the validated recovery path.  Require
+    # a later ordinary operation whose FD provenance still names client0.
+    # close and lseek are deliberately excluded because they need not drive
+    # an NFS request.
     recovery_io = [
         call.index for call in parsed.calls
-        if (call.index > first_acquisition
-            and call.call in HCAP11_RECOVERY_IO
-            and any(fact.origin == HCAP11_ORIGIN
-                    for fact in call.resource_facts.origins))
+        if (call.index > heal and call.call in HCAP11_RECOVERY_IO
+            and HCAP11_ORIGIN in _call_origins(call))
     ]
     if not recovery_io:
         return "client0_recovery_io_missing"
     return None
 
 
-HCAP12_ID = "HCAP-12"
-HCAP12_CLD_PREFIX = "syz_nfsd_cld_ctl$"
-HCAP12_RECONNECT = "syz_nfsd_cld_ctl$reconnect"
-
-
-def _hcap12_program_error(parsed: ParsedProgram) -> str | None:
-    """Return why a program is outside HCAP-12's validated sequence.
-
-    HCAP-12 extends the HCAP-11 recovery sequence with exactly one bounded
-    nfsdcld reconnect between the client0 expiry and the fresh client0
-    acquisition, so the recovery's tracking create meets a pipe whose reader
-    is being replaced.  Any other nfsdcld control operation (the
-    daemon-down validation operation included) is outside the validated
-    subset and is refused here regardless of per-call grants.
-    """
-    error = _hcap11_program_error(parsed)
-    if error is not None:
-        return f"hcap11:{error}"
-    controls = [call for call in parsed.calls
-                if call.call.startswith(HCAP12_CLD_PREFIX)]
-    if any(call.call != HCAP12_RECONNECT for call in controls):
-        return "cld_operation_not_validated"
-    if len(controls) != 1:
-        return "cld_reconnect_count"
-    expiry = next(call.index for call in parsed.calls
-                  if call.call == HCAP11_EXPIRE)
-    acquisition = next(call.index for call in parsed.calls
-                       if call.call == HCAP11_ACQUIRE)
-    if not expiry < controls[0].index < acquisition:
-        return "cld_reconnect_order"
-    return None
+#: nfsdcld control stops and restarts a server daemon, which no NFS client
+#: can do (04 §3.2 trigger rule).  HCAP-12 was withdrawn for it (#98); the
+#: executor call stays for fixture work but is never admitted.
+NFSD_CLD_CONTROL_PREFIX = "syz_nfsd_cld_ctl$"
+#: The server admin interface write (/proc/fs/nfsd/clients/<id>/ctl) that
+#: the first HCAP-11 used is not an NFS client action either (#96): the
+#: executor call stays for fixture work but is never admitted.
+NFSD_CLIENT_CONTROL_PREFIX = "syz_nfsd_client_ctl$"
 
 
 HCAP13_ID = "HCAP-13"
 HCAP13_FIXTURE = "nlm-knfsd"
+#: syz_open_nlm_lane_file is left out: it only opens a regular file beneath
+#: any lane directory, and HCAP-11 locks v4.1 lane files through it.
 HCAP13_CALLS = frozenset({
-    "recvfrom$inet_nlm_tcp", "syz_nlm_lane_fh", "syz_open_nlm_lane_file",
-    "syz_send_nlm_rpc",
+    "recvfrom$inet_nlm_tcp", "syz_nlm_lane_fh", "syz_send_nlm_rpc",
 })
 HCAP13_CALL_PREFIXES = ("syz_socket_connect_nlm$",)
 
@@ -634,6 +648,9 @@ class ArtifactHarnessMaterializer:
             if set(use.unvalidated_scope) != unvalidated:
                 violations.append(
                     f"unvalidated_scope_not_explicit:{capability.id}")
+            # Stage 1 runs one proc on lane 0 (#99).
+            if not capability.layout().covers(STAGE1_LAYOUT.procs):
+                violations.append(f"layout_not_validated:{capability.id}")
             interfaces.update(capability.interface.syz_calls)
             interfaces.update(capability.interface.runtime_features)
         for interface in plan.runtime_selection.enabled_interfaces:
@@ -763,18 +780,13 @@ class ArtifactHarnessMaterializer:
                for item in parsed.nfs_acquisitions):
             self._fail(PROFILE_FIXTURE_ROUTE_MISMATCH,
                        f"{role}_nfs_profile_mismatch")
-        hcap12 = role == "scenario" and HCAP12_ID in required_capabilities
-        if hcap12:
-            error = _hcap12_program_error(parsed)
-            if error is not None:
-                self._fail(CALL_NOT_ADMITTED,
-                           f"{role}_hcap12_program_contract:{error}")
-        elif any(call.call.startswith(HCAP12_CLD_PREFIX)
-                 for call in parsed.calls):
-            # nfsdcld control perturbs a shared lane daemon; only the
-            # HCAP-12 scenario contract may carry it, never a neutral control.
-            self._fail(CALL_NOT_ADMITTED,
-                       f"{role}_hcap12_program_contract:cld_without_hcap12")
+        if any(call.call.startswith(NFSD_CLD_CONTROL_PREFIX)
+               for call in parsed.calls):
+            # Refused even when an older admission authority grants it.
+            self._fail(CALL_NOT_ADMITTED, f"{role}_server_daemon_control")
+        if any(call.call.startswith(NFSD_CLIENT_CONTROL_PREFIX)
+               for call in parsed.calls):
+            self._fail(CALL_NOT_ADMITTED, f"{role}_server_admin_control")
         error = _hcap13_program_error(
             parsed, role=role, selection=selection,
             required_capabilities=required_capabilities)
@@ -787,6 +799,12 @@ class ArtifactHarnessMaterializer:
             if error is not None:
                 self._fail(CALL_NOT_ADMITTED,
                            f"{role}_hcap11_program_contract:{error}")
+        elif any(call.call.startswith(HCAP11_LINK_PREFIX)
+                 for call in parsed.calls):
+            # A partition silences a shared lane client; only the HCAP-11
+            # scenario contract may carry it, never a neutral control.
+            self._fail(CALL_NOT_ADMITTED,
+                       f"{role}_hcap11_program_contract:partition_without_hcap11")
 
         resolved_calls = set(call_table.calls)
         selected: set[str] = set()

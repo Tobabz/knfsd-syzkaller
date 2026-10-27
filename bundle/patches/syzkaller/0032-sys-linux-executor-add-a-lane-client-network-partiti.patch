@@ -1,0 +1,308 @@
+From d018aeebf590d3136c7d2014b7c43ba72ee6e1ee Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Sun, 25 Oct 2026 15:46:07 +0000
+Subject: [PATCH] sys/linux, executor: add a lane client network partition
+
+A lane client can stop talking to its server without the harness acting
+on the server: syz_nfs_lane_link$partition_client0 gives the client's
+only link in its own lane network namespace a blackhole root qdisc for
+15 s, longer than the single fixture's 10 s NFSv4 lease, and returns
+with the qdisc still in place.  syz_nfs_lane_link$heal_client0 deletes
+it.  Each call fails with EALREADY unless it changes the link.
+
+The blackhole qdisc drops every packet the client sends and reports
+success, so the client sees a silent network rather than a local error,
+and the link keeps its addresses and routes.  A link taken down instead
+makes the client's lease renewal fail with ENETUNREACH and drops the
+lane's static route to the second server address.
+
+partition carries a 16 s call timeout so the executor waits for it, and
+heal a 30 s program timeout so the client's recovery requests that
+follow it, which wait on TCP retransmission backoff, finish inside the
+program.  The fork server deletes every lane client's qdisc after each
+program, so no partition outlives the program that made it.
+---
+ executor/common.h            |   1 +
+ executor/common_linux.h      | 171 ++++++++++++++++++++++++++++++++++-
+ pkg/vminfo/linux_syscalls.go |   1 +
+ sys/linux/fs_nfs_fuzz.txt    |  11 +++
+ sys/linux/nfs_fuzz_test.go   |  30 ++++++
+ 5 files changed, 213 insertions(+), 1 deletion(-)
+
+diff --git a/executor/common.h b/executor/common.h
+index 2234c8111..e59f00062 100644
+--- a/executor/common.h
++++ b/executor/common.h
+@@ -774,6 +774,7 @@ static void loop(void)
+ 		// Close the NFS proxy activation window once nothing of the program
+ 		// is left, and before the KCOV generation is aborted.
+ 		nfsp_broker_end();
++		nfs_lane_restore_links();
+ #endif
+ #if SYZ_EXECUTOR && GOOS_linux
+ 		// Cover hangs, crashes, and the BEGIN-return/shared-publication race.  If
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 7c865216c..e20833aa2 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2830,8 +2830,12 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+     __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || \
+     __NR_syz_nfsd_client_ctl || __NR_syz_nfsd_cld_ctl || __NR_syz_send_nfs_fuzz || \
+     __NR_syz_socket_connect_nlm || __NR_syz_open_nlm_lane_file || \
+-    __NR_syz_nlm_lane_fh || __NR_syz_send_nlm_rpc
++    __NR_syz_nlm_lane_fh || __NR_syz_send_nlm_rpc || __NR_syz_nfs_lane_link
+ #include <fcntl.h>
++#include <linux/netlink.h>
++#include <linux/pkt_sched.h>
++#include <linux/rtnetlink.h>
++#include <net/if.h>
+ #include <sched.h>
+ #include <stdio.h>
+ #include <sys/socket.h>
+@@ -3173,6 +3177,171 @@ static long syz_nfsd_client_ctl(volatile long a0)
+ 	return 0;
+ }
+ 
++// A lane client's network partition.  The client's only link in its own lane
++// network namespace drops everything the client sends for a fixed hold that
++// outlasts the single fixture's 10 s NFSv4 lease, so the server sees a client
++// that stopped renewing.  The link gets a blackhole root qdisc, which drops
++// each packet and reports success: the client sees a silent network, as when
++// a cable is pulled further along, not a local error.  The link stays up and
++// its addresses and routes are untouched (a link taken down loses the lane's
++// static route to the second server address).  Nothing in the server
++// namespace is touched.  Heal deletes the qdisc, and the fork server deletes
++// it after every program in case a program ended while partitioned.
++#define NFS_LANE_PARTITION_HOLD_MS 15000
++
++enum {
++	NFS_LANE_LINK_PARTITION = 0,
++	NFS_LANE_LINK_HEAL = 1,
++};
++
++// Add a blackhole root qdisc to a link, or delete the root qdisc.  Returns 0,
++// or -1 with errno set: EEXIST when adding over a qdisc that is already
++// there, ENOENT when deleting the default qdisc.
++static int nfs_lane_root_qdisc(int ifindex, bool blackhole)
++{
++	int sock = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
++	if (sock < 0)
++		return -1;
++	struct {
++		struct nlmsghdr hdr;
++		struct tcmsg tcm;
++		char attrs[64];
++	} req;
++	memset(&req, 0, sizeof(req));
++	req.hdr.nlmsg_type = blackhole ? RTM_NEWQDISC : RTM_DELQDISC;
++	req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
++	if (blackhole)
++		req.hdr.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
++	req.tcm.tcm_family = AF_UNSPEC;
++	req.tcm.tcm_ifindex = ifindex;
++	req.tcm.tcm_parent = TC_H_ROOT;
++	int len = NLMSG_LENGTH(sizeof(req.tcm));
++	if (blackhole) {
++		static const char kind[] = "blackhole";
++		struct rtattr* attr = (struct rtattr*)((char*)&req + NLMSG_ALIGN(len));
++		attr->rta_type = TCA_KIND;
++		attr->rta_len = RTA_LENGTH(sizeof(kind));
++		memcpy(RTA_DATA(attr), kind, sizeof(kind));
++		len = NLMSG_ALIGN(len) + RTA_ALIGN(attr->rta_len);
++	}
++	req.hdr.nlmsg_len = len;
++	struct sockaddr_nl addr;
++	memset(&addr, 0, sizeof(addr));
++	addr.nl_family = AF_NETLINK;
++	int ret = -1;
++	int saved_errno = EPROTO;
++	if (sendto(sock, &req, len, 0, (struct sockaddr*)&addr, sizeof(addr)) != len) {
++		saved_errno = errno;
++	} else {
++		char reply[512];
++		ssize_t n = recv(sock, reply, sizeof(reply), 0);
++		struct nlmsghdr* hdr = (struct nlmsghdr*)reply;
++		if (n < 0) {
++			saved_errno = errno;
++		} else if (n >= (ssize_t)NLMSG_LENGTH(sizeof(struct nlmsgerr)) &&
++			   hdr->nlmsg_type == NLMSG_ERROR) {
++			int error = -((struct nlmsgerr*)NLMSG_DATA(hdr))->error;
++			if (error == 0)
++				ret = 0;
++			else
++				saved_errno = error;
++		}
++	}
++	close(sock);
++	if (ret < 0)
++		errno = saved_errno;
++	return ret;
++}
++
++// Partition (up false) or heal (up true) the one non-loopback link in a
++// client's lane network namespace.  Returns 1 when that changed the link, 0
++// when it already was in that state, and -1 with errno set otherwise.
++static int nfs_lane_client_link(unsigned long client, bool up)
++{
++	if (client > 1 || nfs_fuzz_netns_fds[client] < 0) {
++		errno = ENODEV;
++		return -1;
++	}
++	int current_netns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
++	if (current_netns < 0)
++		return -1;
++	if (setns(nfs_fuzz_netns_fds[client], CLONE_NEWNET)) {
++		int saved_errno = errno;
++		close(current_netns);
++		errno = saved_errno;
++		return -1;
++	}
++	int ret = -1;
++	int saved_errno = ENODEV;
++	struct if_nameindex* links = if_nameindex();
++	if (!links) {
++		saved_errno = errno;
++	} else {
++		int ifindex = 0;
++		int found = 0;
++		for (struct if_nameindex* link = links; link->if_index; link++) {
++			if (strcmp(link->if_name, "lo") == 0)
++				continue;
++			ifindex = link->if_index;
++			found++;
++		}
++		if (found == 1) {
++			if (nfs_lane_root_qdisc(ifindex, !up) == 0)
++				ret = 1;
++			else if (errno == (up ? ENOENT : EEXIST))
++				ret = 0;
++			else
++				saved_errno = errno;
++		}
++		if_freenameindex(links);
++	}
++	if (setns(current_netns, CLONE_NEWNET))
++		fail("restore network namespace after NFS lane link change failed");
++	close(current_netns);
++	if (ret < 0)
++		errno = saved_errno;
++	return ret;
++}
++
++static long syz_nfs_lane_link(volatile long a0, volatile long a1)
++{
++	// syz_nfs_lane_link(client const[0:1], op const[0:1])
++	// partition makes the client's link drop everything and returns after
++	// the hold with the link still dropping; heal brings it back.  Both fail
++	// unless they change the link, so a program cannot partition twice or
++	// heal a live client.
++	unsigned long client = a0, op = a1;
++	if (client > 1 || op > NFS_LANE_LINK_HEAL) {
++		errno = EINVAL;
++		return -1;
++	}
++	int changed = nfs_lane_client_link(client, op == NFS_LANE_LINK_HEAL);
++	if (changed < 0)
++		return -1;
++	if (changed == 0) {
++		errno = EALREADY;
++		return -1;
++	}
++	if (op == NFS_LANE_LINK_PARTITION)
++		sleep_ms(NFS_LANE_PARTITION_HOLD_MS);
++	return 0;
++}
++
++// Fork server, after every program: no partition outlives the program that
++// made it.  A sandbox that may not enter the lane network namespace (EPERM,
++// as in the namespace sandbox of the machine check) cannot have partitioned
++// it either.
++static void nfs_lane_restore_links()
++{
++	for (unsigned long client = 0; client < 2; client++) {
++		if (nfs_fuzz_netns_fds[client] < 0)
++			continue;
++		if (nfs_lane_client_link(client, true) < 0 && errno != EPERM)
++			failmsg("restore NFS lane client link failed", "client=%lu errno=%d",
++				client, errno);
++	}
++}
++
+ static long syz_nfsd_cld_ctl(volatile long a0)
+ {
+ 	// The same server-side broker owns one bounded nfsdcld transaction per
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index b71c32c0e..be9a65a67 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -119,6 +119,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_arm_nfs_proxy_v2":          alwaysSupported,
+ 	"syz_nfsd_client_ctl":           alwaysSupported,
+ 	"syz_nfsd_cld_ctl":              alwaysSupported,
++	"syz_nfs_lane_link":             alwaysSupported,
+ 	"syz_send_nfs_fuzz":             alwaysSupported,
+ 	"syz_socket_connect_nlm":        alwaysSupported,
+ 	"syz_open_nlm_lane_file":        alwaysSupported,
+diff --git a/sys/linux/fs_nfs_fuzz.txt b/sys/linux/fs_nfs_fuzz.txt
+index 8f4a66698..6744dca4a 100644
+--- a/sys/linux/fs_nfs_fuzz.txt
++++ b/sys/linux/fs_nfs_fuzz.txt
+@@ -61,6 +61,17 @@ syz_open_nfs_lane_profile$client1_ganesha_v41(profile const[4], client const[1])
+ syz_nfsd_client_ctl$expire_client0(client const[0])
+ syz_nfsd_client_ctl$expire_client1(client const[1])
+ 
++# A client-side network partition: the lane client's only link in its own
++# network namespace drops everything the client sends (a blackhole root
++# qdisc) for 15 s, which outlasts the single fixture's 10 s NFSv4 lease, and
++# the call returns with the link still dropping.  heal brings it back.  Each
++# call fails with EALREADY unless it changes the link.  The fork server heals
++# every client after each program.  heal's program timeout lets the client's
++# recovery requests that follow it, which wait on TCP retransmission backoff,
++# finish inside the program.
++syz_nfs_lane_link$partition_client0(client const[0], op const[0]) (timeout[16000])
++syz_nfs_lane_link$heal_client0(client const[0], op const[1]) (prog_timeout[30000])
++
+ # Ask the same broker for one bounded nfsdcld transaction on this lane.  The
+ # broker validates the daemon (namespaces, executable, argv, start time and
+ # CLD pipe inode) and owns the executable, the pipe and both fixed windows.
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 8ab22d720..0209d4337 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -388,6 +388,36 @@ func TestNFSCldControl(t *testing.T) {
+ 	}
+ }
+ 
++func TestNFSLaneClientPartition(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, want := range []struct {
++		name        string
++		op          uint64
++		timeout     uint64
++		progTimeout uint64
++	}{
++		{"syz_nfs_lane_link$partition_client0", 0, 16000, 0},
++		{"syz_nfs_lane_link$heal_client0", 1, 0, 30000},
++	} {
++		call := requireNFSFuzzCall(t, target, want.name)
++		if call.CallName != "syz_nfs_lane_link" || len(call.Args) != 2 {
++			t.Fatalf("%s has wrong dispatch or arity", call.Name)
++		}
++		requireConst(t, call.Args[0].Type, 0, call.Name+" client")
++		requireConst(t, call.Args[1].Type, want.op, call.Name+" op")
++		if call.Ret != nil {
++			t.Fatalf("%s returns %T, want status-only pseudo call", call.Name, call.Ret)
++		}
++		if call.Attrs.Timeout != want.timeout || call.Attrs.ProgTimeout != want.progTimeout {
++			t.Fatalf("%s timeouts %d/%d, want %d/%d", call.Name, call.Attrs.Timeout,
++				call.Attrs.ProgTimeout, want.timeout, want.progTimeout)
++		}
++	}
++}
++
+ // TestNFSProxyVariableLengthArm checks the v2 (NFSPARM2) wire packet: unlike
+ // nfs_proxy_arm, its size is NOT fixed, so this asserts shape (fields, length
+ // linkage, magic) rather than a byte count, and that it shares its lifetime FD

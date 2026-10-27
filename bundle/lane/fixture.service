@@ -10,7 +10,9 @@ ExecStart=/opt/frozen-phase9/boot-fixture.sh
 ExecStartPost=/run/frozen-phase9/lane.sh status /tmp/frozen-phase9.manager
 ExecStop=/run/frozen-phase9/lane.sh cleanup /tmp/frozen-phase9.manager
 RemainAfterExit=yes
-TimeoutStartSec=180
+# Under TCG (no KVM) the four-lane start takes several minutes; KVM takes
+# well under one.  The collector waits on its own, slowdown-scaled budget.
+TimeoutStartSec=1800
 TimeoutStopSec=120
 
 [Install]

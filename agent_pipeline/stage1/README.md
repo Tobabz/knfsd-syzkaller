@@ -40,6 +40,13 @@ python -m agent_pipeline.stage1 --config stage1.json run --job <job id>
 approval with `approve JOB TASK REVIEW_MANIFEST_SHA256 DECISION_ID`, then
 `run` again; `replay JOB` re-checks the stored transitions.
 
+`seed JOB --policy kcsan-default` starts a new job for JOB's candidate
+under another policy (another sanitizer, #81 R5) from JOB's plan: no
+Analysis or Planning, the plan is re-validated against the new binding's
+HCAP and materialized, and Q1 must reach again on that harness. Register
+the target-PC mapping of the new harness's vmlinux first (`target-pcs`
+takes the job's own harness).
+
 Only `run` calls a model. Every other command is one-shot: an Agent Task
 it creates (`submit`, `deny`, `operator resume`, a resolved issue) is
 recorded with its attempt left `sending`, and `run`, or a `run` already
@@ -99,7 +106,10 @@ The command writes `output/capture.json`:
 
 `reachability.json` is a canonical `q1.RemoteKcovObservation` and each
 coverage file a canonical `sealed_q1.PublishedCoverage` for the same
-correlation (see the Q1 section of [`../README.md`](../README.md)). Paths are plain file names
+correlation. A run with a kernel crash also lists a `crash-report`
+artifact (`application/vnd.knfsd.crash-report+json`, a canonical
+`crash.CrashReport`); the crash is not a runtime error, and the Controller
+keeps it as a crash finding on the job (see the Q1 section of [`../README.md`](../README.md)). Paths are plain file names
 in `output/`. The collection interval is the supervised process's own start
 and end; stdout and stderr are kept in `process.log`. A nonzero exit,
 timeout or malformed capture ends the task `capture_failed`, which the

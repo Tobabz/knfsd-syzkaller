@@ -1,0 +1,317 @@
+From 0350a62c343badf1698c92b2f857908a86028fa7 Mon Sep 17 00:00:00 2001
+From: knfsd-fuzz <knfsd-fuzz@localhost>
+Date: Fri, 23 Oct 2026 22:55:55 +0900
+Subject: [PATCH] sys/linux, executor: describe a live NFSv4.1 session on a
+ lane transport
+
+Add syz_socket_connect_nfs_lane, which takes a lane profile directory fd as
+its token, checks that it is an NFS directory, and opens a TCP connection in
+that lane's client network namespace with bounded send/receive timeouts.  It
+handles no RPC.
+
+Describe wire-exact one-op NFSv4.1 COMPOUNDs for EXCHANGE_ID,
+CREATE_SESSION and BIND_CONN_TO_SESSION as write$ records, and their replies
+as recvfrom$ structs whose clientid, sequenceid and sessionid fields are
+resources.  Later calls reuse the server's values byte for byte, so the
+program, not the executor, drives the session.  A BIND write sends 1..64
+records back to back; setsockopt$sock_linger and close reset the transport.
+
+The record marker is spelled as bytes because the big-endian 31/1 bitfield
+form places the last-fragment bit in the wrong byte.
+---
+ executor/common_linux.h       |  29 +++++++-
+ pkg/vminfo/linux_syscalls.go  |   1 +
+ sys/linux/nfs_fuzz_test.go    |  85 +++++++++++++++++++++++
+ sys/linux/socket_inet_nfs.txt | 127 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 241 insertions(+), 1 deletion(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 1321802..7c86521 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2826,7 +2826,7 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
+ 
+ #if SYZ_EXECUTOR || __NR_syz_open_nfs_lane || __NR_syz_socket_connect_nfs || \
+     __NR_syz_open_nfs_lane_pair || __NR_syz_open_nfs_lane_profile || \
+-    __NR_syz_socket_connect_nfs_pair || \
++    __NR_syz_socket_connect_nfs_pair || __NR_syz_socket_connect_nfs_lane || \
+     __NR_syz_arm_nfs_proxy || __NR_syz_arm_nfs_proxy_v2 || \
+     __NR_syz_nfsd_client_ctl || __NR_syz_nfsd_cld_ctl || __NR_syz_send_nfs_fuzz || \
+     __NR_syz_socket_connect_nlm || __NR_syz_open_nlm_lane_file || \
+@@ -2961,6 +2961,33 @@ static long syz_socket_connect_nfs_pair(volatile long a0, volatile long a1)
+ 	return nfs_socket_connect_pair(a0, a1);
+ }
+ 
++static long syz_socket_connect_nfs_lane(volatile long a0, volatile long a1,
++					volatile long a2)
++{
++	// syz_socket_connect_nfs_lane(fd fd_nfs_dir, client const[N],
++	//                             backend const[M]) sock_nfs_fuzz_tcp
++	// The profile directory is the lane token: it must be an NFS directory.
++	// Only the transport is set up here; the program writes every RPC
++	// record and reads every reply itself.  Bounded timeouts keep a
++	// missing reply from holding a non-threaded program.
++	struct stat st;
++	struct statfs sfs;
++	int profile_fd = a0;
++	if (profile_fd < 0 || fstat(profile_fd, &st) || fstatfs(profile_fd, &sfs))
++		return -1;
++	if (!S_ISDIR(st.st_mode) || sfs.f_type != 0x6969) {
++		errno = EINVAL;
++		return -1;
++	}
++	int fd = nfs_socket_connect_pair(a1, a2);
++	if (fd < 0)
++		return -1;
++	struct timeval tv = {.tv_sec = 3};
++	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++	return fd;
++}
++
+ // The NLM lane fixture pins the kernel lockd to this TCP port in every lane
+ // namespace.  Both clients reach the server's lockd at the .1 address.
+ #define NFS_LANE_NLM_PORT 4045
+diff --git a/pkg/vminfo/linux_syscalls.go b/pkg/vminfo/linux_syscalls.go
+index e33729a..b71c32c 100644
+--- a/pkg/vminfo/linux_syscalls.go
++++ b/pkg/vminfo/linux_syscalls.go
+@@ -112,6 +112,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
+ 	"syz_open_nfs_lane":             alwaysSupported,
+ 	"syz_socket_connect_nfs":        alwaysSupported,
+ 	"syz_socket_connect_nfs_pair":   alwaysSupported,
++	"syz_socket_connect_nfs_lane":   alwaysSupported,
+ 	"syz_open_nfs_lane_pair":        alwaysSupported,
+ 	"syz_open_nfs_lane_profile":     alwaysSupported,
+ 	"syz_arm_nfs_proxy":             alwaysSupported,
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 2685542..8ab22d7 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -265,6 +265,91 @@ func TestNFSNativeProfiles(t *testing.T) {
+ 	}
+ }
+ 
++func TestNFSLiveSession(t *testing.T) {
++	target, err := prog.GetTarget("linux", "amd64")
++	if err != nil {
++		t.Fatal(err)
++	}
++	connect := requireNFSFuzzCall(t, target, "syz_socket_connect_nfs_lane$client0_knfsd_v41")
++	if connect.CallName != "syz_socket_connect_nfs_lane" || len(connect.Args) != 3 {
++		t.Fatalf("%s has wrong dispatch or arity", connect.Name)
++	}
++	if res, ok := connect.Args[0].Type.(*prog.ResourceType); !ok || res.Desc.Name != "fd_nfs_dir" {
++		t.Fatalf("%s lane token is %v, want fd_nfs_dir", connect.Name, connect.Args[0].Type)
++	}
++	requireConst(t, connect.Args[1].Type, 0, connect.Name+" client")
++	requireConst(t, connect.Args[2].Type, 0, connect.Name+" backend")
++	if res, ok := connect.Ret.(*prog.ResourceType); !ok || res.Desc.Name != "sock_nfs_fuzz_tcp" {
++		t.Fatalf("%s returns %v, want sock_nfs_fuzz_tcp", connect.Name, connect.Ret)
++	}
++
++	// Requests carry a byte-spelled last-fragment record marker.
++	for _, name := range []string{"write$nfs41_exchange_id", "write$nfs41_create_session",
++		"write$nfs41_bind_conn_to_session"} {
++		call := requireNFSFuzzCall(t, target, name)
++		record := requireStruct(t, call, "rpc_tcp_nfs41_record_t")
++		requireConst(t, requireField(t, record, "last_frag").Type, 0x80, name+" last_frag")
++		requireConst(t, requireField(t, record, "frag_len_hi").Type, 0, name+" frag_len_hi")
++	}
++	bind := requireNFSFuzzCall(t, target, "write$nfs41_bind_conn_to_session")
++	records, ok := bind.Args[1].Type.(*prog.PtrType).Elem.(*prog.ArrayType)
++	if !ok || records.RangeBegin != 1 || records.RangeEnd != 64 {
++		t.Fatalf("%s pipeline is %v, want 1..64 records", bind.Name, bind.Args[1].Type)
++	}
++	dir := requireField(t, requireStruct(t, bind, "nfs41_bind_conn_to_session_args"), "dir")
++	if flags, ok := dir.Type.(*prog.FlagsType); !ok || fmt.Sprint(flags.Vals) != "[1 2 3 7]" {
++		t.Fatalf("%s dir is %v, want CDFC4 1, 2, 3, 7", bind.Name, dir.Type)
++	}
++
++	// With an empty tag and an AUTH_NONE reply verifier the first op result
++	// starts 48 bytes into the reply record.
++	for _, reply := range []struct {
++		call, st string
++		fields   []string
++	}{
++		{"recvfrom$nfs41_exchange_id", "nfs41_exchange_id_reply", []string{"clientid", "sequenceid"}},
++		{"recvfrom$nfs41_create_session", "nfs41_create_session_reply", []string{"sessionid_hi", "sessionid_lo"}},
++	} {
++		st := requireStruct(t, requireNFSFuzzCall(t, target, reply.call), reply.st)
++		offsets := map[string]uint64{}
++		offset := uint64(0)
++		for _, field := range st.Fields {
++			if _, ok := field.Type.(*prog.ResourceType); ok {
++				offsets[field.Name] = offset
++			}
++			offset += field.Type.Size()
++		}
++		want := uint64(48)
++		for _, name := range reply.fields {
++			got, ok := offsets[name]
++			if !ok || got != want {
++				t.Fatalf("%s.%s resource is at %d (found %v), want %d", reply.st, name, got, ok, want)
++			}
++			want += requireField(t, st, name).Type.Size()
++		}
++	}
++
++	const text = `r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)
++r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)
++write$nfs41_exchange_id(r1, &(0x7f0000000000)={AUTO, AUTO, AUTO, {0x42490001, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {"42494e4452434521", AUTO, "62696e646c697665726f756e64000000", 0x0, AUTO, AUTO}}}}, AUTO)
++recvfrom$nfs41_exchange_id(r1, &(0x7f0000001000)={{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, <r2=>0x0, <r3=>0x0, ""/1024}, AUTO, AUTO, AUTO, AUTO)
++write$nfs41_create_session(r1, &(0x7f0000000000)={AUTO, AUTO, AUTO, {0x42490002, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r2, r3, 0x0, {0x0, 0x1000, 0x1000, 0x0, 0x8, 0x4, AUTO}, {0x0, 0x1000, 0x1000, 0x0, 0x8, 0x4, AUTO}, 0x40000000, AUTO}}}}, AUTO)
++recvfrom$nfs41_create_session(r1, &(0x7f0000001000)={{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, <r4=>0x0, <r5=>0x0, ""/256}, AUTO, AUTO, AUTO, AUTO)
++write$nfs41_bind_conn_to_session(r1, &(0x7f0000002000)=[{AUTO, AUTO, AUTO, {0x42490010, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r4, r5, 0x3, AUTO}}}}, {AUTO, AUTO, AUTO, {0x42490011, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r4, r5, 0x3, AUTO}}}}], AUTO)
++recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000001000)=""/256, 0x100, 0x0, 0x0, 0x0)
++setsockopt$sock_linger(r1, 0x1, 0xd, &(0x7f0000000000)={0x1, 0x0}, 0x8)
++close(r1)
++close(r0)
++`
++	p, err := target.Deserialize([]byte(text), prog.Strict)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(p.Calls) != 11 {
++		t.Fatalf("parsed %d calls", len(p.Calls))
++	}
++}
++
+ func TestNFSv41LifecycleAdmin(t *testing.T) {
+ 	target, err := prog.GetTarget("linux", "amd64")
+ 	if err != nil {
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index edb45aa..3670733 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -1090,3 +1090,130 @@ nfs4_listxattrs_args {
+ nfs4_removexattr_args {
+ 	name	nfs4_utf8string
+ } [packed]
++
++# Live NFSv4.1 session on a lane-bound transport.  The profile directory fd is
++# the lane token; the executor only opens the TCP connection in that lane's
++# client network namespace and handles no RPC.  Programs write complete
++# record-marked one-op COMPOUNDs and read the replies with recvfrom.  The reply
++# structs capture the server's clientid, sequenceid and sessionid as resources,
++# so the next call reuses them byte for byte.  Every request uses an empty tag
++# and AUTH_SYS, whose reply verifier is AUTH_NONE, so the first op result
++# starts 48 bytes into the reply record (record marker included).  A write of
++# BIND_CONN_TO_SESSION records sends 1..64 of them back to back on one
++# transport; setsockopt$sock_linger with a zero linger and close reset it.
++resource nfs41_clientid[int64]
++resource nfs41_sequenceid[int32]
++resource nfs41_sessionid_hi[int64]
++resource nfs41_sessionid_lo[int64]
++
++syz_socket_connect_nfs_lane$client0_knfsd_v41(fd fd_nfs_dir, client const[0], backend const[0]) sock_nfs_fuzz_tcp
++write$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_exchange_id], len bytesize[buf])
++recvfrom$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_exchange_id_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
++write$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_create_session], len bytesize[buf])
++recvfrom$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_create_session_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
++write$nfs41_bind_conn_to_session(fd sock_nfs_fuzz_tcp, buf ptr[in, array[rpc_tcp_nfs41_bind_conn_to_session, 1:64]], len bytesize[buf])
++
++type rpc_nfs41_call_t[OPNUM, ARGS] {
++	xid		int32be
++	mtype		const[0, int32be]
++	rpcvers		const[2, int32be]
++	prog		const[100003, int32be]
++	vers		const[4, int32be]
++	proc		const[1, int32be]
++	cred		rpc_auth_sys
++	verf		rpc_auth_none
++	tag		const[0, int32be]
++	minorversion	const[1, int32be]
++	argarray_len	const[1, int32be]
++	op		nfs4_op_t[OPNUM, ARGS]
++} [packed]
++
++# The record marker is spelled as bytes, not as a 31/1-bit split of one
++# int32be: syzkaller places the second big-endian bitfield in the wrong byte,
++# which would drop the last-fragment bit.  A record is far below 64 KiB.
++type rpc_tcp_nfs41_record_t[OPNUM, ARGS] {
++	last_frag	const[0x80, int8]
++	frag_len_hi	const[0, int8]
++	frag_len	bytesize[msg, int16be]
++	msg		rpc_nfs41_call_t[OPNUM, ARGS]
++} [packed]
++
++type rpc_tcp_nfs41_exchange_id rpc_tcp_nfs41_record_t[42, nfs41_exchange_id_args]
++type rpc_tcp_nfs41_create_session rpc_tcp_nfs41_record_t[43, nfs41_create_session_args]
++type rpc_tcp_nfs41_bind_conn_to_session rpc_tcp_nfs41_record_t[41, nfs41_bind_conn_to_session_args]
++
++# RFC 8881 18.35: verifier, client owner, flags, SP4_NONE and an empty
++# implementation id list.
++nfs41_exchange_id_args {
++	verifier	array[int8, 8]
++	owner_len	len[owner, int32be]
++	owner		array[int8, 16]
++	flags		flags[nfs4_exchange_id_flags, int32be]
++	state_protect	const[0, int32be]
++	impl_id_len	const[0, int32be]
++} [packed]
++
++nfs41_channel_attrs {
++	headerpad	int32be
++	maxreqsize	int32be
++	maxrespsize	int32be
++	maxresp_cached	int32be
++	maxops		int32be
++	maxreqs		int32be
++	rdma_ird_len	const[0, int32be]
++} [packed]
++
++nfs41_create_session_flags = 0x1, 0x2, 0x4
++
++# RFC 8881 18.36 with no callback security parameters.
++nfs41_create_session_args {
++	clientid	nfs41_clientid
++	sequenceid	nfs41_sequenceid
++	flags		flags[nfs41_create_session_flags, int32be]
++	fore		nfs41_channel_attrs
++	back		nfs41_channel_attrs
++	cb_program	int32be
++	sec_parms_len	const[0, int32be]
++} [packed]
++
++# CDFC4_FORE, CDFC4_BACK, CDFC4_FORE_OR_BOTH, CDFC4_BACK_OR_BOTH.
++nfs41_cdfc4_dirs = 1, 2, 3, 7
++
++# RFC 8881 18.34.
++nfs41_bind_conn_to_session_args {
++	sessionid_hi	nfs41_sessionid_hi
++	sessionid_lo	nfs41_sessionid_lo
++	dir		flags[nfs41_cdfc4_dirs, int32be]
++	rdma_mode	const[0, int32be]
++} [packed]
++
++# Reply record marker, RPC accepted reply with an AUTH_NONE verifier, COMPOUND
++# status, empty tag, result count, then the first op's opnum and status.
++nfs41_reply_header {
++	frag		int32be
++	xid		int32be
++	mtype		int32be
++	reply_stat	int32be
++	verf_flavor	int32be
++	verf_len	int32be
++	accept_stat	int32be
++	status		int32be
++	tag_len		int32be
++	resarray_len	int32be
++	opnum		int32be
++	op_status	int32be
++} [packed]
++
++nfs41_exchange_id_reply {
++	hdr		nfs41_reply_header
++	clientid	nfs41_clientid
++	sequenceid	nfs41_sequenceid
++	rest		array[int8, 1024]
++} [packed]
++
++nfs41_create_session_reply {
++	hdr		nfs41_reply_header
++	sessionid_hi	nfs41_sessionid_hi
++	sessionid_lo	nfs41_sessionid_lo
++	rest		array[int8, 256]
++} [packed]

@@ -487,8 +487,11 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
    Every rule of the production rule set must fit it (`--describe-rules` shows each rule), and
    every listed element must be used by a rule that fires in the window.
 3. Production: boot a target-mode lane with that rule set ("Target mode" above) and run until the
-   guest crashes with those rules firing in the crash window. A deliberate panic after the programs
-   is enough; the crash-cut program must have a mutation recorded.
+   guest crashes with those rules firing in the crash window. The crash must come from the campaign
+   itself: never crash the guest on purpose (sysrq panic, NMI, forced reset) to get one (06 §30). The
+   crash-cut program must have a mutation recorded. Until such a crash exists the subset is not
+   promoted; 06 §30 pins it in a staged revision with crash survival pending meanwhile, a step the
+   gate does not implement yet (#83).
 4. Replay: `replay_runner plan`, then boot a fresh VM on another journal directory and run
    `syz-execprog -procs=1 -repeat=1` over `REPLAY/programs.log` ("Semantic replay" above).
 5. Record the run instead of `replay_runner judge`:

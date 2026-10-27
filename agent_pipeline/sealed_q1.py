@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .artifacts import ArtifactStore
 from .contracts import JudgeVersions, Q1Result, Q1Status, Record, Sha256
+from .crash import CRASH_REPORT_ID, CRASH_REPORT_TYPE, CrashReport
 from .data import canonical_json, load_record, parse_json
 from .evidence import EvidenceStore, ExecutionCorrelation as BundleCorrelation
 from .hcap import ReachabilityPlan
@@ -115,15 +116,31 @@ class ArtifactQ1Judge:
         return (receipt.correlation.job_id == job_id
                 and receipt.correlation.task_id == task_id)
 
+    def _bundle(self, bundle_ref: str, receipt: TrustedQ1Execution):
+        expected = BundleCorrelation.model_validate(receipt.correlation.model_dump())
+        return self.evidence.verify(
+            bundle_ref, expected_correlation=expected,
+            expected_types={OBSERVATION_ID: OBSERVATION_TYPE})
+
+    @staticmethod
+    def _crash(bundle) -> CrashReport | None:
+        found = [a for a in bundle.artifacts
+                 if a.descriptor.identity == CRASH_REPORT_ID]
+        if not found:
+            return None
+        if found[0].descriptor.type != CRASH_REPORT_TYPE:
+            raise ValueError("crash report of another type")
+        return _payload(found[0].data, CrashReport)
+
     def _prepare(self, bundle_ref: str, plan_ref: str, candidate_id: str,
                  versions: JudgeVersions) -> Q1Input:
         receipt = self._receipt(bundle_ref)
         if plan_ref != receipt.plan_ref or candidate_id != receipt.candidate.candidate_id:
             raise ValueError("request does not match the trusted execution receipt")
-        expected = BundleCorrelation.model_validate(receipt.correlation.model_dump())
-        bundle = self.evidence.verify(
-            bundle_ref, expected_correlation=expected,
-            expected_types={OBSERVATION_ID: OBSERVATION_TYPE})
+        bundle = self._bundle(bundle_ref, receipt)
+        # A crash report that cannot be read is not dropped: the bundle is
+        # then unjudgeable evidence, like any other malformed payload.
+        self._crash(bundle)
         plan = load_record(self.artifacts, plan_ref, ReachabilityPlan)
         if plan.candidate_id != candidate_id:
             raise ValueError("plan belongs to another candidate")
@@ -204,6 +221,18 @@ class ArtifactQ1Judge:
                            receipt=receipt.model_dump(mode="json"))
             return Q1Result(verdict_id=hashlib.sha256(canonical_json(lineage)).hexdigest(),
                             **fields)
+
+    def crash_report(self, bundle_ref: str) -> CrashReport | None:
+        """The sealed crash report of the bundle (#81 §3), None when the
+        run had no crash or its bundle does not verify; judge() then
+        returns INCONCLUSIVE(evidence) for the same bundle."""
+        receipt = self._receipt(bundle_ref)
+        try:
+            return self._crash(self._bundle(bundle_ref, receipt))
+        except OSError:
+            raise
+        except _INVALID:
+            return None
 
     def has_required_evidence(self, bundle_ref: str,
                               versions: JudgeVersions) -> bool:

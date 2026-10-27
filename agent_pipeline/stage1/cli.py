@@ -34,6 +34,7 @@ from ..q1 import TargetPcMapping
 from ..registry import ArtifactHarnessRegistry
 from ..rule_compiler import ArtifactMutationRuleCompiler
 from ..runner.process_supervisor import ProcessLimits, ProcessSupervisor
+from ..runner.slots import SlotPolicy, SlotPool
 from .authority import DescriptorKernelIdentity
 from .config import Stage1Config
 from .engine import CommandEngineConfig, CommandExecutionEngine
@@ -72,6 +73,13 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
             run_timeout_seconds=a.run_timeout_s))
     e = config.engine
     state = Path(config.state_dir)
+    slots = None
+    if config.slots is not None:
+        p = config.slots
+        slots = SlotPool.for_host(e.resource_key, SlotPolicy(
+            vm_cpus=p.vm_cpus, vm_memory_mb=p.vm_memory_mb,
+            reserve_cpus=p.reserve_cpus,
+            reserve_memory_mb=p.reserve_memory_mb, max_slots=p.max_slots))
     engine_config = CommandEngineConfig(
         argv=e.argv, cwd=e.cwd, work_root=state / "runs",
         resource_key=e.resource_key, collector_id=e.collector_id, env=e.env,
@@ -80,7 +88,8 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
 
     def engine(store: ArtifactStore) -> CommandExecutionEngine:
         return CommandExecutionEngine(
-            engine_config, store, ProcessSupervisor(state / "processes"))
+            engine_config, store, ProcessSupervisor(state / "processes"),
+            slots=slots)
 
     stage2 = None
     if config.stage2 is not None:
@@ -97,7 +106,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         def stage2_engine(store, receipts, evidence) -> Stage2CommandEngine:
             return Stage2CommandEngine(
                 stage2_config, store, ProcessSupervisor(state / "processes"),
-                receipts=receipts, evidence=evidence)
+                receipts=receipts, evidence=evidence, slots=slots)
 
         stage2 = Stage2Parts(
             engine_factory=stage2_engine,
@@ -121,6 +130,7 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         worker_id=config.worker_id,
         lease_duration_ns=int(config.lease_duration_s * 1e9),
         agent_workers=config.agent_workers, run_agents=run_agents,
+        runner_workers=1 if slots is None else slots.count,
         compiler=None if config.nfs_proxy is None else
         ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
                                      state / "compile"),
@@ -169,6 +179,17 @@ def _job_summary(service: Stage1Service, job_id: str) -> dict:
                            **job.campaign.tally.model_dump(mode="json")}
     if job.triage:
         out["triage"] = [t.model_dump(mode="json") for t in job.triage]
+    if job.fixed is not None:
+        k = job.fixed
+        out["fixed"] = {
+            "campaign_id": k.campaign_id, "sent": k.sent,
+            "reached": k.reached, "not_reached": k.not_reached,
+            "crashes": k.crashes,
+            "consecutive_not_reached": k.consecutive_not_reached,
+            "in_flight": [a.task_id for a in k.in_flight]}
+    if job.crash_findings:
+        out["crash_findings"] = [f.model_dump(mode="json")
+                                 for f in job.crash_findings]
     if job.replay is not None:
         out["replay"] = {"crash_bundle_ref": job.replay.crash.bundle_ref,
                          "outcome": None if job.replay.outcome is None else
@@ -205,6 +226,13 @@ def main(argv: list[str] | None = None) -> int:
         "another kernel commit, as a new job")
     rs.add_argument("job")
     rs.add_argument("--commit", required=True)
+
+    sd = sub.add_parser(
+        "seed", help="start a new job for an earlier job's candidate under "
+        "another policy (e.g. a KCSAN one) from that job's plan, skipping "
+        "Analysis and Planning")
+    sd.add_argument("job")
+    sd.add_argument("--policy", required=True)
 
     r = sub.add_parser("run")
     r.add_argument("--job", help="stop when this job reaches a stop state")
@@ -261,6 +289,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "resubmit":
             job_id = resubmit(service, args.job, args.commit)
             _print({"resubmitted_from": args.job,
+                    **_job_summary(service, job_id)})
+        elif args.command == "seed":
+            try:
+                job_id = service.controller.seed(args.job, args.policy)
+            except (KeyError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            _print({"seeded_from": args.job,
                     **_job_summary(service, job_id)})
         elif args.command == "run":
             service.recover()

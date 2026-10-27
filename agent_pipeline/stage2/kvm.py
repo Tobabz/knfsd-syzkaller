@@ -24,23 +24,26 @@ import time
 import uuid
 import zlib
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..admission import CallAdmissionProfile
 from ..artifacts import ArtifactStore
 from ..contracts import Sanitizer
 from ..controller.store import Store
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ExecutionCorrelation as EvidenceCorrelation
+from ..hcap import HcapCatalog, layout_refusals
 from ..journal_sink import (CHANNEL_CLOSE_TIMEOUT_S, SEGMENT_SUFFIX,
                             ChannelIdentity, ChannelServer, HostJournal)
 from ..materializer import (ExecutionHarnessDescriptor, ReachabilityHarness,
                             descriptor_id)
 from ..q1 import ExecutionCorrelation, KernelIdentity
 from ..q2 import Q2CollectionWindow
+from ..qemu_accel import Accel, accel_of
 from ..replay_runner import PlanError, parse_execprog_barriers
 from ..sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE, PublishedCoverage
 from ..sealed_q2 import (CONSOLE_LOG_TYPE, MANAGER_REPORT_TYPE, Q2_EVIDENCE_ID,
@@ -130,7 +133,8 @@ class StepOptions:
     campaign_executions: int = 128
     campaign_timeout_s: float = 1800
     manager_stop_timeout_s: float = 45
-    exec_slowdown: int = 1
+    #: None takes the collector's ``exec_slowdown`` (TCG hosts scale it).
+    exec_slowdown: int | None = None
 
     def __post_init__(self) -> None:
         if not 1 <= self.campaign_executions <= 192:
@@ -140,7 +144,8 @@ class StepOptions:
                 or self.campaign_timeout_s <= 0
                 or self.manager_stop_timeout_s <= 0):
             raise ValueError("campaign timeouts must be finite and positive")
-        if not 1 <= self.exec_slowdown <= 1000:
+        if self.exec_slowdown is not None and \
+                not 1 <= self.exec_slowdown <= 1000:
             raise ValueError("exec_slowdown must be in [1, 1000]")
 
 
@@ -347,12 +352,14 @@ def _object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _journal_lane_count(vm: dict[str, Any], procs: int) -> int:
+def _journal_lane_count(vm: dict[str, Any], procs: int, *,
+                        accel: Accel = "kvm") -> int:
     qemu_args = vm.get("qemu_args")
     if not isinstance(qemu_args, str):
         raise Stage2StepError("manager VM has no QEMU arguments")
-    if "-enable-kvm" not in qemu_args.split():
-        raise Stage2StepError("manager VM does not enable KVM")
+    if accel_of(qemu_args) != accel:
+        raise Stage2StepError(
+            f"manager VM does not run under the collector's {accel}")
     names = [
         part.removeprefix("name=nfsp-journal-")
         for token in qemu_args.split()
@@ -476,6 +483,66 @@ def _manager_cmdline(vm: dict[str, Any], descriptor: ExecutionHarnessDescriptor,
     return raw
 
 
+def _authority_record(root: Path, name: str, expected_ref: str, model):
+    path = root / name
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise Stage2StepError(f"cannot read {name}") from exc
+    if hashlib.sha256(raw).hexdigest() != expected_ref:
+        raise Stage2StepError(f"{name} differs from harness authority")
+    try:
+        parse_json(raw)
+        value = model.model_validate_json(raw)
+    except (TypeError, ValueError) as exc:
+        raise Stage2StepError(f"{name} is not a valid authority record") from exc
+    if canonical_json(value) != raw:
+        raise Stage2StepError(f"{name} is not canonical")
+    return value
+
+
+def _validate_runtime_authority(
+        root: Path, harness: ReachabilityHarness,
+        descriptor: ExecutionHarnessDescriptor, manager: dict[str, Any],
+) -> None:
+    """Bind the manager's actual layout to the harness authorities."""
+    catalog = _authority_record(
+        root, "hcap.json", harness.hcap_revision, HcapCatalog)
+    profile = _authority_record(
+        root, "admission.json", harness.call_admission_profile_ref,
+        CallAdmissionProfile)
+    profile_refs = {
+        ref.artifact_ref
+        for ref in (*catalog.authority_refs,
+                    *(ref for capability in catalog.capabilities
+                      for ref in capability.authority_refs))
+        if ref.kind == "CallAdmissionProfile"
+    }
+    if profile_refs != {harness.call_admission_profile_ref}:
+        raise Stage2StepError(
+            "HCAP does not select the harness call admission authority")
+    if profile.identity != descriptor.syzkaller_identity:
+        raise Stage2StepError(
+            "call admission authority differs from the harness build")
+    procs = manager.get("procs")
+    if type(procs) is not int or not 1 <= procs <= 64:
+        raise Stage2StepError(
+            "Stage 2 KVM step requires manager procs in [1, 64]")
+    calls = manager.get("enable_syscalls")
+    if calls is not None and (not isinstance(calls, list) or not all(
+            isinstance(call, str) for call in calls)):
+        raise Stage2StepError(
+            "manager enable_syscalls must be a list of calls")
+    enabled = calls if calls is not None else [entry.call for entry in profile.entries]
+    refusals = layout_refusals(
+        catalog, profile.entries, enabled_calls=enabled,
+        runtime_features=("remote_cover",), procs=procs)
+    if refusals:
+        raise Stage2StepError(
+            f"manager at {procs} proc(s) exceeds a validated layout: "
+            f"{refusals[0]}")
+
+
 def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
     execution = _Execution.model_validate_json((root / "execution.json").read_bytes())
     harness = ReachabilityHarness.model_validate_json((root / "harness.json").read_bytes())
@@ -497,7 +564,8 @@ def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
     procs = manager.get("procs")
     if type(procs) is not int or not 1 <= procs <= 64:
         raise Stage2StepError("Stage 2 KVM step requires manager procs in [1, 64]")
-    lanes = _journal_lane_count(vm, procs)
+    _validate_runtime_authority(root, harness, descriptor, manager)
+    lanes = _journal_lane_count(vm, procs, accel=collector.accel)
     builds = {item.name: item.artifact_ref for item in descriptor.build_artifacts}
     lane_pin = _manager_assets(manager, vm, collector, descriptor, builds)
     cmdline = _manager_cmdline(vm, descriptor, harness, lane_pin.sha256)
@@ -711,7 +779,7 @@ def _direct_guest(inputs: _Inputs, lane_dir: Path, console: Path,
         image=inputs.files["vm-image"], lane_dir=lane_dir,
         ssh_key=c.ssh_key, cmdline=inputs.cmdline, console_log=console,
         memory_mb=c.memory_mb, cpus=c.cpus, boot_timeout_s=c.boot_timeout_s,
-        extra_args=extra_args))
+        accel=c.accel, extra_args=extra_args))
 
 
 def _gate(inputs: _Inputs, output: Path, options: StepOptions) -> None:
@@ -1165,6 +1233,9 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
 
 def run_step(options: StepOptions, input_dir: Path, output_dir: Path) -> None:
     inputs = _load_inputs(options, Path(input_dir))
+    if options.exec_slowdown is None:
+        options = replace(options,
+                          exec_slowdown=inputs.collector.exec_slowdown)
     output = Path(output_dir)
     if not output.is_dir() or not (output / "segments").is_dir():
         raise Stage2StepError("engine did not prepare output/segments")

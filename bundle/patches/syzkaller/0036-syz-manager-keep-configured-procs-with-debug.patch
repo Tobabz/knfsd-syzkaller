@@ -1,0 +1,26 @@
+From 3e712149583fd085af7f505f926ef1ebf352649f Mon Sep 17 00:00:00 2001
+From: knfsd bridge builder <bridge@localhost>
+Date: Mon, 26 Oct 2026 23:29:06 +0900
+Subject: [PATCH] syz-manager: keep configured procs with -debug
+
+---
+ syz-manager/manager.go | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/syz-manager/manager.go b/syz-manager/manager.go
+index d1e42f0a2..58e0ac445 100644
+--- a/syz-manager/manager.go
++++ b/syz-manager/manager.go
+@@ -303,9 +303,6 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
+ 	if subsystem.HasList(cfg.TargetOS) {
+ 		mgr.crashStore.Extractor = subsystem.MakeExtractor(subsystem.GetList(cfg.TargetOS))
+ 	}
+-	if *flagDebug {
+-		mgr.cfg.Procs = 1
+-	}
+ 	mgr.http = &manager.HTTPServer{
+ 		// Note that if cfg.HTTP == "", we don't start the server.
+ 		Cfg:        cfg,
+-- 
+2.34.1
+

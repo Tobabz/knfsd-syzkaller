@@ -5,7 +5,7 @@ to run one candidate on a real guest:
 
 | Command | What |
 |---|---|
-| `generate SPEC` | Writes every host record `stage1.json` refers to, plus `stage1.json` and `collector.json` |
+| `generate SPEC` | Writes every host record `stage1.json` refers to, plus `stage1.json` and `collector.json`; with a `stage2` section, the Stage 2 syz-manager config (`../../stage2/README.md`) |
 | `collect --config collector.json IN OUT` | The engine's host command: boots one guest, runs the harness program on lane 0 with remote KCOV, writes the capture |
 | `probe --stage1 S --program P --out D` | Runs one program the same way, without the service. Use it first on a new host |
 | `target-pcs --stage1 S --job J --out F` | Builds a verified `TargetPcMapping` for a submitted job from the pinned vmlinux |
@@ -18,10 +18,17 @@ collector with a scripted guest, and mapping on a gcc
 `s1_reached`. They do not exercise a real guest, kernel or model: this
 runbook does.
 
-## What only the KVM host can provide
+## What only the VM host can provide
 
-- `/dev/kvm`, `qemu-system-x86_64`, `ssh`/`scp`, binutils (`objdump`,
-  `addr2line`, `nm`).
+- `qemu-system-x86_64`, `ssh`/`scp`, binutils (`objdump`, `addr2line`,
+  `nm`). `/dev/kvm` is optional: with it the guests run under KVM, without
+  it under TCG (software emulation, about ten times slower). The spec's
+  `collector.accel` is `auto` by default; generation resolves it on the
+  generating host, writes it to `collector.json`, and for TCG scales the
+  boot, fixture and engine budgets and the execprog slowdown by 10. Set it
+  to `kvm` or `tcg` to pin the choice; `KOOV_QEMU_ACCEL` does the same for
+  `tools/bootstrap-kcov-env.py`, the baker and
+  `tools/prepare-live-lane-config.py`.
 - The bootstrap env: the patched kernel tree, `bzImage`, `vmlinux`,
   `.config`, the baked image and the syzkaller binaries
   (`tools/bootstrap-kcov-env.py`).
@@ -33,7 +40,7 @@ runbook does.
 
 ## Run
 
-From the repository root, on the KVM host, at the commit under test:
+From the repository root, on the VM host, at the commit under test:
 
 ```sh
 uv sync --locked --extra agent-openai
@@ -93,7 +100,9 @@ guest. Read `probe-1/probe.json`:
 
 1. **Facts.** `boot_ok`, `fixture_ok`, `lane_ok`, `runner_completed`,
    `collection_completed` and `extra_present` should all be true, and
-   `runtime_errors` should be empty.
+   `runtime_errors` should be empty, and `crash` should be null: a
+   kernel crash on the serial console is reported there, not as a
+   runtime error.
 2. **Generation counters.** `generation_begin` and `aggregate_published`
    should both be 1. execprog's machine check runs its own extra-coverage
    request, which opens a generation, so the window does not cover the
@@ -115,6 +124,85 @@ guest. Read `probe-1/probe.json`:
    so there are none, and `target-pcs` refuses a vmlinux that still has
    them. If `callsite_plus_5` matches instead, the coverage file holds
    return addresses, and `target-pcs` must shift its PCs to match.
+
+## KASAN and KCSAN from one spec
+
+`variants` in the spec (in place of `variant`) lists the sanitizer builds
+of the same harness, for example:
+
+```json
+"variants": [
+  {"sanitizer": "kasan", "capability_evidence": {"HCAP-11": ["..."]}},
+  {"sanitizer": "kcsan", "capability_evidence": {}}
+]
+```
+
+Build each with `tools/bootstrap-kcov-env.py --variant <sanitizer>` into
+`env/images/<sanitizer>`. The syzkaller build, admission profile, neutral
+controls, judge profile and capability statements are shared. Each variant
+gets its own kernel pins, instrumentation manifest, descriptor, support
+boundary, HCAP revision, approval and binding, so the policy's sanitizer
+selects the harness. KVM capability evidence is pinned to a descriptor, so
+it is collected and listed per variant; a variant without it has those
+capabilities without evidence. `collector.json` keeps each variant's
+`bzimage` and `kernel` under `variant_files`, and the collector boots the
+files of the lease's descriptor. `probe` and `check-pcs` take
+`--variant kcsan`; a KCSAN harness also reports `BUG: KCSAN:` as a crash. A
+`stage2` section writes one manager config per variant.
+
+## Promotion criteria (#100)
+
+Capability evidence must be typed: a `promotion-probe-evidence.v1`
+campaign, or the capability's own KVM evidence model. Untyped evidence is
+refused for every capability.
+
+`generate.LEGACY_CAPABILITY_BASELINES` pins, for each capability the
+checked-in specs held before the criteria, `capability_baseline_sha256` of
+its entry (without `validated_layout` and evidence references). The
+repository pins them, so a spec cannot exempt a capability. While an entry
+still matches, it keeps its earlier status; that includes the live spec's
+HCAP-14, which has been `experimental` since before the criteria. A new
+capability, or one whose entry changed, needs all of the following, and
+`generate` refuses the spec otherwise:
+
+- a `contract` (entry points, boundary functions, fixed arguments and
+  types; `docs/design/02-llm-agent/04-harness-capability-spec.md` §3.3);
+- a `PromotionProbeEvidence` file in `capability_evidence` whose probes
+  are the contract's boundary functions and whose minimal, generated and
+  neutral run sets meet the thresholds in `agent_pipeline/promotion.py`
+  (KVM only for a `time_dependent` contract);
+- syz call arguments that carry no literal the contract does not fix. The
+  check reads the pinned target's argument shapes through the parser
+  bundle's `describe`, so the bundle must be built from this repository's
+  bridge sources.
+
+`gap_contracts` gives the contract a capability filling each gap ID must
+declare; it is copied into the generated HCAP. A capability names the gap
+it fills with `fills_gap`, and `generate` refuses it unless its contract is
+that gap's. A capability that fills a gap also needs a campaign that names
+the candidate's programs in `withheld_program_sha256s`.
+
+The spec's `gap_contracts` are the operator's statement. A Harness
+Generation patch set can change the spec, so on that path the Controller
+passes the gap and its contract from its own state, with the spec the patch
+set started from:
+
+```sh
+uv run python -m agent_pipeline.stage1.host generate SPEC \
+    --gap gap.json --base-spec base-host-spec.json
+```
+
+`gap.json` is a `GapContract`. The spec cannot give that gap another
+contract, and every capability the patch set adds or changes relative to
+the base spec must fill that gap, and it may not remove a base capability.
+Capabilities the base already holds are not the patch set's, whatever gap
+they fill. The base spec must come from the Controller's own read-only
+store, not from the generation worktree.
+
+Outside the legacy baselines, "judged" means every generation: a capability
+promoted after the criteria keeps its promotion only while its spec entry
+lists a probe campaign bound to the generated harness. That is the same
+binding the capability-specific KVM evidence has.
 
 ## How the pieces bind
 

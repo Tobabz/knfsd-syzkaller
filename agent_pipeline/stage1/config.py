@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 
 from ..admission import SyzkallerTargetIdentity
-from ..contracts import JobPolicy, JudgeVersions, Sha256
+from ..contracts import CampaignMode, JobPolicy, JudgeVersions, Sha256
 
 
 class _Config(BaseModel):
@@ -69,6 +70,19 @@ class Stage2Config(_Config):
         return argv
 
 
+class SlotsConfig(_Config):
+    """The host's KVM slot pool (09 §8, #81 R6): one guest's size and the
+    host's reserve.  The slot count is computed from the host's CPUs and
+    memory when the service starts; ``engine.resource_key`` (and the Stage
+    2 backend's leases) then run on ``<resource_key>/kvm-<i>``."""
+
+    vm_cpus: int = Field(ge=1, le=256)
+    vm_memory_mb: int = Field(ge=256)
+    reserve_cpus: int = Field(default=2, ge=0)
+    reserve_memory_mb: int = Field(default=4096, ge=0)
+    max_slots: int | None = Field(default=None, ge=1, le=256)
+
+
 class AgentRuntimeConfig(_Config):
     """Host limits of one Agent execution (``RuntimeLimits``); separate
     from the Controller's retry and repair budgets."""
@@ -107,6 +121,25 @@ class Stage1Config(_Config):
     #: blocked_operator(stage2_compiler_unavailable).
     nfs_proxy: Path | None = None
     stage2: Stage2Config | None = None
+    #: Unset: one execution at a time on ``engine.resource_key``.
+    slots: SlotsConfig | None = None
+
+    @model_validator(mode="after")
+    def _campaign_backends(self) -> Stage1Config:
+        """#81 D16: a mutate policy needs the Stage 2 backend and the
+        Compiler's Proxy, or its jobs could only stop after compiling.  The
+        promoted semantic subset is an HCAP authority, checked by
+        generation and the Rule Compiler, not by this file."""
+        mutate = [p.policy_id for p in self.policies
+                  if p.campaign_mode is CampaignMode.MUTATE]
+        missing = [name for name, value in (("stage2", self.stage2),
+                                            ("nfs_proxy", self.nfs_proxy))
+                   if value is None]
+        if mutate and missing:
+            raise ValueError(
+                f"policies {mutate} use campaign_mode mutate, which needs "
+                + " and ".join(missing))
+        return self
 
     @classmethod
     def load(cls, path: Path) -> Stage1Config:

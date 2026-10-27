@@ -26,6 +26,7 @@ from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
 from .machine import Env, Machine, Outcome, harness_authority_stale
 from .records import (TERMINAL, AgentAttempt, Job, JobState, RepairInput,
+                      SeedPlan,
                       TaskKind, Transition)
 from .store import StaleIssueEvent, Store
 from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
@@ -112,18 +113,32 @@ class Controller:
                 start_line=loc.start_line, end_line=loc.end_line)),
             policy_id)
 
-    def submit(self, submission: CandidateSubmission, policy_id: str) -> str:
+    def submit(self, submission: CandidateSubmission, policy_id: str, *,
+               seed: SeedPlan | None = None) -> str:
         """Register the candidate and start a job for it.  A submission
         intake refuses still gets a job, which ends rejected (09 §3)."""
         self.store.policy(policy_id)            # must exist
         job = Job(job_id=f"job-{self.new_id()}", submission=submission,
-                  job_policy_id=policy_id)
+                  job_policy_id=policy_id, seed=seed)
         self.store.create(job, Transition(
             job_id=job.job_id, seq=0, from_state=None, to_state=job.state,
             reason="submitted", event={"type": "submitted"},
             job_policy_id=policy_id, at=self.clock(), job=job))
         self._intake(job.job_id)
         return job.job_id
+
+    def seed(self, job_id: str, policy_id: str) -> str:
+        """#81 R5: a new job for ``job_id``'s candidate under another
+        policy (another sanitizer), started from its plan instead of
+        Analysis and Planning.  The plan is re-validated against the new
+        binding's HCAP before it is materialized."""
+        src = self.store.job(job_id)
+        if src.candidate is None or src.analysis_ref is None or \
+                src.plan_ref is None:
+            raise ValueError(f"{job_id} has no plan to seed a job with")
+        return self.submit(src.submission, policy_id, seed=SeedPlan(
+            from_job=job_id, analysis_ref=src.analysis_ref,
+            plan_ref=src.plan_ref))
 
     def _intake(self, job_id: str) -> None:
         job = self.store.job(job_id)
@@ -265,8 +280,8 @@ class Controller:
         return self.operator(job_id, f"route_{to}")
 
     def start_stage2(self, job_id: str) -> Outcome | None:
-        """09 §4: an operator starts Stage 2 of a job in s1_reached.  Until
-        JobPolicy.run_stage2 may be true this is the only way in."""
+        """09 §4: an operator starts Stage 2 of a job in s1_reached.  Unless
+        JobPolicy.campaign_mode is mutate this is the only way in."""
         return self.operator(job_id, "start_stage2")
 
     def operator(self, job_id: str, action: str) -> Outcome | None:
@@ -324,6 +339,8 @@ class Controller:
                     lambda: self._link_gap(self.store.job(job_id)))
         self._guard(job_id, "pending_task",
                     lambda: self._poll_pending(job_id))
+        self._guard(job_id, "fixed_attempts",
+                    lambda: self._attempts(job_id, poll=True))
         self._guard(job_id, "rebind", lambda: self._retry_rebind(job_id))
 
     def _retry_rebind(self, job_id: str) -> None:
@@ -410,6 +427,7 @@ class Controller:
                     lambda: self._link_gap(self.store.job(job_id)))
         job = self.store.job(job_id)
         p = job.pending_task
+        self._attempts(job_id)
         if p is None:
             if job.state is JobState.SUBMITTED:
                 self._intake(job_id)
@@ -564,10 +582,27 @@ class Controller:
             self.store.link_issue(job.gap, self.issues.open_or_link(
                 job.gap, job.job_id), job.job_id)
 
+    def _attempts(self, job_id: str, poll: bool = False) -> None:
+        """09 §3.1: send each fixed attempt in flight (idempotent by
+        task_id), or with `poll` ask for it first, and take a final one."""
+        job = self.store.job(job_id)
+        if job.state is not JobState.S1_FIXED or job.fixed is None:
+            return
+        for a in job.fixed.in_flight:
+            job = self.store.job(job_id)
+            if job.cancelling_tasks or job.fixed is None or \
+                    a not in job.fixed.in_flight:
+                continue
+            st = self.runner.status(a.task_id) if poll else None
+            if st is None or st.state == "unknown":
+                st = self.runner.submit(a.task_id, self._runner_input(job))
+            self._take_status(job_id, a.task_id, st)
+
     def _dispatch(self, job_id: str) -> None:
         job = self.store.job(job_id)
         p = job.pending_task
         if p is None:
+            self._attempts(job_id)
             return
         if p.kind is TaskKind.AGENT:
             if self.store.attempt(p.task_id, p.attempt) is not None:

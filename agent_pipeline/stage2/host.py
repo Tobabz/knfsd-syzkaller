@@ -1,4 +1,4 @@
-"""Readiness checks and the real host entry point for Stage 2 KVM.
+"""Readiness checks and the real host entry point for Stage 2 VMs (KVM or TCG).
 
 The Stage 2 engine deliberately treats its host command as trusted
 configuration.  Preflight checks that configuration and its immutable
@@ -14,13 +14,12 @@ Run the read-only check with::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import os
 from pathlib import Path
 import shutil
-import stat
 import subprocess
 import sys
 from typing import Callable, Literal
@@ -28,13 +27,16 @@ from typing import Callable, Literal
 from pydantic import Field
 
 from ..artifacts import ArtifactStore
-from ..contracts import JobPolicy, Record
+from ..contracts import CampaignMode, JobPolicy, Record
 from ..data import load_record, parse_json
-from ..hcap import ArtifactHcapChecker
+from ..admission import CallAdmissionProfile
+from ..hcap import ArtifactHcapChecker, HcapCatalog, layout_refusals
 from ..m1 import M1JudgeProfile
 from ..materializer import (ExecutionHarnessApproval,
                             ExecutionHarnessDescriptor, descriptor_id)
 from ..q2 import Q2JudgeProfile
+from ..qemu_accel import (KVM_API_VERSION, KVM_GET_API_VERSION,  # noqa: F401
+                          AccelError, accel_of, check_kvm)
 from ..registry import HarnessCatalog
 from ..runner.process_supervisor import ProcessLimits
 from ..semantic_promotion import (BuildRegistry,
@@ -70,6 +72,12 @@ class _ApprovedHarness:
     harness_id: str
     command_line: tuple[str, ...]
     pins: tuple[tuple[str, HostFilePin], ...]
+    #: The koov fixture arguments of the descriptor's allowed runtime
+    #: selections, as (selection argument, koov.nfs_trace value) pairs.
+    fixtures: frozenset[tuple[str, str]] = frozenset()
+    #: Each bound HCAP revision with its call admission profile; a manager
+    #: must stay inside their capabilities' validated layouts (#99).
+    authorities: tuple[tuple[HcapCatalog, CallAdmissionProfile], ...] = ()
 
     def pin(self, name: str) -> HostFilePin:
         try:
@@ -113,28 +121,24 @@ def _executable(path: Path | str, *, which: Callable[[str], str | None]
     return found
 
 
-KVM_GET_API_VERSION = 0xAE00
-KVM_API_VERSION = 12
-
-
 def _check_kvm(
     path: Path, *,
     opener: Callable[[Path, int], int] = os.open,
     ioctl: Callable[[int, int], int] = fcntl.ioctl,
     closer: Callable[[int], None] = os.close,
 ) -> str:
-    info = path.stat()
-    if not stat.S_ISCHR(info.st_mode):
-        raise PreflightError(f"not a character device: {path}")
-    fd = opener(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
     try:
-        version = ioctl(fd, KVM_GET_API_VERSION)
-    finally:
-        closer(fd)
-    if version != KVM_API_VERSION:
-        raise PreflightError(
-            f"{path} reported KVM API {version}, expected {KVM_API_VERSION}")
-    return f"{path} opened successfully with KVM API {version}"
+        return check_kvm(path, opener=opener, ioctl=ioctl, closer=closer)
+    except AccelError as exc:
+        raise PreflightError(str(exc)) from exc
+
+
+def _check_accel(collector: CollectorConfig, kvm_path: Path) -> str:
+    """KVM must work when the collector runs under it; TCG needs nothing."""
+    if collector.accel == "kvm":
+        return _check_kvm(kvm_path)
+    return (f"collector runs under TCG (exec slowdown "
+            f"{collector.exec_slowdown}); KVM is not used")
 
 
 def _check_command(config, *, which: Callable[[str], str | None]) -> str:
@@ -170,7 +174,8 @@ def _check_stage2_timeout(config, collector: CollectorConfig,
                           policies: tuple[JobPolicy, ...]) -> str:
     """Ensure the outer supervisor cannot preempt an inner step watchdog."""
     try:
-        slowdown = int(_command_option(config.argv, "--exec-slowdown", "1"))
+        slowdown = int(_command_option(config.argv, "--exec-slowdown",
+                                       str(collector.exec_slowdown)))
         campaign = float(_command_option(
             config.argv, "--campaign-timeout", "1800"))
         manager_stop = float(_command_option(
@@ -243,7 +248,18 @@ def _approved_harness(
     return _ApprovedHarness(
         harness_id=harness_id,
         command_line=tuple(descriptor.guest_kernel_command_line.split()),
-        pins=tuple(pins))
+        pins=tuple(pins),
+        fixtures=_stage2_fixtures(descriptor.allowed_runtime_selections))
+
+
+def _stage2_fixtures(selections) -> frozenset[tuple[str, str]]:
+    """The koov arguments that boot each selection Stage 2 may run, as
+    stage1/host/collector.py guest_cmdline writes them."""
+    return frozenset(
+        (f"koov.nfs_version={s.nfs_version}" if s.fixture_mode == "single"
+         else f"koov.nfs_fixture={s.fixture_mode}",
+         "1" if s.trace_mode == "on" else "0")
+        for s in selections if s.fixture_mode not in _STAGE1_ONLY_FIXTURES)
 
 
 def _check_harnesses(
@@ -263,6 +279,7 @@ def _check_harnesses(
     promoted: list[PromotedSemanticCapabilityRegistry] = []
     harnesses: list[_ApprovedHarness] = []
     checked_descriptors: set[str] = set()
+    authorities: dict[str, list[tuple[HcapCatalog, CallAdmissionProfile]]] = {}
     for registration in catalog.registrations:
         binding = registration.binding
         approval = by_descriptor.get(binding.execution_harness_id)
@@ -281,6 +298,16 @@ def _check_harnesses(
             raise PreflightError(
                 f"HCAP {binding.hcap_revision[:12]} has no promoted semantic subset")
         promoted.append(registry)
+        profiles = [ref.artifact_ref for ref in (
+            *hcap.authority_refs,
+            *(ref for cap in hcap.capabilities for ref in cap.authority_refs))
+            if ref.kind == "CallAdmissionProfile"]
+        if len(set(profiles)) != 1:
+            raise PreflightError(
+                f"HCAP {binding.hcap_revision[:12]} pins no single call "
+                "admission profile")
+        authorities.setdefault(binding.execution_harness_id, []).append(
+            (hcap, load_record(store, profiles[0], CallAdmissionProfile)))
         if binding.execution_harness_id not in checked_descriptors:
             _verify_pins_read_only(collector, descriptor)
             harnesses.append(_approved_harness(
@@ -290,7 +317,31 @@ def _check_harnesses(
         if "nokaslr" not in tokens or "nfs.localio_enabled=N" not in tokens:
             raise PreflightError(
                 "Stage 2 harness requires nokaslr and nfs.localio_enabled=N")
-    return tuple(promoted), tuple(harnesses)
+    return tuple(promoted), tuple(
+        replace(harness, authorities=tuple(authorities[harness.harness_id]))
+        for harness in harnesses)
+
+
+def _check_layout(value: dict, procs: int,
+                  harnesses: tuple[_ApprovedHarness, ...]) -> None:
+    """The manager's procs and calls stay inside the validated layouts of
+    every bound HCAP's capabilities (#99)."""
+    calls = value.get("enable_syscalls")
+    if calls is not None and (not isinstance(calls, list) or not all(
+            isinstance(call, str) for call in calls)):
+        raise PreflightError("manager enable_syscalls must be a list of calls")
+    for harness in harnesses:
+        for hcap, profile in harness.authorities:
+            # Without enable_syscalls syz-manager enables every call.
+            enabled = (calls if calls is not None
+                       else [entry.call for entry in profile.entries])
+            refusals = layout_refusals(
+                hcap, profile.entries, enabled_calls=enabled,
+                runtime_features=("remote_cover",), procs=procs)
+            if refusals:
+                raise PreflightError(
+                    f"manager at {procs} proc(s) exceeds a validated "
+                    f"layout: {refusals[0]}")
 
 
 def _check_runtime(
@@ -339,13 +390,14 @@ def _policy_values(policy: JobPolicy) -> tuple[int, ...]:
 
 
 def _check_policies(policies: tuple[JobPolicy, ...], checks: _Checks) -> None:
-    enabled = [p.policy_id for p in policies if p.run_stage2]
+    enabled = [p.policy_id for p in policies
+               if p.campaign_mode is CampaignMode.MUTATE]
     if enabled:
         checks.add("stage2_policy", "pass",
                    "automatic Stage 2 enabled for: " + ", ".join(enabled))
     else:
         checks.add("stage2_policy", "warning",
-                   "run_stage2 is false for every policy; use operator start_stage2")
+                   "no policy has campaign_mode mutate; use operator start_stage2")
     defaults = [p.policy_id for p in policies
                 if _policy_values(p) == _POLICY_DEFAULTS]
     if defaults:
@@ -382,14 +434,12 @@ def _bind_manager_command(path: Path, command) -> None:
         "manager config must be an explicit Stage 2 command argument")
 
 
-# nlm-knfsd is a Stage 1 reachability fixture (HCAP-13); a Stage 2 manager
-# command line selecting it is refused here.
-_DYNAMIC_CMDLINE_VALUES = {
-    "koov.nfs_fixture": {"broad-knfsd"},
-    "koov.nfs_target": {"1"},
-    "koov.nfs_trace": {"0", "1"},
-    "koov.nfs_version": {"3", "4.0", "4.1", "4.2"},
-}
+# A manager boots one fixture of an approved runtime selection (#81 D17):
+# koov.nfs_version for a single fixture, koov.nfs_fixture otherwise, with
+# that selection's koov.nfs_trace.  nlm-knfsd is a Stage 1 reachability
+# fixture (HCAP-13); a Stage 2 manager command line selecting it is refused.
+_STAGE1_ONLY_FIXTURES = frozenset({"nlm-knfsd"})
+_SELECTION_KEYS = ("koov.nfs_fixture", "koov.nfs_version")
 
 
 def _check_approved_command_line(
@@ -405,25 +455,61 @@ def _check_approved_command_line(
         if key == "koov.lane_sha256":
             allowed = bool(separator and len(value) == 64
                            and all(c in "0123456789abcdef" for c in value))
+        elif key == "koov.nfs_target":
+            allowed = token == "koov.nfs_target=1"
+        elif key == "koov.nfs_trace":
+            allowed = value in ("0", "1") and separator == "="
         else:
-            allowed = separator == "=" and \
-                value in _DYNAMIC_CMDLINE_VALUES.get(key, set())
+            allowed = key in _SELECTION_KEYS and separator == "="
         if not allowed or key in dynamic:
             raise PreflightError(
                 f"manager VM cmdline has unapproved dynamic argument {token}")
         dynamic[key] = value
-    selection = set(dynamic) & {"koov.nfs_fixture", "koov.nfs_version"}
-    if selection not in ({"koov.nfs_fixture"}, {"koov.nfs_version"}):
+    selection = [f"{key}={dynamic[key]}" for key in _SELECTION_KEYS
+                 if key in dynamic]
+    if len(selection) != 1:
         raise PreflightError(
             "manager VM cmdline must select one approved NFS fixture")
     for required in ("koov.lane_sha256", "koov.nfs_target"):
         if required not in dynamic:
             raise PreflightError(
                 f"manager VM cmdline lacks approved {required}")
+    trace = dynamic.get("koov.nfs_trace")
     for harness in harnesses:
         if tuple(base) != harness.command_line:
             raise PreflightError(
                 "manager VM base cmdline differs from the approved command line")
+        if not any(fixture == selection[0] and trace in (None, mode)
+                   for fixture, mode in harness.fixtures):
+            raise PreflightError(
+                f"manager VM fixture {selection[0]} (koov.nfs_trace={trace}) "
+                "is no Stage 2 runtime selection of approved harness "
+                f"{harness.harness_id[:12]}")
+
+
+def _manager_harnesses(
+    value: dict, vm: dict, harnesses: tuple[_ApprovedHarness, ...],
+) -> tuple[_ApprovedHarness, ...]:
+    """The approved harnesses whose kernel the manager boots.  Sanitizer
+    variants (#81 D10) share every other file, so one manager runs one
+    variant."""
+    if not harnesses:
+        raise PreflightError("no approved harness is available")
+    kernel = _required_path(value, "kernel_obj") / "vmlinux"
+    bzimage = _required_path(vm, "kernel", parent="manager VM")
+    try:
+        actual = {"kernel": (file_sha256(kernel), kernel.stat().st_size),
+                  "bzimage": (file_sha256(bzimage), bzimage.stat().st_size)}
+    except OSError as exc:
+        raise PreflightError(f"manager kernel is unreadable: {exc}") from exc
+    matched = tuple(
+        harness for harness in harnesses
+        if all((harness.pin(name).sha256, harness.pin(name).size) == ident
+               for name, ident in actual.items()))
+    if not matched:
+        raise PreflightError(
+            "manager kernel and bzImage are no approved harness's")
+    return matched
 
 
 def _check_manager_assets(
@@ -431,8 +517,6 @@ def _check_manager_assets(
     harnesses: tuple[_ApprovedHarness, ...],
     *, expected_target: str, which: Callable[[str], str | None],
 ) -> None:
-    if not harnesses:
-        raise PreflightError("no approved harness is available")
     kernel_obj = _required_path(value, "kernel_obj")
     syzkaller = _required_path(value, "syzkaller")
     if value.get("target") != expected_target:
@@ -484,6 +568,11 @@ def _check_manager(
         raise PreflightError("manager config is not a JSON object")
     if value.get("type") != "qemu":
         raise PreflightError("manager config type must be qemu")
+    # The lane target is mounted in the executor's mount namespace at
+    # /nfs-lane.  The mgrconfig default is already "none"; a manager that
+    # explicitly selects another sandbox must not silently bypass that.
+    if value.get("sandbox", "none") != "none":
+        raise PreflightError("manager sandbox must be none for the NFS lane")
     if "snapshot" in value and value["snapshot"] is not False:
         raise PreflightError("manager program snapshot mode must be false")
     experimental = value.get("experimental")
@@ -501,6 +590,8 @@ def _check_manager(
     procs = value.get("procs")
     if type(procs) is not int or not 1 <= procs <= 64:
         raise PreflightError("target-mode campaign requires procs in [1, 64]")
+    harnesses = _manager_harnesses(value, vm, harnesses)
+    _check_layout(value, procs, harnesses)
     cmdline = str(vm.get("cmdline", "")).split()
     _check_approved_command_line(cmdline, harnesses)
     template_value = value.get("workdir_template")
@@ -517,8 +608,9 @@ def _check_manager(
     if lane_tokens != [lane_digest]:
         raise PreflightError("manager lane script differs from koov.lane_sha256")
     qemu_args = str(vm.get("qemu_args", ""))
-    if "-enable-kvm" not in qemu_args.split():
-        raise PreflightError("manager QEMU args lack -enable-kvm")
+    if accel_of(qemu_args) != collector.accel:
+        raise PreflightError(
+            f"manager QEMU args do not select the collector's {collector.accel}")
     journal_names = {
         part.removeprefix("name=")
         for token in qemu_args.split()
@@ -567,7 +659,7 @@ def preflight(
         return PreflightReport(ready=False, checks=tuple(checks.items))
     checks.add("collector_config", "pass", f"loaded {collector_file}")
 
-    checks.attempt("kvm", lambda: _check_kvm(kvm_path))
+    checks.attempt("accel", lambda: _check_accel(collector, kvm_path))
     checks.attempt("stage2_command",
                    lambda: _check_command(stage2, which=which))
     checks.attempt("stage2_timeout",
@@ -631,7 +723,10 @@ def preflight(
             checks.add("proxy_identity", "pass",
                        "compiler and replay use the same promoted build")
 
-    if stage2.resource_key == config.engine.resource_key:
+    if config.slots is not None:
+        checks.add("resource_key", "pass",
+                   "Stage 1 and Stage 2 share the host's KVM slot pool")
+    elif stage2.resource_key == config.engine.resource_key:
         checks.add("resource_key", "pass",
                    "Stage 1 and Stage 2 share one KVM resource fence")
     else:
@@ -680,8 +775,9 @@ def main(argv: list[str] | None = None) -> int:
     step.add_argument("--campaign-executions", type=int, default=128)
     step.add_argument("--campaign-timeout", type=float, default=1800)
     step.add_argument("--manager-stop-timeout", type=float, default=45)
-    step.add_argument("--exec-slowdown", type=int, default=1,
-                      help="syz-execprog slowdown for direct gate/replay VMs")
+    step.add_argument("--exec-slowdown", type=int, default=None,
+                      help="syz-execprog slowdown for direct gate/replay VMs "
+                           "(default: the collector's)")
     step.add_argument("input", type=Path)
     step.add_argument("output", type=Path)
     args = parser.parse_args(argv)
