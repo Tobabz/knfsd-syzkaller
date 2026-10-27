@@ -267,7 +267,8 @@ validation (Runner, §5.2)
   - 지시문은 Planning과 Mutation Strategy의 트리거 규칙(`04` §3.2)과 Proxy 역할 문장을 같은 상수로 쓴다.
     입력은 gap, gap key의 vocabulary contract, candidate, CandidateAnalysis와 `CapabilityProposal` 본문, base
     binding, 이전 시도의 patch set과 거부 사유다.
-  - host 연결(Stage 1 service의 구성)은 검증 Runner와 함께 붙인다(#83의 다음 PR).
+  - host 연결: `Stage1Config.generation`이 있으면 Stage 1 service가 이 executor와 §5.2의 검증기를 Controller에
+    붙인다(`agent_pipeline/stage1/cli.py`, `service.py`). 생성 Agent는 `run` 명령에서만 돈다.
 - 생성 Agent가 worktree에서 돌린 build와 test 결과는 판정이 아니다. staged revision을 만드는 판정은 Runner가
   patch set만 받아 새 격리 VM 환경(기본 KVM)에서 다시 build하고 §5.2를 실행해 낸다. Agent worktree의 산출물(binary,
   log)은 그 판정에 쓰지 않는다.
@@ -292,6 +293,18 @@ mutation_engine이면: 생성한 semantic subset이 M7 1단계(staged pin, 03-nf
     digest가 crash survival pending 표시와 함께 staged revision의 HCAP-10 authority_refs에 들어감
 트리거 기준 (04 §3.2): 새 capability의 실행 중 트리거가 NFS 클라이언트의 행위뿐이고 harness가 서버를 직접 조작하지 않음
 ```
+
+- 구현(`agent_pipeline/stage1/validation.py`): 검증 task 하나는 host 명령 한 번이다(`CommandValidator`, Controller의
+  `HarnessValidator`). 명령은 host 설정이고, patch set과 base binding의 descriptor·HCAP을 입력 디렉터리로 받아 다시
+  build하고 위 항목을 VM에서 실행한 뒤 `report.json`에 `passed`(새 descriptor와 staged HCAP catalog),
+  `rejected`(typed 사유), `inconclusive`(기반 시설 문제) 중 하나를 쓴다. 0이 아닌 종료, 시간 초과, 형식이 틀린
+  보고는 `inconclusive`다. 판정이 아니므로 Controller가 새 task로 다시 돌린다(`runtime_retry_limit` 안에서).
+  `passed`이면 검증기가 descriptor의 build 산출물이 저장됐는지와 HCAP catalog가 읽히는지 확인하고, staged
+  `ExecutionHarnessApproval`(그 descriptor와 staged revision)을 저장한 뒤 staged binding을 돌려준다. Materializer의
+  승인 authority는 host의 정적 승인 다음에 이 staged 승인을 본다. 보고와 명령이 남긴 파일은 digest로
+  `ValidationRecord`에 담겨 status의 `evidence_ref`가 된다. task 상태는 SQLite에 남고, 이전 process가 돌리던
+  task는 새 process가 열 때 남은 명령 session을 끝내고 `inconclusive(runner_restart)`로 둔다. 실제 검증 명령(위
+  항목의 실행)은 별도 작업이다(#83의 다음 PR).
 
 mutation_engine의 crash survival(guest crash 직전 MutationDelta가 남는가)은 여기서 보지 않는다. 이를 보려고
 guest를 일부러 crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지). 실제 campaign에서

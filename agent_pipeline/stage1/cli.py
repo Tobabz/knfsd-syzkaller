@@ -20,13 +20,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 
+from ..agent_tasks.generation import GenerationAgentExecutor, GenerationSandbox
 from ..artifacts import ArtifactStore
 from ..contracts import CandidateSubmission, LocationKind, LocationRequest
 from ..controller.records import TERMINAL, JobState
 from ..data import load_record
+from ..hcap import ArtifactHcapChecker
 from ..intake import GitSourceTree
 from ..materializer import (ArtifactHarnessMaterializer, ExecutionHarnessApproval,
                             StaticExecutionHarnessAuthority)
@@ -40,7 +42,10 @@ from .config import Stage1Config
 from .engine import CommandEngineConfig, CommandExecutionEngine
 from ..stage2.authority import Stage2Profiles
 from ..stage2.engine import Stage2CommandEngine, Stage2EngineConfig
-from .service import Stage1Parts, Stage1Service, Stage2Parts
+from .service import GenerationParts, Stage1Parts, Stage1Service, Stage2Parts
+from .validation import (CommandValidator, CommandValidatorConfig,
+                         DeferredValidator, StagedExecutionHarnessAuthority,
+                         ValidationStore)
 
 #: States where the loop has nothing to do until a person acts.
 STOP_STATES = TERMINAL | {JobState.S1_REACHED, JobState.S1_APPROVAL,
@@ -50,12 +55,13 @@ STOP_STATES = TERMINAL | {JobState.S1_REACHED, JobState.S1_APPROVAL,
 
 
 def open_stage1(config: Stage1Config, stack: ExitStack, *,
-                runtime=None, parser=None,
+                runtime=None, parser=None, generation_runtime=None,
                 run_agents: bool = True) -> Stage1Service:
     """Build the production service from host configuration.  Tests may
-    inject ``runtime`` and ``parser``; production uses the PydanticAI
-    driver and the pinned syzkaller bundle.  ``run_agents=False`` is for
-    one-shot commands: Agent Tasks they create are left to ``run``."""
+    inject ``runtime``, ``generation_runtime`` and ``parser``; production
+    uses the PydanticAI drivers and the pinned syzkaller bundle.
+    ``run_agents=False`` is for one-shot commands: Agent Tasks and
+    validations they create are left to ``run``."""
     artifacts = ArtifactStore(config.artifact_root)
     approvals = tuple(load_record(artifacts, ref, ExecutionHarnessApproval)
                       for ref in config.execution_harness_approvals)
@@ -116,12 +122,19 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
                 replay_profile_ref=c.replay_profile_ref,
                 crash_window_bound=c.crash_window_bound))
 
+    authority = StaticExecutionHarnessAuthority(approvals)
+    generation = None
+    if config.generation is not None:
+        authority, generation = _generation(
+            config, stack, artifacts, authority, slots,
+            runtime=generation_runtime, run=run_agents)
+
     tree = GitSourceTree(config.kernel_repo)
     parts = Stage1Parts(
         state_dir=state, artifacts=artifacts, tree=tree,
         registry=ArtifactHarnessRegistry(artifacts, config.harness_catalog_ref),
         materializer=ArtifactHarnessMaterializer(
-            artifacts, StaticExecutionHarnessAuthority(approvals), parser),
+            artifacts, authority, parser),
         runtime=runtime, tools=None, engine_factory=engine,
         judge_versions=config.judge_versions,
         identities=DescriptorKernelIdentity(
@@ -134,8 +147,59 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         compiler=None if config.nfs_proxy is None else
         ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
                                      state / "compile"),
-        stage2=stage2)
+        stage2=stage2, generation=generation)
     return stack.enter_context(Stage1Service(parts))
+
+
+def _generation(config: Stage1Config, stack: ExitStack,
+                artifacts: ArtifactStore,
+                static: StaticExecutionHarnessAuthority, slots, *, runtime,
+                run: bool):
+    """07 §5: the generation Agent, the validator and the authority that
+    adds the staged approvals validation left to the static ones."""
+    g = config.generation
+    state = Path(config.state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    store = stack.enter_context(closing(
+        ValidationStore(state / "validations.sqlite")))
+    authority = StagedExecutionHarnessAuthority(static, store, artifacts)
+    if run:
+        v = g.validation
+        validator = CommandValidator(CommandValidatorConfig(
+            argv=v.argv, cwd=v.cwd, work_root=state / "validation-runs",
+            resource_key=v.resource_key, env=v.env, timeout_s=v.timeout_s),
+            store, artifacts, state / "validation.lock", slots=slots)
+    else:
+        validator = DeferredValidator(store)
+    if runtime is None and run:
+        from ..agent_tasks.pydantic_ai_generation import (
+            PydanticAIGenerationRuntime)
+        runtime = PydanticAIGenerationRuntime()
+    extra = {} if g.allowed_paths is None else \
+        {"allowed_paths": g.allowed_paths}
+    sandbox = GenerationSandbox(
+        repo=g.repo, worktree_root=g.worktree_root, base_ref=g.base_ref,
+        launcher=g.launcher, env=g.env, **extra)
+    hcap = ArtifactHcapChecker(artifacts)
+    executor = GenerationAgentExecutor(
+        runtime, artifacts, sandbox, None,
+        contract_for=lambda gap, revision: gap_contract(hcap, gap, revision))
+    return authority, GenerationParts(executor=executor, validator=validator,
+                                      workers=g.workers)
+
+
+def gap_contract(hcap: ArtifactHcapChecker, gap, revision: str | None):
+    """The gap key's vocabulary contract in the base HCAP revision."""
+    if revision is None:
+        return None
+    try:
+        catalog = hcap.load_catalog(revision)
+    except (OSError, ValueError):
+        return None
+    for item in catalog.gap_contracts:
+        if item.missing_capability_id == gap.missing_capability_id:
+            return item
+    return None
 
 
 def resubmit(service: Stage1Service, job_id: str, kernel_commit: str) -> str:

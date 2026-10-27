@@ -77,6 +77,7 @@ processes at once, or after a later one is ignored.
 | `judge_versions` | fallback `Q1AdmissibilityProfile` / `RemoteKcovSupportBoundary` digests |
 | `vmlinux_artifact_name`, `instrumentation_artifact_name` | descriptor build-artifact names used for the kernel identity |
 | `engine` | the host command, its cwd, environment, resource key and timeout |
+| `generation` | optional Harness Generation (07 §5): the Agent's sandbox (`repo`, `worktree_root`, `base_ref`, `launcher`, `env`, `allowed_paths`, `workers`) and the `validation` command; see below |
 
 Keep `state_dir` and `artifact_root` together: Controller history, Runner
 receipts and Q1 publications are needed for replay.
@@ -114,6 +115,31 @@ in `output/`. The collection interval is the supervised process's own start
 and end; stdout and stderr are kept in `process.log`. A nonzero exit,
 timeout or malformed capture ends the task `capture_failed`, which the
 Controller treats as a runtime failure, not a verdict.
+
+## Harness Generation
+
+With `generation` set, a job whose policy has a `harness_generation_budget`
+goes from a harness gap to `harness_generating` instead of stopping
+(`docs/design/02-llm-agent/09-job-state-graph.md` §3.2). `run` runs the
+generation Agent on its own workers (`QueuedGenerationExecutor`) and each
+patch set it answers through `CommandValidator`, which runs
+`generation.validation.argv` once per validation task with `{input}`,
+`{output}` and `{resource}` replaced (the contract is in
+`validation.py`). The command rebuilds the harness from `input/patch.diff`
+on the base binding, runs the 07 §5.2 checks in a VM and writes
+`output/report.json`: `passed` with the new `descriptor.json` and staged
+`hcap.json`, `rejected` with a typed reason, or `inconclusive`. A pass
+stores a staged `ExecutionHarnessApproval`; the Materializer's authority
+takes it beside the static `execution_harness_approvals`, and the waiting
+jobs continue on the staged binding. Tasks and approvals are in
+`state_dir/validations.sqlite`; command runs in `validation-runs/`.
+
+Only `run` validates (it holds `validation.lock`); other commands read the
+statuses and leave submits to `run`. A validation running when `run` stops
+ends `inconclusive`, and the Controller runs it again as a new task after
+restart. With `slots`, a validation takes a KVM slot from the same pool as
+the Runner workers; without, it runs on its own `resource_key`, so the host
+needs room for both.
 
 ## Q1 authority
 

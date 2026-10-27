@@ -306,7 +306,12 @@ def test_open_stage1_builds_the_production_composition(tmp_path, build):
                                              descriptor_id)
     from agent_pipeline.registry import HarnessCatalog, HarnessRegistration
     from agent_pipeline.stage1.cli import open_stage1
-    from agent_pipeline.stage1.config import EngineConfig, Stage1Config
+    from agent_pipeline.stage1.config import (EngineConfig,
+                                              HarnessGenerationConfig,
+                                              Stage1Config,
+                                              ValidationCommandConfig)
+    from agent_pipeline.stage1.validation import (CommandValidator,
+                                                  DeferredValidator)
 
     repo = tmp_path / "linux"
     (repo / "fs" / "nfsd").mkdir(parents=True)
@@ -345,11 +350,23 @@ def test_open_stage1_builds_the_production_composition(tmp_path, build):
                   str(REPO), str(tmp_path / "command.py"),
                   "{input}", "{output}"),
             cwd=tmp_path, resource_key="test-lane-0",
-            env={"LANG": "C.UTF-8", "TEST_PCS": "4096"}, timeout_s=60))
+            env={"LANG": "C.UTF-8", "TEST_PCS": "4096"}, timeout_s=60),
+        generation=HarnessGenerationConfig(
+            repo=REPO, worktree_root=tmp_path / "worktrees",
+            launcher=("/usr/bin/env",),
+            validation=ValidationCommandConfig(
+                argv=("/bin/false",), cwd=tmp_path,
+                resource_key="test-validate")))
     config = Stage1Config.model_validate_json(config.model_dump_json())
+    with ExitStack() as stack:
+        once = open_stage1(config, stack, parser=b.parser, run_agents=False)
+        assert isinstance(once.parts.generation.validator, DeferredValidator)
     with ExitStack() as stack:
         service = open_stage1(config, stack, runtime=ScriptedRuntime(b),
                               parser=b.parser)
+        assert isinstance(service.parts.generation.validator,
+                          CommandValidator)
+        assert service.controller.generations is not None
         job_id = submit(service, b)
         register_mapping(service, b, job_id)
         service.start_worker(idle_s=0.05)

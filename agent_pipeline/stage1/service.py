@@ -12,10 +12,12 @@ polls, so the verdict is consumed on the next ``step``.
 
 Each ``step``:
 
-1. deliver finished Agent results to the Controller;
+1. deliver finished Agent results (Stage 1/2 and Harness Generation) to
+   the Controller;
 2. publish Q1 authority for sealed Runner tasks and Stage 2 authority
    for every bundle a Stage 2 task added;
-3. ``Controller.poll()``: take Runner statuses, resend lost calls.
+3. ``Controller.poll()``: take Runner and validation statuses, resend
+   lost calls.
 """
 
 from __future__ import annotations
@@ -27,12 +29,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from ..agent_tasks.executor import PinnedToolboxFactory, ToolboxFactory
+from ..agent_tasks.generation import (GenerationAgentExecutor,
+                                      QueuedGenerationExecutor)
 from ..agent_tasks.queued import QueuedAgentExecutor
 from ..agent_tasks.runtime import AgentRuntime
 from ..artifacts import ArtifactStore
 from ..components import (HarnessRegistry, IssueTracker, Materializer,
                           MutationRuleCompiler)
 from ..contracts import JudgeVersions
+from ..controller.generation import HarnessValidator
 from ..controller.machine import Env
 from ..controller.records import Job
 from ..controller.service import Controller, EffectFailure
@@ -75,6 +80,18 @@ class Stage2Parts:
 
 
 @dataclass(frozen=True)
+class GenerationParts:
+    """Harness Generation (07 §5): the Agent executor, which the service
+    queues on its own workers, and the validator of its patch sets.  With
+    ``Stage1Parts.run_agents`` False the Agent is not run and the
+    validator should be a ``DeferredValidator``."""
+
+    executor: GenerationAgentExecutor
+    validator: HarnessValidator
+    workers: int = 1
+
+
+@dataclass(frozen=True)
 class Stage1Parts:
     """Injected components; production values come from ``open_stage1``."""
 
@@ -106,6 +123,9 @@ class Stage1Parts:
     #: None until a Stage 2 engine and profiles are configured: a compiled
     #: rule set then waits in blocked_operator(stage2_gate_unavailable).
     stage2: Stage2Parts | None = None
+    #: None until Harness Generation is configured: a gap a policy would
+    #: generate for then ends unavailable(no_generator).
+    generation: GenerationParts | None = None
 
 
 class AgentDispatchDeferred(RuntimeError):
@@ -121,6 +141,21 @@ class _DeferredAgents:
     """
 
     sink = None
+
+    def start(self, request) -> None:
+        raise AgentDispatchDeferred(
+            f"{request.task_id} is left to the service loop")
+
+    def deliver(self, **kwargs) -> int:
+        return 0
+
+    def close(self, **kwargs) -> None:
+        pass
+
+
+class _DeferredGenerator:
+    """The generation executor of a one-shot command: the try stays unsent
+    and the service loop's ``poll()`` sends a new one (09 §8)."""
 
     def start(self, request) -> None:
         raise AgentDispatchDeferred(
@@ -180,6 +215,14 @@ class Stage1Service:
                 max_workers=parts.agent_workers)
         else:
             self.agents = _DeferredAgents()
+        self.generator = None
+        validator = None
+        if parts.generation is not None:
+            validator = parts.generation.validator
+            self.generator = QueuedGenerationExecutor(
+                parts.generation.executor, sink=None,
+                max_workers=parts.generation.workers) \
+                if parts.run_agents else _DeferredGenerator()
         env = Env(policy=self.store.policy, hcap=hcap,
                   materializer=parts.materializer, judge=self.judge,
                   compiler=parts.compiler, stage2=self.stage2_judge)
@@ -187,8 +230,10 @@ class Stage1Service:
         self.controller = Controller(
             self.store, env, self.runner, self.agents, self.issues,
             parts.registry, parts.tree, self.artifacts, parts.judge_versions,
-            **extra)
+            generator=self.generator, validator=validator, **extra)
         self.agents.sink = self.controller
+        if self.generator is not None:
+            self.generator.sink = self.controller
         self.publisher = Q1AuthorityPublisher(
             self.store, self.runner, self.receipts, self.bridge,
             self.artifacts, parts.identities, self.mappings, self.judge)
@@ -262,6 +307,12 @@ class Stage1Service:
         except Exception as exc:
             # The result stays queued and is offered again next step.
             report.errors.append(f"deliver: {type(exc).__name__}: {exc}")
+        if self.generator is not None:
+            try:
+                report.delivered += self.generator.deliver()
+            except Exception as exc:
+                report.errors.append(
+                    f"deliver generation: {type(exc).__name__}: {exc}")
         report.errors.extend(self.deliver_issue_events())
         report.publications = self.publisher.publish_ready()
         if self.stage2_publisher is not None:
@@ -329,6 +380,18 @@ class Stage1Service:
             self.agents.deliver()
         except Exception as exc:     # the next recover() sends it again
             self.worker_errors.append(f"deliver on close: {exc}")
+        if self.generator is not None:
+            self.generator.close()
+            try:
+                self.generator.deliver()
+            except Exception as exc:
+                self.worker_errors.append(
+                    f"deliver generation on close: {exc}")
+            # A validation still running ends inconclusive and runs again
+            # after restart (07 §5.2).
+            close = getattr(self.parts.generation.validator, "close", None)
+            if close is not None:
+                close()
         self.bridge.close()
         self.stage2_store.close()
         if worker_done:

@@ -93,6 +93,53 @@ class AgentRuntimeConfig(_Config):
     run_timeout_s: float = Field(default=1200, gt=0, le=14_400)
 
 
+class ValidationCommandConfig(_Config):
+    """The host command that validates one patch set (07 §5.2); see
+    ``stage1.validation`` for its contract.  With ``slots`` it runs on a
+    KVM slot of the pool; without, on ``resource_key`` beside the Runner's
+    lease, so the host must have room for both."""
+
+    argv: tuple[str, ...] = Field(min_length=1)
+    cwd: Path
+    env: dict[str, str] = Field(default_factory=lambda: {"LANG": "C.UTF-8"})
+    resource_key: str = Field(min_length=1, max_length=256)
+    #: A rebuild, bootstrap, smoke, control and regression run.
+    timeout_s: float = Field(default=14_400, gt=0, le=86_400)
+
+    @field_validator("argv")
+    @classmethod
+    def _absolute(cls, argv: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError("argv[0] must be an absolute path")
+        return argv
+
+
+class HarnessGenerationConfig(_Config):
+    """Harness Generation (07 §5): the Agent's sandbox and the validation
+    command.  Unset, a gap a policy would generate for ends
+    ``unavailable(no_generator)``."""
+
+    #: The repository clone the worktrees come from (read-only to the
+    #: generation user).
+    repo: Path
+    #: setgid to a group of the generation user (07 §5.1).
+    worktree_root: Path
+    base_ref: str = "HEAD"
+    #: argv prefix: the separate OS user, no network.
+    launcher: tuple[str, ...] = Field(min_length=1)
+    env: dict[str, str] = Field(default_factory=dict)
+    allowed_paths: tuple[str, ...] | None = None
+    workers: int = Field(default=1, ge=1, le=8)
+    validation: ValidationCommandConfig
+
+    @field_validator("launcher")
+    @classmethod
+    def _absolute(cls, argv: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError("launcher[0] must be an absolute path")
+        return argv
+
+
 class Stage1Config(_Config):
     state_dir: Path
     artifact_root: Path
@@ -123,6 +170,7 @@ class Stage1Config(_Config):
     stage2: Stage2Config | None = None
     #: Unset: one execution at a time on ``engine.resource_key``.
     slots: SlotsConfig | None = None
+    generation: HarnessGenerationConfig | None = None
 
     @model_validator(mode="after")
     def _campaign_backends(self) -> Stage1Config:
