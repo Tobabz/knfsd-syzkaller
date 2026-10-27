@@ -41,10 +41,19 @@ def checked_in_series() -> list[tuple[str, str]]:
             for p in sorted(SERIES.glob("*.patch"))]
 
 
+def checked_in_patch_stacks() -> list[tuple[str, str]]:
+    patch_root = REPO / "bundle" / "patches"
+    return [(p.name, p.read_text())
+            for directory in (patch_root / "syzkaller",
+                              patch_root / "kcsan" / "syzkaller")
+            for p in sorted(directory.glob("*.patch"))]
+
+
 def test_series_bytes_match_the_pinned_fingerprint():
-    data = series_bytes(checked_in_series())
+    stacks = checked_in_patch_stacks()
+    data = series_bytes(stacks)
     assert hashlib.sha256(data).hexdigest() == series_fingerprint("syzkaller")
-    assert split_series(data) == checked_in_series()
+    assert split_series(data) == stacks
     with pytest.raises(ValueError):
         split_series(b"name-without-patch\0")
 

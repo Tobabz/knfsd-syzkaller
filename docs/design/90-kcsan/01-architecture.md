@@ -1,8 +1,9 @@
 # KCSAN Policy 전체 구조
 
-> 상태: draft · 최종 확인: 2026-10-14
-> 기준: kernel `v7.3-rc5` / syzkaller `801f09666`
-> 2026-10-16 변경: Program-based 방식은 숫자 Policy ID 대신 `candidate_id`로 Store를 조회한다. 퍼징 시작 경계는 [02](02-program-based-kcsan.md)를 우선한다.
+> 상태: 구현 개요 · 최종 확인: 2026-10-27
+> 현재 기준: [`bundle/patches/BASE`](../../../bundle/patches/BASE) kernel `v7.3-rc6` (`a90ee4305c4a5df72c11b31dacfdc76e00fcf78a`) / syzkaller (`801f0966669a37e048adabf9e5f38ce52825ea82`)
+> 검증 범위: KCSAN patch 0004의 커밋 메시지는 clean-base kernel build와 snapshot VM smoke를 기록하지만, resolved base SHA와 원시 evidence를 보존하지 않는다. 2026-10-14 문서의 `v7.3-rc5` 표기는 과거 기준이며 현재 pin의 최종 검증 근거로 취급하지 않는다. Full Controller→Stage 2 campaign/replay 검증은 미완료다.
+> 2026-10-27 정정: 퍼징 시작 경계와 현재 Program-based 동작은 [02](02-program-based-kcsan.md)를 우선한다.
 
 ## 요약
 
@@ -52,7 +53,7 @@ KCSAN Policy는 NFS/RPC 커널 코드의 후보 함수에 watchpoint 설치 기�
 
 `(P)`는 생성 결과, `(R)`은 VM 등록, `(B)`는 실행별 참조 연결, `(K)`는 함수별 적용의 관측 지점이다. 읽는 순서는 Policy 준비·등록과 프로그램 실행·선택의 두 경로가 kernel의 generation에서 합쳐진 뒤 KCSAN 접근으로 이어진다.
 
-그림은 목표 구조다. `Policy preparation`은 규칙을 산출하는 역할이며, 생성 방식이나 Agent 내부 단계를 뜻하지 않는다. `NFS-RPC work`에는 기존 generation 귀속이 실제로 이어진 작업만 포함된다.
+그림은 구성 요소 사이의 책임 경계를 나타낸다. 현재 Program-based 경로는 단일 `function` 후보에서 고정 rule payload를 만들고 Stage 2 campaign config로 연결한다. 상세한 Controller handoff와 미검증 end-to-end 구간은 [02](02-program-based-kcsan.md)에 기록한다. `NFS-RPC work`에는 generation 귀속이 확인된 작업만 포함하며, 비동기 작업 전체에 적용된다고 가정하지 않는다.
 
 ## 설계
 
@@ -67,15 +68,15 @@ KCSAN Policy는 NFS/RPC 커널 코드의 후보 함수에 watchpoint 설치 기�
 | KCOV generation | 한 프로그램 실행에 선택된 Policy 객체의 참조를 보유한다. |
 | KCSAN 접근 경로 | 활성 참조와 접근 IP로 규칙을 찾고 watchpoint 선택·delay에 사용한다. |
 
-Policy 산출물은 **`candidate_id`, 적용 대상 커널, 기본 규칙, 함수별 watchpoint 가중치·delay**를 구분한다. 후보 함수에 고정 규칙을 주는 방식과 LLM이 관련 호출 경로에서 함수를 고르는 방식은 같은 산출물 형식으로 합류한다. 함수명은 등록 전에 대상 커널에서 실제로 적용 가능한 IP 범위로 해석되어야 한다. 생성 알고리즘, rule 값, 검증 형식은 `03-policy-generation.md`에서 정의할 예정이다.
+현재 payload는 **`candidate_id`, schema version, default settings, 함수별 symbol/subsystem/weight/delay**를 담는다. Kernel commit은 payload에 직렬화되지 않는다. 대신 Stage 2 `_campaign_manager`가 Controller job, harness candidate, descriptor kernel commit, sanitizer를 대조하고 pinned kernel artifacts를 사용한 뒤 payload를 선택한다. 지원 생성 경로는 accepted KCSAN candidate의 단일 `location.kind=function`에 고정 rule을 주는 방식(`weight=4`, `delay_us=3000`)뿐이다. LLM이 호출 경로에서 추가 함수를 선택하는 방식은 구현 범위가 아니다. Kernel resolver는 `kallsyms_lookup_name()`과 symbol size/offset으로 IP range를 얻지만, source path를 보존하거나 kernel-wide 동명 symbol의 유일성을 입증하지 않는다. 따라서 source-level에서 이름이 유일해 보인다는 사실만으로 target IP가 올바르다고 단정할 수 없다. Payload 및 kernel-side validation은 `kcsan_pipeline/program_policy.py`와 kernel overlay patch 0002에 있다.
 
-Policy 유무와 관계없이 watchpoint 설치를 허용하는 공통 범위는 NFS client, NFS common, lockd, SUNRPC, NFSD다. Policy는 이 범위 안에서 함수별 우선순위와 delay를 조정한다. Policy가 없는 실행은 공통 범위 안에서 기본 샘플링을 사용하며, 미등록 후보로 요청한 실행과 구별한다.
+커널 overlay patch 0001은 watchpoint 설치를 built-in NFS client, NFS common, lockd, SUNRPC, NFSD text scope로 제한한다. Policy 없는 실행은 이 공통 scope의 baseline sampling을 유지한다. Policy-bound generation에서는 patch 0003/0004가 선택한 candidate subsystem과 실제 rule IP에 맞는 접근만 새 watchpoint 후보로 샘플링한다. 현재 `weight=4`는 matched access마다 40% 선택 threshold를 뜻하며 unmatched access는 그 generation에서 새로운 watchpoint를 설치하지 않는다. 이미 설치된 watchpoint를 다른 접근이 관측할 수 있으므로, report의 stack만으로 후보 rule이 선택됐다고 단정하지 않는다.
 
-Loader가 등록한 Policy는 VM의 Store에 유지된다. VM은 프로그램마다 새로 부팅되지 않으며, 실행 요청은 Policy 내용 대신 `candidate_id`를 전달한다. syz-manager 설정은 캠페인 시작 시 선택하고, VM 재부팅마다 동일한 payload를 다시 등록한다. 중복 후보와 실행 중 신규 등록은 `04-policy-store-loader.md`에서 다룰 예정이다.
+Loader가 등록한 Policy는 VM의 Store에 유지된다. KCSAN Stage 2 campaign manager config가 payload 하나를 선택하고, syz-manager는 VM 부팅마다 runner 시작 전에 `policy-load`를 수행한다. VM 재부팅 뒤 Store는 비어 있으므로 동일 payload를 다시 등록한다. Store는 candidate별 immutable entry를 갖고 중복 ID를 거부한다. 등록 및 request selection 절차는 [02](02-program-based-kcsan.md)와 kernel overlay patch 0002에서 정의한다.
 
-executor는 프로그램의 첫 syscall 전에 `candidate_id`로 새 generation을 시작한다. 커널은 Store의 Policy를 조회하고 **키가 아닌 Policy 객체의 참조**를 generation에 붙인다. 이후 syscall 직전 bind와 지원되는 원격 작업의 token 전파는 같은 generation을 활성화한다. 매 syscall 또는 KCSAN 메모리 접근마다 Store에서 다시 조회하지 않는다. generation의 수명이 끝나면 참조를 반환한다. Program-based 방식의 퍼징 시작 경계는 `02-program-based-kcsan.md`에서 다룬다.
+syz-manager는 program request마다 manager `candidate_id`를 executor로 전달한다. Remote-coverage executor는 첫 syscall 전에 `KCOV_REMOTE_GENERATION_BEGIN_POLICY`로 새 generation을 만들고, 커널은 Store에서 **키가 아닌 Policy 객체의 참조**를 generation에 붙인다. 이후 지원되는 request bind와 remote token paths는 같은 generation을 활성화한다. 매 syscall 또는 KCSAN memory access에서 Store를 다시 조회하지 않는다. generation 종료 시 참조를 반환한다. generation 밖의 task가 candidate Policy를 상속한다고 일반화하지 않는다.
 
-KCSAN은 활성 Policy가 있으면 접근 IP에 맞는 rule을 이용해 watchpoint 설치 여부와 delay를 결정한다. 가중치가 높은 함수에서 적격 접근당 설치 기회가 커지는지가 핵심 요구다. 구체적인 확률 계산, 기본 샘플링과의 혼합, 함수별 계측은 `05-watchpoint-selection.md`에서 다룰 예정이다. Policy는 KCSAN의 보고 결과를 직접 생성하거나 NFS 요청을 변조하지 않는다.
+KCSAN은 active Policy와 현재 access IP가 맞으면 rule의 delay를 적용하고 watchpoint 설치 기회를 weight로 정한다. Patch 0004의 확률은 weight unit당 10%, 최대 40%이며, 이는 직접 matched-rule sampling이지 기존 KCSAN baseline과 30/70 혼합하는 방식이 아니다. Policy는 KCSAN report를 직접 생성하거나 NFS 요청을 변조하지 않는다.
 
 ## 설계 근거
 
@@ -116,7 +117,7 @@ generation 경로 밖의 작업이 목표 후보의 필수 실행 부분으로 �
 
 | 확인 단계 | 판정 가능한 관측 | 이것만으로 증명하지 않는 것 |
 |---|---|---|
-| 생성 | `candidate_id`, 대상 빌드, 함수별 rule과 산출물 identity | VM 등록 |
+| 생성·선택 | job/harness candidate ID, descriptor kernel commit, sanitizer match, exact payload bytes | 대상 vmlinux에서 runtime symbol/IP가 올바르게 해석됨 |
 | 등록 | Store에서 후보 키, 기본값, 모든 rule의 범위·가중치·delay 조회 | 특정 실행에 선택됨 |
 | 실행 연결 | 요청의 `candidate_id`와 generation의 Policy bind 결과 대조 | 목표 함수에서 접근 발생 |
 | 실제 적용 | 함수별 적격 접근·선택·설치·delay 증가 | 목표 race의 존재 또는 root cause |
@@ -139,14 +140,14 @@ generation 경로 밖의 작업이 목표 후보의 필수 실행 부분으로 �
 |---|---|
 | 결정됨 | 공통 NFS/RPC 범위 안에서 함수별 Policy를 적용한다. |
 | 결정됨 | `candidate_id`는 실행 선택용이고, generation은 실제 Policy 참조를 보유한다. |
-| 미결 | 후보 분석의 어느 산출물을 함수 선정의 정식 입력으로 사용할지. |
+| 현재 범위 밖 | LLM이 호출 경로에서 추가 함수를 선정하는 Program policy generation; 현재는 후보 function 하나를 그대로 rule로 쓴다. |
 | 결정됨 | Program-based 방식은 숫자 ID를 발급하지 않고 KCSAN pipeline이 후보 함수 규칙을 준비한다(`02-program-based-kcsan.md`). |
-| 미결 | Controller의 퍼징 시작 설정 호출부와 실제 VM 등록·변이 승계의 종단 간 검증. |
-| 미결 | 함수별 가중치와 기본 샘플링의 최종 결합 방식. |
+| 구현됨 / 미검증 | Stage 2 `_campaign_manager`가 identity를 확인해 manager config를 선택한다. Current full Stage 2 two-server campaign과 KCSAN report replay는 아직 재실행하지 않았다. |
+| 결정됨 | Patch 0004는 matched rule weight에 직접 10%/unit, max 40% threshold를 적용한다. Default KCSAN baseline은 Policy 없는 scope-bound 실행에 남는다. |
 | 미검증 | 모든 background·비동기 작업에 generation Policy가 전파된다는 주장. |
-| 미검증 | 후보 입력부터 KCSAN 적용 결과까지 전체 경로가 하나의 정식 인터페이스로 동작한다는 주장. |
+| 미검증 | Candidate symbol의 runtime IP가 source path에 지정한 함수와 일치한다는 보장. `kallsyms_lookup_name()`은 source path/동명 symbol disambiguation을 제공하지 않는다. |
 
-Program-based 실행 경계는 `02-program-based-kcsan.md`에 정의한다. 생성·등록·선택의 세부 계약은 `03-policy-generation.md`, `04-policy-store-loader.md`, `05-watchpoint-selection.md`로 분리할 예정이다. 후자의 문서들은 아직 작성되지 않았으며, 각 문서가 완성되면 이 개요에서 세부 규칙을 중복 기술하지 않는다.
+Program-based 실행 경계와 현재 구현 상태는 `02-program-based-kcsan.md`에 정의한다. 이 디렉터리에는 현재 01/02 설계 문서만 있으며, 별도 generation, Store/Loader, watchpoint-selection 문서는 아직 없다. 새 세부 문서를 추가할 때는 patch와 테스트의 실제 계약을 먼저 확인하고, 이 개요와 상충하는 미래형 설명을 남기지 않는다.
 
 ## 참조
 
@@ -155,11 +156,11 @@ Program-based 실행 경계는 `02-program-based-kcsan.md`에 정의한다. 생�
 
 ## Agent 사용 지침
 
-**지원 범위:** 후보는 정확한 커널 commit의 `function` 또는 `source_range` 한 지점으로 주어진다. 이 위치를 출발점으로 Policy 대상 함수를 선정하되, 추가 함수에는 별도의 분석 근거를 붙인다.
+**지원 범위:** Stage 2 KCSAN campaign에서 정확한 kernel commit에 묶인 accepted candidate 하나의 `location.kind=function` rule을 만든다. Candidate/harness/descriptor commit identity는 campaign 진입 때 대조된다. `source_range`와 LLM이 추가하는 함수는 지원하지 않는다.
 
 **비지원 범위:** 후보 하나가 자동으로 race 함수쌍이나 실행 심볼을 보장한다고 가정하지 않는다. KCSAN Policy는 NFS semantic mutation 규칙이나 사용자 공간 Ganesha 계측을 만들지 않는다.
 
-**확장 절차:** 새 함수 선정 방식은 산출물과 검증 계약을 먼저 정의한다. 그다음 등록, 실행별 `candidate_id` 전달, KCSAN 적용 관측을 연결한다. 세부 변경 위치와 순서는 예정된 요소 문서에서 현재 코드를 확인해 작성한다.
+**확장 절차:** 새 실행·함수 policy를 추가할 때는 candidate/kernel identity, serialized payload schema, symbol-to-IP disambiguation, VM Store registration, request candidate ID, generation bind, function-specific KCSAN counters를 각각 테스트한다. Baseline Stage 1/gate/replay에는 candidate policy를 적용하지 않는다.
 
 **제약:** 공통 범위 밖 함수, 다른 빌드의 IP 범위, 출처가 불명확한 `candidate_id`를 정상 적용으로 취급하지 않는다.
 

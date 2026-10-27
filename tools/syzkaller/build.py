@@ -46,18 +46,23 @@ def build(source: Path, output: Path, go: str) -> Path:
     base = dict(line.split("=", 1) for line in
                 (ROOT / "bundle/patches/BASE").read_text().splitlines()
                 if line and not line.startswith("#"))["syzkaller_commit"]
-    series = ROOT / "bundle/patches/syzkaller"
-    names = [line for line in (series / "series").read_text().splitlines()
-             if line and not line.startswith("#")]
-    if names != sorted(p.name for p in series.glob("*.patch")):
-        raise ValueError("series and patch filename ordering disagree")
-    patch_bytes = b"".join(name.encode() + b"\0" + (series / name).read_bytes() + b"\0"
-                           for name in names)
+    series_dirs = (ROOT / "bundle/patches/syzkaller",
+                   ROOT / "bundle/patches/kcsan/syzkaller")
+    patches = []
+    for series in series_dirs:
+        names = [line for line in (series / "series").read_text().splitlines()
+                 if line and not line.startswith("#")]
+        if names != sorted(p.name for p in series.glob("*.patch")):
+            raise ValueError(f"{series}: series and patch filename ordering disagree")
+        patches.extend((series, name) for name in names)
+    patch_bytes = b"".join(name.encode() + b"\0" +
+                           (series / name).read_bytes() + b"\0"
+                           for series, name in patches)
     patch_digest = hashlib.sha256(patch_bytes).hexdigest()
     checkout = output / "checkout"
     run(["git", "clone", "--shared", "--no-checkout", str(source), str(checkout)], cwd=output)
     run(["git", "checkout", "--detach", base], cwd=checkout)
-    for name in names:
+    for series, name in patches:
         # Stable committer identity/date: same base+patch bytes yield the same
         # applied commit, independently of the developer's git configuration.
         run(["git", "-c", "user.name=knfsd bridge builder",

@@ -3,6 +3,8 @@
 베이스 이미지 생성, 환경 부트스트랩(커널 두 종류·syzkaller 빌드·VM 이미지 bake·검증), 패치 시리즈 적용,
 그리고 Ganesha·프록시 기반의 NFS 특화 Mutation Engine 빌드 도구를 모아 둔 디렉터리입니다.
 시드는 bootstrap이 패치·빌드한 syzkaller의 syz-manager로 실행합니다(`README.md` 3절).
+`fport-apply.sh`와 bootstrap은 공통 패치 뒤 KCSAN policy overlay를 자동 적용합니다.
+KCSAN policy는 캠페인 설정에서 선택할 때만 활성화되며, 빌드 지문은 두 패치 스택을 모두 반영합니다.
 
 ## 진입점
 
@@ -29,7 +31,7 @@ uv run python tools/bootstrap-kcov-env.py env ... --update       # 새 커널로
 | `setup-generation-user.sh` | Harness Generation 생성 OS 사용자(`harness-gen`)·launcher·sudoers·state 디렉터리 준비 (sudo, 호스트당 한 번; `agent_pipeline/stage1/host/README.md`) |
 | `harness-generation-build.py` | patch set 검증의 build 단계 — 바뀐 입력이 없으면 base env 재사용, 있으면 tree의 bootstrap으로 해당 variant만 다시 빌드 (`generate`가 `validate.json`에 넣음) |
 | `bootstrap-kcov-env.py` | env 부트스트랩 — `--variant kasan\|kcsan`별 out-of-tree 커널 빌드, syzkaller 빌드, VM 이미지 bake, variant별 부팅 검증 |
-| `fport-apply.sh` | 시리즈 적용 — `fport-apply.sh [--dry-run] <kind> <target>` (bootstrap이 호출; BASE와 다른 베이스도 `git am -3`으로 시도) |
+| `fport-apply.sh` | 공통 시리즈 뒤 `bundle/patches/kcsan/<kind>/` overlay까지 적용 — `fport-apply.sh [--dry-run] <kind> <target>` (bootstrap이 호출; BASE와 다른 베이스도 `git am -3`으로 시도) |
 | `bump-kernel.py` | 새 커널 태그로 이월 — `bump-kernel.py <태그\|latest>`; 충돌 시 손으로 해결 후 `--export <클론>` (해결 기록은 `cache/rr-cache-kernel`) |
 | `kernel_base.py` | `bundle/patches/BASE` 읽기·쓰기와 커널 태그 정렬·`latest` 조회 (bootstrap·bump가 공용) |
 | `release-assembly.sh` | (선택) 보관·전달용 `bundle/` tar.gz 생성 |
@@ -84,7 +86,7 @@ executor가 `executor_linux.h`에 따로 둔 정의와 맞춰야 하므로 필�
 
 | 필드 | 내용 |
 |---|---|
-| `kernel.series_sha256`, `syzkaller.series_sha256` | 패치 시리즈의 파일명·내용 해시(적용 순서 포함) |
+| `kernel.series_sha256`, `syzkaller.series_sha256` | 공통 시리즈와 KCSAN overlay의 파일명·내용 해시(적용 순서 포함) |
 | `changes.axis` | 직전 성공 manifest와 비교한 결과: `kernel-release`, `scenario`, `both`, `none`, `first-run`, `unknown` |
 | `changes.kernel_base` 등 | 커널 베이스·커널 시리즈·syzkaller 베이스·시리즈 각각의 변경 여부 (`syzkaller_inputs_changed`가 시나리오 축) |
 | `timing_seconds` | 단계별 소요 시간(`kernel_clone`, `kernel_apply`, `kernel_build_<variant>`, `kernel_export`, `syzkaller_clone`, `syzkaller_apply`, `syzkaller_build`, `bake`, `verify`, `total`) |
@@ -104,6 +106,7 @@ executor가 `executor_linux.h`에 따로 둔 정의와 맞춰야 하므로 필�
   `kernel.variants.<variant>.config_sha256`가 기록합니다.
 - `bundle/patches/BASE`: 시리즈가 적용되는 것으로 확인된 마지막 베이스(커널 태그·커밋, syzkaller 커밋).
   bootstrap과 `fport-apply.sh`가 읽고 `bump-kernel.py`가 갱신합니다. syzkaller는 고정합니다.
+- `bundle/patches/kcsan/kernel` 및 `bundle/patches/kcsan/syzkaller`: 공통 kernel/syzkaller 시리즈 다음에 적용되는 KCSAN Policy Store·실행 overlay입니다. bootstrap은 두 sanitizer variant에서 동일한 patched source를 사용하고, KCSAN policy는 KCSAN manager 설정에서만 선택됩니다.
 - (선택) `bash tools/release-assembly.sh` → 보관·전달용 번들 tar.gz. 패치·fixture·게스트 의존성을 묶으며 VM 디스크 스냅샷은 포함하지 않습니다.
 
 ## lane 스크립트 하나

@@ -36,7 +36,8 @@ from agent_pipeline.stage2.kvm import (
     _barrier_generation, _campaign_records, _corpus, _correlated,
     _closed_evidence_channels, _JournalChannels, _journal_artifacts,
     _journal_lane_count, _lane_template,
-    _campaign_manager, _manager_assets, _manager_cmdline, _manager_qemu_args,
+    _campaign_manager, _campaign_report_state, _CRASH, _KCSAN_REPORT,
+    _manager_assets, _manager_cmdline, _manager_qemu_args,
     _staged_manager, _evidence_seal_window, _seal_segment, _spool,
     _stop_manager, _validate_runtime_authority, StepOptions,
     stage2_timeout_budget,
@@ -98,6 +99,23 @@ def test_kcsan_campaign_requires_controller_state():
         descriptor=SimpleNamespace(sanitizer=Sanitizer.KCSAN))
     with pytest.raises(Stage2StepError, match="lacks Controller state"):
         _campaign_manager(inputs)
+
+
+def test_kcsan_report_is_not_misclassified_as_guest_termination():
+    console = b"[  5.0] BUG: KCSAN: data-race in nfsd_svc / nfsd_svc\n"
+    assert _KCSAN_REPORT.search(console)
+    assert not _CRASH.search(console)
+    assert _campaign_report_state([], None, console) == (True, False)
+
+
+def test_fatal_console_is_distinct_from_nonfatal_manager_report(tmp_path):
+    report = tmp_path / "report0"
+    report.write_text("WARNING: recoverable warning\n")
+    log = tmp_path / "log0"
+    log.write_text("last executing program\n")
+    assert _campaign_report_state([report], log, b"") == (True, False)
+    assert _campaign_report_state([], None, b"BUG: KASAN: slab-use-after-free\n") \
+        == (True, True)
 
 
 def execution_record(**updates) -> dict:

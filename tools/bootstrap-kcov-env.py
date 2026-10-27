@@ -93,10 +93,11 @@ def timed(manifest, key):
 
 
 def series_fingerprint(kind):
-    """Hash of a patch series (file names and contents, in apply order)."""
+    """Hash the base series and its KCSAN overlay in application order."""
     digest = hashlib.sha256()
-    for path in sorted((BUNDLE / kind).glob("*.patch")):
-        digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    for directory in (BUNDLE / kind, BUNDLE / "kcsan" / kind):
+        for path in sorted(directory.glob("*.patch")):
+            digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
     return digest.hexdigest()
 
 
