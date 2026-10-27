@@ -663,12 +663,19 @@ int nfsp_resolve_rules(const struct nfsp_ruleset *ruleset,
 		return -1;
 	memset(out, 0, sizeof(*out));
 	if (ruleset == NULL || record == NULL || ruleset->schema == NULL ||
-	    ruleset->rules == NULL || ruleset->nrules == 0u ||
+	    (ruleset->nrules != 0u && ruleset->rules == NULL) ||
 	    ruleset->nrules > NFSP_RULES_MAX || record->activation_generation == 0u ||
 	    record->message == NULL || record->payload == NULL)
 		return -1;
 	out->activation_generation = record->activation_generation;
 	out->nrules = ruleset->nrules;
+	/* An empty, validated rule set is target mode's identity transform.  It
+	 * still observes and accounts the record, but has nothing to allocate or
+	 * resolve. */
+	if (out->nrules == 0u) {
+		out->preflight = NFSP_PREFLIGHT_EMPTY;
+		return 0;
+	}
 	out->rules = calloc(out->nrules, sizeof(*out->rules));
 	out->mutations = calloc(NFSP_RESOLVED_MAX, sizeof(*out->mutations));
 	order = malloc((size_t)out->nrules * sizeof(*order));
