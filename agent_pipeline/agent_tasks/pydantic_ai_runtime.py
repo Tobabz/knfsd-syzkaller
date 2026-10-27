@@ -88,10 +88,12 @@ class _ResponseGuard(WrapperModel):
     """Guard responses before the Agent can dispatch tools or accept output."""
 
     def __init__(self, model: Model, request: RuntimeRequest,
-                 limits: RuntimeLimits) -> None:
+                 limits: RuntimeLimits, *,
+                 output_tool: str = OUTPUT_TOOL) -> None:
         super().__init__(model)
         self.policy = request.model_policy
-        self.allowed_tools = frozenset(request.tools.names) | {OUTPUT_TOOL}
+        self.output_tool = output_tool
+        self.allowed_tools = frozenset(request.tools.names) | {output_tool}
         self.limits = limits
         self.requests = 0
         #: Responses received but refused here.  PydanticAI counts a
@@ -104,7 +106,7 @@ class _ResponseGuard(WrapperModel):
         # Count repair turns across both paths, without implementing a loop.
         repair_turns = sum(
             any(isinstance(part, RetryPromptPart)
-                and part.tool_name in (None, OUTPUT_TOOL)
+                and part.tool_name in (None, self.output_tool)
                 for part in message.parts)
             for message in messages if isinstance(message, ModelRequest))
         if repair_turns > self.policy.output_retries:

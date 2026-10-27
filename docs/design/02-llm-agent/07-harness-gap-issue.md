@@ -249,6 +249,25 @@ validation (Runner, §5.2)
   전달하므로 이 process의 secret 환경 변수는 새지 않는다. `LocalWorkspace`는 파일 시스템을 격리하지 않으므로
   위의 OS 사용자 권한이 그 경계다. 모델에 노출할 file·shell tool은 이 API 위에 직접 정의한다(library가 정해 둔
   tool은 없다). 사람 확인이 필요한 명령이 생기면 `ApprovalRequiredToolset`으로 묶을 수 있다.
+- 구현(`agent_pipeline/agent_tasks/generation.py`, `pydantic_ai_generation.py`):
+  - worktree는 생성 기록(`generation_id`)마다 하나다. host 설정 `GenerationSandbox`의 저장소 clone에서
+    `base_ref` commit으로 만들고, 같은 생성의 다음 시도는 이전 시도의 작업에서 이어 간다. `worktree_root`는 생성
+    OS 사용자가 속한 group으로 setgid를 두고, checkout은 group 쓰기 권한(umask 002)으로 만든다.
+  - tool은 `read_file`, `write_file`, `list_dir`, `run_command` 넷이다. 모두 host의 `launcher`(생성 OS 사용자로,
+    network 없이 실행하는 argv 앞부분. 예: `sudo -n -u harness-gen -- unshare -n --`)를 거쳐
+    `LocalWorkspaceBackend`에서 돈다. 그래서 file tool도 그 사용자 권한으로 읽고 쓴다. `launcher`가 없으면
+    executor는 실행을 거부한다. 경로는 worktree 기준 상대 경로이며 `..`, 절대 경로, `.git`은 받지 않는다.
+    `write_file`은 `allowed_paths` 아래만 쓴다(기본값: `bundle/`, `tools/`, host 디렉터리와 spec template,
+    Rule Compiler).
+  - Agent는 `extension(summary)`이나 `infeasible(reason)`으로 답한다. `extension`이면 executor가 worktree의
+    diff(binary 포함)를 시작 commit 기준으로 직접 뽑아 `HarnessPatchSet`으로 저장한다. diff가 비었거나
+    `allowed_paths` 밖을 건드리면 Agent에게 되돌려 고치게 한다(출력 재시도 budget 안에서). worktree의 `.git`
+    파일은 믿지 않는다. executor는 저장소의 worktree git 디렉터리를 직접 지정하고, hook과 fsmonitor를 끈 채
+    git을 돌린다.
+  - 지시문은 Planning과 Mutation Strategy의 트리거 규칙(`04` §3.2)과 Proxy 역할 문장을 같은 상수로 쓴다.
+    입력은 gap, gap key의 vocabulary contract, candidate, CandidateAnalysis와 `CapabilityProposal` 본문, base
+    binding, 이전 시도의 patch set과 거부 사유다.
+  - host 연결(Stage 1 service의 구성)은 검증 Runner와 함께 붙인다(#83의 다음 PR).
 - 생성 Agent가 worktree에서 돌린 build와 test 결과는 판정이 아니다. staged revision을 만드는 판정은 Runner가
   patch set만 받아 새 격리 VM 환경(기본 KVM)에서 다시 build하고 §5.2를 실행해 낸다. Agent worktree의 산출물(binary,
   log)은 그 판정에 쓰지 않는다.
