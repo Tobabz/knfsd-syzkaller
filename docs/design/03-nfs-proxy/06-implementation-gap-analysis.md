@@ -1128,10 +1128,21 @@ Harness Capability Specification을 갱신한다(§21).
   `pin`한다. crash 없는 window는 execprog barrier로 plan한다(`replay_runner.execprog_window`,
   `stage1/host/semantic.py`, `02-llm-agent/07` §5.2).
 
+- Controller의 M7 2단계(#83): 통과한 mutation_engine generation의 `semantic` promotion이 staged binding 위
+  Stage 2 campaign의 자연 crash replay를 `SemanticRecorder`(`stage2/semantic.py`)에 넘긴다. recorder는 Stage 2
+  judge의 `replay_sides`로 두 sealed journal을 열고, validation이 `staged_files/<sha256>/nfs-proxy`에 둔 그
+  build의 host Proxy로 rule set을 기술해 `GuestValidationRun`을 기록하고, pin한 registry를 `previous`로
+  `promote`한다. 통과하면 subset이 passed인 후보 HCAP revision을 남기고, crash cut에 delta가 없으면
+  `UnreproducibleCrash`를 남겨 promotion이 `not_met`이 된다. 사람은 Stage 2 끝(`crash_review` 또는 종료 상태)의
+  job과 함께 결정한다(`02-llm-agent/07` §5.3 항목 7). 검증은 `test_semantic_stage2_promotion.py`(Controller,
+  fake recorder)와 `test_semantic_stage2_recorder.py`(빌드한 Proxy의 host run).
+
 남은 것:
 
-- 자연 crash 뒤 Controller가 M7 2단계를 처리하는 일(사람 결정은 stage 끝에서만 받는다)은 아직 없다(#83). 지금은
-  위 CLI로 한다.
+- staged harness의 Stage 2 compile과 replay 호환성 검사는 아직 설정된(공유) Proxy를 쓴다
+  (`rule_compiler.py`, `stage2/engine.py` `replay_proxy`). 생성한 subset이 새 Proxy build에 있으면 Compiler가
+  "not the promoted build"로 거부하므로, 그 job의 Stage 2가 자연 crash까지 가려면 두 곳이 staged Proxy
+  (`staged_files/<sha256>/nfs-proxy`, launcher 아래)를 써야 한다(#83 다음 PR).
 - subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
   일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가

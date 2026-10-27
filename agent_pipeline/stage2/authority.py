@@ -231,6 +231,12 @@ class PublishedStage2Judge:
         return self.snapshot.judge_replay(
             bundle_ref, crash_bundle_ref=crash_bundle_ref, compiled=compiled)
 
+    def replay_sides(self, bundle_ref: str, *, crash_bundle_ref: str,
+                     compiled: CompiledRuleSet):
+        """``ArtifactStage2Judge.replay_sides`` (M7 stage 2)."""
+        return self.snapshot.replay_sides(
+            bundle_ref, crash_bundle_ref=crash_bundle_ref, compiled=compiled)
+
 
 @dataclass(frozen=True)
 class _Dispatch:

@@ -38,7 +38,7 @@ from ..components import (HarnessRegistry, IssueTracker, Materializer,
                           MutationRuleCompiler)
 from ..contracts import JudgeVersions
 from ..controller.generation import HarnessValidator
-from ..controller.promotion import ProbeCampaigner
+from ..controller.promotion import ProbeCampaigner, SemanticRecorder
 from ..controller.machine import Env
 from ..controller.records import Job
 from ..controller.service import Controller, EffectFailure
@@ -92,6 +92,9 @@ class GenerationParts:
     workers: int = 1
     #: The promotion probe campaign Runner (07 §5.3); None: no promotion.
     campaigner: ProbeCampaigner | None = None
+    #: M7 stage 2 of a mutation_engine gap; its ``judge`` is bound to the
+    #: service's Stage 2 judge.  None: no semantic promotion.
+    semantic: SemanticRecorder | None = None
 
 
 @dataclass(frozen=True)
@@ -219,10 +222,13 @@ class Stage1Service:
         else:
             self.agents = _DeferredAgents()
         self.generator = None
-        validator = campaigner = None
+        validator = campaigner = semantic = None
         if parts.generation is not None:
             validator = parts.generation.validator
             campaigner = parts.generation.campaigner
+            semantic = parts.generation.semantic
+            if semantic is not None and hasattr(semantic, "judge"):
+                semantic.judge = self.stage2_judge
             self.generator = QueuedGenerationExecutor(
                 parts.generation.executor, sink=None,
                 max_workers=parts.generation.workers) \
@@ -235,7 +241,7 @@ class Stage1Service:
             self.store, env, self.runner, self.agents, self.issues,
             parts.registry, parts.tree, self.artifacts, parts.judge_versions,
             generator=self.generator, validator=validator,
-            campaigner=campaigner, **extra)
+            campaigner=campaigner, semantic_recorder=semantic, **extra)
         self.agents.sink = self.controller
         if self.generator is not None:
             self.generator.sink = self.controller

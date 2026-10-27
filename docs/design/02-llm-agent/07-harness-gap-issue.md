@@ -344,6 +344,8 @@ mutation_engine이면: 생성한 semantic subset이 M7 1단계(staged pin, 03-nf
     - pin: `semantic_promotion.pin`이 그 run으로 subset을 crash survival pending으로 pin하고, staged HCAP의
       HCAP-10이 그 registry를 참조한다. base revision의 promoted registry가 같은 build면 그 subset을 유지하고, 다른
       build면 처음부터 시작한다. pin이 거부하면 `semantic_pin_refused`와 이유를 남긴다.
+    - Proxy 보관: host용 patch set Proxy를 collector의 `staged_files/<sha256>/nfs-proxy`에 둔다
+      (`stage_proxy`). M7 2단계가 자연 crash의 rule set을 그 Proxy로 읽는다(§5.3 항목 7).
 
 mutation_engine의 crash survival(guest crash 직전 MutationDelta가 남는가)은 여기서 보지 않는다(위 pin이 pending으로
 남긴다). 이를 보려고
@@ -359,7 +361,8 @@ crash report는 staged revision과 생성 patch set의 digest를 기록한다.
 staged revision을 공유 HCAP으로 올리는 promotion은 아래 승격 기준(#100)을 모두 통과해야 한다. 사람 검토는
 기준 결과를 보고 승인하는 단계다. 기준을 대신하지 않는다. 사람은 stage 중간에서 결정하지 않는다. staged
 harness로 진행한 job이 Stage 1 끝(`s1_reached` 또는 그 뒤)에 이르렀을 때 그 job의 결과와 함께 결정한다(사용자
-결정 2026-10-27). promotion은 job을 막지 않는다. staged harness로 진행
+결정 2026-10-27). mutation_engine gap의 promotion(항목 7)은 Stage 2 끝(`crash_review` 또는 종료 상태)에서
+결정한다. promotion은 job을 막지 않는다. staged harness로 진행
 중인 job은 그대로 진행하고, promotion이 끝나면 issue가 `resolved`가 되며 `09` §5의 `hcap_revision` 재평가 규칙이
 job들을 promoted revision으로 옮긴다. promotion 검토가 생성물을 거부하면 그 staged revision으로 만든 결과는 거부
 사실과 함께 남기고, 해당 job은 `09` §5의 binding 변경 규칙으로 다시 gap 경로에 들어간다.
@@ -404,8 +407,21 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
    되지 않는다.
    - 구현: gate의 두 단계는 `semantic_promotion.pin`(crash survival pending)과 `promote`다. Runner 검증은 생성한
      subset을 pin한다(§5.2). staged harness의 Stage 2 campaign은 staged 파일로 syz-manager를 띄운다
-     (`stage2/kvm.py`). 공유 binding의 HCAP에 pending subset이 있으면 Stage 2 preflight가 거부한다. Controller의
-     M7 2단계 처리는 아직 없다(`03-nfs-proxy/06` §30 "남은 것").
+     (`stage2/kvm.py`). 공유 binding의 HCAP에 pending subset이 있으면 Stage 2 preflight가 거부한다.
+   - Controller의 M7 2단계: 통과한 mutation_engine generation은 `semantic` promotion을 만든다. probe campaign과
+     후보 program 보류는 없고, staged revision의 pending subset마다 항목 하나를 둔다(`collecting`). staged
+     binding의 job이 Stage 2 campaign의 자연 crash를 replay해 판정을 받으면(`crash_review`나 replay evidence
+     차단), Controller는 그 replay를 `SemanticRecorder`에 한 번 넘긴다. host 구현(`stage2/semantic.py`)은
+     Stage 2 judge로 두 sealed journal을 열고(`replay_sides`), §5.2에서 보관한 Proxy로 rule set을 기술해
+     `GuestValidationRun`을 기록한 뒤 pin한 registry를 `previous`로 `promote`한다. 결과는 셋이다.
+     - evidence: subset이 passed가 된 registry와, 그것을 HCAP-10에 둔 후보 revision. 모든 subset이 통과하면
+       `review`다.
+     - unreproducible: crash cut에 MutationDelta가 없다. run과 `UnreproducibleCrash`를 기록하고 promotion은
+       `not_met`이다(subset 거부). 운영자는 `retry`로 다시 자연 crash를 모을 수 있다.
+     - 그 밖(divergent replay, 다른 subset의 rule set, 읽을 수 없는 replay): 증거가 아니며 계속 모은다.
+     사람은 Stage 2 끝의 job과 함께 승인하거나 거부한다. 공유 binding을 후보 revision으로 바꾸는 일은 host의
+     promotion이고, registry의 binding이 subset을 passed로, 그 run을 evidence로 pin하면 `promoted`가 되어 issue가
+     `resolved`된다. 설정은 `HarnessGenerationConfig.semantic`(collector.json)이다.
 
 1~5는 machine 검사다. host generator는 새로 추가하거나 바꾼 capability마다 contract, `PromotionProbeEvidence`,
 인자 일반성을 확인하고 하나라도 실패하면 HCAP을 만들지 않는다. typed model이 없는 raw evidence는 어떤

@@ -398,15 +398,44 @@ class FakeCampaigner(FakeValidator):
         self.tasks[task_id] = CampaignStatus(state=state, **kw)
 
 
+class FakeSemanticRecorder:
+    """M7 stage 2 answers by replay bundle; unknown ones are not
+    evidence."""
+
+    def __init__(self) -> None:
+        self.answers: dict = {}
+        self.calls: list[tuple[str, str]] = []
+
+    def record(self, p, crash, replay_bundle_ref):
+        from agent_pipeline.controller.promotion import SemanticStatus
+        self.calls.append((p.promotion_id, replay_bundle_ref))
+        answer = self.answers.get(replay_bundle_ref)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer or SemanticStatus(state="not_evidence",
+                                        reason="not_equivalent")
+
+
 class FakePromotionInputs:
     """The capabilities a staged HCAP changed, by its revision; a plan's
-    program, by plan digest; what each registry HCAP carries."""
+    program, by plan digest; what each registry HCAP carries; the subsets
+    a staged HCAP pins pending."""
 
     def __init__(self) -> None:
         self.changed: dict[str, tuple[str, ...]] = {}
         self.plan_programs: dict[str, tuple[str, ...]] = {}
         #: hcap_revision -> {(capability_id, evidence_ref)}
         self.carried: dict[str, set] = {}
+        self.pending: dict[str, tuple[str, ...]] = {}
+        #: hcap_revision -> {(subset_id, evidence_ref)} passed
+        self.subsets: dict[str, set] = {}
+
+    def pending_subsets(self, g):
+        return self.pending.get(g.staged_binding.hcap_revision, ())
+
+    def carries_subset(self, binding, subset_id, evidence_ref):
+        return (subset_id, evidence_ref) in \
+            self.subsets.get(binding.hcap_revision, set())
 
     def capabilities(self, g):
         return self.changed.get(g.staged_binding.hcap_revision, ())
@@ -466,6 +495,8 @@ class World:
         self.validator: FakeValidator | None = None
         #: None: no probe campaign Runner is configured.
         self.campaigner: FakeCampaigner | None = None
+        #: None: no M7 stage 2 recorder is configured.
+        self.semantic: FakeSemanticRecorder | None = None
         self.promotion_inputs = FakePromotionInputs()
         self.issues = InMemoryIssues()
         self.registry = InMemoryRegistry()
@@ -493,7 +524,8 @@ class World:
                           new_id=self._new_id, generator=self.generator,
                           validator=self.validator,
                           campaigner=self.campaigner,
-                          promotion_inputs=self.promotion_inputs)
+                          promotion_inputs=self.promotion_inputs,
+                          semantic_recorder=self.semantic)
 
     def restart(self) -> Controller:
         # A fresh Controller with the configured default: adopted judge

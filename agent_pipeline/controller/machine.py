@@ -1940,7 +1940,8 @@ class Machine:
             e.bundle_ref, crash_bundle_ref=crash.bundle_ref,
             compiled=crash.compiled)
         c.consumed.append(r.verdict_id)
-        j.replay = j.replay.model_copy(update={"outcome": r})
+        j.replay = j.replay.model_copy(update={"outcome": r,
+                                               "bundle_ref": e.bundle_ref})
         if r.status == REPLAY_EVIDENCE_REJECTED:
             self._block(c, BlockedReason.REPLAY_EVIDENCE, again)
         elif r.status in REPLAY_STATUSES:
