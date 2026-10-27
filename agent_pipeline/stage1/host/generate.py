@@ -46,7 +46,7 @@ from ...admission_generation import (AdmissionProfileSource,
                                      PinnedSyzkallerInputs,
                                      generate_call_admission_profile)
 from ...artifacts import ArtifactStore
-from ...contracts import (PIPELINE_GAP_IDS, CampaignMode, HarnessBinding,
+from ...contracts import (PIPELINE_GAP_IDS, CampaignMode, GapRef, HarnessBinding,
                           JobPolicy, JudgeVersions, Sanitizer, Sha256)
 from ...data import canonical_json, put_record
 from ...hcap import (STAGE1_LAYOUT, AuthorityRef, Capability, ExecutionLayout,
@@ -1071,7 +1071,7 @@ def _generation(spec: HostSpec, spec_path: Path, state: Path,
 
 def generate(spec_path: Path, *, python: str = sys.executable,
              now: str | None = None,
-             gap: GapContract | None = None,
+             gap: GapContract | GapRef | None = None,
              base_spec: Path | None = None,
              repo: Path = REPO,
              staged: StagedBase | None = None) -> Generated:
@@ -1083,7 +1083,11 @@ def generate(spec_path: Path, *, python: str = sys.executable,
 
     ``repo`` is the tree the kernel patch series and lane script are read
     from: a validation passes the patch set's tree, while this code stays
-    the host's.  ``staged`` generates a staged revision (``StagedBase``)."""
+    the host's.  ``staged`` generates a staged revision (``StagedBase``).
+
+    A ``mutation_engine`` gap has no contract (``GapRef``): its patch set
+    changes the Proxy, so it adds or changes no capability of the spec; its
+    validation pins the semantic subset in HCAP-10 (``semantic``)."""
     if (gap is None) != (base_spec is None):
         raise GenerationError("give the gap and the base spec together")
     if staged is not None and gap is None:
@@ -1092,8 +1096,9 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     spec_path = Path(spec_path).resolve()
     base = spec_path.parent
     spec = HostSpec.model_validate_json(spec_path.read_bytes())
-    if gap is not None:
+    if isinstance(gap, GapContract):
         spec = _with_gap(spec, gap)
+    if gap is not None:
         changed = _changed_capabilities(spec, HostSpec.model_validate_json(
             Path(base_spec).read_bytes()))
     state = _resolve(base, spec.state_dir)
@@ -1230,7 +1235,12 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             or identity.call_table_sha256 != put_record(store, table)):
         raise GenerationError("bundle identity.json disagrees with its files")
     judged = promoted_by_criteria(spec)
-    if gap is not None:
+    if isinstance(gap, GapRef):
+        if changed:
+            raise GenerationError(
+                f"{', '.join(c.id for c in changed)}: a mutation_engine patch "
+                "set changes the Proxy, not the spec's capabilities")
+    elif gap is not None:
         _check_fills(changed, gap.missing_capability_id)
     kept: dict[str, Capability] = {}
     if staged is not None:
@@ -1409,9 +1419,18 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                 raise GenerationError(
                     f"{capability.id} does not meet the promotion criteria "
                     f"(#100): {', '.join(refusals)}")
+        missing = _gap_vocabulary(spec)
+        if staged is not None:
+            # Base entries the spec does not hold (the promoted semantic
+            # HCAP-10) stay, with the gap ids they name.
+            ids = {c.id for c in variant_capabilities}
+            variant_capabilities += [c for c in staged.hcap.capabilities
+                                     if c.id not in ids]
+            missing = tuple(sorted(set(missing)
+                                   | set(staged.hcap.missing_capability_ids)))
         draft = HcapCatalog(
             capabilities=tuple(variant_capabilities),
-            missing_capability_ids=_gap_vocabulary(spec),
+            missing_capability_ids=missing,
             gap_contracts=spec.gap_contracts)
         boundary = RemoteKcovSupportBoundary(
             name=spec.support_boundary.name,
