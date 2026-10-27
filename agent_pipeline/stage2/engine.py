@@ -15,7 +15,8 @@ Command contract (``{input}`` and ``{output}`` in argv are replaced):
                         execution_harness_id, lease_generation, compiled_ref,
                         rule_set_id, gate_repetitions, campaign_id,
                         crash_bundle_ref (null when the step has none)
-    ``harness.json``, ``descriptor.json``, ``program.syz``, ``neutral.syz``
+    ``harness.json``, ``descriptor.json``, ``hcap.json``, ``admission.json``,
+    ``program.syz``, ``neutral.syz``
                         as for Stage 1
     ``rules.nfsprul1``  the compiled rule set to install, byte for byte
     ``compiled.json``   its ``CompiledMutationRuleSet`` record
@@ -53,9 +54,11 @@ from typing import Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..admission import CallAdmissionProfile
 from ..artifacts import ArtifactStore
 from ..data import canonical_json, load_record, parse_json
 from ..evidence import ArtifactInput, EvidenceLimits, EvidenceStore
+from ..hcap import HcapCatalog
 from ..materializer import ExecutionHarnessDescriptor, ReachabilityHarness
 from ..replay_runner import (PlanError, check_rule_set, parse_crash_context,
                              plan_replay, write_replay_inputs)
@@ -64,6 +67,7 @@ from ..runner.evidence_backend import (ExecutionCapture, HostExecutionFacts,
                                        RunnerEvidenceReceiptStore)
 from ..runner.models import WorkLease
 from ..runner.process_supervisor import HostCommand, ProcessLimits, ProcessSupervisor
+from ..runner.slots import SlotPool, resource
 from ..runner.worker import LeaseControl
 from ..semantic_delta import DeltaReadError
 from ..stage1.engine import (INPUT, MAX_CAPTURE_INDEX_BYTES, OUTPUT,
@@ -146,10 +150,13 @@ class Stage2CommandEngine:
                  receipts: RunnerEvidenceReceiptStore,
                  evidence: EvidenceStore | None = None,
                  limits: EvidenceLimits = EvidenceLimits(),
-                 check_rules: Callable[[Path, bytes, Path], object] = check_rule_set
-                 ) -> None:
+                 check_rules: Callable[[Path, bytes, Path], object] = check_rule_set,
+                 slots: SlotPool | None = None) -> None:
         if not 1 <= config.crash_window_bound <= 64:
             raise ValueError("crash_window_bound must be 1..64")
+        #: The host's KVM slots, shared with Stage 1 (#81 R4); None runs on
+        #: ``config.resource_key``.
+        self.slots = slots
         self.config = config
         self.artifacts = artifacts
         self.supervisor = supervisor
@@ -175,6 +182,10 @@ class Stage2CommandEngine:
             raise CaptureError("harness does not belong to this execution harness")
         descriptor = load_record(self.artifacts, b.execution_harness_id,
                                  ExecutionHarnessDescriptor)
+        hcap = load_record(self.artifacts, harness.hcap_revision, HcapCatalog)
+        admission = load_record(
+            self.artifacts, harness.call_admission_profile_ref,
+            CallAdmissionProfile)
         compiled = load_record(self.artifacts, t.compiled_ref,
                                CompiledMutationRuleSet)
         if compiled.harness_ref != b.harness_ref:
@@ -193,6 +204,8 @@ class Stage2CommandEngine:
             "state_dir": str(self.config.state_dir)}))
         _write(inp / "harness.json", canonical_json(harness))
         _write(inp / "descriptor.json", canonical_json(descriptor))
+        _write(inp / "hcap.json", canonical_json(hcap))
+        _write(inp / "admission.json", canonical_json(admission))
         _write(inp / "program.syz", self.artifacts.get(harness.program_ref))
         _write(inp / "neutral.syz",
                self.artifacts.get(harness.neutral_program_ref))
@@ -272,10 +285,10 @@ class Stage2CommandEngine:
         watch = _SegmentControl(control, harvest, self.config.poll_interval_s)
         argv = tuple(arg.replace(INPUT, str(inp)).replace(OUTPUT, str(out))
                      for arg in self.config.argv)
-        result = self.supervisor.run(
-            HostCommand(argv, self.config.cwd, dict(self.config.env)),
-            lease, watch, resource_key=self.config.resource_key,
-            limits=self.config.limits)
+        with resource(self.slots, self.config.resource_key) as key:
+            result = self.supervisor.run(
+                HostCommand(argv, self.config.cwd, dict(self.config.env)),
+                lease, watch, resource_key=key, limits=self.config.limits)
         _write(out.parent / "process.log",
                result.stdout + b"\n--- stderr ---\n" + result.stderr)
         if watch.error is not None:

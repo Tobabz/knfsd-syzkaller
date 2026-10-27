@@ -1069,6 +1069,19 @@ M7은 subset 단위로 반복하는 promotion gate다(issue #8). semantic subset
 state value, v4.1+ backchannel correlation, preserve/raw behavior, semantic Delta crash survival,
 dynamic-original semantic replay를 포함해야 한다. 모든 subset은 semantic Delta crash survival과
 semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능에 해당할 때 통과한다.
+crash survival 증거는 campaign에서 자연히 생긴 guest crash로만 얻는다. 검증을 위해 guest를 일부러
+crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지).
+
+그래서 M7은 두 단계다. subset을 누가 구현했는지(사람, Harness Generation)는 구분하지 않는다.
+
+1. staged pin: crash survival을 뺀 항목을 통과하면 registry digest가 crash survival pending 표시와 함께 staged
+   `hcap_revision`의 HCAP-10에 pin된다. 그 revision을 binding한 job은 이 subset을 쓴다.
+2. promotion: 그 subset을 쓴 campaign에서 자연히 생긴 Q2 crash의 sealed evidence가 crash cut 위치의 MutationDelta를
+   담고, 그 delta로 한 replay가 REPLAY_EQUIVALENT이면 공유 HCAP으로 promotion할 수 있다. 그 전에는 promotion하지
+   않는다. 자연 crash에서 delta가 남지 않았으면 그 crash는 replay로 재현할 수 없다는 사실과 함께 기록하고 subset은
+   promotion에서 거부한다.
+
+Harness Generation 쪽 적용은 `../02-llm-agent/07-harness-gap-issue.md` §5.2, §5.3이 따른다.
 
 Validation evidence를 HCAP `evidence_refs`에 추가하고 subset의 registry digest와 scope를 promotion한 뒤에만
 Harness Capability Specification을 갱신한다(§21).
@@ -1097,10 +1110,27 @@ Harness Capability Specification을 갱신한다(§21).
   revision의 subset을 읽고, `rule_set_scope`는 Compiler가 MutationRuleSet이 맞는 subset을 고르게 한다. 맞는 subset이
   없으면 gap id는 `semantic_mutation.unpromoted`다.
 - 검증: `tests/agent_pipeline/test_semantic_promotion.py`(빌드한 Proxy의 registry가 rule validation과 일치하는지,
-  M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI).
+  M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI). staged pin과 pending subset은
+  같은 파일, preflight 거부는 `test_stage2_host.py`, staged 파일의 manager는 `test_stage2_kvm.py`.
+- M7 1단계(staged pin, #83): `pin`은 crash survival을 뺀 같은 gate다. run이 guest crash로 끝날 필요는 없지만, crash로
+  끝났다면 crash cut의 MutationDelta가 있어야 한다. 통과한 subset은 `PromotedSubset.crash_survival: pending`으로
+  기록되고(passed이면 필드를 쓰지 않아 이전 registry의 digest가 그대로다), `with_semantic_capability`의 HCAP-10
+  entry는 그 revision이 staged라고 적는다. `promoted_registry`는 pending subset을 그 표시와 함께 돌려주므로 그
+  revision을 binding한 job은 subset을 쓴다. 설정된(공유) binding의 HCAP이 pending subset을 pin하면 Stage 2
+  preflight가 거부한다. `promote`에 `previous`로 pin한 registry를 주면 자연 crash run으로 pending subset을 passed로
+  올리고 pin의 evidence를 유지한다. 이미 promotion된 subset은 다시 pin하지 않는다. 자연 crash에서 MutationDelta가
+  남지 않은 run이 있으면 두 gate 모두 subset을 거부하고 CLI는 그 run들을 `UnreproducibleCrash`로 기록한다.
+  CLI는 `pin`, `promote`다.
+- staged harness의 Stage 2: KVM step은 그 harness의 파일로 syz-manager를 띄운다. `verify_pins`가 collector의 `staged_files`에서 고른
+  파일로 manager 설정의 bzImage, image, vmlinux, lane template을 바꾸고, syzkaller binary가 staged이면 pin된
+  binary에 대한 link 디렉터리를 `staged_files` 아래 만들어 `syzkaller`로 쓴다(`stage2/kvm.py` `_staged_manager`).
 
-남은 것: subset마다 KVM에서 production crash window와 replay를 실행하고 `semantic_promotion record`/`promote`로
-promotion하는 일(사람이 한다, `tools/nfs-proxy/README.md` "Capability registry and promotion"). Mutation Rule
+남은 것:
+
+- 생성한 mutation_engine subset을 Runner 검증(`stage1/host/validate.py`)이 `pin`까지 자동으로 하는 일과, 자연 crash
+  뒤 Controller가 M7 2단계를 처리하는 일(사람 결정은 stage 끝에서만 받는다)은 아직 없다(#83). 지금은 위 CLI로 한다.
+- subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
+  일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
 한 subset에 맞는지 확인한다(`../02-llm-agent/08-mutation-rule-set.md` §12 "구현").
 

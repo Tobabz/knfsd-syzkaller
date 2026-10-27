@@ -366,6 +366,7 @@ Agent가 고칠 수 있는 입력
 schema상 유효하지만 runtime이 지원하지 않는 기능
     unsupported_capability, requires_state_lineage
         -> HarnessGapIssue(gap_class=mutation_engine)
+        -> Harness Generation (07 §5) -> 저장된 rule set 다시 compile
 ```
 
 Compiler는 live field offset, current original bytes, runtime XID 또는 Nth-message identity를
@@ -381,9 +382,11 @@ Compiler는 live field offset, current original bytes, runtime XID 또는 Nth-me
 `agent_pipeline/rule_compiler.py`의 `ArtifactMutationRuleCompiler`가 `components.MutationRuleCompiler`를 구현한다.
 한 rule set에 대해 다음 순서로 일한다.
 
-1. `binding.hcap_revision`의 promoted semantic registry(HCAP-10)를 읽는다. 없으면 `unsupported_capability`
-   (`semantic_mutation.unpromoted`)다.
-2. 받은 Proxy binary가 promotion된 build와 정확히 같아야 한다(`04` §7.1). 다르거나, schema가 없거나, runtime이
+1. `binding.hcap_revision`의 promoted semantic registry(HCAP-10)를 읽는다. binding이 Harness Generation의 staged
+   revision이어도 같다. 그 revision에 pin된 registry가 있으면 쓴다. staged revision의 registry는 crash survival이
+   pending일 수 있다(`04` §4, `07` §5.2). 없으면
+   `unsupported_capability`(`semantic_mutation.unpromoted`)다.
+2. 받은 Proxy binary가 binding한 revision이 pin한 build와 정확히 같아야 한다(`04` §7.1). 다르거나, schema가 없거나, runtime이
    Compiler가 쓴 형식을 거부하면 `CompilerUnavailable`을 던진다. rule set을 고쳐서 풀리는 문제가 아니다.
 3. intent마다 bind한다. `traffic_scope`는 Stage 1 harness가 여는 lane profile(`syz_open_nfs_lane_profile$<client>_<backend>_v<N>`)
    중 하나여야 하고, backend는 `knfsd`=0·`ganesha`=1, client는 `client0`=0·`client1`=1로 낮춘다. ProtocolSchema는
@@ -467,6 +470,10 @@ HarnessGapIssue
 
 state lineage가 필요한 intent는 Compiler가 `requires_state_lineage`로 거부하고, Controller가
 `HarnessGapIssue(gap_class=mutation_engine)`에 missing capability `state_lineage`로 연결한다(issue #6).
+Agent가 직접 `unsupported`를 낼 때 missing capability는 HCAP vocabulary의 id다. 맞는 id가 없으면
+`mutation_engine.unlisted`를 쓰고 `CapabilityProposal`(layer `semantic_subset`, `proxy`, `compiler_lowering`)을
+함께 낸다. 빈 id는 출력 형식 결함으로 executor가 거부한다(#81 D5). proposal은 capability를 만들거나 promotion하지
+않는다.
 초기 runtime(M0–M7)은 다음을 표현하지 않는다.
 
 ```text
@@ -476,7 +483,8 @@ client0의 stateid를 client1 요청에 사용
 이전 transaction에서 받은 sessionid / clientid 참조
 ```
 
-Harness Extension Work가 해결된 뒤 Stage 2를 다시 실행한다.
+Harness Generation(`07` §5)이 그 capability를 생성·검증하면 Stage 2를 이어 간다. 생성이 실패하면 job은
+`blocked_harness_gap`에서 기다린다.
 
 ## 16. Q1 baseline 보존
 

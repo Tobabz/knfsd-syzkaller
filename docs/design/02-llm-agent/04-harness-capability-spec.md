@@ -42,9 +42,13 @@ rendered Markdown (이 문서)
 
 - `hcap_revision`은 canonical machine-readable HCAP의 digest다. Controller가 job을 harness에 묶을 때 그
   harness를 기술하는 revision을 고르고, plan과 verdict가 이 값을 기록한다(`01` §11.2, issue #13).
+- revision에는 두 status가 있다. promoted revision은 사람이 검토해 공유 HCAP으로 올린 것이고, staged revision은
+  Harness Generation(`07` §5)이 만든 patch set이 Runner 검증을 통과해 생긴 것이다. staged revision은 그 gap key의
+  job들이 쓰며, promoted revision을 바꾸지 않는다. plan과 verdict는 어느 쪽인지 기록한다.
 - HCAP data는 `missing_capability_id`의 controlled vocabulary도 담는다(`07` §3, issue #13). 예:
   `state_lineage`, `remote_kcov.context.<context>`, `remote_kcov.kernel_revision.<commit>`,
-  `neutral_control.<profile>`(`05` §11).
+  `neutral_control.<profile>`(`05` §11). vocabulary 항목은 `gap_contracts`로 contract(§3.3)를 가질 수 있고,
+  그 gap을 채우는 capability는 그 contract를 선언한다(#100).
 - Controller는 plan의 `required_capabilities`, `status`, `usable_by`를 이 데이터로 검증한다. Harness
   Materializer는 program의 call을 `CallAdmissionProfile`(§3.1)로 capability에 대조하고, Mutation Rule
   Compiler는 promoted semantic registry(§4)를 쓴다.
@@ -121,6 +125,10 @@ Capability
         partially_validated
         experimental
     validated_scope             # status=validated_subset이면 필수
+    validated_layout            # 증거가 돈 실행 배치 (#99)
+        procs                   # 생략하면 Stage 1 배치: procs=1, lanes=[0]
+        lanes[]
+    contract                    # 승격이 판정하는 범위 (§3.3, #100)
 
     evidence_refs[]             # 검증 기록
     authority_refs[]            # 세부 authority artifact의 digest 참조 (§1.1)
@@ -131,6 +139,12 @@ Capability
 `validated_scope`에 데이터로 둔다(issue #14).
 Agent는 기본적으로 `validated` capability와 `validated_subset`의 scope 안을 우선 사용하고,
 `partially_validated` / `experimental` 사용과 scope 밖 사용은 plan에 명시한다.
+
+`validated_layout`은 검증이 성립한 proc 수와 proc lane이다(proc i는 lane i). Stage 1 plan은 lane 0에서
+실행되므로 그 배치를 덮지 않는 capability를 쓰면 거부된다(`layout_not_validated`). Stage 1보다 넓은 배치는
+typed capability evidence의 `layout`이 같은 값일 때만 선언할 수 있다. Stage 2 manager의 `procs`는 runtime
+selection capability(HCAP-04)의 배치를 넘지 못하고, 그 `procs`를 덮지 않는 capability의 call은
+`enable_syscalls`에서 빠진다. 사람이 만든 capability와 생성된 capability에 똑같이 적용한다.
 
 `usable_stage`는 capability가 기능상 어느 stage에 속하는지를, `usable_by`는 누가 그것을 쓸 수 있는지를
 나타낸다. `usable_by`에 `agent_stage1`이나 `agent_stage2`가 없는 capability는 Agent pipeline이 쓰지 않는다.
@@ -169,6 +183,73 @@ CallAdmissionProfile              # repository authority artifact, HCAP authorit
   pseudo-call과, lane resource에 대해 validated seed가 실제로 쓰는 filesystem syscall을 admission한다.
   목록은 profile이 소유하며 이 문서에 복제하지 않는다.
 - artifact는 첫 Stage 1 Materializer 통합에서 도입한다(§1.1의 milestone 규칙).
+
+### 3.2 트리거 기준
+
+capability는 실제 위협 모델 안의 시나리오만 지원한다(결정 기록 `../decisions/2026-10-25-natural-trigger.md`).
+
+- **트리거**는 Q1에서 대상 커널 코드를 실행시키려고 프로그램이 실행 중에 일으키는 행위다. 실행 전 환경
+  구성(fixture 설정, 포트, lease·grace 시간, 데몬 기동)은 트리거가 아니다.
+- 트리거는 NFS 클라이언트의 행위여야 한다(요청, syscall, 요청 중단, 연결 끊기. 여러 클라이언트의 조합 포함).
+- 클라이언트의 행위 때문에 서버가 하는 동작(callback, lease 만료와 laundromat 처리, blocked lock grant, 서버
+  데몬으로 가는 upcall)은 허용한다.
+- 실행 중에 harness나 helper가 서버를 직접 조작하는 행위(서버 관리 인터페이스 쓰기, 서버 데몬 정지·종료·재시작,
+  서버 설정 변경)는 허용하지 않는다.
+- 같은 대상에 도달하는 자연 경로가 있으면 그 경로를 쓴다. 자연 경로가 RemoteKcovSupportBoundary 밖이면
+  `remote_kcov_attribution` gap으로 계측을 생성한다(`07` §5). 귀속되지 않는다는 이유로 부자연스러운 트리거로
+  우회하거나 대상을 포기하지 않는다.
+- 이 기준은 사람이 만든 capability와 Harness Generation이 만든 capability에 똑같이 적용한다.
+- Proxy 변조는 중간자 행위가 아니다. C2S 변조는 악의적인 클라이언트가, S2C 변조는 악의적인 서버가 보내는
+  메시지를 대신 만든 것이다. Proxy는 변조를 정상 시나리오와 구분하려고 둔 구조다. 따라서 S2C 변조는 서버가
+  protocol로 보낼 수 있는 응답·callback이면 허용하고, 그 대상은 서버 응답을 받는 쪽(kernel NFS client)이다.
+  서버 관리 조작(서버 관리 인터페이스 쓰기, 데몬 정지·재시작)은 S2C 시나리오에서도 트리거가 아니다.
+
+### 3.3 CapabilityContract
+
+capability가 무엇을 도달시키는지는 후보와 상관없이 contract로 먼저 선언한다(#100). 승격 기준(`07` §5.3)은
+contract를 기준으로 판정한다.
+
+```text
+CapabilityContract
+    entry_points[]              # 프로그램이 capability에 들어오는 곳
+        kind                    # syz_call | proxy_operation | fixture_action
+        name
+    boundary_functions[]        # 진입점이 도달시키는 공개 kernel 함수 (export·entry 함수, tracepoint 지점)
+                                # Controller가 promotion probe로 고정한다
+    fixed_arguments[]           # 진입점 syz call 인자 중 contract가 정한 고정값
+        call
+        path                    # 인자와 그 아래 field를 점으로 이은 이름 (client, buf.msg.proc)
+        value | text            # 고정 숫자 또는 고정 문자열. 하나만 준다
+    fixed_types[]               # protocol이 상수를 정한 syzlang type. 그 안의 상수는 모두 고정값이다
+    time_dependent              # true면 KVM evidence로만 승격한다
+
+GapContract                     # vocabulary 항목의 contract
+    missing_capability_id
+    contract
+
+Capability.fills_gap?           # 이 capability가 채우는 gap ID
+```
+
+- contract의 `syz_call` 진입점은 capability `interface.syz_calls`와 같아야 한다.
+- `fixed_arguments`는 진입점 call의 인자만 가리킨다. 한 값만 허용하는 인자 위치는 여기나 `fixed_types`에 있어야
+  한다(`07` §5.3 기준 5). 후보 program에서 온 값을 고정값으로 올리지 않는다.
+- contract의 목록은 집합이다. 순서와 상관없이 같은 contract는 digest가 같다.
+- `fills_gap`이 있는 capability의 contract는 그 gap의 `GapContract`와 같다. HCAP은 이를 검증하고, gap
+  contract가 없는 gap을 채운다는 capability도 거부한다. 후보에 맞춰 경계를 줄이면 다른 contract다.
+- host spec의 `gap_contracts`는 spec을 승인한 operator의 진술이다. Harness Generation의 patch set은 spec을 바꿀 수
+  있으므로 그 경로에서는 Controller가 gap과 contract, patch set이 시작한 base spec을 spec 밖에서 넘긴다(`generate
+  --gap --base-spec`, `09` §3.2). 그러면 spec은 그 gap에 다른 contract를 줄 수 없고, patch set이 base spec에 추가하거나
+  바꾼 capability는 모두 그 gap을 `fills_gap`으로 채워야 하고, base의 capability를 지울 수 없다. base에 이미 있던
+  capability는 이 gap 판정의 대상이 아니다. 기준선 밖 capability는 승격 기준(evidence)을 generation마다 다시 거친다.
+  evidence가 생성된 harness에 묶이기 때문이다.
+- 기준이 생기기 전에 checked-in spec에 있던 항목의 digest(`validated_layout`과 evidence 참조를 뺀 spec 항목)는
+  repository 코드 `LEGACY_CAPABILITY_BASELINES`에 고정한다. spec이 스스로 면제를 선언할 수 없다. digest가 같은
+  동안은 contract 없이 남고, 내용이 바뀌면 새 capability와 같이 기준을 거친다(2026-10-26 사용자 결정). 지금은
+  template의 HCAP-01, 03, 04, 11, 13과 `stage1-host-live`의 HCAP-01, 03, 04, 14가 여기에 있다. HCAP-14는 기준
+  이전(2026-10-23)부터 live spec에 `experimental`로 있던 항목이다. 기준선은 그 status를 바꾸지 않으며, validated로
+  올리거나 내용을 바꾸면 기준을 거친다.
+- `contract`, `fills_gap`, `validated_layout`, `gap_contracts`는 `hcap.v1` 뒤에 생긴 field다. record가 그 field를
+  가지고 만들어졌을 때만 직렬화해서, 그 전에 저장된 revision도 canonical bytes가 그대로 유지된다.
 
 ## 4. 현재 capability catalog
 
@@ -325,9 +406,19 @@ constraints:
         SERVER_IMPL=both 필요, knfsd lease 기본 90초
     koov.nfs_trace=0 (default) | 1 (lane NFS tracing opt-in)
 
+validated_layout:
+    procs=1, lanes=[0] (Stage 1 layout)
+    Stage 2 manager procs의 기본값이며 상한 (#99)
+
 verification_note:
     lane 구조 자체는 구현되어 있으나
-    현재 문서에는 four-lane parallel manager topology의 미검증 범위가 남아 있음
+    four-lane parallel manager topology는 아직 증거가 없음
+    python -m agent_pipeline.stage2.topology가 bounded syz-manager campaign으로
+    lane별 spool 귀속, Proxy ack, health, generation journal을 확인하고
+    hcap04-kvm.json(LaneTopologyEvidence)을 쓴다
+    이 증거가 HCAP-01, HCAP-03, HCAP-04의 validated_layout을 함께 넓힌다
+    lane.sh status는 manager VM 안에서 부를 수 없어 spool record의
+    per-execution health 필드로 대신한다
 ```
 
 source refs:
@@ -542,87 +633,104 @@ tools/nfs-proxy/src/delta.h
 tools/nfs-proxy/README.md
 ```
 
-### HCAP-11 — Bounded NFSv4.1 client lifecycle recovery
+### HCAP-11 — Client-induced NFSv4.1 client expiry recovery
 
 ```text
 id: HCAP-11
-name: bounded NFSv4.1 client lifecycle recovery
+name: client-induced NFSv4.1 client expiry recovery
 usable_stage: [stage1]
 usable_by: [agent_stage1]
 status: validated
-scope: [client0_confirmed_expiry_recovery]
+scope: [client0_courtesy_expiry_recovery]
 
 interface:
-    syz_nfsd_client_ctl$expire_client0(0x0)  # exact admitted invocation
+    syz_open_nlm_lane_file
+    syz_nfs_lane_link$partition_client0(0x0, 0x0)
+    syz_nfs_lane_link$heal_client0(0x0, 0x1)
 
 purpose:
-    lane 0의 확정된 NFSv4.1 클라이언트 하나를 만료시키고
+    lane 0의 client0이 lease보다 오래 서버와 끊겨 courtesy client가 된 뒤,
+    client1의 충돌하는 OPEN으로 서버가 client0을 만료시키게 하고
     일반 client0 profile I/O로 EXCHANGE_ID -> CREATE_SESSION 복구를 유도
 
 constraints:
-    single NFSv4.1 fixture와 SERVER_IMPL=both를 사용
-    client0 selector 인자는 반드시 고정값 0x0을 사용하며 expiry는 정확히 한 번 수행
-    expiry 뒤에 client0 profile을 획득하고 client1 획득이나 선행 client0 획득은 거부
-    lifecycle broker가 정확히 하나의 confirmed minor-version-1 owner를 해석
-    owner는 Linux NFSv4.1 frozen-phase9-lane0-client0/<UTS hostname>과 정확히 일치
-    syz 호출은 client selector만 전달하며 client path, owner, ctl payload를 전달하지 않음
-    broker만 /proc/fs/nfsd/clients/<client>/ctl을 선택하고 literal expire를 기록
-    broker reply의 clientid, minorversion=1, session_count>0을 executor가 검사
-    한 번의 expiry 뒤 client0 profile도 정확히 한 번 획득하고,
-    parser가 client0 FD origin을 증명한 ordinary profile I/O를 수행
-    profile 획득만 하거나 close/lseek만 수행한 프로그램은 recovery I/O로 인정하지 않음
+    single NFSv4.1 fixture, SERVER_IMPL=both, 기본 NFSv4 lease 10 s
+    모든 트리거는 NFS client 행위다(§3.2): client0은 자기 lane network namespace의
+    자기 link에서 보내는 packet만 버리고, 만료는 client1의 OPEN에 대한 서버의 반응이다.
+    서버 namespace에는 아무것도 하지 않는다.
+    순서:
+        r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)
+        r1 = syz_open_nlm_lane_file(r0, name, 0x2)   # read-write, write delegation을 받는다
+        syz_nfs_lane_link$partition_client0(0x0, 0x0) 정확히 한 번
+            # link가 15 s(lease보다 김) 동안 보내는 packet을 모두 버리고, 버리는 채로 돌아온다
+        r2 = syz_open_nfs_lane_profile$client1_knfsd_v41(0x2, 0x1)
+        r3 = syz_open_nlm_lane_file(r2, 같은 name, 0x2)
+        syz_nfs_lane_link$heal_client0(0x0, 0x1) 정확히 한 번
+        parser가 client0 FD origin을 증명한 일반 I/O 하나 이상(statx, getdents64 등.
+        close와 lseek는 인정하지 않음)
+    partition과 heal 사이에는 client0 origin call이 없어야 한다(끊긴 link에서 기다린다)
+    두 open이 같은 파일을 가리키는지는 parser fact가 아니다. 다른 파일을 열면 경로에 닿지 못할 뿐이다
+    knfsd는 최근 30~60 s 안에 delegation을 회수한 파일에는 delegation을 주지 않는다. 반복 실행하는
+    프로그램은 스스로 만든 파일에서 시작해야 하므로, 검증된 stimulus는 O_CREAT(mode 0x2)로 열고
+    마지막에 client0이 그 파일을 unlinkat한다
+    partition을 쓰는 프로그램은 syzkaller 기본 프로그램 예산(5 s)을 넘으므로 Stage 1 collector가
+    syz-execprog -program-timeout을 올린다(KVM 90 s, TCG 270 s)
 ```
 
-executor ABI에는 lane 1용 `syz_nfsd_client_ctl$expire_client1`도 존재하지만, HCAP-11과
-CallAdmissionProfile은 실제 KVM에서 검증된 client0만 공개한다. client1은 별도의 runtime 증거가 생기기 전까지
-Agent가 사용할 수 없다. 2026-10-19 실 KVM 검증에서는 neutral control 3회가 승인된 target mapping을 실행하지
-않았고, expiry stimulus 3회는 모두 그 mapping을 실행했다. 각 실행은 remote-KCOV generation begin/publish 1회,
-abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록했다. HCAP-03은 이 실행의
-generation attribution을 계속 담당하며 HCAP-11이 이를 대체하지 않는다. 공유 증거는 실행 descriptor와
-target mapping의 digest 및 전체 mapping identity를 기록하고 후보 source metadata와 target 주소는 포함하지
-않는다. Host generator는 이 typed evidence의 execution harness, kernel/instrumentation/vmlinux/KASLR identity와
-guest lane script digest를 새 descriptor에 대해 다시 검사한 뒤에만 HCAP-11을 promotion한다. fixture status는
-lifecycle broker의 PID start time, server mount/net namespace, 명령행과 정확한 UNIX socket inode 소유권을 함께
-검사하여 stale pathname이나 재사용된 PID를 broker로 인정하지 않는다.
+트리거는 knfsd의 courteous server 동작이다. NFSv4.1 client가 lease 동안 갱신하지 않아도 session이 있으면
+서버는 바로 지우지 않고 `NFSD4_COURTESY`로 남긴다. 다른 client의 요청이 그 client의 state와 충돌할 때에만
+`try_to_expire_client`가 만료시킨다. 검증된 경로에서는 client0이 read-write open으로 write delegation을 받아
+두었고, client1의 OPEN이 그 delegation을 회수하는 `nfsd_break_deleg_cb`(client1 OPEN을 처리하는 nfsd
+thread, 귀속됨)가 courtesy client0을 찾아 laundromat을 깨운다. laundromat의 `mark_client_expired`와 purge는
+workqueue에서 돌아 귀속되지 않는다. client1의 OPEN은 `NFS4ERR_DELAY` 뒤 허가된다. heal 뒤 client0은
+`BADSESSION`과 `STALE_CLIENTID`를 받고 새 clientid로 EXCHANGE_ID, CREATE_SESSION을 한다(nfsd request,
+귀속됨). 첫 HCAP-11이 쓰던 서버 관리 인터페이스 `/proc/fs/nfsd/clients/<id>/ctl` 쓰기
+(`syz_nfsd_client_ctl$expire_client0`)는 NFS client 행위가 아니므로(#96) materializer가 어떤 admission
+authority가 허용하더라도 `syz_nfsd_client_ctl$` call을 `CALL_NOT_ADMITTED`(`<role>_server_admin_control`)로
+거부한다. syzkaller patch 0027의 executor call과 `tools/nfs-proxy/src/lifecycle.c` broker는 fixture 작업용으로
+남는다. `syz_nfs_lane_link$` call은 HCAP-11 scenario 밖에서(neutral control 포함) 거부된다.
+
+KVM 증거는 `tools/nfs-lifecycle/run.py --scenario v41-courtesy-expiry --repeat 3`이 만든다. neutral control
+(client0 lane I/O) 3회와 stimulus 3회를 같은 harness에서 돌린다. 각 실행은 remote-KCOV generation
+begin/publish 1회, abort/overflow/truncation 0회, 종료 시 outstanding token 및 remote ref 0을 기록하고, 실행 뒤
+`lane.sh status`가 fixture를 정상으로 보고하며 dmesg에 crash가 없어야 한다. public probe 세 개
+(`nfsd_break_deleg_cb`, `nfsd4_exchange_id`, `nfsd4_create_session`)를 pinned vmlinux의 coverage callsite로
+mapping하고, control은 셋 다 놓치고 stimulus는 매번 셋 다 실행해야 한다. stimulus의 서버 trace는
+`nfsd_cb_recall` -> `nfsd_mark_client_expired` -> `nfsd_clid_purged` -> client1 `OP_OPEN` 허가 ->
+`nfsd_clid_fresh` -> `OP_EXCHANGE_ID` -> `nfsd_slot_seqid_unconf` -> `nfsd_clid_confirmed` ->
+`OP_CREATE_SESSION` 순서여야 하고 복구한 clientid는 만료된 것과 달라야 한다. HCAP-03은 이 실행의 generation attribution을 계속 담당한다. 공유 증거는
+probe mapping digest와 전체 mapping identity를 기록하고 target 주소는 포함하지 않는다. Host generator는 이
+typed evidence의 execution harness, kernel/instrumentation/vmlinux/KASLR identity와 guest lane script digest를
+새 descriptor에 대해 다시 검사한 뒤에만 HCAP-11을 promotion한다.
+
+2026-10-25 증거(`capability-evidence/hcap11-kvm.json`)는 KVM이 없는 host에서 TCG(`exec_slowdown` 10)로
+얻었다. control 3회는 세 probe를 모두 놓쳤고, stimulus 3회는 매번 `nfsd_break_deleg_cb` 9개,
+`nfsd4_exchange_id` 22개, `nfsd4_create_session` 55개 PC를 실행했으며 위 순서의 trace를 남겼다. 6회 모두
+lane status 정상, crash 0이었다. 앞선 시도에서 확인한 두 가지가 설계에 반영되어 있다. link를 내리는
+partition은 client에 `ENETUNREACH`를 돌려주고 lane의 정적 경로를 지워 복구가 멈췄으므로, 0032는 link를
+유지한 채 blackhole root qdisc로 packet만 버린다. 같은 `lock0`을 다시 쓰는 반복 실행은 knfsd가 delegation을
+주지 않아 충돌이 생기지 않았으므로, stimulus는 마지막에 `lock0`을 지운다.
 
 source refs:
 
 ```text
-bundle/patches/syzkaller/0027-*
+bundle/patches/syzkaller/0032-*
 bundle/lane/lane.sh
-tools/nfs-proxy/src/lifecycle.c
 tools/nfs-lifecycle/run.py
+tools/nfs-lifecycle/programs/v41-courtesy-expiry.prog
 agent_pipeline/stage1/host/template/capability-evidence/hcap11-kvm.json
 ```
 
-### HCAP-12 — Bounded nfsdcld reconnect during NFSv4.1 client recovery
+### HCAP-12 — 철회됨 (nfsdcld reconnect)
 
-```text
-id: HCAP-12
-name: bounded nfsdcld reconnect during NFSv4.1 client recovery
-usable_stage: [stage1]
-usable_by: [agent_stage1]
-status: validated (KVM evidence 전까지 generator가 template을 거부)
-scope: [client0_recovery_cld_reconnect]
-
-interface:
-    syz_nfsd_cld_ctl$reconnect(0x2)  # exact admitted invocation
-
-purpose:
-    HCAP-11 복구 중 fresh client0의 Cld_Create upcall이 rpc_pipefs CLD pipe reader 교체와
-    겹치도록 하여, nfsd request context의 -EAGAIN 재시도와 reader-less 재queue 경로를 실행
-
-constraints:
-    HCAP-11 sequence 안에서 expire_client0 뒤, client0 profile 획득 전에 reconnect를 정확히 한 번 호출
-    syz_nfsd_cld_ctl$daemon_down은 어떤 HCAP에서도 admit되지 않음 (fixture 검증 전용)
-    syz 호출은 고정 op enum만 전달하며 path, PID, mount option, CLD payload, xid, command를 전달하지 않음
-    broker만 nfsdcld를 netns/mntns, PID start time, comm/cmdline, 실행 파일, 소유한 rpc_pipefs CLD pipe
-    dev:inode로 선택하고, 그 identity가 직전 transaction 종료 시점과 다르면 ESTALE로 거부
-    reconnect는 daemon을 bounded 시간 동안 SIGSTOP한 뒤 SIGKILL과 재시작으로 교체; 겹치는 CLD 작업과
-    그 동안의 client expiry는 EBUSY
-    실패한 transaction은 daemon을 한 번 복구하고, 복구도 실패하면 broker가 failed 상태로 남아 모든 CLD 작업을
-    EIO로 거부하며 lane status가 fixture를 unhealthy로 판정
-```
+HCAP-12는 broker가 서버 데몬 nfsdcld를 SIGSTOP·SIGKILL·재시작해 rpc_pipefs CLD pipe reader 교체와 client0
+복구를 겹치게 하는 capability였다. 어떤 NFS client 행위도 서버 데몬을 재시작시킬 수 없으므로 트리거 기준(§3.2)을
+위반한다. 사람이 구현한 capability와 생성된 capability에 같은 기준을 적용하므로 manual 전용으로도 남기지 않고
+카탈로그에서 삭제했다(#98). host generator template에는 HCAP-12 entry, KVM 증거, `syz_nfsd_cld_ctl$reconnect`
+admission, 그 call을 켜는 runtime selection과 neutral control이 없고, materializer는 어떤 admission authority가
+허용하더라도 `syz_nfsd_cld_ctl$` call을 `CALL_NOT_ADMITTED`(`<role>_server_daemon_control`)로 거부한다. 이전
+`hcap_revision`에 묶인 job은 일반 `hcap_revision` 변경 경로로 다시 평가된다. syzkaller patch 0028의 executor
+call과 `tools/nfs-proxy/src/cld.c` broker는 fixture 작업용으로 남는다.
 
 CLD 작업의 실행 context와 귀속:
 
@@ -636,37 +744,9 @@ CLD 작업의 실행 context와 귀속:
 | `rpc_timeout_upcall_queue` (-ETIMEDOUT) | rpciod workqueue | 귀속 안 됨 |
 | tracking init, version 확인, rpc_pipefs mount notifier | nfsd 시작/관리 | 귀속 안 됨 |
 
-귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.cld` gap으로 남으며, 이 capability는 그
-범위를 지원한다고 주장하지 않는다. 그 context를 귀속하려면 커널 패치가 필요하며 owner 승인 전에는 적용하지
-않는다. trace, dmesg, daemon log는 진단 정보일 뿐 Q1 근거가 아니다.
-
-Broker 카운터(`server/cld.state`, broker 소유):
-`reconnect_attempts/ok/fail`, `down_attempts/ok/fail`, `daemon_stop_ok/fail`, `daemon_start_ok/fail`,
-`refused_busy`(겹친 요청), `refused_identity`(stale identity), `restore_ok/fail`(실패 뒤 복구). 실행 증거는 run별
-delta를 기록한다.
-
-KVM 증거(`capability-evidence/hcap12-kvm.json`, `Hcap12KvmEvidence`)는 run마다 하나의 귀속 generation과 공개
-CLD probe(`cld_create`, `cld_create_error`, `pipe_wait_for_open`) hit 수를 담는다. promotion 조건은 다음과 같다.
-
-- neutral control은 모든 probe를 miss하고 broker를 쓰지 않는다.
-- 시나리오 A(normal)는 create를 hit하고 reader-less 재queue와 오류 경로는 miss한다.
-- 시나리오 C(reconnect)는 create와 reader-less 재queue를 hit하고 오류 경로는 miss하며, run마다
-  `reconnect_ok`가 1이다.
-- 시나리오 B(daemon-down)는 fixture 증거로만 쓰며, run마다 `down_ok`가 1이고 daemon이 복구되어야 한다.
-- 모든 run 뒤에 lane status가 통과하고, broker 실패·거부·복구 카운터는 모두 0이어야 한다.
-
-Probe는 공개 커널 함수와 줄 범위에서 계산하며 후보 metadata를 쓰지 않는다. Host generator는 HCAP-11과 같은
-identity 결합을 검사한 뒤에만 HCAP-12를 promotion한다.
-
-source refs:
-
-```text
-bundle/patches/syzkaller/0028-*
-bundle/lane/lane.sh
-tools/nfs-proxy/src/cld.c
-tools/nfs-lifecycle/run.py
-agent_pipeline/stage1/host/template/capability-evidence/hcap12-kvm.json
-```
+귀속되지 않는 context를 요구하는 Q1 target은 `remote_kcov.context.cld` gap이며, 현재 harness는 그
+범위를 지원하지 않는다. 그 context의 귀속 계측은 Harness Generation이 `remote_kcov_attribution`
+gap으로 생성하고 검증한다(`07` §4, §5). trace, dmesg, daemon log는 진단 정보일 뿐 Q1 근거가 아니다.
 
 ### HCAP-13 — NLM lane locking and raw NLM RPC
 
@@ -795,6 +875,11 @@ semantic capability registry
   entry는 promoted registry를 `authority_refs`로, 검증된 subset을 `validated_scope`로 참조한다.
 - Agent와 Mutation Rule Compiler는 promoted scope만 쓴다. 실행 중인 binary가 runtime에 광고하는 범위만으로는
   쓰지 않는다(§7.1).
+- 여기서 promoted는 M7 gate를 통과해 job이 binding한 `hcap_revision`에 pin됐다는 뜻이다. 그 revision은 promoted
+  revision일 수도 있고 Harness Generation이 만든 staged revision(§1.1)일 수도 있다. staged revision이 semantic
+  subset을 담으려면 M7 1단계(crash survival을 뺀 항목, `03-nfs-proxy/06` §30)를 통과해야 하고, pin은 crash survival
+  pending으로 표시된다. crash survival은 자연 crash로만 확인하며 인위적으로 crash를 만들지 않는다. 공유 HCAP으로
+  올리는 promotion은 그 확인(M7 2단계) 뒤에만 한다. subset을 사람이 구현했는지 생성했는지는 구분하지 않는다.
 - path, operator, transform 목록을 이 문서나 Agent·Proxy 설계 문서에 복제하지 않는다.
 
 promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다. registry 생성과 promotion gate는
@@ -814,8 +899,7 @@ STAGE 1
     HCAP-04 lane topology
     HCAP-05 normal-flow seeds
     HCAP-06 flow tracing
-    HCAP-11 bounded NFSv4.1 client lifecycle recovery
-    HCAP-12 bounded nfsdcld reconnect during NFSv4.1 client recovery
+    HCAP-11 client-induced NFSv4.1 client expiry recovery
     HCAP-13 NLM lane locking and raw NLM RPC
 
 STAGE 2
@@ -832,7 +916,8 @@ MANUAL / LEGACY CAMPAIGN (Agent pipeline 아님)
 ```
 
 promotion된 semantic subset이 없으면 Agent Stage 2의 semantic 요청은 `unsupported_by_current_harness`로
-처리하고 `HarnessGapIssue(gap_class=mutation_engine)`를 semantic runtime 구현·검증 작업에 연결한다.
+처리하고 `HarnessGapIssue(gap_class=mutation_engine)`를 연결한 뒤 Harness Generation(`07` §5)이 semantic
+runtime capability를 생성·검증한다.
 legacy 경로를 manual 실험에 쓰더라도 Controller는 Agent intent가 지원된다고 주장하지 않는다(issue #8).
 
 Stage 1은 mutation capability를 Q1을 만들기 위한 우회 수단으로 사용하지 않는다.
@@ -862,15 +947,23 @@ Harness Capability Specification
        HarnessGapIssue 생성/연결
               |
               v
-       blocked_harness_gap
+       Harness Generation (07 §5)
+              |
+              v
+       staged HCAP revision -> Reachability Planning 재개
+              |
+              +-- 생성 실패 -> blocked_harness_gap
 ```
 
 Agent는 없는 capability를 있다고 가정하지 않는다.
-candidate 실행 중에 즉석에서 source를 바꾸지 않는다.
-대신 별도 Harness Extension Work에서 syzlang, pseudo-syscall/executor, fixture/tool,
-mutation-engine capability를 확장할 수 있다.
+Stage 1/2 Agent는 candidate 실행 중에 즉석에서 source를 바꾸지 않는다.
+Planning은 자연 경로가 있으면 그 경로를 고르며, 그 경로가 귀속되지 않으면 서버 직접 조작으로 우회하지 않고
+`remote_kcov_attribution` gap을 낸다(§3.2).
+없는 capability는 Harness Generation이 syzlang, pseudo-syscall/executor, fixture/tool,
+mutation-engine, remote-KCOV 계측으로 생성하고 검증한다.
 
-Linux kernel source를 바꾸는 observability extension은 자동 수행하지 않고 human decision issue로 관리한다.
+Linux kernel source를 바꾸는 observability extension도 Harness Generation이 생성한다. target kernel 동작을 바꾸지
+않는 계측만 허용하고, `07` §5.2의 검증을 통과해야 쓴다. 공유 HCAP으로의 promotion은 사람이 검토한다.
 자세한 계약은 `07-harness-gap-issue.md`를 따른다.
 
 ## 7. 갱신 책임
@@ -900,9 +993,10 @@ runtime이 pin된 authority보다 적거나 다르게 보고
     -> INCONCLUSIVE(infra) / 차단
     -> repository maintenance defect
 
-runtime이 promotion되지 않은 capability를 더 노출
+runtime이 pin된 authority에 없는 capability를 더 노출
     -> 사용하지 않는다
-    -> validation / promotion이 authority를 갱신하기 전에는 Agent capability가 아니다
+    -> validation / promotion(M7 gate나 Harness Generation 검증)이 binding한 revision의 authority를
+       갱신하기 전에는 Agent capability가 아니다. staged revision에 pin된 것은 사용한다
 ```
 
 ### 7.2 drift guard

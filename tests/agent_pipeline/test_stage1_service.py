@@ -135,7 +135,7 @@ class Ids:
 
 def make_service(tmp_path, build, *, pcs="4096", ids=None, command=COMMAND,
                  run_agents=True, registry=None, engine_factory=None,
-                 runtime=None, policies=None, **extra):
+                 runtime=None, policies=None, slots=None, **extra):
     b = build
     if registry is None:
         registry = InMemoryRegistry()
@@ -153,7 +153,8 @@ def make_service(tmp_path, build, *, pcs="4096", ids=None, command=COMMAND,
 
     def engine(store):
         return CommandExecutionEngine(
-            config, store, ProcessSupervisor(tmp_path / "state" / "processes"))
+            config, store, ProcessSupervisor(tmp_path / "state" / "processes"),
+            slots=slots)
 
     parts = Stage1Parts(
         state_dir=tmp_path / "state", artifacts=b.store,
@@ -319,7 +320,12 @@ def test_open_stage1_builds_the_production_composition(tmp_path, build):
                                              descriptor_id)
     from agent_pipeline.registry import HarnessCatalog, HarnessRegistration
     from agent_pipeline.stage1.cli import open_stage1
-    from agent_pipeline.stage1.config import EngineConfig, Stage1Config
+    from agent_pipeline.stage1.config import (EngineConfig,
+                                              HarnessGenerationConfig,
+                                              Stage1Config,
+                                              ValidationCommandConfig)
+    from agent_pipeline.stage1.validation import (CommandValidator,
+                                                  DeferredValidator)
 
     repo = tmp_path / "linux"
     (repo / "fs" / "nfsd").mkdir(parents=True)
@@ -358,11 +364,23 @@ def test_open_stage1_builds_the_production_composition(tmp_path, build):
                   str(REPO), str(tmp_path / "command.py"),
                   "{input}", "{output}"),
             cwd=tmp_path, resource_key="test-lane-0",
-            env={"LANG": "C.UTF-8", "TEST_PCS": "4096"}, timeout_s=60))
+            env={"LANG": "C.UTF-8", "TEST_PCS": "4096"}, timeout_s=60),
+        generation=HarnessGenerationConfig(
+            repo=REPO, worktree_root=tmp_path / "worktrees",
+            launcher=("/usr/bin/env",),
+            validation=ValidationCommandConfig(
+                argv=("/bin/false",), cwd=tmp_path,
+                resource_key="test-validate")))
     config = Stage1Config.model_validate_json(config.model_dump_json())
+    with ExitStack() as stack:
+        once = open_stage1(config, stack, parser=b.parser, run_agents=False)
+        assert isinstance(once.parts.generation.validator, DeferredValidator)
     with ExitStack() as stack:
         service = open_stage1(config, stack, runtime=ScriptedRuntime(b),
                               parser=b.parser)
+        assert isinstance(service.parts.generation.validator,
+                          CommandValidator)
+        assert service.controller.generations is not None
         job_id = submit(service, b)
         register_mapping(service, b, job_id)
         service.start_worker(idle_s=0.05)
@@ -436,7 +454,7 @@ def test_close_keeps_runner_open_for_a_worker_still_cleaning_up(
     task_id = service.job(job_id).pending_task.task_id
     assert service.close(worker_timeout_s=0) is False
     release.set()
-    service._worker_thread.join(30)
+    service._worker_threads[0].join(30)
     try:
         assert service.worker_errors == []
         assert [r.disposition for r in service.worker_runs] == ["not_stopped"]
@@ -633,3 +651,37 @@ def test_resubmit_binds_an_earlier_location_to_another_commit(tmp_path, build):
         assert "synthetic" not in json.dumps(_job_summary(service, new))
         missing = resubmit(service, old, "0" * 40)
         assert service.job(missing).state is JobState.REJECTED
+
+
+def test_a_fixed_campaign_runs_its_attempts_on_the_host_slots(tmp_path,
+                                                              build):
+    """09 §3.1, §8: the attempts of a fixed campaign run on two workers
+    that share two VM slots, and each gets its own Q1 authority."""
+    from agent_pipeline.runner.slots import SlotPool
+    service = make_service(
+        tmp_path, build, slots=SlotPool("test-lane", 2), runner_workers=2,
+        policies=(policy(campaign_mode="fixed", fixed_attempts=3,
+                         fixed_parallelism=2),))
+    with service:
+        job_id = submit(service, build)
+        register_mapping(service, build, job_id)
+        service.start_worker(idle_s=0.05)
+        assert len(service._worker_threads) == 2
+        assert service.run(stopped(service, job_id), interval_s=0.05,
+                           timeout_s=120)
+        job = service.job(job_id)
+        assert (job.state, job.state_reason) == (
+            JobState.S1_REACHED, "fixed_no_signal"), (
+            job, service.store.effect_failures(job_id),
+            service.worker_errors)
+        assert (job.fixed.sent, job.fixed.reached) == (3, 3)
+        attempts = {a.task_id for t in service.store.transitions(job_id)
+                    if t.job.fixed is not None for a in t.job.fixed.in_flight}
+        assert len(attempts) == 3
+        for task_id in attempts:
+            completion = service.runner.receipt(task_id)
+            assert completion.final_state == "sealed"
+            assert service.bridge.publication(
+                completion.bundle_ref).context.correlation.task_id == task_id
+        assert service.controller.replay(job_id) == job
+        assert len(list((tmp_path / "state" / "runs").iterdir())) == 4

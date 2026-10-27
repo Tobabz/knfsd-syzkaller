@@ -54,8 +54,9 @@ func exportTable(target *prog.Target) callTable {
 }
 
 func run(args []string, input io.Reader, output io.Writer) error {
-	if len(args) != 1 || (args[0] != "export" && args[0] != "parse") {
-		return errors.New("expected export or parse")
+	if len(args) != 1 || (args[0] != "export" && args[0] != "parse" &&
+		args[0] != "describe" && args[0] != "generate") {
+		return errors.New("expected export, parse, describe or generate")
 	}
 	if len(sourceCommit) != 40 || len(patchDigest) != 64 || len(sourceTree) != 40 || targetName != "linux/amd64" {
 		return errors.New("missing or unsupported compiled build identity")
@@ -66,7 +67,43 @@ func run(args []string, input io.Reader, output io.Writer) error {
 		return err
 	}
 	var result any
-	if args[0] == "export" {
+	if args[0] == "generate" {
+		data, err := io.ReadAll(io.LimitReader(input, maxProgramBytes+1))
+		if err != nil {
+			return err
+		}
+		if len(data) > maxProgramBytes {
+			return errors.New("generate request byte limit exceeded")
+		}
+		req, err := decodeGenerate(data)
+		if err != nil {
+			return err
+		}
+		programs, err := generatePrograms(target, req)
+		if err != nil {
+			return err
+		}
+		result = struct {
+			Bridge   bridgeInfo        `json:"bridge"`
+			Programs generatedPrograms `json:"programs"`
+		}{metadata(), programs}
+	} else if args[0] == "describe" {
+		data, err := io.ReadAll(io.LimitReader(input, maxProgramBytes+1))
+		if err != nil {
+			return err
+		}
+		if len(data) > maxProgramBytes {
+			return errors.New("call list byte limit exceeded")
+		}
+		shapes, err := describeCalls(target, callNames(data))
+		if err != nil {
+			return err
+		}
+		result = struct {
+			Bridge bridgeInfo `json:"bridge"`
+			Shapes callShapes `json:"call_shapes"`
+		}{metadata(), shapes}
+	} else if args[0] == "export" {
 		result = struct {
 			Bridge bridgeInfo `json:"bridge"`
 			Table  callTable  `json:"call_table"`

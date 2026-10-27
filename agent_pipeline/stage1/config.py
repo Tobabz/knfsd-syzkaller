@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 
 from ..admission import SyzkallerTargetIdentity
-from ..contracts import JobPolicy, JudgeVersions, Sha256
+from ..contracts import CampaignMode, JobPolicy, JudgeVersions, Sha256
 
 
 class _Config(BaseModel):
@@ -69,6 +70,19 @@ class Stage2Config(_Config):
         return argv
 
 
+class SlotsConfig(_Config):
+    """The host's KVM slot pool (09 §8, #81 R6): one guest's size and the
+    host's reserve.  The slot count is computed from the host's CPUs and
+    memory when the service starts; ``engine.resource_key`` (and the Stage
+    2 backend's leases) then run on ``<resource_key>/kvm-<i>``."""
+
+    vm_cpus: int = Field(ge=1, le=256)
+    vm_memory_mb: int = Field(ge=256)
+    reserve_cpus: int = Field(default=2, ge=0)
+    reserve_memory_mb: int = Field(default=4096, ge=0)
+    max_slots: int | None = Field(default=None, ge=1, le=256)
+
+
 class AgentRuntimeConfig(_Config):
     """Host limits of one Agent execution (``RuntimeLimits``); separate
     from the Controller's retry and repair budgets."""
@@ -77,6 +91,79 @@ class AgentRuntimeConfig(_Config):
     max_tool_calls: int = Field(default=96, ge=1, le=1024)
     request_timeout_s: float = Field(default=180, gt=0, le=3600)
     run_timeout_s: float = Field(default=1200, gt=0, le=14_400)
+
+
+class ValidationCommandConfig(_Config):
+    """The host command that validates one patch set (07 §5.2); see
+    ``stage1.validation`` for its contract.  With ``slots`` it runs on a
+    KVM slot of the pool; without, on ``resource_key`` beside the Runner's
+    lease, so the host must have room for both."""
+
+    argv: tuple[str, ...] = Field(min_length=1)
+    cwd: Path
+    env: dict[str, str] = Field(default_factory=lambda: {"LANG": "C.UTF-8"})
+    resource_key: str = Field(min_length=1, max_length=256)
+    #: A rebuild, bootstrap, smoke, control and regression run.
+    timeout_s: float = Field(default=14_400, gt=0, le=86_400)
+
+    @field_validator("argv")
+    @classmethod
+    def _absolute(cls, argv: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError("argv[0] must be an absolute path")
+        return argv
+
+
+class PromotionCampaignConfig(_Config):
+    """The host command that runs one promotion probe campaign (07 §5.3);
+    see ``stage1.campaigns`` for its contract.  ``stage1`` and
+    ``collector`` are what the campaign reads; ``campaign`` sets other
+    ``CampaignConfig`` fields (selection, run counts)."""
+
+    argv: tuple[str, ...] = Field(min_length=1)
+    cwd: Path
+    env: dict[str, str] = Field(default_factory=lambda: {"LANG": "C.UTF-8"})
+    resource_key: str = Field(min_length=1, max_length=256)
+    stage1: Path
+    collector: Path | None = None
+    campaign: dict[str, int] = Field(default_factory=dict)
+    #: About 40 guest boots.
+    timeout_s: float = Field(default=14_400, gt=0, le=86_400)
+
+    @field_validator("argv")
+    @classmethod
+    def _absolute(cls, argv: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError("argv[0] must be an absolute path")
+        return argv
+
+
+class HarnessGenerationConfig(_Config):
+    """Harness Generation (07 §5): the Agent's sandbox and the validation
+    command.  Unset, a gap a policy would generate for ends
+    ``unavailable(no_generator)``."""
+
+    #: The repository clone the worktrees come from (read-only to the
+    #: generation user).
+    repo: Path
+    #: setgid to a group of the generation user (07 §5.1).
+    worktree_root: Path
+    base_ref: str = "HEAD"
+    #: argv prefix: the separate OS user, no network.
+    launcher: tuple[str, ...] = Field(min_length=1)
+    env: dict[str, str] = Field(default_factory=dict)
+    allowed_paths: tuple[str, ...] | None = None
+    workers: int = Field(default=1, ge=1, le=8)
+    validation: ValidationCommandConfig
+    #: Unset: a passed generation's staged harness is not promoted.
+    campaign: PromotionCampaignConfig | None = None
+
+    @field_validator("launcher")
+    @classmethod
+    def _absolute(cls, argv: tuple[str, ...]) -> tuple[str, ...]:
+        if not Path(argv[0]).is_absolute():
+            raise ValueError("launcher[0] must be an absolute path")
+        return argv
 
 
 class Stage1Config(_Config):
@@ -107,6 +194,26 @@ class Stage1Config(_Config):
     #: blocked_operator(stage2_compiler_unavailable).
     nfs_proxy: Path | None = None
     stage2: Stage2Config | None = None
+    #: Unset: one execution at a time on ``engine.resource_key``.
+    slots: SlotsConfig | None = None
+    generation: HarnessGenerationConfig | None = None
+
+    @model_validator(mode="after")
+    def _campaign_backends(self) -> Stage1Config:
+        """#81 D16: a mutate policy needs the Stage 2 backend and the
+        Compiler's Proxy, or its jobs could only stop after compiling.  The
+        promoted semantic subset is an HCAP authority, checked by
+        generation and the Rule Compiler, not by this file."""
+        mutate = [p.policy_id for p in self.policies
+                  if p.campaign_mode is CampaignMode.MUTATE]
+        missing = [name for name, value in (("stage2", self.stage2),
+                                            ("nfs_proxy", self.nfs_proxy))
+                   if value is None]
+        if mutate and missing:
+            raise ValueError(
+                f"policies {mutate} use campaign_mode mutate, which needs "
+                + " and ".join(missing))
+        return self
 
     @classmethod
     def load(cls, path: Path) -> Stage1Config:

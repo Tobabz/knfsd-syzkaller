@@ -19,14 +19,22 @@ from pydantic import TypeAdapter
 from ..artifacts import ArtifactStore
 from ..components import HarnessRegistry, IssueTracker
 from ..contracts import (AgentOutput, AgentTask, AgentUsage,
-                         CandidateSubmission, GapRef,
+                         CandidateSubmission, GapClass, GapRef,
                          HarnessBinding, JudgeVersions, LocationRequest,
                          VulnerabilityCandidate)
 from ..intake import IntakeRejected, SourceTree, validate
 from . import events as ev
+from .generation import (ACTIVE, GenerationAttempt, GenerationDriver,
+                         GenerationOutput, GenerationState,
+                         HarnessGeneration, HarnessGenerator,
+                         HarnessValidator, generation_of)
+from .promotion import (OPEN, REJECTABLE, ArtifactPromotionInputs, HarnessPromotion,
+                        ProbeCampaigner, PromotionDriver, PromotionInputs,
+                        PromotionState, approve, issue_resolved,
+                        new_promotion, on_registry, reject, retry)
 from .machine import Env, Machine, Outcome, harness_authority_stale
-from .records import (TERMINAL, AgentAttempt, Job, JobState, RepairInput,
-                      TaskKind, Transition)
+from .records import (GAP_STATES, TERMINAL, AgentAttempt, Job, JobState,
+                      RepairInput, SeedPlan, TaskKind, Transition)
 from .store import StaleIssueEvent, Store
 from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
                     RunnerInput,
@@ -34,6 +42,11 @@ from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
                     runner_input_digest)
 
 FINAL = ("sealed", "ended_unsealed")
+#: A job past the end of Stage 1: where a person decides the promotion of
+#: the staged harness it ran on (07 §5.3).
+STAGE1_ENDED = TERMINAL | {JobState.S1_REACHED, JobState.S2_STRATEGY,
+                           JobState.S2_GATE, JobState.S2_CAMPAIGN,
+                           JobState.S2_REPLAYING, JobState.CRASH_REVIEW}
 #: Agent attempt states that can still give a result.
 LIVE = ("sending", "running")
 AGENT_OUTPUT = TypeAdapter(AgentOutput)
@@ -70,7 +83,11 @@ class Controller:
                  registry: HarnessRegistry, tree: SourceTree,
                  artifacts: ArtifactStore, judge_versions: JudgeVersions,
                  clock: Callable[[], str] = _utc_now,
-                 new_id: Callable[[], str] = lambda: uuid.uuid4().hex[:12]
+                 new_id: Callable[[], str] = lambda: uuid.uuid4().hex[:12],
+                 generator: HarnessGenerator | None = None,
+                 validator: HarnessValidator | None = None,
+                 campaigner: ProbeCampaigner | None = None,
+                 promotion_inputs: PromotionInputs | None = None
                  ) -> None:
         self.store = store
         self.machine = Machine(env)
@@ -88,6 +105,19 @@ class Controller:
         self.clock = clock
         self.new_id = new_id
         self.failures: list[EffectFailure] = []
+        #: 09 §3.2.  None until a Harness Generation Agent and a validation
+        #: Runner are configured; a gap then ends generation_unavailable.
+        self.generations = None if generator is None or validator is None \
+            else GenerationDriver(store, generator, validator, clock=clock,
+                                  on_end=self._generation_ended)
+        #: 07 §5.3.  None until a probe campaign Runner is configured: a
+        #: passed generation's staged binding then stays unpromoted.
+        self.promotions = None if self.generations is None or \
+            campaigner is None else PromotionDriver(
+                store, campaigner, clock=clock,
+                on_end=self._promotion_ended)
+        self.promotion_inputs = promotion_inputs or \
+            ArtifactPromotionInputs(artifacts)
 
     # ------------------------------------------------------------ intake
 
@@ -112,18 +142,32 @@ class Controller:
                 start_line=loc.start_line, end_line=loc.end_line)),
             policy_id)
 
-    def submit(self, submission: CandidateSubmission, policy_id: str) -> str:
+    def submit(self, submission: CandidateSubmission, policy_id: str, *,
+               seed: SeedPlan | None = None) -> str:
         """Register the candidate and start a job for it.  A submission
         intake refuses still gets a job, which ends rejected (09 §3)."""
         self.store.policy(policy_id)            # must exist
         job = Job(job_id=f"job-{self.new_id()}", submission=submission,
-                  job_policy_id=policy_id)
+                  job_policy_id=policy_id, seed=seed)
         self.store.create(job, Transition(
             job_id=job.job_id, seq=0, from_state=None, to_state=job.state,
             reason="submitted", event={"type": "submitted"},
             job_policy_id=policy_id, at=self.clock(), job=job))
         self._intake(job.job_id)
         return job.job_id
+
+    def seed(self, job_id: str, policy_id: str) -> str:
+        """#81 R5: a new job for ``job_id``'s candidate under another
+        policy (another sanitizer), started from its plan instead of
+        Analysis and Planning.  The plan is re-validated against the new
+        binding's HCAP before it is materialized."""
+        src = self.store.job(job_id)
+        if src.candidate is None or src.analysis_ref is None or \
+                src.plan_ref is None:
+            raise ValueError(f"{job_id} has no plan to seed a job with")
+        return self.submit(src.submission, policy_id, seed=SeedPlan(
+            from_job=job_id, analysis_ref=src.analysis_ref,
+            plan_ref=src.plan_ref))
 
     def _intake(self, job_id: str) -> None:
         job = self.store.job(job_id)
@@ -184,6 +228,25 @@ class Controller:
             job_id, ev.AgentFailed(task_id=task_id, attempt=attempt,
                                    failure=failure)))
 
+    def on_generation_result(self, task_id: str, attempt: int,
+                             output: GenerationOutput) -> None:
+        """A Harness Generation Agent answer (09 §3.2).  Only the
+        generation's current try makes a step."""
+        gid = generation_of(task_id)
+        self._guard(gid, "generation_result", lambda:
+                    self.generations.on_result(task_id, attempt, output))
+
+    def on_generation_failure(self, task_id: str, attempt: int,
+                              failure: str) -> None:
+        gid = generation_of(task_id)
+        self._guard(gid, "generation_result", lambda:
+                    self.generations.on_failure(task_id, attempt, failure))
+
+    def retry_generation(self, job_id: str) -> Outcome | None:
+        """09 §3.2: an operator starts Harness Generation of the job's gap
+        again, with a new budget, on blocked_harness_gap or parked."""
+        return self.operator(job_id, "retry_generation")
+
     def approve(self, job_id: str, task_id: str, review_manifest_sha256: str,
                 decision_id: str) -> None:
         self._apply(job_id, ev.ApprovalGiven(
@@ -207,8 +270,7 @@ class Controller:
         together with the job's record of it, so it is applied at most once
         per job and never after a later event, whichever process delivers
         it."""
-        for job in self.store.jobs({JobState.BLOCKED_HARNESS_GAP,
-                                    JobState.PARKED}):
+        for job in self.store.jobs(set(GAP_STATES)):
             if job.gap != gap or (job_ids is not None and
                                   job.job_id not in job_ids):
                 continue
@@ -233,7 +295,12 @@ class Controller:
 
     def on_registry_changed(self) -> None:
         """A harness build or HCAP revision changed: look every live job's
-        binding up again (09 §5)."""
+        binding up again (09 §5).  An approved promotion the new registry
+        carries ends promoted first."""
+        if self.promotions is not None:
+            for p in self.store.promotions({PromotionState.APPROVED}):
+                self._guard(p.promotion_id, "promotion",
+                            lambda i=p.promotion_id: self._promoted(i))
         for job in list(self.store.jobs()):
             self._reconcile_registry(job.job_id)
 
@@ -265,8 +332,8 @@ class Controller:
         return self.operator(job_id, f"route_{to}")
 
     def start_stage2(self, job_id: str) -> Outcome | None:
-        """09 §4: an operator starts Stage 2 of a job in s1_reached.  Until
-        JobPolicy.run_stage2 may be true this is the only way in."""
+        """09 §4: an operator starts Stage 2 of a job in s1_reached.  Unless
+        JobPolicy.campaign_mode is mutate this is the only way in."""
         return self.operator(job_id, "start_stage2")
 
     def operator(self, job_id: str, action: str) -> Outcome | None:
@@ -282,6 +349,12 @@ class Controller:
         go on; returns this call's failures."""
         self.failures = []
         self._late_cleanup_reports()
+        if self.generations is not None:
+            for g in self.store.generations(set(ACTIVE)):
+                self._guard(g.generation_id, "generation",
+                            lambda i=g.generation_id:
+                            self.generations.poll(i))
+        self._poll_promotions()
         for job in list(self.store.jobs()):
             self._settle(job.job_id)
         return self.failures
@@ -324,7 +397,11 @@ class Controller:
                     lambda: self._link_gap(self.store.job(job_id)))
         self._guard(job_id, "pending_task",
                     lambda: self._poll_pending(job_id))
+        self._guard(job_id, "fixed_attempts",
+                    lambda: self._attempts(job_id, poll=True))
         self._guard(job_id, "rebind", lambda: self._retry_rebind(job_id))
+        self._guard(job_id, "generation",
+                    lambda: self._join_generation(job_id))
 
     def _retry_rebind(self, job_id: str) -> None:
         """A job left in retry_pending (its issue resolved, the binding
@@ -392,6 +469,12 @@ class Controller:
         queue states.  Failures are recorded per job, as in poll()."""
         self.failures = []
         self._late_cleanup_reports()
+        if self.generations is not None:
+            for g in self.store.generations(set(ACTIVE)):
+                self._guard(g.generation_id, "generation",
+                            lambda i=g.generation_id:
+                            self.generations.recover(i))
+        self._poll_promotions(recover=True)
         for job in list(self.store.jobs()):
             self._guard(job.job_id, "recover",
                         lambda j=job.job_id: self._recover(j))
@@ -410,11 +493,14 @@ class Controller:
                     lambda: self._link_gap(self.store.job(job_id)))
         job = self.store.job(job_id)
         p = job.pending_task
+        self._attempts(job_id)
         if p is None:
             if job.state is JobState.SUBMITTED:
                 self._intake(job_id)
             elif job.state is JobState.RETRY_PENDING:
                 self._rebind(job)
+            elif job.state is JobState.HARNESS_GENERATING:
+                self._join_generation(job_id)
             return
         if p.kind is TaskKind.RUNNER:
             self._dispatch(job_id)
@@ -470,9 +556,7 @@ class Controller:
         if job.state in TERMINAL or job.candidate is None or \
                 job.state is JobState.SUBMITTED:
             return
-        policy = self.store.policy(job.job_policy_id)
-        binding = self.registry.lookup(job.candidate.kernel_commit,
-                                       policy.sanitizer)
+        binding = self._binding_for(job)
         stale = binding == job.binding and \
             harness_authority_stale(job, binding)
         if binding != job.binding or stale:
@@ -488,13 +572,273 @@ class Controller:
                     f"{job_id}")
 
     def _rebind(self, job: Job) -> None:
-        policy = self.store.policy(job.job_policy_id)
-        b = self.registry.lookup(job.candidate.kernel_commit,
-                                 policy.sanitizer)
+        b = self._binding_for(job)
         self._apply(job.job_id, ev.BindingChanged(
             binding=b, judge_versions=self._versions_for(b),
             rematerialize_authority=True,
             harness_authority_current=self._authority_current(job, b)))
+
+    def _binding_for(self, job: Job) -> HarnessBinding | None:
+        """The registry's binding for the job's build key, or the staged
+        binding a passed generation gave the job while the registry still
+        has the binding that generation started from (09 §3.2).  A registry
+        change (a promotion, a new build) moves the job to the registry."""
+        policy = self.store.policy(job.job_policy_id)
+        b = self.registry.lookup(job.candidate.kernel_commit,
+                                 policy.sanitizer)
+        s = job.staged
+        if s is not None and s.binding.sanitizer is policy.sanitizer and \
+                self.store.generation(s.generation_id).base_binding == b \
+                and not self._promotion_rejected(s.generation_id):
+            return s.binding
+        return b
+
+    def _promotion_rejected(self, generation_id: str) -> bool:
+        p = self.store.promotion_for(generation_id)
+        return p is not None and p.state is PromotionState.REJECTED
+
+    # ------------------------------------------------------------ generation
+
+    def _join_generation(self, job_id: str) -> None:
+        """09 §3.2, the gap rows: a job in harness_generating takes the
+        result of its gap key's generation, starting one when there is none,
+        when the operator asked to retry the one that refused it, or when the
+        passed one started from a binding the registry no longer has.
+        Idempotent, so poll() and recover() send it again."""
+        job = self.store.job(job_id)
+        if job.state is not JobState.HARNESS_GENERATING or job.gap is None:
+            return
+        policy = self.store.policy(job.job_policy_id)
+        if self.generations is None or not policy.harness_generation_budget:
+            self._apply(job_id, ev.GenerationEnded(
+                gap=job.gap, outcome="unavailable",
+                reason="no_generator" if self.generations is None
+                else "policy"))
+            return
+        commit = job.candidate.kernel_commit
+        base = self.registry.lookup(commit, policy.sanitizer)
+        g = self.store.latest_generation(job.gap, commit, policy.sanitizer)
+        if g is None or g.generation_id == job.generation_retry or (
+                g.state is GenerationState.PASSED and
+                g.base_binding != base):
+            g = self._start_generation(job, policy, base, g)
+        if g.state in ACTIVE:
+            return
+        if g.state is GenerationState.PASSED and \
+                self._promotion_rejected(g.generation_id):
+            self._apply(job_id, ev.GenerationEnded(
+                gap=job.gap, generation_id=g.generation_id,
+                outcome="promotion_rejected", reason="review_rejected"))
+            return
+        if g.state is GenerationState.PASSED and \
+                job.binding == g.staged_binding:
+            self._apply(job_id, ev.GenerationEnded(
+                gap=job.gap, generation_id=g.generation_id,
+                outcome="not_filled", reason="staged_binding_still_gapped"))
+            return
+        out = self._apply(job_id, ev.GenerationEnded(
+            gap=job.gap, generation_id=g.generation_id, outcome=g.state.value,
+            binding=g.staged_binding, reason=g.reason))
+        if out is not None and out.job.state is JobState.RETRY_PENDING:
+            self._rebind(out.job)
+
+    def _start_generation(self, job: Job, policy, base: HarnessBinding | None,
+                          latest: HarnessGeneration | None
+                          ) -> HarnessGeneration:
+        gid = f"gen-{self.new_id()}"
+        g = self.generations.create(HarnessGeneration(
+            generation_id=gid, gap=job.gap,
+            kernel_commit=job.candidate.kernel_commit,
+            sanitizer=policy.sanitizer, base_binding=base,
+            origin_job=job.job_id, candidate=job.candidate,
+            analysis_ref=job.analysis_ref, proposal_ref=job.gap_proposal_ref,
+            model_policy=policy.harness_generation_agent,
+            budget=policy.harness_generation_budget,
+            agent_retry_limit=policy.agent_retry_limit,
+            runtime_retry_limit=policy.runtime_retry_limit,
+            attempts=(GenerationAttempt(number=1,
+                                        agent_task_id=f"{gid}.a1"),)),
+            after=latest.generation_id if latest else None)
+        if g.generation_id == gid:
+            # A failed send stays due; poll() sends a new try.
+            self._guard(gid, "generation",
+                        lambda: self.generations.dispatch(gid))
+        return self.store.generation(g.generation_id)
+
+    def _generation_ended(self, g: HarnessGeneration) -> None:
+        """Every job waiting on the generation's key takes its end.  A
+        passed one's staged harness goes to promotion (07 §5.3); a Stage 2
+        gap's promotion is the M7 gate's, not a probe campaign's."""
+        if g.state is GenerationState.PASSED and \
+                self.promotions is not None and \
+                g.gap.gap_class is not GapClass.MUTATION_ENGINE:
+            self._guard(g.generation_id, "promotion",
+                        lambda: self._create_promotion(g))
+        for job in self.store.jobs({JobState.HARNESS_GENERATING}):
+            if job.gap == g.gap and job.candidate is not None and \
+                    job.candidate.kernel_commit == g.kernel_commit:
+                self._guard(job.job_id, "generation",
+                            lambda j=job.job_id: self._join_generation(j))
+
+    # ------------------------------------------------------------ promotion
+
+    def approve_promotion(self, promotion_id: str, decision_id: str,
+                          note: str = "") -> HarnessPromotion:
+        """07 §5.3: a person approves the evidence of a promotion in
+        review, at the end of Stage 1 of a job on its staged harness.  The
+        host then promotes; the registry change ends it."""
+        jobs = self._stage1_ended(promotion_id)
+        return self._decide(promotion_id, lambda p: approve(
+            p, decision_id, note, self.clock(), jobs), "approved",
+            decision_id)
+
+    def reject_promotion(self, promotion_id: str, decision_id: str,
+                         note: str = "") -> HarnessPromotion:
+        """07 §5.3, at a Stage 1 end as approve_promotion: the jobs leave
+        the staged binding and meet the gap again."""
+        jobs = self._stage1_ended(promotion_id)
+        return self._decide(promotion_id, lambda p: reject(
+            p, decision_id, note, self.clock(), jobs), "rejected",
+            decision_id)
+
+    def promotion_due(self, job: Job) -> HarnessPromotion | None:
+        """The promotion a person decides with this job's Stage 1 end: the
+        job ran on its staged harness, reached the end of Stage 1, and the
+        promotion waits on a decision."""
+        if self.promotions is None or job.staged is None or \
+                job.state not in STAGE1_ENDED:
+            return None
+        p = self.store.promotion_for(job.staged.generation_id)
+        if p is None or p.state not in (PromotionState.REVIEW, *REJECTABLE):
+            return None
+        return p
+
+    def _stage1_ended(self, promotion_id: str) -> tuple[str, ...]:
+        """The jobs on the promotion's staged harness at the end of Stage
+        1.  A person decides a promotion only there, never in the middle of
+        a stage (user decision 2026-10-27)."""
+        p = self.store.promotion(promotion_id)
+        jobs = tuple(sorted(
+            j.job_id for j in self.store.jobs(set(STAGE1_ENDED))
+            if j.staged is not None and
+            j.staged.generation_id == p.generation_id))
+        if not jobs:
+            raise ValueError(f"{promotion_id}: no job on its staged harness "
+                             "has reached the end of Stage 1")
+        return jobs
+
+    def retry_promotion(self, promotion_id: str) -> HarnessPromotion:
+        """Run the campaigns of a promotion not met or failed again."""
+        return self._decide(promotion_id, retry, "retried", None)
+
+    def _decide(self, promotion_id: str, reduce, kind: str,
+                decision_id: str | None) -> HarnessPromotion:
+        if self.promotions is None:
+            raise ValueError("no probe campaign Runner is configured")
+        before = self.store.promotion(promotion_id)
+        if not self.promotions.step(promotion_id, reduce, {
+                "type": kind, "decision_id": decision_id}, send=False):
+            raise ValueError(f"{promotion_id} is {before.state.value}")
+        # Committed: a failed send (a one-shot command) is sent by poll().
+        self._guard(promotion_id, "promotion",
+                    lambda: self.promotions.dispatch(promotion_id))
+        return self.store.promotion(promotion_id)
+
+    def _create_promotion(self, g: HarnessGeneration) -> None:
+        if self.store.promotion_for(g.generation_id) is None:
+            self.promotions.create(new_promotion(
+                g, self.promotion_inputs.capabilities(g)))
+
+    def _poll_promotions(self, recover: bool = False) -> None:
+        """Create the promotion a lost call left out, take the candidate
+        programs, ask the campaigns, look for the promoted registry
+        binding and resolve the issue of a promoted one."""
+        if self.promotions is None:
+            return
+        for g in self.store.generations({GenerationState.PASSED}):
+            if g.gap.gap_class is not GapClass.MUTATION_ENGINE:
+                self._guard(g.generation_id, "promotion",
+                            lambda x=g: self._create_promotion(x))
+        for p in self.store.promotions():
+            if p.state in OPEN:
+                self._guard(p.promotion_id, "promotion",
+                            lambda i=p.promotion_id:
+                            self._poll_promotion(i, recover))
+            elif p.state is PromotionState.PROMOTED and \
+                    not p.issue_resolved:
+                self._guard(p.promotion_id, "promotion",
+                            lambda x=p: self._resolve_issue(x))
+
+    def _poll_promotion(self, promotion_id: str, recover: bool) -> None:
+        programs, waiting = self._candidate_programs(
+            self.store.promotion(promotion_id))
+        self.promotions.programs(promotion_id, programs, waiting)
+        if recover:
+            self.promotions.dispatch(promotion_id)
+        else:
+            self.promotions.poll(promotion_id)
+        self._promoted(promotion_id)
+
+    def _candidate_programs(self, p: HarnessPromotion
+                            ) -> tuple[set[str], bool]:
+        """The plan programs of the jobs on the staged binding, and whether
+        a live one there has no plan yet."""
+        programs, waiting = set(), False
+        for job in self.store.jobs():
+            if job.staged is None or \
+                    job.staged.generation_id != p.generation_id:
+                continue
+            if job.plan_ref is None:
+                waiting = waiting or job.state not in TERMINAL
+            else:
+                programs.update(self.promotion_inputs.programs(job.plan_ref))
+        return programs, waiting
+
+    def _promoted(self, promotion_id: str) -> None:
+        p = self.store.promotion(promotion_id)
+        if p.state is not PromotionState.APPROVED:
+            return
+        b = self.registry.lookup(p.kernel_commit, p.sanitizer)
+        carried = b is not None and all(
+            c.evidence_ref is not None and self.promotion_inputs.carries(
+                b, c.capability_id, c.evidence_ref)
+            for c in p.capabilities)
+        self.promotions.step(promotion_id,
+                             lambda x: on_registry(x, carried),
+                             {"type": "registry", "binding": None if b is None
+                              else b.model_dump(mode="json")})
+
+    def _promotion_ended(self, p: HarnessPromotion) -> None:
+        if p.state is PromotionState.PROMOTED:
+            self._guard(p.promotion_id, "promotion",
+                        lambda: self._resolve_issue(p))
+        elif p.state is PromotionState.REJECTED:
+            # 09 §5: off the staged binding, back to the registry's.
+            for job in list(self.store.jobs()):
+                if job.staged is not None and \
+                        job.staged.generation_id == p.generation_id:
+                    self._guard(job.job_id, "rebind",
+                                lambda j=job.job_id:
+                                self._reconcile_registry(j))
+                elif job.state is JobState.HARNESS_GENERATING:
+                    self._guard(job.job_id, "generation",
+                                lambda j=job.job_id:
+                                self._join_generation(j))
+
+    def _resolve_issue(self, p: HarnessPromotion) -> None:
+        """07 §5.3: a promotion resolves its gap's issue.  A tracker that
+        records status events gets one (the service delivers it);
+        otherwise the jobs on the issue take it here.  Sent again by poll()
+        until recorded."""
+        issue = self.store.issue_ref(p.gap)
+        resolution = f"promoted:{p.promotion_id}"
+        change = getattr(self.issues, "change", None)
+        if issue is not None and change is not None:
+            change(issue, "resolved", resolution)
+        else:
+            self.on_issue(p.gap, "resolved", resolution, issue=issue)
+        self.promotions.step(p.promotion_id, issue_resolved,
+                             {"type": "issue_resolved", "issue": issue})
 
     def _authority_current(self, job: Job,
                            binding: HarnessBinding | None) -> bool:
@@ -543,6 +887,8 @@ class Controller:
         self._guard(j, "dispatch", lambda: self._dispatch(j))
         self._guard(j, "link_issue",
                     lambda: self._link_gap(self.store.job(j)))
+        if new.state is JobState.HARNESS_GENERATING:
+            self._guard(j, "generation", lambda: self._join_generation(j))
 
     def _guard(self, job_id: str, effect: str,
                call: Callable[[], None]) -> bool:
@@ -558,16 +904,32 @@ class Controller:
     def _link_gap(self, job: Job) -> None:
         """07 §2: the Controller creates or links the issue.  Idempotent,
         so poll() and recover() send it again until it is recorded."""
-        if job.state in (JobState.BLOCKED_HARNESS_GAP, JobState.PARKED) \
-                and job.gap is not None and \
+        if job.state in GAP_STATES and job.gap is not None and \
                 not self.store.is_linked(job.job_id, job.gap):
             self.store.link_issue(job.gap, self.issues.open_or_link(
                 job.gap, job.job_id), job.job_id)
+
+    def _attempts(self, job_id: str, poll: bool = False) -> None:
+        """09 §3.1: send each fixed attempt in flight (idempotent by
+        task_id), or with `poll` ask for it first, and take a final one."""
+        job = self.store.job(job_id)
+        if job.state is not JobState.S1_FIXED or job.fixed is None:
+            return
+        for a in job.fixed.in_flight:
+            job = self.store.job(job_id)
+            if job.cancelling_tasks or job.fixed is None or \
+                    a not in job.fixed.in_flight:
+                continue
+            st = self.runner.status(a.task_id) if poll else None
+            if st is None or st.state == "unknown":
+                st = self.runner.submit(a.task_id, self._runner_input(job))
+            self._take_status(job_id, a.task_id, st)
 
     def _dispatch(self, job_id: str) -> None:
         job = self.store.job(job_id)
         p = job.pending_task
         if p is None:
+            self._attempts(job_id)
             return
         if p.kind is TaskKind.AGENT:
             if self.store.attempt(p.task_id, p.attempt) is not None:

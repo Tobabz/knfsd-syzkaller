@@ -8,6 +8,7 @@ import signal
 import struct
 import time
 import zlib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,12 +17,13 @@ import pytest
 from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.contracts import Sanitizer
-from agent_pipeline.data import put_record
+from agent_pipeline.data import canonical_json, load_record, put_record
 from agent_pipeline.journal_sink import CHANNEL_CLOSE_TIMEOUT_S
 from agent_pipeline.stage1.host.collector import (EVIDENCE_COMMAND_TIMEOUT_S,
                                                   EXECPROG_EXIT_GRACE_S, POLL_S,
                                                   CollectorConfig, execprog_argv,
-                                                  execprog_timeout)
+                                                  execprog_timeout, pinned_path,
+                                                  staged_path)
 from agent_pipeline.stage1.host.pins import PinError, pin_file
 from agent_pipeline.stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
                                            GUEST_TRANSFER_TIMEOUT_S,
@@ -35,9 +37,11 @@ from agent_pipeline.stage2.kvm import (
     _closed_evidence_channels, _JournalChannels, _journal_artifacts,
     _journal_lane_count, _lane_template,
     _campaign_manager, _manager_assets, _manager_cmdline, _manager_qemu_args,
-    _evidence_seal_window, _seal_segment, _spool, _stop_manager, StepOptions,
+    _staged_manager, _evidence_seal_window, _seal_segment, _spool,
+    _stop_manager, _validate_runtime_authority, StepOptions,
     stage2_timeout_budget,
 )
+from agent_pipeline.materializer import ReachabilityHarness
 from .stage2_host import rules_bytes
 from .fakes import COMMIT, World
 
@@ -110,6 +114,41 @@ def execution_record(**updates) -> dict:
     }
     value.update(updates)
     return value
+
+
+def runtime_authority(tmp_path):
+    from tests.agent_pipeline.test_materializer import materializer_world
+
+    world = materializer_world(tmp_path)
+    result = world.materializer.materialize(world.plan_ref, world.binding)
+    harness = load_record(world.store, result.harness_ref, ReachabilityHarness)
+    root = tmp_path / "input"
+    root.mkdir()
+    (root / "hcap.json").write_bytes(canonical_json(world.hcap))
+    (root / "admission.json").write_bytes(canonical_json(world.profile))
+    manager = {
+        "procs": 1,
+        "enable_syscalls": ["close", "openat$lane"],
+        "experimental": {"remote_cover": True},
+    }
+    return world, harness, root, manager
+
+
+def test_runtime_rejects_manager_outside_harness_validated_layout(tmp_path):
+    world, harness, root, manager = runtime_authority(tmp_path)
+    _validate_runtime_authority(root, harness, world.descriptor, manager)
+    manager["procs"] = 2
+    with pytest.raises(Stage2StepError, match="validated layout"):
+        _validate_runtime_authority(root, harness, world.descriptor, manager)
+
+
+@pytest.mark.parametrize("name", ["hcap.json", "admission.json"])
+def test_runtime_rejects_altered_authority_bytes(tmp_path, name):
+    world, harness, root, manager = runtime_authority(tmp_path)
+    path = root / name
+    path.write_bytes(path.read_bytes() + b"\n")
+    with pytest.raises(Stage2StepError, match=f"{name} differs"):
+        _validate_runtime_authority(root, harness, world.descriptor, manager)
 
 
 def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):
@@ -252,9 +291,14 @@ def test_journal_lane_count_uses_complete_fixture_topology():
             {"qemu_args": ("-enable-kvm "
                            "-device virtserialport,name=nfsp-journal-0 "
                            "-device virtserialport,name=nfsp-journal-0")}, 1)
-    with pytest.raises(Stage2StepError, match="enable KVM"):
+    with pytest.raises(Stage2StepError, match="collector's kvm"):
         _journal_lane_count(
             {"qemu_args": "-device virtserialport,name=nfsp-journal-0"}, 1)
+    tcg = {"qemu_args": ("-accel tcg,thread=multi -cpu max "
+                         "-device virtserialport,name=nfsp-journal-0")}
+    assert _journal_lane_count(tcg, 1, accel="tcg") == 1
+    with pytest.raises(Stage2StepError, match="collector's kvm"):
+        _journal_lane_count(tcg, 1)
 
 
 def test_manager_cmdline_is_bound_to_harness_selection():
@@ -327,6 +371,74 @@ def test_manager_runtime_assets_are_bound_to_harness_pins(tmp_path):
     manager["image"] = str(wrong)
     with pytest.raises(PinError, match="does not match its pin"):
         _manager_assets(manager, vm, collector, descriptor, builds)
+
+
+def test_a_staged_harness_runs_the_manager_on_its_staged_files(tmp_path):
+    # 07 §5.2: the validation staged a new bzImage and syz-executor under
+    # the collector's staged_files; the configured files stay the base's.
+    syzkaller = tmp_path / "syzkaller"
+    target_bin = syzkaller / "bin/linux_amd64"
+    target_bin.mkdir(parents=True)
+    (tmp_path / "kernel").mkdir()
+    (tmp_path / "template").mkdir()
+    assets = {
+        "bzimage": tmp_path / "bzImage",
+        "kernel": tmp_path / "kernel/vmlinux",
+        "lane-script": tmp_path / "template/lane.sh",
+        "vm-image": tmp_path / "image.qcow2",
+        "syz-execprog": target_bin / "syz-execprog",
+        "syz-executor": target_bin / "syz-executor",
+        "syz-manager": syzkaller / "bin/syz-manager",
+    }
+    for name, path in assets.items():
+        path.write_bytes((name + "\n").encode())
+    assets["syz-manager"].chmod(0o755)
+    key = tmp_path / "id"
+    key.write_text("key\n")
+    store = ArtifactStore(tmp_path / "cas")
+    staged_root = tmp_path / "staged"
+    collector = CollectorConfig(
+        artifact_root=store.root, files=assets, ssh_key=key,
+        qemu="/bin/true", staged_files=staged_root)
+    pins = {name: pin_file(name, path) for name, path in assets.items()}
+    for name in ("bzimage", "syz-executor"):
+        new = tmp_path / f"new-{name}"
+        new.write_bytes(f"staged {name}\n".encode())
+        pins[name] = pin_file(name, new)
+        dest = staged_path(staged_root, pins[name], assets[name])
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(new.read_bytes())
+    builds = {name: put_record(store, pin) for name, pin in pins.items()}
+    files = {name: pinned_path(collector, pins[name], path)
+             for name, path in assets.items()}
+    assert files["bzimage"].is_relative_to(staged_root)
+    manager = {
+        "type": "qemu", "target": "linux/amd64", "syzkaller": str(syzkaller),
+        "kernel_obj": str(tmp_path / "kernel"),
+        "workdir_template": str(tmp_path / "template"),
+        "image": str(assets["vm-image"]), "sshkey": str(key),
+        "vm": {"kernel": str(assets["bzimage"]), "qemu": "/bin/true"},
+    }
+    descriptor = SimpleNamespace(syzkaller_identity=SyzkallerTargetIdentity(
+        syzkaller_commit="a" * 40, patch_series_sha256="b" * 64,
+        build_manifest_sha256="c" * 64, call_table_sha256="d" * 64,
+        target="linux/amd64"))
+    with pytest.raises(PinError, match="does not match its pin"):
+        _manager_assets(manager, manager["vm"], collector, descriptor, builds)
+
+    staged = _staged_manager(manager, collector, files)
+    assert staged["vm"]["kernel"] == str(files["bzimage"])
+    assert staged["image"] == manager["image"]          # not staged
+    links = Path(staged["syzkaller"])
+    assert links.parent == staged_root
+    assert (links / "bin/linux_amd64/syz-executor").resolve() == \
+        files["syz-executor"].resolve()
+    assert _manager_assets(staged, staged["vm"], collector, descriptor,
+                           builds).name == "lane-script"
+    # The same files name the same directory; the base harness is untouched.
+    assert _staged_manager(manager, collector, files)["syzkaller"] == \
+        staged["syzkaller"]
+    assert _staged_manager(manager, collector, assets) == manager
 
 
 def test_malformed_barrier_log_keeps_a_safe_capture_generation():
@@ -519,3 +631,7 @@ def test_direct_qemu_appends_trusted_journal_arguments(tmp_path):
     guest.port = 2222
     argv = guest.qemu_argv()
     assert argv[-2:] == ["-device", "test-device"]
+    assert argv[1:4] == ["-enable-kvm", "-cpu", "host"]
+    guest.config = replace(config, accel="tcg")
+    assert guest.qemu_argv()[1:5] == [
+        "-accel", "tcg,thread=multi", "-cpu", "max"]

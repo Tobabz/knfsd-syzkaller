@@ -36,6 +36,10 @@ Stage 2: Trigger
 
 Stage 2는 Stage 1의 Q1이 증명되기 전에는 시작하지 않는다.
 
+target에 맞는 harness(kernel revision용 build, syzlang, executor, fixture, remote-KCOV 계측, mutation
+capability)가 없으면 pipeline은 멈추지 않는다. Harness Generation(`07` §5)이 필요한 harness를 생성하고 검증한
+뒤 job을 이어 간다. job이 사람을 기다리는 것은 생성이 실패했을 때뿐이다.
+
 ## 2. 전체 흐름
 
 ### 2.1 요소의 종류
@@ -66,7 +70,8 @@ Stage 1 전에는 Controller의 intake/validation만 있다.
 
 2. Harness binding
    Controller는 candidate.kernel_commit용으로 검증된 harness build를 job에 묶는다(§11.2).
-   없으면 HarnessGapIssue를 연결하고 job을 blocked_harness_gap으로 둔다.
+   없으면 HarnessGapIssue를 연결하고 Harness Generation으로 그 commit용 harness를 생성한다(07 §5).
+   생성한 harness가 검증을 통과하면 그것을 묶는다.
 ```
 
 harness가 묶이면 Agent는 Stage 1을 시작한다.
@@ -84,7 +89,7 @@ APPLICATION CONTROLLER
     | validate exact commit/path/location
     | store candidate
     | bind validated harness build for kernel_commit (§11.2)
-    |     none -> HarnessGapIssue -> blocked_harness_gap
+    |     none -> HarnessGapIssue -> Harness Generation (07 §5) -> bind
              =====================================
              STAGE 1 — REACHABILITY HARNESS
              =====================================
@@ -119,15 +124,15 @@ APPLICATION CONTROLLER
               +-- unsupported --> HarnessGapIssue
                                    |
                                    v
-                            blocked_harness_gap
+                         Harness Generation (07 §5)
+                         [AGENT TASK + RUNNER TASK]
                                    |
                                    v
-                         Harness Extension Work
+                         staged capability spec
                                    |
-                                   v
-                         capability spec update
+                                   +----> resume Stage 1
                                    |
-                                   +----> retry Stage 1
+                                   +-- 생성 실패 --> blocked_harness_gap
 
               [supported path]
               |
@@ -372,8 +377,9 @@ ReachabilityHarness
 ```
 
 ReachabilityHarness는 job-local runtime input이다.
-Stage 1은 새 syzlang, pseudo-syscall, kernel instrumentation 또는 repository patch를 생성하지 않는다.
-현재 capability로 candidate에 도달할 수 없으면 `unsupported_by_current_harness`로 남긴다.
+Stage 1 Agent Task는 새 syzlang, pseudo-syscall, kernel instrumentation 또는 repository patch를 직접 만들지 않는다.
+현재 capability로 candidate에 도달할 수 없으면 `unsupported_by_current_harness`로 알리고, 그 capability는
+Harness Generation(`07` §5)이 만든다. job은 생성된 harness로 Stage 1을 이어 간다.
 기존 capability로 표현되는 새 sequence는 gap이 아니며 Agent가 job-local program으로 쓴다(issue #12).
 
 ### 4.6 Q1 판정
@@ -794,6 +800,7 @@ Agent SDK owns
     candidate/path analysis
     reachability planning
     harness-gap reasoning
+    harness generation (staging 영역의 patch set, 07 §5)
     mutation strategy
     semantic mutation intents
     scenario/rule refinement
@@ -824,7 +831,18 @@ Agent SDK does NOT own
              |                     |
              v                     v
     ReachabilityPlan        MutationRuleSet
+
+    Harness Generation Agent   (gap마다, 07 §5)
+             |
+             v
+    harness extension patch set -> Runner 검증 -> staged HCAP
 ```
+
+Harness Generation Agent는 source를 쓰지만 staging 영역에만 쓴다. 다른 Agent와 달리 gap key마다 하나인 git
+worktree에서 파일과 shell 권한을 가지며, 별도 OS 사용자로 돌아 Controller state·artifact store·credential에 닿지
+않고 network 권한은 없다(`07` §5.1). 위 "does NOT own"의 shell command
+authority는 그 workspace 밖의 권한을 말한다. Agent가 workspace에서 돌린 build와 test는 참고일 뿐이고, build PASS,
+검증 판정, staged revision 생성은 Agent 밖(Runner와 Controller)에 있다.
 
 필요해질 때만 kernel-path analyst, NFS protocol analyst, harness analyst 같은 specialist를 추가한다.
 
@@ -987,10 +1005,12 @@ harness binding (Controller)
     +-- 없음
             -> HarnessGapIssue(remote_kcov_attribution,
                    remote_kcov.kernel_revision.<commit>)        (07 §2)
-            -> blocked_harness_gap
+            -> Harness Generation: 계측 series를 kernel_commit에 이식하고 build, bootstrap 검증 (07 §5)
+                   통과 -> staged hcap_revision과 새 build를 job에 묶는다 -> Stage 1
+                   실패 -> blocked_harness_gap (07 §7)
 ```
 
-- intake는 candidate의 source identity만 검증한다(`02` §3). harness가 없다고 candidate를 거부하지 않는다.
+- intake는 candidate의 source identity만 검증한다(`02` §3). harness가 없다고 candidate를 거부하거나 멈추지 않는다.
 - BASE harness로 다른 commit의 candidate를 대신 실행하지 않는다. 그 build의 PC는 candidate commit의 source와
   대응하지 않는다.
 - binding이 Candidate Analysis 앞에 있는 이유는 Candidate Analysis(`03` §8)와 Reachability Planning이 읽는
@@ -998,8 +1018,10 @@ harness binding (Controller)
 - 검증된 harness build란 계측 series를 그 commit에 적용해 build와 bootstrap 검증을 통과했고, 같은 repository
   revision의 HCAP(HCAP-03의 boundary 포함)이 그 계측을 기술하는 build다. JobPolicy가 고른 sanitizer variant의
   build를 묶는다.
-- harness를 다른 kernel revision으로 옮기는 일(`tools/bump-kernel.py`, `tools/fport-apply.sh`)은 사람이 검토하는
-  harness 유지보수이며 candidate마다 자동으로 하지 않는다. 검토 없이 옮긴 계측으로는 Q1을 믿을 수 없다.
+- harness를 다른 kernel revision으로 옮기는 일(`tools/bump-kernel.py`, `tools/fport-apply.sh`)은 Harness
+  Generation이 candidate마다 자동으로 한다. 옮긴 계측의 신뢰는 사람 검토가 아니라 `07` §5.2의 검증(bootstrap,
+  알려진 target의 attribution, 기존 capability 회귀)에서 온다. 검증을 통과하지 못한 이식 build는 묶지 않는다.
+  사람 검토는 promotion(`07` §5.3)과 crash review에서 하며 job을 막지 않는다.
 
 **기록 위치.**
 
@@ -1058,14 +1080,17 @@ Q1 INCONCLUSIVE(unsupported_attribution)
 
 harness binding 실패 (kernel_commit용 검증된 harness build 없음, §11.2)
     -> HarnessGapIssue(remote_kcov_attribution)
-    -> blocked_harness_gap
+    -> Harness Generation (계측 이식, 07 §5)
+    -> staged harness binding -> Stage 1
 
 Reachability Planning unsupported
     -> HarnessGapIssue
-    -> blocked_harness_gap
-    -> Harness Extension Work
-    -> capability spec update
-    -> Stage 1 retry
+    -> Harness Generation (07 §5)
+    -> staged capability spec
+    -> Stage 1 resume
+
+Harness Generation 실패 (budget 소진, infeasible)
+    -> blocked_harness_gap (07 §7)
 
 Stage 2 baseline-with-rules gate (§3)
     Q1 NOT_REACHED
@@ -1095,7 +1120,8 @@ Q2 observed
            hypothesis 단위 결론은 §7.1의 window 집계로 내린다
 ```
 
-gap으로 막힌 job의 상태 전이(`retry_pending`, `parked`, `closed_unsupported`)는 `07` §7이 정한다(issue #13).
+gap을 만난 job의 상태 전이(`harness_generating`, 생성 실패 뒤의 `retry_pending`, `parked`, `closed_unsupported`)는
+`07` §7이 정한다(issue #13).
 위 경로를 job 상태, 전이, repair budget, 재시작 규칙으로 옮긴 상태 기계는 [`09-job-state-graph.md`](09-job-state-graph.md)가
 소유한다. 경로의 의미는 이 절과 각 계약 문서가 소유한다.
 
@@ -1122,16 +1148,17 @@ Post-Crash Phase
 ```
 
 따라서 Stage 1/2 Agent는 vulnerability fix patch를 만들지 않는다.
-현재 harness capability 자체가 부족한 경우에도 campaign 안에서 syzkaller/kernel source patch를 만들어
-즉석에서 기능을 확장하지 않는다. 대신 `HarnessGapIssue`를 생성/연결하고 candidate를
-`blocked_harness_gap`으로 둔다.
+현재 harness capability 자체가 부족한 경우에도 Stage 1/2 Agent가 실행 중인 harness의 source를 즉석에서 바꾸지
+않는다. 대신 `HarnessGapIssue`를 생성/연결하고 Harness Generation(`07` §5)으로 넘긴다.
 
-Harness gap은 별도 Harness Extension Work에서 해결한다. 이 workflow는 syzlang, pseudo-syscall/executor,
-fixture/tool, mutation-engine patch를 만들 수 있다. 해결 후 Harness Capability Specification을 갱신하고
-§11.2의 무효화 규칙에 따라 blocked candidate를 재시도한다.
+Harness Generation은 syzlang, pseudo-syscall/executor, fixture/tool, mutation-engine patch와 remote-KCOV 계측
+patch(계측 series의 kernel revision 이식 포함)를 staging 영역에 만들고, Runner 검증을 통과하면 staged Harness
+Capability Specification을 만든다. Controller는 §11.2의 무효화 규칙에 따라 job을 그 harness에 다시 묶고 막혔던
+지점에서 이어 간다. job은 harness가 없다는 이유로 사람을 기다리지 않는다. 생성이 실패했을 때만
+`blocked_harness_gap`으로 간다.
 
-Linux kernel source observability patch는 pre-crash 자동 대상이 아니다. 필요 시 human-decision issue로
-관리한다.
+Linux kernel source observability patch도 Harness Generation의 대상이다. target kernel의 동작을 바꾸지 않는 계측만
+허용하며, 생성 patch set은 evidence와 crash report에 digest로 남아 promotion 검토와 crash review에서 사람이 본다.
 
 ## 14. 다음 상세 설계 순서
 
@@ -1157,7 +1184,8 @@ Linux kernel source observability patch는 pre-crash 자동 대상이 아니다.
     - log를 자르거나 지운 bundle은 `NOT_OBSERVED`가 아니라 `INCONCLUSIVE`다.
     - complete log, 닫힌 collection window, `runner_stopped`이고 report가 없을 때만 `NOT_OBSERVED`다.
     - profile을 바꾼 재판정은 기존 verdict를 고치지 않고 새 verdict를 만든다.
-12. [`repair/state graph`](09-job-state-graph.md) — draft (2026-10-13). job 상태, 전이, budget, 재시작 규칙
+12. [`repair/state graph`](09-job-state-graph.md) — draft (2026-10-13). job 상태, 전이, budget, 재시작 규칙.
+    gap 경로의 `harness_generating`(§3.2)은 2026-10-25 설계 변경이며 구현 전이다(issue #83)
 13. Agent SDK concrete selection and agent/tool definitions — 선택은
     [`decisions/2026-10-13-agent-implementation-stack.md`](../decisions/2026-10-13-agent-implementation-stack.md)에
     기록했다(PydanticAI). agent/tool definitions는 첫 Stage 1 구현에서 정한다

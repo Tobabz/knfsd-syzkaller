@@ -87,6 +87,8 @@ class FakeHcap:
 
         #: HCAP revisions whose host catalog is corrupt.
         self.corrupt: set[str] = set()
+        #: (plan, HCAP revision) of every compatible-replacement check.
+        self.revalidated: list[tuple[str, str]] = []
 
     def check_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
         if hcap_revision in self.corrupt:
@@ -96,6 +98,7 @@ class FakeHcap:
             (plan_ref, hcap_revision), ()))
 
     def revalidate_plan(self, plan_ref: str, hcap_revision: str) -> HcapCheck:
+        self.revalidated.append((plan_ref, hcap_revision))
         return self.check_plan(plan_ref, hcap_revision)
 
     def judge_versions(self, hcap_revision: str) -> JudgeVersions | None:
@@ -138,6 +141,7 @@ class FakeJudge:
     def __init__(self) -> None:
         self.bundles: dict[str, dict] = {}
         self.missing: set[tuple[str, str]] = set()
+        self.crashes: dict[str, object] = {}
 
     def add(self, bundle: str, harness_id: str, candidate_id: str,
             status: Q1Status, reason: str | None = None,
@@ -167,6 +171,9 @@ class FakeJudge:
             support_boundary_id=versions.support_boundary_id,
             evidence_manifest_sha256=sha("manifest", bundle_ref),
             status=status, reason=reason, gap_signal=gap)
+
+    def crash_report(self, bundle_ref):
+        return self.crashes.get(bundle_ref)
 
     def has_required_evidence(self, bundle_ref, versions) -> bool:
         return (bundle_ref, versions.judge_profile_id) not in self.missing
@@ -335,12 +342,87 @@ class FakeAgents:
         self.requests.append(request)
 
 
+class FakeGenerator:
+    """A Harness Generation Agent that only records its requests."""
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    def start(self, request) -> None:
+        self.requests.append(request)
+
+
+class FakeValidator:
+    """Validation tasks by task_id; a test finishes them with finish()."""
+
+    def __init__(self) -> None:
+        self.tasks: dict[str, object] = {}
+        self.inputs: dict[str, object] = {}
+        self.submitted: list[str] = []
+
+    def submit(self, task_id, task_input):
+        from agent_pipeline.controller.generation import ValidationStatus
+        self.submitted.append(task_id)
+        self.inputs.setdefault(task_id, task_input)
+        return self.tasks.setdefault(task_id,
+                                     ValidationStatus(state="running"))
+
+    def status(self, task_id):
+        from agent_pipeline.controller.generation import ValidationStatus
+        return self.tasks.get(task_id, ValidationStatus(state="unknown"))
+
+    def finish(self, task_id, state, **kw) -> None:
+        from agent_pipeline.controller.generation import ValidationStatus
+        self.tasks[task_id] = ValidationStatus(state=state, **kw)
+
+
 VERSIONS = JudgeVersions(judge_profile_id="jp-1", support_boundary_id="sb-1")
 
 
+class FakeCampaigner(FakeValidator):
+    """Probe campaign tasks by task_id; a test finishes them."""
+
+    def submit(self, task_id, task_input):
+        from agent_pipeline.controller.promotion import CampaignStatus
+        self.submitted.append(task_id)
+        self.inputs.setdefault(task_id, task_input)
+        return self.tasks.setdefault(task_id,
+                                     CampaignStatus(state="running"))
+
+    def status(self, task_id):
+        from agent_pipeline.controller.promotion import CampaignStatus
+        return self.tasks.get(task_id, CampaignStatus(state="unknown"))
+
+    def finish(self, task_id, state, **kw) -> None:
+        from agent_pipeline.controller.promotion import CampaignStatus
+        self.tasks[task_id] = CampaignStatus(state=state, **kw)
+
+
+class FakePromotionInputs:
+    """The capabilities a staged HCAP changed, by its revision; a plan's
+    program, by plan digest; what each registry HCAP carries."""
+
+    def __init__(self) -> None:
+        self.changed: dict[str, tuple[str, ...]] = {}
+        self.plan_programs: dict[str, tuple[str, ...]] = {}
+        #: hcap_revision -> {(capability_id, evidence_ref)}
+        self.carried: dict[str, set] = {}
+
+    def capabilities(self, g):
+        return self.changed.get(g.staged_binding.hcap_revision, ())
+
+    def programs(self, plan_ref):
+        return self.plan_programs.get(plan_ref, (sha("program", plan_ref),))
+
+    def carries(self, binding, capability_id, evidence_ref):
+        return (capability_id, evidence_ref) in \
+            self.carried.get(binding.hcap_revision, set())
+
+
 def binding(execution: str = "build-1", hcap: str = "hcap-1",
-            commit: str = COMMIT) -> HarnessBinding:
-    return HarnessBinding(kernel_commit=commit, sanitizer=Sanitizer.KASAN,
+            commit: str = COMMIT,
+            sanitizer: Sanitizer = Sanitizer.KASAN) -> HarnessBinding:
+    return HarnessBinding(kernel_commit=commit, sanitizer=sanitizer,
                           execution_harness_id=sha(execution),
                           hcap_revision=hcap)
 
@@ -348,7 +430,10 @@ def binding(execution: str = "build-1", hcap: str = "hcap-1",
 def policy(policy_id: str = "p1", **kw) -> JobPolicy:
     values = dict(policy_id=policy_id, sanitizer=Sanitizer.KASAN,
                   approval_required=False, stage1_repair_budget=3,
-                  agent_retry_limit=2, runtime_retry_limit=2)
+                  agent_retry_limit=2, runtime_retry_limit=2,
+                  # The rows a gap takes without Harness Generation; the
+                  # generation tests set a budget.
+                  harness_generation_budget=0)
     values.update(kw)
     return JobPolicy(**values)
 
@@ -376,6 +461,12 @@ class World:
         self.compiler: FakeCompiler | None = None
         #: None: no Stage 2 execution backend is configured.
         self.stage2: FakeStage2 | None = None
+        #: None: no Harness Generation is configured.
+        self.generator: FakeGenerator | None = None
+        self.validator: FakeValidator | None = None
+        #: None: no probe campaign Runner is configured.
+        self.campaigner: FakeCampaigner | None = None
+        self.promotion_inputs = FakePromotionInputs()
         self.issues = InMemoryIssues()
         self.registry = InMemoryRegistry()
         if bound:
@@ -399,7 +490,10 @@ class World:
                           self.issues, self.registry, self.tree,
                           self.artifacts, VERSIONS,
                           clock=lambda: "2026-10-13T00:00:00+00:00",
-                          new_id=self._new_id)
+                          new_id=self._new_id, generator=self.generator,
+                          validator=self.validator,
+                          campaigner=self.campaigner,
+                          promotion_inputs=self.promotion_inputs)
 
     def restart(self) -> Controller:
         # A fresh Controller with the configured default: adopted judge

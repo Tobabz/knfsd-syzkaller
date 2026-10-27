@@ -23,6 +23,7 @@ from ..admission import (
     SyzkallerBuildManifest, SyzkallerCallTable, SyzkallerTargetIdentity,
 )
 from ..data import canonical_json, parse_json
+from ..promotion import CallShapes, GeneratedPrograms
 from ..materializer import (
     PARSER_CALL_NAME, PARSER_REFUSALS, ParsedProgram, SyzParseFailure,
 )
@@ -193,6 +194,57 @@ class PinnedSyzParser:
         if table != self._table:
             raise SyzParseFailure("generated target call table mismatch")
         return table
+
+    def describe(self, calls: list[str]) -> CallShapes:
+        """The pinned target's argument shapes for ``calls`` (#100)."""
+        names = sorted(set(calls))
+        if not names or any(n not in self._call_names for n in names):
+            raise SyzParseFailure("describe takes calls of the pinned table")
+        value = self._invoke("describe", "\n".join(names).encode())
+        try:
+            if set(value) != {"bridge", "call_shapes"}:
+                raise ValueError("invalid describe response")
+            shapes = CallShapes.model_validate_json(
+                canonical_json(value["call_shapes"]))
+            if (shapes.syzkaller_commit != self.identity.syzkaller_commit
+                    or shapes.target != self.identity.target
+                    or [c.call for c in shapes.calls] != names):
+                raise ValueError("inconsistent call shapes")
+            return shapes
+        except (ValueError, TypeError, KeyError, RecursionError) as error:
+            raise SyzParseFailure("invalid call shapes") from error
+
+    def generate(self, *, enabled: list[str], entry: list[str], seed: int,
+                 minimal_per_entry: int = 1, generated: int = 0,
+                 max_calls: int = 8) -> GeneratedPrograms:
+        """Programs for a promotion probe campaign (#100): per entry call a
+        minimal one, and ``generated`` distinct generated and mutated ones
+        over ``enabled`` that each call an entry point."""
+        names = sorted(set(enabled))
+        entries = sorted(set(entry))
+        if (not names or not entries
+                or any(n not in self._call_names for n in names + entries)):
+            raise SyzParseFailure("generate takes calls of the pinned table")
+        value = self._invoke("generate", canonical_json({
+            "schema_version": "syz-generate-request.v1", "seed": seed,
+            "enabled_calls": names, "entry_calls": entries,
+            "minimal_per_entry": minimal_per_entry, "generated": generated,
+            "max_calls": max_calls}))
+        try:
+            if set(value) != {"bridge", "programs"}:
+                raise ValueError("invalid generate response")
+            programs = GeneratedPrograms.model_validate_json(
+                canonical_json(value["programs"]))
+            if (programs.syzkaller_commit != self.identity.syzkaller_commit
+                    or programs.target != self.identity.target
+                    or programs.seed != seed
+                    or len(programs.generated) != generated
+                    or {p.entry_call for p in programs.minimal}
+                    != set(entries)):
+                raise ValueError("inconsistent generated programs")
+            return programs
+        except (ValueError, TypeError, KeyError, RecursionError) as error:
+            raise SyzParseFailure("invalid generated programs") from error
 
     def parse(self, program: bytes, *, identity: SyzkallerTargetIdentity) -> ParsedProgram:
         if identity != self.identity:

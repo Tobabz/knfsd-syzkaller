@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -11,21 +12,24 @@ import pytest
 
 import agent_pipeline.stage2.host as stage2_host
 from agent_pipeline.admission import SyzkallerTargetIdentity
+from agent_pipeline.artifacts import ArtifactStore
+from agent_pipeline.data import put_record
+from agent_pipeline.hcap import HcapCatalog
 from agent_pipeline.contracts import JudgeVersions
 from agent_pipeline.runner.process_supervisor import ProcessLimits
 from agent_pipeline.semantic_promotion import (
     BuildRegistry, CapabilityRegistry, PromotedSemanticCapabilityRegistry,
     PromotedSubset, RegistryLimits, RegistrySchema, SemanticSubset,
-    ValidationItem,
+    ValidationItem, with_semantic_capability,
 )
 from agent_pipeline.stage1.config import EngineConfig, Stage1Config
 from agent_pipeline.stage1.host.collector import CollectorConfig
 from agent_pipeline.stage1.host.pins import pin_file
 from agent_pipeline.stage2.host import (
     KVM_API_VERSION, PreflightError, _ApprovedHarness, _Checks,
-    _check_command, _check_kernel_repo, _check_kvm, _check_manager,
-    _check_policies, _check_runtime, _check_stage2_timeout,
-    _verify_pins_read_only, preflight,
+    _check_accel, _check_command, _check_kernel_repo, _check_kvm,
+    _check_manager, _check_policies, _check_runtime, _check_stage2_timeout,
+    _shared_registry, _verify_pins_read_only, preflight,
 )
 from agent_pipeline.stage2.kvm import stage2_timeout_budget
 
@@ -234,7 +238,9 @@ def _manager_config(tmp_path: Path):
         command_line=("root=/dev/sda", "console=ttyS0", "nokaslr",
                       "nfs.localio_enabled=N"),
         pins=tuple((name, pin_file(name, asset))
-                   for name, asset in assets.items()))
+                   for name, asset in assets.items()),
+        fixtures=frozenset({("koov.nfs_version=4.1", "0"),
+                            ("koov.nfs_fixture=broad-knfsd", "0")}))
     manager = {
         "type": "qemu", "target": "linux/amd64", "procs": 1,
         "workdir_template": str(template),
@@ -282,6 +288,11 @@ def test_manager_config_binds_approved_assets_and_command(tmp_path):
     with pytest.raises(PreflightError, match="approved linux/amd64"):
         _manager_check(path, collector, harnesses, command)
     manager["target"] = "linux/amd64"
+    manager["sandbox"] = "namespace"
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="sandbox must be none"):
+        _manager_check(path, collector, harnesses, command)
+    del manager["sandbox"]
     approved_cmdline = manager["vm"]["cmdline"]
     manager["vm"]["cmdline"] += " sunrpc.lane_attribution=0"
     path.write_text(json.dumps(manager))
@@ -293,6 +304,23 @@ def test_manager_config_binds_approved_assets_and_command(tmp_path):
     path.write_text(json.dumps(manager))
     with pytest.raises(PreflightError, match="approved command line"):
         _manager_check(path, collector, harnesses, command)
+
+
+def test_manager_accelerator_matches_the_collector(tmp_path):
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    tcg = collector.model_copy(update={"accel": "tcg", "exec_slowdown": 10})
+    with pytest.raises(PreflightError, match="collector's tcg"):
+        _manager_check(path, tcg, harnesses, command)
+    manager["vm"]["qemu_args"] = manager["vm"]["qemu_args"].replace(
+        "-enable-kvm", "-accel tcg,thread=multi -cpu max")
+    path.write_text(json.dumps(manager))
+    assert "approved assets" in _manager_check(path, tcg, harnesses, command)
+    with pytest.raises(PreflightError, match="collector's kvm"):
+        _manager_check(path, collector, harnesses, command)
+    assert "TCG" in _check_accel(tcg, tmp_path / "absent-kvm")
+    with pytest.raises(PreflightError, match="unavailable"):
+        _check_accel(collector, tmp_path / "absent-kvm")
 
 
 def test_manager_config_binds_window_lane_script_and_all_proc_journals(
@@ -330,6 +358,64 @@ def test_manager_config_binds_window_lane_script_and_all_proc_journals(
         _manager_check(path, collector, harnesses, command)
 
 
+def test_manager_fixture_is_an_approved_stage2_runtime_selection(tmp_path):
+    # #81 D17: the allowed fixtures are the descriptor's runtime selections.
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    approved_cmdline = manager["vm"]["cmdline"]
+
+    def check(old, new):
+        manager["vm"]["cmdline"] = approved_cmdline.replace(old, new)
+        path.write_text(json.dumps(manager))
+        return _manager_check(path, collector, harnesses, command)
+    assert "approved assets" in check(
+        "koov.nfs_version=4.1", "koov.nfs_fixture=broad-knfsd")
+    assert "approved assets" in check(
+        "koov.nfs_target=1", "koov.nfs_target=1 koov.nfs_trace=0")
+    with pytest.raises(PreflightError, match="koov.nfs_trace=1"):
+        check("koov.nfs_target=1", "koov.nfs_target=1 koov.nfs_trace=1")
+    with pytest.raises(PreflightError, match="no Stage 2 runtime selection"):
+        check("koov.nfs_version=4.1", "koov.nfs_version=4.2")
+    with pytest.raises(PreflightError, match="unapproved dynamic argument"):
+        check("koov.nfs_target=1", "koov.nfs_target=0")
+    with pytest.raises(PreflightError, match="one approved NFS fixture"):
+        check("koov.nfs_version=4.1",
+              "koov.nfs_version=4.1 koov.nfs_fixture=broad-knfsd")
+
+
+def test_nlm_fixture_stays_a_stage1_selection():
+    from agent_pipeline.stage2.host import _stage2_fixtures
+    from .test_materializer import runtime
+    assert _stage2_fixtures((
+        runtime(), runtime(trace_mode="on"),
+        runtime(fixture_mode="broad-knfsd"),
+        runtime(fixture_mode="nlm-knfsd", nfs_version="3",
+                profile="knfsd-v3"))) == {
+        ("koov.nfs_version=4.1", "0"), ("koov.nfs_version=4.1", "1"),
+        ("koov.nfs_fixture=broad-knfsd", "0")}
+
+
+def test_manager_runs_the_variant_whose_kernel_it_boots(tmp_path):
+    # #81 D10: sanitizer variants differ in their kernel only.
+    path, manager, lane, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    (kasan,) = harnesses
+    other = tmp_path / "kcsan"
+    other.mkdir()
+    pins = dict(kasan.pins)
+    for name in ("bzimage", "kernel"):
+        (other / name).write_bytes(f"kcsan {name}\n".encode())
+        pins[name] = pin_file(name, other / name)
+    kcsan = dataclasses.replace(kasan, harness_id="b" * 64,
+                                pins=tuple(pins.items()))
+    assert "approved assets" in _manager_check(
+        path, collector, (kasan, kcsan), command)
+    manager["vm"]["kernel"] = str(other / "bzimage")
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="no approved harness's"):
+        _manager_check(path, collector, (kasan, kcsan), command)
+
+
 def test_promoted_runtime_must_match_every_harness():
     build, promoted = _build()
     assert _check_runtime(Path("/proxy"), (promoted,),
@@ -337,6 +423,25 @@ def test_promoted_runtime_must_match_every_harness():
     other, _ = _build("other")
     with pytest.raises(PreflightError, match="not the promoted"):
         _check_runtime(Path("/proxy"), (promoted,), reader=lambda _: other)
+
+
+def test_a_shared_binding_takes_no_pending_subset(tmp_path):
+    # 03-nfs-proxy/06 §30: a staged pin is only a staged revision's.
+    store = ArtifactStore(tmp_path / "cas")
+    _, promoted = _build()
+
+    def hcap(registry):
+        return with_semantic_capability(
+            HcapCatalog(capabilities=(), missing_capability_ids=()), put_record(store, registry), registry)
+
+    assert _shared_registry(store, hcap(promoted), "a" * 64) == promoted
+    pending = promoted.model_copy(update={"subsets": tuple(
+        s.model_copy(update={"crash_survival": "pending"})
+        for s in promoted.subsets)})
+    with pytest.raises(PreflightError, match="crash survival pending"):
+        _shared_registry(store, hcap(pending), "a" * 64)
+    with pytest.raises(PreflightError, match="no promoted semantic subset"):
+        _shared_registry(store, HcapCatalog(capabilities=(), missing_capability_ids=()), "a" * 64)
 
 
 def test_operator_start_and_placeholder_thresholds_are_warnings():
@@ -348,3 +453,63 @@ def test_operator_start_and_placeholder_thresholds_are_warnings():
     changed = policy(run_stage2=True, fuzz_budget_executions=1234)
     _check_policies((changed,), checks)
     assert all(item.status == "pass" for item in checks.items)
+
+
+def test_manager_stays_inside_the_validated_layouts(tmp_path):
+    # #99: procs above a capability's validated layout refuse its calls
+    # and its runtime features; the manager's other checks still run.
+    from dataclasses import replace
+
+    from agent_pipeline.hcap import HcapCatalog
+    path, manager, _, collector, harnesses, command = \
+        _manager_config(tmp_path)
+    catalog = HcapCatalog.model_validate({
+        "capabilities": (
+            {"id": "CAP-lane", "name": "lane", "purpose": "lane",
+             "usable_stage": ("stage2",), "usable_by": ("agent_stage2",),
+             "interface": {"syz_calls": ("openat$lane",)},
+             "status": "validated", "scope": ("lane",),
+             "validated_layout": {"procs": 2, "lanes": (0, 1)}},
+            {"id": "CAP-observe", "name": "kcov", "purpose": "kcov",
+             "usable_stage": ("stage2",), "usable_by": ("agent_stage2",),
+             "interface": {"runtime_features": ("remote_cover",)},
+             "status": "validated", "scope": ("generation",),
+             "validated_layout": {"procs": 2, "lanes": (0, 1)}},
+            {"id": "CAP-one", "name": "one lane", "purpose": "lane 0",
+             "usable_stage": ("stage2",), "usable_by": ("agent_stage2",),
+             "interface": {"syz_calls": ("syz_lane0_only",)},
+             "status": "validated", "scope": ("lane0",)}),
+        "missing_capability_ids": ()}, strict=False)
+    profile = SimpleNamespace(entries=(
+        SimpleNamespace(call="openat$lane", capability_ids=("CAP-lane",)),
+        SimpleNamespace(call="syz_lane0_only", capability_ids=("CAP-one",))))
+    harnesses = tuple(replace(item, authorities=((catalog, profile),))
+                      for item in harnesses)
+    manager["procs"] = 2
+    manager["vm"]["qemu_args"] += \
+        " -device virtserialport,name=nfsp-journal-1"
+    manager["enable_syscalls"] = ["openat$lane", "close"]
+    path.write_text(json.dumps(manager))
+    assert "2 proc(s)" in _manager_check(path, collector, harnesses, command)
+    manager["enable_syscalls"] = ["openat$lane", "syz_lane0_only"]
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match=r"call_outside_validated_layout:"
+                       r"syz_lane0_only"):
+        _manager_check(path, collector, harnesses, command)
+    # Without enable_syscalls syz-manager enables every call.
+    del manager["enable_syscalls"]
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="syz_lane0_only"):
+        _manager_check(path, collector, harnesses, command)
+    manager["enable_syscalls"] = ["openat$lane"]
+    manager["procs"] = 3
+    manager["vm"]["qemu_args"] += \
+        " -device virtserialport,name=nfsp-journal-2"
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match=r"openat\$lane"):
+        _manager_check(path, collector, harnesses, command)
+    manager["enable_syscalls"] = []
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="runtime_feature_outside_"
+                       "validated_layout:remote_cover"):
+        _manager_check(path, collector, harnesses, command)

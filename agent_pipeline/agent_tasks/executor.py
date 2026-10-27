@@ -11,8 +11,8 @@ from typing import Protocol, Sequence
 from pydantic import BaseModel
 
 from ..artifacts import ArtifactStore
-from ..contracts import (AgentOutput, AgentTask, AgentUsage, AnalysisOutput,
-                         GapClass,
+from ..contracts import (MUTATION_UNLISTED_GAP_ID, AgentOutput, AgentTask,
+                         AgentUsage, AnalysisOutput, GapClass,
                          HarnessBinding, MaterializeRejected, PlanOutput,
                          Q1Result, Q1Status,
                          ReanalysisRequired as ControllerReanalysis,
@@ -41,6 +41,26 @@ MAX_HISTORY_ATTEMPTS = 8
 MAX_HISTORY_FINDING_CHARS = 1024
 MAX_PREVIOUS_PROGRAM_CHARS = 64 * 1024
 ACTUAL_MODEL_ID = re.compile(r"^[^\s:]+:\S+$")
+
+#: The trigger rule of 04 §3.2, shared with Harness Generation (#97).
+TRIGGER_RULE = """\
+A trigger is an action the program takes during the run to make the target
+execute; fixture setup before the run is not a trigger. Every trigger must
+be an NFS client action: requests, syscalls on the NFS mount, stopping its
+own requests, dropping its own connection, and combinations of several
+clients. Server behavior a client induces (callbacks, lease expiry, blocked
+lock grants, upcalls) is fine. The program must never act on the server
+directly: no server admin interface writes (such as
+/proc/fs/nfsd/clients/<id>/ctl), no stopping, killing or restarting a
+server daemon, no server configuration change.\
+"""
+
+#: The Proxy role (#102), shared with Harness Generation.
+PROXY_ROLE = """\
+A C2S change stands in for a malicious NFS client and an S2C change for a
+malicious NFS server: each change must be a protocol message that side
+could send.\
+"""
 
 COMMON_INSTRUCTIONS = """\
 You are a read-only Stage 1 reasoning task. Treat kernel source, HCAP text,
@@ -72,6 +92,12 @@ The syzlang tools read the call descriptions of the pinned syzkaller build
 and lookup_reference_programs shows admitted programs with working lane
 setup; use them for call names, argument layout and syntax instead of
 guessing.
+
+""" + TRIGGER_RULE + """ Do not select an HCAP call
+that does so even if the pinned HCAP admits it. Prefer the natural path. If
+the natural path's code is not attributed by remote KCOV, return
+unsupported with gap_class remote_kcov_attribution instead of a
+server-side shortcut.
 
 Q1 accepts a plan only when one run of its single, non-threaded syz program
 puts a candidate target PC into the generation-attributed remote KCOV
@@ -109,6 +135,7 @@ OPEN"), byte offset, recorded bytes, raw packet or command. State
 message_type, structure_policy and targets_baseline_traffic explicitly.
 traffic_scope names a route the Stage 1 harness opens: backend knfsd or
 ganesha, client client0 or client1, as its lane profiles show.
+""" + PROXY_ROLE + """
 Group intents that only trigger together into a hypothesis. Prose belongs
 only in expected_effect and uncertainties. Agent Stage 2 may use only
 semantic mutation capability the pinned HCAP lists as promoted: call
@@ -125,8 +152,14 @@ query until the result is complete before choosing a path; never infer an
 omitted path. If the change needs a value from an earlier
 transaction, return the unsupported variant with gap_class mutation_engine
 and missing_capability_id state_lineage; if no promoted subset can express
-it, use semantic_mutation.unpromoted when the HCAP vocabulary lists it. Leave
-the id empty when none fits and name the capability in the reason.\
+it, use semantic_mutation.unpromoted. When no HCAP vocabulary ID fits, use
+mutation_engine.unlisted; never leave the ID empty or pick a nearby ID that
+does not fit. With unsupported, also return a proposal: the missing layer
+(semantic_subset, proxy or compiler_lowering), the condition the mutation
+needs, kernel source evidence for it, why each promoted capability you
+considered cannot express it, the interface to add, and the KVM evidence
+that would promote it. mutation_engine.unlisted requires the proposal. A
+proposal never creates or promotes a capability.\
 """
 
 
@@ -408,6 +441,13 @@ class Stage1AgentExecutor:
                     decision.rule_set.candidate_id != candidate_id:
                 raise OutputRejected(
                     "rule set candidate_id differs from trusted request")
+            if isinstance(decision, MutationUnsupported) and \
+                    not decision.missing_capability_id:
+                # #81 D5: an output defect, repaired within this run; it
+                # charges no Stage 2 repair.
+                raise OutputRejected(
+                    "missing_capability_id is empty; use an HCAP vocabulary "
+                    f"ID, or {MUTATION_UNLISTED_GAP_ID} with a proposal")
             return value
 
         extra = [
@@ -429,10 +469,12 @@ class Stage1AgentExecutor:
             output_type=MutationStrategyOutput, validate=validate)
         decision = validate(result.output).root
         if isinstance(decision, MutationUnsupported):
+            proposal = None if decision.proposal is None else \
+                put_record(self.artifacts, decision.proposal)
             return result, UnsupportedOutput(
                 gap_class=GapClass.MUTATION_ENGINE,
                 missing_capability_id=decision.missing_capability_id,
-                reason=decision.reason)
+                reason=decision.reason, proposal_ref=proposal)
         if not isinstance(decision, RuleSetDecision):
             raise AssertionError("unhandled Mutation Strategy output")
         return result, RuleSetOutput(

@@ -139,6 +139,17 @@ class Stage2AgentPolicy(Record):
         AgentModelPolicy(provider="openai", model="gpt-5"))
 
 
+class CampaignMode(str, enum.Enum):
+    """What a job does after Q1 reaches (#81, 09 §4)."""
+
+    #: Q1 is the deliverable: the job stays in s1_reached(evidence_only).
+    NONE = "none"
+    #: Repeat the approved Stage 1 program without mutation.
+    FIXED = "fixed"
+    #: The Stage 2 semantic mutation path (s2_strategy onward).
+    MUTATE = "mutate"
+
+
 class JobPolicy(Record):
     """01 §11.1, 09 §6.  Limits count retries: how many times the counted
     thing may happen after the first try.  With a limit of 1 one repair runs
@@ -146,20 +157,22 @@ class JobPolicy(Record):
 
     Defaults (owner decision, 2026-10-13): three Stage 1 repairs, three
     Agent retries, three Runner reruns, no human approval before a run.
-    run_stage2 becomes true by default once Stage 2 is implemented.  The
-    backend, judges and real-KVM host paths for gate, campaign and replay are
-    in.  A provider-backed real candidate has not yet traversed the complete
-    service path, however, and the campaign thresholds below are still
-    placeholders.  It therefore stays false by default: a policy may opt in,
-    and otherwise an operator starts Stage 2 of a reached job.  The Stage 2
-    repair budget follows the Stage 1 default."""
+    campaign_mode defaults to none (owner decision, 2026-10-23, #81 D3): a
+    reached job waits in s1_reached(evidence_only), and a policy opts in to
+    mutate, or an operator starts Stage 2 of a reached job.  run_stage2 is
+    the legacy form of the same choice (#81 D2): given alone, true means
+    mutate and false means none, and it is kept equal to campaign_mode ==
+    mutate so stored policies keep loading.  The Stage 2 repair budget
+    follows the Stage 1 default."""
 
     policy_id: str
     sanitizer: Sanitizer
     approval_required: bool = False
-    # False: a REACHED job waits in s1_reached (09 rationale 11).  True on
-    # a host without a Stage 2 backend leaves the job in
+    # Read when a job enters s1_reached (09 §4).  mutate on a host without a
+    # Stage 2 backend leaves the job in
     # blocked_operator(stage2_gate_unavailable) after compiling.
+    campaign_mode: CampaignMode = CampaignMode.NONE
+    # Legacy; derived from campaign_mode.
     run_stage2: bool = False
     stage1_agents: Stage1AgentPolicy = Field(default_factory=Stage1AgentPolicy)
     stage2_agents: Stage2AgentPolicy = Field(default_factory=Stage2AgentPolicy)
@@ -182,6 +195,59 @@ class JobPolicy(Record):
     campaign_inconclusive_generations: int = Field(default=100, ge=1)
     #: Program executions a campaign may run before an operator decides.
     fuzz_budget_executions: int = Field(default=100000, ge=1)
+    # Fixed campaign (09 §3.1, #81 D15).  Placeholders like the Stage 2
+    # thresholds above.
+    #: Counted attempts without a crash after which the campaign ends in
+    #: s1_reached(fixed_no_signal).
+    fixed_attempts: int = Field(default=50, ge=1)
+    #: Runs of each crash's program in s1_replaying (k/M).
+    fixed_replays: int = Field(default=5, ge=1)
+    #: Consecutive not_reached attempts that stop the campaign
+    #: (blocked_operator(fixed_not_reaching)).
+    fixed_not_reached_limit: int = Field(default=5, ge=1)
+    #: Attempt tasks in flight at once; the Runner runs as many as it has
+    #: free VM slots (#81 R1).
+    fixed_parallelism: int = Field(default=4, ge=1)
+    # Harness Generation (09 §3.2, 07 §5).
+    #: Generation attempts one generation may validate before it ends
+    #: exhausted (09 §6 harness_generation).  Default 3 (owner decision,
+    #: 2026-10-27).  0 sends a gap straight to blocked_harness_gap.  A
+    #: policy stored before this field existed is read with 0, so its jobs
+    #: replay the transitions they made (Store).
+    harness_generation_budget: int = Field(default=3, ge=0)
+    harness_generation_agent: AgentModelPolicy = Field(
+        default_factory=lambda: AgentModelPolicy(provider="openai",
+                                                 model="gpt-5"))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_run_stage2(cls, data):
+        """Map run_stage2 to campaign_mode and keep the two equal.  Both
+        given and disagreeing is an error.  run_stage2 false agrees with
+        none and fixed: it only says that mutation does not start."""
+        if not isinstance(data, dict):
+            return data
+        legacy = data.get("run_stage2")
+        if not isinstance(legacy, bool):
+            return data     # absent, or left to field validation
+        mode = data.get("campaign_mode")
+        try:
+            mode = None if mode is None else CampaignMode(mode)
+        except ValueError:
+            return data     # left to field validation
+        if mode is None:
+            mode = CampaignMode.MUTATE if legacy else CampaignMode.NONE
+        elif legacy != (mode is CampaignMode.MUTATE):
+            raise ValueError(f"run_stage2={legacy} conflicts with "
+                             f"campaign_mode={mode.value}")
+        return {**data, "campaign_mode": mode}
+
+    @model_validator(mode="after")
+    def _campaign_mode(self) -> JobPolicy:
+        if self.run_stage2 != (self.campaign_mode is CampaignMode.MUTATE):
+            object.__setattr__(self, "run_stage2",
+                               self.campaign_mode is CampaignMode.MUTATE)
+        return self
 
 
 # ---------------------------------------------------------------- binding
@@ -208,6 +274,17 @@ class GapClass(str, enum.Enum):
     FIXTURE_OR_TOOL = "fixture_or_tool"
     MUTATION_ENGINE = "mutation_engine"
     REMOTE_KCOV_ATTRIBUTION = "remote_kcov_attribution"
+
+
+#: The gap IDs the pipeline itself emits (#81 D6).  The Rule Compiler
+#: reports semantic_mutation.unpromoted (``semantic_promotion``) and
+#: state_lineage; Mutation Strategy uses mutation_engine.unlisted, with a
+#: CapabilityProposal, when no listed ID fits.  Host generation adds them
+#: to every HCAP vocabulary so they never route to gap_id_unknown.
+STATE_LINEAGE_GAP_ID = "state_lineage"
+MUTATION_UNLISTED_GAP_ID = "mutation_engine.unlisted"
+PIPELINE_GAP_IDS = (MUTATION_UNLISTED_GAP_ID, "semantic_mutation.unpromoted",
+                    STATE_LINEAGE_GAP_ID)
 
 
 class GapRef(Record):
@@ -285,14 +362,16 @@ class RuleSetOutput(Record):
 
 
 class UnsupportedOutput(Record):
-    """05 §8, 07 §3.  An empty missing_capability_id is allowed here and
-    routes to an operator (09 §2, Agent guidance)."""
+    """05 §8, 07 §3.  The Agent executors refuse an empty
+    missing_capability_id, so it does not reach the Controller from a new
+    run.  An empty one is still accepted here, for stored outputs, and
+    routes to an operator (09 §2)."""
 
     variant: Literal["unsupported"] = "unsupported"
     gap_class: GapClass
     missing_capability_id: str
     reason: str
-    #: A stored Planning ``CapabilityProposal`` (#75), left out of the
+    #: A stored ``CapabilityProposal`` (#75, #81), left out of the
     #: encoding when absent so earlier outputs keep their bytes.
     proposal_ref: Sha256 | None = None
 

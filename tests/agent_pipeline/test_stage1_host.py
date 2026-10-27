@@ -9,6 +9,7 @@ the model responses and the syzkaller parser.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -21,14 +22,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from agent_pipeline.admission import (BuildFile, SyzkallerBuildManifest,
                                       SyzkallerCallTable,
                                       SyzkallerTargetIdentity)
 from agent_pipeline.artifacts import ArtifactStore
-from agent_pipeline.contracts import (CandidateSubmission, LocationKind,
-                                      LocationRequest, Q1Status)
+from agent_pipeline.contracts import (PIPELINE_GAP_IDS, CandidateSubmission,
+                                      LocationKind, LocationRequest, Q1Status,
+                                      Sanitizer)
 from agent_pipeline.controller.records import JobState
+from agent_pipeline.crash import CRASH_REPORT_TYPE, CrashKind, CrashReport
 from agent_pipeline.data import canonical_json, load_record
 from agent_pipeline.q1 import (KernelIdentity, RemoteKcovObservation,
                                TargetPcMapping)
@@ -37,12 +41,16 @@ from agent_pipeline.stage1.cli import STOP_STATES, open_stage1
 from agent_pipeline.stage1.config import EngineConfig, Stage1Config
 from agent_pipeline.stage1.host import kcov
 from agent_pipeline.stage1.host.__main__ import main as host_main
+import agent_pipeline.stage1.host.generate as generate_module
+from agent_pipeline.hcap import (STAGE1_LAYOUT, Capability, CapabilityContract,
+                                 ExecutionLayout, GapContract, HcapCatalog)
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
 from agent_pipeline.stage1.host.generate import (GenerationError,
+                                                 capability_baseline_sha256,
                                                  HCAP11_RECOVERY_ORDER,
-                                                 Hcap11KvmEvidence, Hcap12KvmEvidence,
+                                                 Hcap11KvmEvidence,
                                                  Hcap13KvmEvidence,
                                                  generate,
                                                  series_fingerprint)
@@ -164,7 +172,7 @@ def _write_syz_record(env: Path, **override) -> None:
 
 
 @pytest.fixture
-def host(tmp_path):
+def host(tmp_path, monkeypatch):
     """A bootstrap env, a parser bundle and a host spec over them."""
     env = tmp_path / "env"
     linux = env / "linux"
@@ -232,7 +240,9 @@ def host(tmp_path):
     }
     path = tmp_path / "host-spec.json"
     path.write_text(json.dumps(spec, indent=1))
-    return SimpleNamespace(root=tmp_path, spec=path, env=env,
+    # The synthetic capabilities stand for ones promoted before #100.
+    _mark_legacy(monkeypatch, spec)
+    return SimpleNamespace(root=tmp_path, spec=path, env=env, monkeypatch=monkeypatch,
                            kernel_commit=kernel_commit, identity=identity,
                            selection=selection)
 
@@ -284,8 +294,6 @@ def test_cover_pcs_and_lane_state():
                               "owner 1")
     assert not kcov.lane_state_ok("lane_id 0 lane_epoch 1 valid 0 "
                                   "unhealthy 0 owner 1")
-    assert kcov.fatal_dmesg("ok\nKASAN: use-after-free\nBUG: KCSAN: race") \
-        == ["KASAN: use-after-free"]
 
 
 def test_objdump_and_addr2line_parsing():
@@ -358,7 +366,9 @@ def test_generate_pins_files_and_writes_consistent_configs(host):
 
 
 @needs_gcc
-def test_generate_binds_declared_capability_evidence(host):
+def test_generate_refuses_untyped_capability_evidence(host):
+    # #100: evidence without a typed model promotes no capability, whoever
+    # wrote it.
     evidence = host.root / "capability-evidence.json"
     evidence.write_text(
         '{"schema_version":"test-evidence.v1","result":"pass"}\n')
@@ -366,16 +376,28 @@ def test_generate_binds_declared_capability_evidence(host):
     spec["capability_evidence"] = {
         "CAP-lane": ["capability-evidence.json"]}
     host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="no typed evidence model"):
+        generate(host.spec)
 
+
+@needs_gcc
+def test_generated_hcap_lists_the_pipeline_gap_ids(host):
+    # #81 D6: the spec lists none, the generated revision has all three.
     result = generate(host.spec)
-    store = ArtifactStore(host.root / "cas")
     from agent_pipeline.hcap import ArtifactHcapChecker
-    capability = next(
-        item for item in ArtifactHcapChecker(store).load_catalog(
-            result.hcap_revision).capabilities
-        if item.id == "CAP-lane")
-    assert len(capability.evidence_refs) == 1
-    assert store.get(capability.evidence_refs[0]) == evidence.read_bytes()
+    catalog = ArtifactHcapChecker(ArtifactStore(host.root / "cas")) \
+        .load_catalog(result.hcap_revision)
+    assert set(catalog.missing_capability_ids) == set(PIPELINE_GAP_IDS)
+
+
+def test_generate_refuses_a_mutate_policy(host):
+    # #81 D16: generation configures no Stage 2 backend yet.
+    spec = json.loads(host.spec.read_text())
+    spec["policies"] = [policy(campaign_mode="mutate").model_dump(
+        mode="json")]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="campaign_mode mutate"):
+        generate(host.spec)
 
 
 @needs_gcc
@@ -397,36 +419,7 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         instrumentation_sha256=builds["instrumentation"],
         vmlinux_sha256=builds["kernel"],
         kaslr_enabled=False, kaslr_offset=0)
-    evidence_value = {
-        "schema_version": "hcap-kvm-evidence.v1",
-        "capability_id": "HCAP-11",
-        "observed_at": "2026-10-19",
-        "scenario": "v41-client-expiry",
-        "execution_harness_id": initial.execution_harness_id,
-        "mapping_identity": identity.model_dump(mode="json"),
-        "target_mapping_sha256": "a" * 64,
-        "campaign_result_sha256": "b" * 64,
-        "guest_lane_script_sha256": lane_pin.sha256,
-        "guest_nfs_proxy_sha256": "c" * 64,
-        "runs": {
-            "control": {"completed": 1, "target_hit_counts": [0]},
-            "stimulus": {"completed": 1, "target_hit_counts": [1]},
-        },
-        "generation_contract": {
-            "generation_begin_each": 1,
-            "aggregate_published_each": 1,
-            "generation_aborted_each": 0,
-            "scratch_overflow_each": 0,
-            "merge_truncation_each": 0,
-            "outstanding_tokens_after_each": 0,
-            "remote_refs_after_each": 0,
-            "minimum_remote_start_ok": 1,
-        },
-        "recovery_order": list(HCAP11_RECOVERY_ORDER),
-        "crash_signature_count": 0,
-        "raw_artifact_error_count": 0,
-        "shareable_result_contains_target_metadata_or_addresses": False,
-    }
+    evidence_value = _hcap11_evidence(identity, lane_pin.sha256)
     evidence = host.root / "hcap11-evidence.json"
     evidence.write_text(json.dumps(evidence_value))
     spec = json.loads(host.spec.read_text())
@@ -437,6 +430,7 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         "status": "validated", "scope": ["client0_recovery"],
     })
     spec["capability_evidence"] = {"HCAP-11": [evidence.name]}
+    _mark_legacy(host.monkeypatch, spec)
     host.spec.write_text(json.dumps(spec, indent=1))
 
     result = generate(host.spec)
@@ -460,43 +454,17 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         generate(host.spec)
 
 
-def _hcap12_run(completed=3, *, create=1, error=0, wait=0, **broker):
-    counters = dict.fromkeys((
-        "reconnect_ok", "reconnect_fail", "down_ok", "down_fail",
-        "daemon_stop_fail", "daemon_start_fail", "refused_busy",
-        "refused_identity", "restore_ok", "restore_fail"), 0)
-    counters.update(broker)
-    return {
-        "completed": completed,
-        "probe_hits": {"cld_create": [create] * completed,
-                       "cld_create_error": [error] * completed,
-                       "pipe_wait_for_open": [wait] * completed},
-        "broker": counters,
-        "status_checks_passed": completed,
-        "attributed_generations": completed,
-    }
-
-
-def _hcap12_evidence(identity, lane_sha256):
+def _kvm_evidence(identity, lane_sha256):
+    """Fields every typed KVM campaign evidence record shares."""
     return {
         "schema_version": "hcap-kvm-evidence.v1",
-        "capability_id": "HCAP-12",
         "observed_at": "2026-10-20",
-        "scenario": "v41-cld-lifecycle",
         "execution_harness_id": identity.execution_harness_id,
         "mapping_identity": identity.model_dump(mode="json"),
-        "probe_mapping_sha256": {"cld_create": "1" * 64,
-                                 "cld_create_error": "2" * 64,
-                                 "pipe_wait_for_open": "3" * 64},
         "campaign_result_sha256": "b" * 64,
         "guest_lane_script_sha256": lane_sha256,
         "guest_nfs_proxy_sha256": "c" * 64,
-        "runs": {
-            "control": _hcap12_run(create=0),
-            "normal": _hcap12_run(),
-            "reconnect": _hcap12_run(wait=1, reconnect_ok=3),
-            "daemon_down": _hcap12_run(create=1, error=1, wait=1, down_ok=3),
-        },
+        "layout": {"procs": 1, "lanes": [0]},
         "generation_contract": {
             "generation_begin_each": 1,
             "aggregate_published_each": 1,
@@ -513,107 +481,10 @@ def _hcap12_evidence(identity, lane_sha256):
     }
 
 
-HCAP12_IDENTITY = KernelIdentity(
+EVIDENCE_IDENTITY = KernelIdentity(
     execution_harness_id="d" * 64, kernel_commit="e" * 40,
     instrumentation_sha256="f" * 64, vmlinux_sha256="9" * 64,
     kaslr_enabled=False, kaslr_offset=0)
-
-
-def test_hcap12_evidence_accepts_the_validated_campaign_shape():
-    evidence = Hcap12KvmEvidence.model_validate(
-        _hcap12_evidence(HCAP12_IDENTITY, "8" * 64))
-    assert evidence.runs.reconnect.broker.reconnect_ok == 3
-
-
-@pytest.mark.parametrize(("path", "value", "message"), [
-    (("runs", "control", "probe_hits", "cld_create"), [0, 1, 0],
-     "control run reached a CLD probe"),
-    (("runs", "normal", "probe_hits", "cld_create"), [1, 0, 1],
-     "normal run missed the CLD create upcall"),
-    (("runs", "normal", "probe_hits", "pipe_wait_for_open"), [0, 0, 1],
-     "normal run queued without a pipe reader"),
-    (("runs", "reconnect", "probe_hits", "pipe_wait_for_open"), [1, 0, 1],
-     "reconnect run missed the reader-loss requeue"),
-    (("runs", "reconnect", "probe_hits", "cld_create_error"), [0, 1, 0],
-     "reconnect run reached the create error path"),
-    (("runs", "reconnect", "broker", "reconnect_ok"), 2,
-     "reconnect broker transactions differ"),
-    (("runs", "reconnect", "broker", "restore_ok"), 1,
-     "failed or refused transaction"),
-    (("runs", "daemon_down", "broker", "down_ok"), 2,
-     "daemon-down broker transactions differ"),
-    (("runs", "normal", "broker", "reconnect_ok"), 1,
-     "normal run invoked the nfsdcld broker"),
-    (("runs", "control", "broker", "refused_busy"), 1,
-     "failed or refused transaction"),
-    (("runs", "normal", "status_checks_passed"), 2,
-     "left the lane fixture unhealthy"),
-    (("runs", "reconnect", "attributed_generations"), 2,
-     "lacks one attributed generation"),
-    (("runs", "normal", "completed"), 2, "greater than or equal to 3"),
-    (("probe_mapping_sha256",), {"cld_create": "1" * 64},
-     "probe mappings differ"),
-    (("crash_signature_count",), 1, "crash or artifact error"),
-    (("shareable_result_contains_target_metadata_or_addresses",), True,
-     "private target data"),
-    (("capability_id",), "HCAP-11", "HCAP-12"),
-])
-def test_hcap12_evidence_rejects_unvalidated_campaigns(path, value, message):
-    evidence = _hcap12_evidence(HCAP12_IDENTITY, "8" * 64)
-    target = evidence
-    for key in path[:-1]:
-        target = target[key]
-    target[path[-1]] = value
-    with pytest.raises(ValueError, match=message):
-        Hcap12KvmEvidence.model_validate(evidence)
-
-
-@needs_gcc
-def test_hcap12_evidence_is_bound_to_generated_harness(host):
-    initial = generate(host.spec)
-    config = Stage1Config.load(initial.stage1_config)
-    store = ArtifactStore(config.artifact_root)
-    from agent_pipeline.materializer import ExecutionHarnessApproval
-    from agent_pipeline.stage1.host.pins import HostFilePin
-    descriptor = load_record(store, config.execution_harness_approvals[0],
-                             ExecutionHarnessApproval).descriptor
-    builds = {item.name: item.artifact_ref
-              for item in descriptor.build_artifacts}
-    lane_pin = load_record(store, builds["lane-script"], HostFilePin)
-    identity = KernelIdentity(
-        execution_harness_id=initial.execution_harness_id,
-        kernel_commit=descriptor.kernel_commit,
-        instrumentation_sha256=builds["instrumentation"],
-        vmlinux_sha256=builds["kernel"],
-        kaslr_enabled=False, kaslr_offset=0)
-    value = _hcap12_evidence(identity, lane_pin.sha256)
-    evidence = host.root / "hcap12-evidence.json"
-    evidence.write_text(json.dumps(value))
-    spec = json.loads(host.spec.read_text())
-    spec["capabilities"].append({
-        "id": "HCAP-12", "name": "cld", "purpose": "test binding",
-        "usable_stage": ["stage1"], "usable_by": ["agent_stage1"],
-        "interface": {"runtime_features": ["cld_reconnect"]},
-        "status": "validated", "scope": ["client0_recovery_cld_reconnect"],
-    })
-    spec["capability_evidence"] = {"HCAP-12": [evidence.name]}
-    host.spec.write_text(json.dumps(spec, indent=1))
-    result = generate(host.spec)
-    from agent_pipeline.hcap import HcapCatalog
-    catalog = load_record(store, result.hcap_revision, HcapCatalog)
-    cld = next(item for item in catalog.capabilities if item.id == "HCAP-12")
-    assert len(cld.evidence_refs) == 1
-
-    value["guest_lane_script_sha256"] = "7" * 64
-    evidence.write_text(json.dumps(value))
-    with pytest.raises(GenerationError, match="HCAP-12 evidence names "
-                       "another guest lane script"):
-        generate(host.spec)
-    value["guest_lane_script_sha256"] = lane_pin.sha256
-    value["runs"]["reconnect"]["probe_hits"]["pipe_wait_for_open"] = [0] * 3
-    evidence.write_text(json.dumps(value))
-    with pytest.raises(GenerationError, match="invalid HCAP-12 KVM evidence"):
-        generate(host.spec)
 
 
 def test_template_spec_is_valid():
@@ -628,9 +499,10 @@ def test_template_spec_is_valid():
         assert set(selection.enabled_interfaces) - {"remote_cover"} <= calls
     lifecycle = next(c for c in spec.capabilities if c.id == "HCAP-11")
     assert lifecycle.status == "validated"
-    assert lifecycle.scope == ("client0_confirmed_expiry_recovery",)
+    assert lifecycle.scope == ("client0_courtesy_expiry_recovery",)
     assert lifecycle.interface.syz_calls == (
-        "syz_nfsd_client_ctl$expire_client0",)
+        "syz_nfs_lane_link$heal_client0",
+        "syz_nfs_lane_link$partition_client0", "syz_open_nlm_lane_file")
     assert spec.capability_evidence["HCAP-11"] == (
         Path("capability-evidence/hcap11-kvm.json"),)
     evidence_path = template / spec.capability_evidence["HCAP-11"][0]
@@ -641,47 +513,49 @@ def test_template_spec_is_valid():
     assert evidence.shareable_result_contains_target_metadata_or_addresses is False
     assert not {"target_pcs", "candidate_id", "path", "symbol"} & set(
         evidence_json)
-    assert any("syz_nfsd_client_ctl$expire_client0(0x0)" in item
-               for item in lifecycle.constraints)
-    expiry = next(e for e in spec.admission_source.entries
-                  if e.call == "syz_nfsd_client_ctl$expire_client0")
-    assert expiry.capability_ids == ("HCAP-11",)
-    assert all("syz_nfsd_client_ctl$expire_client1" not in
-               selection.enabled_interfaces
-               for selection in spec.runtime_selections)
-
-    # HCAP-12 is promoted only by typed KVM evidence for exactly this
-    # harness: until capability-evidence/hcap12-kvm.json exists, generate()
-    # refuses the template, so the reconnect call is never admitted early.
-    cld = next(c for c in spec.capabilities if c.id == "HCAP-12")
-    assert cld.interface.syz_calls == ("syz_nfsd_cld_ctl$reconnect",)
-    assert cld.scope == ("client0_recovery_cld_reconnect",)
-    assert spec.capability_evidence["HCAP-12"] == (
-        Path("capability-evidence/hcap12-kvm.json"),)
-    cld_evidence = template / spec.capability_evidence["HCAP-12"][0]
-    if cld_evidence.is_file():
-        evidence_json = json.loads(cld_evidence.read_text())
-        assert Hcap12KvmEvidence.model_validate(
-            evidence_json).capability_id == "HCAP-12"
-        assert not {"target_pcs", "candidate_id", "path", "symbol"} & set(
-            evidence_json)
-    reconnect = next(e for e in spec.admission_source.entries
-                     if e.call == "syz_nfsd_cld_ctl$reconnect")
-    assert reconnect.capability_ids == ("HCAP-12",)
-    assert all(not e.call.startswith("syz_nfsd_cld_ctl$daemon_down")
+    assert evidence.scenario == "v41-courtesy-expiry"
+    # #96: the server admin expiry is not an NFS client action, so nothing
+    # admits or enables syz_nfsd_client_ctl; the partition is client0's own
+    # link and only HCAP-11 admits it.
+    assert all(not e.call.startswith("syz_nfsd_client_ctl$")
                for e in spec.admission_source.entries)
-    assert all("syz_nfsd_cld_ctl$daemon_down" not in
-               selection.enabled_interfaces
-               for selection in spec.runtime_selections)
-    # The HCAP-11 selection is unchanged; reconnect has its own selection.
+    assert all(not call.startswith("syz_nfsd_client_ctl$")
+               for selection in spec.runtime_selections
+               for call in selection.enabled_interfaces)
+    for call in ("syz_nfs_lane_link$heal_client0",
+                 "syz_nfs_lane_link$partition_client0"):
+        entry = next(e for e in spec.admission_source.entries
+                     if e.call == call)
+        assert entry.capability_ids == ("HCAP-11",)
+
+    # HCAP-12 (nfsdcld reconnect) was withdrawn (#98): stopping a server
+    # daemon is not an NFS client action, so nothing admits nfsdcld control.
+    assert all(c.id != "HCAP-12" for c in spec.capabilities)
+    assert "HCAP-12" not in spec.capability_evidence
+    assert all(not e.call.startswith("syz_nfsd_cld_ctl$")
+               for e in spec.admission_source.entries)
+    assert all(not call.startswith("syz_nfsd_cld_ctl$")
+               for selection in spec.runtime_selections
+               for call in selection.enabled_interfaces)
+
+    # #99: every capability is validated on Stage 1's single lane until
+    # lane-topology evidence widens it; Stage 2 inherits HCAP-04's layout.
+    for capability in spec.capabilities:
+        assert capability.layout() == STAGE1_LAYOUT
+    assert evidence.layout == STAGE1_LAYOUT
+    assert spec.stage2 is not None and spec.stage2.procs is None
+
+    # #100: the criteria judge new and revised capabilities; the template's
+    # are all unchanged legacy entries.
+    assert generate_module.promoted_by_criteria(spec) == ()
+    live = HostSpec.model_validate_json(
+        (REPO / "stage1-host-live/host-spec.json").read_bytes())
+    assert generate_module.promoted_by_criteria(live) == ()
+    assert all(not call.startswith("syz_nfsd_cld_ctl$")
+               for item in spec.neutral_controls
+               for call in item.runtime_selection.enabled_interfaces)
     v41 = [s for s in spec.runtime_selections if s.profile == "knfsd-v41"]
-    with_cld = [s for s in v41
-                if "syz_nfsd_cld_ctl$reconnect" in s.enabled_interfaces]
-    without = [s for s in v41
-               if "syz_nfsd_cld_ctl$reconnect" not in s.enabled_interfaces]
-    assert len(with_cld) == len(without) == 1
-    assert set(with_cld[0].enabled_interfaces) - set(
-        without[0].enabled_interfaces) == {"syz_nfsd_cld_ctl$reconnect"}
+    assert len(v41) == 1
     assert "remote_kcov.context.cld" in spec.missing_capability_ids
 
     # HCAP-13 has its own nlm-knfsd NFSv3 selection, a neutral control on
@@ -704,7 +578,10 @@ def test_template_spec_is_valid():
                for item in spec.neutral_controls)
     entries = {e.call: e for e in spec.admission_source.entries}
     for call in nlm.interface.syz_calls:
-        assert entries[call].capability_ids == ("HCAP-13",)
+        # HCAP-11's delegation open shares the NLM lane file open.
+        want = (("HCAP-11", "HCAP-13") if call == "syz_open_nlm_lane_file"
+                else ("HCAP-13",))
+        assert entries[call].capability_ids == want
     lock = entries["fcntl$lock"]
     assert [(c.kind, getattr(c, "minimum", None), getattr(c, "maximum", None))
             for c in lock.resource_constraints] == [
@@ -731,7 +608,7 @@ def _hcap13_run(completed=3, **hits):
 
 
 def _hcap13_evidence(identity, lane_sha256):
-    value = _hcap12_evidence(identity, lane_sha256)
+    value = _kvm_evidence(identity, lane_sha256)
     value.update({
         "capability_id": "HCAP-13",
         "scenario": "v3-nlm-lock",
@@ -751,9 +628,80 @@ def _hcap13_evidence(identity, lane_sha256):
     return value
 
 
+def _hcap11_run(completed=3, **hits):
+    probes = dict.fromkeys(("break_deleg", "create_session",
+                            "exchange_id"), 0)
+    probes.update(hits)
+    return {
+        "completed": completed,
+        "probe_hits": {name: [count] * completed
+                       for name, count in probes.items()},
+        "status_checks_passed": completed,
+        "attributed_generations": completed,
+    }
+
+
+def _hcap11_evidence(identity, lane_sha256):
+    value = _kvm_evidence(identity, lane_sha256)
+    value.update({
+        "capability_id": "HCAP-11",
+        "scenario": "v41-courtesy-expiry",
+        "probe_mapping_sha256": {name: "1" * 64 for name in (
+            "break_deleg", "create_session", "exchange_id")},
+        "nfsv4_lease_time_s": 10,
+        "partition_hold_s": 15,
+        "runs": {
+            "control": _hcap11_run(),
+            "stimulus": _hcap11_run(create_session=3, exchange_id=5,
+                                    break_deleg=2),
+        },
+        "recovery_order": list(HCAP11_RECOVERY_ORDER),
+    })
+    return value
+
+
+def test_hcap11_evidence_accepts_the_validated_campaign_shape():
+    evidence = Hcap11KvmEvidence.model_validate(
+        _hcap11_evidence(EVIDENCE_IDENTITY, "8" * 64))
+    assert evidence.runs.stimulus.probe_hits.break_deleg == (2, 2, 2)
+
+
+@pytest.mark.parametrize(("path", "value", "message"), [
+    (("runs", "control", "probe_hits", "exchange_id"), [0, 1, 0],
+     "control run reached an HCAP-11 probe"),
+    (("runs", "stimulus", "probe_hits", "break_deleg"), [2, 0, 2],
+     "stimulus run missed break_deleg"),
+    (("runs", "stimulus", "probe_hits", "create_session"), [0, 3, 3],
+     "stimulus run missed create_session"),
+    (("runs", "stimulus", "status_checks_passed"), 2,
+     "left the lane fixture unhealthy"),
+    (("runs", "control", "attributed_generations"), 2,
+     "lacks one attributed generation"),
+    (("runs", "stimulus", "completed"), 2, "greater than or equal to 3"),
+    (("probe_mapping_sha256",), {"exchange_id": "1" * 64},
+     "probe mappings differ"),
+    (("recovery_order",), ["nfsd_clid_admin_expired"],
+     "recovery order differs"),
+    (("partition_hold_s",), 5, "15"),
+    (("nfsv4_lease_time_s",), 90, "10"),
+    (("scenario",), "v41-client-expiry", "v41-courtesy-expiry"),
+    (("crash_signature_count",), 1, "crash or artifact error"),
+    (("shareable_result_contains_target_metadata_or_addresses",), True,
+     "private target data"),
+])
+def test_hcap11_evidence_rejects_unvalidated_campaigns(path, value, message):
+    evidence = _hcap11_evidence(EVIDENCE_IDENTITY, "8" * 64)
+    target = evidence
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=message):
+        Hcap11KvmEvidence.model_validate(evidence)
+
+
 def test_hcap13_evidence_accepts_the_validated_campaign_shape():
     evidence = Hcap13KvmEvidence.model_validate(
-        _hcap13_evidence(HCAP12_IDENTITY, "8" * 64))
+        _hcap13_evidence(EVIDENCE_IDENTITY, "8" * 64))
     assert evidence.runs.blocked.probe_hits.clnt_grant == (1, 1, 1)
 
 
@@ -789,7 +737,7 @@ def test_hcap13_evidence_accepts_the_validated_campaign_shape():
     (("scenario",), "v41-cld-lifecycle", "v3-nlm-lock"),
 ])
 def test_hcap13_evidence_rejects_unvalidated_campaigns(path, value, message):
-    evidence = _hcap13_evidence(HCAP12_IDENTITY, "8" * 64)
+    evidence = _hcap13_evidence(EVIDENCE_IDENTITY, "8" * 64)
     target = evidence
     for key in path[:-1]:
         target = target[key]
@@ -849,11 +797,12 @@ def test_series_fingerprint_is_the_bootstrap_record_digest():
 
 # ------------------------------------------------------------ collector
 
-def _inputs(tmp: Path, config: Stage1Config, harness_selection) -> Path:
+def _inputs(tmp: Path, config: Stage1Config, harness_selection,
+            approval: int = 0) -> Path:
     """An engine-shaped input directory for one lease."""
     from agent_pipeline.materializer import ExecutionHarnessApproval
     store = ArtifactStore(config.artifact_root)
-    approval = load_record(store, config.execution_harness_approvals[0],
+    approval = load_record(store, config.execution_harness_approvals[approval],
                            ExecutionHarnessApproval)
     from agent_pipeline.materializer import descriptor_id
     harness_id = descriptor_id(approval.descriptor)
@@ -887,11 +836,11 @@ def _inputs(tmp: Path, config: Stage1Config, harness_selection) -> Path:
     return inp
 
 
-def _collect(host, tmp, **fake):
+def _collect(host, tmp, approval=0, **fake):
     result = generate(host.spec)
     config = Stage1Config.load(result.stage1_config)
     collector = CollectorConfig.load(result.collector_config)
-    inp = _inputs(tmp, config, host.selection)
+    inp = _inputs(tmp, config, host.selection, approval)
     out = tmp / "output"
     out.mkdir()
     guests = []
@@ -906,6 +855,22 @@ def _collect(host, tmp, **fake):
     return SimpleNamespace(out=out, observation=observation, guest=guests[0],
                            capture=json.loads((out / "capture.json")
                                               .read_text()))
+
+
+def test_partition_programs_get_a_raised_program_budget():
+    from agent_pipeline.stage1.host.collector import (execprog_argv,
+                                                      program_timeout_s)
+    partition = (b"r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)\n"
+                 b"syz_nfs_lane_link$partition_client0(0x0, 0x0)\n")
+    assert program_timeout_s(b"getdents64(r0, 0x0, 0x0)\n") is None
+    assert program_timeout_s(partition) == 90
+    # syzkaller scales its program budget by min(slowdown, 3).
+    assert program_timeout_s(partition, 10) == 270
+    argv = execprog_argv(600, 10, program_timeout_s(partition, 10))
+    assert "-program-timeout=270s /tmp/stage1/program.syz" in argv
+    assert "-program-timeout" not in execprog_argv(600, 10)
+    with pytest.raises(ValueError, match="inside the watchdog"):
+        execprog_argv(60, 1, 90)
 
 
 @needs_gcc
@@ -925,6 +890,7 @@ def test_collector_writes_a_generation_attributed_capture(host, tmp_path):
     stats = [i for i, c in enumerate(commands) if "*_stats" in c]
     released = commands.index("touch /tmp/stage1/gate.go")
     assert stats[0] < released < stats[1]
+    assert not any("-program-timeout" in c for c in commands)
     assert obs.lane_trace_mode == "off"
     coverage = PublishedCoverage.model_validate_json(
         (run.out / "coverage.json").read_bytes())
@@ -944,9 +910,6 @@ def test_collector_records_guest_failures_as_facts(host, tmp_path):
     run = _collect(host, tmp_path / "a", pcs=[], fixture="failed")
     assert run.observation.boot_ok and not run.observation.fixture_ok
     assert "fixture_not_ready" in run.observation.runtime_errors
-    run = _collect(host, tmp_path / "b", pcs=["0x401000"],
-                   dmesg="BUG: KASAN: slab-out-of-bounds in nfsd4_open\n")
-    assert any("KASAN" in e for e in run.observation.runtime_errors)
     # A fixture of another mode is not the selection's fixture.
     run = _collect(host, tmp_path / "d", pcs=["0x401000"],
                    fixture_mode="nlm-knfsd")
@@ -954,6 +917,51 @@ def test_collector_records_guest_failures_as_facts(host, tmp_path):
     run = _collect(host, tmp_path / "c", boot_error="no ssh")
     assert not run.observation.boot_ok
     assert run.observation.generation.generation_begin is None
+
+
+def _crash(run):
+    entries = {a["identity"]: a for a in run.capture["artifacts"]}
+    if "crash-report" not in entries:
+        return None
+    assert entries["crash-report"]["type"] == CRASH_REPORT_TYPE
+    return CrashReport.model_validate_json(
+        (run.out / entries["crash-report"]["path"]).read_bytes())
+
+
+@needs_gcc
+def test_collector_seals_a_crash_of_a_completed_run(host, tmp_path):
+    """#81 §3: the crash is a sealed report, not a runtime error; the run
+    stays complete and judgeable."""
+    run = _collect(host, tmp_path / "a", pcs=["0x401000"],
+                   console="[   9.1] WARNING: CPU: 0 PID: 1 at x.c:1\n")
+    obs = run.observation
+    assert obs.runtime_errors == ()
+    assert obs.runner_completed and obs.generation_attributed
+    crash = _crash(run)
+    assert (crash.source, crash.kind) == ("console", CrashKind.WARNING)
+    assert crash.title == "WARNING: CPU: 0 PID: 1 at x.c:1"
+    assert not crash.panicked
+    assert b"WARNING: CPU: 0" in (run.out / "console.log").read_bytes()
+    # The console is the primary evidence; dmesg is the fallback.
+    run = _collect(host, tmp_path / "b", pcs=["0x401000"],
+                   dmesg="BUG: KASAN: slab-out-of-bounds in nfsd4_open\n")
+    assert run.observation.runtime_errors == ()
+    assert (_crash(run).source, _crash(run).kind) == ("dmesg",
+                                                      CrashKind.KASAN)
+    assert _crash(_collect(host, tmp_path / "c", pcs=["0x401000"])) is None
+
+
+@needs_gcc
+def test_collector_seals_a_panic_of_an_incomplete_run(host, tmp_path):
+    run = _collect(host, tmp_path / "a", pcs=["0x401000"], panic=True,
+                   console="BUG: KASAN: use-after-free in nfsd4_bind\n"
+                           "Kernel panic - not syncing: KASAN: panic_on_warn"
+                           "\n")
+    obs = run.observation
+    assert not obs.runner_completed and obs.runtime_errors
+    crash = _crash(run)
+    assert crash.kind is CrashKind.KASAN and crash.panicked
+    assert crash.source == "console"
 
 
 @needs_gcc
@@ -1020,17 +1028,24 @@ collect(CollectorConfig.load(sys.argv[1]), Path(sys.argv[2]),
 
 
 @needs_gcc
-def test_generated_host_runs_a_candidate_to_reached(host, tmp_path):
+@pytest.mark.parametrize("warning", (False, True))
+def test_generated_host_runs_a_candidate_to_reached(host, tmp_path, warning):
     """stage1.json from generate, the collector (scripted guest) as the
-    engine command, and a mapping from target-pcs on the gcc binary."""
+    engine command, and a mapping from target-pcs on the gcc binary.  A
+    WARNING while the program runs is a crash finding; the job still
+    reaches s1_reached on its coverage (#81 §3)."""
     result = generate(host.spec)
     config = Stage1Config.load(result.stage1_config)
     pcs_file = tmp_path / "cover-pcs.txt"
+    console = tmp_path / "console.txt"
+    console.write_text("[  7.5] WARNING: CPU: 0 PID: 9 at fs/nfsd/x.c:3\n"
+                       if warning else "")
     config = config.model_copy(update={"engine": EngineConfig(
         argv=(sys.executable, "-I", "-c", COMMAND.format(repo=str(REPO)),
               str(result.collector_config), "{input}", "{output}"),
         cwd=tmp_path, resource_key="test-lane",
-        env={"LANG": "C.UTF-8", "TEST_COVER_PCS": str(pcs_file)},
+        env={"LANG": "C.UTF-8", "TEST_COVER_PCS": str(pcs_file),
+             "TEST_CONSOLE": str(console)},
         timeout_s=60)})
     config_path = tmp_path / "stage1-test.json"
     config_path.write_text(config.model_dump_json())
@@ -1077,6 +1092,14 @@ def test_generated_host_runs_a_candidate_to_reached(host, tmp_path):
             service.store.effect_failures(job_id), service.worker_errors)
         verdict = job.last_verdict.result
         assert verdict.status is Q1Status.REACHED
+        if warning:
+            (finding,) = job.crash_findings
+            assert finding.kind == "warning"
+            assert finding.title.startswith("WARNING: CPU: 0 PID: 9")
+            assert finding.bundle_ref == job.last_verdict.bundle_ref
+            assert finding.q1_verdict_id == verdict.verdict_id
+        else:
+            assert job.crash_findings == ()
         assert service.controller.replay(job_id) == job
     coverage = next(Path(config.state_dir, "runs").glob("*/output/coverage.json"))
     assert host_main(["check-pcs", "--stage1", str(result.stage1_config),
@@ -1328,3 +1351,722 @@ def test_kernel_series_apply_is_deterministic(tmp_path):
             ["git", "-C", str(tree), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True).stdout.strip())
     assert heads[0] == heads[1] != commit
+
+
+# ------------------------------------------------------------ KCSAN variant
+
+def _two_variants(host, **variant_kw):
+    """The host's KASAN build plus a KCSAN build of the same tree, one spec
+    for both (#81 D10)."""
+    images = host.env / "images" / "kcsan"
+    images.mkdir()
+    _compile_vmlinux(host.env / "linux", images / "vmlinux")
+    (images / "bzImage").write_bytes(b"synthetic kcsan bzImage")
+    (images / ".config").write_text("CONFIG_KCOV=y\nCONFIG_KCSAN=y\n")
+    (images / "build.json").write_text(json.dumps({
+        "head": host.kernel_commit,
+        "series_sha256": series_fingerprint("kernel")}))
+    spec = json.loads(host.spec.read_text())
+    del spec["variant"]
+    spec["variants"] = [{"sanitizer": "kasan", **variant_kw.get("kasan", {})},
+                        {"sanitizer": "kcsan", **variant_kw.get("kcsan", {})}]
+    spec["policies"].append(policy("p-kcsan", sanitizer="kcsan").model_dump(
+        mode="json"))
+    host.spec.write_text(json.dumps(spec, indent=1))
+
+
+@needs_gcc
+def test_one_spec_generates_a_harness_per_variant(host):
+    _two_variants(host)
+    result = generate(host.spec)
+    config = Stage1Config.load(result.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    from agent_pipeline.materializer import ExecutionHarnessApproval
+    from agent_pipeline.registry import ArtifactHarnessRegistry
+    descriptors = [load_record(store, ref, ExecutionHarnessApproval).descriptor
+                   for ref in config.execution_harness_approvals]
+    assert [d.sanitizer.value for d in descriptors] == ["kasan", "kcsan"]
+    kasan, kcsan = descriptors
+    builds = [{a.name: a.artifact_ref for a in d.build_artifacts}
+              for d in descriptors]
+    # The kernel build is the variant's own; the rest is shared.
+    for name in ("bzimage", "instrumentation"):
+        assert builds[0][name] != builds[1][name]
+    for name in ("lane-script", "syz-executor", "vm-image"):
+        assert builds[0][name] == builds[1][name]
+    assert kasan.syzkaller_identity == kcsan.syzkaller_identity
+    assert set(result.variants) == {"kasan", "kcsan"}
+    assert result.execution_harness_id == \
+        result.variants["kasan"].execution_harness_id
+    ids = {v.execution_harness_id for v in result.variants.values()}
+    hcaps = {v.hcap_revision for v in result.variants.values()}
+    assert len(ids) == len(hcaps) == 2
+    # The policy's sanitizer selects the binding.
+    registry = ArtifactHarnessRegistry(store, config.harness_catalog_ref)
+    for name, variant in result.variants.items():
+        b = registry.lookup(host.kernel_commit, Sanitizer(name))
+        assert (b.execution_harness_id, b.hcap_revision) == (
+            variant.execution_harness_id, variant.hcap_revision)
+    # Each HCAP names its own support boundary (its instrumentation).
+    checker = ArtifactHcapChecker(store)
+    versions = [checker.judge_versions(v.hcap_revision)
+                for v in result.variants.values()]
+    assert versions[0].judge_profile_id == versions[1].judge_profile_id
+    assert versions[0].support_boundary_id != versions[1].support_boundary_id
+    assert config.judge_versions == versions[0]
+    collector = CollectorConfig.load(result.collector_config)
+    assert "bzimage" not in collector.files
+    assert collector.files_for(Sanitizer.KCSAN)["bzimage"] == \
+        (host.env / "images" / "kcsan" / "bzImage").resolve()
+    assert result.digests["kcsan:hcap"] == \
+        result.variants["kcsan"].hcap_revision
+
+
+@needs_gcc
+def test_capability_evidence_belongs_to_its_variant(host):
+    _two_variants(host)
+    identity, lane_sha256 = _generated_identity(host, "kcsan")
+    evidence = host.root / "kcsan-evidence.json"
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-lane", PROBE_CONTRACT)))
+    spec = json.loads(host.spec.read_text())
+    spec["variants"][1]["capability_evidence"] = {
+        "CAP-lane": ["kcsan-evidence.json"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    result = generate(host.spec)
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    checker = ArtifactHcapChecker(ArtifactStore(host.root / "cas"))
+
+    def refs(name):
+        catalog = checker.load_catalog(result.variants[name].hcap_revision)
+        return next(c for c in catalog.capabilities
+                    if c.id == "CAP-lane").evidence_refs
+    assert refs("kasan") == ()
+    assert len(refs("kcsan")) == 1
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ({"variant": "kasan"}, "variant or variants"),
+    ({"capability_evidence": {"CAP-lane": ["x.json"]}},
+     "belongs to each variant"),
+    ({"variants": [{"sanitizer": "kcsan"}, {"sanitizer": "kcsan"}]},
+     "listed twice"),
+])
+def test_variant_spec_errors(host, change, message):
+    from agent_pipeline.stage1.host.generate import HostSpec
+    spec = json.loads(host.spec.read_text())
+    del spec["variant"]
+    spec["variants"] = [{"sanitizer": "kasan"}]
+    spec.update(change)
+    with pytest.raises(ValidationError, match=message):
+        HostSpec.model_validate_json(json.dumps(spec))
+
+
+def test_a_policy_needs_a_generated_variant(host):
+    spec = json.loads(host.spec.read_text())
+    spec["policies"].append(policy("p-kcsan", sanitizer="kcsan").model_dump(
+        mode="json"))
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="another sanitizer"):
+        generate(host.spec)
+
+
+KCSAN_REPORT = ("[   4.2] BUG: KCSAN: data-race in nfsd4_bind_conn / "
+                "nfsd4_destroy_session\n")
+
+
+@needs_gcc
+def test_a_kcsan_harness_seals_a_kcsan_report(host, tmp_path):
+    _two_variants(host)
+    run = _collect(host, tmp_path / "kcsan", approval=1, pcs=["0x401000"],
+                   console=KCSAN_REPORT)
+    crash = _crash(run)
+    assert crash.kind is CrashKind.KCSAN and crash.sanitizer is \
+        Sanitizer.KCSAN
+    assert crash.title.startswith("BUG: KCSAN: data-race in nfsd4_bind_conn")
+    assert run.observation.runtime_errors == ()
+    assert run.guest.config.bzimage == \
+        (host.env / "images" / "kcsan" / "bzImage").resolve()
+    # The same report on the KASAN harness is not a crash of its own.
+    run = _collect(host, tmp_path / "kasan", approval=0, pcs=["0x401000"],
+                   console=KCSAN_REPORT)
+    assert _crash(run) is None
+
+
+# ------------------------------------------------------------ Stage 2 manager
+
+def _with_stage2(host, **stage2):
+    spec = json.loads(host.spec.read_text())
+    spec["stage2"] = stage2
+    host.spec.write_text(json.dumps(spec, indent=1))
+
+
+def _preflight_manager(host, result, path: Path) -> str:
+    """The Stage 2 preflight's manager check on a generated config, against
+    every generated harness."""
+    from agent_pipeline.materializer import (ExecutionHarnessApproval,
+                                             descriptor_id)
+    from agent_pipeline.stage2.host import _approved_harness, _check_manager
+    config = Stage1Config.load(result.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    descriptors = [load_record(store, ref, ExecutionHarnessApproval).descriptor
+                   for ref in config.execution_harness_approvals]
+    harnesses = tuple(_approved_harness(store, descriptor_id(d), d)
+                      for d in descriptors)
+    (host.env / "syzkaller" / "bin" / "syz-manager").chmod(0o755)
+    command = SimpleNamespace(
+        argv=("/bin/true", "--manager", str(path), "{input}", "{output}"),
+        cwd=host.root)
+    return _check_manager(
+        path, 4, command=command,
+        collector=CollectorConfig.load(result.collector_config),
+        harnesses=harnesses, expected_target=config.syzkaller_identity.target,
+        which=lambda _: "/bin/true")
+
+
+@needs_gcc
+def test_generate_writes_a_stage2_manager_the_preflight_accepts(host):
+    # #81 D17: the manager is pinned to the Stage 1 collector's descriptor.
+    _with_stage2(host, nfs_proxy_window=6)
+    result = generate(host.spec)
+    path = result.stage2_managers["kasan"]
+    assert path == host.root / "state" / "stage2-manager.json"
+    manager = json.loads(path.read_text())
+    # Every admitted call and every call the selection enables.
+    assert manager["enable_syscalls"] == ["close", "openat$lane", "read$extra"]
+    # No validated_layout on the topology capability: one proc (#99).
+    assert manager["procs"] == 1
+    assert manager["experimental"] == {"remote_cover": True,
+                                       "nfs_proxy_window": 6}
+    collector = CollectorConfig.load(result.collector_config)
+    assert manager["vm"]["kernel"] == str(collector.files["bzimage"])
+    assert Path(manager["kernel_obj"]) / "vmlinux" == collector.files["kernel"]
+    assert manager["image"] == str(collector.files["vm-image"])
+    assert manager["sshkey"] == str(collector.ssh_key)
+    lane = Path(manager["workdir_template"]) / "lane.sh"
+    assert lane.read_bytes() == collector.files["lane-script"].read_bytes()
+    cmdline = manager["vm"]["cmdline"].split()
+    assert cmdline[:4] == ["root=/dev/sda", "console=ttyS0", "nokaslr",
+                           "nfs.localio_enabled=N"]
+    assert {"koov.nfs_version=4.1", "koov.nfs_trace=0",
+            "koov.nfs_target=1"} <= set(cmdline)
+    assert result.digests["stage2_manager"] == hashlib.sha256(
+        path.read_bytes()).hexdigest()
+    assert "1 proc(s)" in _preflight_manager(host, result, path)
+    # Generating again keeps the frozen lane template.
+    assert generate(host.spec).stage2_managers["kasan"].read_bytes() == \
+        path.read_bytes()
+
+
+@needs_gcc
+@pytest.mark.parametrize("accel", ["kvm", "tcg"])
+def test_generate_runs_guests_under_the_chosen_accelerator(host, accel):
+    # KVM is a speed choice: a TCG host scales the KVM-speed budgets.
+    spec = json.loads(host.spec.read_text())
+    spec["collector"] = {"accel": accel}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    _with_stage2(host)
+    result = generate(host.spec)
+    collector = CollectorConfig.load(result.collector_config)
+    config = Stage1Config.load(result.stage1_config)
+    scale = 1 if accel == "kvm" else 10
+    assert collector.accel == accel
+    assert collector.exec_slowdown == scale
+    assert collector.boot_timeout_s == 300 * scale
+    assert collector.fixture_timeout_s == 180 * scale
+    assert collector.exec_timeout_s == 600
+    assert config.engine.timeout_s == 1800 * scale
+    manager = json.loads(result.stage2_managers["kasan"].read_text())
+    head = manager["vm"]["qemu_args"].split()[:4]
+    assert head == (["-enable-kvm", "-cpu", "host", "-fsdev"]
+                    if accel == "kvm" else
+                    ["-accel", "tcg,thread=multi", "-cpu", "max"])
+    _preflight_manager(host, result, result.stage2_managers["kasan"])
+
+
+@needs_gcc
+def test_stage2_manager_calls_include_the_approved_calls(host):
+    _with_stage2(host, enable_syscalls=["close", "write$known"])
+    with pytest.raises(GenerationError,
+                       match=r"lacks approved calls: openat\$lane, read\$extra"):
+        generate(host.spec)
+    _with_stage2(host, enable_syscalls=[
+        "close", "openat$lane", "read$extra", "write$nope"])
+    with pytest.raises(GenerationError, match=r"lacks: write\$nope"):
+        generate(host.spec)
+    _with_stage2(host, enable_syscalls=[
+        "close", "openat$lane", "read$extra", "write$known"])
+    manager = json.loads(generate(host.spec).stage2_managers["kasan"]
+                         .read_text())
+    assert manager["enable_syscalls"][-1] == "write$known"
+
+
+def _generated_identity(host, sanitizer="kasan"):
+    """The mapping identity and lane script digest of the host's harness
+    for ``sanitizer``, which typed KVM evidence must name."""
+    initial = generate(host.spec)
+    config = Stage1Config.load(initial.stage1_config)
+    store = ArtifactStore(config.artifact_root)
+    from agent_pipeline.materializer import (ExecutionHarnessApproval,
+                                             descriptor_id)
+    from agent_pipeline.stage1.host.pins import HostFilePin
+    descriptor = next(
+        approval.descriptor for approval in (
+            load_record(store, ref, ExecutionHarnessApproval)
+            for ref in config.execution_harness_approvals)
+        if approval.descriptor.sanitizer.value == sanitizer)
+    builds = {item.name: item.artifact_ref
+              for item in descriptor.build_artifacts}
+    identity = KernelIdentity(
+        execution_harness_id=descriptor_id(descriptor),
+        kernel_commit=descriptor.kernel_commit,
+        instrumentation_sha256=builds["instrumentation"],
+        vmlinux_sha256=builds["kernel"],
+        kaslr_enabled=False, kaslr_offset=0)
+    return identity, load_record(store, builds["lane-script"],
+                                 HostFilePin).sha256
+
+
+def _lane_topology_evidence(identity, lane_sha256, procs, **lane):
+    executions = 8
+    lanes = [{"lane": n, "executions": executions,
+              "attributed_executions": executions,
+              "distinct_generations": executions,
+              "proxy_acked_executions": executions,
+              "healthy_executions": executions,
+              "journal_generations": executions,
+              "generations_missing_from_journal": 0,
+              "foreign_journal_events": 0, **lane}
+             for n in range(procs)]
+    return {
+        "schema_version": "hcap-kvm-evidence.v1",
+        "observed_at": "2026-10-26",
+        "execution_harness_id": identity.execution_harness_id,
+        "mapping_identity": identity.model_dump(mode="json"),
+        "campaign_result_sha256": "b" * 64,
+        "program_sha256": generate_module.LANE_TOPOLOGY_PROGRAM_SHA256,
+        "guest_lane_script_sha256": lane_sha256,
+        "capability_id": "HCAP-04",
+        "capability_ids": list(generate_module.LANE_TOPOLOGY_CAPABILITIES),
+        "scenario": "stage2-lane-topology",
+        "layout": {"procs": procs, "lanes": list(range(procs))},
+        "min_executions_per_lane": 8, "lanes": lanes,
+        "manager_exited_unexpectedly": False, "crash_signature_count": 0,
+        "shareable_result_contains_target_metadata_or_addresses": False,
+    }
+
+
+@needs_gcc
+def test_stage2_procs_stay_inside_the_topology_layout(host):
+    # #99: without a validated_layout CAP-lane is validated for one proc.
+    _with_stage2(host, procs=2)
+    with pytest.raises(GenerationError, match=r"stage2\.procs 2 exceeds the "
+                       r"1 proc\(s\) CAP-lane is validated for"):
+        generate(host.spec)
+
+
+@needs_gcc
+def test_lane_topology_evidence_widens_the_stage2_layout(host, monkeypatch):
+    # The synthetic host's lane and topology capability is CAP-lane, its
+    # remote KCOV CAP-observe.
+    monkeypatch.setattr(generate_module, "LANE_TOPOLOGY_CAPABILITIES",
+                        ("CAP-lane", "CAP-observe"))
+    for name in ("CAP-lane", "CAP-observe"):
+        monkeypatch.setitem(generate_module.CAPABILITY_EVIDENCE_MODELS,
+                            name, generate_module.LaneTopologyEvidence)
+    identity, lane_sha256 = _generated_identity(host)
+    evidence = host.root / "topology.json"
+    evidence.write_text(json.dumps(
+        _lane_topology_evidence(identity, lane_sha256, 2)))
+    spec = json.loads(host.spec.read_text())
+    widened = [c for c in spec["capabilities"]
+               if c["id"] in ("CAP-lane", "CAP-observe")]
+    spec["capability_evidence"] = {"CAP-lane": [evidence.name],
+                                   "CAP-observe": [evidence.name]}
+    spec["stage2"] = {}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    # The declared layout is what the evidence ran.
+    with pytest.raises(GenerationError, match="not its validated_layout"):
+        generate(host.spec)
+    for capability in widened:
+        capability["validated_layout"] = {"procs": 2, "lanes": [0, 1]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    result = generate(host.spec)
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          result.hcap_revision, HcapCatalog)
+    assert next(c for c in catalog.capabilities
+                if c.id == "CAP-lane").validated_layout.procs == 2
+    manager = json.loads(result.stage2_managers["kasan"].read_text())
+    assert manager["procs"] == 2
+    # CAP-extra is still validated on lane 0 only, so read$extra is out.
+    assert manager["enable_syscalls"] == ["close", "openat$lane"]
+    assert "2 proc(s)" in _preflight_manager(
+        host, result, result.stage2_managers["kasan"])
+    spec["stage2"] = {"procs": 1}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    manager = json.loads(generate(host.spec).stage2_managers["kasan"]
+                         .read_text())
+    assert manager["procs"] == 1
+    assert manager["enable_syscalls"] == ["close", "openat$lane", "read$extra"]
+    spec["stage2"] = {"enable_syscalls": ["close", "openat$lane",
+                                          "read$extra"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match=r"call_outside_validated_layout:"
+                       r"read\$extra"):
+        generate(host.spec)
+    # A layout beyond Stage 1's needs typed evidence that ran it.
+    spec["capability_evidence"] = {}
+    spec["stage2"] = {}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="needs typed evidence"):
+        generate(host.spec)
+
+
+@pytest.mark.parametrize(("lane", "message"), [
+    ({"executions": 7, "attributed_executions": 7, "distinct_generations": 7,
+      "proxy_acked_executions": 7, "healthy_executions": 7},
+     "too few executions"),
+    ({"attributed_executions": 7}, "unattributed"),
+    ({"distinct_generations": 7}, "repeated"),
+    ({"proxy_acked_executions": 7}, "unacked"),
+    ({"healthy_executions": 7}, "unhealthy"),
+    ({"journal_generations": 7}, "journal lacks a generation"),
+    ({"generations_missing_from_journal": 1}, "journal lacks a generation"),
+    ({"foreign_journal_events": 1}, "another lane's events"),
+])
+def test_lane_topology_evidence_rejects_unvalidated_lanes(lane, message):
+    identity = KernelIdentity(
+        execution_harness_id="a" * 64, kernel_commit="b" * 40,
+        instrumentation_sha256="c" * 64, vmlinux_sha256="d" * 64,
+        kaslr_enabled=False, kaslr_offset=0)
+    value = _lane_topology_evidence(identity, "e" * 64, 4)
+    assert generate_module.LaneTopologyEvidence.model_validate(
+        value).layout.procs == 4
+    value["lanes"][2].update(lane)
+    with pytest.raises(ValidationError, match=message):
+        generate_module.LaneTopologyEvidence.model_validate(value)
+
+
+@pytest.mark.parametrize(("field", "value", "message"), [
+    ("capability_ids", ["HCAP-04"], "names other capabilities"),
+    ("layout", {"procs": 4, "lanes": [0, 1]}, "every lane of its procs"),
+    ("manager_exited_unexpectedly", True, "manager exit"),
+    ("crash_signature_count", 1, "crash"),
+    ("shareable_result_contains_target_metadata_or_addresses", True,
+     "private target data"),
+])
+def test_lane_topology_evidence_rejects_unvalidated_campaigns(
+        field, value, message):
+    identity = KernelIdentity(
+        execution_harness_id="a" * 64, kernel_commit="b" * 40,
+        instrumentation_sha256="c" * 64, vmlinux_sha256="d" * 64,
+        kaslr_enabled=False, kaslr_offset=0)
+    evidence = _lane_topology_evidence(identity, "e" * 64, 4)
+    evidence[field] = value
+    with pytest.raises(ValidationError, match=message):
+        generate_module.LaneTopologyEvidence.model_validate(evidence)
+
+
+@needs_gcc
+def test_stage2_manager_boots_a_spec_runtime_selection(host):
+    other = host.selection.model_copy(update={"nfs_version": "4.2",
+                                              "profile": "knfsd-v42"})
+    _with_stage2(host, runtime_selection=other.model_dump(mode="json"))
+    with pytest.raises(GenerationError, match="not one of runtime_selections"):
+        generate(host.spec)
+
+
+@needs_gcc
+def test_each_variant_gets_its_own_stage2_manager(host):
+    _two_variants(host)
+    _with_stage2(host)
+    result = generate(host.spec)
+    assert set(result.stage2_managers) == {"kasan", "kcsan"}
+    kernels = set()
+    for name, path in result.stage2_managers.items():
+        assert path.name == f"stage2-manager-{name}.json"
+        manager = json.loads(path.read_text())
+        kernels.add(manager["vm"]["kernel"])
+        # The preflight matches the manager to its own variant.
+        assert "approved assets" in _preflight_manager(host, result, path)
+        assert result.digests[f"{name}:stage2_manager"]
+    assert len(kernels) == 2
+
+
+def test_live_spec_manager_enables_the_live_bind_calls():
+    # The live BIND path is the HCAP-14 syzlang calls (patch 0031); the
+    # manager enables them as approved calls.
+    from agent_pipeline.stage1.host.generate import HostSpec, _approved_calls
+    spec = HostSpec.model_validate_json(
+        (REPO / "stage1-host-live/host-spec.json").read_bytes())
+    assert spec.stage2 is not None
+    bind = next(c for c in spec.capabilities if c.id == "HCAP-14")
+    (selection,) = spec.runtime_selections
+    calls = {e.call for e in spec.admission_source.entries} | {
+        i for i in selection.enabled_interfaces if i != "remote_cover"}
+    table = SimpleNamespace(calls=tuple(sorted(calls)))
+    approved = _approved_calls(spec.admission_source, table, selection)
+    assert set(bind.interface.syz_calls) <= approved
+    assert "write$nfs41_bind_conn_to_session" in approved
+    assert "remote_cover" not in approved
+
+
+# ------------------------------------------------------------ promotion (#100)
+
+def _mark_legacy(monkeypatch, spec):
+    """Every capability of ``spec`` keeps its earlier promotion."""
+    monkeypatch.setattr(generate_module, "LEGACY_CAPABILITY_BASELINES", {
+        c["id"]: frozenset({capability_baseline_sha256(
+            Capability.model_validate_json(json.dumps(c)))})
+        for c in spec["capabilities"]})
+
+
+PROBE_CONTRACT = {
+    "entry_points": [{"kind": "fixture_action", "name": "lane_partition"}],
+    "boundary_functions": ["nfsd4_exchange_id", "nfsd4_create_session"]}
+
+
+def _probe_evidence(identity, lane_sha256, capability_id, contract, **change):
+    from agent_pipeline.promotion import contract_sha256
+    probes = contract["boundary_functions"]
+    value = {
+        "schema_version": "promotion-probe-evidence.v1",
+        "capability_id": capability_id,
+        "contract_sha256": contract_sha256(
+            CapabilityContract.model_validate_json(json.dumps(contract))),
+        "observed_at": "2026-10-26",
+        "execution_harness_id": identity.execution_harness_id,
+        "mapping_identity": identity.model_dump(mode="json"),
+        "guest_lane_script_sha256": lane_sha256,
+        "layout": {"procs": 1, "lanes": [0]},
+        "accelerator": "kvm", "exec_slowdown": 1,
+        "probes": probes,
+        "probe_mapping_sha256": {name: "c" * 64 for name in probes},
+        "minimal": {"program_sha256s": ["d" * 64], "runs": 3,
+                    "runs_hitting": 3, "probes_hit": probes},
+        "generated": {"program_sha256s": [f"{n:064x}" for n in range(16)],
+                      "runs": 40, "runs_hitting": 12, "probes_hit": probes},
+        "neutral": {"program_sha256s": ["f" * 64], "runs": 3,
+                    "runs_hitting": 0, "probes_hit": []},
+        "generated_without_entry_call": 0, "crash_signature_count": 0,
+        "shareable_result_contains_target_metadata_or_addresses": False,
+    }
+    value.update(change)
+    return value
+
+
+def _new_capability(contract=None):
+    capability = {
+        "id": "CAP-new", "name": "partition", "purpose": "test promotion",
+        "usable_stage": ["stage1"], "usable_by": ["agent_stage1"],
+        "interface": {"runtime_features": ["lane_partition"]},
+        "status": "validated", "scope": ["client0_partition"]}
+    if contract is not None:
+        capability["contract"] = contract
+    return capability
+
+
+@needs_gcc
+def test_a_new_capability_must_meet_the_promotion_criteria(host):
+    spec = json.loads(host.spec.read_text())
+    spec["capabilities"].append(_new_capability())
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="CAP-new does not meet the "
+                       "promotion criteria.*contract_missing"):
+        generate(host.spec)
+    spec["capabilities"][-1] = _new_capability(PROBE_CONTRACT)
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="promotion_evidence_missing"):
+        generate(host.spec)
+    # The probe campaign has to be this harness's; generate once without
+    # the new capability to learn its identity.
+    spec["capabilities"].pop()
+    host.spec.write_text(json.dumps(spec, indent=1))
+    identity, lane_sha256 = _generated_identity(host)
+    spec["capabilities"].append(_new_capability(PROBE_CONTRACT))
+    evidence = host.root / "promotion.json"
+    spec["capability_evidence"] = {"CAP-new": [evidence.name]}
+    other = {**PROBE_CONTRACT, "boundary_functions": ["nfsd4_exchange_id"]}
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-new", other)))
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="promotion_evidence_contract_"
+                       "mismatch, probes_not_contract_boundary"):
+        generate(host.spec)
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-new", PROBE_CONTRACT)))
+    result = generate(host.spec)
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          result.hcap_revision, HcapCatalog)
+    promoted = next(c for c in catalog.capabilities if c.id == "CAP-new")
+    assert promoted.contract == CapabilityContract.model_validate_json(
+        json.dumps(PROBE_CONTRACT))
+    assert len(promoted.evidence_refs) == 1
+    # A gap filler declares the vocabulary's contract for its gap.
+    spec["capabilities"][-1]["fills_gap"] = "lane.partition"
+    spec["missing_capability_ids"] = ["lane.partition"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="gap_contract_missing:lane.partition"):
+        generate(host.spec)
+    spec["gap_contracts"] = [{"missing_capability_id": "lane.partition",
+                              "contract": {**PROBE_CONTRACT,
+                                           "time_dependent": True}}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError,
+                       match="contract_differs_from_gap:lane.partition"):
+        generate(host.spec)
+    spec["gap_contracts"][0]["contract"] = PROBE_CONTRACT
+    host.spec.write_text(json.dumps(spec, indent=1))
+    # A candidate raised the gap; the campaign names its programs.
+    with pytest.raises(GenerationError,
+                       match="candidate_programs_not_withheld"):
+        generate(host.spec)
+    evidence.write_text(json.dumps(_probe_evidence(
+        identity, lane_sha256, "CAP-new", PROBE_CONTRACT,
+        withheld_program_sha256s=["7" * 64])))
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          generate(host.spec).hcap_revision, HcapCatalog)
+    assert catalog.gap_contracts[0].missing_capability_id == "lane.partition"
+
+    # A Harness Generation patch set can change the spec, so the Controller
+    # passes the gap, its contract and the spec the patch set started from:
+    # the spec cannot narrow that contract, and every capability the patch
+    # set adds or changes fills that gap.
+    gap = GapContract.model_validate_json(json.dumps(
+        {"missing_capability_id": "lane.partition",
+         "contract": PROBE_CONTRACT}))
+    base_spec = host.root / "base-spec.json"
+    base_spec.write_text(json.dumps(
+        {**spec, "capabilities": spec["capabilities"][:-1]}, indent=1))
+    with pytest.raises(GenerationError, match="the gap and the base spec"):
+        generate(host.spec, gap=gap)
+    generate(host.spec, gap=gap, base_spec=base_spec)
+    narrowed = GapContract.model_validate_json(json.dumps(
+        {"missing_capability_id": "lane.partition",
+         "contract": {**PROBE_CONTRACT, "time_dependent": True}}))
+    with pytest.raises(GenerationError, match="another contract than the "
+                       "Controller's"):
+        generate(host.spec, gap=narrowed, base_spec=base_spec)
+    del spec["gap_contracts"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    catalog = load_record(ArtifactStore(host.root / "cas"),
+                          generate(host.spec, gap=gap,
+                                   base_spec=base_spec).hcap_revision,
+                          HcapCatalog)
+    assert catalog.gap_contracts == (gap,)
+    # Once CAP-new is in the base, a later patch set that leaves it alone
+    # is not held to the later gap, and one that changes nothing fills none.
+    base_spec.write_text(host.spec.read_text())
+    with pytest.raises(GenerationError, match="adds or changes no "
+                       "capability for gap lane.partition"):
+        generate(host.spec, gap=gap, base_spec=base_spec)
+    del spec["capabilities"][-1]["fills_gap"]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="CAP-new does not fill gap "
+                       "lane.partition"):
+        generate(host.spec, gap=gap, base_spec=base_spec)
+
+
+def test_a_patch_set_is_held_to_its_own_gap_only():
+    """Capabilities the base already holds, filling another gap or none,
+    are not the patch set's."""
+    base = _capabilities()
+    earlier = base[0].model_copy(update={"id": "CAP-a",
+                                         "fills_gap": "gap.a"})
+    human = base[0].model_copy(update={"id": "CAP-human"})
+    new = base[0].model_copy(update={"id": "CAP-b", "fills_gap": "gap.b"})
+
+    def spec(*capabilities):
+        return SimpleNamespace(capabilities=capabilities)
+
+    changed = generate_module._changed_capabilities(
+        spec(earlier, human, new), spec(earlier, human))
+    assert changed == (new,)
+    generate_module._check_fills(changed, "gap.b")
+    revised = human.model_copy(update={"purpose": "changed by the patch"})
+    changed = generate_module._changed_capabilities(
+        spec(earlier, revised, new), spec(earlier, human))
+    with pytest.raises(GenerationError, match="CAP-human does not fill gap "
+                       "gap.b"):
+        generate_module._check_fills(changed, "gap.b")
+    # A patch set cannot drop a base capability for its own.
+    with pytest.raises(GenerationError, match="removes CAP-human"):
+        generate_module._changed_capabilities(spec(earlier, new),
+                                              spec(earlier, human))
+
+
+@needs_gcc
+def test_a_changed_legacy_capability_is_judged_again(host, monkeypatch):
+    spec = json.loads(host.spec.read_text())
+    spec["capabilities"][0]["purpose"] = "a revised purpose"
+    host.spec.write_text(json.dumps(spec, indent=1))
+    name = spec["capabilities"][0]["id"]
+    with pytest.raises(GenerationError, match=f"{name} does not meet the "
+                       "promotion criteria.*contract_missing"):
+        generate(host.spec)
+
+    # The baselines are the repository's: a capability the spec adds is
+    # judged even under a legacy ID.
+    spec["capabilities"][0]["purpose"] = _capabilities()[0].purpose
+    spec["capabilities"].append(_new_capability())
+    spec["capabilities"][-1]["id"] = "HCAP-01"
+    host.spec.write_text(json.dumps(spec, indent=1))
+    monkeypatch.setattr(generate_module, "LEGACY_CAPABILITY_BASELINES", {
+        **generate_module.LEGACY_CAPABILITY_BASELINES,
+        "HCAP-01": frozenset({"0" * 64})})
+    with pytest.raises(GenerationError, match="HCAP-01 does not meet"):
+        generate(host.spec)
+
+
+def test_a_layout_change_keeps_the_legacy_baseline():
+    capability = _capabilities()[0]
+    widened = capability.model_copy(update={
+        "validated_layout": ExecutionLayout(procs=2, lanes=(0, 1))})
+    assert capability_baseline_sha256(widened) == \
+        capability_baseline_sha256(capability)
+    assert capability_baseline_sha256(capability.model_copy(
+        update={"purpose": "other"})) != capability_baseline_sha256(capability)
+
+
+@needs_gcc
+def test_new_syz_call_arguments_must_be_general(host, monkeypatch):
+    from agent_pipeline.promotion import ArgumentLeaf, CallShape, CallShapes
+    import agent_pipeline.syzkaller.adapter as adapter
+
+    class Parser:
+        def __init__(self, bundle, *, identity):
+            self.identity = identity
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def describe(self, calls):
+            assert calls == ["read$extra"]
+            return CallShapes(
+                syzkaller_commit=self.identity.syzkaller_commit,
+                calls=(CallShape(call="read$extra", leaves=(
+                    ArgumentLeaf(path="fd", literal=False),
+                    ArgumentLeaf(path="len", literal=True, value=64))),))
+
+    monkeypatch.setattr(adapter, "PinnedSyzParser", Parser)
+    spec = json.loads(host.spec.read_text())
+    extra = next(c for c in spec["capabilities"] if c["id"] == "CAP-extra")
+    extra["contract"] = {
+        "entry_points": [{"kind": "syz_call", "name": "read$extra"}],
+        "boundary_functions": ["nfsd_read"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match=r"CAP-extra syz call arguments "
+                       r"are not general.*literal_argument:read\$extra:len"):
+        generate(host.spec)
+    extra["contract"]["fixed_arguments"] = [
+        {"call": "read$extra", "path": "len", "value": 64}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    # General arguments; promotion still needs its probe campaign.
+    with pytest.raises(GenerationError, match="promotion_evidence_missing"):
+        generate(host.spec)

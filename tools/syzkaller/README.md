@@ -37,6 +37,22 @@ to a broken bundle fails the tests. The tests cover actual disabled and unknown
 calls, malformed programs, changed identity axes and build bytes, sealed binary
 replacement, stream/time limits, large allocations, and conservative NFS facts.
 
+## Campaign programs (`generate`)
+
+`bridge generate` makes the programs of a promotion probe campaign (#100,
+`docs/design/02-llm-agent/07-harness-gap-issue.md` §5.3) with the same
+target. The request (`syz-generate-request.v1`) names the enabled calls
+(the HCAP's admission profile), the contract's entry syz calls, a seed and
+counts. The answer holds, per entry call, minimal programs that end in that
+call with the constructors of its resources before it, and distinct
+programs generated from them and mutated with `prog.Mutate` over the
+enabled calls; a mutation that lost every entry call is dropped and
+counted. One seed gives one answer for one bridge build. An entry call
+whose resources no enabled call makes is refused
+(`entry_call_not_generatable`). `PinnedSyzParser.generate` checks the
+answer; the host's `probe-campaign` parses and admits every program before
+it runs one.
+
 ## Authority and artifact identity
 
 The output `bundle/` contains:
@@ -140,14 +156,20 @@ its explicit valid `AUTO` syntax remains part of the pinned parser semantics.
   origin. An explicit close invalidates that root; unknown FD effects invalidate
   all roots. A small allowlist of ordinary IO/metadata calls (listed in
   `preservesRoots` in `facts.go`) preserves existing roots. The bounded
-  `syz_nfsd_client_ctl` and `syz_nfsd_cld_ctl` fixture controls also preserve
+  `syz_nfsd_client_ctl` and `syz_nfsd_cld_ctl` fixture controls and the
+  `syz_nfs_lane_link` client partition of patch 0032 also preserve
   roots because they cannot consume or replace a program FD, as do `fcntl`
-  (F_DUPFD returns a new, unrooted FD) and the NLM lane calls of patch 0030.
+  (F_DUPFD returns a new, unrooted FD), `setsockopt` and the NLM lane calls of
+  patch 0030.
   Opening a filename does not prove it stays on NFS: symlink/mount traversal is
-  runtime state. The one exception is `syz_open_nlm_lane_file`: the executor
-  opens a regular file strictly beneath its lane directory argument (openat2
+  runtime state. There are two exceptions. `syz_open_nlm_lane_file` opens a
+  regular file strictly beneath its lane directory argument (openat2
   `RESOLVE_BENEATH|RESOLVE_NO_XDEV|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS`
-  and an NFS superblock check), so its result takes that argument's origin.
+  and an NFS superblock check). `syz_socket_connect_nfs_lane` of patch 0031
+  checks that its directory argument is NFS and connects in that lane's client
+  namespace. Either result takes that argument's origin, so the live NFSv4.1
+  session `write$nfs41_*` and `recvfrom$nfs41_*` calls on the socket can be
+  constrained to `nfs-profile:knfsd-v41:client0`.
 * **Unsupported:** path/socket/buffer origins; legacy lane/pair and raw NFS socket
   acquisitions whose protocol profile cannot be proved; asynchronous, rerun and
   fault-injected call properties. Unverified NFS acquisitions reject the entire

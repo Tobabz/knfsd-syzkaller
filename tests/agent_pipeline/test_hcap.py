@@ -17,7 +17,9 @@ from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.components import HcapChecker
 from agent_pipeline.contracts import CandidateLocation
 from agent_pipeline.data import canonical_json, load_record, put_record
-from agent_pipeline.hcap import ArtifactHcapChecker, HcapCatalog, ReachabilityPlan
+from agent_pipeline.hcap import (STAGE1_LAYOUT, ArtifactHcapChecker,
+                                 ExecutionLayout, HcapCatalog, ReachabilityPlan,
+                                 calls_in_layout, layout_refusals)
 
 
 @pytest.fixture
@@ -611,3 +613,60 @@ def test_program_cannot_claim_seed_provenance(synthetic):
     plan["program_proposal"].update(
         seed_manifest_ref=synthetic.evidence, seed_id="synthetic-seed")
     assert check(synthetic, plan=plan).violations == ("invalid_plan_artifact",)
+
+
+@pytest.mark.parametrize(("layout", "message"), [
+    ({"procs": 2, "lanes": [1, 0]}, "sorted and unique"),
+    ({"procs": 2, "lanes": [0, 0]}, "sorted and unique"),
+    ({"procs": 2, "lanes": [0, 2]}, "outside the layout's procs"),
+    ({"procs": 0, "lanes": [0]}, "greater than or equal to 1"),
+    ({"procs": 1, "lanes": []}, "at least 1 item"),
+])
+def test_execution_layout_shape(layout, message):
+    with pytest.raises(ValidationError, match=message):
+        ExecutionLayout.model_validate(layout)
+
+
+def test_execution_layout_covers_runs_inside_it():
+    # #99: proc i uses lane i, so a run needs every lane below its procs.
+    four = ExecutionLayout(procs=4, lanes=(0, 1, 2, 3))
+    assert [four.covers(n) for n in (1, 3, 4, 5)] == [True, True, True, False]
+    lane0 = ExecutionLayout(procs=4, lanes=(0,))
+    assert [lane0.covers(n) for n in (1, 2)] == [True, False]
+    assert STAGE1_LAYOUT == ExecutionLayout(procs=1, lanes=(0,))
+
+
+def test_capability_without_a_layout_is_validated_on_stage1_only(synthetic):
+    catalog = HcapCatalog.model_validate_json(
+        canonical_json(catalog_data(synthetic)))
+    lane = catalog.capabilities[0]
+    assert lane.validated_layout is None and lane.layout() == STAGE1_LAYOUT
+    entries = [SimpleNamespace(call="synthetic_lane_open",
+                               capability_ids=("TEST-lane",)),
+               SimpleNamespace(call="synthetic_shared",
+                               capability_ids=("TEST-lane", "TEST-remote"))]
+    assert calls_in_layout(catalog, entries, 1) == {
+        "synthetic_lane_open", "synthetic_shared"}
+    assert calls_in_layout(catalog, entries, 2) == set()
+    assert layout_refusals(
+        catalog, entries, enabled_calls=["synthetic_lane_open", "close"],
+        runtime_features=["remote_cover"], procs=2) == [
+        "call_outside_validated_layout:synthetic_lane_open",
+        "runtime_feature_outside_validated_layout:remote_cover"]
+    # One admitting capability that covers the run admits a shared call.
+    data = catalog_data(synthetic)
+    data["capabilities"][1]["validated_layout"] = {"procs": 2,
+                                                   "lanes": [0, 1]}
+    wider = HcapCatalog.model_validate_json(canonical_json(data))
+    assert calls_in_layout(wider, entries, 2) == {"synthetic_shared"}
+    assert layout_refusals(
+        wider, entries, enabled_calls=["synthetic_shared"],
+        runtime_features=["remote_cover"], procs=2) == []
+
+
+def test_stage1_plan_needs_a_layout_with_lane_zero(synthetic):
+    catalog = catalog_data(synthetic)
+    catalog["capabilities"][0]["validated_layout"] = {"procs": 2,
+                                                      "lanes": [1]}
+    assert "layout_not_validated:TEST-lane" in check(
+        synthetic, catalog=catalog).violations

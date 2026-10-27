@@ -206,6 +206,34 @@ export executor_root
 export proxy_target_dir
 export KOOV_GANESHA_ASAN_OPTIONS KOOV_UBSAN_OPTIONS KOOV_GANESHA_DEBUG
 
+# Target mode writes the NFS proxy journal to a stable virtio-serial name.
+# The kernel exposes each port as /dev/vportN with its QEMU name in
+# /sys/class/virtio-ports/vportN/name; the image's udev rule normally makes
+# /dev/virtio-ports/<name>, but the parent directory is not guaranteed on
+# every base image.  Materialize the links (and the node if udev has not
+# created it yet) before setup_lane checks for the journal port.
+prepare_journal_ports()
+{
+    test -d /sys/class/virtio-ports || return 0
+    mkdir -p /dev/virtio-ports
+    for port in /sys/class/virtio-ports/vport*; do
+        test -r "$port/name" || continue
+        name=$(cat "$port/name") || continue
+        case "$name" in
+            nfsp-journal-*) ;;
+            *) continue ;;
+        esac
+        node=/dev/${port##*/}
+        if [ ! -e "$node" ]; then
+            IFS=: read -r major minor < "$port/dev" || continue
+            test -n "$major" && test -n "$minor" || continue
+            mknod "$node" c "$major" "$minor" 2>/dev/null || continue
+            chmod 0600 "$node"
+        fi
+        ln -sfn "$node" "/dev/virtio-ports/$name"
+    done
+}
+
 valid_count()
 {
     case "$1" in
@@ -2042,6 +2070,7 @@ setup)
         cleanup_fixture >/dev/null || true
     fi; exit "$rc"' EXIT
     mkdir -p "$root"
+    prepare_journal_ports
     printf '%s\n' "$requested_count" > "$root/fixture.count"
     printf '%s\n' "$fixture_label" > "$root/fixture.mode"
     printf '%s\n' "$nfs_version" > "$root/fixture.version"

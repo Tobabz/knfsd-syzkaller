@@ -1,0 +1,147 @@
+From 11e2f04b7205eb6d40820f6bb9495613cd9855c2 Mon Sep 17 00:00:00 2001
+From: ci <ci@localhost>
+Date: Tue, 27 Oct 2026 01:09:24 +0900
+Subject: [PATCH] executor: finish target generation after a failed freeze
+
+---
+ executor/executor.cc                  | 24 ++++++++++++++++--------
+ executor/nfs_proxy_activation.h       | 16 +++++++++++++---
+ executor/nfs_proxy_activation_test.go | 21 +++++++++++++++++++--
+ executor/test.h                       | 10 +++++++---
+ 4 files changed, 55 insertions(+), 16 deletions(-)
+
+diff --git a/executor/executor.cc b/executor/executor.cc
+index 0eb9f544e..45449082d 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -1261,19 +1261,27 @@ static void nfsp_broker_wait(int timeout_ms)
+ }
+ 
+ // Fork server: the program asked to end (DONE, which fuzzed syscalls can also
+-// send).  Freeze it, then end the KCOV generation and publish its remote
+-// coverage while nothing of the program runs.  The caller then kills it, and
+-// nfsp_broker_end closes the window once its cgroup is empty.  The window is
+-// still open here, and only a frozen program's generation is FINISHed.
++// send).  Request a freeze before ending the KCOV generation.  If the
++// cgroup.freeze write failed, the program can still run; abort instead of
++// publishing.  If the write succeeded, FINISH may drain roots and tokens even
++// if a timed-out call thread is still in the kernel: CLOSING rejects new
++// roots/tokens, and the caller kills the cgroup after this.  The caller then
++// closes the window once the cgroup is empty; only a program whose freeze
++// request was accepted is FINISHed.
+ static void nfsp_broker_end_program()
+ {
+ 	nfsp_broker* k = &nfsp_broker_state;
+-	bool frozen = nfsp_cg_freeze(kNfspCgroupFd, syscall_timeout_ms * 10);
+-	if (!frozen)
+-		debug("NFS proxy: program did not freeze\n");
++	int freeze = nfsp_cg_freeze(kNfspCgroupFd, syscall_timeout_ms * 10);
++	if (freeze == NFSP_CG_FREEZE_WRITE_FAILED)
++		debug("NFS proxy: program freeze write failed\n");
++	else if (freeze == NFSP_CG_FREEZE_WRITE_OK)
++		debug("NFS proxy: program frozen wait timed out\n");
++	// DONE is untrusted and can be sent by a fuzzed call.  A timed-out call
++	// thread can still be in the kernel after it.  The evidence for publishing
++	// is an accepted cgroup.freeze write plus FINISH's bounded root/token drain.
+ 	uint64 generation = k->b.generation;
+ 	bool finished = false;
+-	if (frozen && k->done_valid)
++	if (k->done_valid && freeze != NFSP_CG_FREEZE_WRITE_FAILED)
+ 		finished = cover_finish_remote_generation(generation, 1000 * slowdown_scale);
+ 	if (finished || cover_abort_remote_generation(generation, false))
+ 		nfsp_broker_kcov_done = true;
+diff --git a/executor/nfs_proxy_activation.h b/executor/nfs_proxy_activation.h
+index 9f58928a1..2dd9a5623 100644
+--- a/executor/nfs_proxy_activation.h
++++ b/executor/nfs_proxy_activation.h
+@@ -630,11 +630,21 @@ static int nfsp_cg_reenter(int pid, int proc)
+ 	return entered;
+ }
+ 
+-// Parent: freeze every task of the program.  1 once all are frozen; a task
+-// still in a syscall freezes only when that syscall returns.
++// Parent: freeze every task of the program.  The write result and the wait
++// result are separate: 0 means cgroup.freeze could not be written, 1 means
++// the request was accepted but the frozen wait timed out, and 2 means every
++// task was observed frozen.  A task still in a syscall freezes only when that
++// syscall returns.
++#define NFSP_CG_FREEZE_WRITE_FAILED 0
++#define NFSP_CG_FREEZE_WRITE_OK 1
++#define NFSP_CG_FREEZE_FROZEN 2
+ static int nfsp_cg_freeze(int dir, uint64_t timeout_ms)
+ {
+-	return nfsp_cg_write(dir, "cgroup.freeze", "1") && nfsp_cg_wait(dir, "frozen", 1, timeout_ms);
++	if (!nfsp_cg_write(dir, "cgroup.freeze", "1"))
++		return NFSP_CG_FREEZE_WRITE_FAILED;
++	if (!nfsp_cg_wait(dir, "frozen", 1, timeout_ms))
++		return NFSP_CG_FREEZE_WRITE_OK;
++	return NFSP_CG_FREEZE_FROZEN;
+ }
+ 
+ // Parent: kill every task of the program and wait until the cgroup is empty,
+diff --git a/executor/nfs_proxy_activation_test.go b/executor/nfs_proxy_activation_test.go
+index 3c1da7acf..3c7ef6b24 100644
+--- a/executor/nfs_proxy_activation_test.go
++++ b/executor/nfs_proxy_activation_test.go
+@@ -159,9 +159,11 @@ func TestNfsProxyForkServerEndsTheProgram(t *testing.T) {
+ 	)
+ 	end := nfspSection(t, "executor.cc", "static void nfsp_broker_end_program()\n{", "\n}\n")
+ 	nfspRequireOrder(t, "nfsp_broker_end_program", end,
+-		"nfsp_cg_freeze(kNfspCgroupFd",
+-		"if (frozen && k->done_valid)",
++		"int freeze = nfsp_cg_freeze(kNfspCgroupFd",
++		"if (freeze == NFSP_CG_FREEZE_WRITE_FAILED)",
++		"if (k->done_valid && freeze != NFSP_CG_FREEZE_WRITE_FAILED)",
+ 		"cover_finish_remote_generation(generation",
++		"cover_abort_remote_generation(generation, false)",
+ 		"write_extra_output();",
+ 	)
+ 	if bytes.Contains(end, []byte("nfsp_act_release")) {
+@@ -235,3 +237,18 @@ func TestNfsProxySealSurvivesExec(t *testing.T) {
+ 		"PR_CAPBSET_DROP, NFSP_CAP_SYS_PTRACE",
+ 	)
+ }
++
++func TestNfsProxyFreezeWriteFailureDoesNotPublish(t *testing.T) {
++	end := nfspSection(t, "executor.cc", "static void nfsp_broker_end_program()\n{", "\n}\n")
++	if bytes.Contains(end, []byte("if (frozen")) {
++		t.Fatal("nfsp_broker_end_program lost its freeze result")
++	}
++	freeze := nfspSection(t, "nfs_proxy_activation.h", "static int nfsp_cg_freeze(", "\n}\n")
++	nfspRequireOrder(t, "nfsp_cg_freeze", freeze,
++		`if (!nfsp_cg_write(dir, "cgroup.freeze", "1"))`,
++		"return NFSP_CG_FREEZE_WRITE_FAILED;",
++		"if (!nfsp_cg_wait(dir, \"frozen\", 1, timeout_ms))",
++		"return NFSP_CG_FREEZE_WRITE_OK;",
++		"return NFSP_CG_FREEZE_FROZEN;",
++	)
++}
+diff --git a/executor/test.h b/executor/test.h
+index 204aec41e..4df21f7c7 100644
+--- a/executor/test.h
++++ b/executor/test.h
+@@ -796,14 +796,18 @@ static int test_nfsp_cgroup()
+ 	int ret = reentry != 0;
+ 	for (int i = 0; i < 1000 && !(progress[0] && progress[1] && progress[3]); i++)
+ 		usleep(1000);
+-	bool frozen = nfsp_cg_freeze(dir, 1000);
++	int freeze = nfsp_cg_freeze(dir, 1000);
+ 	uint64 program = progress[0], helper = progress[1];
+ 	usleep(50 * 1000);
+-	if (!frozen || progress[0] != program || progress[1] != helper) {
+-		printf("freeze: frozen=%d program %llu -> %llu helper %llu -> %llu\n", frozen, program,
++	if (freeze != NFSP_CG_FREEZE_FROZEN || progress[0] != program || progress[1] != helper) {
++		printf("freeze: result=%d program %llu -> %llu helper %llu -> %llu\n", freeze, program,
+ 		       (uint64)progress[0], helper, (uint64)progress[1]);
+ 		ret = 1;
+ 	}
++	if (nfsp_cg_freeze(-1, 0) != NFSP_CG_FREEZE_WRITE_FAILED) {
++		printf("freeze: invalid directory did not report a write failure\n");
++		ret = 1;
++	}
+ 	bool empty = nfsp_cg_empty(dir, 1000);
+ 	int status = 0;
+ 	// Only an escaped program survives the cgroup kill.
+-- 
+2.34.1
+

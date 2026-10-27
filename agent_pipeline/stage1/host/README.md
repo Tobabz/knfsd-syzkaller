@@ -5,11 +5,12 @@ to run one candidate on a real guest:
 
 | Command | What |
 |---|---|
-| `generate SPEC` | Writes every host record `stage1.json` refers to, plus `stage1.json` and `collector.json` |
+| `generate SPEC` | Writes every host record `stage1.json` refers to, plus `stage1.json` and `collector.json`; with a `stage2` section, the Stage 2 syz-manager config (`../../stage2/README.md`) |
 | `collect --config collector.json IN OUT` | The engine's host command: boots one guest, runs the harness program on lane 0 with remote KCOV, writes the capture |
 | `probe --stage1 S --program P --out D` | Runs one program the same way, without the service. Use it first on a new host |
 | `target-pcs --stage1 S --job J --out F` | Builds a verified `TargetPcMapping` for a submitted job from the pinned vmlinux |
 | `check-pcs --stage1 S --coverage F` | Checks that the published PCs are coverage call sites, so they use the same form as `target-pcs` |
+| `validate --config validate.json IN OUT` | The validation command of a Harness Generation patch set (`generation.validation.argv`, see below) |
 
 Everything is invoked as `uv run python -m agent_pipeline.stage1.host ...`.
 The tests (`tests/agent_pipeline/test_stage1_host.py`) cover generation, the
@@ -18,10 +19,17 @@ collector with a scripted guest, and mapping on a gcc
 `s1_reached`. They do not exercise a real guest, kernel or model: this
 runbook does.
 
-## What only the KVM host can provide
+## What only the VM host can provide
 
-- `/dev/kvm`, `qemu-system-x86_64`, `ssh`/`scp`, binutils (`objdump`,
-  `addr2line`, `nm`).
+- `qemu-system-x86_64`, `ssh`/`scp`, binutils (`objdump`, `addr2line`,
+  `nm`). `/dev/kvm` is optional: with it the guests run under KVM, without
+  it under TCG (software emulation, about ten times slower). The spec's
+  `collector.accel` is `auto` by default; generation resolves it on the
+  generating host, writes it to `collector.json`, and for TCG scales the
+  boot, fixture and engine budgets and the execprog slowdown by 10. Set it
+  to `kvm` or `tcg` to pin the choice; `KOOV_QEMU_ACCEL` does the same for
+  `tools/bootstrap-kcov-env.py`, the baker and
+  `tools/prepare-live-lane-config.py`.
 - The bootstrap env: the patched kernel tree, `bzImage`, `vmlinux`,
   `.config`, the baked image and the syzkaller binaries
   (`tools/bootstrap-kcov-env.py`).
@@ -33,7 +41,7 @@ runbook does.
 
 ## Run
 
-From the repository root, on the KVM host, at the commit under test:
+From the repository root, on the VM host, at the commit under test:
 
 ```sh
 uv sync --locked --extra agent-openai
@@ -53,6 +61,11 @@ uv run python tools/syzkaller/build.py --source env/syzkaller \
 mkdir -p stage1-host
 cp agent_pipeline/stage1/host/template/* stage1-host/
 $EDITOR stage1-host/host-spec.json
+
+# 3b. Optional, Harness Generation: the generation OS user, once per host,
+#     then "generation": {} in the spec (see "Validating a Harness
+#     Generation patch set")
+sudo bash tools/setup-generation-user.sh --spec stage1-host/host-spec.json
 
 # 4. Generate records and configs (writes stage1-state/)
 uv run python -m agent_pipeline.stage1.host generate stage1-host/host-spec.json
@@ -93,7 +106,9 @@ guest. Read `probe-1/probe.json`:
 
 1. **Facts.** `boot_ok`, `fixture_ok`, `lane_ok`, `runner_completed`,
    `collection_completed` and `extra_present` should all be true, and
-   `runtime_errors` should be empty.
+   `runtime_errors` should be empty, and `crash` should be null: a
+   kernel crash on the serial console is reported there, not as a
+   runtime error.
 2. **Generation counters.** `generation_begin` and `aggregate_published`
    should both be 1. execprog's machine check runs its own extra-coverage
    request, which opens a generation, so the window does not cover the
@@ -115,6 +130,116 @@ guest. Read `probe-1/probe.json`:
    so there are none, and `target-pcs` refuses a vmlinux that still has
    them. If `callsite_plus_5` matches instead, the coverage file holds
    return addresses, and `target-pcs` must shift its PCs to match.
+
+## KASAN and KCSAN from one spec
+
+`variants` in the spec (in place of `variant`) lists the sanitizer builds
+of the same harness, for example:
+
+```json
+"variants": [
+  {"sanitizer": "kasan", "capability_evidence": {"HCAP-11": ["..."]}},
+  {"sanitizer": "kcsan", "capability_evidence": {}}
+]
+```
+
+Build each with `tools/bootstrap-kcov-env.py --variant <sanitizer>` into
+`env/images/<sanitizer>`. The syzkaller build, admission profile, neutral
+controls, judge profile and capability statements are shared. Each variant
+gets its own kernel pins, instrumentation manifest, descriptor, support
+boundary, HCAP revision, approval and binding, so the policy's sanitizer
+selects the harness. KVM capability evidence is pinned to a descriptor, so
+it is collected and listed per variant; a variant without it has those
+capabilities without evidence. `collector.json` keeps each variant's
+`bzimage` and `kernel` under `variant_files`, and the collector boots the
+files of the lease's descriptor. `probe` and `check-pcs` take
+`--variant kcsan`; a KCSAN harness also reports `BUG: KCSAN:` as a crash. A
+`stage2` section writes one manager config per variant.
+
+## Promotion criteria (#100)
+
+Capability evidence must be typed: a `promotion-probe-evidence.v1`
+campaign, or the capability's own KVM evidence model. Untyped evidence is
+refused for every capability.
+
+`generate.LEGACY_CAPABILITY_BASELINES` pins, for each capability the
+checked-in specs held before the criteria, `capability_baseline_sha256` of
+its entry (without `validated_layout` and evidence references). The
+repository pins them, so a spec cannot exempt a capability. While an entry
+still matches, it keeps its earlier status; that includes the live spec's
+HCAP-14, which has been `experimental` since before the criteria. A new
+capability, or one whose entry changed, needs all of the following, and
+`generate` refuses the spec otherwise:
+
+- a `contract` (entry points, boundary functions, fixed arguments and
+  types; `docs/design/02-llm-agent/04-harness-capability-spec.md` §3.3);
+- a `PromotionProbeEvidence` file in `capability_evidence` whose probes
+  are the contract's boundary functions and whose minimal, generated and
+  neutral run sets meet the thresholds in `agent_pipeline/promotion.py`
+  (KVM only for a `time_dependent` contract);
+- syz call arguments that carry no literal the contract does not fix. The
+  check reads the pinned target's argument shapes through the parser
+  bundle's `describe`, so the bundle must be built from this repository's
+  bridge sources.
+
+`probe-campaign` runs the campaign and writes the evidence:
+
+```sh
+uv run python -m agent_pipeline.stage1.host probe-campaign \
+    --config campaign.json campaign-out
+```
+
+`campaign.json` is a `campaign.CampaignConfig`: `stage1` (and optionally
+`collector`), the binding (`execution_harness_id`, `hcap_revision`; a
+staged one boots from `staged_files`), `capability_id`, the candidate's
+`withheld_program_sha256s`, the runtime `selection` index and `seed`. The
+probes are the contract's boundary functions mapped to the binding's
+coverage call sites (`probe-<name>.json`). The parser bundle's `generate`
+makes a minimal program per entry syz call and distinct generated and
+mutated programs over the admission profile's calls; each is parsed and
+admitted as the Materializer would, and withheld or refused ones are
+dropped. Each run boots a fresh guest: the minimal programs (3 runs), 16
+generated programs twice each, and the selection's neutral control 3
+times. `campaign-out/campaign.json` is `evidence` (then
+`campaign-out/evidence.json` goes into `capability_evidence`), `refused`
+(the criteria are not met, or the contract has no entry syz call) or
+`inconclusive` (a guest did not boot or a run did not finish). The parser
+bundle must be built from this repository's bridge sources, `generate.go`
+included.
+
+The command exits 0 whenever it wrote `campaign.json`; a nonzero exit is
+an infrastructure end. For a staged harness the service runs it as
+`generation.campaign`, which `generate` writes with this `stage1.json` and
+`collector.json` (see "Promotion of a staged harness" in
+[`../README.md`](../README.md)).
+
+`gap_contracts` gives the contract a capability filling each gap ID must
+declare; it is copied into the generated HCAP. A capability names the gap
+it fills with `fills_gap`, and `generate` refuses it unless its contract is
+that gap's. A capability that fills a gap also needs a campaign that names
+the candidate's programs in `withheld_program_sha256s`.
+
+The spec's `gap_contracts` are the operator's statement. A Harness
+Generation patch set can change the spec, so on that path the Controller
+passes the gap and its contract from its own state, with the spec the patch
+set started from:
+
+```sh
+uv run python -m agent_pipeline.stage1.host generate SPEC \
+    --gap gap.json --base-spec base-host-spec.json
+```
+
+`gap.json` is a `GapContract`. The spec cannot give that gap another
+contract, and every capability the patch set adds or changes relative to
+the base spec must fill that gap, and it may not remove a base capability.
+Capabilities the base already holds are not the patch set's, whatever gap
+they fill. The base spec must come from the Controller's own read-only
+store, not from the generation worktree.
+
+Outside the legacy baselines, "judged" means every generation: a capability
+promoted after the criteria keeps its promotion only while its spec entry
+lists a probe campaign bound to the generated harness. That is the same
+binding the capability-specific KVM evidence has.
 
 ## How the pieces bind
 
@@ -149,3 +274,83 @@ guest. Read `probe-1/probe.json`:
   is written into the observation (a false fact or a runtime error), and
   the Judge returns `INCONCLUSIVE(infra)`. `console.log`, `executor.log`,
   `dmesg.log` and `collector-result.json` are sealed with the capture.
+
+## Validating a Harness Generation patch set
+
+With a `generation` section in the host spec, `generate` also writes
+`stage1.json`'s `generation` (`../README.md`) and
+`stage1-state/validate.json`, so each patch set the generation Agent
+answers is validated by `validate` (`validate.py`;
+`docs/design/02-llm-agent/07-harness-gap-issue.md` §5.2). Everything
+follows this repository's layout:
+
+| Where | What |
+|---|---|
+| this checkout | the clone the worktrees and patch sets start from; the spec must be inside it |
+| `stage1-state/generation-worktrees/` | one worktree per generation |
+| `stage1-state/validation-work/` | scratch per validation task (`tree`, `env`, `state`, `cas`) |
+| the spec's `env_dir` and `syzkaller_bundle` | the base env and parser bundle of every rebuild |
+| `tools/harness-generation-build.py` | the build step |
+| `/usr/local/libexec/knfsd-harness-gen` | the launcher of `tools/setup-generation-user.sh` |
+
+`tools/setup-generation-user.sh` (run once with `sudo`, like
+`make-base-image.sh`) creates the system user `harness-gen`, installs the
+launcher (a new network namespace, then `setpriv` to `harness-gen` with
+no_new_privs and umask 002) with a sudoers rule that lets only the
+invoking user run it, creates the two state directories setgid to the
+`harness-gen` group, adds ACLs where `harness-gen` could not read the
+clone, and checks the result. The invoking user joins the group at its
+next login. Commands through sudo get its `secure_path`, so give the
+build step tools outside it by absolute path (`--go`).
+
+The spec section, all fields optional:
+
+```json
+"generation": {
+  "user": "harness-gen",
+  "launcher": null,
+  "base_ref": "HEAD",
+  "workers": 1,
+  "build_args": ["--go", "/opt/go1.26.0/bin/go"],
+  "build_timeout_s": 21600,
+  "validation_timeout_s": 28800
+}
+```
+
+`launcher` replaces the setup script's wrapper with another argv prefix
+that runs as a separate user without network; `build_args` go to the
+build step (`--go`, `--version`, `--kernel-repo`, `--syz-repo`,
+`--jobs`). `validate.json` is a `validate.ValidateConfig`:
+
+| Field | What |
+|---|---|
+| `repo` | the host's clone; a patch set names one of its commits |
+| `work_root` | scratch per task; `env` is setgid 2775 so the generation user can write the build |
+| `base_spec` | the host's own `host-spec.json`, never the tree's |
+| `collector` | the service's `collector.json` (`staged_files`, key, timings) |
+| `build_argv` | the build step, with `{tree}`, `{env}`, `{base_env}`, `{sanitizer}` |
+| `launcher` | the generation OS user without network, as in `generation.launcher` |
+| `build_timeout_s`, `build_env`, `allowed_paths`, `keep_work` | limits and debugging |
+
+`tools/harness-generation-build.py` compares what each build reads
+(kernel series and configs, syzkaller series, baker, lane, guest
+dependencies) between the patched tree and this checkout. When nothing
+changed it links the base env and bundle; otherwise it runs the tree's
+`bootstrap-kcov-env.py` for the one variant with the base env's trees as
+local mirrors, and `tools/syzkaller/build.py` when the syzkaller series
+changed.
+
+The build script writes a `tools/bootstrap-kcov-env.py` env into `{env}`
+(`linux/`, `images/<variant>/`, `syzkaller/`) and the parser bundle into
+`{env}/syz-bridge/` (`bundle/` and `checkout/`). It runs without network,
+so give it local mirrors, and it may copy from `{base_env}` what the patch
+set did not change (a spec-only patch set needs no rebuild). The new
+build's host files are then copied to `collector.json`'s `staged_files`
+(`<state>/staged-files/<sha256>/<name>`), where the collector finds a pin
+the configured files do not match.
+
+A patch set must add `stage1-host/generation/<gap id>/smoke.syz` (and
+optionally `smoke-*.syz` and a `selection.json`). Its capabilities are
+`experimental` with `fills_gap` and the gap's contract. The VM runs are
+the smoke programs, the neutral control of their selection, and every
+neutral control of the base spec as the regression.

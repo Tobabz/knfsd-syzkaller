@@ -103,9 +103,12 @@ class CapabilityProposal(Record):
     schema_version: Literal["capability-proposal.v1"] = \
         "capability-proposal.v1"
     #: The missing layer: syzlang, pseudo-syscall/executor, fixture or
-    #: tool, or remote-KCOV attribution context.
+    #: tool, or remote-KCOV attribution context for Planning (equal to its
+    #: gap_class); a semantic subset, the Proxy, or the Rule Compiler's
+    #: lowering for Mutation Strategy (#81, MUTATION_LAYERS).
     layer: Literal["syzlang", "pseudo_syscall_executor", "fixture_or_tool",
-                   "remote_kcov_attribution"]
+                   "remote_kcov_attribution", "semantic_subset", "proxy",
+                   "compiler_lowering"]
     summary: ShortText
     #: The condition on the selected path that must be created.
     required_condition: LongText

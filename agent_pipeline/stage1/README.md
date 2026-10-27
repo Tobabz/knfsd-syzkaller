@@ -40,6 +40,13 @@ python -m agent_pipeline.stage1 --config stage1.json run --job <job id>
 approval with `approve JOB TASK REVIEW_MANIFEST_SHA256 DECISION_ID`, then
 `run` again; `replay JOB` re-checks the stored transitions.
 
+`seed JOB --policy kcsan-default` starts a new job for JOB's candidate
+under another policy (another sanitizer, #81 R5) from JOB's plan: no
+Analysis or Planning, the plan is re-validated against the new binding's
+HCAP and materialized, and Q1 must reach again on that harness. Register
+the target-PC mapping of the new harness's vmlinux first (`target-pcs`
+takes the job's own harness).
+
 Only `run` calls a model. Every other command is one-shot: an Agent Task
 it creates (`submit`, `deny`, `operator resume`, a resolved issue) is
 recorded with its attempt left `sending`, and `run`, or a `run` already
@@ -70,6 +77,7 @@ processes at once, or after a later one is ignored.
 | `judge_versions` | fallback `Q1AdmissibilityProfile` / `RemoteKcovSupportBoundary` digests |
 | `vmlinux_artifact_name`, `instrumentation_artifact_name` | descriptor build-artifact names used for the kernel identity |
 | `engine` | the host command, its cwd, environment, resource key and timeout |
+| `generation` | optional Harness Generation (07 §5): the Agent's sandbox (`repo`, `worktree_root`, `base_ref`, `launcher`, `env`, `allowed_paths`, `workers`), the `validation` command and the optional promotion probe `campaign` command; see below |
 
 Keep `state_dir` and `artifact_root` together: Controller history, Runner
 receipts and Q1 publications are needed for replay.
@@ -99,11 +107,90 @@ The command writes `output/capture.json`:
 
 `reachability.json` is a canonical `q1.RemoteKcovObservation` and each
 coverage file a canonical `sealed_q1.PublishedCoverage` for the same
-correlation (see the Q1 section of [`../README.md`](../README.md)). Paths are plain file names
+correlation. A run with a kernel crash also lists a `crash-report`
+artifact (`application/vnd.knfsd.crash-report+json`, a canonical
+`crash.CrashReport`); the crash is not a runtime error, and the Controller
+keeps it as a crash finding on the job (see the Q1 section of [`../README.md`](../README.md)). Paths are plain file names
 in `output/`. The collection interval is the supervised process's own start
 and end; stdout and stderr are kept in `process.log`. A nonzero exit,
 timeout or malformed capture ends the task `capture_failed`, which the
 Controller treats as a runtime failure, not a verdict.
+
+## Harness Generation
+
+With `generation` set, a job whose policy has a `harness_generation_budget`
+goes from a harness gap to `harness_generating` instead of stopping
+(`docs/design/02-llm-agent/09-job-state-graph.md` §3.2). `run` runs the
+generation Agent on its own workers (`QueuedGenerationExecutor`) and each
+patch set it answers through `CommandValidator`, which runs
+`generation.validation.argv` once per validation task with `{input}`,
+`{output}` and `{resource}` replaced (the contract is in
+`validation.py`). The command rebuilds the harness from `input/patch.diff`
+on the base binding, runs the 07 §5.2 checks in a VM and writes
+`output/report.json` (on a KVM host, `agent_pipeline.stage1.host validate`,
+which `generate` sets up from the host spec's `generation` section; see
+[`host/README.md`](host/README.md)): `passed` with the new
+`descriptor.json` and staged
+`hcap.json`, `rejected` with a typed reason, or `inconclusive`. A pass
+stores a staged `ExecutionHarnessApproval`; the Materializer's authority
+takes it beside the static `execution_harness_approvals`, and the waiting
+jobs continue on the staged binding. Tasks and approvals are in
+`state_dir/validations.sqlite`; command runs in `validation-runs/`.
+
+Only `run` validates (it holds `validation.lock`); other commands read the
+statuses and leave submits to `run`. A validation running when `run` stops
+ends `inconclusive`, and the Controller runs it again as a new task after
+restart. With `slots`, a validation takes a KVM slot from the same pool as
+the Runner workers; without, it runs on its own `resource_key`, so the host
+needs room for both.
+
+### Promotion of a staged harness
+
+With `generation.campaign` set (`generate` writes it from the host spec's
+`generation` section), a passed generation's staged harness goes to
+promotion (07 §5.3, `controller/promotion.py`). Promotion never changes a
+job's state; the jobs keep running on the staged binding.
+
+1. **Candidate programs.** The Controller collects the plan program of
+   every job on the staged binding. Once no live job there is still
+   without a plan, it starts the campaigns with those digests withheld.
+2. **Campaigns.** One task per capability the staged HCAP added or changed
+   for the gap (a Stage 2 gap has none: its promotion is the M7 gate's).
+   `CommandCampaigner` runs `generation.campaign.argv` with `{input}`,
+   `{output}` and `{resource}` replaced (the contract is in
+   `campaigns.py`): `input/campaign.json` is a `CampaignConfig` for the
+   staged binding, and the command is `agent_pipeline.stage1.host
+   probe-campaign`. Evidence is stored in the CAS. An `inconclusive`
+   campaign runs again up to the generation's `runtime_retry_limit`.
+   Tasks are in `state_dir/campaigns.sqlite`; runs are in
+   `campaign-runs/`.
+3. **Review.** With evidence for every capability the promotion waits in
+   `review`. A person decides only at the end of Stage 1 of a job on the
+   staged harness (`s1_reached` or later), never in the middle of a stage:
+   until then `approve-promotion` and `reject-promotion` are refused, and
+   from then the job's `status` shows `promotion_due`. A refused campaign, or a candidate program known later that
+   a campaign ran, makes it `not_met`: the staged binding stays and
+   `retry-promotion` runs the campaigns again.
+
+   ```sh
+   uv run python -m agent_pipeline.stage1 --config stage1.json promotions
+   uv run python -m agent_pipeline.stage1 --config stage1.json \
+       approve-promotion gen-0003.p review-1 --note "..."
+   uv run python -m agent_pipeline.stage1 --config stage1.json \
+       export-promotion gen-0003.p evidence/
+   ```
+
+4. **Promotion.** After approval the host promotes. The capability and
+   the exported evidence go into the host spec (`capability_evidence`),
+   `generate` runs, and the service runs on the new `harness_catalog_ref`.
+   The promotion becomes `promoted` once the registry's binding for the
+   build key carries each capability with its campaign evidence. The gap's
+   issue is then resolved, and the registry change moves the jobs (09 §5).
+
+`reject-promotion` (at a Stage 1 end, not while campaigns run) sends the jobs on the staged binding back to the
+registry's binding. A job that meets the gap again ends in
+`blocked_harness_gap(generation_promotion_rejected)` until an operator
+sends `retry_generation`.
 
 ## Q1 authority
 

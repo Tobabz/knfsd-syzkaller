@@ -487,8 +487,10 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
    Every rule of the production rule set must fit it (`--describe-rules` shows each rule), and
    every listed element must be used by a rule that fires in the window.
 3. Production: boot a target-mode lane with that rule set ("Target mode" above) and run until the
-   guest crashes with those rules firing in the crash window. A deliberate panic after the programs
-   is enough; the crash-cut program must have a mutation recorded.
+   guest crashes with those rules firing in the crash window. The crash must come from the campaign
+   itself: never crash the guest on purpose (sysrq panic, NMI, forced reset) to get one (06 §30). The
+   crash-cut program must have a mutation recorded. Until such a crash exists the subset is not
+   promoted; step 6's `pin` keeps it in a staged revision with crash survival pending meanwhile.
 4. Replay: `replay_runner plan`, then boot a fresh VM on another journal directory and run
    `syz-execprog -procs=1 -repeat=1` over `REPLAY/programs.log` ("Semantic replay" above).
 5. Record the run instead of `replay_runner judge`:
@@ -502,10 +504,22 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
    ```
 
    It prints `run=REF` and the verdict, and exits 3 with the reasons when the run does not count.
-6. Promote: `python -m agent_pipeline.semantic_promotion promote --store ARTIFACTS --build REF
+   A run whose window ended without a crash (`--production-end vm_teardown`) counts only for `pin`.
+6. Pin (06 §30 stage 1): `python -m agent_pipeline.semantic_promotion pin` with the arguments of
+   `promote` below checks everything but crash survival and prints `pinned=REF hcap_revision=REF`.
+   The registry marks the subset `crash_survival: pending`, and the HCAP-10 entry says the revision
+   is staged. Bind it only to a staged harness: the Stage 2 preflight refuses a configured binding
+   whose HCAP pins a pending subset. Jobs on the staged harness use the subset; their campaigns are
+   where the natural crash of step 3 comes from.
+7. Promote (stage 2): `python -m agent_pipeline.semantic_promotion promote --store ARTIFACTS --build REF
    --subset SUBSET.json --run REF [--run REF ...] --hcap HCAP_REVISION [--previous PROMOTED_REF]`
-   prints `promoted=REF hcap_revision=REF`, or every reason it refuses. Bind the new revision in the
+   prints `promoted=REF hcap_revision=REF`, or every reason it refuses. `--previous` is the pinned
+   registry: its pending subset passes and keeps the pin's evidence. Bind the new revision in the
    harness registry for Stage 2 to use it.
+
+Either gate refuses the subset when a run's production ended in a guest crash with no MutationDelta
+at the crash cut: replay cannot reproduce that crash. It then stores an `UnreproducibleCrash` with
+those runs and prints `unreproducible=REF`.
 
 `tests/agent_pipeline/test_semantic_promotion.py` runs this with the M6 host run standing in for the
 KVM run; that is a test of the gate, not evidence.

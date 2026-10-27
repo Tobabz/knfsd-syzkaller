@@ -2,6 +2,10 @@
 
 ``generate SPEC``           write every host record and stage1.json
 ``collect --config C IN OUT``  the engine's host command (one lease)
+``validate --config V IN OUT``  the validation command of a Harness
+                            Generation patch set (07 §5.2)
+``probe-campaign --config C OUT``  the promotion probe campaign of a
+                            capability (07 §5.3)
 ``probe --stage1 S --program P --out D``  boot and run one program, no service
 ``target-pcs --stage1 S --job J --out F``  verified TargetPcMapping for a job
 ``check-pcs --stage1 S --coverage F``  are published PCs coverage call sites?
@@ -19,8 +23,8 @@ from ...data import load_record
 from ...materializer import ExecutionHarnessApproval, ExecutionHarnessDescriptor
 from ...q1 import CandidateTarget, KernelIdentity
 from ..config import Stage1Config
-from .collector import CollectorConfig, CollectorError, collect
-from .pins import HostFilePin, PinCache, verify_file
+from .collector import CollectorConfig, CollectorError, collect, pinned_path
+from .pins import HostFilePin, PinCache
 
 
 def _collector(args) -> CollectorConfig:
@@ -29,16 +33,22 @@ def _collector(args) -> CollectorConfig:
     return CollectorConfig.load(path)
 
 
-def _descriptor(config: Stage1Config, harness_id: str | None = None
-                ) -> ExecutionHarnessDescriptor:
+def _descriptor(config: Stage1Config, harness_id: str | None = None,
+                variant: str | None = None) -> ExecutionHarnessDescriptor:
+    """The descriptor ``harness_id`` names, else the approved one of
+    ``variant`` (a sanitizer), else the first approved one."""
     store = ArtifactStore(config.artifact_root)
     if harness_id is not None:
         return load_record(store, harness_id, ExecutionHarnessDescriptor)
-    approvals = [load_record(store, ref, ExecutionHarnessApproval)
-                 for ref in config.execution_harness_approvals]
-    if len(approvals) != 1:
-        raise SystemExit("several approvals; pass --harness")
-    return approvals[0].descriptor
+    descriptors = [load_record(store, ref, ExecutionHarnessApproval).descriptor
+                   for ref in config.execution_harness_approvals]
+    if variant is None:
+        return descriptors[0]
+    found = [d for d in descriptors if d.sanitizer.value == variant]
+    if not found:
+        raise SystemExit(f"no approved {variant} harness; approved: "
+                         + ", ".join(d.sanitizer.value for d in descriptors))
+    return found[0]
 
 
 def _vmlinux(config: Stage1Config, collector: CollectorConfig,
@@ -47,14 +57,19 @@ def _vmlinux(config: Stage1Config, collector: CollectorConfig,
     builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
     name = config.vmlinux_artifact_name
     pin = load_record(store, builds[name], HostFilePin)
-    path = collector.files[name]
-    verify_file(pin, path, PinCache(collector.pin_cache))
+    path = pinned_path(collector, pin,
+                       collector.files_for(descriptor.sanitizer)[name],
+                       PinCache(collector.pin_cache))
     return path, pin
 
 
 def cmd_generate(args) -> int:
     from .generate import generate
-    result = generate(args.spec)
+    gap = None
+    if args.gap is not None:
+        from ...hcap import GapContract
+        gap = GapContract.model_validate_json(args.gap.read_bytes())
+    result = generate(args.spec, gap=gap, base_spec=args.base_spec)
     print(json.dumps(result.model_dump(mode="json"), indent=2, default=str))
     return 0
 
@@ -67,7 +82,25 @@ def cmd_collect(args) -> int:
         print(f"collector: {exc}", file=sys.stderr)
         return 2
     print(json.dumps({k: result[k] for k in (
-        "vm_instance_id", "facts", "published_pc_count", "runtime_errors")}))
+        "vm_instance_id", "facts", "published_pc_count", "runtime_errors",
+        "crash")}))
+    return 0
+
+
+def cmd_validate(args) -> int:
+    from .validate import ValidateConfig, validate
+    report = validate(ValidateConfig.load(args.config), args.input,
+                      args.output)
+    print(json.dumps({k: report.get(k) for k in ("result", "reason")}))
+    return 0
+
+
+def cmd_probe_campaign(args) -> int:
+    from .campaign import CampaignConfig, probe_campaign
+    report = probe_campaign(CampaignConfig.load(args.config), args.output)
+    print(json.dumps({k: report.get(k) for k in ("result", "reason")}))
+    # The report says the result; a nonzero exit is an infrastructure end
+    # (stage1.campaigns).
     return 0
 
 
@@ -75,12 +108,13 @@ def cmd_probe(args) -> int:
     """Run one program the way ``collect`` does, without the service: the
     first check on a new host (boot, fixture, counters, coverage)."""
     from ...hcap import RuntimeSelection
-    from .collector import (guest_cmdline, run_lane, verify_pins)
+    from .collector import (crash_report, guest_cmdline, run_lane,
+                            verify_pins)
     from .kcov import counter_deltas, generation_counters
     from .vm import QemuGuest, VmConfig
     config = Stage1Config.load(args.stage1)
     collector = _collector(args)
-    descriptor = _descriptor(config)
+    descriptor = _descriptor(config, variant=args.variant)
     files = verify_pins(collector, descriptor)
     selection = descriptor.allowed_runtime_selections[args.selection]
     if args.trace:
@@ -108,6 +142,8 @@ def cmd_probe(args) -> int:
         "boot_ok", "fixture_ok", "lane_ok", "runner_completed",
         "collection_started", "collection_completed", "extra_present")}
     summary["runtime_errors"] = run.runtime_errors
+    crash = crash_report(args.out, args.out / "console.log", descriptor)
+    summary["crash"] = None if crash is None else crash.model_dump(mode="json")
     summary["published_pcs"] = len(run.pcs)
     if run.stats_before is not None and run.stats_after is not None:
         summary["generation"] = generation_counters(
@@ -166,7 +202,8 @@ def cmd_check_pcs(args) -> int:
     from .target_pcs import check_pcs, vmlinux_callsites
     config = Stage1Config.load(args.stage1)
     collector = _collector(args)
-    vmlinux, pin = _vmlinux(config, collector, _descriptor(config))
+    vmlinux, pin = _vmlinux(config, collector,
+                            _descriptor(config, variant=args.variant))
     text = args.coverage.read_text()
     if text.lstrip().startswith("{"):
         pcs = json.loads(text)["pcs"]
@@ -187,14 +224,33 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
     g = sub.add_parser("generate")
     g.add_argument("spec", type=Path)
+    g.add_argument("--gap", type=Path,
+                   help="the Controller's GapContract for the gap a Harness "
+                        "Generation patch set fills (#100)")
+    g.add_argument("--base-spec", type=Path,
+                   help="with --gap, the host spec the patch set started "
+                        "from")
     c = sub.add_parser("collect")
     c.add_argument("--config", type=Path, required=True)
     c.add_argument("input", type=Path)
     c.add_argument("output", type=Path)
+    v = sub.add_parser("validate")
+    v.add_argument("--config", type=Path, required=True)
+    v.add_argument("--resource", help="the KVM slot the validator holds")
+    v.add_argument("input", type=Path)
+    v.add_argument("output", type=Path)
+    pc = sub.add_parser("probe-campaign")
+    pc.add_argument("--config", type=Path, required=True,
+                    help="a campaign.CampaignConfig")
+    pc.add_argument("output", type=Path)
     for name in ("probe", "target-pcs", "check-pcs"):
         p = sub.add_parser(name)
         p.add_argument("--stage1", type=Path, required=True)
         p.add_argument("--collector", type=Path)
+        if name != "target-pcs":
+            # target-pcs takes the job's own harness.
+            p.add_argument("--variant", help="sanitizer of the approved "
+                           "harness to use (default: the first)")
         if name == "probe":
             p.add_argument("--program", type=Path, required=True)
             p.add_argument("--out", type=Path, required=True)
@@ -211,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--cache", type=Path)
     args = ap.parse_args(argv)
     return {"generate": cmd_generate, "collect": cmd_collect,
+            "validate": cmd_validate, "probe-campaign": cmd_probe_campaign,
             "probe": cmd_probe, "target-pcs": cmd_target_pcs,
             "check-pcs": cmd_check_pcs}[args.command](args)
 
