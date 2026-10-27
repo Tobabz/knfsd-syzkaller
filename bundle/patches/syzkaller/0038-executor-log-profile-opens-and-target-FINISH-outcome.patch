@@ -4,22 +4,23 @@ Date: Tue, 27 Oct 2026 10:46:48 +0900
 Subject: [PATCH] executor: log profile opens and target FINISH outcome
 
 ---
- executor/common_linux.h | 5 ++++-
+ executor/common_linux.h | 6 +++++-
  executor/executor.cc    | 2 ++
- 2 files changed, 6 insertions(+), 1 deletion(-)
+ 2 files changed, 7 insertions(+), 1 deletion(-)
 
 diff --git a/executor/common_linux.h b/executor/common_linux.h
 index 095702742..68c4e1613 100644
 --- a/executor/common_linux.h
 +++ b/executor/common_linux.h
-@@ -2905,7 +2905,10 @@ static long syz_open_nfs_lane_profile(volatile long a0, volatile long a1)
+@@ -2905,7 +2905,11 @@ static long syz_open_nfs_lane_profile(volatile long a0, volatile long a1)
  		errno = ENAMETOOLONG;
  		return -1;
  	}
 -	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 +	debug("NFS lane profile: path=%s\n", path);
 +	long fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-+	debug("NFS lane profile: path=%s fd=%ld errno=%d\n", path, fd, errno);
++	debug("NFS lane profile: path=%s fd=%ld errno=%d\n", path, fd,
++	      fd < 0 ? errno : 0);
 +	return fd;
  }
  
@@ -39,4 +40,3 @@ index 45449082d..eedf39312 100644
  		// this process maps too.  Append it to the program's output.
 -- 
 2.34.1
-
