@@ -127,7 +127,9 @@ patch set it answers through `CommandValidator`, which runs
 `{output}` and `{resource}` replaced (the contract is in
 `validation.py`). The command rebuilds the harness from `input/patch.diff`
 on the base binding, runs the 07 §5.2 checks in a VM and writes
-`output/report.json`: `passed` with the new `descriptor.json` and staged
+`output/report.json` (on a KVM host, `agent_pipeline.stage1.host validate`;
+see [`host/README.md`](host/README.md)): `passed` with the new
+`descriptor.json` and staged
 `hcap.json`, `rejected` with a typed reason, or `inconclusive`. A pass
 stores a staged `ExecutionHarnessApproval`; the Materializer's authority
 takes it beside the static `execution_harness_approvals`, and the waiting

@@ -2,6 +2,8 @@
 
 ``generate SPEC``           write every host record and stage1.json
 ``collect --config C IN OUT``  the engine's host command (one lease)
+``validate --config V IN OUT``  the validation command of a Harness
+                            Generation patch set (07 §5.2)
 ``probe --stage1 S --program P --out D``  boot and run one program, no service
 ``target-pcs --stage1 S --job J --out F``  verified TargetPcMapping for a job
 ``check-pcs --stage1 S --coverage F``  are published PCs coverage call sites?
@@ -19,8 +21,8 @@ from ...data import load_record
 from ...materializer import ExecutionHarnessApproval, ExecutionHarnessDescriptor
 from ...q1 import CandidateTarget, KernelIdentity
 from ..config import Stage1Config
-from .collector import CollectorConfig, CollectorError, collect
-from .pins import HostFilePin, PinCache, verify_file
+from .collector import CollectorConfig, CollectorError, collect, pinned_path
+from .pins import HostFilePin, PinCache
 
 
 def _collector(args) -> CollectorConfig:
@@ -53,8 +55,9 @@ def _vmlinux(config: Stage1Config, collector: CollectorConfig,
     builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
     name = config.vmlinux_artifact_name
     pin = load_record(store, builds[name], HostFilePin)
-    path = collector.files_for(descriptor.sanitizer)[name]
-    verify_file(pin, path, PinCache(collector.pin_cache))
+    path = pinned_path(collector, pin,
+                       collector.files_for(descriptor.sanitizer)[name],
+                       PinCache(collector.pin_cache))
     return path, pin
 
 
@@ -79,6 +82,14 @@ def cmd_collect(args) -> int:
     print(json.dumps({k: result[k] for k in (
         "vm_instance_id", "facts", "published_pc_count", "runtime_errors",
         "crash")}))
+    return 0
+
+
+def cmd_validate(args) -> int:
+    from .validate import ValidateConfig, validate
+    report = validate(ValidateConfig.load(args.config), args.input,
+                      args.output)
+    print(json.dumps({k: report.get(k) for k in ("result", "reason")}))
     return 0
 
 
@@ -212,6 +223,11 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--config", type=Path, required=True)
     c.add_argument("input", type=Path)
     c.add_argument("output", type=Path)
+    v = sub.add_parser("validate")
+    v.add_argument("--config", type=Path, required=True)
+    v.add_argument("--resource", help="the KVM slot the validator holds")
+    v.add_argument("input", type=Path)
+    v.add_argument("output", type=Path)
     for name in ("probe", "target-pcs", "check-pcs"):
         p = sub.add_parser(name)
         p.add_argument("--stage1", type=Path, required=True)
@@ -236,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--cache", type=Path)
     args = ap.parse_args(argv)
     return {"generate": cmd_generate, "collect": cmd_collect,
+            "validate": cmd_validate,
             "probe": cmd_probe, "target-pcs": cmd_target_pcs,
             "check-pcs": cmd_check_pcs}[args.command](args)
 

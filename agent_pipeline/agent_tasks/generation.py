@@ -84,7 +84,16 @@ capability (07 section 5.2).
 
 The new capability must declare the gap's contract when one is given: the
 same entry points and boundary functions, and no other fixed argument
-values. Do not add probes. Do not write a vulnerability fix, and do not
+values. Do not add probes. In the host spec (stage1-host/host-spec.json),
+add or change only capabilities that fill this gap (fills_gap), with
+status experimental: the promotion criteria judge them later. Put the
+smoke program the validation runs at
+stage1-host/generation/<missing_capability_id>/smoke.syz (more as
+smoke-*.syz; a selection.json there names its runtime selection, else the
+first allowed one). It must reach a boundary function through the new
+capability; the neutral control of that selection must not. Do not change
+bundle/lane/boot-fixture.sh or bundle/lane/fixture.service: no pin covers
+them, so the validation refuses a change there. Do not write a vulnerability fix, and do not
 change what target kernel code does: kernel patches may only add
 instrumentation.
 

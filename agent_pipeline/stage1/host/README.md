@@ -10,6 +10,7 @@ to run one candidate on a real guest:
 | `probe --stage1 S --program P --out D` | Runs one program the same way, without the service. Use it first on a new host |
 | `target-pcs --stage1 S --job J --out F` | Builds a verified `TargetPcMapping` for a submitted job from the pinned vmlinux |
 | `check-pcs --stage1 S --coverage F` | Checks that the published PCs are coverage call sites, so they use the same form as `target-pcs` |
+| `validate --config validate.json IN OUT` | The validation command of a Harness Generation patch set (`generation.validation.argv`, see below) |
 
 Everything is invoked as `uv run python -m agent_pipeline.stage1.host ...`.
 The tests (`tests/agent_pipeline/test_stage1_host.py`) cover generation, the
@@ -237,3 +238,46 @@ binding the capability-specific KVM evidence has.
   is written into the observation (a false fact or a runtime error), and
   the Judge returns `INCONCLUSIVE(infra)`. `console.log`, `executor.log`,
   `dmesg.log` and `collector-result.json` are sealed with the capture.
+
+## Validating a Harness Generation patch set
+
+With `generation` in `stage1.json` (`../README.md`), each patch set the
+generation Agent answers is validated by `validate`
+(`validate.py`; `docs/design/02-llm-agent/07-harness-gap-issue.md` §5.2).
+Point `generation.validation.argv` at it:
+
+```json
+"validation": {
+  "argv": ["/srv/knfsd-syzkaller/.venv/bin/python", "-m",
+           "agent_pipeline.stage1.host", "validate",
+           "--config", "/srv/stage1-state/validate.json",
+           "{input}", "{output}"],
+  "cwd": "/srv/knfsd-syzkaller", "resource_key": "validate"}
+```
+
+`validate.json` is a `validate.ValidateConfig`:
+
+| Field | What |
+|---|---|
+| `repo` | the host's clone; a patch set names one of its commits |
+| `work_root` | scratch per task (`tree`, `env`, `state`, `cas`); `env` is setgid 2775 so the generation user can write the build |
+| `base_spec` | the host's own `host-spec.json`, never the tree's |
+| `collector` | the service's `collector.json` (`staged_files`, key, timings) |
+| `build_argv` | the operator's build script, with `{tree}`, `{env}`, `{base_env}` |
+| `launcher` | the generation OS user without network, as in `generation.launcher` |
+| `build_timeout_s`, `build_env`, `allowed_paths`, `keep_work` | limits and debugging |
+
+The build script writes a `tools/bootstrap-kcov-env.py` env into `{env}`
+(`linux/`, `images/<variant>/`, `syzkaller/`) and the parser bundle into
+`{env}/syz-bridge/` (`bundle/` and `checkout/`). It runs without network,
+so give it local mirrors, and it may copy from `{base_env}` what the patch
+set did not change (a spec-only patch set needs no rebuild). The new
+build's host files are then copied to `collector.json`'s `staged_files`
+(`<state>/staged-files/<sha256>/<name>`), where the collector finds a pin
+the configured files do not match.
+
+A patch set must add `stage1-host/generation/<gap id>/smoke.syz` (and
+optionally `smoke-*.syz` and a `selection.json`). Its capabilities are
+`experimental` with `fills_gap` and the gap's contract. The VM runs are
+the smoke programs, the neutral control of their selection, and every
+neutral control of the base spec as the regression.
