@@ -1110,12 +1110,25 @@ Harness Capability Specification을 갱신한다(§21).
   revision의 subset을 읽고, `rule_set_scope`는 Compiler가 MutationRuleSet이 맞는 subset을 고르게 한다. 맞는 subset이
   없으면 gap id는 `semantic_mutation.unpromoted`다.
 - 검증: `tests/agent_pipeline/test_semantic_promotion.py`(빌드한 Proxy의 registry가 rule validation과 일치하는지,
-  M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI).
+  M6 host run을 KVM run 대신 넣은 gate 판정, HCAP revision, Agent 도구, CLI). staged pin과 pending subset은
+  같은 파일, preflight 거부는 `test_stage2_host.py`, staged 파일의 manager는 `test_stage2_kvm.py`.
+- M7 1단계(staged pin, #83): `pin`은 crash survival을 뺀 같은 gate다. run이 guest crash로 끝날 필요는 없지만, crash로
+  끝났다면 crash cut의 MutationDelta가 있어야 한다. 통과한 subset은 `PromotedSubset.crash_survival: pending`으로
+  기록되고(passed이면 필드를 쓰지 않아 이전 registry의 digest가 그대로다), `with_semantic_capability`의 HCAP-10
+  entry는 그 revision이 staged라고 적는다. `promoted_registry`는 pending subset을 그 표시와 함께 돌려주므로 그
+  revision을 binding한 job은 subset을 쓴다. 설정된(공유) binding의 HCAP이 pending subset을 pin하면 Stage 2
+  preflight가 거부한다. `promote`에 `previous`로 pin한 registry를 주면 자연 crash run으로 pending subset을 passed로
+  올리고 pin의 evidence를 유지한다. 이미 promotion된 subset은 다시 pin하지 않는다. 자연 crash에서 MutationDelta가
+  남지 않은 run이 있으면 두 gate 모두 subset을 거부하고 CLI는 그 run들을 `UnreproducibleCrash`로 기록한다.
+  CLI는 `pin`, `promote`다.
+- staged harness의 Stage 2: KVM step은 그 harness의 파일로 syz-manager를 띄운다. `verify_pins`가 collector의 `staged_files`에서 고른
+  파일로 manager 설정의 bzImage, image, vmlinux, lane template을 바꾸고, syzkaller binary가 staged이면 pin된
+  binary에 대한 link 디렉터리를 `staged_files` 아래 만들어 `syzkaller`로 쓴다(`stage2/kvm.py` `_staged_manager`).
 
 남은 것:
 
-- M7 1단계(crash survival pending으로 staged pin)는 아직 구현되지 않았다. 지금 `promote`는 guest crash로 끝난
-  run만 센다(#83).
+- 생성한 mutation_engine subset을 Runner 검증(`stage1/host/validate.py`)이 `pin`까지 자동으로 하는 일과, 자연 crash
+  뒤 Controller가 M7 2단계를 처리하는 일(사람 결정은 stage 끝에서만 받는다)은 아직 없다(#83). 지금은 위 CLI로 한다.
 - subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
   일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
