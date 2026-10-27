@@ -404,3 +404,37 @@ def test_without_a_stage2_backend_the_rule_set_waits_for_an_operator(
         job = run_job(service, build)
         assert job.state is JobState.BLOCKED_OPERATOR
         assert job.state_reason == "stage2_gate_unavailable"
+
+
+def test_the_replay_gate_asks_the_proxy_the_rules_were_compiled_for(
+        tmp_path):
+    """03-nfs-proxy/06 §30: a staged harness's rule set was compiled for
+    its staged Proxy; the replay gate asks that one, under the launcher."""
+    import hashlib
+    from agent_pipeline.semantic_promotion import StagedProxies
+    from agent_pipeline.stage1.host.semantic import stage_proxy
+    configured = tmp_path / "nfs-proxy"
+    configured.write_bytes(b"the configured Proxy")
+    generated = tmp_path / "generated"
+    generated.write_bytes(b"a generated Proxy")
+    staged = StagedProxies(tmp_path / "staged-files", ("/usr/bin/env",))
+    stage_proxy(staged.root, generated)
+
+    def engine(staged_proxies):
+        config = Stage2EngineConfig(
+            argv=("/bin/true",), cwd=tmp_path, work_root=tmp_path / "runs",
+            resource_key="k", collector_id="c", replay_proxy=configured,
+            state_dir=tmp_path / "state", staged_proxies=staged_proxies)
+        return Stage2CommandEngine(config, None, None, receipts=None)
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    assert engine(staged)._replay_proxy(digest(generated)) == (
+        staged.path(digest(generated)), {"launcher": ("/usr/bin/env",)})
+    # The configured Proxy is the compiled one; an unknown build stays on
+    # it (the gate then reports the mismatch); no staged root, no lookup.
+    for e, sha256 in ((engine(staged), digest(configured)),
+                      (engine(staged), "0" * 64),
+                      (engine(None), digest(generated))):
+        assert e._replay_proxy(sha256) == (configured, {})

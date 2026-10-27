@@ -141,7 +141,10 @@ class PromotionCampaignConfig(_Config):
 class SemanticPromotionConfig(_Config):
     """M7 stage 2 of a ``mutation_engine`` generation (03-nfs-proxy/06
     §30): ``collector`` is the service's collector.json, whose
-    ``staged_files`` hold the host Proxy validation staged."""
+    ``staged_files`` hold the host Proxy validation staged.  The Compiler
+    and the Stage 2 replay gate of a staged harness run that Proxy, under
+    the generation launcher, and the recorder reads its natural crashes
+    with it."""
 
     collector: Path
 

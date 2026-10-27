@@ -422,6 +422,9 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
      사람은 Stage 2 끝의 job과 함께 승인하거나 거부한다. 공유 binding을 후보 revision으로 바꾸는 일은 host의
      promotion이고, registry의 binding이 subset을 passed로, 그 run을 evidence로 pin하면 `promoted`가 되어 issue가
      `resolved`된다. 설정은 `HarnessGenerationConfig.semantic`(collector.json)이다.
+   - staged job의 Stage 2는 staged Proxy로 compile하고 replay 호환성을 검사한다. pending subset을 가진 staged
+     revision이 설정된 Proxy와 다른 build를 pin하면, 위에서 보관한 Proxy를 launcher 아래에서 쓴다
+     (`rule_compiler.py`, `stage2/engine.py`).
 
 1~5는 machine 검사다. host generator는 새로 추가하거나 바꾼 capability마다 contract, `PromotionProbeEvidence`,
 인자 일반성을 확인하고 하나라도 실패하면 HCAP을 만들지 않는다. typed model이 없는 raw evidence는 어떤

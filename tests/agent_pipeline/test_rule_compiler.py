@@ -28,8 +28,9 @@ from agent_pipeline.rule_compiler import (ArtifactMutationRuleCompiler,
                                           load_compiled)
 from agent_pipeline.semantic_promotion import (
     UNPROMOTED_GAP_ID, PromotedSemanticCapabilityRegistry, PromotedSubset,
-    SemanticSubset, describe_rule_set, read_build_registry, required_items,
-    with_semantic_capability)
+    SemanticSubset, StagedProxies, describe_rule_set, read_build_registry,
+    required_items, with_semantic_capability)
+from agent_pipeline.stage1.host.semantic import stage_proxy
 
 from . import test_journal_live as live_mod
 from .fakes import binding, sha
@@ -99,7 +100,8 @@ def _base_catalog() -> HcapCatalog:
 
 class World:
     def __init__(self, tmp_path, proxy, build, the_subset=None, *,
-                 the_harness=None, promote=True, promoted_build=None):
+                 the_harness=None, promote=True, promoted_build=None,
+                 pending=False, staged=None):
         self.store = ArtifactStore(tmp_path / "artifacts")
         catalog = _base_catalog()
         if promote:
@@ -109,13 +111,14 @@ class World:
                 proxy_sha256=b.proxy_sha256, registry_digest=b.registry_digest,
                 registry=b.registry, subsets=(PromotedSubset(
                     subset=s, validation_items=required_items(s),
-                    evidence_refs=(self.store.put(b"guest evidence"),)),))
+                    evidence_refs=(self.store.put(b"guest evidence"),),
+                    **({"crash_survival": "pending"} if pending else {})),))
             catalog = with_semantic_capability(
                 catalog, put_record(self.store, promoted), promoted)
         self.binding = binding(hcap=put_record(self.store, catalog))
         self.harness_ref = put_record(self.store, the_harness or harness())
         self.compiler = ArtifactMutationRuleCompiler(
-            self.store, proxy, tmp_path / "compile")
+            self.store, proxy, tmp_path / "compile", staged=staged)
 
     def compile(self, *intents):
         rule_set = MutationRuleSet.model_validate({
@@ -340,6 +343,48 @@ def test_without_promotion_nothing_is_supported(tmp_path, proxy, build):
 def test_another_proxy_build_is_not_the_capability(tmp_path, proxy, build):
     other = build.model_copy(update={"proxy_sha256": "1" * 64})
     world = World(tmp_path, proxy, build, promoted_build=other)
+    with pytest.raises(CompilerUnavailable, match="not the promoted build"):
+        world.compile(call_intent())
+
+
+def _other_build(proxy, tmp_path):
+    """The configured Proxy is another build: other bytes, same code."""
+    other = tmp_path / "configured-proxy"
+    other.write_bytes(proxy.read_bytes() + b"\0")
+    other.chmod(0o755)
+    return other
+
+
+def test_a_staged_revision_compiles_with_its_staged_proxy(tmp_path, proxy,
+                                                          build):
+    """03-nfs-proxy/06 §30: a subset pinned pending on a generated build
+    compiles with that build's staged host Proxy, under the launcher."""
+    staged = StagedProxies(tmp_path / "staged-files", ("/usr/bin/env",))
+    stage_proxy(staged.root, proxy)
+    world = World(tmp_path, _other_build(proxy, tmp_path), build,
+                  pending=True, staged=staged)
+    compiled = world.compile(call_intent(intent_id="slot"))
+    assert isinstance(compiled, CompiledRuleSet), compiled
+    record, _ = _describe(world, proxy, tmp_path, compiled)
+    assert record.proxy_sha256 == build.proxy_sha256
+
+
+def test_a_shared_revision_never_uses_a_staged_proxy(tmp_path, proxy, build):
+    staged = StagedProxies(tmp_path / "staged-files")
+    stage_proxy(staged.root, proxy)
+    world = World(tmp_path, _other_build(proxy, tmp_path), build,
+                  staged=staged)
+    with pytest.raises(CompilerUnavailable, match="not the promoted build"):
+        world.compile(call_intent())
+
+
+def test_a_staged_proxy_with_other_bytes_is_not_used(tmp_path, proxy, build):
+    staged = StagedProxies(tmp_path / "staged-files")
+    path = stage_proxy(staged.root, proxy)
+    path.chmod(0o755)
+    path.write_bytes(path.read_bytes() + b"\0")
+    world = World(tmp_path, _other_build(proxy, tmp_path), build,
+                  pending=True, staged=staged)
     with pytest.raises(CompilerUnavailable, match="not the promoted build"):
         world.compile(call_intent())
 

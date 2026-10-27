@@ -63,9 +63,11 @@ from .materializer import ReachabilityHarness
 from .protocol_schema import (SCHEMA_ROOT, SN_OPERATION, Node,
                               ProtocolSchema, Resolution, load_schemas)
 from .semantic_promotion import (DEFAULT_CAPABILITY_ID, UNPROMOTED_GAP_ID,
+                                 BuildRegistry,
                                  PromotedSemanticCapabilityRegistry,
-                                 check_runtime, promoted_registry,
-                                 read_build_registry, rule_set_scope)
+                                 StagedProxies, check_runtime,
+                                 promoted_registry, read_build_registry,
+                                 rule_set_scope)
 
 Visible = Annotated[str, Field(min_length=1, max_length=512,
                                pattern=r"^[\x21-\x7e]+$")]
@@ -283,13 +285,20 @@ class _Check:
     predicate: int | None = None
 
 
-def _check(proxy: Path, workdir: Path, blob: bytes) -> _Check:
-    """``nfs-proxy --check-rules``: the loader ``--target`` runs."""
+def _check(proxy: Path, workdir: Path, blob: bytes,
+           launcher: tuple[str, ...] = ()) -> _Check:
+    """``nfs-proxy --check-rules``: the loader ``--target`` runs.
+    ``launcher`` prefixes a staged Proxy, which reads the file as another
+    user."""
     digest = hashlib.sha256(blob).hexdigest()
     with tempfile.TemporaryDirectory(dir=workdir) as tmp:
         path = Path(tmp) / "rules.bin"
         path.write_bytes(blob)
-        run = subprocess.run([str(proxy), "--check-rules", str(path)],
+        if launcher:
+            Path(tmp).chmod(0o755)
+            path.chmod(0o644)
+        run = subprocess.run([*launcher, str(proxy), "--check-rules",
+                              str(path)],
                              capture_output=True, text=True, timeout=60)
     line = run.stdout.strip()
     ok = _OK.fullmatch(line)
@@ -457,14 +466,33 @@ def _bind(s: ProtocolSchema, harness_routes_: set[tuple[str, str]],
 
 class ArtifactMutationRuleCompiler:
     """``components.MutationRuleCompiler`` over the artifact store, the
-    promoted Proxy build and the pinned ProtocolSchema source."""
+    promoted Proxy build and the pinned ProtocolSchema source.
+
+    A staged revision (a subset pinned with crash survival pending,
+    03-nfs-proxy/06 §30) may pin another build than the configured Proxy:
+    its staged host Proxy (``staged``) compiles for it, under the
+    launcher.  A shared revision uses the configured Proxy only."""
 
     def __init__(self, store: ArtifactStore, proxy: Path, workdir: Path, *,
-                 schema_root: Path = SCHEMA_ROOT) -> None:
+                 schema_root: Path = SCHEMA_ROOT,
+                 staged: StagedProxies | None = None) -> None:
         self.store = store
         self.proxy = Path(proxy)
         self.workdir = Path(workdir)
         self.schema_root = Path(schema_root)
+        self.staged = staged
+
+    def _runtime(self, promoted) -> tuple[Path, tuple[str, ...],
+                                          BuildRegistry]:
+        build = read_build_registry(self.proxy)
+        if check_runtime(promoted, build) or not promoted.pending or \
+                self.staged is None:
+            return self.proxy, (), build
+        found = self.staged.find(promoted.proxy_sha256)
+        if found is None:
+            return self.proxy, (), build
+        launcher = self.staged.launcher
+        return found, launcher, read_build_registry(found, launcher=launcher)
 
     def compile(self, rule_set_ref: str, harness_ref: str,
                 binding: HarnessBinding) -> CompiledRuleSet | CompileRejected:
@@ -480,7 +508,7 @@ class ArtifactMutationRuleCompiler:
             return CompileRejected(
                 reason=_GAP, missing_capability_id=UNPROMOTED_GAP_ID,
                 detail="no semantic subset is promoted in this HCAP revision")
-        build = read_build_registry(self.proxy)
+        proxy, launcher, build = self._runtime(promoted)
         if not check_runtime(promoted, build):
             raise CompilerUnavailable(
                 f"the Proxy {build.proxy_sha256[:12]} is not the promoted "
@@ -498,8 +526,9 @@ class ArtifactMutationRuleCompiler:
         for n, intent in enumerate(rule_set.intents):
             try:
                 rule = _bind(schema, routes, intent, f"r{n:03d}")
-                checked = _check(self.proxy, self.workdir, encode_rule_set(
-                    schema.schema_id, rule_set.candidate_id, [rule]))
+                checked = _check(proxy, self.workdir, encode_rule_set(
+                    schema.schema_id, rule_set.candidate_id, [rule]),
+                    launcher)
                 if checked.status != "ok":
                     reason = _RUNTIME_REASON.get(checked.status)
                     if reason is None:
@@ -540,7 +569,7 @@ class ArtifactMutationRuleCompiler:
 
         blob = encode_rule_set(schema.schema_id, rule_set.candidate_id,
                                lowered)
-        if _check(self.proxy, self.workdir, blob).status != "ok":
+        if _check(proxy, self.workdir, blob, launcher).status != "ok":
             raise CompilerUnavailable("the runtime refused the whole set its "
                                       "rules each passed")
         record = CompiledMutationRuleSet(
