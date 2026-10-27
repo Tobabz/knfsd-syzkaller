@@ -325,8 +325,28 @@ mutation_engine이면: 생성한 semantic subset이 M7 1단계(staged pin, 03-nf
       coverage를 비교하는 회귀와 트리거 기준의 기계 판정은 아직 없다.
   - 판정: guest가 boot하지 못하면 host나 build 탓일 수 있어 `inconclusive`다. boot한 뒤의 실패는 patch set 탓으로
     본다.
+  - mutation_engine gap(contract 없음, `agent_pipeline/stage1/host/semantic.py`): patch set은 Proxy source를 바꾸고
+    spec capability는 추가하거나 바꾸지 않는다(바꾸면 `generate_refused`). build script는 Proxy source가 바뀌었으면
+    tree의 `tools/nfs-proxy/build-guest.sh`로 guest Proxy를 `{env}/nfs-proxy-lane`에 build하고, guest
+    dependency의 `/usr/sbin/nfs-proxy`를 그것으로 바꿔 image를 굽는다(`tools/harness-generation-build.py`). smoke
+    대신 회귀 다음에 M7 1단계를 돈다.
+    - 입력: `stage1-host/generation/<gap id>/`의 `subset.json`(SemanticSubset), `rules.nfsprul1`(subset 안의 rule
+      set), `production.syz`(그 rule이 걸리는 program). 하나라도 없으면 `semantic_input_missing`이다.
+    - registry: patch set의 guest Proxy를 생성 OS 사용자로 돌려 `--capability-registry`를 읽고, subset이 그 안에
+      있어야 한다(`semantic_subset_not_built`).
+    - production: 새 guest를 target mode로 boot하고 lane 0에 rule set을, host sink에 MutationDelta journal을
+      둔다. `production.syz`를 한 번 돌린 뒤 host가 VM을 멈춘다. guest의 `/usr/sbin/nfs-proxy`가 위 Proxy와 같은
+      binary여야 한다(`guest_proxy_differs`). production이 crash하면 patch set 탓이다
+      (`semantic_production_crashed`).
+    - replay: crash가 없으므로 window는 execprog barrier에서 만든다(`replay_runner.execprog_window`). plan,
+      compatibility gate, 다른 journal을 둔 새 guest의 replay, `judge_input`과 `evaluate`를 거쳐
+      `GuestValidationRun`을 기록한다.
+    - pin: `semantic_promotion.pin`이 그 run으로 subset을 crash survival pending으로 pin하고, staged HCAP의
+      HCAP-10이 그 registry를 참조한다. base revision의 promoted registry가 같은 build면 그 subset을 유지하고, 다른
+      build면 처음부터 시작한다. pin이 거부하면 `semantic_pin_refused`와 이유를 남긴다.
 
-mutation_engine의 crash survival(guest crash 직전 MutationDelta가 남는가)은 여기서 보지 않는다. 이를 보려고
+mutation_engine의 crash survival(guest crash 직전 MutationDelta가 남는가)은 여기서 보지 않는다(위 pin이 pending으로
+남긴다). 이를 보려고
 guest를 일부러 crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지). 실제 campaign에서
 자연히 생긴 crash로만 확인하며, 그 전까지 subset은 staged에 머문다(§5.3).
 
@@ -382,10 +402,10 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
    본다. M7 2단계(자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를 통과할 때까지 promotion하지 않는다.
    사람이 구현한 subset과 같은 기준이다. 그 전까지 staged revision으로 job은 계속 진행하고 issue는 `resolved`가
    되지 않는다.
-   - 구현: gate의 두 단계는 `semantic_promotion.pin`(crash survival pending)과 `promote`다. staged harness의 Stage 2
-     campaign은 staged 파일로 syz-manager를 띄운다(`stage2/kvm.py`). 공유 binding의 HCAP에 pending subset이 있으면
-     Stage 2 preflight가 거부한다. Runner 검증이 생성한 subset을 자동으로 pin하는 일과 Controller의 M7 2단계
-     처리는 아직 없다(`03-nfs-proxy/06` §30 "남은 것").
+   - 구현: gate의 두 단계는 `semantic_promotion.pin`(crash survival pending)과 `promote`다. Runner 검증은 생성한
+     subset을 pin한다(§5.2). staged harness의 Stage 2 campaign은 staged 파일로 syz-manager를 띄운다
+     (`stage2/kvm.py`). 공유 binding의 HCAP에 pending subset이 있으면 Stage 2 preflight가 거부한다. Controller의
+     M7 2단계 처리는 아직 없다(`03-nfs-proxy/06` §30 "남은 것").
 
 1~5는 machine 검사다. host generator는 새로 추가하거나 바꾼 capability마다 contract, `PromotionProbeEvidence`,
 인자 일반성을 확인하고 하나라도 실패하면 HCAP을 만들지 않는다. typed model이 없는 raw evidence는 어떤

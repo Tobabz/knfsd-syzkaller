@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -145,7 +146,7 @@ class World:
                                "--binary"], check=True,
                               capture_output=True).stdout
 
-    def inputs(self, diff: bytes, name="in") -> Path:
+    def inputs(self, diff: bytes, name="in", gap: GapRef = GAP) -> Path:
         inp = self.tmp / name
         inp.mkdir()
         files = sorted({line.split(" b/", 1)[1] for line in
@@ -153,7 +154,7 @@ class World:
                         if line.startswith("diff --git ")})
         b = self.approval.descriptor
         task = {"task_id": "gen-1.a1.v1", "generation_id": "gen-1",
-                "gap": GAP.model_dump(mode="json"),
+                "gap": gap.model_dump(mode="json"),
                 "kernel_commit": b.kernel_commit, "sanitizer": "kasan",
                 "base_binding": {
                     "kernel_commit": b.kernel_commit, "sanitizer": "kasan",
@@ -163,7 +164,7 @@ class World:
         (inp / "validation.json").write_text(json.dumps(task))
         (inp / "patch_set.json").write_text(json.dumps({
             "generation_id": "gen-1", "task_id": "gen-1.a1", "attempt": 1,
-            "gap": GAP.model_dump(mode="json"), "base_commit": self.commit,
+            "gap": gap.model_dump(mode="json"), "base_commit": self.commit,
             "patch_ref": "1" * 64, "files": files, "summary": "lock owner"}))
         (inp / "patch.diff").write_bytes(diff)
         (inp / "base_hcap.json").write_bytes(
@@ -179,8 +180,9 @@ class World:
             return guest
         return make
 
-    def run(self, diff, *, out="out", **kw) -> tuple[dict, Path]:
-        inp = self.inputs(diff, name=f"{out}-in")
+    def run(self, diff, *, out="out", gap: GapRef = GAP,
+            **kw) -> tuple[dict, Path]:
+        inp = self.inputs(diff, name=f"{out}-in", gap=gap)
         outdir = self.tmp / out
         outdir.mkdir()
         report = validate(self.validate_config, inp, outdir,
@@ -547,3 +549,103 @@ def test_the_build_step_reuses_the_base_env_when_no_input_changed(tmp_path):
                       "--base-bundle", str(bundle)]) == 0
     assert (env / "linux").resolve() == base_env / "linux"
     assert (env / "syz-bridge" / "bundle").resolve() == bundle
+
+
+# ---------------------------------------------------------------- mutation_engine
+
+SEMANTIC_GAP = GapRef(gap_class=GapClass.MUTATION_ENGINE,
+                      missing_capability_id="mutation_engine.unlisted")
+SEMANTIC_DIR = f"stage1-host/generation/{SEMANTIC_GAP.missing_capability_id}"
+
+
+def _semantic_patch(world, **over):
+    files = {f"{SEMANTIC_DIR}/subset.json": b"{}",
+             f"{SEMANTIC_DIR}/rules.nfsprul1": b"NFSPRUL1",
+             f"{SEMANTIC_DIR}/production.syz": b"getpid()\n",
+             "bundle/src/nfs-proxy-lane": b"the patch set's guest Proxy\n"}
+    files.update(over)
+    return world.patch(capability=False, smoke=None,
+                       extra={k: v for k, v in files.items() if v is not None})
+
+
+def test_a_mutation_engine_patch_set_is_pinned_in_hcap10(world, monkeypatch):
+    """M7 stage 1 (03-nfs-proxy/06 §30): no smoke, the regression, then the
+    staged pin, whose registry the staged HCAP-10 references."""
+    import agent_pipeline.stage1.host.semantic as semantic
+    from .test_stage2_host import _build
+    _, promoted = _build()
+    pinned = promoted.model_copy(update={"subsets": tuple(
+        p.model_copy(update={"crash_survival": "pending"})
+        for p in promoted.subsets)})
+    seen = {}
+
+    def fake_pin(store, proxy, inputs, guest, work, **kw):
+        seen.update(proxy=proxy.read_bytes(), program=inputs.program.name,
+                    guest=guest, **kw)
+        return pinned, "e" * 64
+
+    monkeypatch.setattr(semantic, "read_inputs", lambda d: SimpleNamespace(
+        subset=pinned.subsets[0].subset, program=d / "production.syz"))
+    monkeypatch.setattr(semantic, "staged_pin", fake_pin)
+    report, out = world.run(_semantic_patch(world), gap=SEMANTIC_GAP)
+    assert report["result"] == "passed", report
+    assert seen["proxy"] == b"the patch set's guest Proxy\n"
+    assert seen["launcher"] == world.validate_config.launcher
+    assert "koov.nfs_target=1" in seen["guest"].cmdline
+    hcap = HcapCatalog.model_validate_json((out / "hcap.json").read_bytes())
+    entry = next(c for c in hcap.capabilities if c.id == "HCAP-10")
+    assert any("Crash survival pending" in c for c in entry.constraints)
+    runs = json.loads((out / "runs.json").read_text())
+    assert [r["label"] for r in runs][-1] == "semantic"
+    assert not any(r["label"].startswith("smoke") for r in runs)
+
+
+@pytest.mark.parametrize("over,reason", [
+    ({"bundle/src/nfs-proxy-lane": None}, "proxy_missing"),
+    ({f"{SEMANTIC_DIR}/subset.json": None}, "semantic_input_missing"),
+])
+def test_what_a_mutation_engine_patch_set_is_rejected_for(world, over, reason):
+    report, _ = world.run(_semantic_patch(world, **over), gap=SEMANTIC_GAP)
+    assert (report["result"], report["reason"]) == ("rejected", reason)
+
+
+def test_a_mutation_engine_patch_set_adds_no_spec_capability(world):
+    diff = world.patch(smoke=None, capability=_capability(
+        fills_gap=SEMANTIC_GAP.missing_capability_id, contract=None))
+    report, _ = world.run(diff, gap=SEMANTIC_GAP)
+    assert (report["result"], report["reason"]) == ("rejected",
+                                                    "generate_refused")
+
+
+def test_a_changed_proxy_is_built_and_baked_into_the_guest_deps(tmp_path):
+    import io
+    import tarfile
+    tool = _build_tool()
+    host, tree = tmp_path / "host", tmp_path / "tree"
+    for root in (host, tree):
+        (root / "tools" / "nfs-proxy" / "src").mkdir(parents=True)
+        (root / "tools" / "nfs-proxy" / "src" / "rule.c").write_text("old\n")
+    assert tool.changed(tree, host) == []
+    (tree / "tools" / "nfs-proxy" / "src" / "rule.c").write_text("new\n")
+    assert tool.changed(tree, host) == ["proxy"]
+
+    deps = tmp_path / "deps.tar.gz"
+    with tarfile.open(deps, "w:gz") as tar:
+        for name, body in (("./usr/sbin/nfs-proxy", b"old proxy"),
+                           ("./usr/sbin/rpc.nfsd", b"nfsd")):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(body), 0o755
+            tar.addfile(info, io.BytesIO(body))
+    proxy = tmp_path / "nfs-proxy-lane"
+    proxy.write_bytes(b"new proxy")
+    out = tool.with_proxy(deps, proxy, tmp_path / "out.tar.gz")
+    with tarfile.open(out) as tar:
+        members = {m.name: m for m in tar.getmembers()}
+        assert tar.extractfile(members["./usr/sbin/nfs-proxy"]).read() == \
+            b"new proxy"
+        assert members["./usr/sbin/nfs-proxy"].mode == 0o755
+        assert tar.extractfile(members["./usr/sbin/rpc.nfsd"]).read() == b"nfsd"
+    with tarfile.open(deps, "w:gz") as tar:
+        pass
+    with pytest.raises(SystemExit, match="has no ./usr/sbin/nfs-proxy"):
+        tool.with_proxy(deps, proxy, tmp_path / "none.tar.gz")

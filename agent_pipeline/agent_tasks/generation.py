@@ -105,6 +105,18 @@ a server-side shortcut.
 A semantic mutation capability models one side of the protocol through the
 NFS Proxy. """ + PROXY_ROLE + """
 
+For a mutation_engine gap there is no contract and no smoke program: change
+the Proxy source (tools/nfs-proxy/src; the validation builds the guest
+Proxy from it), not the host spec's capabilities. Under
+stage1-host/generation/<missing_capability_id>/ put subset.json (the
+SemanticSubset the change implements, inside the build's
+--capability-registry), rules.nfsprul1 (a rule set inside that subset that
+uses every element of it) and production.syz (a program that makes those
+rules fire). The validation runs the program in target mode with the rules,
+replays the window in a fresh guest, and pins the subset only when the
+replay is equivalent and replaced original values the production never had
+(03-nfs-proxy/06 section 30). Nothing crashes a guest on purpose.
+
 When an earlier attempt was rejected, its patch set and the rejection are
 shown; change what the rejection points at. Answer extension only when the
 worktree holds the whole change; the executor takes its diff.\

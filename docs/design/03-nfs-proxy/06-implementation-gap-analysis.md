@@ -1124,11 +1124,14 @@ Harness Capability Specification을 갱신한다(§21).
 - staged harness의 Stage 2: KVM step은 그 harness의 파일로 syz-manager를 띄운다. `verify_pins`가 collector의 `staged_files`에서 고른
   파일로 manager 설정의 bzImage, image, vmlinux, lane template을 바꾸고, syzkaller binary가 staged이면 pin된
   binary에 대한 link 디렉터리를 `staged_files` 아래 만들어 `syzkaller`로 쓴다(`stage2/kvm.py` `_staged_manager`).
+- 생성한 subset의 staged pin: Runner 검증이 patch set의 subset, rule set, program으로 production과 replay를 돌려
+  `pin`한다. crash 없는 window는 execprog barrier로 plan한다(`replay_runner.execprog_window`,
+  `stage1/host/semantic.py`, `02-llm-agent/07` §5.2).
 
 남은 것:
 
-- 생성한 mutation_engine subset을 Runner 검증(`stage1/host/validate.py`)이 `pin`까지 자동으로 하는 일과, 자연 crash
-  뒤 Controller가 M7 2단계를 처리하는 일(사람 결정은 stage 끝에서만 받는다)은 아직 없다(#83). 지금은 위 CLI로 한다.
+- 자연 crash 뒤 Controller가 M7 2단계를 처리하는 일(사람 결정은 stage 끝에서만 받는다)은 아직 없다(#83). 지금은
+  위 CLI로 한다.
 - subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
   일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
