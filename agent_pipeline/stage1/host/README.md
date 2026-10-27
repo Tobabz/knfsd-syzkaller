@@ -62,6 +62,11 @@ mkdir -p stage1-host
 cp agent_pipeline/stage1/host/template/* stage1-host/
 $EDITOR stage1-host/host-spec.json
 
+# 3b. Optional, Harness Generation: the generation OS user, once per host,
+#     then "generation": {} in the spec (see "Validating a Harness
+#     Generation patch set")
+sudo bash tools/setup-generation-user.sh --spec stage1-host/host-spec.json
+
 # 4. Generate records and configs (writes stage1-state/)
 uv run python -m agent_pipeline.stage1.host generate stage1-host/host-spec.json
 
@@ -241,31 +246,68 @@ binding the capability-specific KVM evidence has.
 
 ## Validating a Harness Generation patch set
 
-With `generation` in `stage1.json` (`../README.md`), each patch set the
-generation Agent answers is validated by `validate`
-(`validate.py`; `docs/design/02-llm-agent/07-harness-gap-issue.md` §5.2).
-Point `generation.validation.argv` at it:
+With a `generation` section in the host spec, `generate` also writes
+`stage1.json`'s `generation` (`../README.md`) and
+`stage1-state/validate.json`, so each patch set the generation Agent
+answers is validated by `validate` (`validate.py`;
+`docs/design/02-llm-agent/07-harness-gap-issue.md` §5.2). Everything
+follows this repository's layout:
+
+| Where | What |
+|---|---|
+| this checkout | the clone the worktrees and patch sets start from; the spec must be inside it |
+| `stage1-state/generation-worktrees/` | one worktree per generation |
+| `stage1-state/validation-work/` | scratch per validation task (`tree`, `env`, `state`, `cas`) |
+| the spec's `env_dir` and `syzkaller_bundle` | the base env and parser bundle of every rebuild |
+| `tools/harness-generation-build.py` | the build step |
+| `/usr/local/libexec/knfsd-harness-gen` | the launcher of `tools/setup-generation-user.sh` |
+
+`tools/setup-generation-user.sh` (run once with `sudo`, like
+`make-base-image.sh`) creates the system user `harness-gen`, installs the
+launcher (a new network namespace, then `setpriv` to `harness-gen` with
+no_new_privs and umask 002) with a sudoers rule that lets only the
+invoking user run it, creates the two state directories setgid to the
+`harness-gen` group, adds ACLs where `harness-gen` could not read the
+clone, and checks the result. The invoking user joins the group at its
+next login. Commands through sudo get its `secure_path`, so give the
+build step tools outside it by absolute path (`--go`).
+
+The spec section, all fields optional:
 
 ```json
-"validation": {
-  "argv": ["/srv/knfsd-syzkaller/.venv/bin/python", "-m",
-           "agent_pipeline.stage1.host", "validate",
-           "--config", "/srv/stage1-state/validate.json",
-           "{input}", "{output}"],
-  "cwd": "/srv/knfsd-syzkaller", "resource_key": "validate"}
+"generation": {
+  "user": "harness-gen",
+  "launcher": null,
+  "base_ref": "HEAD",
+  "workers": 1,
+  "build_args": ["--go", "/opt/go1.26.0/bin/go"],
+  "build_timeout_s": 21600,
+  "validation_timeout_s": 28800
+}
 ```
 
-`validate.json` is a `validate.ValidateConfig`:
+`launcher` replaces the setup script's wrapper with another argv prefix
+that runs as a separate user without network; `build_args` go to the
+build step (`--go`, `--version`, `--kernel-repo`, `--syz-repo`,
+`--jobs`). `validate.json` is a `validate.ValidateConfig`:
 
 | Field | What |
 |---|---|
 | `repo` | the host's clone; a patch set names one of its commits |
-| `work_root` | scratch per task (`tree`, `env`, `state`, `cas`); `env` is setgid 2775 so the generation user can write the build |
+| `work_root` | scratch per task; `env` is setgid 2775 so the generation user can write the build |
 | `base_spec` | the host's own `host-spec.json`, never the tree's |
 | `collector` | the service's `collector.json` (`staged_files`, key, timings) |
-| `build_argv` | the operator's build script, with `{tree}`, `{env}`, `{base_env}` |
+| `build_argv` | the build step, with `{tree}`, `{env}`, `{base_env}`, `{sanitizer}` |
 | `launcher` | the generation OS user without network, as in `generation.launcher` |
 | `build_timeout_s`, `build_env`, `allowed_paths`, `keep_work` | limits and debugging |
+
+`tools/harness-generation-build.py` compares what each build reads
+(kernel series and configs, syzkaller series, baker, lane, guest
+dependencies) between the patched tree and this checkout. When nothing
+changed it links the base env and bundle; otherwise it runs the tree's
+`bootstrap-kcov-env.py` for the one variant with the base env's trees as
+local mirrors, and `tools/syzkaller/build.py` when the syzkaller series
+changed.
 
 The build script writes a `tools/bootstrap-kcov-env.py` env into `{env}`
 (`linux/`, `images/<variant>/`, `syzkaller/`) and the parser bundle into

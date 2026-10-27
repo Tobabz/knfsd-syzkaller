@@ -254,7 +254,8 @@ validation (Runner, §5.2)
     `base_ref` commit으로 만들고, 같은 생성의 다음 시도는 이전 시도의 작업에서 이어 간다. `worktree_root`는 생성
     OS 사용자가 속한 group으로 setgid를 두고, checkout은 group 쓰기 권한(umask 002)으로 만든다.
   - tool은 `read_file`, `write_file`, `list_dir`, `run_command` 넷이다. 모두 host의 `launcher`(생성 OS 사용자로,
-    network 없이 실행하는 argv 앞부분. 예: `sudo -n -u harness-gen -- unshare -n --`)를 거쳐
+    network 없이 실행하는 argv 앞부분. 기본값은 `tools/setup-generation-user.sh`가 설치하는
+    `sudo -n /usr/local/libexec/knfsd-harness-gen --`로, 새 network namespace에서 `harness-gen`으로 바꿔 실행한다)를 거쳐
     `LocalWorkspaceBackend`에서 돈다. 그래서 file tool도 그 사용자 권한으로 읽고 쓴다. `launcher`가 없으면
     executor는 실행을 거부한다. 경로는 worktree 기준 상대 경로이며 `..`, 절대 경로, `.git`은 받지 않는다.
     `write_file`은 `allowed_paths` 아래만 쓴다(기본값: `bundle/`, `tools/`, host 디렉터리와 spec template,

@@ -283,6 +283,7 @@ class Validation:
         argv = [*self.config.launcher, *(
             a.replace("{tree}", str(tree)).replace("{env}", str(env))
             .replace("{base_env}", str(base_env))
+            .replace("{sanitizer}", self.sanitizer.value)
             for a in self.config.build_argv)]
         log = self.out / "build.log"
         try:

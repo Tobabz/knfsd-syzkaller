@@ -118,6 +118,40 @@ class CollectorSpec(_Spec):
     exec_timeout_s: float = 600
 
 
+class GenerationSpec(_Spec):
+    """Harness Generation on this host (07 §5).  ``generate`` writes the
+    ``generation`` section of stage1.json and ``validate.json`` from it,
+    with this repository's layout: worktrees and validation scratch under
+    ``state_dir``, this checkout as the clone, the env and bundle of this
+    spec as the base, and ``tools/harness-generation-build.py`` as the
+    build step.  ``sudo bash tools/setup-generation-user.sh`` sets up the
+    generation OS user and its launcher once per host."""
+
+    #: The generation OS user of ``tools/setup-generation-user.sh``.
+    user: str = Field(default="harness-gen", pattern=r"^[a-z0-9_-]{1,32}$")
+    #: argv prefix: the generation OS user, without network (07 §5.1).
+    #: Default: the setup script's wrapper for ``user`` through sudo.
+    launcher: tuple[str, ...] | None = Field(default=None, min_length=1)
+    base_ref: str = "HEAD"
+    workers: int = Field(default=1, ge=1, le=8)
+    #: More options of the build step (``--go``, ``--version``, mirrors).
+    build_args: tuple[str, ...] = ()
+    build_timeout_s: float = Field(default=21_600, gt=0)
+    validation_timeout_s: float = Field(default=28_800, gt=0, le=86_400)
+
+
+    def resolved_launcher(self) -> tuple[str, ...]:
+        if self.launcher is not None:
+            return self.launcher
+        wrapper = Path(f"/usr/local/libexec/knfsd-{self.user}")
+        if not wrapper.is_file():
+            raise GenerationError(
+                f"no generation launcher {wrapper}: run "
+                "'sudo bash tools/setup-generation-user.sh' once on this "
+                "host (07 section 5.1)")
+        return ("/usr/bin/sudo", "-n", str(wrapper), "--")
+
+
 HCAP11_PROBES = ("break_deleg", "create_session", "exchange_id")
 
 
@@ -522,6 +556,7 @@ class HostSpec(_Spec):
     engine: EngineSpec = EngineSpec()
     collector: CollectorSpec = CollectorSpec()
     stage2: Stage2ManagerSpec | None = None
+    generation: GenerationSpec | None = None
 
     @model_validator(mode="after")
     def _variants(self) -> Self:
@@ -981,6 +1016,46 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
                "kernel": str(files["bzimage"]), "cmdline": cmdline,
                "qemu_args": " ".join(qemu_args)},
     }
+
+
+def _generation(spec: HostSpec, spec_path: Path, state: Path,
+                collector_path: Path, bundle: Path, python: str):
+    """stage1.json's ``generation`` section and ``validate.json`` (see
+    ``GenerationSpec``)."""
+    from ..config import HarnessGenerationConfig, ValidationCommandConfig
+    from .validate import ValidateConfig
+    g = spec.generation
+    try:
+        spec_in_repo = spec_path.relative_to(REPO)
+    except ValueError:
+        raise GenerationError(
+            "with a generation section the spec must be in this repository "
+            f"({REPO}): a patch set's tree has it at the same path") from None
+    launcher = g.resolved_launcher()
+    validate_path = state / "validate.json"
+    validate_path.write_text(ValidateConfig(
+        repo=REPO, work_root=state / "validation-work",
+        spec=str(spec_in_repo), base_spec=spec_path,
+        collector=collector_path,
+        build_argv=(python, str(REPO / "tools" / "harness-generation-build.py"),
+                    "{tree}", "{env}", "{base_env}", "--base-bundle",
+                    str(bundle), "--variant", "{sanitizer}",
+                    *g.build_args),
+        launcher=launcher, build_timeout_s=g.build_timeout_s,
+        build_env={"LANG": "C.UTF-8",
+                   "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    ).model_dump_json(indent=2) + "\n")
+    return HarnessGenerationConfig(
+        repo=REPO, worktree_root=state / "generation-worktrees",
+        base_ref=g.base_ref, launcher=launcher, workers=g.workers,
+        validation=ValidationCommandConfig(
+            argv=(python, "-m", "agent_pipeline.stage1.host", "validate",
+                  "--config", str(validate_path), "{input}", "{output}"),
+            cwd=REPO, env={"LANG": "C.UTF-8",
+                           "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                           "HOME": os.environ.get("HOME", str(state))},
+            resource_key="harness-validation",
+            timeout_s=g.validation_timeout_s))
 
 
 def generate(spec_path: Path, *, python: str = sys.executable,
@@ -1463,6 +1538,9 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             managers[v.sanitizer] = state / name
             digests[key(v, "stage2_manager")] = \
                 hashlib.sha256(data).hexdigest()
+    if spec.generation is not None and staged is None:
+        config = config.model_copy(update={"generation": _generation(
+            spec, spec_path, state, collector_path, bundle, python)})
     config_path = state / "stage1.json"
     config_path.write_text(config.model_dump_json(indent=2) + "\n")
     report_path = state / "generated.json"

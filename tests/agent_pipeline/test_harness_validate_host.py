@@ -445,3 +445,98 @@ def test_the_build_script_must_be_an_absolute_path():
         ValidateConfig(repo="/r", work_root="/w", base_spec="/s",
                        collector="/c", build_argv=("build",),
                        launcher=("/usr/bin/env",))
+
+
+# -- generate's generation section and the build step ------------------------
+
+def _with_generation(host, monkeypatch, **generation) -> None:
+    import agent_pipeline.stage1.host.generate as generate_module
+    spec = json.loads(host.spec.read_text())
+    spec["generation"] = generation
+    host.spec.write_text(json.dumps(spec, indent=1))
+    _mark_legacy(monkeypatch, spec)
+    # The spec must be inside the clone; here the clone is the fixture.
+    monkeypatch.setattr(generate_module, "REPO", host.root)
+
+
+def test_generate_writes_the_generation_configs(host, monkeypatch):
+    _with_generation(host, monkeypatch, launcher=["/usr/bin/env"],
+                     build_args=["--go", "/opt/go/bin/go"])
+    out = generate(host.spec)
+    config = Stage1Config.load(out.stage1_config)
+    g = config.generation
+    state = out.stage1_config.parent
+    assert (g.repo, g.worktree_root, g.launcher) == (
+        host.root, state / "generation-worktrees", ("/usr/bin/env",))
+    argv = g.validation.argv
+    assert argv[1:5] == ("-m", "agent_pipeline.stage1.host", "validate",
+                         "--config")
+    v = ValidateConfig.model_validate_json(Path(argv[5]).read_bytes())
+    assert v.repo == host.root and v.base_spec == host.spec
+    assert v.spec == str(host.spec.relative_to(host.root))
+    assert v.collector == out.collector_config
+    assert v.work_root == state / "validation-work"
+    assert v.launcher == ("/usr/bin/env",)
+    assert v.build_argv[1].endswith("tools/harness-generation-build.py")
+    assert v.build_argv[2:5] == ("{tree}", "{env}", "{base_env}")
+    assert "{sanitizer}" in v.build_argv
+    assert v.build_argv[-2:] == ("--go", "/opt/go/bin/go")
+
+
+def test_the_default_launcher_needs_the_setup_script(host, monkeypatch):
+    from agent_pipeline.stage1.host.generate import GenerationError
+    _with_generation(host, monkeypatch, user="no-such-gen-user")
+    with pytest.raises(GenerationError, match="setup-generation-user.sh"):
+        generate(host.spec)
+
+
+def test_a_generation_spec_outside_the_clone_is_refused(host, monkeypatch):
+    import agent_pipeline.stage1.host.generate as generate_module
+    from agent_pipeline.stage1.host.generate import GenerationError
+    _with_generation(host, monkeypatch, launcher=["/usr/bin/env"])
+    monkeypatch.setattr(generate_module, "REPO", host.root / "elsewhere")
+    with pytest.raises(GenerationError, match="in this repository"):
+        generate(host.spec)
+
+
+def _build_tool():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "harness_generation_build",
+        REPO / "tools" / "harness-generation-build.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_build_step_reuses_the_base_env_when_no_input_changed(tmp_path):
+    tool = _build_tool()
+    host, tree = tmp_path / "host", tmp_path / "tree"
+    for root in (host, tree):
+        (root / "bundle" / "patches" / "kernel").mkdir(parents=True)
+        (root / "bundle" / "patches" / "kernel" / "0001.patch").write_text(
+            "kernel\n")
+        (root / "bundle" / "lane").mkdir(parents=True)
+        (root / "bundle" / "lane" / "lane.sh").write_text("lane\n")
+        (root / "stage1-host").mkdir()
+    (tree / "stage1-host" / "host-spec.json").write_text("{}")
+    assert tool.changed(tree, host) == []
+    (tree / "bundle" / "lane" / "lane.sh").write_text("new lane\n")
+    assert tool.changed(tree, host) == ["image"]
+    (tree / "bundle" / "patches" / "kernel" / "0002.patch").write_text("x\n")
+    assert tool.changed(tree, host) == ["kernel", "image"]
+
+    (tree / "bundle" / "lane" / "lane.sh").write_text("lane\n")
+    (tree / "bundle" / "patches" / "kernel" / "0002.patch").unlink()
+    base_env, bundle = tmp_path / "base-env", tmp_path / "syz-bridge" / "bundle"
+    for name in ("linux", "images", "syzkaller"):
+        (base_env / name).mkdir(parents=True)
+    bundle.mkdir(parents=True)
+    env = tmp_path / "env"
+    env.mkdir()
+    tool.HOST = host
+    tool.changed.__defaults__ = (host,)
+    assert tool.main([str(tree), str(env), str(base_env),
+                      "--base-bundle", str(bundle)]) == 0
+    assert (env / "linux").resolve() == base_env / "linux"
+    assert (env / "syz-bridge" / "bundle").resolve() == bundle
