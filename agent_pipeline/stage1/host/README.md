@@ -354,3 +354,17 @@ optionally `smoke-*.syz` and a `selection.json`). Its capabilities are
 `experimental` with `fills_gap` and the gap's contract. The VM runs are
 the smoke programs, the neutral control of their selection, and every
 neutral control of the base spec as the regression.
+
+A `mutation_engine` gap has no contract. Its patch set changes the Proxy
+source and no spec capability, and adds `subset.json`, `rules.nfsprul1`
+and `production.syz` under `stage1-host/generation/<gap id>/`. When the
+Proxy source changed, the build script builds the guest Proxy into
+`{env}/nfs-proxy-lane` with the tree's `tools/nfs-proxy/build-guest.sh`
+(Docker, with `debian:bookworm` already pulled) and bakes it into the
+guest dependencies. After the regression, `semantic.py` pins the subset
+(M7 stage 1, crash survival pending): a target-mode production of the
+program with the rule set, its replay in a fresh guest, the judgment and
+`semantic_promotion.pin`. The staged HCAP's HCAP-10 references the pinned
+registry. The Proxy runs on the host only under `launcher`; `proxy` in
+`validate.json` names the tree's Proxy for a build that did not rebuild
+it.

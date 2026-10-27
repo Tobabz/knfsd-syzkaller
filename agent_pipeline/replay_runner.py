@@ -2,7 +2,9 @@
 
 What the Runner does, in order:
 
-1. **CrashContextWindow.**  `parse_crash_context` reads the "last executing
+1. **CrashContextWindow.**  (A run that ended without a crash, the M7
+   staged pin's, takes its window from the execprog barriers instead:
+   `execprog_window`.)  `parse_crash_context` reads the "last executing
    test programs" section syz-manager prepends to a crash log.  With
    syzkaller patch 0024 each record there carries its lane and, once the
    program finished, the NFS proxy barrier of its KCOV generation
@@ -190,6 +192,30 @@ def parse_crash_context(log: str, *, vm_instance_id: str, bound: int,
             for i, r in enumerate(selected)))
 
 
+def execprog_window(output: str, programs: tuple[str, ...], *,
+                    vm_instance_id: str, lane_id: int, bound: int
+                    ) -> CrashContextWindow:
+    """The window of a run that ended without a crash (03-nfs-proxy/06 §30
+    stage 1): ``programs`` ran once each, in order, on one lane under
+    ``syz-execprog -procs=1 -repeat=1``, which printed one barrier per
+    finished program.  A program without a barrier did not finish; only
+    trailing ones may lack it.  The window is the last ``bound`` programs.
+    """
+    barriers = parse_execprog_barriers(output)
+    if not programs:
+        raise PlanError("the run names no program")
+    if len(barriers) > len(programs):
+        raise PlanError(f"{len(barriers)} barriers for {len(programs)} programs")
+    entries = [(i, program, barriers[i] if i < len(barriers) else None)
+               for i, program in enumerate(programs)][-bound:]
+    return CrashContextWindow(
+        vm_instance_id=vm_instance_id, lane_id=lane_id, bound=bound,
+        entries=tuple(WindowEntry(
+            window_index=n, exec_id=i, printed_proc=0, lane_id=lane_id,
+            barrier=barrier, program=program.strip("\n") + "\n")
+            for n, (i, program, barrier) in enumerate(entries)))
+
+
 # ---------------------------------------------------------------- plan
 
 
@@ -307,11 +333,13 @@ _REFUSAL_REASON = {
 }
 
 
-def check_rule_set(proxy: Path, rule_set: bytes, workdir: Path) -> Compatibility:
-    """Ask the replay runtime whether it can run the recorded rule set."""
+def check_rule_set(proxy: Path, rule_set: bytes, workdir: Path, *,
+                   launcher: tuple[str, ...] = ()) -> Compatibility:
+    """Ask the replay runtime whether it can run the recorded rule set.
+    ``launcher`` prefixes the command (a generated Proxy's OS user)."""
     path = Path(workdir) / "recorded-rules.bin"
     path.write_bytes(rule_set)
-    run = subprocess.run([str(proxy), "--check-rules", str(path)],
+    run = subprocess.run([*launcher, str(proxy), "--check-rules", str(path)],
                          capture_output=True, text=True, timeout=60)
     line = run.stdout.strip()
     digest = hashlib.sha256(rule_set).hexdigest()
@@ -540,6 +568,7 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "Barrier", "Compatibility", "CrashContextWindow", "EXECPROG_FLAGS", "PlanError",
+    "execprog_window",
     "PlannedPosition", "ReplayPlan", "WindowEntry", "check_rule_set", "install_replay",
     "invalid_plan_input", "judge_input", "parse_crash_context", "parse_execprog_barriers",
     "plan_replay", "write_replay_inputs",

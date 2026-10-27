@@ -31,6 +31,14 @@ the patch set's own build runs under the generation launcher.
 6. **Report.** ``passed`` lists the descriptor, the staged HCAP and every
    object ``generate`` stored; any end lists the logs.
 
+A ``mutation_engine`` gap has no contract: its patch set changes the Proxy
+and adds no spec capability.  Step 5 then runs the regression and, in
+place of the smoke programs, M7 stage 1 (``semantic``): the subset the
+patch set declares is pinned with crash survival pending in the staged
+revision's HCAP-10, over a production and replay of its rule set on the
+new build.  The patch set's guest Proxy (``proxy``) runs on the host only
+under the launcher.
+
 A guest that does not boot is ``inconclusive`` (the host or the build may
 be at fault; the Controller retries within its limit), and so is any
 host-side error.  Everything after a boot is the patch set's.
@@ -50,7 +58,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ...agent_tasks.generation import DEFAULT_ALLOWED_PATHS, allowed
 from ...artifacts import ArtifactStore
-from ...contracts import Sanitizer
+from ...contracts import GapClass, GapRef, Sanitizer
 from ...data import canonical_json, load_record
 from ...hcap import GapContract, HcapCatalog, RuntimeSelection
 from ...materializer import ExecutionHarnessDescriptor, _runtime_key
@@ -58,7 +66,7 @@ from .collector import (CollectorConfig, CollectorError, staged_path,
                         verify_pins)
 from .guest_run import run_program
 from .generate import GenerationError, HostSpec, StagedBase, generate
-from .pins import HostFilePin, PinCache, PinError, verify_file
+from .pins import HostFilePin, PinCache, PinError, file_sha256, verify_file
 from .target_pcs import function_callsites
 from .vm import QemuGuest, VmConfig
 
@@ -97,6 +105,10 @@ class ValidateConfig(BaseModel):
         default_factory=lambda: {"LANG": "C.UTF-8"})
     build_timeout_s: float = Field(default=21_600, gt=0)
     allowed_paths: tuple[str, ...] = DEFAULT_ALLOWED_PATHS
+    #: The tree's guest Proxy, which the image carries as
+    #: /usr/sbin/nfs-proxy (a mutation_engine gap's M7 pin), unless the
+    #: build rebuilt it into ``{env}/nfs-proxy-lane``.
+    proxy: str = "bundle/src/nfs-proxy-lane"
     #: Keep the tree and env after the run (debugging).
     keep_work: bool = False
 
@@ -149,7 +161,8 @@ class Validation:
         self.task = json.loads((self.inp / "validation.json").read_text())
         self.task_id = self.task["task_id"]
         self.sanitizer = Sanitizer(self.task["sanitizer"])
-        self.gap_id = self.task["gap"]["missing_capability_id"]
+        self.gap = GapRef.model_validate(self.task["gap"])
+        self.gap_id = self.gap.missing_capability_id
         self.work = config.work_root / self.task_id
         self.artifacts: list[dict] = []
         self.runs: list[dict] = []
@@ -189,8 +202,10 @@ class Validation:
             raise _inconclusive("no_base_binding")
         base_hcap = HcapCatalog.model_validate_json(
             (self.inp / "base_hcap.json").read_bytes())
-        gap = next((g for g in base_hcap.gap_contracts
-                    if g.missing_capability_id == self.gap_id), None)
+        semantic = self.gap.gap_class is GapClass.MUTATION_ENGINE
+        gap = self.gap if semantic else next(
+            (g for g in base_hcap.gap_contracts
+             if g.missing_capability_id == self.gap_id), None)
         if gap is None:
             raise _inconclusive("gap_contract_missing")
         tree = self._tree()
@@ -210,10 +225,15 @@ class Validation:
         built = CollectorConfig.load(result.collector_config)
         files = verify_pins(built, descriptor)
         self._stage(tree, store, descriptor, built, service)
-        self._runs(tree, store, descriptor, built, files, gap,
-                   HcapCatalog.model_validate_json(store.get(hcap_ref)))
+        hcap = HcapCatalog.model_validate_json(store.get(hcap_ref))
+        if semantic:
+            self._regression(descriptor, built, files, set())
+            hcap = self._semantic(tree, env, store, descriptor, built,
+                                  files, hcap, base_hcap)
+        else:
+            self._runs(tree, store, descriptor, built, files, gap, hcap)
         (self.out / "descriptor.json").write_bytes(canonical_json(descriptor))
-        (self.out / "hcap.json").write_bytes(store.get(hcap_ref))
+        (self.out / "hcap.json").write_bytes(canonical_json(hcap))
         objects = []
         for shard in sorted(Path(store.root).iterdir()):
             for item in sorted(shard.iterdir()):
@@ -401,14 +421,7 @@ class Validation:
         if not smokes:
             raise _reject("smoke_missing", f"{GENERATION_DIR}/{self.gap_id}/"
                           "smoke*.syz")
-        selection = descriptor.allowed_runtime_selections[0]
-        if (directory / "selection.json").is_file():
-            selection = RuntimeSelection.model_validate_json(
-                (directory / "selection.json").read_bytes())
-        allowed_keys = {_runtime_key(s)
-                        for s in descriptor.allowed_runtime_selections}
-        if _runtime_key(selection) not in allowed_keys:
-            raise _reject("smoke_selection_not_allowed")
+        selection = self._selection(directory, descriptor)
         for i, program in enumerate(smokes):
             run = self._run(f"smoke-{i}", program, selection, descriptor,
                             built, files, probes)
@@ -425,7 +438,14 @@ class Validation:
             raise _reject("neutral_reached")
         if run["crash"] is not None:
             raise _reject("neutral_crashed")
-        seen = {(neutral.read_bytes(), _runtime_key(selection))}
+        self._regression(descriptor, built, files, probes,
+                         {(neutral.read_bytes(), _runtime_key(selection))})
+
+    def _regression(self, descriptor: ExecutionHarnessDescriptor,
+                    built: CollectorConfig, files: dict[str, Path],
+                    probes: set[int], seen: set | None = None) -> None:
+        """Every neutral control of the base spec still runs clean."""
+        seen = set() if seen is None else seen
         for i, item in enumerate(self._base_spec().neutral_controls):
             program = self._resolve_base(item.program)
             key = (program.read_bytes(), _runtime_key(item.runtime_selection))
@@ -439,6 +459,66 @@ class Validation:
                 raise _reject("regression", f"base neutral control "
                               f"{item.program}: {run['runtime_errors']}")
             self._clean(run)
+
+    def _semantic(self, tree: Path, env: Path, store: ArtifactStore,
+                  descriptor: ExecutionHarnessDescriptor,
+                  built: CollectorConfig, files: dict[str, Path],
+                  hcap: HcapCatalog, base_hcap: HcapCatalog) -> HcapCatalog:
+        """M7 stage 1 of the patch set's subset: the staged HCAP with the
+        subset pinned, crash survival pending (``semantic``)."""
+        from .semantic import (KvmSemanticGuest, SemanticRefused,
+                               pinned_hcap, read_inputs, staged_pin)
+        directory = tree / GENERATION_DIR / self.gap_id
+        # A build that rebuilt the Proxy left it in the env
+        # (tools/harness-generation-build.py); else the tree's is baked.
+        proxy = env / "nfs-proxy-lane"
+        if not proxy.exists() and not proxy.is_symlink():
+            proxy = tree / self.config.proxy
+        if proxy.is_symlink() or not proxy.is_file():
+            raise _reject("proxy_missing", self.config.proxy)
+        selection = self._selection(directory, descriptor)
+        builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
+        lane = load_record(store, builds["lane-script"], HostFilePin)
+        work = self.work / "semantic"
+        work.mkdir()
+        work.chmod(0o755)         # the launcher's Proxy reads the rule sets
+        guest = KvmSemanticGuest(
+            descriptor, built, files, selection, lane.sha256,
+            file_sha256(proxy), guest_factory=self.guest_factory,
+            sleep=self.sleep)
+        try:
+            inputs = read_inputs(directory)
+            pinned, run_ref = staged_pin(
+                store, proxy, inputs, guest, work,
+                kernel_commit=descriptor.kernel_commit,
+                base_hcap=base_hcap, launcher=self.config.launcher)
+        except SemanticRefused as refused:
+            end = _inconclusive if refused.reason == "vm_boot_failed" \
+                else _reject
+            raise end(refused.reason, refused.detail) from refused
+        finally:
+            for side in ("production", "replay"):
+                console = self.work / "semantic" / side / "console.log"
+                if console.is_file():
+                    _write_log(self.out / f"semantic-{side}.console.log",
+                               console.read_bytes())
+                    self._evidence(f"semantic-{side}-console", LOG_TYPE,
+                                   f"semantic-{side}.console.log")
+        self.runs.append({"label": "semantic", "run_ref": run_ref,
+                          "subset_id": inputs.subset.subset_id})
+        return pinned_hcap(store, hcap, pinned)
+
+    def _selection(self, directory: Path,
+                   descriptor: ExecutionHarnessDescriptor) -> RuntimeSelection:
+        selection = descriptor.allowed_runtime_selections[0]
+        if (directory / "selection.json").is_file():
+            selection = RuntimeSelection.model_validate_json(
+                (directory / "selection.json").read_bytes())
+        allowed_keys = {_runtime_key(s)
+                        for s in descriptor.allowed_runtime_selections}
+        if _runtime_key(selection) not in allowed_keys:
+            raise _reject("smoke_selection_not_allowed")
+        return selection
 
     def _neutral(self, store: ArtifactStore, hcap: HcapCatalog,
                  selection: RuntimeSelection) -> Path:

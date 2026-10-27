@@ -168,8 +168,11 @@ class RegistryError(ValueError):
     """The Proxy refused, or printed something that is not its contract."""
 
 
-def read_build_registry(proxy: Path) -> BuildRegistry:
-    run = subprocess.run([str(proxy), "--capability-registry"],
+def read_build_registry(proxy: Path, *, launcher: tuple[str, ...] = ()
+                        ) -> BuildRegistry:
+    """``launcher`` prefixes the command: a Proxy a Harness Generation
+    patch set built runs as the generation user (07 §5.1)."""
+    run = subprocess.run([*launcher, str(proxy), "--capability-registry"],
                          capture_output=True, timeout=60)
     if run.returncode != 0:
         raise RegistryError(f"--capability-registry exited {run.returncode}: "
@@ -219,11 +222,12 @@ class RuleSetDescription(_Strict):
     rules: tuple[RuleDescription, ...] = Field(min_length=1, max_length=256)
 
 
-def describe_rule_set(proxy: Path, rule_set: bytes, workdir: Path
-                      ) -> RuleSetDescription:
+def describe_rule_set(proxy: Path, rule_set: bytes, workdir: Path, *,
+                      launcher: tuple[str, ...] = ()) -> RuleSetDescription:
     path = Path(workdir) / "described-rules.bin"
     path.write_bytes(rule_set)
-    run = subprocess.run([str(proxy), "--describe-rules", str(path)],
+    run = subprocess.run([*launcher, str(proxy), "--describe-rules",
+                          str(path)],
                          capture_output=True, timeout=60)
     if run.returncode != 0:
         raise RegistryError("the runtime refused the rule set: "
