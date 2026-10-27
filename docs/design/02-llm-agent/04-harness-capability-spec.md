@@ -261,6 +261,8 @@ name: NFS lane filesystem access
 usable_stage: [stage1]
 usable_by: [agent_stage1]
 status: validated_subset
+validated_layout:
+    procs=4, lanes=[0,1,2,3] (2026-10-27 lane-topology KVM evidence)
 validated_scope:
     syz_open_nfs_lane / syz_open_nfs_lane_pair 경로
     profile open(0020)과 broad-knfsd 노출은 scope 밖 (experimental)
@@ -344,6 +346,8 @@ name: remote KCOV lane attribution
 usable_stage: [stage1, stage2]
 usable_by: [agent_stage1, agent_stage2]
 status: validated
+validated_layout:
+    procs=4, lanes=[0,1,2,3] (2026-10-27 lane-topology KVM evidence)
 
 authority_refs:                     # digest 참조. artifact는 아직 없다 (§1.1)
     RemoteKcovSupportBoundary       # 귀속 execution context 목록 (06 §6.1)
@@ -407,18 +411,19 @@ constraints:
     koov.nfs_trace=0 (default) | 1 (lane NFS tracing opt-in)
 
 validated_layout:
-    procs=1, lanes=[0] (Stage 1 layout)
+    procs=4, lanes=[0,1,2,3] (2026-10-27 KVM lane-topology evidence)
     Stage 2 manager procs의 기본값이며 상한 (#99)
 
 verification_note:
-    lane 구조 자체는 구현되어 있으나
-    four-lane parallel manager topology는 아직 증거가 없음
-    python -m agent_pipeline.stage2.topology가 bounded syz-manager campaign으로
-    lane별 spool 귀속, Proxy ack, health, generation journal을 확인하고
-    hcap04-kvm.json(LaneTopologyEvidence)을 쓴다
+    2026-10-27 KVM campaign (agent_pipeline.stage2.topology)에서
+    procs=4, lane별 최소 8 trusted executions, independent generation,
+    Proxy ACK, healthy execution, lane journal 및 no foreign event를 확인했다.
+    evidence: capability-evidence/hcap04-kvm.json (LaneTopologyEvidence)
     이 증거가 HCAP-01, HCAP-03, HCAP-04의 validated_layout을 함께 넓힌다
     lane.sh status는 manager VM 안에서 부를 수 없어 spool record의
-    per-execution health 필드로 대신한다
+    per-execution health 필드로 대신한다. Stage 1은 여전히 lane 0에서 실행된다.
+    이 증거는 execution layout만 넓히며 HCAP-04의 나머지 partial scope를
+    generic capability promotion으로 바꾸지 않는다.
 ```
 
 source refs:
@@ -429,6 +434,7 @@ bundle/corpus/nfs-normal/README.md
 bundle/lane/lane.sh
 bundle/lane/boot-fixture.sh
 tools/prepare-live-lane-config.py
+capability-evidence/hcap04-kvm.json
 ```
 
 ### HCAP-05 — Normal-flow scenario seeds
@@ -757,6 +763,8 @@ usable_stage: [stage1]
 usable_by: [agent_stage1]
 status: validated (KVM evidence 전까지 generator가 template을 거부)
 scope: [nlm_lane_lock_rpc]
+validated_layout:
+    procs=1, lanes=[0] (Stage 1 only; Stage 2 재검증 전 lane 0으로 제한)
 
 interface:
     syz_open_nlm_lane_file(lane fd, name, mode)       # lane 아래 regular file

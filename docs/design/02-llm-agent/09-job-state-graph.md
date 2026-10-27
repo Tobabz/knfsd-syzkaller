@@ -949,8 +949,8 @@ bundle fixture로 대신한다.
 - **결정됨(2026-10-18, 구현 기본값):** gate 반복은 각 반복에 gate 표를 적용하고 가장 위의 행을 gate 결과로 한다
   (§4, `01` §3). 기본 반복 수는 1이다.
 - **미결:** gate Q1 `NOT_REACHED`의 자동 진단. 지금은 사람 결정(`blocked_operator(gate_regression)`)이다. 후보는 같은
-  target mode에서 빈 rule set으로 gate를 다시 돌려 rule의 영향과 runtime 퇴행을 가르는 것이다. 빈 rule set으로
-  target mode를 켤 수 있는지는 미검증이다.
+  target mode에서 빈 rule set으로 gate를 다시 돌려 rule의 영향과 runtime 퇴행을 가르는 것이다. 빈 rule set의
+  identity relay와 four-lane target mode는 2026-10-27 KVM lane-topology evidence에서 검증했다.
 - **결정됨(2026-10-18, Controller 쪽):** campaign evidence의 이벤트 단위는 campaign task가 실행 중에 봉인한 bundle
   하나다(§4). bundle 하나가 무엇을 담는지(fuzz VM instance의 실행 구간)와 Runner 쪽 봉인 구현은 `01` §14 14번이
   정한다.

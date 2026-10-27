@@ -176,18 +176,18 @@ python -m agent_pipeline.stage2.topology \
     --output state/topology --procs 4
 ```
 
-The campaign runs the manager with `procs` lanes, `reproduce: false`, the
-neutral program's calls and an empty Proxy rule set, and stops when every
-lane has at least `--executions` (default 8) executions or at `--timeout`.
-Per lane it requires that every spooled execution is attributed to that
-lane, was acknowledged by the lane's Proxy, reports a healthy lane, and that
-each generation it ran opened on that lane's journal channel with no event
-from another lane. It writes `result.json` and, when every lane passes,
-`hcap04-kvm.json`. Promotable evidence is bound to the repository's fixed
-`v41-client-io-control.prog` digest; the command does not accept another
-corpus. Add that file to `capability_evidence` for HCAP-01,
-HCAP-03 and HCAP-04 and set their `validated_layout` to
-`{"procs": 4, "lanes": [0, 1, 2, 3]}`.
+The campaign runs the manager in `corpus-run` mode with `procs` lanes,
+`reproduce: false`, an isolated corpus view and an empty Proxy rule set, and
+stops when every lane has at least `--executions` (default 8) trusted
+executions or at `--timeout`. Per lane it requires that every spooled
+execution has the repository's fixed serialized program digest, is attributed
+to that lane, was acknowledged by the lane's Proxy, reports a healthy lane,
+and that each generation it ran opened on that lane's journal channel with no
+event from another lane. It writes `result.json` and, when every lane passes,
+`hcap04-kvm.json`. The command does not accept another corpus. The checked-in
+evidence widens HCAP-01, HCAP-03 and HCAP-04 to
+`{"procs": 4, "lanes": [0, 1, 2, 3]}`; the Stage 2 default is now
+`procs=4`.
 
 `lane.sh status` runs inside the guest and is not reachable from a manager
 VM, so the per-execution health fields of the spool record stand in for it.
