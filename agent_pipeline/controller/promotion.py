@@ -31,6 +31,28 @@ per capability the staged HCAP added or changed for the gap, and keeps the
   (09 §5 binding change) and meet the gap again; the generation then ends
   them ``promotion_rejected`` until an operator retries generation.
 
+A ``semantic`` promotion is M7 stage 2 of a ``mutation_engine`` gap
+(03-nfs-proxy/06 §30): the generation's validation pinned a semantic
+subset with crash survival pending in the staged HCAP's HCAP-10 (stage 1).
+There is no probe campaign and nothing is withheld; the evidence is a
+natural guest crash of a Stage 2 campaign on the staged binding.
+
+- ``collecting``: each replay of such a crash that the job's Stage 2
+  judged goes to the ``SemanticRecorder``.  It records the
+  ``GuestValidationRun`` and runs ``promote`` for each pending subset with
+  the pinned registry as ``previous``.  ``evidence``: the subset passed
+  (``CapabilityCampaign`` per subset: ``evidence_ref`` the run,
+  ``record_ref`` the promoted registry), and the candidate HCAP revision
+  is kept; ``review`` once every pending subset passed.
+  ``unreproducible``: the crash left no MutationDelta at the crash cut; the
+  run and its ``UnreproducibleCrash`` are recorded and the promotion is
+  ``not_met`` (the subset is refused).  Any other replay is not evidence;
+  the promotion keeps collecting.
+- A person decides at the end of Stage 2 of a job on the staged harness
+  (``crash_review`` or an end state), never in the middle of a stage.
+- ``promoted`` once the registry's binding for the build key pins each
+  subset passed, with its run among the evidence.
+
 The reducers are pure; PromotionDriver commits each step, then sends the
 campaign tasks the step names, as GenerationDriver does.
 """
@@ -44,6 +66,7 @@ from pydantic import Field
 
 from ..contracts import GapRef, HarnessBinding, Record, Sanitizer
 from .generation import HarnessGeneration
+from .records import CrashRef
 
 
 class PromotionState(str, enum.Enum):
@@ -99,9 +122,36 @@ class ProbeCampaigner(Protocol):
     def status(self, task_id: str) -> CampaignStatus: ...
 
 
+class SemanticStatus(Record):
+    """What the ``SemanticRecorder`` made of one replay (module doc).
+    ``unavailable``: the host cannot read it now (the staged Proxy is
+    missing); it is asked again."""
+
+    state: Literal["evidence", "unreproducible", "not_evidence",
+                   "unavailable"]
+    subset_id: str | None = None
+    reason: str | None = Field(default=None, max_length=2000)
+    #: The ``GuestValidationRun``.
+    run_ref: str | None = None
+    #: The promoted registry (evidence) or the ``UnreproducibleCrash``.
+    record_ref: str | None = None
+    #: evidence: the staged revision with the subset passed.
+    hcap_revision: str | None = None
+
+
+class SemanticRecorder(Protocol):
+    def record(self, p: HarnessPromotion, crash: CrashRef,
+               replay_bundle_ref: str) -> SemanticStatus:
+        """Judge one replay of a natural crash on ``p``'s staged binding
+        for M7 stage 2.  Deterministic for its arguments; host faults
+        raise."""
+
+
 class CapabilityCampaign(Record):
-    """The campaign of one capability.  ``attempt`` numbers its Runner
-    tasks over every round; ``tries`` counts the current round's."""
+    """The campaign of one capability, or for a ``semantic`` promotion the
+    M7 stage 2 of one pending subset (``capability_id`` is its subset id).
+    ``attempt`` numbers its Runner tasks over every round; ``tries``
+    counts the current round's."""
 
     capability_id: str
     attempt: int = 1
@@ -134,6 +184,7 @@ class HarnessPromotion(Record):
     base_binding: HarnessBinding | None
     staged_binding: HarnessBinding
     runtime_retry_limit: int = Field(ge=1)
+    kind: Literal["probe", "semantic"] = "probe"
     state: PromotionState = PromotionState.COLLECTING
     capabilities: tuple[CapabilityCampaign, ...] = ()
     #: Every candidate program seen on the staged binding.
@@ -143,6 +194,10 @@ class HarnessPromotion(Record):
     review: PromotionReview | None = None
     reason: str | None = None
     issue_resolved: bool = False
+    #: semantic: the replay bundles the recorder judged.
+    examined: tuple[str, ...] = ()
+    #: semantic: the staged revision with the passed subsets.
+    candidate_hcap_revision: str | None = None
     seq: int = 0
 
     def task_id(self, index: int) -> str:
@@ -180,6 +235,14 @@ class PromotionInputs(Protocol):
         """Does the binding's HCAP have the capability with this
         evidence?"""
 
+    def pending_subsets(self, g: HarnessGeneration) -> tuple[str, ...]:
+        """The subsets the staged HCAP pins with crash survival pending."""
+
+    def carries_subset(self, binding: HarnessBinding, subset_id: str,
+                       evidence_ref: str) -> bool:
+        """Does the binding's HCAP pin the subset passed, with this run
+        among its evidence?"""
+
 
 def promotion_id_of(generation_id: str) -> str:
     return f"{generation_id}.p"
@@ -201,6 +264,15 @@ def new_promotion(g: HarnessGeneration,
     return p
 
 
+def new_semantic_promotion(g: HarnessGeneration,
+                           subset_ids: tuple[str, ...]) -> HarnessPromotion:
+    """M7 stage 2 of a passed ``mutation_engine`` generation."""
+    p = new_promotion(g, subset_ids).model_copy(update={"kind": "semantic"})
+    if not p.capabilities:
+        return p.model_copy(update={"reason": "no_pending_subset"})
+    return p
+
+
 # ---------------------------------------------------------------- reducer
 
 
@@ -216,6 +288,8 @@ def on_programs(p: HarnessPromotion, programs: set[str],
                 waiting: bool) -> HarnessPromotion | None:
     """The candidate programs on the staged binding now, and whether a
     live job there still has no plan."""
+    if p.kind == "semantic":
+        return None
     known = set(p.candidate_program_sha256s)
     seen = tuple(sorted(known | programs))
     if p.state is PromotionState.COLLECTING:
@@ -282,6 +356,39 @@ def on_campaign(p: HarnessPromotion, task_id: str,
     return p.model_copy(update={"state": PromotionState.REVIEW})
 
 
+def on_semantic(p: HarnessPromotion, replay_bundle_ref: str,
+                st: SemanticStatus) -> HarnessPromotion | None:
+    """The recorder's answer for one replay of a natural crash."""
+    if p.kind != "semantic" or p.state is not PromotionState.COLLECTING or \
+            replay_bundle_ref in p.examined or st.state == "unavailable":
+        return None
+    p = p.model_copy(update={
+        "examined": tuple(sorted({*p.examined, replay_bundle_ref}))})
+    index = next((i for i, c in enumerate(p.capabilities)
+                  if c.capability_id == st.subset_id and c.result is None),
+                 None)
+    if st.state == "not_evidence" or index is None:
+        return p
+    c = p.capabilities[index]
+    if st.state == "unreproducible":
+        c = c.model_copy(update={"result": "refused",
+                                 "reason": "unreproducible_crash",
+                                 "record_ref": st.record_ref})
+        update = {"state": PromotionState.NOT_MET,
+                  "reason": f"{c.capability_id}:unreproducible_crash"}
+    else:
+        c = c.model_copy(update={"result": "evidence", "reason": "evidence",
+                                 "evidence_ref": st.run_ref,
+                                 "record_ref": st.record_ref})
+        update = {"candidate_hcap_revision": st.hcap_revision}
+    caps = p.capabilities[:index] + (c,) + p.capabilities[index + 1:]
+    p = p.model_copy(update={"capabilities": caps, **update})
+    if p.state is PromotionState.COLLECTING and \
+            all(x.result == "evidence" for x in caps):
+        return p.model_copy(update={"state": PromotionState.REVIEW})
+    return p
+
+
 #: Where a person may reject: the campaigns are not running.
 REJECTABLE = frozenset({PromotionState.REVIEW, PromotionState.NOT_MET,
                         PromotionState.FAILED})
@@ -315,7 +422,8 @@ def reject(p: HarnessPromotion, decision_id: str, note: str, at: str,
 
 def retry(p: HarnessPromotion) -> HarnessPromotion | None:
     """An operator runs the campaigns again (new tasks, a new seed) after
-    they were not met or failed."""
+    they were not met or failed.  A semantic promotion collects natural
+    crashes again; the replays it judged stay judged."""
     if p.state not in (PromotionState.NOT_MET, PromotionState.FAILED) or \
             not p.capabilities:
         return None
@@ -328,7 +436,7 @@ def retry(p: HarnessPromotion) -> HarnessPromotion | None:
         "state": PromotionState.CAMPAIGNING if seen
         else PromotionState.COLLECTING,
         "capabilities": caps, "withheld_program_sha256s": seen,
-        "reason": None})
+        "reason": None, "candidate_hcap_revision": None})
 
 
 def on_registry(p: HarnessPromotion, carried: bool
@@ -351,7 +459,7 @@ class PromotionDriver:
     """Commits promotion steps and sends their campaign tasks.  ``on_end``
     is called with a promotion that reached an end, after its commit."""
 
-    def __init__(self, store, campaigner: ProbeCampaigner, *,
+    def __init__(self, store, campaigner: ProbeCampaigner | None, *,
                  clock: Callable[[], str],
                  on_end: Callable[[HarnessPromotion], None]) -> None:
         self.store = store
@@ -376,10 +484,19 @@ class PromotionDriver:
                   {"type": "programs", "programs": sorted(programs),
                    "waiting": waiting})
 
+    def semantic(self, promotion_id: str, replay_bundle_ref: str,
+                 st: SemanticStatus) -> None:
+        self.step(promotion_id,
+                  lambda p: on_semantic(p, replay_bundle_ref, st), {
+                      "type": "semantic_run",
+                      "replay_bundle_ref": replay_bundle_ref,
+                      "status": st.model_dump(mode="json")})
+
     def dispatch(self, promotion_id: str) -> None:
         """Submit each campaign without a result.  Idempotent by task_id."""
         p = self.store.promotion(promotion_id)
-        if p.state is not PromotionState.CAMPAIGNING:
+        if p.state is not PromotionState.CAMPAIGNING or \
+                self.campaigner is None:
             return
         for i, c in enumerate(p.capabilities):
             if c.result is None:
@@ -389,7 +506,8 @@ class PromotionDriver:
 
     def poll(self, promotion_id: str) -> None:
         p = self.store.promotion(promotion_id)
-        if p.state is not PromotionState.CAMPAIGNING:
+        if p.state is not PromotionState.CAMPAIGNING or \
+                self.campaigner is None:
             return
         for i, c in enumerate(p.capabilities):
             if c.result is None:
@@ -468,3 +586,23 @@ class ArtifactPromotionInputs:
             return False
         return any(c.id == capability_id and evidence_ref in c.evidence_refs
                    for c in catalog.capabilities)
+
+    def _promoted(self, revision: str):
+        from ..semantic_promotion import promoted_registry
+        return promoted_registry(self.artifacts,
+                                 self.hcap.load_catalog(revision))
+
+    def pending_subsets(self, g: HarnessGeneration) -> tuple[str, ...]:
+        promoted = self._promoted(g.staged_binding.hcap_revision)
+        return () if promoted is None else promoted.pending
+
+    def carries_subset(self, binding: HarnessBinding, subset_id: str,
+                       evidence_ref: str) -> bool:
+        try:
+            promoted = self._promoted(binding.hcap_revision)
+        except (OSError, ValueError):
+            return False
+        return promoted is not None and any(
+            p.subset.subset_id == subset_id and
+            p.crash_survival == "passed" and evidence_ref in p.evidence_refs
+            for p in promoted.subsets)

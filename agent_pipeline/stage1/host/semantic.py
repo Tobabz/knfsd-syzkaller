@@ -30,11 +30,17 @@ The host does the rest, the way an operator does it with
 
 ``SemanticGuest`` is the guest side; ``KvmSemanticGuest`` boots the staged
 build as ``collect`` does, with the Stage 2 journal channels.
+
+The host copy of the patch set's Proxy is staged beside the harness files,
+under the collector's ``staged_files`` by its digest (``stage_proxy``):
+M7 stage 2 reads a natural crash's rule set with it (``stage2/semantic.py``).
 """
 
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -60,6 +66,7 @@ from ...semantic_replay import ReplayJudgeProfile, Termination, evaluate
 from .collector import (GUEST_DIR, CollectorConfig, _checked, _fixture_ready,
                         crash_report, execprog_timeout, guest_cmdline,
                         run_lane)
+from .pins import file_sha256
 from .vm import QemuGuest, VmConfig
 
 SUBSET = "subset.json"
@@ -68,6 +75,8 @@ PRODUCTION = "production.syz"
 #: Where the guest image keeps the Proxy (``tools/bootstrap-kcov-env.py``).
 GUEST_PROXY = "/usr/sbin/nfs-proxy"
 PROFILE = ReplayJudgeProfile(name="replay-default", revision="1")
+#: The host Proxy's name under ``<staged_files>/<sha256>/``.
+STAGED_PROXY = "nfs-proxy"
 
 
 class SemanticRefused(Exception):
@@ -200,6 +209,34 @@ def pinned_hcap(store: ArtifactStore, hcap: HcapCatalog,
                 pinned: PromotedSemanticCapabilityRegistry) -> HcapCatalog:
     """The staged revision with the pinned registry in its HCAP-10."""
     return with_semantic_capability(hcap, put_record(store, pinned), pinned)
+
+
+def staged_proxy(root: Path, proxy_sha256: str) -> Path:
+    """Where ``stage_proxy`` keeps the host Proxy of this digest."""
+    return root / proxy_sha256 / STAGED_PROXY
+
+
+def stage_proxy(root: Path, proxy: Path) -> Path:
+    """Copy the patch set's host Proxy under ``root`` by its digest, read
+    only, unless it is there already."""
+    digest = file_sha256(proxy)
+    dest = staged_proxy(root, digest)
+    if dest.is_file():
+        if file_sha256(dest) != digest:
+            raise SemanticRefused("staged_proxy_differs", str(dest))
+        return dest
+    tmp = dest.parent.with_name(f"{dest.parent.name}.{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    shutil.copyfile(proxy, tmp / STAGED_PROXY)
+    (tmp / STAGED_PROXY).chmod(0o555)
+    try:
+        tmp.rename(dest.parent)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not dest.is_file():
+            raise
+    return dest
 
 
 # ---------------------------------------------------------------- KVM

@@ -35,7 +35,9 @@ on the generation's own published coverage.  The full Q1 profile
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal
 
@@ -60,14 +62,16 @@ from ..m1 import (BarrierResults, BarrierStatus, ClosureReason,
 from ..q1 import CandidateTarget, KernelIdentity, TargetPcMapping
 from ..q2 import Q2Status
 from ..replay_runner import (Barrier, Compatibility as GateCompatibility,
-                             PlanError, judge_input, invalid_plan_input,
+                             PlanError, ReplayPlan, judge_input,
+                             invalid_plan_input,
                              parse_crash_context, parse_execprog_barriers,
                              plan_replay)
 from ..rule_compiler import CompiledMutationRuleSet
 from ..sealed_q1 import ArtifactQ1Judge, PublishedCoverage, TrustedQ1Execution
 from ..sealed_q2 import ArtifactQ2Judge, TrustedQ2Execution
 from ..semantic_delta import DeltaReadError, GenerationDelta, SealedJournal, SessionDelta
-from ..semantic_replay import InvalidReason, ReplayJudgeProfile, evaluate as replay_evaluate
+from ..semantic_replay import (InvalidReason, ReplayJudgeInput,
+                              ReplayJudgeProfile, evaluate as replay_evaluate)
 from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
                        GENERATION_COVERAGE_PREFIX, GENERATION_COVERAGE_TYPE,
                        HOST_FACTS_ID, HOST_FACTS_TYPE, NEUTRAL_COVERAGE_ID,
@@ -111,6 +115,20 @@ class Stage2Execution(Record):
     m1_profile_ref: Sha256
     q2_profile_ref: Sha256
     replay_profile_ref: Sha256
+
+
+@dataclass(frozen=True)
+class ReplaySides:
+    """A planned replay: its plan, both sealed journals and the judge
+    input over them."""
+
+    plan: ReplayPlan
+    production: SealedJournal
+    replay: SealedJournal
+    judge_input: ReplayJudgeInput
+    kernel_commit: str
+    production_vm_instance_id: str
+    replay_vm_instance_id: str
 
 
 class UnknownStage2Execution(ValueError):
@@ -596,49 +614,69 @@ class ArtifactStage2Judge:
 
     # ------------------------------------------------------------ replay
 
-    def judge_replay(self, bundle_ref: str, *, crash_bundle_ref: str,
-                     compiled: CompiledRuleSet) -> ReplayOutcome:
+    def _replay_executions(self, bundle_ref: str, crash_bundle_ref: str
+                           ) -> tuple[Stage2Execution, Stage2Execution,
+                                      ReplayJudgeProfile]:
         x = self._execution(bundle_ref)
         crash = self._execution(crash_bundle_ref)
         if x.step != "replay" or crash.step != "campaign":
             raise UnknownStage2Execution("not a replay of a campaign bundle")
-        profile = load_record(self.artifacts, x.replay_profile_ref,
-                              ReplayJudgeProfile)
+        return x, crash, load_record(self.artifacts, x.replay_profile_ref,
+                                     ReplayJudgeProfile)
+
+    def _replay_input(self, x: Stage2Execution, crash: Stage2Execution,
+                      profile: ReplayJudgeProfile, crash_bundle_ref: str,
+                      compiled: CompiledRuleSet, stack: list
+                      ) -> tuple[ReplayJudgeInput, ReplaySides | None]:
+        """The judge input of a published replay, and its two sides when
+        the replay was planned.  The journals stay open until ``stack`` is
+        cleaned up."""
+        if compiled != x.compiled or compiled != crash.compiled or \
+                x.crash_bundle_ref != crash_bundle_ref:
+            raise ValueError("request does not match the published replay")
+        ev = self._open(x, stack)
+        facts = ev.facts
+        if facts.plan_error is not None:
+            return invalid_plan_input(
+                candidate_id=x.candidate.candidate_id,
+                production_manifest_sha256=crash_bundle_ref,
+                reason=InvalidReason.DELTA_CORRUPT, profile=profile,
+                evidence_verified=True), None
+        production = self._open(crash, stack)
+        log = production.text(CRASH_LOG_ID, CRASH_LOG_TYPE)
+        if log is None:
+            raise ValueError("the crash bundle has no crash log")
+        window = parse_crash_context(
+            log, vm_instance_id=crash.correlation.vm_instance_id,
+            bound=x.crash_window_bound)
+        plan = plan_replay(production.journal, window)
+        text = ev.text(REPLAY_EXECPROG_ID, EXECPROG_TYPE) or ""
+        compat = facts.compatibility
+        inputs = judge_input(
+            plan, production.journal, ev.journal,
+            replay_vm_instance_id=x.correlation.vm_instance_id,
+            replay_lane_id=x.correlation.lane,
+            replay_barriers=parse_execprog_barriers(text),
+            production_termination=facts.production_end,
+            replay_termination=facts.replay.replay_end,
+            compatibility=GateCompatibility(compat.ok, compat.reason,
+                                            compat.line),
+            evidence_verified=True, profile=profile,
+            fixture_failed=facts.replay.fixture_failed)
+        return inputs, ReplaySides(
+            plan=plan, production=production.journal, replay=ev.journal,
+            judge_input=inputs, kernel_commit=x.identity.kernel_commit,
+            production_vm_instance_id=crash.correlation.vm_instance_id,
+            replay_vm_instance_id=x.correlation.vm_instance_id)
+
+    def judge_replay(self, bundle_ref: str, *, crash_bundle_ref: str,
+                     compiled: CompiledRuleSet) -> ReplayOutcome:
+        x, crash, profile = self._replay_executions(bundle_ref,
+                                                    crash_bundle_ref)
         stack: list = []
         try:
-            if compiled != x.compiled or compiled != crash.compiled or \
-                    x.crash_bundle_ref != crash_bundle_ref:
-                raise ValueError("request does not match the published replay")
-            ev = self._open(x, stack)
-            facts = ev.facts
-            if facts.plan_error is not None:
-                inputs = invalid_plan_input(
-                    candidate_id=x.candidate.candidate_id,
-                    production_manifest_sha256=crash_bundle_ref,
-                    reason=InvalidReason.DELTA_CORRUPT, profile=profile,
-                    evidence_verified=True)
-            else:
-                production = self._open(crash, stack)
-                log = production.text(CRASH_LOG_ID, CRASH_LOG_TYPE)
-                if log is None:
-                    raise ValueError("the crash bundle has no crash log")
-                window = parse_crash_context(
-                    log, vm_instance_id=crash.correlation.vm_instance_id,
-                    bound=x.crash_window_bound)
-                plan = plan_replay(production.journal, window)
-                text = ev.text(REPLAY_EXECPROG_ID, EXECPROG_TYPE) or ""
-                compat = facts.compatibility
-                inputs = judge_input(
-                    plan, production.journal, ev.journal,
-                    replay_vm_instance_id=x.correlation.vm_instance_id,
-                    replay_lane_id=x.correlation.lane,
-                    replay_barriers=parse_execprog_barriers(text),
-                    production_termination=facts.production_end,
-                    replay_termination=facts.replay.replay_end,
-                    compatibility=GateCompatibility(compat.ok, compat.reason,
-                                                    compat.line),
-                    evidence_verified=True, profile=profile,
-                    fixture_failed=facts.replay.fixture_failed)
+            inputs, _ = self._replay_input(x, crash, profile,
+                                           crash_bundle_ref, compiled, stack)
             result = replay_evaluate(inputs)
         except OSError:
             raise
@@ -660,5 +698,26 @@ class ArtifactStage2Judge:
                              status=result.semantic_verdict.value.lower(),
                              reason=reasons or None)
 
+    @contextmanager
+    def replay_sides(self, bundle_ref: str, *, crash_bundle_ref: str,
+                     compiled: CompiledRuleSet) -> Iterator[ReplaySides]:
+        """The planned sides of a published replay, for the M7 gate
+        (03-nfs-proxy/06 §30): the journals are open inside the block.
+        An unplanned replay raises ValueError; so does evidence the judge
+        would reject."""
+        x, crash, profile = self._replay_executions(bundle_ref,
+                                                    crash_bundle_ref)
+        stack: list = []
+        try:
+            _, sides = self._replay_input(x, crash, profile,
+                                          crash_bundle_ref, compiled, stack)
+            if sides is None:
+                raise ValueError("the replay was not planned")
+            yield sides
+        finally:
+            for tmp in stack:
+                tmp.cleanup()
 
-__all__ = ["ArtifactStage2Judge", "Stage2Execution", "UnknownStage2Execution"]
+
+__all__ = ["ArtifactStage2Judge", "ReplaySides", "Stage2Execution",
+           "UnknownStage2Execution"]

@@ -192,6 +192,14 @@ def _generation(config: Stage1Config, stack: ExitStack,
                 campaigns, artifacts, state / "campaign.lock", slots=slots)
         else:
             campaigner = DeferredValidator(campaigns)
+    semantic = None
+    if g.semantic is not None and run:
+        from ..stage2.semantic import ArtifactSemanticRecorder
+        from .host.collector import CollectorConfig
+        semantic = ArtifactSemanticRecorder(
+            artifacts, staged_files=CollectorConfig.load(
+                g.semantic.collector).staged_files,
+            workdir=state / "semantic-promotion", launcher=g.launcher)
     if runtime is None and run:
         from ..agent_tasks.pydantic_ai_generation import (
             PydanticAIGenerationRuntime)
@@ -207,7 +215,8 @@ def _generation(config: Stage1Config, stack: ExitStack,
         contract_for=lambda gap, revision: gap_contract(hcap, gap, revision))
     return authority, GenerationParts(executor=executor, validator=validator,
                                       workers=g.workers,
-                                      campaigner=campaigner)
+                                      campaigner=campaigner,
+                                      semantic=semantic)
 
 
 def gap_contract(hcap: ArtifactHcapChecker, gap, revision: str | None):

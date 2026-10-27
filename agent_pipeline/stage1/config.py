@@ -138,6 +138,14 @@ class PromotionCampaignConfig(_Config):
         return argv
 
 
+class SemanticPromotionConfig(_Config):
+    """M7 stage 2 of a ``mutation_engine`` generation (03-nfs-proxy/06
+    §30): ``collector`` is the service's collector.json, whose
+    ``staged_files`` hold the host Proxy validation staged."""
+
+    collector: Path
+
+
 class HarnessGenerationConfig(_Config):
     """Harness Generation (07 §5): the Agent's sandbox and the validation
     command.  Unset, a gap a policy would generate for ends
@@ -157,6 +165,9 @@ class HarnessGenerationConfig(_Config):
     validation: ValidationCommandConfig
     #: Unset: a passed generation's staged harness is not promoted.
     campaign: PromotionCampaignConfig | None = None
+    #: Unset: a passed mutation_engine generation's subset stays pinned
+    #: pending (M7 stage 1).
+    semantic: SemanticPromotionConfig | None = None
 
     @field_validator("launcher")
     @classmethod

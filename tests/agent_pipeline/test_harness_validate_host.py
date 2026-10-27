@@ -10,6 +10,7 @@ boundary PCs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -598,6 +599,11 @@ def test_a_mutation_engine_patch_set_is_pinned_in_hcap10(world, monkeypatch):
     runs = json.loads((out / "runs.json").read_text())
     assert [r["label"] for r in runs][-1] == "semantic"
     assert not any(r["label"].startswith("smoke") for r in runs)
+    # M7 stage 2 reads a natural crash's rule set with the host Proxy.
+    proxy = b"the patch set's guest Proxy\n"
+    kept = semantic.staged_proxy(world.collector.staged_files,
+                                 hashlib.sha256(proxy).hexdigest())
+    assert kept.read_bytes() == proxy
 
 
 @pytest.mark.parametrize("over,reason", [

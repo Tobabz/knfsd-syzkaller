@@ -229,7 +229,8 @@ class Validation:
         if semantic:
             self._regression(descriptor, built, files, set())
             hcap = self._semantic(tree, env, store, descriptor, built,
-                                  files, hcap, base_hcap)
+                                  files, hcap, base_hcap,
+                                  service.staged_files)
         else:
             self._runs(tree, store, descriptor, built, files, gap, hcap)
         (self.out / "descriptor.json").write_bytes(canonical_json(descriptor))
@@ -463,11 +464,14 @@ class Validation:
     def _semantic(self, tree: Path, env: Path, store: ArtifactStore,
                   descriptor: ExecutionHarnessDescriptor,
                   built: CollectorConfig, files: dict[str, Path],
-                  hcap: HcapCatalog, base_hcap: HcapCatalog) -> HcapCatalog:
+                  hcap: HcapCatalog, base_hcap: HcapCatalog,
+                  staged_files: Path) -> HcapCatalog:
         """M7 stage 1 of the patch set's subset: the staged HCAP with the
-        subset pinned, crash survival pending (``semantic``)."""
+        subset pinned, crash survival pending (``semantic``).  The host
+        Proxy is staged for M7 stage 2."""
         from .semantic import (KvmSemanticGuest, SemanticRefused,
-                               pinned_hcap, read_inputs, staged_pin)
+                               pinned_hcap, read_inputs, stage_proxy,
+                               staged_pin)
         directory = tree / GENERATION_DIR / self.gap_id
         # A build that rebuilt the Proxy left it in the env
         # (tools/harness-generation-build.py); else the tree's is baked.
@@ -506,6 +510,7 @@ class Validation:
                                    f"semantic-{side}.console.log")
         self.runs.append({"label": "semantic", "run_ref": run_ref,
                           "subset_id": inputs.subset.subset_id})
+        stage_proxy(staged_files, proxy)
         return pinned_hcap(store, hcap, pinned)
 
     def _selection(self, directory: Path,

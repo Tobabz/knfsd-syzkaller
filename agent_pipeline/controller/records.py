@@ -306,6 +306,8 @@ class Replay(Record):
     crash: CrashRef
     resume: Target
     outcome: ReplayOutcome | None = None
+    #: The replay bundle the outcome judged (M7 stage 2 reads it).
+    bundle_ref: str | None = None
 
 
 class TriageItem(Record):

@@ -30,8 +30,9 @@ from .generation import (ACTIVE, GenerationAttempt, GenerationDriver,
                          HarnessValidator, generation_of)
 from .promotion import (OPEN, REJECTABLE, ArtifactPromotionInputs, HarnessPromotion,
                         ProbeCampaigner, PromotionDriver, PromotionInputs,
-                        PromotionState, approve, issue_resolved,
-                        new_promotion, on_registry, reject, retry)
+                        PromotionState, SemanticRecorder, approve,
+                        issue_resolved, new_promotion,
+                        new_semantic_promotion, on_registry, reject, retry)
 from .machine import Env, Machine, Outcome, harness_authority_stale
 from .records import (GAP_STATES, TERMINAL, AgentAttempt, Job, JobState,
                       RepairInput, SeedPlan, TaskKind, Transition)
@@ -47,9 +48,16 @@ FINAL = ("sealed", "ended_unsealed")
 STAGE1_ENDED = TERMINAL | {JobState.S1_REACHED, JobState.S2_STRATEGY,
                            JobState.S2_GATE, JobState.S2_CAMPAIGN,
                            JobState.S2_REPLAYING, JobState.CRASH_REVIEW}
+#: A job past the end of Stage 2: where a person decides the M7 stage 2
+#: promotion of the staged harness it ran on (03-nfs-proxy/06 §30).
+STAGE2_ENDED = TERMINAL | {JobState.CRASH_REVIEW}
 #: Agent attempt states that can still give a result.
 LIVE = ("sending", "running")
 AGENT_OUTPUT = TypeAdapter(AgentOutput)
+
+
+def _decided_at(p: HarnessPromotion) -> frozenset[JobState]:
+    return STAGE2_ENDED if p.kind == "semantic" else STAGE1_ENDED
 
 
 class ReplayMismatch(Exception):
@@ -87,7 +95,8 @@ class Controller:
                  generator: HarnessGenerator | None = None,
                  validator: HarnessValidator | None = None,
                  campaigner: ProbeCampaigner | None = None,
-                 promotion_inputs: PromotionInputs | None = None
+                 promotion_inputs: PromotionInputs | None = None,
+                 semantic_recorder: SemanticRecorder | None = None
                  ) -> None:
         self.store = store
         self.machine = Machine(env)
@@ -110,12 +119,15 @@ class Controller:
         self.generations = None if generator is None or validator is None \
             else GenerationDriver(store, generator, validator, clock=clock,
                                   on_end=self._generation_ended)
-        #: 07 §5.3.  None until a probe campaign Runner is configured: a
-        #: passed generation's staged binding then stays unpromoted.
-        self.promotions = None if self.generations is None or \
-            campaigner is None else PromotionDriver(
-                store, campaigner, clock=clock,
-                on_end=self._promotion_ended)
+        #: 07 §5.3.  A passed generation's staged binding stays
+        #: unpromoted without a probe campaign Runner, or for a
+        #: mutation_engine gap without a SemanticRecorder (M7 stage 2).
+        self.campaigner = campaigner
+        self.semantic = semantic_recorder
+        self.promotions = None if self.generations is None or (
+            campaigner is None and semantic_recorder is None) \
+            else PromotionDriver(store, campaigner, clock=clock,
+                                 on_end=self._promotion_ended)
         self.promotion_inputs = promotion_inputs or \
             ArtifactPromotionInputs(artifacts)
 
@@ -669,9 +681,7 @@ class Controller:
         """Every job waiting on the generation's key takes its end.  A
         passed one's staged harness goes to promotion (07 §5.3); a Stage 2
         gap's promotion is the M7 gate's, not a probe campaign's."""
-        if g.state is GenerationState.PASSED and \
-                self.promotions is not None and \
-                g.gap.gap_class is not GapClass.MUTATION_ENGINE:
+        if self._promotable(g):
             self._guard(g.generation_id, "promotion",
                         lambda: self._create_promotion(g))
         for job in self.store.jobs({JobState.HARNESS_GENERATING}):
@@ -685,46 +695,50 @@ class Controller:
     def approve_promotion(self, promotion_id: str, decision_id: str,
                           note: str = "") -> HarnessPromotion:
         """07 §5.3: a person approves the evidence of a promotion in
-        review, at the end of Stage 1 of a job on its staged harness.  The
-        host then promotes; the registry change ends it."""
-        jobs = self._stage1_ended(promotion_id)
+        review, at the end of Stage 1 of a job on its staged harness (of
+        Stage 2 for a semantic one).  The host then promotes; the registry
+        change ends it."""
+        jobs = self._stage_ended(promotion_id)
         return self._decide(promotion_id, lambda p: approve(
             p, decision_id, note, self.clock(), jobs), "approved",
             decision_id)
 
     def reject_promotion(self, promotion_id: str, decision_id: str,
                          note: str = "") -> HarnessPromotion:
-        """07 §5.3, at a Stage 1 end as approve_promotion: the jobs leave
+        """07 §5.3, at a stage end as approve_promotion: the jobs leave
         the staged binding and meet the gap again."""
-        jobs = self._stage1_ended(promotion_id)
+        jobs = self._stage_ended(promotion_id)
         return self._decide(promotion_id, lambda p: reject(
             p, decision_id, note, self.clock(), jobs), "rejected",
             decision_id)
 
     def promotion_due(self, job: Job) -> HarnessPromotion | None:
-        """The promotion a person decides with this job's Stage 1 end: the
-        job ran on its staged harness, reached the end of Stage 1, and the
-        promotion waits on a decision."""
-        if self.promotions is None or job.staged is None or \
-                job.state not in STAGE1_ENDED:
+        """The promotion a person decides with this job's stage end: the
+        job ran on its staged harness, reached the end of Stage 1 (of
+        Stage 2 for a semantic promotion), and the promotion waits on a
+        decision."""
+        if self.promotions is None or job.staged is None:
             return None
         p = self.store.promotion_for(job.staged.generation_id)
-        if p is None or p.state not in (PromotionState.REVIEW, *REJECTABLE):
+        if p is None or p.state not in (PromotionState.REVIEW, *REJECTABLE) \
+                or job.state not in _decided_at(p):
             return None
         return p
 
-    def _stage1_ended(self, promotion_id: str) -> tuple[str, ...]:
-        """The jobs on the promotion's staged harness at the end of Stage
-        1.  A person decides a promotion only there, never in the middle of
-        a stage (user decision 2026-10-27)."""
+    def _stage_ended(self, promotion_id: str) -> tuple[str, ...]:
+        """The jobs on the promotion's staged harness at the end of Stage 1
+        (Stage 2 for a semantic one).  A person decides a promotion only
+        there, never in the middle of a stage (user decision
+        2026-10-27)."""
         p = self.store.promotion(promotion_id)
         jobs = tuple(sorted(
-            j.job_id for j in self.store.jobs(set(STAGE1_ENDED))
+            j.job_id for j in self.store.jobs(set(_decided_at(p)))
             if j.staged is not None and
             j.staged.generation_id == p.generation_id))
         if not jobs:
+            stage = "2" if p.kind == "semantic" else "1"
             raise ValueError(f"{promotion_id}: no job on its staged harness "
-                             "has reached the end of Stage 1")
+                             f"has reached the end of Stage {stage}")
         return jobs
 
     def retry_promotion(self, promotion_id: str) -> HarnessPromotion:
@@ -734,7 +748,7 @@ class Controller:
     def _decide(self, promotion_id: str, reduce, kind: str,
                 decision_id: str | None) -> HarnessPromotion:
         if self.promotions is None:
-            raise ValueError("no probe campaign Runner is configured")
+            raise ValueError("no promotion is configured")
         before = self.store.promotion(promotion_id)
         if not self.promotions.step(promotion_id, reduce, {
                 "type": kind, "decision_id": decision_id}, send=False):
@@ -744,8 +758,21 @@ class Controller:
                     lambda: self.promotions.dispatch(promotion_id))
         return self.store.promotion(promotion_id)
 
+    def _promotable(self, g: HarnessGeneration) -> bool:
+        """A passed generation whose kind of promotion is configured."""
+        if g.state is not GenerationState.PASSED or self.promotions is None:
+            return False
+        if g.gap.gap_class is GapClass.MUTATION_ENGINE:
+            return self.semantic is not None
+        return self.campaigner is not None
+
     def _create_promotion(self, g: HarnessGeneration) -> None:
-        if self.store.promotion_for(g.generation_id) is None:
+        if self.store.promotion_for(g.generation_id) is not None:
+            return
+        if g.gap.gap_class is GapClass.MUTATION_ENGINE:
+            self.promotions.create(new_semantic_promotion(
+                g, self.promotion_inputs.pending_subsets(g)))
+        else:
             self.promotions.create(new_promotion(
                 g, self.promotion_inputs.capabilities(g)))
 
@@ -756,7 +783,7 @@ class Controller:
         if self.promotions is None:
             return
         for g in self.store.generations({GenerationState.PASSED}):
-            if g.gap.gap_class is not GapClass.MUTATION_ENGINE:
+            if self._promotable(g):
                 self._guard(g.generation_id, "promotion",
                             lambda x=g: self._create_promotion(x))
         for p in self.store.promotions():
@@ -770,6 +797,10 @@ class Controller:
                             lambda x=p: self._resolve_issue(x))
 
     def _poll_promotion(self, promotion_id: str, recover: bool) -> None:
+        if self.store.promotion(promotion_id).kind == "semantic":
+            self._semantic_runs(promotion_id)
+            self._promoted(promotion_id)
+            return
         programs, waiting = self._candidate_programs(
             self.store.promotion(promotion_id))
         self.promotions.programs(promotion_id, programs, waiting)
@@ -794,13 +825,36 @@ class Controller:
                 programs.update(self.promotion_inputs.programs(job.plan_ref))
         return programs, waiting
 
+    def _semantic_runs(self, promotion_id: str) -> None:
+        """M7 stage 2: each replay of a natural crash on the staged
+        binding that Stage 2 judged and the recorder has not, while the
+        promotion collects.  Sent again by poll() until taken."""
+        p = self.store.promotion(promotion_id)
+        if self.semantic is None or p.kind != "semantic":
+            return
+        for job in self.store.jobs():
+            p = self.store.promotion(promotion_id)
+            r = job.replay
+            if p.state is not PromotionState.COLLECTING:
+                return
+            if job.staged is None or \
+                    job.staged.generation_id != p.generation_id or \
+                    r is None or r.outcome is None or r.bundle_ref is None \
+                    or r.bundle_ref in p.examined:
+                continue
+            self.promotions.semantic(promotion_id, r.bundle_ref,
+                                     self.semantic.record(p, r.crash,
+                                                          r.bundle_ref))
+
     def _promoted(self, promotion_id: str) -> None:
         p = self.store.promotion(promotion_id)
         if p.state is not PromotionState.APPROVED:
             return
         b = self.registry.lookup(p.kernel_commit, p.sanitizer)
+        carries = self.promotion_inputs.carries_subset \
+            if p.kind == "semantic" else self.promotion_inputs.carries
         carried = b is not None and all(
-            c.evidence_ref is not None and self.promotion_inputs.carries(
+            c.evidence_ref is not None and carries(
                 b, c.capability_id, c.evidence_ref)
             for c in p.capabilities)
         self.promotions.step(promotion_id,
@@ -889,6 +943,14 @@ class Controller:
                     lambda: self._link_gap(self.store.job(j)))
         if new.state is JobState.HARNESS_GENERATING:
             self._guard(j, "generation", lambda: self._join_generation(j))
+        if new.staged is not None and new.replay is not None and \
+                new.replay.outcome is not None and (
+                    old.replay is None or
+                    old.replay.bundle_ref != new.replay.bundle_ref):
+            p = self.store.promotion_for(new.staged.generation_id)
+            if p is not None and p.kind == "semantic":
+                self._guard(p.promotion_id, "promotion",
+                            lambda: self._semantic_runs(p.promotion_id))
 
     def _guard(self, job_id: str, effect: str,
                call: Callable[[], None]) -> bool:
