@@ -379,3 +379,31 @@ def test_retry_generation_needs_a_gap_wait(make_world, state):
     assert w.c.retry_generation(j) is None
     assert w.job(j).pending_task is None or \
         w.job(j).pending_task.kind is TaskKind.AGENT
+
+
+def test_the_default_budget_is_three_and_a_legacy_policy_keeps_it_off(
+        tmp_path):
+    import json
+
+    from agent_pipeline.contracts import JobPolicy, Sanitizer
+    from agent_pipeline.controller.store import Store
+
+    assert JobPolicy(policy_id="new",
+                     sanitizer=Sanitizer.KASAN).harness_generation_budget == 3
+    store = Store(tmp_path / "jobs.sqlite")
+    legacy = JobPolicy(policy_id="old", sanitizer=Sanitizer.KASAN)
+    body = json.loads(legacy.model_dump_json())
+    del body["harness_generation_budget"]
+    store.db.execute("INSERT INTO policies VALUES (?, ?)",
+                     ("old", json.dumps(body)))
+    # Read with generation off, so its jobs replay what they did.
+    assert store.policy("old").harness_generation_budget == 0
+    # The same policy given again (a host restart) is still the same.
+    store.save_policy(JobPolicy(policy_id="old", sanitizer=Sanitizer.KASAN))
+    assert store.policy("old").harness_generation_budget == 0
+    # Turning generation on needs a new policy identity.
+    with pytest.raises(ValueError):
+        store.save_policy(JobPolicy(policy_id="old", sanitizer=Sanitizer.KASAN,
+                                    harness_generation_budget=3))
+    store.save_policy(JobPolicy(policy_id="new", sanitizer=Sanitizer.KASAN))
+    assert store.policy("new").harness_generation_budget == 3

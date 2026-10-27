@@ -8,6 +8,7 @@ refused, not merged).  Tasks are sent only after commit, by the service.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Iterator
@@ -93,8 +94,14 @@ class Store:
                                   (policy.policy_id,)).fetchone()
             body = policy.model_dump_json()
             # Compared as values: a policy stored before a field with a
-            # default existed is still the same policy (01 §11.1).
-            if row and JobPolicy.model_validate_json(row[0]) != policy:
+            # default existed is still the same policy (01 §11.1).  One
+            # stored before Harness Generation keeps it off (_load_policy),
+            # also when the same policy is given again without the field.
+            if row and _legacy_generation(row[0]) and \
+                    "harness_generation_budget" not in policy.model_fields_set:
+                policy = policy.model_copy(
+                    update={"harness_generation_budget": 0})
+            if row and _load_policy(row[0]) != policy:
                 # A policy identity names one policy forever (01 §11.1).
                 raise ValueError(f"policy {policy.policy_id} already exists "
                                  f"with other values")
@@ -106,7 +113,7 @@ class Store:
                               (policy_id,)).fetchone()
         if row is None:
             raise KeyError(policy_id)
-        return JobPolicy.model_validate_json(row[0])
+        return _load_policy(row[0])
 
     # ---------------------------------------------------------- judge
 
@@ -397,6 +404,20 @@ class Store:
                               (gap.gap_class.value,
                                gap.missing_capability_id)).fetchone()
         return row[0] if row else None
+
+
+def _legacy_generation(body: str) -> bool:
+    return "harness_generation_budget" not in json.loads(body)
+
+
+def _load_policy(body: str) -> JobPolicy:
+    """A policy stored before harness_generation_budget existed keeps
+    Harness Generation off, so its jobs replay the transitions they made
+    (09 §3.2, §8).  A policy stored since carries the field."""
+    policy = JobPolicy.model_validate_json(body)
+    if _legacy_generation(body):
+        policy = policy.model_copy(update={"harness_generation_budget": 0})
+    return policy
 
 
 class _Tx:

@@ -390,7 +390,10 @@ def binding(execution: str = "build-1", hcap: str = "hcap-1",
 def policy(policy_id: str = "p1", **kw) -> JobPolicy:
     values = dict(policy_id=policy_id, sanitizer=Sanitizer.KASAN,
                   approval_required=False, stage1_repair_budget=3,
-                  agent_retry_limit=2, runtime_retry_limit=2)
+                  agent_retry_limit=2, runtime_retry_limit=2,
+                  # The rows a gap takes without Harness Generation; the
+                  # generation tests set a budget.
+                  harness_generation_budget=0)
     values.update(kw)
     return JobPolicy(**values)
 

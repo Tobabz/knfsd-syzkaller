@@ -210,10 +210,11 @@ class JobPolicy(Record):
     fixed_parallelism: int = Field(default=4, ge=1)
     # Harness Generation (09 §3.2, 07 §5).
     #: Generation attempts one generation may validate before it ends
-    #: exhausted (09 §6 harness_generation).  0 sends a gap straight to
-    #: blocked_harness_gap, as before generation existed: a policy stored
-    #: earlier keeps the transitions it made.
-    harness_generation_budget: int = Field(default=0, ge=0)
+    #: exhausted (09 §6 harness_generation).  Default 3 (owner decision,
+    #: 2026-10-27).  0 sends a gap straight to blocked_harness_gap.  A
+    #: policy stored before this field existed is read with 0, so its jobs
+    #: replay the transitions they made (Store).
+    harness_generation_budget: int = Field(default=3, ge=0)
     harness_generation_agent: AgentModelPolicy = Field(
         default_factory=lambda: AgentModelPolicy(provider="openai",
                                                  model="gpt-5"))

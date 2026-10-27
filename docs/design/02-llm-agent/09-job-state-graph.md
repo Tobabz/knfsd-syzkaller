@@ -398,9 +398,11 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
 - 생성 Agent의 실패는 `agent_retry_limit`까지 같은 task를 새 try로 다시 보내고, 넘으면 `failed`다. 검증의
   `INCONCLUSIVE`는 `runtime_retry_limit`까지 새 검증 task로 다시 실행하고, 넘으면 `failed`다. Controller가 다시
   시작하면 생성 Agent task는 새 try로 다시 보내고, 검증 task는 `task_id`로 다시 붙는다(§8).
-- JobPolicy `harness_generation_budget`이 0이면(기본값) gap은 지금처럼 바로 `blocked_harness_gap`에 간다. 이 필드가
-  생기기 전에 저장된 policy의 전이를 replay에서 그대로 재현하기 위해서다. 0보다 크지만 host에 생성기가 설정되지
-  않았으면 `harness_generating`에서 바로 `blocked_harness_gap(generation_unavailable)`로 간다.
+- JobPolicy `harness_generation_budget`의 기본값은 3이다(사용자 결정, 2026-10-27). 0이면 gap은 바로
+  `blocked_harness_gap`에 간다. 이 필드가 생기기 전에 저장된 policy는 store가 0으로 읽는다. 그 job들의 전이를
+  replay에서 그대로 재현하기 위해서다. 같은 policy를 이 필드 없이 다시 등록해도(host 재시작) 0으로 남고, 생성을
+  켜려면 새 policy id가 필요하다. 0보다 크지만 host에 생성기가 설정되지 않았으면 `harness_generating`에서 바로
+  `blocked_harness_gap(generation_unavailable)`로 간다.
 - `harness_generating`에서 issue resolved는 `retry_pending`, deferred는 `parked`, wont_fix는 `closed_unsupported`다.
   진행 중인 생성은 같은 key의 다른 job을 위해 계속한다.
 
