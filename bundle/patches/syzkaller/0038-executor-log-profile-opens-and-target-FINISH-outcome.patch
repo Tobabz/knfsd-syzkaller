@@ -1,0 +1,42 @@
+From 615b8710862cbdefaee65d0e9fde367b2fe7e81a Mon Sep 17 00:00:00 2001
+From: ci <ci@localhost>
+Date: Tue, 27 Oct 2026 10:46:48 +0900
+Subject: [PATCH] executor: log profile opens and target FINISH outcome
+
+---
+ executor/common_linux.h | 6 +++++-
+ executor/executor.cc    | 2 ++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 095702742..68c4e1613 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -2905,7 +2905,11 @@ static long syz_open_nfs_lane_profile(volatile long a0, volatile long a1)
+ 		errno = ENAMETOOLONG;
+ 		return -1;
+ 	}
+-	return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	debug("NFS lane profile: path=%s\n", path);
++	long fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	debug("NFS lane profile: path=%s fd=%ld errno=%d\n", path, fd,
++	      fd < 0 ? errno : 0);
++	return fd;
+ }
+ 
+ static long nfs_socket_connect_port(unsigned long client, unsigned long backend,
+diff --git a/executor/executor.cc b/executor/executor.cc
+index 45449082d..eedf39312 100644
+--- a/executor/executor.cc
++++ b/executor/executor.cc
+@@ -1285,6 +1285,8 @@ static void nfsp_broker_end_program()
+ 		finished = cover_finish_remote_generation(generation, 1000 * slowdown_scale);
+ 	if (finished || cover_abort_remote_generation(generation, false))
+ 		nfsp_broker_kcov_done = true;
++	debug("NFS proxy: end gen=%llu done_valid=%d freeze=%d finished=%d\n",
++	      generation, k->done_valid, freeze, finished);
+ 	if (finished) {
+ 		// FINISH published the generation's aggregate into extra_cov, which
+ 		// this process maps too.  Append it to the program's output.
+-- 
+2.34.1

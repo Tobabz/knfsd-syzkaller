@@ -1,0 +1,99 @@
+From d1604aebf3539ed806cc549da861305411994f89 Mon Sep 17 00:00:00 2001
+From: ci <ci@localhost>
+Date: Tue, 27 Oct 2026 09:21:50 +0900
+Subject: [PATCH] executor: mount lane profile aliases without a control
+ directory
+
+---
+ executor/common_linux.h | 67 +++++++++++++++++++++--------------------
+ 1 file changed, 34 insertions(+), 33 deletions(-)
+
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index a0ff1c642..0e73ebeed 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -5149,8 +5149,9 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+ 		errno = mount_errno;
+ 		failmsg("mount NFS fuzz lane client1 failed", "proc=%llu", procid);
+ 	}
+-	// Only the both-backend fixture creates this directory.  The original
+-	// single-backend fixture retains its exact two-mount sandbox layout.
++	// Only the both-backend fixture creates this directory.  Control is
++	// optional, but profile aliases exist for every fixture and must be
++	// mounted whether or not control is present.
+ 	char source_control[160];
+ 	if (snprintf(source_control, sizeof(source_control), "%s/control", source) >=
+ 	    (int)sizeof(source_control))
+@@ -5163,38 +5164,38 @@ static void setup_nfs_fuzz_lane(const char* newroot)
+ 		if (mkdir(target_control, 0700) ||
+ 		    mount(source_control, target_control, NULL, MS_BIND, NULL))
+ 			fail("mount proc-scoped NFS proxy control failed");
+-		for (unsigned client = 0; client < 2; client++) {
+-			for (unsigned backend = 0; backend < 2; backend++) {
+-				char src[160], dst[160];
+-				const char* name = backend ? "ganesha" : "knfsd";
+-				if (snprintf(src, sizeof(src), "%s/client%u-%s", source, client, name) >=
+-				    (int)sizeof(src) ||
+-				    snprintf(dst, sizeof(dst), "%s/client%u-%s", target, client, name) >=
+-				    (int)sizeof(dst))
+-					fail("NFS pair mount path is too long");
+-				if (access(src, F_OK) && errno == ENOENT)
+-					continue;
+-				if (mkdir(dst, 0700) || mount(src, dst, NULL, MS_BIND | MS_REC, NULL))
+-					fail("mount NFS client/backend pair failed");
+-			}
++	}
++	for (unsigned client = 0; client < 2; client++) {
++		for (unsigned backend = 0; backend < 2; backend++) {
++			char src[160], dst[160];
++			const char* name = backend ? "ganesha" : "knfsd";
++			if (snprintf(src, sizeof(src), "%s/client%u-%s", source, client, name) >=
++			    (int)sizeof(src) ||
++			    snprintf(dst, sizeof(dst), "%s/client%u-%s", target, client, name) >=
++			    (int)sizeof(dst))
++				fail("NFS pair mount path is too long");
++			if (access(src, F_OK) && errno == ENOENT)
++				continue;
++			if (mkdir(dst, 0700) || mount(src, dst, NULL, MS_BIND | MS_REC, NULL))
++				fail("mount NFS client/backend pair failed");
+ 		}
+-		static const char* const profiles[] = {
+-			"knfsd-v3", "knfsd-v40", "knfsd-v41", "knfsd-v42",
+-			"ganesha-v41",
+-		};
+-		for (unsigned client = 0; client < 2; client++) {
+-			for (unsigned profile = 0; profile < sizeof(profiles) / sizeof(profiles[0]); profile++) {
+-				char src[160], dst[160];
+-				if (snprintf(src, sizeof(src), "%s/client%u-%s", source, client,
+-					     profiles[profile]) >= (int)sizeof(src) ||
+-				    snprintf(dst, sizeof(dst), "%s/client%u-%s", target, client,
+-					     profiles[profile]) >= (int)sizeof(dst))
+-					fail("NFS profile mount path is too long");
+-				if (access(src, F_OK) && errno == ENOENT)
+-					continue;
+-				if (mkdir(dst, 0700) || mount(src, dst, NULL, MS_BIND | MS_REC, NULL))
+-					fail("mount NFS client/profile failed");
+-			}
++	}
++	static const char* const profiles[] = {
++		"knfsd-v3", "knfsd-v40", "knfsd-v41", "knfsd-v42",
++		"ganesha-v41",
++	};
++	for (unsigned client = 0; client < 2; client++) {
++		for (unsigned profile = 0; profile < sizeof(profiles) / sizeof(profiles[0]); profile++) {
++			char src[160], dst[160];
++			if (snprintf(src, sizeof(src), "%s/client%u-%s", source, client,
++				     profiles[profile]) >= (int)sizeof(src) ||
++			    snprintf(dst, sizeof(dst), "%s/client%u-%s", target, client,
++				     profiles[profile]) >= (int)sizeof(dst))
++				fail("NFS profile mount path is too long");
++			if (access(src, F_OK) && errno == ENOENT)
++				continue;
++			if (mkdir(dst, 0700) || mount(src, dst, NULL, MS_BIND | MS_REC, NULL))
++				fail("mount NFS client/profile failed");
+ 		}
+ 	}
+ 	// Target mode: connect the proxy activation endpoint while the source tree
+-- 
+2.34.1
+

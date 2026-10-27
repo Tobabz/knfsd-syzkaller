@@ -61,9 +61,10 @@ static void print_stats(const struct nfsp_proxy_stats *stats, const char *phase)
 		}
 	}
 	printf("peak_active=%u active=%u framing_errors=%u relay_errors=%u "
-	       "mutation_errors=%u rejected_client=%u\n",
+	       "mutation_errors=%u record_refused=%u rejected_client=%u\n",
 	       stats->peak_active, stats->active, stats->framing_errors,
-	       stats->relay_errors, stats->mutation_errors, stats->rejected_client);
+	       stats->relay_errors, stats->mutation_errors, stats->record_refused,
+	       stats->rejected_client);
 	printf("stats_end %s\n", phase);
 	fflush(stdout);
 }

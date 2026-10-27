@@ -33,3 +33,5 @@
 0033-syz-manager-collect-coverage-in-corpus-run.patch
 0035-executor-finish-target-generation-after-a-failed-fr.patch
 0036-syz-manager-keep-configured-procs-with-debug.patch
+0037-executor-mount-lane-profile-aliases-without-a-contro.patch
+0038-executor-log-profile-opens-and-target-FINISH-outcome.patch

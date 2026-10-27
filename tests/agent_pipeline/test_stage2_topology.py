@@ -19,7 +19,8 @@ def record(lane, generation, **fields):
     value = {
         "schema_version": "knfsd-nfs-proxy-execution.v2", "vm": 0,
         "lane": lane, "execution_id": lane * 1000 + generation,
-        "campaign": True, "program_sha256": "1" * 64,
+        "campaign": True,
+        "program_sha256": topology.LANE_TOPOLOGY_PROGRAM_SHA256,
         "generation": generation, "program_digest": "2" * 64,
         "activation": "Acked", "activation_status": 0,
         "deactivation": "Acked", "deactivation_status": 0,
@@ -53,8 +54,9 @@ def test_clean_lanes_count_every_execution():
     records, events = clean()
     lanes = topology.lane_results(records, events, PREFIXES)
     assert lanes == [{
-        "lane": lane, "executions": 8, "attributed_executions": 8,
-        "distinct_generations": 8, "proxy_acked_executions": 8,
+        "lane": lane, "executions": 8, "foreign_program_executions": 0,
+        "attributed_executions": 8, "distinct_generations": 8,
+        "proxy_acked_executions": 8,
         "healthy_executions": 8, "journal_generations": 8,
         "generations_missing_from_journal": 0,
         "foreign_journal_events": 0} for lane in (0, 1)]
@@ -62,6 +64,7 @@ def test_clean_lanes_count_every_execution():
 
 @pytest.mark.parametrize(("change", "field", "value"), [
     ({"pcs": ()}, "attributed_executions", 7),
+    ({"program_sha256": "f" * 64}, "foreign_program_executions", 1),
     ({"generation": 1}, "distinct_generations", 7),
     ({"deactivation_status": 5}, "proxy_acked_executions", 7),
     ({"activation": "Failed"}, "proxy_acked_executions", 7),
@@ -75,7 +78,7 @@ def test_one_bad_execution_shows_on_its_lane(change, field, value):
     records[9] = record(1, change.pop("generation", 2), **change)
     lanes = topology.lane_results(records, events, PREFIXES)
     assert lanes[1][field] == value
-    assert lanes[0][field] == 8
+    assert lanes[0][field] == (0 if field == "foreign_program_executions" else 8)
 
 
 def test_cross_lane_journal_events_are_foreign():
@@ -101,6 +104,26 @@ def test_campaign_waits_for_every_lane():
     assert not topology._enough(records[:3], 2, 3)
     assert not topology._enough(
         [record(0, 1, campaign=False)] * 3 + records[3:], 2, 3)
+    assert not topology._enough(
+        [record(0, 1, program_sha256="f" * 64)] + records[1:], 2, 3)
+
+
+def test_seedless_view_hides_upstream_test_seeds(tmp_path):
+    source = tmp_path / "syzkaller"
+    (source / "bin").mkdir(parents=True)
+    (source / "sys" / "linux" / "test").mkdir(parents=True)
+    (source / "sys" / "linux" / "test" / "upstream.prog").write_text("openat()")
+    view = topology._seedless_syzkaller(source, tmp_path / "work")
+    assert (view / "bin").is_symlink()
+    assert (view / "bin").resolve() == (source / "bin").resolve()
+    assert list((view / "sys" / "linux" / "test").iterdir()) == []
+
+
+def test_manager_runs_the_corpus_without_mutation(tmp_path):
+    assert topology._manager_command(tmp_path / "syz-manager",
+                                     tmp_path / "manager.json") == [
+        str(tmp_path / "syz-manager"), "-config",
+        str(tmp_path / "manager.json"), "-mode", "corpus-run", "-debug"]
 
 
 def test_program_calls_are_the_corpus_calls():

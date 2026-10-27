@@ -41,12 +41,60 @@ struct answer_log {
 	uint64_t generation;
 };
 
+struct rpc_message {
+	uint8_t body[256];
+	uint8_t framed[260];
+	size_t body_len;
+	size_t framed_len;
+};
+
 static void put32(uint8_t *p, uint32_t value)
 {
 	p[0] = (uint8_t)(value >> 24);
 	p[1] = (uint8_t)(value >> 16);
 	p[2] = (uint8_t)(value >> 8);
 	p[3] = (uint8_t)value;
+}
+
+static void rpc_word(struct rpc_message *m, uint32_t value)
+{
+	put32(m->body + m->body_len, value);
+	m->body_len += 4u;
+}
+
+static void rpc_frame(struct rpc_message *m)
+{
+	put32(m->framed, 0x80000000u | (uint32_t)m->body_len);
+	memcpy(m->framed + 4u, m->body, m->body_len);
+	m->framed_len = m->body_len + 4u;
+}
+
+static void nfs4_null_call(struct rpc_message *m, uint32_t xid)
+{
+	memset(m, 0, sizeof(*m));
+	rpc_word(m, xid);
+	rpc_word(m, 0);       /* CALL */
+	rpc_word(m, 2);       /* RPC version */
+	rpc_word(m, 100003);  /* NFS */
+	rpc_word(m, 4);
+	rpc_word(m, 0);       /* NULL */
+	rpc_word(m, 0);       /* AUTH_NONE credential */
+	rpc_word(m, 0);
+	rpc_word(m, 0);       /* AUTH_NONE verifier */
+	rpc_word(m, 0);
+	rpc_frame(m);
+}
+
+static void accepted_reply(struct rpc_message *m, uint32_t xid)
+{
+	memset(m, 0, sizeof(*m));
+	rpc_word(m, xid);
+	rpc_word(m, 1);       /* REPLY */
+	rpc_word(m, 0);       /* MSG_ACCEPTED */
+	rpc_word(m, 0);       /* AUTH_NONE verifier */
+	rpc_word(m, 0);
+	rpc_word(m, 0);       /* SUCCESS */
+	rpc_frame(m);
 }
 
 static size_t put_string(uint8_t *p, size_t off, const char *value)
@@ -358,9 +406,122 @@ static void test_complete_ack_is_retirement_point(void)
 	close(host.fd);
 }
 
+static void test_active_zero_rules_forward_call_and_reply(void)
+{
+	const struct nfsp_schema_family *families[] = {
+		&nfsp_schema_family_nfs4,
+	};
+	const char *schema_id = nfsp_schema_family_nfs4.schemas[0]->schema_id;
+	struct nfsp_target_cfg cfg;
+	struct nfsp_target *target = NULL;
+	struct host_event host;
+	struct answer_log log;
+	struct nfsp_rpc_record record;
+	struct nfsp_relay_verdict verdict;
+	struct rpc_message call, reply;
+	struct pollfd pfd;
+	uint8_t rules[512], digest[NFSP_SHA256_LEN];
+	char rule_set_id[65], err[256];
+	size_t rules_len;
+	uint32_t status;
+	int sv[2];
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+		CHECK(0, "zero-rule journal socketpair");
+		return;
+	}
+	CHECK(1, "zero-rule journal socketpair");
+	rules_len = zero_rule_set(rules, schema_id);
+	nfsp_sha256(rules, rules_len, digest);
+	nfsp_sha256_hex(digest, rule_set_id);
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.families = families;
+	cfg.nfamilies = 1;
+	cfg.rule_set = rules;
+	cfg.rule_set_len = rules_len;
+	cfg.journal_fd = sv[0];
+	cfg.proxy_session_id = TEST_SESSION;
+	cfg.lane_id = 0;
+	cfg.retransmit_ms = 100;
+	memset(err, 0, sizeof(err));
+	CHECK(nfsp_target_open(&target, &cfg, err, sizeof(err)) == 0,
+	      "zero-rule target open: %s", err);
+	if (target == NULL) {
+		close(sv[1]);
+		return;
+	}
+	memset(&host, 0, sizeof(host));
+	host.fd = sv[1];
+	expect_event(target, &host, "RULESET");
+	ack_event(target, &host, rule_set_id);
+
+	memset(digest, 0xa5, sizeof(digest));
+	memset(&log, 0, sizeof(log));
+	status = UINT32_MAX;
+	CHECK(nfsp_target_request(target, NFSP_TARGET_OP_ACTIVATE, 401, digest,
+				  rule_set_id, &status, answer, &log) == 1,
+	      "zero-rule generation activate");
+	expect_event(target, &host, "GENERATION_OPEN");
+	ack_event(target, &host, rule_set_id);
+	CHECK(log.count == 1 && log.status == 0, "zero-rule activation ACK");
+
+	nfs4_null_call(&call, 0x12345678u);
+	memset(&record, 0, sizeof(record));
+	record.conn.connection_id = 17;
+	record.conn.client = 0;
+	record.conn.backend = 0;
+	record.direction = NFSP_DIR_C2S;
+	record.rpc_payload = call.body;
+	record.rpc_payload_len = call.body_len;
+	record.nfrags = 1;
+	memset(&verdict, 0, sizeof(verdict));
+	verdict.out = call.framed;
+	verdict.out_len = call.framed_len;
+	CHECK(relay(&record, call.framed, call.framed_len, &verdict, target) ==
+	      NFSP_RELAY_FORWARD, "active zero-rule CALL forwards");
+	CHECK(verdict.out == call.framed && verdict.out_len == call.framed_len &&
+	      verdict.completion == 0 && verdict.hold == 0,
+	      "active zero-rule CALL is unchanged");
+
+	accepted_reply(&reply, 0x12345678u);
+	record.direction = NFSP_DIR_S2C;
+	record.rpc_payload = reply.body;
+	record.rpc_payload_len = reply.body_len;
+	memset(&verdict, 0, sizeof(verdict));
+	verdict.out = reply.framed;
+	verdict.out_len = reply.framed_len;
+	CHECK(relay(&record, reply.framed, reply.framed_len, &verdict, target) ==
+	      NFSP_RELAY_FORWARD, "active zero-rule REPLY forwards");
+	CHECK(verdict.out == reply.framed && verdict.out_len == reply.framed_len &&
+	      verdict.completion == 0 && verdict.hold == 0,
+	      "active zero-rule REPLY is unchanged");
+	CHECK(target->stats.records == 2 && target->stats.eligible == 2,
+	      "active zero-rule CALL and REPLY are observed");
+	pfd = (struct pollfd){host.fd, POLLIN, 0};
+	CHECK(poll(&pfd, 1, 0) == 0,
+	      "zero-rule relay emits no mutation/refusal event");
+
+	memset(&log, 0, sizeof(log));
+	status = UINT32_MAX;
+	CHECK(nfsp_target_request(target, NFSP_TARGET_OP_DEACTIVATE, 401, digest,
+				  rule_set_id, &status, answer, &log) == 1,
+	      "zero-rule generation deactivate");
+	expect_event(target, &host, "GENERATION_DRAINING");
+	ack_event(target, &host, rule_set_id);
+	CHECK(log.count == 1 && log.status == 0, "zero-rule deactivation ACK");
+	CHECK(host_read_event(&host) == 0 &&
+	      strcmp(host.type, "GENERATION_COMPLETE") == 0,
+	      "zero-rule generation completes after relayed reply");
+	ack_event(target, &host, rule_set_id);
+
+	nfsp_target_close(target);
+	close(host.fd);
+}
+
 int main(void)
 {
 	test_complete_ack_is_retirement_point();
+	test_active_zero_rules_forward_call_and_reply();
 	printf("%u checks, %u failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

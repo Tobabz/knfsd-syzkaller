@@ -109,6 +109,16 @@ def _healthy(record: NfsProxyExecution) -> bool:
             and not record.error)
 
 
+def _trusted(record: NfsProxyExecution) -> bool:
+    """Whether the record ran the checked-in lane-topology corpus.
+
+    The spool's digest is SHA-256 of ``Prog.Serialize()``.  The corpus file is
+    canonical syzkaller text, so this digest is also the file digest; the
+    pinned executor's own serialization was checked against it.
+    """
+    return record.program_sha256 == LANE_TOPOLOGY_PROGRAM_SHA256
+
+
 def _acked(record: NfsProxyExecution) -> bool:
     return (record.activation == "Acked" and record.activation_status == 0
             and record.deactivation == "Acked"
@@ -132,7 +142,8 @@ def lane_results(records: list[NfsProxyExecution], events: list[StoredEvent],
     for lane, prefix in enumerate(prefixes):
         channel = f"nfsp-journal-{lane}"
         mine = [r for r in records if r.campaign and r.lane == lane]
-        attributed = [r for r in mine if _attributed(r)]
+        trusted = [r for r in mine if _trusted(r)]
+        attributed = [r for r in trusted if _attributed(r)]
         generations = {r.generation for r in attributed}
         on_channel = [e for e in events if e.binding.channel_id == channel]
         opened = {e.request.payload.correlation.kcov_generation
@@ -148,6 +159,7 @@ def lane_results(records: list[NfsProxyExecution], events: list[StoredEvent],
         results.append({
             "lane": lane,
             "executions": len(mine),
+            "foreign_program_executions": len(mine) - len(trusted),
             "attributed_executions": len(attributed),
             "distinct_generations": len(generations),
             "proxy_acked_executions": sum(_acked(r) for r in mine),
@@ -163,9 +175,35 @@ def _enough(records: list[NfsProxyExecution], procs: int,
             executions: int) -> bool:
     counts = [0] * procs
     for record in records:
-        if record.campaign and record.lane < procs:
+        if record.campaign and record.lane < procs and _trusted(record):
             counts[record.lane] += 1
     return min(counts) >= executions
+
+
+def _seedless_syzkaller(source: Path, work: Path) -> Path:
+    """A manager view with no upstream ``sys/linux/test`` seeds.
+
+    syz-manager always loads ``<syzkaller>/sys/<os>/test`` in addition to the
+    workdir corpus.  Those upstream seeds are not the trusted lane corpus and
+    would make a corpus-run campaign non-deterministic.  Keep the pinned binary
+    tree as the source of truth, but expose only its ``bin`` and an empty test
+    directory to this campaign.
+    """
+    source = source.absolute()
+    bin_dir = source / "bin"
+    if not bin_dir.is_dir():
+        raise Stage2StepError(
+            f"manager syzkaller tree has no bin directory: {source}")
+    view = work / "syzkaller-seedless"
+    (view / "sys" / "linux" / "test").mkdir(parents=True)
+    (view / "bin").symlink_to(bin_dir, target_is_directory=True)
+    return view
+
+
+def _manager_command(binary: Path, config: Path) -> list[str]:
+    """Run the corpus unchanged, one program per request, with coverage."""
+    return [str(binary), "-config", str(config),
+            "-mode", "corpus-run", "-debug"]
 
 
 def _validate_manager_mode(manager: dict[str, Any]) -> None:
@@ -213,6 +251,10 @@ def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
     workdir, spool = work / "manager-workdir", work / "executions"
     workdir.mkdir(parents=True)
     spool.mkdir()
+    # The manager must see only the one-record corpus written below.  The
+    # isolated view also keeps the pinned syzkaller tree itself untouched.
+    manager["syzkaller"] = str(_seedless_syzkaller(
+        Path(str(manager["syzkaller"])), work))
     _corpus(workdir / "corpus.db", program)
     vm_id = f"hcap04-topology.{uuid.uuid4().hex[:12]}"
     prefixes = tuple(f"tl{lane}-{uuid.uuid4().hex}" for lane in range(procs))
@@ -236,7 +278,7 @@ def run(*, manager_path: Path, collector_path: Path, descriptor_path: Path,
     try:
         with log_path.open("wb") as log:
             process = subprocess.Popen(
-                [str(binary), "-config", str(config), "-debug"],
+                _manager_command(binary, config),
                 stdin=subprocess.DEVNULL, stdout=log,
                 stderr=subprocess.STDOUT, start_new_session=True)
             deadline = time.monotonic() + timeout_s

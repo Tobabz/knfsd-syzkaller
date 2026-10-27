@@ -1706,6 +1706,7 @@ def _generated_identity(host, sanitizer="kasan"):
 def _lane_topology_evidence(identity, lane_sha256, procs, **lane):
     executions = 8
     lanes = [{"lane": n, "executions": executions,
+              "foreign_program_executions": 0,
               "attributed_executions": executions,
               "distinct_generations": executions,
               "proxy_acked_executions": executions,
@@ -1803,6 +1804,7 @@ def test_lane_topology_evidence_widens_the_stage2_layout(host, monkeypatch):
       "proxy_acked_executions": 7, "healthy_executions": 7},
      "too few executions"),
     ({"attributed_executions": 7}, "unattributed"),
+    ({"foreign_program_executions": 1}, "outside the trusted lane-topology corpus"),
     ({"distinct_generations": 7}, "repeated"),
     ({"proxy_acked_executions": 7}, "unacked"),
     ({"healthy_executions": 7}, "unhealthy"),
