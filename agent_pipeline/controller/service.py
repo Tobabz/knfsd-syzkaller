@@ -28,7 +28,7 @@ from .generation import (ACTIVE, GenerationAttempt, GenerationDriver,
                          GenerationOutput, GenerationState,
                          HarnessGeneration, HarnessGenerator,
                          HarnessValidator, generation_of)
-from .promotion import (OPEN, ArtifactPromotionInputs, HarnessPromotion,
+from .promotion import (OPEN, REJECTABLE, ArtifactPromotionInputs, HarnessPromotion,
                         ProbeCampaigner, PromotionDriver, PromotionInputs,
                         PromotionState, approve, issue_resolved,
                         new_promotion, on_registry, reject, retry)
@@ -42,6 +42,11 @@ from .tasks import (CLEANUP_UNCONFIRMED, AgentExecutor, AgentRequest, Runner,
                     runner_input_digest)
 
 FINAL = ("sealed", "ended_unsealed")
+#: A job past the end of Stage 1: where a person decides the promotion of
+#: the staged harness it ran on (07 §5.3).
+STAGE1_ENDED = TERMINAL | {JobState.S1_REACHED, JobState.S2_STRATEGY,
+                           JobState.S2_GATE, JobState.S2_CAMPAIGN,
+                           JobState.S2_REPLAYING, JobState.CRASH_REVIEW}
 #: Agent attempt states that can still give a result.
 LIVE = ("sending", "running")
 AGENT_OUTPUT = TypeAdapter(AgentOutput)
@@ -680,16 +685,47 @@ class Controller:
     def approve_promotion(self, promotion_id: str, decision_id: str,
                           note: str = "") -> HarnessPromotion:
         """07 §5.3: a person approves the evidence of a promotion in
-        review.  The host then promotes; the registry change ends it."""
+        review, at the end of Stage 1 of a job on its staged harness.  The
+        host then promotes; the registry change ends it."""
+        jobs = self._stage1_ended(promotion_id)
         return self._decide(promotion_id, lambda p: approve(
-            p, decision_id, note, self.clock()), "approved", decision_id)
+            p, decision_id, note, self.clock(), jobs), "approved",
+            decision_id)
 
     def reject_promotion(self, promotion_id: str, decision_id: str,
                          note: str = "") -> HarnessPromotion:
-        """07 §5.3: the jobs leave the staged binding and meet the gap
-        again."""
+        """07 §5.3, at a Stage 1 end as approve_promotion: the jobs leave
+        the staged binding and meet the gap again."""
+        jobs = self._stage1_ended(promotion_id)
         return self._decide(promotion_id, lambda p: reject(
-            p, decision_id, note, self.clock()), "rejected", decision_id)
+            p, decision_id, note, self.clock(), jobs), "rejected",
+            decision_id)
+
+    def promotion_due(self, job: Job) -> HarnessPromotion | None:
+        """The promotion a person decides with this job's Stage 1 end: the
+        job ran on its staged harness, reached the end of Stage 1, and the
+        promotion waits on a decision."""
+        if self.promotions is None or job.staged is None or \
+                job.state not in STAGE1_ENDED:
+            return None
+        p = self.store.promotion_for(job.staged.generation_id)
+        if p is None or p.state not in (PromotionState.REVIEW, *REJECTABLE):
+            return None
+        return p
+
+    def _stage1_ended(self, promotion_id: str) -> tuple[str, ...]:
+        """The jobs on the promotion's staged harness at the end of Stage
+        1.  A person decides a promotion only there, never in the middle of
+        a stage (user decision 2026-10-27)."""
+        p = self.store.promotion(promotion_id)
+        jobs = tuple(sorted(
+            j.job_id for j in self.store.jobs(set(STAGE1_ENDED))
+            if j.staged is not None and
+            j.staged.generation_id == p.generation_id))
+        if not jobs:
+            raise ValueError(f"{promotion_id}: no job on its staged harness "
+                             "has reached the end of Stage 1")
+        return jobs
 
     def retry_promotion(self, promotion_id: str) -> HarnessPromotion:
         """Run the campaigns of a promotion not met or failed again."""

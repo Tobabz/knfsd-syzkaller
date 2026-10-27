@@ -9,7 +9,8 @@ the jobs back to the gap.  The jobs' own path never waits on any of it.
 
 import pytest
 
-from agent_pipeline.contracts import GapClass, GapRef, UnsupportedOutput
+from agent_pipeline.contracts import (GapClass, GapRef, Q1Status,
+                                     UnsupportedOutput)
 from agent_pipeline.controller.generation import (ExtensionOutput,
                                                   GenerationState)
 from agent_pipeline.controller.promotion import PromotionState
@@ -68,6 +69,13 @@ def _finish(w, state, task_id=None, **kw):
     return task_id
 
 
+def _reached(w, j) -> None:
+    """The job ends Stage 1 on the staged harness: where a person decides
+    the promotion."""
+    w.run(j, Q1Status.REACHED)
+    assert w.job(j).state is JobState.S1_REACHED
+
+
 def _evidence(w, name="ev-1", programs=("gen-1", "gen-2")):
     return _finish(w, "evidence", evidence_ref=sha(name),
                    record_ref=sha("record", name),
@@ -109,6 +117,41 @@ def test_a_pass_campaigns_without_the_candidate_program_and_waits_for_review(
                              PromotionState.REVIEW]
 
 
+def test_a_person_decides_only_at_the_end_of_stage_1(make_world):
+    """User decision 2026-10-27: no human approval in the middle of a
+    stage.  The evidence waits for a job on the staged harness to end
+    Stage 1, and the decision is shown with that job."""
+    w = _world(make_world)
+    j = _staged(w)
+    w.plan(j)
+    w.c.poll()
+    _evidence(w)
+    pid = _promotion(w).promotion_id
+    assert w.job(j).state is JobState.S1_RUNNING
+    assert w.c.promotion_due(w.job(j)) is None
+    for decide in (w.c.approve_promotion, w.c.reject_promotion):
+        with pytest.raises(ValueError, match="end of Stage 1"):
+            decide(pid, "review-1")
+    assert _promotion(w).state is PromotionState.REVIEW
+    _reached(w, j)
+    assert w.c.promotion_due(w.job(j)).promotion_id == pid
+    assert w.c.approve_promotion(pid, "review-1").state is \
+        PromotionState.APPROVED
+    assert w.c.promotion_due(w.job(j)) is None
+
+
+def test_campaigns_are_not_rejected_while_they_run(make_world):
+    w = _world(make_world)
+    j = _staged(w)
+    w.plan(j)
+    w.c.poll()
+    pid = _promotion(w).promotion_id
+    _reached(w, j)
+    assert _promotion(w).state is PromotionState.CAMPAIGNING
+    with pytest.raises(ValueError, match="campaigning"):
+        w.c.reject_promotion(pid, "review-1")
+
+
 def test_an_approved_promotion_ends_when_the_registry_carries_it(make_world):
     w = _world(make_world)
     j = _staged(w)
@@ -116,10 +159,12 @@ def test_an_approved_promotion_ends_when_the_registry_carries_it(make_world):
     w.c.poll()
     _evidence(w)
     pid = _promotion(w).promotion_id
+    _reached(w, j)
     p = w.c.approve_promotion(pid, "review-7", "looks general")
     assert p.state is PromotionState.APPROVED
     assert p.review.decision_id == "review-7"
     assert p.review.evidence_refs == (sha("ev-1"),)
+    assert p.review.job_ids == (j,)
     # The registry moves to a build that does not carry the evidence.
     w.registry.put(binding(execution="build-g1", hcap="hcap-other"))
     w.c.on_registry_changed()
@@ -146,6 +191,7 @@ def test_a_promotion_resolves_its_issue_through_a_recording_tracker(
     w.c.poll()
     _evidence(w)
     pid = _promotion(w).promotion_id
+    _reached(w, j)
     w.c.approve_promotion(pid, "review-7")
     w.promotion_inputs.carried["hcap-promoted"] = {("CAP-lock", sha("ev-1"))}
     w.registry.put(PROMOTED)
@@ -170,6 +216,7 @@ def test_a_failed_issue_resolution_is_sent_again(make_world):
     w.plan(j)
     w.c.poll()
     _evidence(w)
+    _reached(w, j)
     w.c.approve_promotion(_promotion(w).promotion_id, "review-7")
     w.promotion_inputs.carried["hcap-promoted"] = {("CAP-lock", sha("ev-1"))}
     w.registry.put(PROMOTED)
@@ -275,6 +322,7 @@ def test_a_rejected_promotion_sends_the_jobs_back_to_the_gap(make_world):
     w.c.poll()
     _evidence(w)
     pid = _promotion(w).promotion_id
+    _reached(w, j)
     p = w.c.reject_promotion(pid, "review-9", "targets the candidate")
     assert p.state is PromotionState.REJECTED
     assert p.review.decision == "rejected"

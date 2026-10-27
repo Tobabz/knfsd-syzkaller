@@ -337,7 +337,9 @@ crash report는 staged revision과 생성 patch set의 digest를 기록한다.
 ### 5.3 promotion
 
 staged revision을 공유 HCAP으로 올리는 promotion은 아래 승격 기준(#100)을 모두 통과해야 한다. 사람 검토는
-기준 결과를 보고 승인하는 단계다. 기준을 대신하지 않는다. promotion은 job을 막지 않는다. staged harness로 진행
+기준 결과를 보고 승인하는 단계다. 기준을 대신하지 않는다. 사람은 stage 중간에서 결정하지 않는다. staged
+harness로 진행한 job이 Stage 1 끝(`s1_reached` 또는 그 뒤)에 이르렀을 때 그 job의 결과와 함께 결정한다(사용자
+결정 2026-10-27). promotion은 job을 막지 않는다. staged harness로 진행
 중인 job은 그대로 진행하고, promotion이 끝나면 issue가 `resolved`가 되며 `09` §5의 `hcap_revision` 재평가 규칙이
 job들을 promoted revision으로 옮긴다. promotion 검토가 생성물을 거부하면 그 staged revision으로 만든 결과는 거부
 사실과 함께 남기고, 해당 job은 `09` §5의 binding 변경 규칙으로 다시 gap 경로에 들어간다.
@@ -408,10 +410,13 @@ capability의 근거로도 받지 않는다.
   - campaign: capability마다 Runner task 하나다(`CommandCampaigner`, host 명령은 `probe-campaign`).
     `inconclusive`는 생성의 `runtime_retry_limit`까지 다시 돌리고, 넘으면 `failed`다. `refused`가 있으면
     `not_met`이다. staged binding은 남고, operator가 campaign을 다시 돌릴 수 있다.
-  - 모든 capability에 evidence가 있으면 `review`에서 사람의 결정을 기다린다. 승인하면 `approved`다. host가
+  - 모든 capability에 evidence가 있으면 `review`다. 결정은 staged binding의 job 하나가 Stage 1 끝에 이른 뒤에만
+    받는다. 그 전의 승인과 거부는 거부되고, job의 status가 결정할 promotion을 보여 준다. 결정 기록에는 그때
+    Stage 1 끝에 있던 job을 남긴다. 승인하면 `approved`다. host가
     capability와 evidence를 host spec에 넣어 promotion하고, registry의 binding이 각 capability를 그 evidence와 함께
     가지면 `promoted`가 된다. 이때 issue를 `resolved`로 바꾸고, registry 변경이 job을 옮긴다(`09` §5).
-  - 사람이 거부하면 `rejected`다. staged binding의 job은 registry binding으로 돌아간다. 그 gap을 다시 만난 job은
+  - 사람이 Stage 1 끝에서 거부하면 `rejected`다(`review`, `not_met`, `failed`에서. campaign이 도는 동안은 받지
+    않는다). staged binding의 job은 registry binding으로 돌아간다. 그 gap을 다시 만난 job은
     `blocked_harness_gap`(`generation_promotion_rejected`)에서 operator의 `retry_generation`을 기다린다.
 
 기준을 통과하지 못한 capability는 버리지 않는다. staged revision으로 남겨 그 후보의 job은 계속 진행한다. 다만

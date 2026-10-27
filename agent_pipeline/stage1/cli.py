@@ -280,6 +280,13 @@ def _job_summary(service: Stage1Service, job_id: str) -> dict:
         out["replay"] = {"crash_bundle_ref": job.replay.crash.bundle_ref,
                          "outcome": None if job.replay.outcome is None else
                          job.replay.outcome.model_dump(mode="json")}
+    due = service.controller.promotion_due(job)
+    if due is not None:
+        # 07 §5.3: decided with this Stage 1 end (approve-promotion).
+        out["promotion_due"] = {"promotion_id": due.promotion_id,
+                                "state": due.state.value,
+                                "reason": due.reason,
+                                "evidence_refs": list(due.evidence_refs)}
     failures = service.store.effect_failures(job_id)
     if failures:
         out["last_effect_failure"] = list(failures[-1])

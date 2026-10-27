@@ -165,7 +165,10 @@ job's state; the jobs keep running on the staged binding.
    Tasks are in `state_dir/campaigns.sqlite`; runs are in
    `campaign-runs/`.
 3. **Review.** With evidence for every capability the promotion waits in
-   `review`. A refused campaign, or a candidate program known later that
+   `review`. A person decides only at the end of Stage 1 of a job on the
+   staged harness (`s1_reached` or later), never in the middle of a stage:
+   until then `approve-promotion` and `reject-promotion` are refused, and
+   from then the job's `status` shows `promotion_due`. A refused campaign, or a candidate program known later that
    a campaign ran, makes it `not_met`: the staged binding stays and
    `retry-promotion` runs the campaigns again.
 
@@ -184,7 +187,7 @@ job's state; the jobs keep running on the staged binding.
    build key carries each capability with its campaign evidence. The gap's
    issue is then resolved, and the registry change moves the jobs (09 §5).
 
-`reject-promotion` sends the jobs on the staged binding back to the
+`reject-promotion` (at a Stage 1 end, not while campaigns run) sends the jobs on the staged binding back to the
 registry's binding. A job that meets the gap again ends in
 `blocked_harness_gap(generation_promotion_rejected)` until an operator
 sends `retry_generation`.

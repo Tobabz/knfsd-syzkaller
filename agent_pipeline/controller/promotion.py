@@ -14,16 +14,20 @@ per capability the staged HCAP added or changed for the gap, and keeps the
 - ``campaigning``: one campaign Runner task per capability.  An
   ``inconclusive`` one runs again, up to the generation's
   ``runtime_retry_limit``; then the promotion is ``failed``.
-- ``review``: every campaign wrote evidence.  ``not_met``: a campaign was
+- ``review``: every campaign wrote evidence.  A person decides at the end
+  of Stage 1 of a job that ran on the staged harness, with that job's
+  results; never in the middle of a stage (user decision 2026-10-27).
+  ``not_met``: a campaign was
   refused, or a candidate program known later ran in a campaign.  The
   staged binding stays; the jobs go on (07 §5.3).  An operator may run the
   campaigns again (``retry``).
-- ``approved``: a person approved the evidence.  The promotion itself is
+- ``approved``: a person approved the evidence at a Stage 1 end.  The promotion itself is
   the host's (the capabilities and their evidence in the host spec, a new
   harness catalog); ``promoted`` once the registry's binding for the build
   key carries each capability with its campaign evidence.  The gap's issue
   is then resolved, and the registry change moves the jobs (09 §5).
-- ``rejected``: a person rejected it.  The jobs leave the staged binding
+- ``rejected``: a person rejected it at a Stage 1 end (from ``review``,
+  ``not_met`` or ``failed``).  The jobs leave the staged binding
   (09 §5 binding change) and meet the gap again; the generation then ends
   them ``promotion_rejected`` until an operator retries generation.
 
@@ -115,6 +119,9 @@ class PromotionReview(Record):
     note: str = Field(default="", max_length=2000)
     #: The evidence the decision saw.
     evidence_refs: tuple[str, ...] = ()
+    #: The jobs on the staged harness at the end of Stage 1 when it was
+    #: decided.
+    job_ids: tuple[str, ...] = ()
     at: str
 
 
@@ -275,26 +282,35 @@ def on_campaign(p: HarnessPromotion, task_id: str,
     return p.model_copy(update={"state": PromotionState.REVIEW})
 
 
-def approve(p: HarnessPromotion, decision_id: str, note: str,
-            at: str) -> HarnessPromotion | None:
-    if p.state is not PromotionState.REVIEW:
+#: Where a person may reject: the campaigns are not running.
+REJECTABLE = frozenset({PromotionState.REVIEW, PromotionState.NOT_MET,
+                        PromotionState.FAILED})
+
+
+def approve(p: HarnessPromotion, decision_id: str, note: str, at: str,
+            job_ids: tuple[str, ...]) -> HarnessPromotion | None:
+    """``job_ids``: the jobs on the staged harness at the end of Stage 1;
+    without one there is no decision to take."""
+    if p.state is not PromotionState.REVIEW or not job_ids:
         return None
     return p.model_copy(update={
         "state": PromotionState.APPROVED,
         "review": PromotionReview(decision="approved",
                                   decision_id=decision_id, note=note,
-                                  evidence_refs=p.evidence_refs, at=at)})
+                                  evidence_refs=p.evidence_refs,
+                                  job_ids=job_ids, at=at)})
 
 
-def reject(p: HarnessPromotion, decision_id: str, note: str,
-           at: str) -> HarnessPromotion | None:
-    if p.state in (PromotionState.PROMOTED, PromotionState.REJECTED):
+def reject(p: HarnessPromotion, decision_id: str, note: str, at: str,
+           job_ids: tuple[str, ...]) -> HarnessPromotion | None:
+    if p.state not in REJECTABLE or not job_ids:
         return None
     return p.model_copy(update={
         "state": PromotionState.REJECTED, "reason": "review_rejected",
         "review": PromotionReview(decision="rejected",
                                   decision_id=decision_id, note=note,
-                                  evidence_refs=p.evidence_refs, at=at)})
+                                  evidence_refs=p.evidence_refs,
+                                  job_ids=job_ids, at=at)})
 
 
 def retry(p: HarnessPromotion) -> HarnessPromotion | None:
