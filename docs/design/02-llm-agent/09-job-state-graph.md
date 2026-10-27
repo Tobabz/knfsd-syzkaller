@@ -7,8 +7,10 @@
 > `agent_pipeline/rule_compiler.py`. gate·campaign·replay의 Runner backend와 artifact 기반 Stage 2 Judge는 미구현).
 > 구현 스택은 `../decisions/2026-10-13-agent-implementation-stack.md`
 > 관련 게이트: Q1 / Stage 2 baseline-with-rules gate / Q2 / Replay
-> 설계 변경(2026-10-25): gap은 `blocked_harness_gap`이 아니라 `harness_generating`(§3.2)으로 간다. 구현은 아직
-> gap에서 멈춘다(issue #83). 결정 기록은 `../decisions/2026-10-25-harness-generation-on-gap.md`
+> 설계 변경(2026-10-25): gap은 `blocked_harness_gap`이 아니라 `harness_generating`(§3.2)으로 간다. Controller
+> 경로(`agent_pipeline/controller/generation.py`)는 구현됐다. 생성 Agent Task와 검증 Runner task는 아직 없어서
+> host에서는 `generation_unavailable`로 `blocked_harness_gap`에 간다(issue #83). 결정 기록은
+> `../decisions/2026-10-25-harness-generation-on-gap.md`
 
 ## 요약
 
@@ -376,6 +378,34 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
 - `kernel_commit`용 harness가 없는 경우(binding 실패 행)의 생성은 계측 series의 이식과 그 build의 검증이다.
   Q1은 그 build에서 처음부터 세운다.
 
+**구현(`agent_pipeline/controller/generation.py`).**
+
+- 생성 기록 `HarnessGeneration`은 gap key와 build key(`kernel_commit`, sanitizer)마다 있다. staged build는 한
+  commit과 sanitizer에만 쓰이기 때문이다. 기록은 시작할 때 registry의 binding(`base_binding`), 시작한 job의
+  candidate, CandidateAnalysis, `CapabilityProposal`, 그리고 그 job의 JobPolicy에서 온 한도를 고정한다. 상태는
+  `generating`, `validating`, `passed`, `infeasible`, `exhausted`, `failed`다. 단계마다 store에 commit하고 전이를
+  따로 남긴다(`generation_transitions`).
+- job은 생성 기록의 끝을 자기 이벤트 `GenerationEnded`로 받는다. `passed`는 staged binding을 싣고 job을
+  `retry_pending`으로 보낸다. 그 다음 다시 binding하는 규칙은 issue resolved와 같다(§5). 나머지 끝은 job을
+  `blocked_harness_gap`에 두고, job이 거부당한 생성 기록을 `Job.generation_refused`에 남긴다.
+- job이 `harness_generating`에 들어오면 service가 그 key의 마지막 생성 기록을 찾는다. 기록이 없거나, operator가 그
+  기록을 다시 시도하라고 했거나(`retry_generation`), 통과한 기록의 `base_binding`이 registry에 더는 없으면 새 기록을
+  만든다. 그 밖에는 마지막 기록을 함께 기다리거나 그 끝을 받는다. 그래서 infeasible이나 exhausted로 끝난 key에 늦게
+  들어온 job도 바로 `blocked_harness_gap`에 간다. budget은 key 단위이고, 다시 시작하는 것은 operator다. 이미 그
+  staged binding에 있는데 같은 gap을 다시 만난 job은 그 결과를 다시 받지 않는다(`not_filled`).
+- job은 `Job.staged`가 가리키는 staged binding에 있는 동안, registry가 그 생성의 `base_binding`을 그대로 가지면
+  staged binding을 유지한다. registry가 바뀌면(promotion, 새 build) registry binding으로 옮긴다.
+- 생성 Agent의 실패는 `agent_retry_limit`까지 같은 task를 새 try로 다시 보내고, 넘으면 `failed`다. 검증의
+  `INCONCLUSIVE`는 `runtime_retry_limit`까지 새 검증 task로 다시 실행하고, 넘으면 `failed`다. Controller가 다시
+  시작하면 생성 Agent task는 새 try로 다시 보내고, 검증 task는 `task_id`로 다시 붙는다(§8).
+- JobPolicy `harness_generation_budget`의 기본값은 3이다(사용자 결정, 2026-10-27). 0이면 gap은 바로
+  `blocked_harness_gap`에 간다. 이 필드가 생기기 전에 저장된 policy는 store가 0으로 읽는다. 그 job들의 전이를
+  replay에서 그대로 재현하기 위해서다. 같은 policy를 이 필드 없이 다시 등록해도(host 재시작) 0으로 남고, 생성을
+  켜려면 새 policy id가 필요하다. 0보다 크지만 host에 생성기가 설정되지 않았으면 `harness_generating`에서 바로
+  `blocked_harness_gap(generation_unavailable)`로 간다.
+- `harness_generating`에서 issue resolved는 `retry_pending`, deferred는 `parked`, wont_fix는 `closed_unsupported`다.
+  진행 중인 생성은 같은 key의 다른 job을 위해 계속한다.
+
 ### 4. Stage 2 전이
 
 Stage 2는 Proxy M4 이후 구현한다(`../decisions/2026-10-13-agent-implementation-stack.md` 결정 1). 아래 표는
@@ -476,11 +506,11 @@ job이 기준 지점에 있었다면 표가 만들었을 결과로 `resume_point
 
 | 이벤트 | 대상 | 처리 | 근거 |
 |---|---|---|---|
-| operator `retry_generation` | `blocked_harness_gap`, `parked` | `harness_generating`. `harness_generation` counter를 0으로 되돌리고 같은 gap과 `resume_point`로 생성을 다시 시작한다 | `07` §7 |
-| issue resolved | `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding한 뒤 `resume_point`로 간다. binding이 바뀌었으면 먼저 표 위 규칙대로 `resume_point`를 바꾼다. identity가 바뀌었으면 아래 identity 변경 행을, identity가 같고 `hcap_revision`만 바뀌었으면(build를 바꾸지 않은 promotion) 아래 `hcap_revision` 변경 행을 적용한다. 그 `hcap_revision`의 변경 이벤트가 issue 이벤트보다 늦게 오거나 오지 않아도 같다 | `07` §7 |
-| issue deferred | `blocked_harness_gap` | `parked` | `07` §7 |
+| operator `retry_generation` | `blocked_harness_gap`, `parked` | `harness_generating`. `harness_generation` counter를 0으로 되돌리고 같은 gap과 `resume_point`로 생성을 다시 시작한다. 그 job을 거부한 생성 기록이 key의 마지막 기록일 때만 새 기록을 만들고, 다른 job이 이미 새로 시작했으면 그 기록을 함께 기다린다(§3.2) | `07` §7 |
+| issue resolved | `harness_generating`, `blocked_harness_gap`, `parked` | `retry_pending`. 다시 binding한 뒤 `resume_point`로 간다. binding이 바뀌었으면 먼저 표 위 규칙대로 `resume_point`를 바꾼다. identity가 바뀌었으면 아래 identity 변경 행을, identity가 같고 `hcap_revision`만 바뀌었으면(build를 바꾸지 않은 promotion) 아래 `hcap_revision` 변경 행을 적용한다. 그 `hcap_revision`의 변경 이벤트가 issue 이벤트보다 늦게 오거나 오지 않아도 같다 | `07` §7 |
+| issue deferred | `harness_generating`, `blocked_harness_gap` | `parked` | `07` §7 |
 | issue reopened | `parked` | `blocked_harness_gap`. 같은 gap과 `resume_point`로 issue를 다시 기다린다 | `07` §7 |
-| issue wont_fix | `blocked_harness_gap`, `parked` | `closed_unsupported(reason)` | `07` §7 |
+| issue wont_fix | `harness_generating`, `blocked_harness_gap`, `parked` | `closed_unsupported(reason)` | `07` §7 |
 | bound ExecutionHarnessIdentity 변경(harness build 교체·폐기) | binding 뒤의 비종료 상태(`s2_replaying` 제외) | 진행 중인 task는 결과를 받지 않는다. 다시 binding하고 identity 재수립 지점(표 아래)으로 간다. 대기 상태는 표 위 규칙대로 `resume_point`만 바꾼다 | `01` §11.2, `07` §7 |
 | 같은 변경 | `s2_replaying` | 다시 binding만 한다. replay는 crash evidence의 harness identity로 계속한다(`../03-nfs-proxy/05` §25). 바뀐 binding은 `crash_review`의 `resume_point`에 반영된다(§4) | `01` §11.2, §12 |
 | `hcap_revision`만 변경 | 비종료 상태(`s2_replaying` 제외. 대기 상태는 표 위 규칙) | `s1_analysis`, `s1_planning`은 진행 중인 task의 결과를 받지 않고 같은 Agent Task를 새 `hcap_revision`으로 다시 시작한다. 그 밖의 상태는 plan과 evidence를 새 HCAP으로 결정적으로 다시 검증해, 실패하면 `s1_planning`(repair, `hcap_changed`)으로 간다. 통과하면 MutationRuleSet을 입력으로 쓰는 지점(`s2_gate`, `s2_campaign`, §4의 Compiler 거부 행이 정한 `resume_point`)은 그 rule set을 다시 compile해 `s2_gate`로 가고(거부는 §4의 Compiler 행), Mutation Strategy를 기다리는 `s2_strategy`는 진행 중인 task의 결과를 받지 않고 그 Agent Task를 새 `hcap_revision`으로 다시 시작한다. 나머지 상태는 그대로 둔다. harness는 새 HCAP에서 나온 CallAdmissionProfile·NeutralControlCatalog ref가 harness에 기록된 ref와 다를 때만 다시 materialize한다(진행 중인 Runner task는 결과를 받지 않는다). 같으면 harness를 유지하고 그 `hcap_revision`으로 다시 검증했다고 기록한다 | `01` §11.2, `07` §7 |
@@ -509,7 +539,7 @@ remote_kcov.kernel_revision.<commit>)`이다. 대기 상태에서는 이 검증�
 | `agent_repair[stage2]` | Stage 2에서 `(repair)` 전이의 수(cause `hcap_changed` 제외) | operator `resume` | `blocked_operator(stage2_repair_budget)` |
 | `agent_retry` | 같은 Agent Task 요청의 연속 실행 실패: provider 오류, timeout, usage limit, 프레임워크의 출력 검증 재시도를 다 쓴 뒤에도 schema에 맞지 않는 출력 | Agent Task 성공, 새 요청 시작 | `blocked_operator(agent_failure)` |
 | `runtime_retry[step]` | 같은 Runner 입력의 연속 재실행 (`s1_running`, `s1_fixed`, `s1_replaying`, `s2_gate`, `s2_campaign`, `s2_replaying`). `s1_fixed`는 campaign의 연속 infra attempt를 센다 | 그 단계가 재실행이 아닌 행으로 끝날 때, Runner 입력이 바뀔 때. `s2_campaign`은 이어 간 campaign이 bundle을 봉인할 때도(campaign evidence는 §4의 campaign 임계값이 따로 센다). 재실행 행으로 가는 결과는 판정된 verdict여도(`INCONCLUSIVE(loss)`, gate의 M1 `INCONCLUSIVE`) 되돌리지 않는다 | `blocked_operator(runtime_retry_exhausted)` |
-| `harness_generation[gap key]` | 같은 gap key에서 검증이 거부된 생성 시도의 수 | 검증 통과, operator `retry_generation` | `blocked_harness_gap(..., generation_exhausted)` (§3.2) |
+| `harness_generation[gap key]` | 같은 gap key에서 검증이 거부된 생성 시도의 수. 한도는 JobPolicy `harness_generation_budget`(생성 시도 수)이고, 생성을 시작한 job의 값을 그 생성 기록에 고정한다 | 검증 통과, operator `retry_generation`(새 생성 기록) | `blocked_harness_gap(..., generation_exhausted)` (§3.2) |
 | campaign 임계값, fuzz budget | `01` §11.1, §12 | — | §4 표 |
 | fixed campaign 수 | 센 attempt(`fixed_attempts`), 연속 `not_reached`(`fixed_not_reached_limit`) | 연속 수: `reached_no_crash`, operator `resume` | §3.1 표 |
 
