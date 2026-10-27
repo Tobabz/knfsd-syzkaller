@@ -556,7 +556,9 @@ def test_template_spec_is_valid():
     assert topology.layout == ExecutionLayout(procs=4, lanes=(0, 1, 2, 3))
     assert topology.capability_ids == ("HCAP-01", "HCAP-03", "HCAP-04")
     assert all(not lane.foreign_program_executions for lane in topology.lanes)
-    assert spec.stage2 is not None and spec.stage2.procs == 4
+    # Stage 2 stays on one proc: HCAP-11 and HCAP-13 are validated on
+    # lane 0 only, and four procs would drop their calls.
+    assert spec.stage2 is not None and spec.stage2.procs == 1
 
     # #100: the criteria judge new and revised capabilities; the checked-in
     # four-lane layout is now a legacy catalog entry.
@@ -564,7 +566,7 @@ def test_template_spec_is_valid():
     live = HostSpec.model_validate_json(
         (REPO / "stage1-host-live/host-spec.json").read_bytes())
     assert generate_module.promoted_by_criteria(live) == ()
-    assert live.stage2 is not None and live.stage2.procs == 4
+    assert live.stage2 is not None and live.stage2.procs == 1
     live_layouts = {cap.id: cap.layout() for cap in live.capabilities}
     assert all(live_layouts[capability_id] ==
                ExecutionLayout(procs=4, lanes=(0, 1, 2, 3))
@@ -1783,25 +1785,33 @@ def test_lane_topology_evidence_widens_the_stage2_layout(host, monkeypatch):
     for capability in widened:
         capability["validated_layout"] = {"procs": 2, "lanes": [0, 1]}
     host.spec.write_text(json.dumps(spec, indent=1))
+    # CAP-extra is still validated on lane 0 only: left out, procs stay
+    # where read$extra is enabled.
     result = generate(host.spec)
     catalog = load_record(ArtifactStore(host.root / "cas"),
                           result.hcap_revision, HcapCatalog)
     assert next(c for c in catalog.capabilities
                 if c.id == "CAP-lane").validated_layout.procs == 2
     manager = json.loads(result.stage2_managers["kasan"].read_text())
+    assert manager["procs"] == 1
+    assert manager["enable_syscalls"] == ["close", "openat$lane", "read$extra"]
+    # Two procs would drop read$extra: refused, not dropped unnoticed.
+    spec["stage2"] = {"procs": 2}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match=r"stage2 at 2 proc\(s\) would "
+                       r"not enable read\$extra: CAP-extra"):
+        generate(host.spec)
+    # Unless the spec leaves it out by name.
+    spec["stage2"] = {"procs": 2, "enable_syscalls": ["close", "openat$lane"]}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    result = generate(host.spec)
+    manager = json.loads(result.stage2_managers["kasan"].read_text())
     assert manager["procs"] == 2
-    # CAP-extra is still validated on lane 0 only, so read$extra is out.
     assert manager["enable_syscalls"] == ["close", "openat$lane"]
     assert "2 proc(s)" in _preflight_manager(
         host, result, result.stage2_managers["kasan"])
-    spec["stage2"] = {"procs": 1}
-    host.spec.write_text(json.dumps(spec, indent=1))
-    manager = json.loads(generate(host.spec).stage2_managers["kasan"]
-                         .read_text())
-    assert manager["procs"] == 1
-    assert manager["enable_syscalls"] == ["close", "openat$lane", "read$extra"]
-    spec["stage2"] = {"enable_syscalls": ["close", "openat$lane",
-                                          "read$extra"]}
+    spec["stage2"] = {"procs": 2, "enable_syscalls": [
+        "close", "openat$lane", "read$extra"]}
     host.spec.write_text(json.dumps(spec, indent=1))
     with pytest.raises(GenerationError, match=r"call_outside_validated_layout:"
                        r"read\$extra"):

@@ -918,6 +918,6 @@
       ],
       "trace_mode": "off"
     },
-    "procs": 4
+    "procs": 1
   }
 }
