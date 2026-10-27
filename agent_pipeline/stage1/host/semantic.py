@@ -58,7 +58,8 @@ from ...semantic_delta import DeltaReadError, SealedJournal
 from ...semantic_promotion import (GuestValidationRun,
                                    PromotedSemanticCapabilityRegistry,
                                    PromotionRefused, RegistryError,
-                                   SemanticSubset, describe_rule_set,
+                                   SemanticSubset, StagedProxies,
+                                   describe_rule_set,
                                    dynamic_originals, pin, promoted_registry,
                                    read_build_registry, subset_problems,
                                    with_semantic_capability)
@@ -212,8 +213,9 @@ def pinned_hcap(store: ArtifactStore, hcap: HcapCatalog,
 
 
 def staged_proxy(root: Path, proxy_sha256: str) -> Path:
-    """Where ``stage_proxy`` keeps the host Proxy of this digest."""
-    return root / proxy_sha256 / STAGED_PROXY
+    """Where ``stage_proxy`` keeps the host Proxy of this digest
+    (``semantic_promotion.StagedProxies``)."""
+    return StagedProxies(root).path(proxy_sha256)
 
 
 def stage_proxy(root: Path, proxy: Path) -> Path:

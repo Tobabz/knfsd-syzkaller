@@ -368,6 +368,7 @@ program with the rule set, its replay in a fresh guest, the judgment and
 registry. The Proxy runs on the host only under `launcher`; `proxy` in
 `validate.json` names the tree's Proxy for a build that did not rebuild
 it. The host Proxy is then kept read-only in `staged_files` as
-`<sha256>/nfs-proxy`; M7 stage 2 (`agent_pipeline/stage2/semantic.py`,
-enabled by `generation.semantic.collector` in the Stage 1 config) reads a
-natural Stage 2 crash's rule set with it.
+`<sha256>/nfs-proxy`. With `generation.semantic.collector` in the Stage 1
+config, a staged harness's Stage 2 compiles and checks its replay rule set
+with it, under `launcher`, and M7 stage 2
+(`agent_pipeline/stage2/semantic.py`) reads its natural crashes with it.

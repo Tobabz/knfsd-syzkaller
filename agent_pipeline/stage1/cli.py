@@ -114,7 +114,8 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
             crash_window_bound=c.crash_window_bound, env=c.env,
             limits=ProcessLimits(timeout_s=c.timeout_s,
                                  max_output_bytes=c.max_output_bytes),
-            poll_interval_s=c.poll_interval_s, state_dir=state.resolve())
+            poll_interval_s=c.poll_interval_s, state_dir=state.resolve(),
+            staged_proxies=_staged_proxies(config))
 
         def stage2_engine(store, receipts, evidence) -> Stage2CommandEngine:
             return Stage2CommandEngine(
@@ -153,7 +154,8 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         runner_workers=1 if slots is None else slots.count,
         compiler=None if config.nfs_proxy is None else
         ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
-                                     state / "compile"),
+                                     state / "compile",
+                                     staged=_staged_proxies(config)),
         stage2=stage2, generation=generation)
     return stack.enter_context(Stage1Service(parts))
 
@@ -193,13 +195,12 @@ def _generation(config: Stage1Config, stack: ExitStack,
         else:
             campaigner = DeferredValidator(campaigns)
     semantic = None
-    if g.semantic is not None and run:
+    staged = _staged_proxies(config)
+    if staged is not None and run:
         from ..stage2.semantic import ArtifactSemanticRecorder
-        from .host.collector import CollectorConfig
         semantic = ArtifactSemanticRecorder(
-            artifacts, staged_files=CollectorConfig.load(
-                g.semantic.collector).staged_files,
-            workdir=state / "semantic-promotion", launcher=g.launcher)
+            artifacts, staged_files=staged.root,
+            workdir=state / "semantic-promotion", launcher=staged.launcher)
     if runtime is None and run:
         from ..agent_tasks.pydantic_ai_generation import (
             PydanticAIGenerationRuntime)
@@ -217,6 +218,18 @@ def _generation(config: Stage1Config, stack: ExitStack,
                                       workers=g.workers,
                                       campaigner=campaigner,
                                       semantic=semantic)
+
+
+def _staged_proxies(config: Stage1Config):
+    """The host Proxies Harness Generation validation staged (M7, 03-nfs-
+    proxy/06 §30), when ``generation.semantic`` is configured."""
+    g = config.generation
+    if g is None or g.semantic is None:
+        return None
+    from ..semantic_promotion import StagedProxies
+    from .host.collector import CollectorConfig
+    root = CollectorConfig.load(g.semantic.collector).staged_files
+    return None if root is None else StagedProxies(root, g.launcher)
 
 
 def gap_contract(hcap: ArtifactHcapChecker, gap, revision: str | None):

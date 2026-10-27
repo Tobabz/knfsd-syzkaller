@@ -41,6 +41,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -183,6 +184,30 @@ def read_build_registry(proxy: Path, *, launcher: tuple[str, ...] = ()
     return BuildRegistry(proxy_sha256=hashlib.sha256(
         Path(proxy).read_bytes()).hexdigest(),
         registry_digest=registry.digest, registry=registry)
+
+
+@dataclass(frozen=True)
+class StagedProxies:
+    """The host Proxies Harness Generation validation staged, each under
+    ``<root>/<sha256>/nfs-proxy`` (``stage1/host/semantic.py``
+    ``stage_proxy``).  A patch set built them: they run under
+    ``launcher`` (07 §5.1).  A staged revision's pinned build is found
+    here when the configured Proxy is not it (03-nfs-proxy/06 §30)."""
+
+    root: Path
+    launcher: tuple[str, ...] = ()
+
+    def path(self, proxy_sha256: str) -> Path:
+        return Path(self.root) / proxy_sha256 / "nfs-proxy"
+
+    def find(self, proxy_sha256: str) -> Path | None:
+        """The staged Proxy of this digest, when its bytes are it."""
+        path = self.path(proxy_sha256)
+        if not path.is_file() or path.is_symlink():
+            return None
+        if hashlib.sha256(path.read_bytes()).hexdigest() != proxy_sha256:
+            return None
+        return path
 
 
 # ---------------------------------------------------------------- rule description
@@ -1005,7 +1030,8 @@ __all__ = [
     "BuildRegistry", "CapabilityRegistry", "DEFAULT_CAPABILITY_ID",
     "DIMENSIONS", "DynamicOriginals", "GuestValidationRun", "PromotedSemanticCapabilityRegistry",
     "PromotedSubset", "PromotionRefused", "RegistryError", "RuleDescription",
-    "RuleSetDescription", "ScopeCheck", "SemanticSubset", "UNPROMOTED_GAP_ID",
+    "RuleSetDescription", "ScopeCheck", "SemanticSubset", "StagedProxies",
+    "UNPROMOTED_GAP_ID",
     "UnreproducibleCrash",
     "ValidationItem", "check_runtime", "describe_rule_set", "dynamic_originals",
     "pin", "promote",

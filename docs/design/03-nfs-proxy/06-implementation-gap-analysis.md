@@ -1136,13 +1136,14 @@ Harness Capability Specification을 갱신한다(§21).
   `UnreproducibleCrash`를 남겨 promotion이 `not_met`이 된다. 사람은 Stage 2 끝(`crash_review` 또는 종료 상태)의
   job과 함께 결정한다(`02-llm-agent/07` §5.3 항목 7). 검증은 `test_semantic_stage2_promotion.py`(Controller,
   fake recorder)와 `test_semantic_stage2_recorder.py`(빌드한 Proxy의 host run).
+- staged Proxy로 하는 Stage 2: staged revision(pending subset)이 설정된 Proxy와 다른 build를 pin하면 Compiler는
+  그 build의 staged host Proxy(`semantic_promotion.StagedProxies`, `staged_files/<sha256>/nfs-proxy`)로
+  `--capability-registry`와 `--check-rules`를 launcher 아래에서 돈다. 공유 revision은 설정된 Proxy만 쓴다.
+  Stage 2 engine의 replay 호환성 검사는 compiled rule set이 기록한 `proxy_sha256`의 Proxy에 묻는다(설정된 것이
+  그 build가 아니면 staged 것). 둘 다 `HarnessGenerationConfig.semantic`이 설정됐을 때만 찾는다. 검증은
+  `test_rule_compiler.py`와 `test_stage2_service.py`.
 
 남은 것:
-
-- staged harness의 Stage 2 compile과 replay 호환성 검사는 아직 설정된(공유) Proxy를 쓴다
-  (`rule_compiler.py`, `stage2/engine.py` `replay_proxy`). 생성한 subset이 새 Proxy build에 있으면 Compiler가
-  "not the promoted build"로 거부하므로, 그 job의 Stage 2가 자연 crash까지 가려면 두 곳이 staged Proxy
-  (`staged_files/<sha256>/nfs-proxy`, launcher 아래)를 써야 한다(#83 다음 PR).
 - subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
   일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가

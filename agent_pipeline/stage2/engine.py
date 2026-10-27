@@ -47,6 +47,7 @@ the replay is still judged (REPLAY_INVALID) instead of retried.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +71,7 @@ from ..runner.process_supervisor import HostCommand, ProcessLimits, ProcessSuper
 from ..runner.slots import SlotPool, resource
 from ..runner.worker import LeaseControl
 from ..semantic_delta import DeltaReadError
+from ..semantic_promotion import StagedProxies
 from ..stage1.engine import (INPUT, MAX_CAPTURE_INDEX_BYTES, OUTPUT,
                              CaptureError, _CaptureEntry, _read_regular, _write)
 from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, HOST_FACTS_ID,
@@ -110,6 +112,9 @@ class Stage2EngineConfig:
     limits: ProcessLimits = ProcessLimits()
     #: How often a running command's finished segments are taken.
     poll_interval_s: float = 1.0
+    #: A staged harness's rule set was compiled for its staged Proxy
+    #: (03-nfs-proxy/06 §30); the gate asks that one, under its launcher.
+    staged_proxies: StagedProxies | None = None
 
 
 class _SegmentControl:
@@ -214,11 +219,25 @@ class Stage2CommandEngine:
         unplanned = None
         if t.step == "replay":
             unplanned = self._plan_replay(t.crash_bundle_ref, inp / "replay",
-                                          run / "plan-work")
+                                          run / "plan-work",
+                                          compiled.proxy_sha256)
         return inp, out, unplanned
 
+    def _replay_proxy(self, proxy_sha256: str
+                      ) -> tuple[Path, dict[str, tuple[str, ...]]]:
+        """The Proxy the rule set was compiled for: the configured one, or
+        a staged build's under its launcher."""
+        staged = self.config.staged_proxies
+        found = None if staged is None else staged.find(proxy_sha256)
+        if found is None or hashlib.sha256(
+                self.config.replay_proxy.read_bytes()).hexdigest() == \
+                proxy_sha256:
+            return self.config.replay_proxy, {}
+        return found, {"launcher": staged.launcher} if staged.launcher \
+            else {}
+
     def _plan_replay(self, crash_bundle_ref: str | None, target: Path,
-                     work: Path) -> Stage2HostFacts | None:
+                     work: Path, proxy_sha256: str) -> Stage2HostFacts | None:
         """Write the replay inputs; the facts of an unplanned replay
         otherwise.  Host faults (an unreadable crash bundle) raise."""
         if crash_bundle_ref is None:
@@ -244,7 +263,10 @@ class Stage2CommandEngine:
             plan = plan_replay(journal, window)
         except (KeyError, ValueError, PlanError, DeltaReadError) as exc:
             return Stage2HostFacts(step="replay", plan_error=_short(exc))
-        result = self.check_rules(self.config.replay_proxy, plan.rule_set, work)
+        proxy, launcher = self._replay_proxy(proxy_sha256)
+        if launcher:
+            work.chmod(0o755)     # the launcher's Proxy reads the rule set
+        result = self.check_rules(proxy, plan.rule_set, work, **launcher)
         compatibility = Compatibility(ok=result.ok, reason=result.reason,
                                       line=result.line[:512])
         write_replay_inputs(plan, target)
