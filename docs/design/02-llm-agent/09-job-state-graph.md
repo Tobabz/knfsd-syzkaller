@@ -405,6 +405,12 @@ program을 바꾸지 않으므로 Agent도 Compiler도 부르지 않는다. 시�
   `blocked_harness_gap(generation_unavailable)`로 간다.
 - `harness_generating`에서 issue resolved는 `retry_pending`, deferred는 `parked`, wont_fix는 `closed_unsupported`다.
   진행 중인 생성은 같은 key의 다른 job을 위해 계속한다.
+- promotion(`agent_pipeline/controller/promotion.py`, `07` §5.3)은 생성 기록마다 하나이고, 생성처럼 store에
+  단계마다 commit하고 전이를 따로 남긴다(`promotions`, `promotion_transitions`). 상태는 `collecting`,
+  `campaigning`, `review`, `approved`, `promoted`, `rejected`, `not_met`, `failed`다. job 상태는 바꾸지 않는다.
+  예외는 거부다. `rejected`인 생성의 staged binding은 job에게 주지 않는다. job은 registry binding으로 다시
+  binding하고, 그 gap을 다시 만나면 `GenerationEnded(promotion_rejected)`로 `blocked_harness_gap`에 간다.
+  campaign task는 검증 task처럼 `task_id`로 다시 붙는다.
 
 ### 4. Stage 2 전이
 

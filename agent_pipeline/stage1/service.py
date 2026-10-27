@@ -38,6 +38,7 @@ from ..components import (HarnessRegistry, IssueTracker, Materializer,
                           MutationRuleCompiler)
 from ..contracts import JudgeVersions
 from ..controller.generation import HarnessValidator
+from ..controller.promotion import ProbeCampaigner
 from ..controller.machine import Env
 from ..controller.records import Job
 from ..controller.service import Controller, EffectFailure
@@ -89,6 +90,8 @@ class GenerationParts:
     executor: GenerationAgentExecutor
     validator: HarnessValidator
     workers: int = 1
+    #: The promotion probe campaign Runner (07 §5.3); None: no promotion.
+    campaigner: ProbeCampaigner | None = None
 
 
 @dataclass(frozen=True)
@@ -216,9 +219,10 @@ class Stage1Service:
         else:
             self.agents = _DeferredAgents()
         self.generator = None
-        validator = None
+        validator = campaigner = None
         if parts.generation is not None:
             validator = parts.generation.validator
+            campaigner = parts.generation.campaigner
             self.generator = QueuedGenerationExecutor(
                 parts.generation.executor, sink=None,
                 max_workers=parts.generation.workers) \
@@ -230,7 +234,8 @@ class Stage1Service:
         self.controller = Controller(
             self.store, env, self.runner, self.agents, self.issues,
             parts.registry, parts.tree, self.artifacts, parts.judge_versions,
-            generator=self.generator, validator=validator, **extra)
+            generator=self.generator, validator=validator,
+            campaigner=campaigner, **extra)
         self.agents.sink = self.controller
         if self.generator is not None:
             self.generator.sink = self.controller
@@ -389,9 +394,11 @@ class Stage1Service:
                     f"deliver generation on close: {exc}")
             # A validation still running ends inconclusive and runs again
             # after restart (07 §5.2).
-            close = getattr(self.parts.generation.validator, "close", None)
-            if close is not None:
-                close()
+            for runner in (self.parts.generation.validator,
+                           self.parts.generation.campaigner):
+                close = getattr(runner, "close", None)
+                if close is not None:
+                    close()
         self.bridge.close()
         self.stage2_store.close()
         if worker_done:

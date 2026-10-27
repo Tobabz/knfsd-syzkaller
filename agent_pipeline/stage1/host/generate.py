@@ -124,7 +124,9 @@ class GenerationSpec(_Spec):
     with this repository's layout: worktrees and validation scratch under
     ``state_dir``, this checkout as the clone, the env and bundle of this
     spec as the base, and ``tools/harness-generation-build.py`` as the
-    build step.  ``sudo bash tools/setup-generation-user.sh`` sets up the
+    build step, and ``probe-campaign`` as the promotion probe campaign
+    command of a staged harness, reading this ``stage1.json`` and
+    ``collector.json``.  ``sudo bash tools/setup-generation-user.sh`` sets up the
     generation OS user and its launcher once per host."""
 
     #: The generation OS user of ``tools/setup-generation-user.sh``.
@@ -138,6 +140,8 @@ class GenerationSpec(_Spec):
     build_args: tuple[str, ...] = ()
     build_timeout_s: float = Field(default=21_600, gt=0)
     validation_timeout_s: float = Field(default=28_800, gt=0, le=86_400)
+    #: A promotion probe campaign (07 §5.3): about 40 guest boots.
+    campaign_timeout_s: float = Field(default=14_400, gt=0, le=86_400)
 
 
     def resolved_launcher(self) -> tuple[str, ...]:
@@ -1022,7 +1026,8 @@ def _generation(spec: HostSpec, spec_path: Path, state: Path,
                 collector_path: Path, bundle: Path, python: str):
     """stage1.json's ``generation`` section and ``validate.json`` (see
     ``GenerationSpec``)."""
-    from ..config import HarnessGenerationConfig, ValidationCommandConfig
+    from ..config import (HarnessGenerationConfig, PromotionCampaignConfig,
+                          ValidationCommandConfig)
     from .validate import ValidateConfig
     g = spec.generation
     try:
@@ -1045,17 +1050,23 @@ def _generation(spec: HostSpec, spec_path: Path, state: Path,
         build_env={"LANG": "C.UTF-8",
                    "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
     ).model_dump_json(indent=2) + "\n")
+    env = {"LANG": "C.UTF-8", "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+           "HOME": os.environ.get("HOME", str(state))}
     return HarnessGenerationConfig(
         repo=REPO, worktree_root=state / "generation-worktrees",
         base_ref=g.base_ref, launcher=launcher, workers=g.workers,
         validation=ValidationCommandConfig(
             argv=(python, "-m", "agent_pipeline.stage1.host", "validate",
                   "--config", str(validate_path), "{input}", "{output}"),
-            cwd=REPO, env={"LANG": "C.UTF-8",
-                           "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                           "HOME": os.environ.get("HOME", str(state))},
-            resource_key="harness-validation",
-            timeout_s=g.validation_timeout_s))
+            cwd=REPO, env=env, resource_key="harness-validation",
+            timeout_s=g.validation_timeout_s),
+        campaign=PromotionCampaignConfig(
+            argv=(python, "-m", "agent_pipeline.stage1.host",
+                  "probe-campaign", "--config", "{input}/campaign.json",
+                  "{output}"),
+            cwd=REPO, env=env, resource_key="promotion-campaign",
+            stage1=state / "stage1.json", collector=collector_path,
+            timeout_s=g.campaign_timeout_s))
 
 
 def generate(spec_path: Path, *, python: str = sys.executable,

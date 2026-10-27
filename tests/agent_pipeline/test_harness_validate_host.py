@@ -481,6 +481,13 @@ def test_generate_writes_the_generation_configs(host, monkeypatch):
     assert v.build_argv[2:5] == ("{tree}", "{env}", "{base_env}")
     assert "{sanitizer}" in v.build_argv
     assert v.build_argv[-2:] == ("--go", "/opt/go/bin/go")
+    # The promotion probe campaign reads this stage1.json and collector.
+    c = g.campaign
+    assert c.argv[1:5] == ("-m", "agent_pipeline.stage1.host",
+                           "probe-campaign", "--config")
+    assert c.argv[5:] == ("{input}/campaign.json", "{output}")
+    assert (c.stage1, c.collector, c.cwd) == (
+        out.stage1_config, out.collector_config, host.root)
 
 
 def test_the_default_launcher_needs_the_setup_script(host, monkeypatch):

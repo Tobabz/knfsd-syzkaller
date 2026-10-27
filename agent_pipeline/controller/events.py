@@ -169,13 +169,15 @@ class GenerationEnded(Record):
     leave the job on its issue.  ``unavailable``: the policy asks for
     generation but the host has no generator configured, or the job's
     policy no longer does.  ``not_filled``: the job already runs on the
-    generation's staged binding and still meets the gap."""
+    generation's staged binding and still meets the gap.
+    ``promotion_rejected``: the generation passed, and a person rejected
+    the promotion of its staged harness (07 §5.3)."""
 
     type: Literal["generation_ended"] = "generation_ended"
     gap: GapRef
     generation_id: str | None = None
     outcome: Literal["passed", "infeasible", "exhausted", "failed",
-                     "unavailable", "not_filled"]
+                     "unavailable", "not_filled", "promotion_rejected"]
     binding: HarnessBinding | None = None
     reason: str | None = None
 

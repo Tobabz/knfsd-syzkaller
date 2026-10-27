@@ -207,6 +207,12 @@ times. `campaign-out/campaign.json` is `evidence` (then
 bundle must be built from this repository's bridge sources, `generate.go`
 included.
 
+The command exits 0 whenever it wrote `campaign.json`; a nonzero exit is
+an infrastructure end. For a staged harness the service runs it as
+`generation.campaign`, which `generate` writes with this `stage1.json` and
+`collector.json` (see "Promotion of a staged harness" in
+[`../README.md`](../README.md)).
+
 `gap_contracts` gives the contract a capability filling each gap ID must
 declare; it is copied into the generated HCAP. A capability names the gap
 it fills with `fills_gap`, and `generate` refuses it unless its contract is

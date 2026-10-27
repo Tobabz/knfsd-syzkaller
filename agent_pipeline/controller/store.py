@@ -17,6 +17,8 @@ from ..contracts import (GapRef, JobPolicy, JudgeVersions, Q1Result,
                          Sanitizer, VulnerabilityCandidate)
 from .generation import (GenerationState, GenerationTransition,
                          HarnessGeneration)
+from .promotion import (HarnessPromotion, PromotionState,
+                        PromotionTransition)
 from .records import (GAP_STATES, AgentAttempt, Job, JobState,
                       Transition)
 
@@ -58,6 +60,12 @@ CREATE TABLE IF NOT EXISTS generations (
 CREATE TABLE IF NOT EXISTS generation_transitions (
     generation_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
     PRIMARY KEY (generation_id, seq));
+CREATE TABLE IF NOT EXISTS promotions (
+    promotion_id TEXT PRIMARY KEY, generation_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS promotion_transitions (
+    promotion_id TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
+    PRIMARY KEY (promotion_id, seq));
 CREATE TABLE IF NOT EXISTS effect_failures (
     job_id TEXT NOT NULL, effect TEXT NOT NULL, error TEXT NOT NULL,
     at TEXT NOT NULL);
@@ -331,6 +339,63 @@ class Store:
                                "WHERE generation_id = ? ORDER BY seq",
                                (generation_id,)).fetchall()
         return [GenerationTransition.model_validate_json(b) for (b,) in rows]
+
+    # ---------------------------------------------------------- promotions
+
+    def create_promotion(self, p: HarnessPromotion,
+                         transition: PromotionTransition) -> HarnessPromotion:
+        """Store `p` unless its generation has a promotion; returns the
+        stored one."""
+        with self._tx():
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO promotions VALUES (?, ?, ?, ?, ?)",
+                (p.promotion_id, p.generation_id, p.state.value, p.seq,
+                 p.model_dump_json()))
+            if cur.rowcount == 1:
+                self._append_promotion(transition)
+        return self.promotion_for(p.generation_id)
+
+    def commit_promotion(self, prev_seq: int, p: HarnessPromotion,
+                         transition: PromotionTransition) -> None:
+        with self._tx():
+            cur = self.db.execute(
+                "UPDATE promotions SET state = ?, seq = ?, body = ? "
+                "WHERE promotion_id = ? AND seq = ?",
+                (p.state.value, p.seq, p.model_dump_json(), p.promotion_id,
+                 prev_seq))
+            if cur.rowcount != 1:
+                raise StaleJob(p.promotion_id)
+            self._append_promotion(transition)
+
+    def _append_promotion(self, t: PromotionTransition) -> None:
+        self.db.execute("INSERT INTO promotion_transitions VALUES (?, ?, ?)",
+                        (t.promotion_id, t.seq, t.model_dump_json()))
+
+    def promotion(self, promotion_id: str) -> HarnessPromotion:
+        row = self.db.execute("SELECT body FROM promotions WHERE "
+                              "promotion_id = ?", (promotion_id,)).fetchone()
+        if row is None:
+            raise KeyError(promotion_id)
+        return HarnessPromotion.model_validate_json(row[0])
+
+    def promotion_for(self, generation_id: str) -> HarnessPromotion | None:
+        row = self.db.execute("SELECT body FROM promotions WHERE "
+                              "generation_id = ?", (generation_id,)).fetchone()
+        return HarnessPromotion.model_validate_json(row[0]) if row else None
+
+    def promotions(self, states: set[PromotionState] | None = None
+                   ) -> list[HarnessPromotion]:
+        rows = self.db.execute("SELECT body FROM promotions ORDER BY rowid"
+                               ).fetchall()
+        out = [HarnessPromotion.model_validate_json(b) for (b,) in rows]
+        return [p for p in out if states is None or p.state in states]
+
+    def promotion_transitions(self, promotion_id: str
+                              ) -> list[PromotionTransition]:
+        rows = self.db.execute("SELECT body FROM promotion_transitions "
+                               "WHERE promotion_id = ? ORDER BY seq",
+                               (promotion_id,)).fetchall()
+        return [PromotionTransition.model_validate_json(b) for (b,) in rows]
 
     # ---------------------------------------------------------- gap issues
 

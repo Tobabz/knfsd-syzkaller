@@ -99,7 +99,9 @@ def cmd_probe_campaign(args) -> int:
     from .campaign import CampaignConfig, probe_campaign
     report = probe_campaign(CampaignConfig.load(args.config), args.output)
     print(json.dumps({k: report.get(k) for k in ("result", "reason")}))
-    return 0 if report["result"] == "evidence" else 1
+    # The report says the result; a nonzero exit is an infrastructure end
+    # (stage1.campaigns).
+    return 0
 
 
 def cmd_probe(args) -> int:
