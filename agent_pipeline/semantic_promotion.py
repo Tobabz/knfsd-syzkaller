@@ -20,6 +20,16 @@ through this gate:
 The gate writes a ``PromotedSemanticCapabilityRegistry`` and the HCAP entry
 that references it by digest.  A different build is promoted afresh.
 
+The gate has two stages (§30).  ``pin`` is stage 1, the staged pin: the
+same checks without crash survival, so a run need not end in a guest crash.
+Its subset is marked ``crash_survival: pending`` and may only sit in a
+staged ``hcap_revision``; the jobs bound to that revision use it.  Guests
+are never crashed on purpose, so the evidence for stage 2 (``promote``) is
+a crash a campaign with the subset met by itself.  A run whose production
+ended in such a crash without the crash-cut MutationDelta cannot be
+reproduced by replay: either stage refuses the subset over it and the CLI
+records an ``UnreproducibleCrash``.
+
 Content addressing establishes byte integrity, not provenance.  That a run
 came from a KVM guest with the real executor and knfsd is the operator's
 statement when recording it, as for every other host-supplied record; host
@@ -34,7 +44,8 @@ import subprocess
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import (ConfigDict, Field, field_validator, model_serializer,
+                      model_validator)
 
 from .artifacts import ArtifactStore
 from .contracts import Record, Sha256
@@ -290,10 +301,13 @@ def _items_of_rule(rule: RuleDescription) -> set[ValidationItem]:
     return items
 
 
-def required_items(subset: SemanticSubset) -> tuple[ValidationItem, ...]:
-    """Crash survival and replay always; the rest when the subset has them."""
-    items = {ValidationItem.DELTA_CRASH_SURVIVAL,
-             ValidationItem.DYNAMIC_ORIGINAL_REPLAY}
+def required_items(subset: SemanticSubset, *, crash: bool = True
+                   ) -> tuple[ValidationItem, ...]:
+    """Crash survival and replay always; the rest when the subset has them.
+    ``crash=False`` is the staged pin's list, without crash survival."""
+    items = {ValidationItem.DYNAMIC_ORIGINAL_REPLAY}
+    if crash:
+        items.add(ValidationItem.DELTA_CRASH_SURVIVAL)
     if "call" in subset.message_types:
         items.add(ValidationItem.REQUEST_MUTATION)
         if "S2C" in subset.directions:
@@ -445,8 +459,31 @@ def _exercised(run: GuestValidationRun) -> set[str]:
     return found
 
 
+def _crash_cut(run: GuestValidationRun) -> tuple[bool, bool]:
+    """Whether the production window ended in a guest crash, and whether
+    the crash-cut position's MutationDelta was read back."""
+    production = [p.production for p in run.judge_input.positions]
+    last = production[-1] if production else None
+    crashed = any(p is not None for p in production) and all(
+        p.termination is Termination.GUEST_CRASH
+        for p in production if p is not None)
+    delta = (last is not None and bool(last.batches)
+             and last.journal_integrity is not JournalIntegrity.CORRUPT)
+    return crashed, delta
+
+
+def unreproducible(run: GuestValidationRun) -> bool:
+    """A guest crash left no MutationDelta at the crash cut: replay cannot
+    reproduce it, and the subset is refused (§30)."""
+    crashed, delta = _crash_cut(run)
+    return crashed and not delta
+
+
 def run_problems(run: GuestValidationRun, build: BuildRegistry,
-                 subset: SemanticSubset) -> list[str]:
+                 subset: SemanticSubset, *, crash: bool = True) -> list[str]:
+    """Why ``run`` does not count for ``subset``.  ``crash=False`` is the
+    staged pin's check: the run need not end in a guest crash, but one that
+    did must have left its MutationDelta."""
     problems = []
     if run.subset_id != subset.subset_id:
         problems.append("the run validates another subset")
@@ -481,13 +518,10 @@ def run_problems(run: GuestValidationRun, build: BuildRegistry,
         problems.append("the original values are not from the judged journals")
     # Semantic Delta crash survival: the production window ended in a guest
     # crash and the crash-cut position's MutationDelta was read back.
-    production = [p.production for p in data.positions]
-    last = production[-1]
-    if any(p is not None and p.termination is not Termination.GUEST_CRASH
-           for p in production):
+    crashed, delta = _crash_cut(run)
+    if crash and not crashed:
         problems.append("the production side did not end in a guest crash")
-    if (last is None or not last.batches or last.journal_integrity
-            is JournalIntegrity.CORRUPT):
+    if (crash or crashed) and not delta:
         problems.append("the crash-cut position has no MutationDelta")
     return problems
 
@@ -500,6 +534,17 @@ class PromotedSubset(_Strict):
     validation_items: tuple[ValidationItem, ...]
     evidence_refs: tuple[Sha256, ...] = Field(min_length=1,
                                               max_length=MAX_RUNS)
+    #: ``pending``: the staged pin (§30 stage 1), usable only through a
+    #: staged ``hcap_revision``.  Omitted when passed, so subsets promoted
+    #: before the field keep their canonical bytes.
+    crash_survival: Literal["passed", "pending"] = "passed"
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.crash_survival == "passed":
+            data.pop("crash_survival", None)
+        return data
 
 
 class PromotedSemanticCapabilityRegistry(_Strict):
@@ -522,11 +567,44 @@ class PromotedSemanticCapabilityRegistry(_Strict):
             raise ValueError("subsets must be in subset_id order")
         return self
 
+    @property
+    def pending(self) -> tuple[str, ...]:
+        """The subsets pinned with crash survival pending: this registry
+        belongs to a staged revision, never a shared one (§30)."""
+        return tuple(p.subset.subset_id for p in self.subsets
+                     if p.crash_survival == "pending")
+
+
+class UnreproducibleCrash(_Strict):
+    """Natural guest crashes of a subset's runs that left no MutationDelta
+    at the crash cut.  Replay cannot reproduce them; the subset was refused
+    (§30)."""
+
+    schema_version: Literal["semantic-unreproducible-crash.v1"] = \
+        "semantic-unreproducible-crash.v1"
+    subset_id: SubsetId
+    proxy_sha256: Sha256
+    registry_digest: Sha256
+    run_refs: tuple[Sha256, ...] = Field(min_length=1, max_length=MAX_RUNS)
+
 
 class PromotionRefused(ValueError):
-    def __init__(self, problems: list[str]) -> None:
+    def __init__(self, problems: list[str],
+                 unreproducible: tuple[str, ...] = ()) -> None:
         super().__init__("; ".join(problems))
         self.problems = problems
+        #: Runs whose natural crash left no MutationDelta.
+        self.unreproducible = unreproducible
+
+
+def pin(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
+        run_refs: tuple[str, ...],
+        previous: PromotedSemanticCapabilityRegistry | None = None,
+        ) -> PromotedSemanticCapabilityRegistry:
+    """M7 stage 1, the staged pin: the gate without crash survival.  The
+    subset is kept with ``crash_survival: pending``; ``promote`` with a
+    natural crash's runs passes it later."""
+    return _gate(store, build, subset, run_refs, previous, crash=False)
 
 
 def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
@@ -535,7 +613,14 @@ def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
             ) -> PromotedSemanticCapabilityRegistry:
     """Run the M7 gate for one subset; raise PromotionRefused with every
     reason it fails.  ``previous`` keeps the subsets already promoted on the
-    same build."""
+    same build; a subset it pins pending is passed, its evidence kept."""
+    return _gate(store, build, subset, run_refs, previous, crash=True)
+
+
+def _gate(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
+          run_refs: tuple[str, ...],
+          previous: PromotedSemanticCapabilityRegistry | None, *,
+          crash: bool) -> PromotedSemanticCapabilityRegistry:
     problems = subset_problems(subset, build.registry)
     if previous is not None and (previous.proxy_sha256, previous.registry_digest
                                  ) != (build.proxy_sha256,
@@ -549,13 +634,20 @@ def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
                         f"{MAX_RUNS}")
     exercised: list[tuple[str, RuleDescription]] = []
     passed: set[ValidationItem] = set()
+    lost: list[str] = []
     for ref in run_refs:
         run = load_record(store, ref, GuestValidationRun)
-        found = run_problems(run, build, subset)
+        found = run_problems(run, build, subset, crash=crash)
+        if unreproducible(run):
+            lost.append(ref)
+            found.append("a natural guest crash left no MutationDelta at "
+                         "the crash cut, so replay cannot reproduce it; "
+                         "the subset is refused")
         problems += [f"run {ref[:12]}: {p}" for p in found]
         if found:
             continue
-        passed.add(ValidationItem.DELTA_CRASH_SURVIVAL)
+        if crash:
+            passed.add(ValidationItem.DELTA_CRASH_SURVIVAL)
         used = _exercised(run)
         # Equivalent on the same originals proves nothing dynamic.
         if used & _dynamic_rules(run):
@@ -581,7 +673,7 @@ def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
         missing = sorted(set(getattr(subset, name)) - covered[name])
         if missing:
             problems.append(f"no guest evidence exercises {name} {missing}")
-    required = required_items(subset)
+    required = required_items(subset, crash=crash)
     missing_items = [i.value for i in required if i not in passed]
     if missing_items:
         problems.append(f"validation items not covered: {missing_items}")
@@ -591,12 +683,16 @@ def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
     if old is not None and old.subset != subset:
         problems.append(f"{subset.subset_id} is already promoted with "
                         "another definition")
+    if old is not None and not crash and old.crash_survival == "passed":
+        problems.append(f"{subset.subset_id} is already promoted; a staged "
+                        "pin would not change it")
     if problems:
-        raise PromotionRefused(problems)
+        raise PromotionRefused(problems, tuple(lost))
     refs = set(run_refs) | set(old.evidence_refs if old else ())
     kept[subset.subset_id] = PromotedSubset(
         subset=subset, validation_items=required,
-        evidence_refs=tuple(sorted(refs)))
+        evidence_refs=tuple(sorted(refs)),
+        **({} if crash else {"crash_survival": "pending"}))
     return PromotedSemanticCapabilityRegistry(
         proxy_sha256=build.proxy_sha256, registry_digest=build.registry_digest,
         registry=build.registry,
@@ -625,10 +721,16 @@ def with_semantic_capability(catalog: HcapCatalog, promoted_ref: str,
     Its promotion is the M7 gate (``promote``), Stage 2's criterion in
     place of the probe campaign (07 §5.3 item 7), so the entry carries no
     contract.  The rest of the catalog, its gap contracts included, is kept.
+    A subset pinned with crash survival pending (``pin``) makes the revision
+    a staged one: the entry says so, and no shared catalog takes it.
     """
     ids = tuple(p.subset.subset_id for p in promoted.subsets)
     evidence = tuple(sorted({r for p in promoted.subsets
                              for r in p.evidence_refs}))
+    pending = (
+        (f"Crash survival pending for {', '.join(promoted.pending)}: a "
+         "staged pin (M7 stage 1); this revision is staged, not shared.",)
+        if promoted.pending else ())
     entry = Capability(
         id=capability_id, name="Promoted semantic mutation",
         purpose=("Semantic NFS/RPC mutation of Stage 1 traffic through the "
@@ -643,7 +745,7 @@ def with_semantic_capability(catalog: HcapCatalog, promoted_ref: str,
             "supported.",
             f"Proxy build sha256 {promoted.proxy_sha256}, registry "
             f"{promoted.registry_digest}; any other runtime is not this "
-            "capability."),
+            "capability.", *pending),
         status="validated_subset", scope=ids, validated_scope=ids,
         evidence_refs=evidence,
         authority_refs=(AuthorityRef(
@@ -671,7 +773,9 @@ def promoted_registry(store: ArtifactStore, catalog: HcapCatalog, *,
     Only the entry ``with_semantic_capability`` writes counts: the
     capability ``capability_id``, usable by ``agent_stage2``, validated,
     and referencing the registry itself.  A registry digest anywhere else in
-    the catalog (top level, another capability) is not Agent scope.
+    the catalog (top level, another capability) is not Agent scope.  A
+    subset pinned pending is kept, marked: a job bound to the staged
+    revision uses it (§30 stage 1); ``pending`` names them.
     """
     entry = next((c for c in catalog.capabilities if c.id == capability_id),
                  None)
@@ -770,8 +874,13 @@ def main(argv: list[str] | None = None) -> int:
     registry: print the BuildRegistry of a Proxy binary (store it with --store).
     record:   turn one KVM validation (replay plan, both journals, the
               execprog output) into a GuestValidationRun record.
+    pin:      M7 stage 1: the gate without crash survival; write the
+              registry with the subset pending and the staged HCAP revision.
     promote:  run the gate for a subset over recorded runs; write the
               promoted registry and the new HCAP revision.
+
+    A refusal over a natural crash without its MutationDelta stores an
+    ``UnreproducibleCrash`` and prints ``unreproducible=<ref>``.
     """
     import argparse
     import sys
@@ -806,14 +915,16 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--production-end", choices=ends, required=True)
     c.add_argument("--replay-end", choices=ends, required=True)
     c.add_argument("--note", default="")
-    p = sub.add_parser("promote")
-    p.add_argument("--store", type=Path, required=True)
-    p.add_argument("--build", required=True, help="BuildRegistry ref")
-    p.add_argument("--subset", type=Path, required=True)
-    p.add_argument("--run", action="append", required=True, dest="runs")
-    p.add_argument("--hcap", required=True, help="the HCAP revision to extend")
-    p.add_argument("--previous", help="promoted registry ref on this build")
-    p.add_argument("--capability-id", default=DEFAULT_CAPABILITY_ID)
+    for name in ("pin", "promote"):
+        p = sub.add_parser(name)
+        p.add_argument("--store", type=Path, required=True)
+        p.add_argument("--build", required=True, help="BuildRegistry ref")
+        p.add_argument("--subset", type=Path, required=True)
+        p.add_argument("--run", action="append", required=True, dest="runs")
+        p.add_argument("--hcap", required=True,
+                       help="the HCAP revision to extend")
+        p.add_argument("--previous", help="promoted registry ref on this build")
+        p.add_argument("--capability-id", default=DEFAULT_CAPABILITY_ID)
     args = parser.parse_args(argv)
 
     if args.command == "registry":
@@ -864,17 +975,25 @@ def main(argv: list[str] | None = None) -> int:
     previous = (load_record(store, args.previous,
                             PromotedSemanticCapabilityRegistry)
                 if args.previous else None)
+    gate = pin if args.command == "pin" else promote
     try:
-        promoted = promote(store, build, subset, tuple(args.runs), previous)
+        promoted = gate(store, build, subset, tuple(args.runs), previous)
     except PromotionRefused as refused:
         for problem in refused.problems:
-            print(f"promotion refused: {problem}", file=sys.stderr)
+            print(f"{args.command} refused: {problem}", file=sys.stderr)
+        if refused.unreproducible:
+            lost = put_record(store, UnreproducibleCrash(
+                subset_id=subset.subset_id, proxy_sha256=build.proxy_sha256,
+                registry_digest=build.registry_digest,
+                run_refs=tuple(sorted(refused.unreproducible))))
+            print(f"unreproducible={lost}")
         return 3
     promoted_ref = put_record(store, promoted)
     catalog = load_record(store, args.hcap, HcapCatalog)
     hcap = with_semantic_capability(catalog, promoted_ref, promoted,
                                     capability_id=args.capability_id)
-    print(f"promoted={promoted_ref} hcap_revision={put_record(store, hcap)}")
+    label = "pinned" if args.command == "pin" else "promoted"
+    print(f"{label}={promoted_ref} hcap_revision={put_record(store, hcap)}")
     return 0
 
 
@@ -883,10 +1002,12 @@ __all__ = [
     "DIMENSIONS", "DynamicOriginals", "GuestValidationRun", "PromotedSemanticCapabilityRegistry",
     "PromotedSubset", "PromotionRefused", "RegistryError", "RuleDescription",
     "RuleSetDescription", "ScopeCheck", "SemanticSubset", "UNPROMOTED_GAP_ID",
+    "UnreproducibleCrash",
     "ValidationItem", "check_runtime", "describe_rule_set", "dynamic_originals",
-    "promote",
+    "pin", "promote",
     "promoted_registry", "read_build_registry", "required_items",
     "rule_problems", "rule_set_scope", "run_problems", "subset_problems",
+    "unreproducible",
     "with_semantic_capability",
 ]
 

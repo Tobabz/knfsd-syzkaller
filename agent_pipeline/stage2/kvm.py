@@ -382,6 +382,77 @@ def _required_path(value: dict[str, Any], key: str, *, label: str) -> Path:
     return Path(raw)
 
 
+_SYZKALLER_FILES = ("syz-manager", "syz-execprog", "syz-executor")
+
+
+def _staged_manager(manager: dict[str, Any], collector: CollectorConfig,
+                    files: dict[str, Path]) -> dict[str, Any]:
+    """A staged harness (07 §5.2) boots the files its validation staged
+    under the collector's ``staged_files``; ``verify_pins`` chose them.
+    Point the manager at those files, so ``_manager_assets`` sees the
+    harness's pins.  syz-manager finds its binaries under one ``syzkaller``
+    directory: a staged one gets a directory of links to the pinned files,
+    named by them, beside the staged files."""
+    root = collector.staged_files
+    if root is None:
+        return manager
+    staged = {name: path for name, path in files.items()
+              if path.is_relative_to(root)}
+    if not staged:
+        return manager
+    manager = json.loads(json.dumps(manager))
+    vm = manager.get("vm")
+    if not isinstance(vm, dict):
+        raise Stage2StepError("manager must configure one qemu VM")
+    for name, path in staged.items():
+        if name == "bzimage":
+            vm["kernel"] = str(path)
+        elif name == "vm-image":
+            manager["image"] = str(path)
+        elif name in ("kernel", "lane-script"):
+            wanted = "vmlinux" if name == "kernel" else "lane.sh"
+            if path.name != wanted:
+                raise Stage2StepError(
+                    f"staged {name} is not named {wanted}")
+            manager["kernel_obj" if name == "kernel"
+                    else "workdir_template"] = str(path.parent)
+    if staged.keys() & set(_SYZKALLER_FILES):
+        if any(name not in files for name in _SYZKALLER_FILES):
+            raise Stage2StepError("collector lacks the syzkaller binaries")
+        target = manager.get("target")
+        if not isinstance(target, str) or target.count("/") != 1:
+            raise Stage2StepError(f"unsupported manager target: {target}")
+        manager["syzkaller"] = str(_syzkaller_links(
+            root, target.replace("/", "_"),
+            {name: files[name] for name in _SYZKALLER_FILES}))
+    return manager
+
+
+def _syzkaller_links(root: Path, target_dir: str,
+                     binaries: dict[str, Path]) -> Path:
+    layout = {"syz-manager": Path("bin/syz-manager"),
+              "syz-execprog": Path("bin") / target_dir / "syz-execprog",
+              "syz-executor": Path("bin") / target_dir / "syz-executor"}
+    key = hashlib.sha256("\n".join(
+        f"{layout[name]}={binaries[name].resolve()}"
+        for name in sorted(binaries)).encode()).hexdigest()
+    final = root / f"syzkaller-{key[:32]}"
+    if final.is_dir():
+        return final
+    tmp = Path(tempfile.mkdtemp(prefix=final.name + ".", dir=root))
+    for name, rel in layout.items():
+        (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp / rel).symlink_to(binaries[name].resolve())
+    try:
+        tmp.rename(final)
+    except OSError:
+        # Another step made the same directory first.
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not final.is_dir():
+            raise
+    return final
+
+
 def _manager_assets(manager: dict[str, Any], vm: dict[str, Any],
                     collector: CollectorConfig,
                     descriptor: ExecutionHarnessDescriptor,
@@ -550,7 +621,7 @@ def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
         raise Stage2StepError("descriptor and execution identity disagree")
     collector = CollectorConfig.load(options.collector)
     files = verify_pins(collector, descriptor)
-    manager = _object(options.manager)
+    manager = _staged_manager(_object(options.manager), collector, files)
     vm = manager.get("vm")
     if manager.get("type") != "qemu" or not isinstance(vm, dict):
         raise Stage2StepError("manager must configure one qemu VM")

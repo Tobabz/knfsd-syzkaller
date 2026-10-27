@@ -30,8 +30,9 @@ from agent_pipeline.replay_runner import (
 from agent_pipeline.semantic_delta import SealedJournal
 from agent_pipeline.semantic_promotion import (
     UNPROMOTED_GAP_ID, GuestValidationRun, PromotedSemanticCapabilityRegistry,
-    PromotionRefused, SemanticSubset, ValidationItem, check_runtime,
-    describe_rule_set, dynamic_originals, main, promote, promoted_registry, read_build_registry,
+    PromotionRefused, SemanticSubset, UnreproducibleCrash, ValidationItem,
+    check_runtime, describe_rule_set, dynamic_originals, main, pin, promote,
+    promoted_registry, read_build_registry,
     required_items, rule_set_scope, run_problems, subset_problems,
     with_semantic_capability,
 )
@@ -297,6 +298,81 @@ def test_a_clean_production_end_is_not_crash_survival(build, run):
         changed, build, subset())
 
 
+def _ended(run, termination=Termination.VM_TEARDOWN, *, delta=True):
+    """``run`` with its window ended otherwise on both sides, re-judged."""
+    positions = list(run.judge_input.positions)
+    for i, p in enumerate(positions):
+        update = {"termination": termination}
+        if not delta and i == len(positions) - 1:
+            update["batches"] = ()
+        sides = {"production": p.production.model_copy(update=update)}
+        if p.replay is not None:
+            sides["replay"] = p.replay.model_copy(
+                update={"termination": termination})
+        positions[i] = p.model_copy(update=sides)
+    data = run.judge_input.model_copy(update={"positions": tuple(positions)})
+    return run.model_copy(update={"judge_input": data,
+                                  "replay_result": evaluate(data)})
+
+
+def test_staged_pin_needs_no_crash_and_marks_it_pending(build, run, store):
+    clean = _ended(run)
+    assert run_problems(clean, build, subset(), crash=False) == []
+    ref = put_record(store, clean)
+    with pytest.raises(PromotionRefused, match="did not end in a guest crash"):
+        promote(store, build, subset(), (ref,))
+    pinned = pin(store, build, subset(), (ref,))
+    (entry,) = pinned.subsets
+    assert entry.crash_survival == "pending"
+    assert entry.validation_items == required_items(subset(), crash=False)
+    assert ValidationItem.DELTA_CRASH_SURVIVAL not in entry.validation_items
+    assert pinned.pending == (subset().subset_id,)
+    pinned_ref = put_record(store, pinned)
+    assert load_record(store, pinned_ref,
+                       PromotedSemanticCapabilityRegistry) == pinned
+    # A passed subset keeps the bytes it had before the field existed.
+    passed = promote(store, build, subset(), (put_record(store, run),))
+    assert "crash_survival" not in passed.model_dump(mode="json")["subsets"][0]
+    assert passed.pending == ()
+
+
+def test_a_natural_crash_passes_the_pinned_subset(build, run, store):
+    clean = put_record(store, _ended(run))
+    pinned = pin(store, build, subset(), (clean,))
+    crashed = put_record(store, run)
+    promoted = promote(store, build, subset(), (crashed,), pinned)
+    (entry,) = promoted.subsets
+    assert entry.crash_survival == "passed" and promoted.pending == ()
+    assert entry.validation_items == required_items(subset())
+    assert entry.evidence_refs == tuple(sorted((clean, crashed)))
+    # A staged pin never lowers a promoted subset.
+    with pytest.raises(PromotionRefused, match="already promoted"):
+        pin(store, build, subset(), (clean,), promoted)
+
+
+def test_a_crash_without_its_delta_refuses_the_subset(build, run, store):
+    lost = _ended(run, Termination.GUEST_CRASH, delta=False)
+    good = put_record(store, run)
+    ref = put_record(store, lost)
+    for gate in (pin, promote):
+        with pytest.raises(PromotionRefused) as refused:
+            gate(store, build, subset(), (good, ref))
+        assert refused.value.unreproducible == (ref,)
+        assert any("cannot reproduce it" in p for p in refused.value.problems)
+    assert "the crash-cut position has no MutationDelta" in run_problems(
+        lost, build, subset(), crash=False)
+
+
+def test_a_pending_subset_marks_its_hcap_revision_staged(build, run, store):
+    pinned = pin(store, build, subset(), (put_record(store, _ended(run)),))
+    ref = put_record(store, pinned)
+    catalog = with_semantic_capability(_catalog(), ref, pinned)
+    entry = next(c for c in catalog.capabilities if c.id == "HCAP-10")
+    assert any("Crash survival pending" in c for c in entry.constraints)
+    # The jobs bound to the staged revision use the subset.
+    assert promoted_registry(store, catalog).pending == (subset().subset_id,)
+
+
 def test_another_build_starts_afresh(build, run, store):
     ref = put_record(store, run)
     promoted = promote(store, build, subset(), (ref,))
@@ -469,6 +545,19 @@ def test_cli_records_and_promotes(proxy_binary, build, tmp_path, capsys):
     catalog = ArtifactHcapChecker(store).load_catalog(out["hcap_revision"])
     assert promoted_registry(store, catalog).subsets[0].evidence_refs == (run_ref,)
     assert canonical_json(load_record(store, build_ref, type(build))) == canonical_json(build)
+
+    # The staged pin over the same run, and a crash without its delta.
+    assert main(["pin", "--store", str(store_dir), "--build", build_ref,
+                 "--subset", str(subset_path), "--run", run_ref, "--hcap", hcap_ref]) == 0
+    out = dict(item.split("=") for item in capsys.readouterr().out.split())
+    pinned = load_record(store, out["pinned"], PromotedSemanticCapabilityRegistry)
+    assert pinned.pending == (subset().subset_id,)
+    run = load_record(store, run_ref, GuestValidationRun)
+    lost_ref = put_record(store, _ended(run, Termination.GUEST_CRASH, delta=False))
+    assert main(["promote", "--store", str(store_dir), "--build", build_ref,
+                 "--subset", str(subset_path), "--run", lost_ref, "--hcap", hcap_ref]) == 3
+    record = capsys.readouterr().out.strip().removeprefix("unreproducible=")
+    assert load_record(store, record, UnreproducibleCrash).run_refs == (lost_ref,)
 
     # A wider subset over the same run is refused, and nothing is written.
     subset_path.write_text(json.dumps(subset(predicate_ops=("eq", "gt")).model_dump(

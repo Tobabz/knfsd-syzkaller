@@ -382,6 +382,10 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
    본다. M7 2단계(자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를 통과할 때까지 promotion하지 않는다.
    사람이 구현한 subset과 같은 기준이다. 그 전까지 staged revision으로 job은 계속 진행하고 issue는 `resolved`가
    되지 않는다.
+   - 구현: gate의 두 단계는 `semantic_promotion.pin`(crash survival pending)과 `promote`다. staged harness의 Stage 2
+     campaign은 staged 파일로 syz-manager를 띄운다(`stage2/kvm.py`). 공유 binding의 HCAP에 pending subset이 있으면
+     Stage 2 preflight가 거부한다. Runner 검증이 생성한 subset을 자동으로 pin하는 일과 Controller의 M7 2단계
+     처리는 아직 없다(`03-nfs-proxy/06` §30 "남은 것").
 
 1~5는 machine 검사다. host generator는 새로 추가하거나 바꾼 capability마다 contract, `PromotionProbeEvidence`,
 인자 일반성을 확인하고 하나라도 실패하면 HCAP을 만들지 않는다. typed model이 없는 raw evidence는 어떤

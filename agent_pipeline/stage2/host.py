@@ -262,6 +262,22 @@ def _stage2_fixtures(selections) -> frozenset[tuple[str, str]]:
         for s in selections if s.fixture_mode not in _STAGE1_ONLY_FIXTURES)
 
 
+def _shared_registry(store: ArtifactStore, hcap: HcapCatalog,
+                     revision: str) -> PromotedSemanticCapabilityRegistry:
+    """The promoted registry a configured (shared) binding's HCAP pins.  A
+    subset pinned with crash survival pending stays in its staged revision
+    (03-nfs-proxy/06 §30)."""
+    registry = promoted_registry(store, hcap)
+    if registry is None:
+        raise PreflightError(
+            f"HCAP {revision[:12]} has no promoted semantic subset")
+    if registry.pending:
+        raise PreflightError(
+            f"HCAP {revision[:12]} pins {', '.join(registry.pending)} with "
+            "crash survival pending; only a staged revision may")
+    return registry
+
+
 def _check_harnesses(
     store: ArtifactStore, config: Stage1Config, collector: CollectorConfig,
 ) -> tuple[tuple[PromotedSemanticCapabilityRegistry, ...],
@@ -293,11 +309,7 @@ def _check_harnesses(
         if binding.hcap_revision not in approval.approved_hcap_revisions:
             raise PreflightError("harness binding uses an unapproved HCAP")
         hcap = checker.load_catalog(binding.hcap_revision)
-        registry = promoted_registry(store, hcap)
-        if registry is None:
-            raise PreflightError(
-                f"HCAP {binding.hcap_revision[:12]} has no promoted semantic subset")
-        promoted.append(registry)
+        promoted.append(_shared_registry(store, hcap, binding.hcap_revision))
         profiles = [ref.artifact_ref for ref in (
             *hcap.authority_refs,
             *(ref for cap in hcap.capabilities for ref in cap.authority_refs))
