@@ -118,6 +118,40 @@ class CollectorSpec(_Spec):
     exec_timeout_s: float = 600
 
 
+class GenerationSpec(_Spec):
+    """Harness Generation on this host (07 §5).  ``generate`` writes the
+    ``generation`` section of stage1.json and ``validate.json`` from it,
+    with this repository's layout: worktrees and validation scratch under
+    ``state_dir``, this checkout as the clone, the env and bundle of this
+    spec as the base, and ``tools/harness-generation-build.py`` as the
+    build step.  ``sudo bash tools/setup-generation-user.sh`` sets up the
+    generation OS user and its launcher once per host."""
+
+    #: The generation OS user of ``tools/setup-generation-user.sh``.
+    user: str = Field(default="harness-gen", pattern=r"^[a-z0-9_-]{1,32}$")
+    #: argv prefix: the generation OS user, without network (07 §5.1).
+    #: Default: the setup script's wrapper for ``user`` through sudo.
+    launcher: tuple[str, ...] | None = Field(default=None, min_length=1)
+    base_ref: str = "HEAD"
+    workers: int = Field(default=1, ge=1, le=8)
+    #: More options of the build step (``--go``, ``--version``, mirrors).
+    build_args: tuple[str, ...] = ()
+    build_timeout_s: float = Field(default=21_600, gt=0)
+    validation_timeout_s: float = Field(default=28_800, gt=0, le=86_400)
+
+
+    def resolved_launcher(self) -> tuple[str, ...]:
+        if self.launcher is not None:
+            return self.launcher
+        wrapper = Path(f"/usr/local/libexec/knfsd-{self.user}")
+        if not wrapper.is_file():
+            raise GenerationError(
+                f"no generation launcher {wrapper}: run "
+                "'sudo bash tools/setup-generation-user.sh' once on this "
+                "host (07 section 5.1)")
+        return ("/usr/bin/sudo", "-n", str(wrapper), "--")
+
+
 HCAP11_PROBES = ("break_deleg", "create_session", "exchange_id")
 
 
@@ -522,6 +556,7 @@ class HostSpec(_Spec):
     engine: EngineSpec = EngineSpec()
     collector: CollectorSpec = CollectorSpec()
     stage2: Stage2ManagerSpec | None = None
+    generation: GenerationSpec | None = None
 
     @model_validator(mode="after")
     def _variants(self) -> Self:
@@ -763,18 +798,19 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def series_fingerprint(kind: str) -> str:
+def series_fingerprint(kind: str, repo: Path = REPO) -> str:
     """The checked-in ``bundle/patches/<kind>`` series digest.  It is the
     ``series_sha256`` ``tools/bootstrap-kcov-env.py`` records for a build,
     and, for syzkaller, the ``patch_series_sha256`` of the parser bundle
     ``tools/syzkaller/build.py`` makes (same bytes: name, NUL, patch, NUL)."""
     digest = hashlib.sha256()
-    for path in sorted((REPO / "bundle" / "patches" / kind).glob("*.patch")):
+    for path in sorted((repo / "bundle" / "patches" / kind).glob("*.patch")):
         digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
     return digest.hexdigest()
 
 
-def _build_record(path: Path, kind: str, tree: Path) -> dict:
+def _build_record(path: Path, kind: str, tree: Path,
+                  repo: Path = REPO) -> dict:
     """A bootstrap build record that matches the checked-in series and the
     tree as it is now; the same rules as the bootstrap's ``stale_build``."""
     try:
@@ -782,7 +818,7 @@ def _build_record(path: Path, kind: str, tree: Path) -> dict:
     except (OSError, ValueError):
         raise GenerationError(f"{path} is missing or unreadable; rebuild "
                               "with tools/bootstrap-kcov-env.py") from None
-    current = series_fingerprint(kind)
+    current = series_fingerprint(kind, repo)
     if record.get("series_sha256") != current:
         raise GenerationError(
             f"{path}: the {kind} build used another patch series "
@@ -795,6 +831,21 @@ def _build_record(path: Path, kind: str, tree: Path) -> dict:
             f"{record.get('head')}, now {head}); rebuild or check out that "
             "commit")
     return record
+
+
+class StagedBase(BaseModel):
+    """07 §5.2: generate a staged revision of one variant over the HCAP of
+    the base binding a Harness Generation patch set started from.  The
+    capabilities the patch set leaves unchanged keep their base HCAP
+    entries, evidence included: their evidence is bound to the base build,
+    and the validation's regression runs stand for it on the new one.  The
+    capabilities it adds or changes must be ``experimental`` and need no
+    promotion evidence; the promotion criteria judge them later (07 §5.3)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sanitizer: Sanitizer
+    hcap: HcapCatalog
 
 
 def _sorted_selections(items):
@@ -967,17 +1018,66 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
     }
 
 
+def _generation(spec: HostSpec, spec_path: Path, state: Path,
+                collector_path: Path, bundle: Path, python: str):
+    """stage1.json's ``generation`` section and ``validate.json`` (see
+    ``GenerationSpec``)."""
+    from ..config import HarnessGenerationConfig, ValidationCommandConfig
+    from .validate import ValidateConfig
+    g = spec.generation
+    try:
+        spec_in_repo = spec_path.relative_to(REPO)
+    except ValueError:
+        raise GenerationError(
+            "with a generation section the spec must be in this repository "
+            f"({REPO}): a patch set's tree has it at the same path") from None
+    launcher = g.resolved_launcher()
+    validate_path = state / "validate.json"
+    validate_path.write_text(ValidateConfig(
+        repo=REPO, work_root=state / "validation-work",
+        spec=str(spec_in_repo), base_spec=spec_path,
+        collector=collector_path,
+        build_argv=(python, str(REPO / "tools" / "harness-generation-build.py"),
+                    "{tree}", "{env}", "{base_env}", "--base-bundle",
+                    str(bundle), "--variant", "{sanitizer}",
+                    *g.build_args),
+        launcher=launcher, build_timeout_s=g.build_timeout_s,
+        build_env={"LANG": "C.UTF-8",
+                   "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    ).model_dump_json(indent=2) + "\n")
+    return HarnessGenerationConfig(
+        repo=REPO, worktree_root=state / "generation-worktrees",
+        base_ref=g.base_ref, launcher=launcher, workers=g.workers,
+        validation=ValidationCommandConfig(
+            argv=(python, "-m", "agent_pipeline.stage1.host", "validate",
+                  "--config", str(validate_path), "{input}", "{output}"),
+            cwd=REPO, env={"LANG": "C.UTF-8",
+                           "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                           "HOME": os.environ.get("HOME", str(state))},
+            resource_key="harness-validation",
+            timeout_s=g.validation_timeout_s))
+
+
 def generate(spec_path: Path, *, python: str = sys.executable,
              now: str | None = None,
              gap: GapContract | None = None,
-             base_spec: Path | None = None) -> Generated:
+             base_spec: Path | None = None,
+             repo: Path = REPO,
+             staged: StagedBase | None = None) -> Generated:
     """``gap`` is the Controller's contract for the gap a Harness
     Generation patch set fills (#100), and ``base_spec`` the spec the patch
     set started from.  Both come from outside the spec, which the patch set
     can change: every capability the patch set adds or changes must fill
-    that gap, and the spec cannot give the gap another contract."""
+    that gap, and the spec cannot give the gap another contract.
+
+    ``repo`` is the tree the kernel patch series and lane script are read
+    from: a validation passes the patch set's tree, while this code stays
+    the host's.  ``staged`` generates a staged revision (``StagedBase``)."""
     if (gap is None) != (base_spec is None):
         raise GenerationError("give the gap and the base spec together")
+    if staged is not None and gap is None:
+        raise GenerationError("a staged revision needs the gap and the base "
+                              "spec")
     spec_path = Path(spec_path).resolve()
     base = spec_path.parent
     spec = HostSpec.model_validate_json(spec_path.read_bytes())
@@ -991,10 +1091,16 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     bundle = _resolve(base, spec.syzkaller_bundle)
     ssh_key = _resolve(base, spec.ssh_key)
     variants = spec.variant_specs()
+    if staged is not None:
+        variants = tuple(v for v in variants
+                         if v.sanitizer is staged.sanitizer)
+        if not variants:
+            raise GenerationError(f"the spec has no {staged.sanitizer.value} "
+                                  "variant for the staged revision")
     sanitizers = {v.sanitizer for v in variants}
     wrong = [p.policy_id for p in spec.policies
              if p.sanitizer not in sanitizers]
-    if wrong:
+    if wrong and staged is None:
         names = "/".join(v.sanitizer.value for v in variants)
         raise GenerationError(f"policies {wrong} use another sanitizer than "
                               f"the {names} harness")
@@ -1022,7 +1128,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     kernel_repo = env / "linux"
     common = {
         "vm-image": images / "bookworm-kcov-fresh.qcow2",
-        "lane-script": REPO / "bundle" / "lane" / "lane.sh",
+        "lane-script": repo / "bundle" / "lane" / "lane.sh",
         "syz-executor": env / "syzkaller" / "bin" / "linux_amd64" /
         "syz-executor",
         "syz-execprog": env / "syzkaller" / "bin" / "linux_amd64" /
@@ -1038,7 +1144,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         common_builds.append(HarnessBuildArtifact(name=name,
                                                   artifact_ref=ref))
         digests[f"pin:{name}"] = ref
-    patches = REPO / "bundle" / "patches" / "kernel"
+    patches = repo / "bundle" / "patches" / "kernel"
     series = [p for p in sorted(patches.glob("*.patch"))]
     kernel_builds: dict[Sanitizer, dict] = {}
     variant_files: dict[Sanitizer, dict[str, Path]] = {}
@@ -1050,7 +1156,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         # series, so the kernel must have been built from exactly that
         # series.
         kernel_builds[v.sanitizer] = _build_record(
-            directory / "build.json", "kernel", kernel_repo)
+            directory / "build.json", "kernel", kernel_repo, repo)
         files = {"bzimage": directory / "bzImage",
                  "kernel": directory / "vmlinux"}
         builds = list(common_builds)
@@ -1080,7 +1186,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     checkout = bundle.parent / "checkout"
     provenance = _read_json(bundle / "provenance.json")
     syz_build = _build_record(env / "syzkaller" / "bin" / "build.json",
-                              "syzkaller", env / "syzkaller")
+                              "syzkaller", env / "syzkaller", repo)
     syz_tree = _git(env / "syzkaller", "rev-parse", "HEAD^{tree}")
     if syz_tree != provenance["source_tree"]:
         raise GenerationError(
@@ -1090,13 +1196,13 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     identity = SyzkallerTargetIdentity.model_validate_json(
         (bundle / "identity.json").read_bytes())
     series_bytes = (bundle / "patch-series.bin").read_bytes()
-    if (identity.patch_series_sha256 != series_fingerprint("syzkaller")
+    if (identity.patch_series_sha256 != series_fingerprint("syzkaller", repo)
             or hashlib.sha256(series_bytes).hexdigest()
             != identity.patch_series_sha256):
         raise GenerationError(
             "the parser bundle was built from another syzkaller patch series "
             f"({identity.patch_series_sha256}, checked-in "
-            f"{series_fingerprint('syzkaller')}); rebuild it with "
+            f"{series_fingerprint('syzkaller', repo)}); rebuild it with "
             "tools/syzkaller/build.py")
     manifest = SyzkallerBuildManifest.model_validate_json(
         (bundle / "build-manifest.json").read_bytes())
@@ -1115,6 +1221,25 @@ def generate(spec_path: Path, *, python: str = sys.executable,
     judged = promoted_by_criteria(spec)
     if gap is not None:
         _check_fills(changed, gap.missing_capability_id)
+    kept: dict[str, Capability] = {}
+    if staged is not None:
+        loose = [c.id for c in changed if c.status != "experimental"]
+        if loose:
+            raise GenerationError(
+                f"{', '.join(loose)}: a staged revision's new or changed "
+                "capability is experimental until the promotion criteria "
+                "judge it (07 section 5.3)")
+        base_entries = {c.id: c for c in staged.hcap.capabilities}
+        changed_ids = {c.id for c in changed}
+        kept_ids = [c.id for c in spec.capabilities
+                    if c.id not in changed_ids]
+        absent = [i for i in kept_ids if i not in base_entries]
+        if absent:
+            raise GenerationError(
+                f"the base HCAP lacks {', '.join(absent)}, which the base "
+                "spec holds")
+        kept = {i: base_entries[i] for i in kept_ids}
+        judged = changed
     _check_gap_contracts(spec, judged)
     _check_argument_generality(judged, bundle, identity)
 
@@ -1240,6 +1365,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         evidence_layouts: dict[str, list[ExecutionLayout]] = {}
         probe_evidence: list[PromotionProbeEvidence] = []
         for capability_id, paths in sorted(v.capability_evidence.items()):
+            if capability_id in kept:
+                continue        # the base entry carries its evidence
             refs = []
             for path in paths:
                 resolved = _resolve(base, path)
@@ -1260,8 +1387,12 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                 "evidence_refs": tuple(sorted(set(capability.evidence_refs)
                                               | set(refs)))})
         for capability in variant_capabilities:
-            _check_layout(capability, evidence_layouts.get(capability.id, []))
-        for capability in judged:
+            if capability.id not in kept:
+                _check_layout(capability,
+                              evidence_layouts.get(capability.id, []))
+        variant_capabilities = [kept.get(c.id, c)
+                                for c in variant_capabilities]
+        for capability in () if staged is not None else judged:
             refusals = promotion_refusals(capability, probe_evidence)
             if refusals:
                 raise GenerationError(
@@ -1349,6 +1480,7 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         files={n: p.resolve() for n, p in collector_files.items()},
         variant_files={s: {n: p.resolve() for n, p in files.items()}
                        for s, files in per_variant.items()},
+        staged_files=state / "staged-files",
         accel=accel, exec_slowdown=scale, **timings)
     collector_path.write_text(collector.model_dump_json(indent=2) + "\n")
     config = Stage1Config(
@@ -1406,6 +1538,9 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             managers[v.sanitizer] = state / name
             digests[key(v, "stage2_manager")] = \
                 hashlib.sha256(data).hexdigest()
+    if spec.generation is not None and staged is None:
+        config = config.model_copy(update={"generation": _generation(
+            spec, spec_path, state, collector_path, bundle, python)})
     config_path = state / "stage1.json"
     config_path.write_text(config.model_dump_json(indent=2) + "\n")
     report_path = state / "generated.json"

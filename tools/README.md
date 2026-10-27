@@ -26,6 +26,8 @@ uv run python tools/bootstrap-kcov-env.py env ... --update       # 새 커널로
 | 도구 | 용도 |
 |---|---|
 | `make-base-image.sh` | 사이트 로컬 베이스·키쌍 생성 (create-image.sh -d bookworm; sudo 필요, 산출물은 `SUDO_USER` 소유로 되돌림) |
+| `setup-generation-user.sh` | Harness Generation 생성 OS 사용자(`harness-gen`)·launcher·sudoers·state 디렉터리 준비 (sudo, 호스트당 한 번; `agent_pipeline/stage1/host/README.md`) |
+| `harness-generation-build.py` | patch set 검증의 build 단계 — 바뀐 입력이 없으면 base env 재사용, 있으면 tree의 bootstrap으로 해당 variant만 다시 빌드 (`generate`가 `validate.json`에 넣음) |
 | `bootstrap-kcov-env.py` | env 부트스트랩 — `--variant kasan\|kcsan`별 out-of-tree 커널 빌드, syzkaller 빌드, VM 이미지 bake, variant별 부팅 검증 |
 | `fport-apply.sh` | 시리즈 적용 — `fport-apply.sh [--dry-run] <kind> <target>` (bootstrap이 호출; BASE와 다른 베이스도 `git am -3`으로 시도) |
 | `bump-kernel.py` | 새 커널 태그로 이월 — `bump-kernel.py <태그\|latest>`; 충돌 시 손으로 해결 후 `--export <클론>` (해결 기록은 `cache/rr-cache-kernel`) |

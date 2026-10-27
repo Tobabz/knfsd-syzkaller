@@ -109,7 +109,7 @@ class _Report(_Model):
     reason: str | None = Field(default=None, max_length=MAX_REASON_CHARS)
     descriptor: str | None = None
     hcap: str | None = None
-    artifacts: tuple[_Entry, ...] = Field(default=(), max_length=256)
+    artifacts: tuple[_Entry, ...] = Field(default=(), max_length=4096)
 
 
 class ValidationArtifact(Record):

@@ -254,7 +254,8 @@ validation (Runner, §5.2)
     `base_ref` commit으로 만들고, 같은 생성의 다음 시도는 이전 시도의 작업에서 이어 간다. `worktree_root`는 생성
     OS 사용자가 속한 group으로 setgid를 두고, checkout은 group 쓰기 권한(umask 002)으로 만든다.
   - tool은 `read_file`, `write_file`, `list_dir`, `run_command` 넷이다. 모두 host의 `launcher`(생성 OS 사용자로,
-    network 없이 실행하는 argv 앞부분. 예: `sudo -n -u harness-gen -- unshare -n --`)를 거쳐
+    network 없이 실행하는 argv 앞부분. 기본값은 `tools/setup-generation-user.sh`가 설치하는
+    `sudo -n /usr/local/libexec/knfsd-harness-gen --`로, 새 network namespace에서 `harness-gen`으로 바꿔 실행한다)를 거쳐
     `LocalWorkspaceBackend`에서 돈다. 그래서 file tool도 그 사용자 권한으로 읽고 쓴다. `launcher`가 없으면
     executor는 실행을 거부한다. 경로는 worktree 기준 상대 경로이며 `..`, 절대 경로, `.git`은 받지 않는다.
     `write_file`은 `allowed_paths` 아래만 쓴다(기본값: `bundle/`, `tools/`, host 디렉터리와 spec template,
@@ -303,8 +304,27 @@ mutation_engine이면: 생성한 semantic subset이 M7 1단계(staged pin, 03-nf
   `ExecutionHarnessApproval`(그 descriptor와 staged revision)을 저장한 뒤 staged binding을 돌려준다. Materializer의
   승인 authority는 host의 정적 승인 다음에 이 staged 승인을 본다. 보고와 명령이 남긴 파일은 digest로
   `ValidationRecord`에 담겨 status의 `evidence_ref`가 된다. task 상태는 SQLite에 남고, 이전 process가 돌리던
-  task는 새 process가 열 때 남은 명령 session을 끝내고 `inconclusive(runner_restart)`로 둔다. 실제 검증 명령(위
-  항목의 실행)은 별도 작업이다(#83의 다음 PR).
+  task는 새 process가 열 때 남은 명령 session을 끝내고 `inconclusive(runner_restart)`로 둔다.
+- host 검증 명령(`python -m agent_pipeline.stage1.host validate`, `agent_pipeline/stage1/host/validate.py`): 코드는
+  host의 checkout이고, patch를 적용한 tree에서는 spec, bundle, lane 같은 data만 읽는다.
+  - tree: patch set의 시작 commit을 host clone에서 꺼내 patch를 적용한다. `allowed_paths` 밖을 바꾸거나 pin이 없는
+    lane 파일(`boot-fixture.sh`, `fixture.service`)을 바꾸면 거부한다.
+  - build: 운영자가 정한 build script를 생성 OS 사용자로, network 없이 그 tree에서 돌린다. 실패하면
+    `rejected(build_failed)`다.
+  - staged 생성: `generate --gap --base-spec`에 base binding의 HCAP을 더한 staged 모드(`StagedBase`)로 그 sanitizer
+    하나만 만든다. patch set이 추가하거나 바꾼 capability는 `experimental`이어야 하고 promotion evidence를 요구하지
+    않는다(§5.3이 나중에 판정한다). 바꾸지 않은 capability는 base HCAP 항목을 evidence째 그대로 쓴다. 그 evidence는
+    base build의 것이고, 새 build에서는 아래 회귀 실행이 그 자리를 대신한다.
+  - staged 파일: 새 build의 host 파일은 service collector의 `staged_files/<sha256>/`에 복사한다. collector는 설정된
+    파일이 pin과 맞지 않으면 그 digest의 staged 파일로 boot한다.
+  - 실행: guest마다 새로 boot한다.
+    - smoke: `stage1-host/generation/<gap id>/smoke*.syz`는 fixture, lane, 실행을 통과하고, crash 없이 gap
+      contract의 경계 함수 하나 이상에 도달해야 한다.
+    - neutral control: 같은 selection의 neutral control은 경계 함수에 하나도 도달하지 않아야 한다.
+    - 회귀: base spec의 neutral control은 새 build에서 runtime error와 crash 없이 돌아야 한다. 기존 build와
+      coverage를 비교하는 회귀와 트리거 기준의 기계 판정은 아직 없다.
+  - 판정: guest가 boot하지 못하면 host나 build 탓일 수 있어 `inconclusive`다. boot한 뒤의 실패는 patch set 탓으로
+    본다.
 
 mutation_engine의 crash survival(guest crash 직전 MutationDelta가 남는가)은 여기서 보지 않는다. 이를 보려고
 guest를 일부러 crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지). 실제 campaign에서

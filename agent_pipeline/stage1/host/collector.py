@@ -46,7 +46,7 @@ from ...sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE
 from .kcov import (STATE_COMMAND, STATS_COMMAND, LaneRun, capture_records,
                    lane_state_ok, parse_cover_pcs, parse_stats,
                    unsettled_generations)
-from .pins import HostFilePin, PinCache, verify_file
+from .pins import HostFilePin, PinCache, PinError, verify_file
 from .vm import GUEST_COMMAND_TIMEOUT_S, Guest, QemuGuest, VmConfig
 
 #: Descriptor build-artifact names the collector boots from.
@@ -109,6 +109,10 @@ class CollectorConfig(BaseModel):
     vmlinux_artifact_name: str = "kernel"
     instrumentation_artifact_name: str = "instrumentation"
     pin_cache: Path | None = None
+    #: Host files of staged builds (07 §5.2), by pin digest:
+    #: ``<staged_files>/<sha256>/<file name>``.  A descriptor whose pin a
+    #: configured file does not match boots the staged file instead.
+    staged_files: Path | None = None
 
     @classmethod
     def load(cls, path: Path) -> CollectorConfig:
@@ -132,14 +136,39 @@ def verify_pins(config: CollectorConfig,
     if missing:
         raise CollectorError(f"descriptor or collector config lacks: "
                              f"{', '.join(missing)}")
+    resolved = {}
     for name, path in files.items():
         if name not in builds:
             raise CollectorError(f"{name} is not a descriptor build artifact")
         pin = load_record(store, builds[name], HostFilePin)
         if pin.name != name:
             raise CollectorError(f"pin for {name} names {pin.name}")
+        resolved[name] = pinned_path(config, pin, path, cache)
+    return resolved
+
+
+def staged_path(root: Path, pin: HostFilePin, configured: Path) -> Path:
+    """Where a staged build keeps the file ``pin`` names: its own
+    directory (the lane script's is the guest's lane directory), under the
+    configured file's name."""
+    return root / pin.sha256 / Path(configured).name
+
+
+def pinned_path(config: CollectorConfig, pin: HostFilePin, path: Path,
+                cache: PinCache | None = None) -> Path:
+    """The configured file when it matches ``pin``, else the staged file
+    of that digest."""
+    try:
         verify_file(pin, path, cache)
-    return files
+        return path
+    except PinError:
+        if config.staged_files is None:
+            raise
+        staged = staged_path(config.staged_files, pin, path)
+        if not staged.is_file():
+            raise
+    verify_file(pin, staged, cache)
+    return staged
 
 
 def guest_cmdline(descriptor: ExecutionHarnessDescriptor,
