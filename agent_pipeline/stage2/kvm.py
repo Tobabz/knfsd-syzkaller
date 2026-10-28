@@ -631,6 +631,34 @@ def _validate_runtime_authority(
             f"{refusals[0]}")
 
 
+def program_calls(program: bytes) -> list[str]:
+    """The calls a syz program names, in order of first use: the manager
+    enables exactly these, so the campaign stays lane I/O."""
+    calls: list[str] = []
+    for line in program.decode().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        call = line.split("(", 1)[0].split("=")[-1].strip()
+        if call not in calls:
+            calls.append(call)
+    return calls
+
+
+def _check_program_calls(program: bytes, manager: dict) -> None:
+    """Every call of the candidate program is enabled (#99): syz-manager
+    drops a disabled call from a seed without a word, and the campaign
+    would fuzz the program without it."""
+    calls = manager.get("enable_syscalls")
+    if calls is None:
+        return              # syz-manager enables every call
+    disabled = [call for call in program_calls(program) if call not in calls]
+    if disabled:
+        raise Stage2StepError(
+            "manager enable_syscalls leaves out candidate program calls: "
+            + ", ".join(disabled))
+
+
 def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
     execution = _Execution.model_validate_json((root / "execution.json").read_bytes())
     harness = ReachabilityHarness.model_validate_json((root / "harness.json").read_bytes())
@@ -653,6 +681,7 @@ def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
     if type(procs) is not int or not 1 <= procs <= 64:
         raise Stage2StepError("Stage 2 KVM step requires manager procs in [1, 64]")
     _validate_runtime_authority(root, harness, descriptor, manager)
+    _check_program_calls((root / "program.syz").read_bytes(), manager)
     lanes = _journal_lane_count(vm, procs, accel=collector.accel)
     builds = {item.name: item.artifact_ref for item in descriptor.build_artifacts}
     lane_pin = _manager_assets(manager, vm, collector, descriptor, builds)
