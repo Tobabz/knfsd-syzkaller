@@ -514,8 +514,10 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
 7. Promote (stage 2): `python -m agent_pipeline.semantic_promotion promote --store ARTIFACTS --build REF
    --subset SUBSET.json --run REF [--run REF ...] --hcap HCAP_REVISION [--previous PROMOTED_REF]`
    prints `promoted=REF hcap_revision=REF`, or every reason it refuses. `--previous` is the pinned
-   registry: its pending subset passes and keeps the pin's evidence. Bind the new revision in the
-   harness registry for Stage 2 to use it.
+   registry: its pending subset passes and keeps the pin's evidence. For Stage 2 to use it, give
+   `promoted=REF` as `stage2.backend.semantic_registry` in the host spec and run `generate`, which
+   writes HCAP-10 into every variant's HCAP revision (`agent_pipeline/stage2/README.md` "Stage 2
+   backend").
 
 Either gate refuses the subset when a run's production ended in a guest crash with no MutationDelta
 at the crash cut: replay cannot reproduce that crash. It then stores an `UnreproducibleCrash` with

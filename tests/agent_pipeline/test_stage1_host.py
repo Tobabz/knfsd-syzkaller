@@ -2027,6 +2027,67 @@ def test_stage2_backend_errors(host):
     assert config.stage2.m1_profile_ref == ref
 
 
+def _promoted_for(proxy: Path, *, pending: bool = False) -> str:
+    """A promoted registry of ``proxy``'s build, stored in the CAS."""
+    from agent_pipeline.stage1.host.pins import file_sha256
+    from .test_stage2_host import _build
+    (proxy.parent / "cas").mkdir(exist_ok=True)
+    store = ArtifactStore(proxy.parent / "cas")
+    _, promoted = _build()
+    # The HCAP checker loads the evidence an entry references.
+    evidence = put_record(store, promoted.subsets[0].subset)
+    subsets = tuple(p.model_copy(update={
+        "evidence_refs": (evidence,),
+        "crash_survival": "pending" if pending else "passed"})
+        for p in promoted.subsets)
+    promoted = promoted.model_copy(update={
+        "proxy_sha256": file_sha256(proxy), "subsets": subsets})
+    return put_record(store, promoted)
+
+
+@needs_gcc
+def test_stage2_backend_carries_the_promoted_semantic_registry(host):
+    # #134: the HCAP of every variant pins it as HCAP-10.
+    from agent_pipeline.hcap import ArtifactHcapChecker
+    from agent_pipeline.semantic_promotion import promoted_registry
+    from agent_pipeline.stage2.host import _shared_registry
+    _two_variants(host)
+    proxy = _with_backend(host)
+    ref = _promoted_for(proxy)
+    _with_backend(host, semantic_registry=ref)
+    result = generate(host.spec)
+    store = ArtifactStore(host.root / "cas")
+    assert result.digests["stage2_semantic_registry"] == ref
+    for variant in result.variants.values():
+        hcap = ArtifactHcapChecker(store).load_catalog(variant.hcap_revision)
+        entry = next(c for c in hcap.capabilities if c.id == "HCAP-10")
+        assert entry.authority_refs[0].artifact_ref == ref
+        assert promoted_registry(store, hcap) is not None
+        _shared_registry(store, hcap, variant.hcap_revision)
+    # Without it there is no HCAP-10.
+    _with_backend(host)
+    plain = generate(host.spec).variants["kasan"].hcap_revision
+    assert all(c.id != "HCAP-10" for c in ArtifactHcapChecker(store)
+               .load_catalog(plain).capabilities)
+
+
+@needs_gcc
+def test_stage2_backend_semantic_registry_errors(host):
+    proxy = _with_backend(host)
+    _with_backend(host, semantic_registry=_promoted_for(proxy, pending=True))
+    with pytest.raises(GenerationError, match="crash survival pending"):
+        generate(host.spec)
+    ref = _promoted_for(proxy)
+    proxy.write_text("#!/bin/sh\n# another build\n")
+    _with_backend(host, semantic_registry=ref)
+    proxy.write_text("#!/bin/sh\n# another build\n")
+    with pytest.raises(GenerationError, match="not stage2.backend.nfs_proxy"):
+        generate(host.spec)
+    _with_backend(host, semantic_registry="0" * 64)
+    with pytest.raises(GenerationError, match="semantic_registry"):
+        generate(host.spec)
+
+
 def test_live_spec_manager_enables_the_live_bind_calls():
     # The live BIND path is the HCAP-14 syzlang calls (patch 0031); the
     # manager enables them as approved calls.
