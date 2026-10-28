@@ -508,15 +508,40 @@ class Stage2ManagerSpec(_Spec):
     enable_syscalls: tuple[str, ...] | None = None
 
 
+class EvidenceCarryover(_Spec):
+    """An operator's statement that a ``capability_evidence`` file collected
+    on another build still holds for this one (#99 N2).  It names the
+    harness the evidence ran on, so a later rebuild is not carried by it
+    silently; the lane script must still be the one the evidence ran."""
+
+    path: Path
+    from_execution_harness_id: Sha256
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class CarriedCapabilityEvidence(_Spec):
+    """The record a carried evidence file leaves in its capability's
+    ``evidence_refs``, next to the evidence itself."""
+
+    schema_version: Literal["carried-capability-evidence.v1"] = \
+        "carried-capability-evidence.v1"
+    capability_id: str
+    evidence_ref: Sha256
+    from_execution_harness_id: Sha256
+    to_execution_harness_id: Sha256
+    reason: str
+
+
 class VariantSpec(_Spec):
     """One sanitizer build of the shared harness (#81 D10).  Its kernel is
     ``env_dir/images/<sanitizer>``; capability evidence is pinned to its
     own descriptor, so each variant names the KVM evidence collected on
-    it."""
+    it, or carries evidence over from another build."""
 
     sanitizer: Sanitizer
     capability_evidence: dict[str, tuple[Path, ...]] = Field(
         default_factory=dict)
+    evidence_carryover: tuple[EvidenceCarryover, ...] = ()
 
 
 CAPABILITY_EVIDENCE_MODELS = {
@@ -552,6 +577,9 @@ class HostSpec(_Spec):
     #: generated HCAP catalog. Paths are relative to this spec.
     capability_evidence: dict[str, tuple[Path, ...]] = Field(
         default_factory=dict)
+    #: Evidence files in ``capability_evidence`` collected on another build
+    #: that the operator carries over to this one.
+    evidence_carryover: tuple[EvidenceCarryover, ...] = ()
     #: The contract each gap ID's capability must declare (04 §3.3).
     gap_contracts: tuple[GapContract, ...] = ()
     #: The capability whose constraints list the allowed runtime selections.
@@ -576,10 +604,10 @@ class HostSpec(_Spec):
             return self
         if "variant" in self.model_fields_set:
             raise ValueError("give variant or variants, not both")
-        if self.capability_evidence:
-            raise ValueError("with variants, capability_evidence belongs "
-                             "to each variant (it is pinned to its "
-                             "descriptor)")
+        if self.capability_evidence or self.evidence_carryover:
+            raise ValueError("with variants, capability_evidence and "
+                             "evidence_carryover belong to each variant "
+                             "(evidence is pinned to its descriptor)")
         names = [v.sanitizer for v in self.variants]
         if len(set(names)) != len(names):
             raise ValueError("a sanitizer is listed twice in variants")
@@ -588,7 +616,8 @@ class HostSpec(_Spec):
     def variant_specs(self) -> tuple[VariantSpec, ...]:
         return self.variants or (VariantSpec(
             sanitizer=self.variant,
-            capability_evidence=self.capability_evidence),)
+            capability_evidence=self.capability_evidence,
+            evidence_carryover=self.evidence_carryover),)
 
 
 def capability_baseline_sha256(capability: Capability) -> str:
@@ -653,6 +682,7 @@ _EVIDENCE_HELP = ("agent_pipeline/stage1/host/README.md, \"The template's "
 def _validated_capability_evidence(
         capability_id: str, path: Path, *,
         expected_mapping_identity: KernelIdentity,
+        carryover: EvidenceCarryover | None = None,
         lane_script_sha256: str,
 ) -> tuple[bytes, ExecutionLayout, PromotionProbeEvidence | None]:
     """Validate identity-sensitive evidence before it can promote an HCAP.
@@ -683,17 +713,25 @@ def _validated_capability_evidence(
     except ValidationError as error:
         raise GenerationError(
             f"invalid {capability_id} KVM evidence {path}: {error}") from error
-    if evidence.mapping_identity != expected_mapping_identity:
+    other_build = (evidence.mapping_identity != expected_mapping_identity
+                   or evidence.execution_harness_id !=
+                   expected_mapping_identity.execution_harness_id)
+    if other_build and carryover is None:
         raise GenerationError(
             f"{capability_id} evidence mapping identity differs from the "
-            f"generated execution harness: {path} ran another build; "
-            f"collect it on this one or remove it ({_EVIDENCE_HELP})")
-    if evidence.execution_harness_id != \
-            expected_mapping_identity.execution_harness_id:
+            f"generated execution harness: {path} ran another build "
+            f"({evidence.execution_harness_id}); collect it on this one, "
+            f"carry it over or remove it ({_EVIDENCE_HELP})")
+    if carryover is not None and not other_build:
         raise GenerationError(
-            f"{capability_id} evidence names another execution harness: "
-            f"{path} ran another build; collect it on this one or remove "
-            f"it ({_EVIDENCE_HELP})")
+            f"{capability_id} evidence {path} ran this build; remove its "
+            "evidence_carryover")
+    if carryover is not None and carryover.from_execution_harness_id != \
+            evidence.execution_harness_id:
+        raise GenerationError(
+            f"{capability_id} evidence_carryover for {path} names harness "
+            f"{carryover.from_execution_harness_id}, but the evidence ran "
+            f"{evidence.execution_harness_id}")
     if evidence.guest_lane_script_sha256 != lane_script_sha256:
         raise GenerationError(
             f"{capability_id} evidence names another guest lane script")
@@ -702,7 +740,7 @@ def _validated_capability_evidence(
         raise GenerationError(
             f"{capability_id} evidence validates other capabilities")
     probe = evidence if isinstance(evidence, PromotionProbeEvidence) else None
-    return contents, evidence.layout, probe
+    return contents, evidence.layout, probe, evidence.execution_harness_id
 
 
 def _with_gap(spec: HostSpec, gap: GapContract) -> HostSpec:
@@ -1314,6 +1352,15 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             if not paths:
                 raise GenerationError(
                     f"capability_evidence for {capability_id} is empty")
+        listed = {_resolve(base, path) for paths in
+                  v.capability_evidence.values() for path in paths}
+        carried = [_resolve(base, c.path) for c in v.evidence_carryover]
+        if len(set(carried)) != len(carried):
+            raise GenerationError("evidence_carryover names a file twice")
+        unlisted = sorted(str(path) for path in set(carried) - listed)
+        if unlisted:
+            raise GenerationError("evidence_carryover names a file no "
+                                  "capability_evidence lists: " + unlisted[0])
     if spec.runtime_selection_capability is not None:
         index = next((i for i, c in enumerate(capabilities)
                       if c.id == spec.runtime_selection_capability), None)
@@ -1421,6 +1468,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         variant_capabilities = list(capabilities)
         evidence_layouts: dict[str, list[ExecutionLayout]] = {}
         probe_evidence: list[PromotionProbeEvidence] = []
+        carryovers = {_resolve(base, c.path): c
+                      for c in v.evidence_carryover}
         for capability_id, paths in sorted(v.capability_evidence.items()):
             if capability_id in kept:
                 continue        # the base entry carries its evidence
@@ -1430,14 +1479,24 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                 if not resolved.is_file():
                     raise GenerationError(
                         f"capability evidence is not a file: {resolved}")
-                contents, layout, probe = _validated_capability_evidence(
-                    capability_id, resolved,
-                    expected_mapping_identity=expected_mapping_identity,
-                    lane_script_sha256=file_pins["lane-script"].sha256)
+                carryover = carryovers.get(resolved)
+                contents, layout, probe, ran_on = \
+                    _validated_capability_evidence(
+                        capability_id, resolved,
+                        expected_mapping_identity=expected_mapping_identity,
+                        carryover=carryover,
+                        lane_script_sha256=file_pins["lane-script"].sha256)
                 evidence_layouts.setdefault(capability_id, []).append(layout)
                 if probe is not None:
                     probe_evidence.append(probe)
-                refs.append(store.put(contents))
+                ref = store.put(contents)
+                refs.append(ref)
+                if carryover is not None:
+                    refs.append(put_record(store, CarriedCapabilityEvidence(
+                        capability_id=capability_id, evidence_ref=ref,
+                        from_execution_harness_id=ran_on,
+                        to_execution_harness_id=harness_id,
+                        reason=carryover.reason)))
             index = capability_indexes[capability_id]
             capability = variant_capabilities[index]
             variant_capabilities[index] = capability.model_copy(update={

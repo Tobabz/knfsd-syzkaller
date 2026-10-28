@@ -47,7 +47,8 @@ from agent_pipeline.hcap import (STAGE1_LAYOUT, Capability, CapabilityContract,
 from agent_pipeline.stage1.host.collector import (CollectorConfig,
                                                   CollectorError, collect,
                                                   guest_cmdline)
-from agent_pipeline.stage1.host.generate import (GenerationError,
+from agent_pipeline.stage1.host.generate import (CarriedCapabilityEvidence,
+                                                 GenerationError,
                                                  capability_baseline_sha256,
                                                  HCAP11_RECOVERY_ORDER,
                                                  Hcap11KvmEvidence,
@@ -455,8 +456,51 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
         descriptor.guest_kernel_command_line + " audit=1"
     host.spec.write_text(json.dumps(spec, indent=1))
     with pytest.raises(GenerationError, match="mapping identity differs"
-                       ".* ran another build; collect it on this one or "
-                       "remove it"):
+                       ".* ran another build .*; collect it on this one, "
+                       "carry it over or remove it"):
+        generate(host.spec)
+
+    # An operator may carry it over, naming the build it ran (#99 N2).
+    carry = {"path": evidence.name, "reason": "cmdline only"}
+    spec["evidence_carryover"] = [{**carry,
+                                   "from_execution_harness_id": "f" * 64}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="names harness f{64}, but the "
+                       "evidence ran " + initial.execution_harness_id):
+        generate(host.spec)
+    spec["evidence_carryover"] = [{
+        **carry, "from_execution_harness_id": initial.execution_harness_id}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    carried = generate(host.spec)
+    assert carried.execution_harness_id != initial.execution_harness_id
+    catalog = load_record(store, carried.hcap_revision, HcapCatalog)
+    lifecycle = next(item for item in catalog.capabilities
+                     if item.id == "HCAP-11")
+    records = [json.loads(store.get(ref)) for ref in lifecycle.evidence_refs]
+    (note,) = [r for r in records
+               if r.get("schema_version") == "carried-capability-evidence.v1"]
+    assert CarriedCapabilityEvidence.model_validate(note) == \
+        CarriedCapabilityEvidence(
+            capability_id="HCAP-11",
+            evidence_ref=next(ref for ref, r in zip(lifecycle.evidence_refs,
+                                                    records) if r is not note),
+            from_execution_harness_id=initial.execution_harness_id,
+            to_execution_harness_id=carried.execution_harness_id,
+            reason="cmdline only")
+
+    # A carryover of evidence that ran this build, or of a file no
+    # capability lists, is stale.
+    spec["guest_kernel_command_line"] = descriptor.guest_kernel_command_line
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="ran this build; remove its "
+                       "evidence_carryover"):
+        generate(host.spec)
+    spec["evidence_carryover"] = [{
+        **carry, "path": "other.json",
+        "from_execution_harness_id": initial.execution_harness_id}]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    with pytest.raises(GenerationError, match="names a file no "
+                       "capability_evidence lists"):
         generate(host.spec)
 
 
@@ -1543,7 +1587,10 @@ def test_capability_evidence_belongs_to_its_variant(host):
 @pytest.mark.parametrize(("change", "message"), [
     ({"variant": "kasan"}, "variant or variants"),
     ({"capability_evidence": {"CAP-lane": ["x.json"]}},
-     "belongs to each variant"),
+     "belong to each variant"),
+    ({"evidence_carryover": [{"path": "x.json", "reason": "r",
+                              "from_execution_harness_id": "f" * 64}]},
+     "belong to each variant"),
     ({"variants": [{"sanitizer": "kcsan"}, {"sanitizer": "kcsan"}]},
      "listed twice"),
 ])
