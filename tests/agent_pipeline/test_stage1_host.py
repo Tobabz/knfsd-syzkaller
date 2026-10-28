@@ -33,7 +33,7 @@ from agent_pipeline.contracts import (PIPELINE_GAP_IDS, CandidateSubmission,
                                       Sanitizer)
 from agent_pipeline.controller.records import JobState
 from agent_pipeline.crash import CRASH_REPORT_TYPE, CrashKind, CrashReport
-from agent_pipeline.data import canonical_json, load_record
+from agent_pipeline.data import canonical_json, load_record, put_record
 from agent_pipeline.q1 import (KernelIdentity, RemoteKcovObservation,
                                TargetPcMapping)
 from agent_pipeline.sealed_q1 import PublishedCoverage
@@ -395,13 +395,13 @@ def test_generated_hcap_lists_the_pipeline_gap_ids(host):
     assert set(catalog.missing_capability_ids) == set(PIPELINE_GAP_IDS)
 
 
-def test_generate_refuses_a_mutate_policy(host):
-    # #81 D16: generation configures no Stage 2 backend yet.
+def test_generate_refuses_a_mutate_policy_without_a_backend(host):
+    # #81 D16: without stage2.backend there is no Stage 2 backend.
     spec = json.loads(host.spec.read_text())
     spec["policies"] = [policy(campaign_mode="mutate").model_dump(
         mode="json")]
     host.spec.write_text(json.dumps(spec, indent=1))
-    with pytest.raises(GenerationError, match="campaign_mode mutate"):
+    with pytest.raises(GenerationError, match="give stage2.backend"):
         generate(host.spec)
 
 
@@ -1943,6 +1943,88 @@ def test_each_variant_gets_its_own_stage2_manager(host):
         assert "approved assets" in _preflight_manager(host, result, path)
         assert result.digests[f"{name}:stage2_manager"]
     assert len(kernels) == 2
+
+
+def _with_backend(host, *, mutate=True, **backend):
+    proxy = host.root / "nfs-proxy"
+    proxy.write_text("#!/bin/sh\n")
+    proxy.chmod(0o755)
+    spec = json.loads(host.spec.read_text())
+    spec["stage2"] = {**spec.get("stage2", {}),
+                      "backend": {"nfs_proxy": str(proxy), **backend}}
+    if mutate:
+        spec["policies"] = [policy(campaign_mode="mutate").model_dump(
+            mode="json")]
+    host.spec.write_text(json.dumps(spec, indent=1))
+    return proxy
+
+
+@needs_gcc
+def test_generate_writes_the_stage2_backend_for_a_mutate_policy(host):
+    # #81 D16: stage2.backend sets Stage1Config.stage2 and nfs_proxy.
+    from agent_pipeline.m1 import M1JudgeProfile
+    from agent_pipeline.q2 import default_q2_profile
+    from agent_pipeline.semantic_replay import ReplayJudgeProfile
+    from agent_pipeline.stage2.host import (_bind_manager_command,
+                                            _check_profiles)
+    proxy = _with_backend(host, campaign_executions=64)
+    result = generate(host.spec)
+    config = Stage1Config.load(result.stage1_config)
+    stage2 = config.stage2
+    assert config.nfs_proxy == stage2.replay_proxy == proxy
+    manager = result.stage2_managers["kasan"]
+    assert stage2.argv[1:] == (
+        "-m", "agent_pipeline.stage2.host", "step", "--manager",
+        str(manager), "--collector", str(result.collector_config),
+        "--campaign-executions", "64", "{input}", "{output}")
+    assert stage2.resource_key == config.engine.resource_key
+    assert stage2.crash_window_bound == 4
+    store = ArtifactStore(config.artifact_root)
+    _check_profiles(store, stage2)
+    assert load_record(store, stage2.m1_profile_ref, M1JudgeProfile).name \
+        == "m1-default"
+    assert stage2.q2_profile_ref == put_record(store, default_q2_profile())
+    assert load_record(store, stage2.replay_profile_ref,
+                       ReplayJudgeProfile).name == "replay-default"
+    assert result.digests["stage2_m1_profile"] == stage2.m1_profile_ref
+    _bind_manager_command(manager, stage2)
+
+
+@needs_gcc
+def test_stage2_backend_names_each_variant_manager(host):
+    from agent_pipeline.stage2.host import _bind_manager_command
+    _two_variants(host)
+    _with_backend(host, mutate=False)
+    result = generate(host.spec)
+    stage2 = Stage1Config.load(result.stage1_config).stage2
+    paths = result.stage2_managers
+    assert stage2.argv[4:8] == (
+        "--variant-manager", f"kasan={paths['kasan']}",
+        "--variant-manager", f"kcsan={paths['kcsan']}")
+    for path in paths.values():
+        _bind_manager_command(path, stage2)
+
+
+@needs_gcc
+def test_stage2_backend_errors(host):
+    from agent_pipeline.m1 import M1JudgeProfile
+    proxy = _with_backend(host, crash_window_bound=7)
+    with pytest.raises(ValidationError, match="exceeds"):
+        generate(host.spec)
+    _with_backend(host, m1_profile_ref="0" * 64)
+    with pytest.raises(GenerationError, match="m1_profile_ref"):
+        generate(host.spec)
+    _with_backend(host)
+    proxy.chmod(0o644)
+    with pytest.raises(GenerationError, match="not an executable"):
+        generate(host.spec)
+    # A given profile in the CAS is kept.
+    proxy.chmod(0o755)
+    ref = put_record(ArtifactStore(host.root / "cas"),
+                     M1JudgeProfile(name="m1-host", revision="2"))
+    _with_backend(host, m1_profile_ref=ref)
+    config = Stage1Config.load(generate(host.spec).stage1_config)
+    assert config.stage2.m1_profile_ref == ref
 
 
 def test_live_spec_manager_enables_the_live_bind_calls():

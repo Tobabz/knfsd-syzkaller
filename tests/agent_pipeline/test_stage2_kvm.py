@@ -37,7 +37,7 @@ from agent_pipeline.stage2.kvm import (
     _closed_evidence_channels, _JournalChannels, _journal_artifacts,
     _journal_lane_count, _lane_template,
     _campaign_manager, _campaign_report_state, _CRASH, _KCSAN_REPORT,
-    _manager_assets, _manager_cmdline, _manager_qemu_args,
+    _manager_assets, _manager_cmdline, _manager_path, _manager_qemu_args,
     _staged_manager, _evidence_seal_window, _seal_segment, _spool,
     _stop_manager, _validate_runtime_authority, StepOptions,
     stage2_timeout_budget,
@@ -205,6 +205,45 @@ def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):
             collector=tmp_path / "collector.json",
             exec_slowdown=0,
         )
+
+
+def test_a_lease_runs_the_manager_of_its_variant(tmp_path):
+    # #81 D10: a host with several variants names one manager each.
+    kasan, kcsan = tmp_path / "kasan.json", tmp_path / "kcsan.json"
+    options = StepOptions(
+        manager=None, collector=tmp_path / "collector.json",
+        variant_managers=((Sanitizer.KASAN, kasan),
+                          (Sanitizer.KCSAN, kcsan)))
+    assert _manager_path(options, SimpleNamespace(
+        sanitizer=Sanitizer.KCSAN)) == kcsan
+    only = replace(options, variant_managers=((Sanitizer.KASAN, kasan),))
+    with pytest.raises(Stage2StepError, match="no variant manager for the "
+                                              "kcsan harness"):
+        _manager_path(only, SimpleNamespace(sanitizer=Sanitizer.KCSAN))
+    with pytest.raises(ValueError, match="one manager or variant"):
+        StepOptions(manager=None, collector=tmp_path / "c.json")
+    with pytest.raises(ValueError, match="one manager or variant"):
+        replace(options, manager=kasan)
+    with pytest.raises(ValueError, match="two variant managers"):
+        replace(options, variant_managers=((Sanitizer.KASAN, kasan),) * 2)
+
+
+def test_step_cli_parses_variant_managers(tmp_path, monkeypatch):
+    from agent_pipeline.stage2 import host, kvm
+    seen = []
+    monkeypatch.setattr(kvm, "run_step", lambda *args: seen.append(args))
+    assert host.main(["step", "--variant-manager", "kasan=/m/a.json",
+                      "--variant-manager", "kcsan=/m/c.json",
+                      "--collector", "/c.json", "in", "out"]) == 0
+    assert seen[0][0].variant_managers == (
+        (Sanitizer.KASAN, Path("/m/a.json")),
+        (Sanitizer.KCSAN, Path("/m/c.json")))
+    assert seen[0][0].manager is None
+    for bad in (["--variant-manager", "kmsan=/m.json"],
+                ["--variant-manager", "kasan="],
+                ["--manager", "/m.json", "--variant-manager", "kasan=/m"]):
+        with pytest.raises(SystemExit):
+            host.main(["step", *bad, "--collector", "/c.json", "i", "o"])
 
 
 def test_stage2_timeout_budget_accounts_for_every_bounded_operation(tmp_path):
