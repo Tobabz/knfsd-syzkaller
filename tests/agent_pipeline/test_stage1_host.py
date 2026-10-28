@@ -454,7 +454,9 @@ def test_hcap11_evidence_is_typed_and_bound_to_generated_harness(host):
     spec["guest_kernel_command_line"] = \
         descriptor.guest_kernel_command_line + " audit=1"
     host.spec.write_text(json.dumps(spec, indent=1))
-    with pytest.raises(GenerationError, match="mapping identity differs"):
+    with pytest.raises(GenerationError, match="mapping identity differs"
+                       ".* ran another build; collect it on this one or "
+                       "remove it"):
         generate(host.spec)
 
 

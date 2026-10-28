@@ -131,6 +131,26 @@ guest. Read `probe-1/probe.json`:
    them. If `callsite_plus_5` matches instead, the coverage file holds
    return addresses, and `target-pcs` must shift its PCs to match.
 
+## The template's capability evidence
+
+The three files in `template/capability-evidence/` are the KVM runs that
+validated HCAP-04 (whose layout HCAP-01 and HCAP-03 share), HCAP-11 and
+HCAP-13. Each is pinned to the execution harness it ran on, and the three
+name three different harnesses (`3579138b…`, `a9bcc791…`, `13c965c1…`).
+`generate` takes an evidence file only for the harness it builds, so the
+template copied as is fails step 4 on any host ("evidence mapping identity
+differs from the generated execution harness"). The files record those
+runs and show the format; they are not evidence for another build.
+
+Before step 4, for each of these capabilities either
+
+- collect its evidence on your build and list the new file in
+  `capability_evidence` (`docs/design/02-llm-agent/04-harness-capability-spec.md`,
+  HCAP-04, HCAP-11 and HCAP-13 give each run), or
+- remove its `capability_evidence` entry. For HCAP-01, HCAP-03 and HCAP-04
+  also remove `validated_layout`: a layout beyond Stage 1's (1 proc, lane
+  0) needs evidence that ran it.
+
 ## KASAN and KCSAN from one spec
 
 `variants` in the spec (in place of `variant`) lists the sanitizer builds

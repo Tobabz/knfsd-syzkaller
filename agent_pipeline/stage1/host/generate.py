@@ -646,6 +646,10 @@ def _resolve(base: Path, path: Path) -> Path:
     return (path if path.is_absolute() else base / path).resolve()
 
 
+_EVIDENCE_HELP = ("agent_pipeline/stage1/host/README.md, \"The template's "
+                  "capability evidence\"")
+
+
 def _validated_capability_evidence(
         capability_id: str, path: Path, *,
         expected_mapping_identity: KernelIdentity,
@@ -682,11 +686,14 @@ def _validated_capability_evidence(
     if evidence.mapping_identity != expected_mapping_identity:
         raise GenerationError(
             f"{capability_id} evidence mapping identity differs from the "
-            "generated execution harness")
+            f"generated execution harness: {path} ran another build; "
+            f"collect it on this one or remove it ({_EVIDENCE_HELP})")
     if evidence.execution_harness_id != \
             expected_mapping_identity.execution_harness_id:
         raise GenerationError(
-            f"{capability_id} evidence names another execution harness")
+            f"{capability_id} evidence names another execution harness: "
+            f"{path} ran another build; collect it on this one or remove "
+            f"it ({_EVIDENCE_HELP})")
     if evidence.guest_lane_script_sha256 != lane_script_sha256:
         raise GenerationError(
             f"{capability_id} evidence names another guest lane script")
