@@ -131,6 +131,47 @@ guest. Read `probe-1/probe.json`:
    them. If `callsite_plus_5` matches instead, the coverage file holds
    return addresses, and `target-pcs` must shift its PCs to match.
 
+## The template's capability evidence
+
+The three files in `template/capability-evidence/` are the KVM runs that
+validated HCAP-04 (whose layout HCAP-01 and HCAP-03 share), HCAP-11 and
+HCAP-13. Each is pinned to the execution harness it ran on, and the three
+name three different harnesses (`3579138b…`, `a9bcc791…`, `13c965c1…`).
+`generate` takes an evidence file only for the harness it builds, so the
+template copied as is fails step 4 on any host ("evidence mapping identity
+differs from the generated execution harness"). The files record those
+runs and show the format; they are not evidence for another build.
+
+Before step 4, for each of these capabilities either
+
+- collect its evidence on your build and list the new file in
+  `capability_evidence` (`docs/design/02-llm-agent/04-harness-capability-spec.md`,
+  HCAP-04, HCAP-11 and HCAP-13 give each run),
+- carry the file over, when you judge that what changed since it ran (a
+  kernel, syzkaller or image rebuild) does not touch the capability, or
+- remove its `capability_evidence` entry. For HCAP-01, HCAP-03 and HCAP-04
+  also remove `validated_layout`: a layout beyond Stage 1's (1 proc, lane
+  0) needs evidence that ran it.
+
+A carryover names the file, the harness it ran on and why it still holds:
+
+```json
+"evidence_carryover": [
+  {"path": "capability-evidence/hcap04-kvm.json",
+   "from_execution_harness_id": "3579138b…",
+   "reason": "syzkaller 0039 only changes write$inet_nfs_fuzz"}
+]
+```
+
+It sits next to `capability_evidence` (in each variant when the spec has
+`variants`). `generate` then takes the file and adds a
+`carried-capability-evidence.v1` record (the evidence, both harness ids and
+the reason) to the capability's `evidence_refs`, so the HCAP shows which
+evidence came from another build. It refuses a carryover whose harness is
+not the one the evidence ran, one for evidence that ran this build, and
+one for a file no `capability_evidence` lists. The guest lane script must
+still be the one the evidence ran: a `lane.sh` change is not carried.
+
 ## KASAN and KCSAN from one spec
 
 `variants` in the spec (in place of `variant`) lists the sanitizer builds

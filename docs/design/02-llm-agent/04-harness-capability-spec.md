@@ -149,7 +149,10 @@ generation이 거부한다. 빠진 call은 candidate program에서도 잘려 나
 seed에서 지운다). `stage2.procs`를 비워 두면 모든 admitted call이 enable되는 가장 큰 `procs`를 쓴다. 지금 HCAP-11,
 HCAP-13, HCAP-14는 lane 0에서만 검증됐으므로 template과 live spec은 `procs=1`이다(#124 검토). Stage 2 KVM
 단계도 candidate program의 call이 manager의 `enable_syscalls` 밖에 있으면 campaign을 시작하지 않는다. 그래서
-spec이 이름으로 뺀 call을 쓰는 program도 잘린 채로 fuzz되지 않는다. 사람이 만든
+spec이 이름으로 뺀 call을 쓰는 program도 잘린 채로 fuzz되지 않는다. typed evidence는
+그것을 수집한 execution harness에 묶인다. 다른 빌드에서 수집한 evidence는 운영자가 host spec의
+`evidence_carryover`에 원래 harness id와 사유를 적어야 받아들여진다. 그 사실은 capability의 `evidence_refs`에
+`carried-capability-evidence.v1` record로 남는다. guest lane script는 이월되지 않는다. 사람이 만든
 capability와 생성된 capability에 똑같이 적용한다.
 
 `usable_stage`는 capability가 기능상 어느 stage에 속하는지를, `usable_by`는 누가 그것을 쓸 수 있는지를
