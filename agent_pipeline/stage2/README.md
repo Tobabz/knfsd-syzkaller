@@ -143,9 +143,36 @@ lane. `enable_syscalls` is every admitted call and every call the runtime
 selection enables; a given list must include all of them and name only
 calls the syzkaller build has. `runtime_selection` picks the selection the
 manager boots and may be left out when the spec has one. `generated.json`
-records each manager's SHA-256 under `stage2_manager`. Generation does not
-set `Stage1Config.stage2` or `nfs_proxy`, which need the promoted Proxy and
-the judge profiles; pass the manager to the `step` and `preflight` commands.
+records each manager's SHA-256 under `stage2_manager`.
+
+### Stage 2 backend
+
+Without `stage2.backend`, generation does not set `Stage1Config.stage2` or
+`nfs_proxy`, and a `campaign_mode: mutate` policy is refused (#81 D16). With
+it, generation writes both, so a mutate policy can be generated:
+
+```json
+"stage2": {"nfs_proxy_window": 6,
+           "backend": {"nfs_proxy": "/opt/nfs-proxy/nfs-proxy"}}
+```
+
+`nfs_proxy` is the promoted Proxy build. It is the Rule Compiler's
+`nfs_proxy` and the gate's `stage2.replay_proxy`, so the two are the same
+build. The step command is `agent_pipeline.stage2.host step` with the
+generated manager (`--manager`), or one `--variant-manager SANITIZER=PATH`
+per variant, and a lease runs the manager of its descriptor's sanitizer.
+`campaign_executions` (128), `timeout_s` (86400), `crash_window_bound` (4,
+at most `nfs_proxy_window`) and `resource_key` (the engine's) may be set.
+The judge profiles default to `M1JudgeProfile` `m1-default`/1,
+`q2.default_q2_profile()` and `ReplayJudgeProfile` `replay-default`/1,
+stored in the CAS; `m1_profile_ref`, `q2_profile_ref` and
+`replay_profile_ref` name other profiles already in the CAS.
+`generated.json` records the three under `stage2_*_profile`.
+
+The promoted semantic subset is not part of the spec. It is HCAP-10 of the
+bound HCAP revision; a rule set no promoted subset covers is a
+`mutation_engine` gap, which Harness Generation fills (07 §5). Run
+`preflight` with each manager before the first mutate job.
 
 ### Validated layouts (#99)
 
@@ -270,13 +297,13 @@ off by default.
 Run the complete service path as follows:
 
 1. Bring a job to `s1_reached` with the Stage 1 service (its README).
-2. Build the promoted Proxy and set `nfs_proxy` (the compiler) and
-   `stage2.replay_proxy` to it.
-3. Store the three judge profiles and put their digests in `stage2`.
-   `q2.default_q2_profile()` is the reference Q2 profile.
-4. Configure the `step` argv above. The base manager config remains immutable;
-   the command copies it per lease and replaces only workdir, lane template,
-   journal sockets and `experimental.nfs_proxy_evidence` with private paths.
+2. Build the promoted Proxy and give it as `stage2.backend.nfs_proxy` in the
+   host spec (see "Stage 2 backend"); `generate` sets `nfs_proxy`,
+   `stage2.replay_proxy`, the judge profiles and the `step` argv.
+3. Run `preflight` with each generated manager.
+4. The base manager config remains immutable; the step command copies it
+   per lease and replaces only workdir, lane template, journal sockets and
+   `experimental.nfs_proxy_evidence` with private paths.
 5. `python -m agent_pipeline.stage1 --config stage1.json operator JOB start_stage2`,
    then `run --job JOB`. It stops in `crash_review`, `blocked_operator` or
    `parked`; `status --job JOB` shows the gate runs, campaign tally, triage

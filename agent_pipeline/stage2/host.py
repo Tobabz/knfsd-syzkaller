@@ -27,7 +27,7 @@ from typing import Callable, Literal
 from pydantic import Field
 
 from ..artifacts import ArtifactStore
-from ..contracts import CampaignMode, JobPolicy, Record
+from ..contracts import CampaignMode, JobPolicy, Record, Sanitizer
 from ..data import load_record, parse_json
 from ..admission import CallAdmissionProfile
 from ..hcap import ArtifactHcapChecker, HcapCatalog, layout_refusals
@@ -434,14 +434,20 @@ def _bind_manager_command(path: Path, command) -> None:
     for argument in command.argv[1:]:
         if "{" in argument or "}" in argument:
             continue
-        candidate = Path(argument)
-        if not candidate.is_absolute():
-            candidate = cwd / candidate
-        try:
-            if candidate.resolve(strict=True) == expected:
-                return
-        except OSError:
-            continue
+        # A --variant-manager value is SANITIZER=PATH.
+        name, separator, rest = argument.partition("=")
+        values = [argument]
+        if separator and name in {s.value for s in Sanitizer}:
+            values.append(rest)
+        for value in values:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                candidate = cwd / candidate
+            try:
+                if candidate.resolve(strict=True) == expected:
+                    return
+            except OSError:
+                continue
     raise PreflightError(
         "manager config must be an explicit Stage 2 command argument")
 
@@ -770,6 +776,18 @@ def _print(report: PreflightReport) -> None:
     print("READY" if report.ready else "NOT READY")
 
 
+def _variant_manager(value: str) -> tuple[Sanitizer, Path]:
+    name, sep, path = value.partition("=")
+    try:
+        sanitizer = Sanitizer(name)
+    except ValueError:
+        sep = ""
+    if not sep or not path:
+        raise argparse.ArgumentTypeError(
+            f"expected SANITIZER=PATH, got {value!r}")
+    return sanitizer, Path(path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m agent_pipeline.stage2.host",
@@ -782,7 +800,12 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--kvm", type=Path, default=Path("/dev/kvm"))
     check.add_argument("--json", action="store_true")
     step = sub.add_parser("step")
-    step.add_argument("--manager", type=Path, required=True)
+    managers = step.add_mutually_exclusive_group(required=True)
+    managers.add_argument("--manager", type=Path)
+    managers.add_argument("--variant-manager", action="append",
+                          type=_variant_manager, metavar="SANITIZER=PATH",
+                          help="the manager of one sanitizer variant; a "
+                               "lease runs its harness's (repeatable)")
     step.add_argument("--collector", type=Path, required=True)
     step.add_argument("--campaign-executions", type=int, default=128)
     step.add_argument("--campaign-timeout", type=float, default=1800)
@@ -800,7 +823,8 @@ def main(argv: list[str] | None = None) -> int:
             campaign_executions=args.campaign_executions,
             campaign_timeout_s=args.campaign_timeout,
             manager_stop_timeout_s=args.manager_stop_timeout,
-            exec_slowdown=args.exec_slowdown),
+            exec_slowdown=args.exec_slowdown,
+            variant_managers=tuple(args.variant_manager or ())),
             args.input, args.output)
         return 0
     report = preflight(args.stage1, collector_path=args.collector,

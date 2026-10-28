@@ -128,15 +128,24 @@ class NfsProxyExecution(BaseModel):
 
 @dataclass(frozen=True)
 class StepOptions:
-    manager: Path
+    #: The manager config; None when ``variant_managers`` picks one.
+    manager: Path | None
     collector: Path
     campaign_executions: int = 128
     campaign_timeout_s: float = 1800
     manager_stop_timeout_s: float = 45
     #: None takes the collector's ``exec_slowdown`` (TCG hosts scale it).
     exec_slowdown: int | None = None
+    #: (sanitizer, manager config) pairs of a host with several variants
+    #: (#81 D10): a lease runs the manager of its descriptor's sanitizer.
+    variant_managers: tuple[tuple[Sanitizer, Path], ...] = ()
 
     def __post_init__(self) -> None:
+        if (self.manager is None) == (not self.variant_managers):
+            raise ValueError("give one manager or variant managers")
+        sanitizers = [sanitizer for sanitizer, _ in self.variant_managers]
+        if len(set(sanitizers)) != len(sanitizers):
+            raise ValueError("a sanitizer has two variant managers")
         if not 1 <= self.campaign_executions <= 192:
             raise ValueError("campaign_executions must be in [1, 192]")
         if (not all(math.isfinite(value) for value in (
@@ -659,6 +668,17 @@ def _check_program_calls(program: bytes, manager: dict) -> None:
             + ", ".join(disabled))
 
 
+def _manager_path(options: StepOptions,
+                  descriptor: ExecutionHarnessDescriptor) -> Path:
+    if options.manager is not None:
+        return options.manager
+    path = dict(options.variant_managers).get(descriptor.sanitizer)
+    if path is None:
+        raise Stage2StepError(f"no variant manager for the "
+                              f"{descriptor.sanitizer.value} harness")
+    return path
+
+
 def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
     execution = _Execution.model_validate_json((root / "execution.json").read_bytes())
     harness = ReachabilityHarness.model_validate_json((root / "harness.json").read_bytes())
@@ -670,7 +690,8 @@ def _load_inputs(options: StepOptions, root: Path) -> _Inputs:
         raise Stage2StepError("descriptor and execution identity disagree")
     collector = CollectorConfig.load(options.collector)
     files = verify_pins(collector, descriptor)
-    manager = _staged_manager(_object(options.manager), collector, files)
+    manager = _staged_manager(_object(_manager_path(options, descriptor)),
+                              collector, files)
     vm = manager.get("vm")
     if manager.get("type") != "qemu" or not isinstance(vm, dict):
         raise Stage2StepError("manager must configure one qemu VM")

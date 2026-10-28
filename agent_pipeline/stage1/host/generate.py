@@ -19,7 +19,9 @@ host's build outputs (``tools/bootstrap-kcov-env.py`` env directory and the
 * ``stage1.json`` (service config), ``collector.json`` (host command
   config) and ``generated.json`` (every digest, for the record).
 * with a ``stage2`` section (#81 D17), the Stage 2 syz-manager config of
-  each variant (``stage2-manager.json``) and its frozen lane template.
+  each variant (``stage2-manager.json``) and its frozen lane template; with
+  ``stage2.backend``, also ``Stage1Config.stage2`` and ``nfs_proxy`` and
+  the judge profiles they name (#81 D16).
 
 Generation checks the cross-record rules the service enforces later, so a
 wrong spec fails here and not in the middle of a run.
@@ -48,7 +50,7 @@ from ...admission_generation import (AdmissionProfileSource,
 from ...artifacts import ArtifactStore
 from ...contracts import (PIPELINE_GAP_IDS, CampaignMode, GapRef, HarnessBinding,
                           JobPolicy, JudgeVersions, Sanitizer, Sha256)
-from ...data import canonical_json, put_record
+from ...data import canonical_json, load_record, put_record
 from ...hcap import (STAGE1_LAYOUT, AuthorityRef, Capability, ExecutionLayout,
                       GapContract, HcapCatalog, RuntimeSelection,
                       calls_in_layout, layout_refusals)
@@ -63,7 +65,10 @@ from ...q1 import (KernelIdentity, Q1AdmissibilityProfile,
 from ...qemu_accel import Accel, AccelChoice, resolve, slowdown
 from ...qemu_accel import qemu_args as accel_qemu_args
 from ...registry import HarnessCatalog, HarnessRegistration
-from ..config import EngineConfig, SlotsConfig, Stage1Config
+from ...m1 import M1JudgeProfile
+from ...q2 import default_q2_profile
+from ...semantic_replay import ReplayJudgeProfile
+from ..config import EngineConfig, SlotsConfig, Stage1Config, Stage2Config
 from .collector import CollectorConfig, guest_cmdline
 from .pins import InstrumentationManifest, file_sha256, pin_file
 
@@ -483,6 +488,32 @@ class LaneTopologyEvidence(_Spec):
         return self
 
 
+class Stage2BackendSpec(_Spec):
+    """``stage2.backend``: ``Stage1Config.stage2`` and ``nfs_proxy``, so a
+    ``campaign_mode: mutate`` policy can be generated (#81 D16).  The step
+    command is ``agent_pipeline.stage2.host step`` with the generated
+    manager of each variant."""
+
+    #: The promoted semantic Proxy build: the Rule Compiler's
+    #: ``nfs_proxy`` and the ``--check-rules`` gate's ``replay_proxy``.
+    nfs_proxy: Path
+    #: Left out: ``engine.resource_key``, one KVM fence for both stages.
+    resource_key: str | None = Field(default=None, min_length=1,
+                                     max_length=256)
+    timeout_s: float = Field(default=86_400, gt=0, le=86_400)
+    #: ``step --campaign-executions``.
+    campaign_executions: int = Field(default=128, ge=1, le=192)
+    #: At most ``stage2.nfs_proxy_window``.
+    crash_window_bound: int = Field(default=4, ge=1, le=64)
+    #: CAS digests of other judge profiles.  Left out, generation stores
+    #: the defaults: ``M1JudgeProfile`` m1-default/1,
+    #: ``q2.default_q2_profile()`` and ``ReplayJudgeProfile``
+    #: replay-default/1.
+    m1_profile_ref: Sha256 | None = None
+    q2_profile_ref: Sha256 | None = None
+    replay_profile_ref: Sha256 | None = None
+
+
 class Stage2ManagerSpec(_Spec):
     """``stage2``: the syz-manager config a Stage 2 lease runs (#81 D17).
     Generation writes it from each variant's descriptor, so its kernel,
@@ -506,6 +537,17 @@ class Stage2ManagerSpec(_Spec):
     #: every admitted call and every call a runtime selection enables.
     #: Given, they must include all of them.
     enable_syscalls: tuple[str, ...] | None = None
+    #: Left out: generation writes the managers only, and a mutate policy
+    #: is refused.
+    backend: Stage2BackendSpec | None = None
+
+    @model_validator(mode="after")
+    def _window(self) -> Self:
+        if self.backend is not None and \
+                self.backend.crash_window_bound > self.nfs_proxy_window:
+            raise ValueError("stage2.backend.crash_window_bound exceeds "
+                             "stage2.nfs_proxy_window")
+        return self
 
 
 class EvidenceCarryover(_Spec):
@@ -1196,14 +1238,19 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                               f"the {names} harness")
     mutate = [p.policy_id for p in spec.policies
               if p.campaign_mode is CampaignMode.MUTATE]
-    if mutate:
-        # #81 D16: generation writes no Stage 2 backend, no Proxy for the
-        # Rule Compiler and no promoted semantic registry yet, so a mutate
-        # job could only stop after Q1.
+    backend = spec.stage2.backend if spec.stage2 is not None else None
+    if mutate and backend is None:
+        # #81 D16: without a Stage 2 backend and a Proxy for the Rule
+        # Compiler a mutate job could only stop after Q1.
         raise GenerationError(
             f"policies {mutate} use campaign_mode mutate, which needs a Stage "
-            "2 backend, an nfs_proxy and a promoted semantic subset; this "
-            "generator configures none of them. Use campaign_mode none")
+            "2 backend and an nfs_proxy: give stage2.backend, or use "
+            "campaign_mode none")
+    if backend is not None:
+        nfs_proxy = _resolve(base, backend.nfs_proxy)
+        if not nfs_proxy.is_file() or not os.access(nfs_proxy, os.X_OK):
+            raise GenerationError("stage2.backend.nfs_proxy is not an "
+                                  f"executable file: {nfs_proxy}")
     state.mkdir(parents=True, exist_ok=True)
     store = ArtifactStore(root)
     digests: dict[str, str] = {}
@@ -1608,32 +1655,6 @@ def generate(spec_path: Path, *, python: str = sys.executable,
         staged_files=state / "staged-files",
         accel=accel, exec_slowdown=scale, **timings)
     collector_path.write_text(collector.model_dump_json(indent=2) + "\n")
-    config = Stage1Config(
-        state_dir=state, artifact_root=root, kernel_repo=kernel_repo,
-        harness_catalog_ref=catalog_ref,
-        execution_harness_approvals=tuple(r[2] for r in results.values()),
-        syzkaller_bundle=bundle, syzkaller_identity=identity,
-        policies=spec.policies,
-        # Each binding's HCAP names its own Q1 authorities; this default
-        # is the first variant's.
-        judge_versions=JudgeVersions(judge_profile_id=judge_profile_ref,
-                                     support_boundary_id=first[4]),
-        engine=EngineConfig(
-            argv=(python, "-m", "agent_pipeline.stage1.host", "collect",
-                  "--config", str(collector_path), "{input}", "{output}"),
-            cwd=REPO, env={"LANG": "C.UTF-8",
-                           "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                           "HOME": os.environ.get("HOME", str(state))},
-            resource_key=spec.engine.resource_key,
-            collector_id="stage1-host-collector",
-            timeout_s=spec.engine.timeout_s * scale,
-            max_output_bytes=spec.engine.max_output_bytes),
-        slots=SlotsConfig(
-            vm_cpus=spec.collector.cpus,
-            vm_memory_mb=spec.collector.memory_mb,
-            reserve_cpus=spec.engine.reserve_cpus,
-            reserve_memory_mb=spec.engine.reserve_memory_mb,
-            max_slots=spec.engine.max_slots))
     managers: dict[Sanitizer, Path] = {}
     if spec.stage2 is not None:
         # A frozen copy of the pinned lane script is the manager's lane
@@ -1663,6 +1684,70 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             managers[v.sanitizer] = state / name
             digests[key(v, "stage2_manager")] = \
                 hashlib.sha256(data).hexdigest()
+    command_env = {"LANG": "C.UTF-8",
+                   "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                   "HOME": os.environ.get("HOME", str(state))}
+    stage2_config = None
+    if backend is not None:
+        if several:
+            chosen = [arg for sanitizer, path in sorted(
+                          managers.items(), key=lambda m: m[0].value)
+                      for arg in ("--variant-manager",
+                                  f"{sanitizer.value}={path}")]
+        else:
+            chosen = ["--manager", str(managers[variants[0].sanitizer])]
+        profiles = {}
+        for name, given, default in (
+                ("m1", backend.m1_profile_ref,
+                 M1JudgeProfile(name="m1-default", revision="1")),
+                ("q2", backend.q2_profile_ref, default_q2_profile()),
+                ("replay", backend.replay_profile_ref,
+                 ReplayJudgeProfile(name="replay-default", revision="1"))):
+            if given is None:
+                given = put_record(store, default)
+            else:
+                try:
+                    load_record(store, given, type(default))
+                except (OSError, ValueError) as exc:
+                    raise GenerationError(
+                        f"stage2.backend.{name}_profile_ref: {exc}") from exc
+            profiles[f"{name}_profile_ref"] = given
+            digests[f"stage2_{name}_profile"] = given
+        stage2_config = Stage2Config(
+            argv=(python, "-m", "agent_pipeline.stage2.host", "step",
+                  *chosen, "--collector", str(collector_path),
+                  "--campaign-executions", str(backend.campaign_executions),
+                  "{input}", "{output}"),
+            cwd=REPO, env=command_env,
+            resource_key=backend.resource_key or spec.engine.resource_key,
+            timeout_s=backend.timeout_s, replay_proxy=nfs_proxy,
+            crash_window_bound=backend.crash_window_bound, **profiles)
+    config = Stage1Config(
+        state_dir=state, artifact_root=root, kernel_repo=kernel_repo,
+        harness_catalog_ref=catalog_ref,
+        execution_harness_approvals=tuple(r[2] for r in results.values()),
+        syzkaller_bundle=bundle, syzkaller_identity=identity,
+        policies=spec.policies,
+        # Each binding's HCAP names its own Q1 authorities; this default
+        # is the first variant's.
+        judge_versions=JudgeVersions(judge_profile_id=judge_profile_ref,
+                                     support_boundary_id=first[4]),
+        engine=EngineConfig(
+            argv=(python, "-m", "agent_pipeline.stage1.host", "collect",
+                  "--config", str(collector_path), "{input}", "{output}"),
+            cwd=REPO, env=command_env,
+            resource_key=spec.engine.resource_key,
+            collector_id="stage1-host-collector",
+            timeout_s=spec.engine.timeout_s * scale,
+            max_output_bytes=spec.engine.max_output_bytes),
+        slots=SlotsConfig(
+            vm_cpus=spec.collector.cpus,
+            vm_memory_mb=spec.collector.memory_mb,
+            reserve_cpus=spec.engine.reserve_cpus,
+            reserve_memory_mb=spec.engine.reserve_memory_mb,
+            max_slots=spec.engine.max_slots),
+        nfs_proxy=nfs_proxy if backend is not None else None,
+        stage2=stage2_config)
     if spec.generation is not None and staged is None:
         config = config.model_copy(update={"generation": _generation(
             spec, spec_path, state, collector_path, bundle, python)})
