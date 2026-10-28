@@ -67,6 +67,9 @@ from ...qemu_accel import qemu_args as accel_qemu_args
 from ...registry import HarnessCatalog, HarnessRegistration
 from ...m1 import M1JudgeProfile
 from ...q2 import default_q2_profile
+from ...semantic_promotion import DEFAULT_CAPABILITY_ID as SEMANTIC_CAPABILITY_ID
+from ...semantic_promotion import (PromotedSemanticCapabilityRegistry,
+                                   with_semantic_capability)
 from ...semantic_replay import ReplayJudgeProfile
 from ..config import EngineConfig, SlotsConfig, Stage1Config, Stage2Config
 from .collector import CollectorConfig, guest_cmdline
@@ -512,6 +515,12 @@ class Stage2BackendSpec(_Spec):
     m1_profile_ref: Sha256 | None = None
     q2_profile_ref: Sha256 | None = None
     replay_profile_ref: Sha256 | None = None
+    #: CAS digest of a ``PromotedSemanticCapabilityRegistry`` the M7 gate
+    #: (``semantic_promotion promote``) wrote for ``nfs_proxy``.  Every
+    #: variant's HCAP then carries it as HCAP-10, the promoted semantic
+    #: subset a mutate job compiles against.  Left out, the HCAP has no
+    #: HCAP-10 and the Stage 2 preflight is not ready.
+    semantic_registry: Sha256 | None = None
 
 
 class Stage2ManagerSpec(_Spec):
@@ -1138,6 +1147,33 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
     }
 
 
+def _semantic_registry(spec: HostSpec, store: ArtifactStore, ref: str,
+                       nfs_proxy: Path
+                       ) -> tuple[str, PromotedSemanticCapabilityRegistry]:
+    """``stage2.backend.semantic_registry``: a promoted registry of the
+    backend's Proxy build, with no subset pending (a pinned registry
+    belongs to a staged revision, 03-nfs-proxy/06 §30)."""
+    try:
+        promoted = load_record(store, ref, PromotedSemanticCapabilityRegistry)
+    except (OSError, ValueError) as exc:
+        raise GenerationError(
+            f"stage2.backend.semantic_registry: {exc}") from exc
+    if promoted.pending:
+        raise GenerationError(
+            "stage2.backend.semantic_registry pins "
+            f"{', '.join(promoted.pending)} with crash survival pending; "
+            "only a promoted registry may be shared")
+    if promoted.proxy_sha256 != file_sha256(nfs_proxy):
+        raise GenerationError(
+            "stage2.backend.semantic_registry was promoted for Proxy build "
+            f"{promoted.proxy_sha256[:12]}, not stage2.backend.nfs_proxy")
+    if any(c.id == SEMANTIC_CAPABILITY_ID for c in spec.capabilities):
+        raise GenerationError(
+            f"{SEMANTIC_CAPABILITY_ID} comes from "
+            "stage2.backend.semantic_registry, not from capabilities")
+    return ref, promoted
+
+
 def _generation(spec: HostSpec, spec_path: Path, state: Path,
                 collector_path: Path, bundle: Path, python: str):
     """stage1.json's ``generation`` section and ``validate.json`` (see
@@ -1253,7 +1289,13 @@ def generate(spec_path: Path, *, python: str = sys.executable,
                                   f"executable file: {nfs_proxy}")
     state.mkdir(parents=True, exist_ok=True)
     store = ArtifactStore(root)
+    semantic = None
+    if backend is not None and backend.semantic_registry is not None:
+        semantic = _semantic_registry(spec, store, backend.semantic_registry,
+                                      nfs_proxy)
     digests: dict[str, str] = {}
+    if semantic is not None:
+        digests["stage2_semantic_registry"] = semantic[0]
     several = len(variants) > 1
 
     def key(variant: VariantSpec, name: str) -> str:
@@ -1574,6 +1616,10 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             capabilities=tuple(variant_capabilities),
             missing_capability_ids=missing,
             gap_contracts=spec.gap_contracts)
+        if semantic is not None and not any(
+                c.id == SEMANTIC_CAPABILITY_ID for c in draft.capabilities):
+            # A staged revision keeps its base's HCAP-10 (above).
+            draft = with_semantic_capability(draft, *semantic)
         boundary = RemoteKcovSupportBoundary(
             name=spec.support_boundary.name,
             revision=spec.support_boundary.revision,

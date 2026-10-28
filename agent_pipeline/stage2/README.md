@@ -169,10 +169,19 @@ stored in the CAS; `m1_profile_ref`, `q2_profile_ref` and
 `replay_profile_ref` name other profiles already in the CAS.
 `generated.json` records the three under `stage2_*_profile`.
 
-The promoted semantic subset is not part of the spec. It is HCAP-10 of the
-bound HCAP revision; a rule set no promoted subset covers is a
-`mutation_engine` gap, which Harness Generation fills (07 §5). Run
-`preflight` with each manager before the first mutate job.
+The promoted semantic subset is HCAP-10 of the bound HCAP revision.
+`semantic_registry` is the CAS digest of the `PromotedSemanticCapabilityRegistry`
+that `python -m agent_pipeline.semantic_promotion promote` printed
+(`promoted=REF`, `tools/nfs-proxy/README.md` "Capability registry and
+promotion"), run with `--store` on this spec's `artifact_root`. Generation
+refuses a registry for another Proxy build than `nfs_proxy`, one with a
+subset pinned with crash survival pending (`pin`), and an HCAP-10 among the
+spec's `capabilities`. Every variant's HCAP then carries the registry as
+HCAP-10, and `generated.json` records it under `stage2_semantic_registry`.
+Without it the HCAP has no HCAP-10: the preflight's `authority` check fails
+("has no promoted semantic subset"), and a rule set no promoted subset
+covers is a `mutation_engine` gap, which Harness Generation fills (07 §5).
+Run `preflight` with each manager before the first mutate job.
 
 ### Validated layouts (#99)
 
