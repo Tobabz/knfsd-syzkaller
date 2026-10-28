@@ -147,7 +147,9 @@ selection capability(HCAP-04)의 배치를 넘지 못한다. 그 `procs`를 덮�
 enable하지 않으며, 조용히 빼지도 않는다. host spec이 `stage2.enable_syscalls`에서 그 call을 이름으로 빼지 않았으면
 generation이 거부한다. 빠진 call은 candidate program에서도 잘려 나가기 때문이다(pinned syzkaller가 비활성 call을
 seed에서 지운다). `stage2.procs`를 비워 두면 모든 admitted call이 enable되는 가장 큰 `procs`를 쓴다. 지금 HCAP-11,
-HCAP-13, HCAP-14는 lane 0에서만 검증됐으므로 template과 live spec은 `procs=1`이다(#124 검토). 사람이 만든
+HCAP-13, HCAP-14는 lane 0에서만 검증됐으므로 template과 live spec은 `procs=1`이다(#124 검토). Stage 2 KVM
+단계도 candidate program의 call이 manager의 `enable_syscalls` 밖에 있으면 campaign을 시작하지 않는다. 그래서
+spec이 이름으로 뺀 call을 쓰는 program도 잘린 채로 fuzz되지 않는다. 사람이 만든
 capability와 생성된 capability에 똑같이 적용한다.
 
 `usable_stage`는 capability가 기능상 어느 stage에 속하는지를, `usable_by`는 누가 그것을 쓸 수 있는지를

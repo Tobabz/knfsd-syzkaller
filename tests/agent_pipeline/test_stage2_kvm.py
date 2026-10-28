@@ -32,7 +32,7 @@ from agent_pipeline.stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
 from agent_pipeline.stage2.kvm import (
     ARTIFACT_SEAL_RESERVE_S, EVIDENCE_SEAL_RESERVE_S,
     MANAGER_SIGNAL_TIMEOUT_S, MAX_JOURNAL_CHANNELS, NfsProxyExecution,
-    Stage2StepError, _Artifact,
+    Stage2StepError, _Artifact, _check_program_calls,
     _barrier_generation, _campaign_records, _corpus, _correlated,
     _closed_evidence_channels, _JournalChannels, _journal_artifacts,
     _journal_lane_count, _lane_template,
@@ -158,6 +158,22 @@ def test_runtime_rejects_manager_outside_harness_validated_layout(tmp_path):
     manager["procs"] = 2
     with pytest.raises(Stage2StepError, match="validated layout"):
         _validate_runtime_authority(root, harness, world.descriptor, manager)
+
+
+def test_every_candidate_program_call_is_enabled():
+    """syz-manager drops a disabled call from the seed without a word
+    (#99): the step refuses instead."""
+    program = (b"r0 = openat$lane(0xffffffffffffff9c, 0x0, 0x0, 0x0)\n"
+               b"# a comment\n"
+               b"read$extra(r0, 0x0, 0x0)\n"
+               b"close(r0)\n")
+    _check_program_calls(program, {"enable_syscalls": [
+        "close", "openat$lane", "read$extra"]})
+    _check_program_calls(program, {})       # every call enabled
+    with pytest.raises(Stage2StepError,
+                       match="leaves out candidate program calls: read\\$extra$"):
+        _check_program_calls(program, {"enable_syscalls": [
+            "close", "openat$lane"]})
 
 
 @pytest.mark.parametrize("name", ["hcap.json", "admission.json"])

@@ -51,7 +51,7 @@ from ..stage1.host.generate import (LANE_TOPOLOGY_CAPABILITIES,
                                     LANE_TOPOLOGY_MIN_EXECUTIONS,
                                     LANE_TOPOLOGY_PROGRAM_SHA256,
                                     LaneTopologyEvidence)
-from .kvm import (_CRASH, NfsProxyExecution, Stage2StepError,
+from .kvm import (_CRASH, NfsProxyExecution, Stage2StepError, program_calls,
                   _corpus, _crash_files, _JournalChannels, _lane_template,
                   _manager_assets, _manager_cmdline, _manager_qemu_args,
                   _spool, _stop_manager)
@@ -62,20 +62,6 @@ DEFAULT_PROGRAM = (Path(__file__).resolve().parents[2] / "tools" /
 SHAREABLE_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
 POLL_S = 1.0
 MANAGER_STOP_TIMEOUT_S = 45.0
-
-
-def program_calls(program: bytes) -> list[str]:
-    """The calls a syz program names, in order of first use: the manager
-    enables exactly these, so the campaign stays lane I/O."""
-    calls: list[str] = []
-    for line in program.decode().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        call = line.split("(", 1)[0].split("=")[-1].strip()
-        if call not in calls:
-            calls.append(call)
-    return calls
 
 
 def _selection(descriptor: ExecutionHarnessDescriptor, cmdline: str):
