@@ -29,7 +29,7 @@ from agent_pipeline.stage2.host import (
     KVM_API_VERSION, PreflightError, _ApprovedHarness, _Checks,
     _check_accel, _check_command, _check_kernel_repo, _check_kvm,
     _check_manager, _check_policies, _check_runtime, _check_stage2_timeout,
-    _shared_registry, _verify_pins_read_only, preflight,
+    _shared_registry, _verify_pins_read_only, preflight, unpromoted,
 )
 from agent_pipeline.stage2.kvm import stage2_timeout_budget
 
@@ -425,8 +425,8 @@ def test_promoted_runtime_must_match_every_harness():
         _check_runtime(Path("/proxy"), (promoted,), reader=lambda _: other)
 
 
-def test_a_shared_binding_takes_no_pending_subset(tmp_path):
-    # 03-nfs-proxy/06 §30: a staged pin is only a staged revision's.
+def test_a_shared_binding_takes_a_pending_subset_and_warns(tmp_path):
+    # #144: a staged pin runs; the preflight warns instead of refusing.
     store = ArtifactStore(tmp_path / "cas")
     _, promoted = _build()
 
@@ -435,13 +435,15 @@ def test_a_shared_binding_takes_no_pending_subset(tmp_path):
             HcapCatalog(capabilities=(), missing_capability_ids=()), put_record(store, registry), registry)
 
     assert _shared_registry(store, hcap(promoted), "a" * 64) == promoted
+    assert unpromoted(promoted, "a" * 64) is None
     pending = promoted.model_copy(update={"subsets": tuple(
         s.model_copy(update={"crash_survival": "pending"})
         for s in promoted.subsets)})
-    with pytest.raises(PreflightError, match="crash survival pending"):
-        _shared_registry(store, hcap(pending), "a" * 64)
-    with pytest.raises(PreflightError, match="no promoted semantic subset"):
-        _shared_registry(store, HcapCatalog(capabilities=(), missing_capability_ids=()), "a" * 64)
+    assert _shared_registry(store, hcap(pending), "a" * 64) == pending
+    assert "crash survival pending" in unpromoted(pending, "a" * 64)
+    bare = HcapCatalog(capabilities=(), missing_capability_ids=())
+    assert _shared_registry(store, bare, "a" * 64) is None
+    assert "no promoted semantic subset" in unpromoted(None, "a" * 64)
 
 
 def test_a_shared_binding_takes_a_subset_promoted_on_the_durability_check(

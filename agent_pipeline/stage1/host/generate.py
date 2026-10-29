@@ -1160,19 +1160,14 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
 def _semantic_registry(spec: HostSpec, store: ArtifactStore, ref: str,
                        nfs_proxy: Path
                        ) -> tuple[str, PromotedSemanticCapabilityRegistry]:
-    """``stage2.backend.semantic_registry``: a promoted registry of the
-    backend's Proxy build, with no subset pending (a pinned registry
-    belongs to a staged revision, 03-nfs-proxy/06 §30)."""
+    """``stage2.backend.semantic_registry``: a registry of the backend's
+    Proxy build.  A subset pinned with crash survival pending is carried
+    as such; the preflight warns (#144)."""
     try:
         promoted = load_record(store, ref, PromotedSemanticCapabilityRegistry)
     except (OSError, ValueError) as exc:
         raise GenerationError(
             f"stage2.backend.semantic_registry: {exc}") from exc
-    if promoted.pending:
-        raise GenerationError(
-            "stage2.backend.semantic_registry pins "
-            f"{', '.join(promoted.pending)} with crash survival pending; "
-            "only a promoted registry may be shared")
     if promoted.proxy_sha256 != file_sha256(nfs_proxy):
         raise GenerationError(
             "stage2.backend.semantic_registry was promoted for Proxy build "

@@ -263,25 +263,30 @@ def _stage2_fixtures(selections) -> frozenset[tuple[str, str]]:
 
 
 def _shared_registry(store: ArtifactStore, hcap: HcapCatalog,
-                     revision: str) -> PromotedSemanticCapabilityRegistry:
-    """The promoted registry a configured (shared) binding's HCAP pins.  A
-    subset pinned with crash survival pending stays in its staged revision
-    (03-nfs-proxy/06 §30)."""
-    registry = promoted_registry(store, hcap)
+                     revision: str) -> PromotedSemanticCapabilityRegistry | None:
+    """The semantic registry a configured (shared) binding's HCAP pins, or
+    None when it pins none.  A subset pinned with crash survival pending is
+    still used: ``unpromoted`` names what a binding lacks (#144)."""
+    return promoted_registry(store, hcap)
+
+
+def unpromoted(registry: PromotedSemanticCapabilityRegistry | None,
+               revision: str) -> str | None:
+    """What a shared binding runs without promotion, for the preflight's
+    warning; None when its subsets are all promoted."""
     if registry is None:
-        raise PreflightError(
-            f"HCAP {revision[:12]} has no promoted semantic subset")
+        return (f"HCAP {revision[:12]} pins no promoted semantic subset: "
+                "no rule set is compiled for it")
     if registry.pending:
-        raise PreflightError(
-            f"HCAP {revision[:12]} pins {', '.join(registry.pending)} with "
-            "crash survival pending; only a staged revision may")
-    return registry
+        return (f"HCAP {revision[:12]} pins {', '.join(registry.pending)} "
+                "with crash survival pending: not promoted")
+    return None
 
 
 def _check_harnesses(
     store: ArtifactStore, config: Stage1Config, collector: CollectorConfig,
 ) -> tuple[tuple[PromotedSemanticCapabilityRegistry, ...],
-           tuple[_ApprovedHarness, ...]]:
+           tuple[_ApprovedHarness, ...], tuple[str, ...]]:
     approvals = [load_record(store, ref, ExecutionHarnessApproval)
                  for ref in config.execution_harness_approvals]
     by_descriptor = {descriptor_id(item.descriptor): item
@@ -293,6 +298,7 @@ def _check_harnesses(
         raise PreflightError("harness catalog has no registrations")
     checker = ArtifactHcapChecker(store)
     promoted: list[PromotedSemanticCapabilityRegistry] = []
+    notes: list[str] = []
     harnesses: list[_ApprovedHarness] = []
     checked_descriptors: set[str] = set()
     authorities: dict[str, list[tuple[HcapCatalog, CallAdmissionProfile]]] = {}
@@ -309,7 +315,12 @@ def _check_harnesses(
         if binding.hcap_revision not in approval.approved_hcap_revisions:
             raise PreflightError("harness binding uses an unapproved HCAP")
         hcap = checker.load_catalog(binding.hcap_revision)
-        promoted.append(_shared_registry(store, hcap, binding.hcap_revision))
+        registry = _shared_registry(store, hcap, binding.hcap_revision)
+        if registry is not None:
+            promoted.append(registry)
+        note = unpromoted(registry, binding.hcap_revision)
+        if note is not None:
+            notes.append(note)
         profiles = [ref.artifact_ref for ref in (
             *hcap.authority_refs,
             *(ref for cap in hcap.capabilities for ref in cap.authority_refs))
@@ -331,7 +342,7 @@ def _check_harnesses(
                 "Stage 2 harness requires nokaslr and nfs.localio_enabled=N")
     return tuple(promoted), tuple(
         replace(harness, authorities=tuple(authorities[harness.harness_id]))
-        for harness in harnesses)
+        for harness in harnesses), tuple(notes)
 
 
 def _check_layout(value: dict, procs: int,
@@ -690,6 +701,7 @@ def preflight(
 
     promoted: tuple[PromotedSemanticCapabilityRegistry, ...] = ()
     harnesses: tuple[_ApprovedHarness, ...] = ()
+    notes: tuple[str, ...] = ()
     try:
         if not config.artifact_root.is_dir():
             raise PreflightError(f"artifact root is absent: {config.artifact_root}")
@@ -698,12 +710,15 @@ def preflight(
                 f"collector artifact root is absent: {collector.artifact_root}")
         store = ArtifactStore(config.artifact_root)
         _check_profiles(store, stage2)
-        promoted, harnesses = _check_harnesses(store, config, collector)
+        promoted, harnesses, notes = _check_harnesses(
+            store, config, collector)
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         checks.add("authority", "error", f"{type(exc).__name__}: {exc}")
     else:
         checks.add("authority", "pass",
                    f"{len(promoted)} harness binding(s), profiles and pins verified")
+        if notes:
+            checks.add("unpromoted_semantic", "warning", "; ".join(notes)[:1024])
 
     compiler_build: BuildRegistry | None = None
     replay_build: BuildRegistry | None = None
