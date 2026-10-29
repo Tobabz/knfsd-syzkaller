@@ -574,6 +574,11 @@ class CampaignSegment(Record):
     hypothesis_inconclusive: int = Field(ge=0)
     attribution_quality: Literal["exact", "campaign", "ambiguous", "none"] = "none"
     attribution_warnings: tuple[str, ...] = ()
+    #: ``inconclusive_mapping``: the host had no target-PC mapping for the
+    #: bound kernel, so no generation was judged reached; the counts above
+    #: are zero and mean nothing about the target (#136).
+    m1_status: Literal["evaluated", "inconclusive_mapping"] = Field(
+        default="evaluated", exclude_if=lambda value: value == "evaluated")
 
 
 class ReplayOutcome(Record):

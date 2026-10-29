@@ -1819,7 +1819,9 @@ class Machine:
                 t.hypothesis_not_applied + seg.hypothesis_not_applied,
             "hypothesis_inconclusive":
                 t.hypothesis_inconclusive + seg.hypothesis_inconclusive,
-            "applied_crashes": t.applied_crashes + int(applied)})
+            "applied_crashes": t.applied_crashes + int(applied),
+            "m1_unevaluated": t.m1_unevaluated + int(
+                seg.m1_status == "inconclusive_mapping")})
         j.campaign = j.campaign.model_copy(update={"tally": t})
         # 09 §6: a continued campaign that seals a bundle ends the reruns.
         j.counters = j.counters.model_copy(update={"runtime_retry": 0})

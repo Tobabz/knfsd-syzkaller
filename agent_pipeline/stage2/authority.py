@@ -383,7 +383,10 @@ class Stage2AuthorityPublisher:
                 "nokaslr and name the vmlinux and instrumentation artifacts")
         target = candidate_target(snapshot.candidate)
         mapping_ref = self.mappings.lookup(target, identity)
-        if mapping_ref is None:
+        if mapping_ref is None and task_input.step == "gate":
+            # Only the gate's Q1 needs the mapping.  A campaign still
+            # judges its crash (Q2) and a replay its journals without one
+            # (#136); the campaign's M1 is then inconclusive_mapping.
             raise Q1AuthorityPending("no verified target mapping is registered")
 
         q1 = q2 = None
@@ -407,6 +410,8 @@ class Stage2AuthorityPublisher:
                      "replay input names another crash than its dispatch")
         p = self.profiles
         execution = Stage2Execution(
+            schema_version=("stage2-execution.v1" if mapping_ref is not None
+                            else "stage2-execution.v2"),
             bundle_ref=fact.bundle_ref, step=task_input.step, index=fact.index,
             lease_generation=fact.generation, correlation=receipt.correlation,
             candidate=target, compiled=d.compiled, identity=identity,

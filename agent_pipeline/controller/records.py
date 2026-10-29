@@ -258,6 +258,9 @@ class CampaignTally(Record):
     hypothesis_inconclusive: int = 0
     #: Q2 OBSERVED segments with an APPLIED rule in their window.
     applied_crashes: int = 0
+    #: Segments whose M1 was inconclusive for want of a target mapping.
+    m1_unevaluated: int = Field(default=0, ge=0,
+                                exclude_if=lambda value: value == 0)
 
 
 class Campaign(Record):

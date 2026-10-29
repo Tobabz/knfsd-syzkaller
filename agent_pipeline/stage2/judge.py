@@ -99,7 +99,8 @@ class Stage2Execution(Record):
     was published, so a replay of the job reads the same ones."""
 
     model_config = ConfigDict(strict=True, revalidate_instances="always")
-    schema_version: Literal["stage2-execution.v1"] = "stage2-execution.v1"
+    schema_version: Literal["stage2-execution.v1", "stage2-execution.v2"] = \
+        "stage2-execution.v1"
     bundle_ref: Sha256
     step: Literal["gate", "campaign", "replay"]
     index: int = Field(ge=0)
@@ -108,7 +109,9 @@ class Stage2Execution(Record):
     candidate: CandidateTarget
     compiled: CompiledRuleSet
     identity: KernelIdentity
-    mapping_ref: Sha256
+    #: None (``stage2-execution.v2``) for a campaign or replay published
+    #: before the host registered a mapping for the kernel (#136).
+    mapping_ref: Sha256 | None = None
     program_ref: Sha256
     plan_ref: Sha256 | None = None
     q1: TrustedQ1Execution | None = None
@@ -241,8 +244,10 @@ class ArtifactStage2Judge:
         return load_record(self.artifacts, x.m1_profile_ref, M1JudgeProfile)
 
     def _target_pcs(self, x: Stage2Execution) -> frozenset[int]:
+        if x.mapping_ref is None:
+            raise ValueError("no target mapping was published")
         mapping = load_record(self.artifacts, x.mapping_ref, TargetPcMapping)
-        if not mapping.verified or mapping.identity != x.identity or \
+        if not mapping.verified or not mapping.identity.same_kernel(x.identity) or \
                 mapping.target != x.candidate:
             raise ValueError("target mapping does not fit this execution")
         return frozenset(mapping.target_pcs)
@@ -645,16 +650,29 @@ class ArtifactStage2Judge:
             ev = self._open(x, stack)
             executions = ev.facts.campaign.executions
             m1_rules, _, _ = self._rule_set(x)
-            counts, generation_ids = self._generation_counts(x, ev, m1_rules)
+            # Without a mapping no generation can be judged reached; the
+            # crash window and Q2 do not read one.
+            unmapped = x.mapping_ref is None
+            if unmapped:
+                counts, generation_ids = dict(
+                    reached_generations=0, hypothesis_applied=0,
+                    hypothesis_not_applied=0, hypothesis_inconclusive=0), []
+            else:
+                counts, generation_ids = self._generation_counts(
+                    x, ev, m1_rules)
             applied: tuple[str, ...] = ()
             window_id = None
             if q2.status is Q2Status.OBSERVED:
                 applied, window_id = self._crash_window(x, ev, m1_rules)
             return CampaignSegment(
                 **fields, executions=executions,
-                m1_verdict_id=_lineage(kind="campaign_m1", window=window_id,
-                                       generations=generation_ids),
-                crash_window_applied=applied, **counts)
+                m1_verdict_id=_lineage(
+                    kind="campaign_m1_unmapped" if unmapped
+                    else "campaign_m1", window=window_id,
+                    generations=generation_ids),
+                crash_window_applied=applied,
+                m1_status="inconclusive_mapping" if unmapped else "evaluated",
+                **counts)
         except OSError:
             raise
         except _INVALID as exc:

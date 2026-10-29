@@ -78,7 +78,7 @@ def in_campaign(w) -> str:
 
 def segment(w, job_id, q2="not_observed", applied=(), executions=10,
             reached_gens=10, h_applied=0, h_not=0, h_inc=0, task_id=None,
-            name=None, poll=True) -> str:
+            name=None, poll=True, m1_status="evaluated") -> str:
     """Seal one campaign bundle on the running (or given) task."""
     task_id = task_id or pending(w, job_id).task_id
     name = name or f"seg-{task_id}-{len(w.runner.tasks[task_id]['bundles'])}"
@@ -86,7 +86,7 @@ def segment(w, job_id, q2="not_observed", applied=(), executions=10,
         q2_status=q2, crash_window_applied=tuple(applied),
         executions=executions, reached_generations=reached_gens,
         hypothesis_applied=h_applied, hypothesis_not_applied=h_not,
-        hypothesis_inconclusive=h_inc)
+        hypothesis_inconclusive=h_inc, m1_status=m1_status)
     w.runner.seal(task_id, name)
     if poll:
         w.c.poll()
@@ -479,6 +479,28 @@ def test_campaign_thresholds(make_world, kw, policy, state, reason):
         segment(w, job_id, **kw)
         assert w.job(job_id).state is JobState.S2_CAMPAIGN
     same(w, job_id)
+
+
+def test_a_campaign_without_a_mapping_counts_no_target_miss(world):
+    # #136: M1 is inconclusive_mapping; nothing counts as reached or missed,
+    # and the tally says how many segments were not evaluated.
+    job_id = in_campaign(world)
+    segment(world, job_id, executions=10, reached_gens=0,
+            m1_status="inconclusive_mapping")
+    segment(world, job_id, executions=10, reached_gens=3, h_not=3)
+    j = world.job(job_id)
+    tally = j.campaign.tally
+    assert (tally.segments, tally.m1_unevaluated) == (2, 1)
+    assert (tally.reached_generations, tally.hypothesis_not_applied) == (3, 3)
+    assert j.state is JobState.S2_CAMPAIGN
+    same(world, job_id)
+
+
+def test_an_unmapped_campaign_crash_still_replays(world):
+    job_id = in_campaign(world)
+    segment(world, job_id, q2="observed", applied=("r000",), reached_gens=0,
+            m1_status="inconclusive_mapping")
+    assert world.job(job_id).state is JobState.S2_REPLAYING
 
 
 def test_ended_unsealed_campaign_continues_and_a_seal_resets(make_world):

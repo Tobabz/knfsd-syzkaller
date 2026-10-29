@@ -196,14 +196,27 @@ def test_matching_correlation_cannot_override_host_build(sample):
     ("instrumentation_sha256", digest("other-patches")),
     ("vmlinux_sha256", digest("other-vmlinux")), ("kaslr_enabled", True),
 ])
-@pytest.mark.parametrize("location", ["observation", "mapping"])
-def test_build_mapping_and_observation_bind_all_identity_fields(sample, field, value, location):
+def test_observation_binds_all_identity_fields(sample, field, value):
     identity = replace(sample.expected_identity, **{field: value})
-    if location == "observation":
-        data = observe(sample, identity=identity)
-    else:
-        data = replace(sample, mapping=replace(sample.mapping, identity=identity))
-    expect_unknown(data, "evidence")
+    expect_unknown(observe(sample, identity=identity), "evidence")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("kernel_commit", "b" * 40),
+    ("instrumentation_sha256", digest("other-patches")),
+    ("vmlinux_sha256", digest("other-vmlinux")), ("kaslr_enabled", True),
+])
+def test_mapping_binds_the_kernel_it_was_built_for(sample, field, value):
+    identity = replace(sample.expected_identity, **{field: value})
+    expect_unknown(replace(sample, mapping=replace(sample.mapping, identity=identity)),
+                   "evidence")
+
+
+def test_mapping_survives_a_changed_execution_harness(sample):
+    # #136: an image, lane script or executor change does not move a target PC.
+    identity = replace(sample.expected_identity, execution_harness_id=digest("other-harness"))
+    data = replace(sample, mapping=replace(sample.mapping, identity=identity))
+    assert evaluate(data).status is Q1Status.REACHED
 
 
 def test_kaslr_mapping_must_match_verified_runtime_offset(sample):
