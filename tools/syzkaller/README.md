@@ -46,8 +46,8 @@ replacement, stream/time limits, large allocations, and conservative NFS facts.
 `docs/design/02-llm-agent/07-harness-gap-issue.md` §5.3) with the same
 target. The request (`syz-generate-request.v1`) names the enabled calls
 (the HCAP's admission profile), the contract's entry syz calls, a seed and
-counts. The answer holds, per entry call, minimal programs that end in that
-call with the constructors of its resources before it, and distinct
+counts. The answer holds, per entry call, minimal programs with the
+constructors of its resources and any required protocol response barrier, and distinct
 programs generated from them and mutated with `prog.Mutate` over the
 enabled calls; a mutation that lost every entry call is dropped and
 counted. One seed gives one answer for one bridge build. An entry call

@@ -183,6 +183,56 @@
         "stage1-host-live/live-bind-race.syz",
         "stage1-host-live/live-bind-race64p.syz"
       ]
+    },
+    {
+      "id": "HCAP-15",
+      "name": "live NFSv4.1 session RECLAIM_COMPLETE",
+      "purpose": "Drive SEQUENCE followed by RECLAIM_COMPLETE on a live NFSv4.1 session created by the program on the client0 lane transport",
+      "usable_stage": [
+        "stage1"
+      ],
+      "usable_by": [
+        "agent_stage1"
+      ],
+      "interface": {
+        "syz_calls": [
+          "recvfrom$nfs41_reclaim_complete",
+          "write$nfs41_reclaim_complete"
+        ]
+      },
+      "constraints": [
+        "requires the exact contiguous open, connect, EXCHANGE_ID write/read, CREATE_SESSION write/read and RECLAIM_COMPLETE write/read chain on the same client0 knfsd-v41 TCP transport; reply resources provide the client ID, sequence ID and session ID consumed by later requests",
+        "EXCHANGE_ID, CREATE_SESSION and RECLAIM_COMPLETE use the same fixed AUTH_SYS principal with empty machine name, uid 0, gid 0 and no supplementary groups",
+        "EXCHANGE_ID and CREATE_SESSION flags are zero; both CREATE_SESSION channels use headerpad 0, request and response size 4096, cached response size 0, maxops 8, maxreqs 4 and no RDMA attributes",
+        "the typed call emits a two-operation NFSv4.1 COMPOUND with SEQUENCE first and RECLAIM_COMPLETE second; sequence ID 1, slot 0, highest slot 0 and cachethis false are protocol-fixed",
+        "all three request writes are no-squash typed structures, and generated, parsed and mutated programs must preserve these bootstrap conditions; the final typed receive is the response and remote-coverage barrier",
+        "direct knfsd endpoint; the socket resource must originate from nfs-profile:knfsd-v41:client0",
+        "this capability establishes live-session RECLAIM_COMPLETE reachability and does not claim a crash outcome"
+      ],
+      "status": "experimental",
+      "scope": [
+        "live_reclaim_complete"
+      ],
+      "validated_scope": [],
+      "source_refs": [
+        "bundle/patches/syzkaller/0040-*",
+        "fs/nfsd/nfs4state.c:nfsd4_reclaim_complete"
+      ],
+      "fills_gap": "nfs41.reclaim_complete.session_call",
+      "contract": {
+        "entry_points": [
+          {
+            "kind": "syz_call",
+            "name": "write$nfs41_reclaim_complete"
+          }
+        ],
+        "boundary_functions": [
+          "nfsd4_reclaim_complete"
+        ],
+        "fixed_types": [
+          "rpc_tcp_nfs41_compound2_record_t"
+        ]
+      }
     }
   ],
   "capability_evidence": {
@@ -196,7 +246,9 @@
       "capability-evidence/hcap04-kvm.json"
     ]
   },
-  "missing_capability_ids": [],
+  "missing_capability_ids": [
+    "nfs41.reclaim_complete.session_call"
+  ],
   "admission_source": {
     "schema_version": "call-admission-source.v1",
     "target": "linux/amd64",
@@ -264,6 +316,22 @@
         "call": "recvfrom$nfs41_exchange_id",
         "capability_ids": [
           "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "recvfrom$nfs41_reclaim_complete",
+        "capability_ids": [
+          "HCAP-15"
         ],
         "resource_constraints": [
           {
@@ -350,6 +418,22 @@
         "call": "write$nfs41_exchange_id",
         "capability_ids": [
           "HCAP-14"
+        ],
+        "resource_constraints": [
+          {
+            "kind": "resource_origin",
+            "argument_index": 0,
+            "resource_type": "fd",
+            "allowed_origins": [
+              "nfs-profile:knfsd-v41:client0"
+            ]
+          }
+        ]
+      },
+      {
+        "call": "write$nfs41_reclaim_complete",
+        "capability_ids": [
+          "HCAP-15"
         ],
         "resource_constraints": [
           {
@@ -633,5 +717,24 @@
   "stage2": {
     "procs": 1,
     "nfs_proxy_window": 6
-  }
+  },
+  "gap_contracts": [
+    {
+      "missing_capability_id": "nfs41.reclaim_complete.session_call",
+      "contract": {
+        "entry_points": [
+          {
+            "kind": "syz_call",
+            "name": "write$nfs41_reclaim_complete"
+          }
+        ],
+        "boundary_functions": [
+          "nfsd4_reclaim_complete"
+        ],
+        "fixed_types": [
+          "rpc_tcp_nfs41_compound2_record_t"
+        ]
+      }
+    }
+  ]
 }

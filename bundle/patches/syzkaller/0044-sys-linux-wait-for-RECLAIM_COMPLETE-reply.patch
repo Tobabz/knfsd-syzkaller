@@ -1,0 +1,66 @@
+From 692cedbf506d8f3a8d10180135d5d8db8fbdbb73 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 29 Oct 2026 16:30:00 +0900
+Subject: [PATCH] sys/linux: wait for RECLAIM_COMPLETE reply
+
+---
+ sys/linux/nfs_fuzz_test.go    |  9 +++++++++
+ sys/linux/socket_inet_nfs.txt | 11 +++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 8b0b4de35..d5dfc231d 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -470,6 +470,7 @@ func TestNFSLiveSession(t *testing.T) {
+ 	}{
+ 		{"recvfrom$nfs41_exchange_id", "nfs41_exchange_id_reply", []string{"clientid", "sequenceid"}},
+ 		{"recvfrom$nfs41_create_session", "nfs41_create_session_reply", []string{"sessionid_hi", "sessionid_lo"}},
++		{"recvfrom$nfs41_reclaim_complete", "nfs41_reclaim_complete_reply", nil},
+ 	} {
+ 		st := requireStruct(t, requireNFSFuzzCall(t, target, reply.call), reply.st)
+ 		offsets := map[string]uint64{}
+@@ -489,6 +490,14 @@ func TestNFSLiveSession(t *testing.T) {
+ 			want += requireField(t, st, name).Type.Size()
+ 		}
+ 	}
++	reclaimReply := requireStruct(t, requireNFSFuzzCall(t, target,
++		"recvfrom$nfs41_reclaim_complete"), "nfs41_reclaim_complete_reply")
++	if got := requireField(t, reclaimReply, "sequence_result").Type.Size(); got != 36 {
++		t.Fatalf("RECLAIM_COMPLETE SEQUENCE result is %d bytes, want 36", got)
++	}
++	if got := requireField(t, reclaimReply, "reclaim_status").Type.Size(); got != 4 {
++		t.Fatalf("RECLAIM_COMPLETE status is %d bytes, want 4", got)
++	}
+ 
+ 	const text = `r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)
+ r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index d82f63d73..7de75c184 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -1139,6 +1139,7 @@ write$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_creat
+ recvfrom$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_create_session_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+ write$nfs41_bind_conn_to_session(fd sock_nfs_fuzz_tcp, buf ptr[in, array[rpc_tcp_nfs41_bind_conn_to_session, 1:64]], len bytesize[buf])
+ write$nfs41_reclaim_complete(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_reclaim_complete], len bytesize[buf]) (no_squash)
++recvfrom$nfs41_reclaim_complete(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_reclaim_complete_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+ 
+ type rpc_nfs41_call_t[OPNUM, ARGS] {
+ 	xid		int32be
+@@ -1284,3 +1285,13 @@ nfs41_create_session_reply {
+ 	sessionid_lo	nfs41_sessionid_lo
+ 	rest		array[int8, 256]
+ } [packed]
++
++# A successful SEQUENCE result is 36 bytes. The following operation/status
++# pair is RECLAIM_COMPLETE and doubles as the execution barrier for this RPC.
++nfs41_reclaim_complete_reply {
++	hdr			nfs41_reply_header
++	sequence_result	array[int8, 36]
++	reclaim_opnum	int32be
++	reclaim_status	int32be
++	rest			array[int8, 32]
++} [packed]
+-- 
+2.34.1
+

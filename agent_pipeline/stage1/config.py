@@ -127,7 +127,7 @@ class PromotionCampaignConfig(_Config):
     stage1: Path
     collector: Path | None = None
     campaign: dict[str, int] = Field(default_factory=dict)
-    #: About 40 guest boots.
+    #: About a dozen guest boots, executed concurrently by the host campaign.
     timeout_s: float = Field(default=14_400, gt=0, le=86_400)
 
     @field_validator("argv")

@@ -33,6 +33,14 @@ SignalName = Annotated[
 ConsoleLogCompleteness = Literal["complete", "truncated", "missing"]
 VmTermination = Literal["runner_stopped", "guest_crashed", "lost", "unknown"]
 NoSignalStatus = Literal["not_observed", "inconclusive"]
+AttributionQuality = Literal["exact", "campaign", "ambiguous", "none"]
+
+_LEGACY_ATTRIBUTION_ERRORS = (
+    "crash_before_generation_attributed_campaign_execution",
+    "report_before_generation_attributed_campaign_execution",
+    "uncorrelated_program_results:",
+    "foreign_program_execution:",
+)
 
 
 def _digest(value: object) -> str:
@@ -274,6 +282,8 @@ class Q2Evidence(_Record):
     collection_window: Q2CollectionWindow
     internal_errors: tuple[Text, ...] = ()
     candidate_association: CandidateAssociation | None = None
+    attribution_quality: AttributionQuality = "none"
+    attribution_warnings: tuple[Text, ...] = ()
 
 
 class Q2Input(_Record):
@@ -307,6 +317,8 @@ class Q2Result(_Record):
     signals: tuple[Q2Signal, ...]
     vm_termination: VmTermination
     candidate_association: CandidateAssociation | None = None
+    attribution_quality: AttributionQuality = "none"
+    attribution_warnings: tuple[Text, ...] = ()
 
 
 class Q2Decision(_Record):
@@ -324,6 +336,8 @@ class Q2Decision(_Record):
     signals: tuple[Q2Signal, ...]
     vm_termination: VmTermination
     candidate_association: CandidateAssociation | None
+    attribution_quality: AttributionQuality = "none"
+    attribution_warnings: tuple[Text, ...] = ()
     observations: tuple[Text, ...]
 
     def as_result(self) -> Q2Result:
@@ -337,6 +351,8 @@ class Q2Decision(_Record):
             signals=self.signals,
             vm_termination=self.vm_termination,
             candidate_association=self.candidate_association,
+            attribution_quality=self.attribution_quality,
+            attribution_warnings=self.attribution_warnings,
         )
 
 
@@ -351,6 +367,21 @@ def evaluate(inputs: Q2Input) -> Q2Decision:
 
     data = Q2Input.model_validate(inputs)
     evidence, profile = data.evidence, data.profile
+    integrity_errors = tuple(
+        error for error in evidence.internal_errors
+        if not error.startswith(_LEGACY_ATTRIBUTION_ERRORS))
+    legacy_warnings = tuple(
+        error for error in evidence.internal_errors
+        if error.startswith(_LEGACY_ATTRIBUTION_ERRORS))
+    attribution_warnings = tuple(dict.fromkeys(
+        (*evidence.attribution_warnings, *legacy_warnings)))
+    attribution_quality = evidence.attribution_quality
+    if attribution_quality == "none" and legacy_warnings:
+        attribution_quality = (
+            "ambiguous"
+            if any(item.startswith("foreign_program_execution:")
+                   for item in legacy_warnings)
+            else "campaign")
 
     def decide(status: Q2Status, reason: str | None, diagnostic: str,
                *, signals: tuple[Q2Signal, ...] = ()) -> Q2Decision:
@@ -366,6 +397,8 @@ def evaluate(inputs: Q2Input) -> Q2Decision:
             signals=signals,
             vm_termination=evidence.vm_termination,
             candidate_association=evidence.candidate_association,
+            attribution_quality=attribution_quality,
+            attribution_warnings=attribution_warnings,
             observations=(diagnostic,),
         )
         identity_fields = {
@@ -377,6 +410,8 @@ def evaluate(inputs: Q2Input) -> Q2Decision:
                 evidence.candidate_association.model_dump(mode="json")
                 if evidence.candidate_association is not None else None
             ),
+            "attribution_quality": attribution_quality,
+            "attribution_warnings": attribution_warnings,
         }
         return Q2Decision(verdict_id=_digest(identity_fields), **fields)
 
@@ -385,7 +420,7 @@ def evaluate(inputs: Q2Input) -> Q2Decision:
 
     # 1. Manifest verification, host authority, correlation and consistency.
     report_ids = tuple(item.artifact_identity for item in evidence.manager_crash_reports)
-    if (not data.evidence_verified or evidence.internal_errors
+    if (not data.evidence_verified or integrity_errors
             or evidence.execution_harness_id != data.expected_execution_harness_id
             or evidence.correlation != data.expected_correlation
             or data.expected_correlation.execution_harness_id

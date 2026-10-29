@@ -182,6 +182,20 @@ class ApplyRefusalPayload(_Record):
     rule_id: Visible
 
 
+class ProtocolOperation(_Record):
+    index: Uint32
+    name: Visible
+    opcode: Uint32
+    status: Uint32
+
+
+class NfsCompoundReplyPayload(_Record):
+    correlation: Correlation
+    record_context: RecordContext
+    minor_version: Uint32
+    operations: Annotated[list[ProtocolOperation], Field(min_length=1, max_length=1024)]
+
+
 class ForwardCompletePayload(_Record):
     batch_id: Uint64
     correlation: Correlation
@@ -231,6 +245,7 @@ EVENT_PAYLOADS: dict[str, type[_Record]] = {
     "GENERATION_DRAINING": GenerationDrainingPayload,
     "EXPOSURE_INTENT": ExposureIntentPayload,
     "APPLY_REFUSAL": ApplyRefusalPayload,
+    "NFS_COMPOUND_REPLY": NfsCompoundReplyPayload,
     "FORWARD_COMPLETE": ForwardCompletePayload,
     "FORWARD_FAILED": ForwardFailedPayload,
     "GENERATION_COMPLETE": GenerationCompletePayload,
@@ -243,7 +258,8 @@ class _Envelope(_Record):
     event_seq: Uint64
     event_type: Literal["RULESET", "GENERATION_OPEN", "GENERATION_DRAINING",
                         "EXPOSURE_INTENT", "APPLY_REFUSAL", "FORWARD_COMPLETE",
-                        "FORWARD_FAILED", "GENERATION_COMPLETE", "RUN_COMPLETE"]
+                        "FORWARD_FAILED", "NFS_COMPOUND_REPLY",
+                        "GENERATION_COMPLETE", "RUN_COMPLETE"]
     payload: dict[str, Any]
     proxy_session_id: Annotated[str, Field(min_length=1, max_length=256, pattern=_ID)]
     rule_set_id: Hex64
@@ -459,6 +475,17 @@ def _admit(session: _Session, request: JournalRequest) -> _Verdict:
             assert isinstance(payload, ExposureIntentPayload)
             if payload.batch_id in session.batches:
                 return _refuse("batch_conflict", inconsistent=True)
+        return _accept()
+    if kind == "NFS_COMPOUND_REPLY":
+        assert isinstance(payload, NfsCompoundReplyPayload)
+        ctx = payload.record_context
+        if (ctx.direction, ctx.message_type, ctx.program, ctx.version,
+                ctx.procedure, payload.minor_version) != (
+                    "s2c", "reply", 100003, 4, 1, 1):
+            return _refuse("protocol_context_mismatch")
+        if any(op.index != index
+               for index, op in enumerate(payload.operations)):
+            return _refuse("protocol_operation_order")
         return _accept()
     if kind in ("FORWARD_COMPLETE", "FORWARD_FAILED"):
         batch = session.batches.get(payload.batch_id)  # type: ignore[attr-defined]

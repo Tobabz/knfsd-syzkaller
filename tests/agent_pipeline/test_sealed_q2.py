@@ -138,6 +138,19 @@ def test_sealed_valid_report_is_observed_without_candidate_symbol(tmp_path):
     assert f.judge.matches_execution(f.bundle_ref, job_id="job-1", task_id="task-1")
 
 
+def test_sealed_attribution_warning_is_diagnostic_only(tmp_path):
+    f = setup(
+        tmp_path, reports=(b"BUG: KASAN: slab-out-of-bounds in worker\n",),
+        observation_update={
+            "attribution_quality": "campaign",
+            "attribution_warnings": ("exact_generation_unavailable",),
+        })
+    result = f.judge.judge(f.bundle_ref, f.profile_ref)
+    assert result.status is Q2Status.OBSERVED
+    assert result.attribution_quality == "campaign"
+    assert result.attribution_warnings == ("exact_generation_unavailable",)
+
+
 def test_sealed_complete_no_report_is_not_observed(tmp_path):
     f = setup(tmp_path)
     result = f.judge.judge(f.bundle_ref, f.profile_ref)

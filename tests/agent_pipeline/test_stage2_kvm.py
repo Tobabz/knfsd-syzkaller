@@ -34,10 +34,13 @@ from agent_pipeline.stage2.kvm import (
     MANAGER_SIGNAL_TIMEOUT_S, MAX_JOURNAL_CHANNELS, NfsProxyExecution,
     Stage2StepError, _Artifact, _check_program_calls,
     _barrier_generation, _campaign_records, _corpus, _correlated,
+    _crash_attribution,
     _closed_evidence_channels, _JournalChannels, _journal_artifacts,
     _journal_lane_count, _lane_template,
     _campaign_manager, _campaign_report_state, _CRASH, _KCSAN_REPORT,
+    _foreign_campaign_execution, _manager_command,
     _manager_assets, _manager_cmdline, _manager_path, _manager_qemu_args,
+    _seedless_syzkaller,
     _staged_manager, _evidence_seal_window, _seal_segment, _spool,
     _stop_manager, _validate_runtime_authority, StepOptions,
     stage2_timeout_budget,
@@ -205,6 +208,16 @@ def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):
             collector=tmp_path / "collector.json",
             exec_slowdown=0,
         )
+    assert StepOptions(
+        manager=tmp_path / "manager.json",
+        collector=tmp_path / "collector.json",
+    ).campaign_executions == 96
+    with pytest.raises(ValueError, match="campaign_executions"):
+        StepOptions(
+            manager=tmp_path / "manager.json",
+            collector=tmp_path / "collector.json",
+            campaign_executions=97,
+        )
 
 
 def test_a_lease_runs_the_manager_of_its_variant(tmp_path):
@@ -315,6 +328,69 @@ def test_only_generation_attributed_target_execution_counts_as_campaign_work():
         [setup, uncorrelated, seed, uncorrelated, fuzz])
     assert span == [uncorrelated, seed, uncorrelated, fuzz]
     assert campaign == [seed, fuzz]
+
+
+def test_crash_attribution_is_campaign_without_a_completion_record():
+    quality, warnings = _crash_attribution(
+        report_seen=True, crash_log=None, vm="vm", procs=1,
+        campaign=[], correlated=[], foreign=None)
+    assert quality == "campaign"
+    assert warnings == ("exact_generation_unavailable",)
+
+
+def test_crash_attribution_is_ambiguous_with_competing_lanes():
+    quality, warnings = _crash_attribution(
+        report_seen=True, crash_log=None, vm="vm", procs=2,
+        campaign=[], correlated=[], foreign=None)
+    assert quality == "ambiguous"
+    assert "multiple_active_lanes:2" in warnings
+
+
+def test_crash_attribution_is_exact_when_barrier_matches_spool():
+    record = NfsProxyExecution.model_validate_json(json.dumps(
+        execution_record(execution_id=19, generation=2,
+                         program_digest="a" * 64)))
+    log = """last executing test programs:
+
+0s ago: executing program 0 (id=19):
+nfs-proxy: lane=0 generation=2 program_digest={digest} activation=Acked/0 deactivation=Acked/0 executed=true lease_cleared=true
+getpid()
+
+kernel console output (not intermixed with test programs):
+""".format(digest="a" * 64)
+    quality, warnings = _crash_attribution(
+        report_seen=True, crash_log=log, vm="vm", procs=1,
+        campaign=[record], correlated=[record], foreign=None)
+    assert quality == "exact"
+    assert warnings == ()
+
+
+def test_campaign_manager_runs_only_the_approved_corpus(tmp_path):
+    source = tmp_path / "syzkaller"
+    (source / "bin").mkdir(parents=True)
+    (source / "sys/linux/test").mkdir(parents=True)
+    (source / "sys/linux/test/upstream.prog").write_text("getpid()\n")
+    view = _seedless_syzkaller(source, tmp_path / "work")
+    assert (view / "bin").resolve() == (source / "bin").resolve()
+    assert list((view / "sys/linux/test").iterdir()) == []
+    assert _manager_command(tmp_path / "syz-manager",
+                            tmp_path / "manager.json") == [
+        str(tmp_path / "syz-manager"), "-config",
+        str(tmp_path / "manager.json"), "-mode", "corpus-run", "-debug"]
+
+
+def test_foreign_campaign_program_is_detected_immediately():
+    def record(**updates):
+        return NfsProxyExecution.model_validate_json(
+            json.dumps(execution_record(**updates)))
+
+    approved = record(execution_id=1, program_sha256="a" * 64)
+    foreign = record(execution_id=2, program_sha256="d" * 64)
+    setup = record(execution_id=3, campaign=False,
+                   program_sha256="e" * 64)
+    assert _foreign_campaign_execution([setup, approved], "a" * 64) is None
+    assert _foreign_campaign_execution(
+        [setup, approved, foreign], "a" * 64) is foreign
 
 
 def test_one_program_corpus_is_syzkaller_db_v2_corpus_v5(tmp_path):

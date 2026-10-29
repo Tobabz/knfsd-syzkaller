@@ -505,7 +505,7 @@ class Stage2BackendSpec(_Spec):
                                      max_length=256)
     timeout_s: float = Field(default=86_400, gt=0, le=86_400)
     #: ``step --campaign-executions``.
-    campaign_executions: int = Field(default=128, ge=1, le=192)
+    campaign_executions: int = Field(default=96, ge=1, le=96)
     #: At most ``stage2.nfs_proxy_window``.
     crash_window_bound: int = Field(default=4, ge=1, le=64)
     #: CAS digests of other judge profiles.  Left out, generation stores
@@ -1035,8 +1035,10 @@ def _stage2_procs(spec: HostSpec, profile) -> int:
                     if layout.covers(n))
     wanted = spec.stage2.procs
     if wanted is None:
-        catalog = HcapCatalog(capabilities=spec.capabilities,
-                              missing_capability_ids=())
+        catalog = HcapCatalog(
+            capabilities=spec.capabilities,
+            missing_capability_ids=_gap_vocabulary(spec),
+            gap_contracts=spec.gap_contracts)
         admitted = {e.call for e in profile.entries}
         return max(n for n in range(1, validated + 1)
                    if n == 1 or calls_in_layout(catalog, profile.entries, n)
@@ -1056,8 +1058,10 @@ def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
     refused unless the given calls leave it out by name, so a candidate
     program's call is not dropped from the manager unnoticed.  Given calls
     must include the rest and none of those."""
-    catalog = HcapCatalog(capabilities=spec.capabilities,
-                          missing_capability_ids=())
+    catalog = HcapCatalog(
+        capabilities=spec.capabilities,
+        missing_capability_ids=_gap_vocabulary(spec),
+        gap_contracts=spec.gap_contracts)
     refusals = layout_refusals(catalog, profile.entries, enabled_calls=(),
                                runtime_features=("remote_cover",),
                                procs=procs)

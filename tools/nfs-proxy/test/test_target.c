@@ -97,6 +97,50 @@ static void accepted_reply(struct rpc_message *m, uint32_t xid)
 	rpc_frame(m);
 }
 
+static void nfs41_sequence_call(struct rpc_message *m, uint32_t xid)
+{
+	memset(m, 0, sizeof(*m));
+	rpc_word(m, xid);
+	rpc_word(m, 0);       /* CALL */
+	rpc_word(m, 2);       /* RPC version */
+	rpc_word(m, 100003);  /* NFS */
+	rpc_word(m, 4);
+	rpc_word(m, 1);       /* COMPOUND */
+	rpc_word(m, 0);       /* AUTH_NONE credential */
+	rpc_word(m, 0);
+	rpc_word(m, 0);       /* AUTH_NONE verifier */
+	rpc_word(m, 0);
+	rpc_word(m, 0);       /* empty tag */
+	rpc_word(m, 1);       /* minor version */
+	rpc_word(m, 1);       /* one operation */
+	rpc_word(m, 53);      /* OP_SEQUENCE */
+	for (uint32_t i = 0; i < 4; i++)
+		rpc_word(m, 0x11111111u + i);
+	rpc_word(m, 1);       /* sequence id */
+	rpc_word(m, 0);       /* slot id */
+	rpc_word(m, 0);       /* highest slot id */
+	rpc_word(m, 0);       /* cache this */
+	rpc_frame(m);
+}
+
+static void nfs41_sequence_reply(struct rpc_message *m, uint32_t xid)
+{
+	accepted_reply(m, xid);
+	rpc_word(m, 0);       /* compound status */
+	rpc_word(m, 0);       /* empty tag */
+	rpc_word(m, 1);       /* one operation */
+	rpc_word(m, 53);      /* OP_SEQUENCE */
+	rpc_word(m, 0);       /* operation status */
+	for (uint32_t i = 0; i < 4; i++)
+		rpc_word(m, 0x11111111u + i);
+	rpc_word(m, 1);       /* sequence id */
+	rpc_word(m, 0);       /* slot id */
+	rpc_word(m, 0);       /* highest slot id */
+	rpc_word(m, 0);       /* target highest slot id */
+	rpc_word(m, 0);       /* status flags */
+	rpc_frame(m);
+}
+
 static size_t put_string(uint8_t *p, size_t off, const char *value)
 {
 	size_t len = strlen(value);
@@ -406,6 +450,190 @@ static void test_complete_ack_is_retirement_point(void)
 	close(host.fd);
 }
 
+static void test_protocol_reply_is_durable_before_completion(void)
+{
+	const struct nfsp_schema_family *families[] = {
+		&nfsp_schema_family_nfs4,
+	};
+	const char *schema_id = nfsp_schema_family_nfs4.schemas[0]->schema_id;
+	struct nfsp_target_cfg cfg;
+	struct nfsp_target *target = NULL;
+	struct host_event host;
+	struct answer_log log;
+	struct nfsp_rpc_record record;
+	struct nfsp_relay_verdict verdict;
+	struct rpc_message call, reply;
+	uint8_t rules[512], digest[NFSP_SHA256_LEN];
+	char rule_set_id[65], err[256];
+	size_t rules_len;
+	uint32_t status;
+	int sv[2];
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+		CHECK(0, "protocol journal socketpair");
+		return;
+	}
+	CHECK(1, "protocol journal socketpair");
+	rules_len = zero_rule_set(rules, schema_id);
+	nfsp_sha256(rules, rules_len, digest);
+	nfsp_sha256_hex(digest, rule_set_id);
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.families = families;
+	cfg.nfamilies = 1;
+	cfg.rule_set = rules;
+	cfg.rule_set_len = rules_len;
+	cfg.journal_fd = sv[0];
+	cfg.proxy_session_id = TEST_SESSION;
+	cfg.lane_id = 0;
+	cfg.retransmit_ms = 100;
+	memset(err, 0, sizeof(err));
+	CHECK(nfsp_target_open(&target, &cfg, err, sizeof(err)) == 0,
+	      "protocol target open: %s", err);
+	if (target == NULL) {
+		close(sv[1]);
+		return;
+	}
+	memset(&host, 0, sizeof(host));
+	host.fd = sv[1];
+	expect_event(target, &host, "RULESET");
+	ack_event(target, &host, rule_set_id);
+
+	memset(digest, 0x53, sizeof(digest));
+	memset(&log, 0, sizeof(log));
+	status = UINT32_MAX;
+	CHECK(nfsp_target_request(target, NFSP_TARGET_OP_ACTIVATE, 501, digest,
+				  rule_set_id, &status, answer, &log) == 1,
+	      "protocol generation activate");
+	expect_event(target, &host, "GENERATION_OPEN");
+	ack_event(target, &host, rule_set_id);
+	CHECK(log.count == 1 && log.status == 0, "protocol activation ACK");
+
+	nfs41_sequence_call(&call, 0x53000001u);
+	memset(&record, 0, sizeof(record));
+	record.conn.connection_id = 53;
+	record.direction = NFSP_DIR_C2S;
+	record.rpc_payload = call.body;
+	record.rpc_payload_len = call.body_len;
+	record.nfrags = 1;
+	memset(&verdict, 0, sizeof(verdict));
+	verdict.out = call.framed;
+	verdict.out_len = call.framed_len;
+	CHECK(relay(&record, call.framed, call.framed_len, &verdict, target) ==
+	      NFSP_RELAY_FORWARD, "NFSv4.1 CALL forwards");
+
+	nfs41_sequence_reply(&reply, 0x53000001u);
+	record.direction = NFSP_DIR_S2C;
+	record.rpc_payload = reply.body;
+	record.rpc_payload_len = reply.body_len;
+	memset(&verdict, 0, sizeof(verdict));
+	verdict.out = reply.framed;
+	verdict.out_len = reply.framed_len;
+	CHECK(relay(&record, reply.framed, reply.framed_len, &verdict, target) ==
+	      NFSP_RELAY_FORWARD, "NFSv4.1 REPLY forwards");
+	expect_event(target, &host, "NFS_COMPOUND_REPLY");
+	CHECK(target->gens[0].pending_protocol_events == 1,
+	      "protocol evidence remains pending before host ACK");
+
+	memset(&log, 0, sizeof(log));
+	status = UINT32_MAX;
+	CHECK(nfsp_target_request(target, NFSP_TARGET_OP_DEACTIVATE, 501, digest,
+				  rule_set_id, &status, answer, &log) == 1,
+	      "protocol generation deactivate queues behind reply evidence");
+	ack_event(target, &host, rule_set_id);
+	CHECK(target->gens[0].pending_protocol_events == 0,
+	      "protocol evidence ACK clears pending state");
+	CHECK(host_read_event(&host) == 0 &&
+	      strcmp(host.type, "GENERATION_DRAINING") == 0,
+	      "DRAINING follows durable protocol evidence");
+	ack_event(target, &host, rule_set_id);
+	CHECK(log.count == 1 && log.status == 0, "protocol deactivation ACK");
+	CHECK(host_read_event(&host) == 0 &&
+	      strcmp(host.type, "GENERATION_COMPLETE") == 0,
+	      "COMPLETE follows protocol and DRAINING ACKs");
+	ack_event(target, &host, rule_set_id);
+
+	/* A rejected protocol record is terminal, but it dirties the
+	 * generation and prevents a clean RUN_COMPLETE claim. */
+	memset(&log, 0, sizeof(log));
+	status = UINT32_MAX;
+	CHECK(nfsp_target_request(target, NFSP_TARGET_OP_ACTIVATE, 502, digest,
+				  rule_set_id, &status, answer, &log) == 1,
+	      "rejected protocol generation activate");
+	expect_event(target, &host, "GENERATION_OPEN");
+	ack_event(target, &host, rule_set_id);
+	nfs41_sequence_call(&call, 0x53000002u);
+	record.direction = NFSP_DIR_C2S;
+	record.rpc_payload = call.body;
+	record.rpc_payload_len = call.body_len;
+	memset(&verdict, 0, sizeof(verdict));
+	verdict.out = call.framed;
+	verdict.out_len = call.framed_len;
+	CHECK(relay(&record, call.framed, call.framed_len, &verdict, target) ==
+	      NFSP_RELAY_FORWARD, "rejected-evidence CALL forwards");
+	nfs41_sequence_reply(&reply, 0x53000002u);
+	record.direction = NFSP_DIR_S2C;
+	record.rpc_payload = reply.body;
+	record.rpc_payload_len = reply.body_len;
+	memset(&verdict, 0, sizeof(verdict));
+	verdict.out = reply.framed;
+	verdict.out_len = reply.framed_len;
+	CHECK(relay(&record, reply.framed, reply.framed_len, &verdict, target) ==
+	      NFSP_RELAY_FORWARD, "rejected-evidence REPLY forwards");
+	expect_event(target, &host, "NFS_COMPOUND_REPLY");
+	CHECK(host_reject(&host, "protocol_context_mismatch") == 0,
+	      "reject protocol evidence");
+	nfsp_target_tick(target);
+	CHECK(target->gens[0].pending_protocol_events == 0 &&
+	      target->gens[0].evidence_failures == 1 &&
+	      target->stats.evidence_path_failures == 1 &&
+	      target->stats.evidence_path_degraded,
+	      "protocol rejection fails the generation evidence");
+	memset(&log, 0, sizeof(log));
+	status = UINT32_MAX;
+	CHECK(nfsp_target_request(target, NFSP_TARGET_OP_DEACTIVATE, 502, digest,
+				  rule_set_id, &status, answer, &log) == 1,
+	      "rejected protocol generation deactivates");
+	expect_event(target, &host, "GENERATION_DRAINING");
+	ack_event(target, &host, rule_set_id);
+	CHECK(host_read_event(&host) == 0 &&
+	      strcmp(host.type, "GENERATION_COMPLETE") == 0,
+	      "dirty generation summary is submitted");
+	ack_event(target, &host, rule_set_id);
+	nfsp_target_finish(target, 10);
+	CHECK(target->run_state == RUN_SKIPPED,
+	      "protocol rejection prevents clean RUN_COMPLETE");
+
+	nfsp_target_close(target);
+	close(host.fd);
+}
+
+static void test_protocol_reply_loss_fails_closed(void)
+{
+	struct nfsp_target target;
+	struct tgen generation;
+	uint64_t seq = 7;
+
+	/* The journal transport has separate exhaustive loss tests.  Inject its
+	 * callback here to prove the target attributes protocol loss to G. */
+	memset(&target, 0, sizeof(target));
+	memset(&generation, 0, sizeof(generation));
+	generation.generation = 503;
+	generation.pending_protocol_events = 1;
+	generation.protocol_seqs = &seq;
+	generation.nprotocol_seqs = 1;
+	generation.protocol_seqs_cap = 1;
+	target.gens = &generation;
+	target.ngens = 1;
+	on_journal(&target, seq, COOKIE(CK_PROTOCOL, 503),
+		   NFSP_JOURNAL_LOST, "channel_failed");
+	CHECK(generation.pending_protocol_events == 0 &&
+	      generation.nprotocol_seqs == 0 &&
+	      generation.evidence_failures == 1 &&
+	      target.stats.evidence_path_failures == 1 &&
+	      target.stats.evidence_path_degraded,
+	      "lost protocol evidence fails closed");
+}
+
 static void test_active_zero_rules_forward_call_and_reply(void)
 {
 	const struct nfsp_schema_family *families[] = {
@@ -522,6 +750,8 @@ int main(void)
 {
 	test_complete_ack_is_retirement_point();
 	test_active_zero_rules_forward_call_and_reply();
+	test_protocol_reply_is_durable_before_completion();
+	test_protocol_reply_loss_fails_closed();
 	printf("%u checks, %u failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

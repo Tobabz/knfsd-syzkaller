@@ -33,7 +33,8 @@ from .journal_framing import (
 from .journal_sink import (
     SEGMENT_SUFFIX, SESSION_END_SCHEMA, ApplyRefusalPayload, ExposureIntentPayload,
     ForwardCompletePayload, ForwardFailedPayload, GenerationCompletePayload,
-    GenerationOpenPayload, HostJournal, JournalSinkError, RequestError, ruleset_header,
+    GenerationOpenPayload, HostJournal, JournalSinkError, NfsCompoundReplyPayload,
+    RequestError, ruleset_header,
 )
 from .semantic_replay import (
     ApplyRefusal, Batch, BatchSignature, Correlation, DeliveryState, GenerationSummary,
@@ -64,6 +65,34 @@ class ExposureDelta:
     #: (rule_id, semantic_path, SHA-256 of original_value) per application:
     #: what M7 compares to show replay ran on other dynamic originals.
     originals: tuple[tuple[str, str, str], ...] = ()
+    applications: tuple["ApplicationDelta", ...] = ()
+    record_context: object | None = None
+
+
+@dataclass(frozen=True)
+class ApplicationDelta:
+    rule_id: str
+    semantic_path: str
+    kind: str
+    part: str
+    original_value: str
+    mutated_value: str
+
+
+@dataclass(frozen=True)
+class ProtocolOperationDelta:
+    index: int
+    name: str
+    opcode: int
+    status: int
+
+
+@dataclass(frozen=True)
+class CompoundReplyDelta:
+    event_seq: int
+    minor_version: int
+    record_context: object
+    operations: tuple[ProtocolOperationDelta, ...]
 
 
 @dataclass
@@ -75,6 +104,7 @@ class GenerationDelta:
     draining_seq: int | None = None
     exposures: list[ExposureDelta] = field(default_factory=list)
     refusals: list[ApplyRefusalPayload] = field(default_factory=list)
+    protocol_replies: list[CompoundReplyDelta] = field(default_factory=list)
     summary: GenerationCompletePayload | None = None
     summary_seq: int | None = None
     #: The last event of this generation in the journal, of any type.
@@ -195,7 +225,14 @@ class SealedJournal:
                     originals=tuple(
                         (a.rule_id, a.semantic_path,
                          hashlib.sha256(bytes.fromhex(a.original_value)).hexdigest())
-                        for a in payload.applications)))
+                        for a in payload.applications),
+                    applications=tuple(ApplicationDelta(
+                        rule_id=a.rule_id, semantic_path=a.semantic_path,
+                        kind=a.kind, part=a.part,
+                        original_value=a.original_value,
+                        mutated_value=a.mutated_value)
+                        for a in payload.applications),
+                    record_context=payload.record_context))
             elif request.event_type in ("FORWARD_COMPLETE", "FORWARD_FAILED"):
                 assert isinstance(payload, (ForwardCompletePayload, ForwardFailedPayload))
                 for exposure in gen.exposures:
@@ -206,6 +243,15 @@ class SealedJournal:
             elif request.event_type == "APPLY_REFUSAL":
                 assert isinstance(payload, ApplyRefusalPayload)
                 gen.refusals.append(payload)
+            elif request.event_type == "NFS_COMPOUND_REPLY":
+                assert isinstance(payload, NfsCompoundReplyPayload)
+                gen.protocol_replies.append(CompoundReplyDelta(
+                    event_seq=request.event_seq,
+                    minor_version=payload.minor_version,
+                    record_context=payload.record_context,
+                    operations=tuple(ProtocolOperationDelta(
+                        index=op.index, name=op.name, opcode=op.opcode,
+                        status=op.status) for op in payload.operations)))
             elif request.event_type == "GENERATION_COMPLETE":
                 assert isinstance(payload, GenerationCompletePayload)
                 gen.summary = payload
@@ -289,6 +335,7 @@ class _Bytes:
 
 
 __all__ = [
-    "DeltaReadError", "ExposureDelta", "GenerationDelta", "SealedJournal", "SegmentInfo",
-    "SessionDelta",
+    "ApplicationDelta", "CompoundReplyDelta", "DeltaReadError",
+    "ExposureDelta", "GenerationDelta", "ProtocolOperationDelta",
+    "SealedJournal", "SegmentInfo", "SessionDelta",
 ]

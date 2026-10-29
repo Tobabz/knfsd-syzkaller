@@ -611,7 +611,8 @@ def test_template_spec_is_valid():
     assert generate_module.promoted_by_criteria(spec) == ()
     live = HostSpec.model_validate_json(
         (REPO / "stage1-host-live/host-spec.json").read_bytes())
-    assert generate_module.promoted_by_criteria(live) == ()
+    assert tuple(c.id for c in generate_module.promoted_by_criteria(live)) == (
+        "HCAP-15",)
     assert live.stage2 is not None and live.stage2.procs == 1
     live_layouts = {cap.id: cap.layout() for cap in live.capabilities}
     assert all(live_layouts[capability_id] ==

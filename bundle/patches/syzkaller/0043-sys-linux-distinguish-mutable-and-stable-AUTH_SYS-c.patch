@@ -1,0 +1,136 @@
+From 50229ce1a8124e3a76c96b6fe3950ba6105c4368 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 29 Oct 2026 12:00:00 +0900
+Subject: [PATCH] sys/linux: distinguish mutable and stable AUTH_SYS
+ credentials
+
+---
+ sys/linux/nfs_fuzz_test.go    | 13 ++++++++++---
+ sys/linux/socket_inet_nfs.txt | 28 +++++++++++++++-------------
+ 2 files changed, 25 insertions(+), 16 deletions(-)
+
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index 57525f401..8b0b4de35 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -61,6 +61,13 @@ func TestNFSRawRPCSend(t *testing.T) {
+ 	if write.CallName != "write" {
+ 		t.Fatalf("write variant calls %s, want ordinary write", write.CallName)
+ 	}
++	mutable := requireStruct(t, write, "rpc_auth_sys_mutable")
++	requireConst(t, requireField(t, mutable, "flavor").Type, 1,
++		"mutable AUTH_SYS flavor")
++	mutableData := requireStruct(t, write, "rpc_auth_sys_mutable_data")
++	if _, fixed := requireField(t, mutableData, "uid").Type.(*prog.ConstType); fixed {
++		t.Fatal("mutable AUTH_SYS uid is const; authentication fuzzing would be disabled")
++	}
+ 	requireSingleRPCRecords(t, write)
+ 	requireSingleRPCRecordWire(t, target)
+ 	for _, gone := range []string{
+@@ -415,14 +422,14 @@ func TestNFSLiveSession(t *testing.T) {
+ 	for _, name := range []string{"write$nfs41_exchange_id", "write$nfs41_create_session",
+ 		"write$nfs41_reclaim_complete"} {
+ 		call := requireNFSFuzzCall(t, target, name)
+-		cred := requireStruct(t, call, "rpc_auth_sys_nfs41")
++		cred := requireStruct(t, call, "rpc_auth_sys_stable")
+ 		requireConst(t, requireField(t, cred, "flavor").Type, 1, name+" AUTH_SYS flavor")
+-		data := requireStruct(t, call, "rpc_auth_sys_nfs41_data")
++		data := requireStruct(t, call, "rpc_auth_sys_stable_data")
+ 		for _, field := range []string{"stamp", "uid", "gid", "gids_len"} {
+ 			requireConst(t, requireField(t, data, field).Type, 0,
+ 				name+" AUTH_SYS "+field)
+ 		}
+-		machine := requireStruct(t, call, "nfs41_empty_machine_name")
++		machine := requireStruct(t, call, "rpc_auth_sys_stable_machine_name")
+ 		requireConst(t, requireField(t, machine, "length").Type, 0,
+ 			name+" AUTH_SYS machinename length")
+ 	}
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index 3f933a518..d82f63d73 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -39,18 +39,20 @@ recvfrom$inet_nfs_fuzz_tcp(fd sock_nfs_fuzz_tcp, buf buffer[out], len len[buf],
+ nfs_path_names = "export", "tmp", "root", "test", "mnt", "home", "var", "dev", "etc", "testfile", "file1", "dir1", "share", "pub", "user.test", "system.nfs4_acl", "security.selinux"
+ 
+ # RPC Auth definitions
++# rpc_auth_sys_mutable deliberately exposes principal fields for authentication
++# and authorization fuzzing. Stateful NFSv4 bootstrap uses the stable type below.
+ rpc_auth_none {
+ 	flavor	const[0, int32be]
+ 	length	const[0, int32be]
+ } [packed]
+ 
+-rpc_auth_sys {
++rpc_auth_sys_mutable {
+ 	flavor	const[1, int32be]
+ 	length	len[data, int32be]
+-	data	rpc_auth_sys_data
++	data	rpc_auth_sys_mutable_data
+ } [packed]
+ 
+-rpc_auth_sys_data {
++rpc_auth_sys_mutable_data {
+ 	stamp		int32be
+ 	machinename	xdr_machine_name
+ 	uid		int32be
+@@ -91,7 +93,7 @@ rpc_auth_generic {
+ 
+ rpc_auth [
+ 	none	rpc_auth_none
+-	sys	rpc_auth_sys
++	sys	rpc_auth_sys_mutable
+ 	gss	rpc_auth_gss
+ 	raw	rpc_auth_generic
+ ] [varlen]
+@@ -1110,23 +1112,23 @@ resource nfs41_sequenceid[int32]
+ resource nfs41_sessionid_hi[int64]
+ resource nfs41_sessionid_lo[int64]
+ 
+-# EXCHANGE_ID establishes the client principal. CREATE_SESSION and every
+-# session request must use the same AUTH_SYS identity to confirm that client.
+-rpc_auth_sys_nfs41 {
++# NFSv4 client-state transitions compare credentials across requests. This stable
++# principal lets a harness pass those transitions before mutating later operations.
++rpc_auth_sys_stable {
+ 	flavor	const[1, int32be]
+ 	length	len[data, int32be]
+-	data	rpc_auth_sys_nfs41_data
++	data	rpc_auth_sys_stable_data
+ } [packed]
+ 
+-rpc_auth_sys_nfs41_data {
++rpc_auth_sys_stable_data {
+ 	stamp		const[0, int32be]
+-	machinename	nfs41_empty_machine_name
++	machinename	rpc_auth_sys_stable_machine_name
+ 	uid		const[0, int32be]
+ 	gid		const[0, int32be]
+ 	gids_len	const[0, int32be]
+ } [packed]
+ 
+-nfs41_empty_machine_name {
++rpc_auth_sys_stable_machine_name {
+ 	length	const[0, int32be]
+ } [packed]
+ 
+@@ -1145,7 +1147,7 @@ type rpc_nfs41_call_t[OPNUM, ARGS] {
+ 	prog		const[100003, int32be]
+ 	vers		const[4, int32be]
+ 	proc		const[1, int32be]
+-	cred		rpc_auth_sys_nfs41
++	cred		rpc_auth_sys_stable
+ 	verf		rpc_auth_none
+ 	tag		const[0, int32be]
+ 	minorversion	const[1, int32be]
+@@ -1175,7 +1177,7 @@ type rpc_nfs41_compound2_call_t[OPNUM1, ARGS1, OPNUM2, ARGS2] {
+ 	prog		const[100003, int32be]
+ 	vers		const[4, int32be]
+ 	proc		const[1, int32be]
+-	cred		rpc_auth_sys_nfs41
++	cred		rpc_auth_sys_stable
+ 	verf		rpc_auth_none
+ 	tag		const[0, int32be]
+ 	minorversion	const[1, int32be]
+-- 
+2.34.1
+

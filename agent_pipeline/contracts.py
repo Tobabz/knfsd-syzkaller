@@ -572,6 +572,8 @@ class CampaignSegment(Record):
     hypothesis_applied: int = Field(ge=0)
     hypothesis_not_applied: int = Field(ge=0)
     hypothesis_inconclusive: int = Field(ge=0)
+    attribution_quality: Literal["exact", "campaign", "ambiguous", "none"] = "none"
+    attribution_warnings: tuple[str, ...] = ()
 
 
 class ReplayOutcome(Record):

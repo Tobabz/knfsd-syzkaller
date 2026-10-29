@@ -173,11 +173,11 @@ def test_a_campaign_writes_evidence_generate_promotes_on(world):
     evidence = PromotionProbeEvidence.model_validate_json(
         (out / "evidence.json").read_bytes())
     assert evidence.probes == (PROBE,)
-    assert (evidence.minimal.runs, evidence.minimal.runs_hitting) == (3, 3)
-    assert evidence.generated.runs == 32
-    assert len(evidence.generated.program_sha256s) == 16
+    assert (evidence.minimal.runs, evidence.minimal.runs_hitting) == (2, 2)
+    assert evidence.generated.runs == 8
+    assert len(evidence.generated.program_sha256s) == 8
     assert withheld not in evidence.generated.program_sha256s
-    assert (evidence.neutral.runs, evidence.neutral.runs_hitting) == (3, 0)
+    assert (evidence.neutral.runs, evidence.neutral.runs_hitting) == (2, 0)
     assert evidence.withheld_program_sha256s == (withheld,)
     collector = json.loads((world.base.collector_config).read_bytes())
     assert evidence.accelerator == collector["accel"]
@@ -186,8 +186,8 @@ def test_a_campaign_writes_evidence_generate_promotes_on(world):
     request = Bridge.requests[0]
     assert request["entry"] == ["read$extra"]
     assert request["enabled"] == ["close", "openat$lane", "read$extra"]
-    assert request["generated"] == 64
-    assert len(world.guests) == 3 + 32 + 3
+    assert request["generated"] == 32
+    assert len(world.guests) == 2 + 8 + 2
     record = json.loads((out / f"probe-{PROBE}.json").read_bytes())
     assert record["pcs"] == [f"{PROBE_PC:#x}"]
     assert evidence.probe_mapping_sha256[PROBE] == hashlib.sha256(
@@ -211,7 +211,7 @@ def test_a_campaign_writes_evidence_generate_promotes_on(world):
     ({"neutral": True}, {}, "criteria_not_met"),
     ({"generated": lambda i: i % 8 == 0}, {}, "criteria_not_met"),
     ({"minimal": lambda i: i != 1}, {}, "criteria_not_met"),
-    ({}, {"generated_programs": 8}, "criteria_not_met"),
+    ({}, {"generated_programs": 4}, "criteria_not_met"),
     ({}, {"capability_id": "CAP-lane"}, "contract_missing"),
     ({}, {"capability_id": "CAP-nope"}, "capability_missing"),
 ])

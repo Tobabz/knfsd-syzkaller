@@ -224,7 +224,9 @@ class Capability(HcapRecord):
     more procs must not use it (``layout()``).
 
     ``contract`` is the scope promotion judges (#100).  Its syz call entry
-    points must be the interface's syz calls.
+    points must be exposed by the interface.  An interface may also expose
+    dependent calls, such as a receive that completes an entry call's
+    protocol chain.
     """
 
     id: Identifier
@@ -270,10 +272,10 @@ class Capability(HcapRecord):
         if (self.status == "validated" and self.validated_scope
                 and set(self.validated_scope) != set(self.scope)):
             raise ValueError("validated must cover all declared scope")
-        if (self.contract is not None and set(self.contract.syz_calls())
-                != set(self.interface.syz_calls)):
-            raise ValueError("contract syz call entry points must be the "
-                             "interface's syz calls")
+        if (self.contract is not None and not set(self.contract.syz_calls())
+                <= set(self.interface.syz_calls)):
+            raise ValueError("contract syz call entry points must be exposed "
+                             "by the interface")
         return self
 
 

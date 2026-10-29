@@ -134,6 +134,12 @@ func parseProgram(target *prog.Target, data []byte) (programResult, error) {
 		}
 		return result, fmt.Errorf("strict parse: %w", err)
 	}
+	if !validProtocolSemantics(p) {
+		return result, fmt.Errorf("protocol semantics invalid")
+	}
+	if !validRequiredProtocolChains(p) {
+		return result, fmt.Errorf("protocol chain invalid")
+	}
 	if len(p.Calls) == 0 || len(p.Calls) > maxCalls {
 		return result, fmt.Errorf("call limit exceeded")
 	}

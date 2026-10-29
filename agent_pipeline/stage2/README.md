@@ -70,8 +70,16 @@ numbered from 0, as `segments/.NNNNNN.tmp` renamed when complete. Its
 | step | `host` (`evidence`) | artifacts |
 |---|---|---|
 | gate | `GateHostFacts`: `journal_name` | `reachability` and `coverage` (the Stage 1 Q1 observation, scenario run with rules); `neutral-coverage` (`NEUTRAL_COVERAGE_TYPE`); `execprog.scenario`, `execprog.neutral` (syz-execprog output); `journal/<name>.NNNN.njnl` |
-| campaign | `CampaignHostFacts`: `journal_name`, `executions`, the Q2 collector facts (console identity and completeness, every syz-manager report identity, `vm_termination`, `collection_window`) | `q2-evidence`, console, reports (`sealed_q2`); `crash-log` when the VM crashed; `generation-coverage/<lane>.<generation>` per program generation; `journal/...` |
+| campaign | `CampaignHostFacts`: `journal_name`, `executions`, the Q2 collector facts (console identity and completeness, every syz-manager report identity, `vm_termination`, `collection_window`) | `q2-evidence`, console, reports (`sealed_q2`); `crash-log` when the VM crashed; paired `generation-coverage/<lane>.<generation>` and `generation-execution/<lane>.<generation>` artifacts per program generation; `journal/...` |
 | replay | `ReplayHostFacts`: `journal_name`, `replay_end`, `fixture_failed` | `execprog.replay`; `journal/...` of the separate replay journal |
+
+Q2 classifies sanitizer and kernel reports independently of crash attribution.
+The sealed Q2 index records `attribution_quality` as `exact`, `campaign`,
+`ambiguous`, or `none`, plus diagnostic `attribution_warnings`. Missing exact
+generation attribution never invalidates a classified report. `internal_errors`
+is reserved for evidence-integrity and collector-consistency failures. Exact
+attribution supports replay and minimization; campaign attribution is enough to
+retain a crash and its campaign-level mutation context.
 
 A gate must finish `gate_repetitions` segments, a replay one, a campaign at
 least one; fewer, a nonzero exit or a malformed segment ends the lease
@@ -92,7 +100,7 @@ judged REPLAY_INVALID instead of retried.
            "agent_pipeline.stage2.host", "step", "--manager",
            "/var/lib/knfsd/stage2/manager.json", "--collector",
            "/var/lib/knfsd/stage1/collector.json",
-           "--campaign-executions", "128",
+           "--campaign-executions", "96",
            "{input}", "{output}"],
   "cwd": "/var/lib/knfsd/stage2",
   "resource_key": "host-a/kvm",
@@ -107,8 +115,9 @@ judged REPLAY_INVALID instead of retried.
 Use the Stage 1 command's `resource_key` when both use the same VMs. The
 profiles are records in the CAS (`data.put_record`). `crash_window_bound`
 must not exceed syzkaller's `experimental.nfs_proxy_window`.
-The step command limits one syz-manager invocation to 128 completed programs
-by default so its generation artifacts fit the 255-artifact segment bound.
+The step command limits one syz-manager invocation to 96 completed programs
+by default so its paired coverage and execution artifacts fit the 255-artifact
+segment bound.
 The Controller starts further campaign tasks until policy routes the job.
 `--exec-slowdown` is the bounded syz-execprog slowdown for direct gate and
 replay guests. Left out, it is the collector's `exec_slowdown`: 1 under KVM,
@@ -161,7 +170,7 @@ it, generation writes both, so a mutate policy can be generated:
 build. The step command is `agent_pipeline.stage2.host step` with the
 generated manager (`--manager`), or one `--variant-manager SANITIZER=PATH`
 per variant, and a lease runs the manager of its descriptor's sanitizer.
-`campaign_executions` (128), `timeout_s` (86400), `crash_window_bound` (4,
+`campaign_executions` (96), `timeout_s` (86400), `crash_window_bound` (4,
 at most `nfs_proxy_window`) and `resource_key` (the engine's) may be set.
 The judge profiles default to `M1JudgeProfile` `m1-default`/1,
 `q2.default_q2_profile()` and `ReplayJudgeProfile` `replay-default`/1,

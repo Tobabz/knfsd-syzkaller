@@ -15,8 +15,8 @@ import (
 // Controller fixes the probes; these are the programs that try to reach
 // them, none of them a candidate's:
 //
-//   - minimal: per entry call, a short program that ends in that call,
-//     with the calls that make its resources before it;
+//   - minimal: per entry call, a short program with its constructors and any
+//     required request/reply barrier around it;
 //   - generated: distinct programs, each generated from a minimal one and
 //     mutated over the selection's enabled calls, that still call an entry
 //     point. A program that lost every entry call is dropped and counted.
@@ -76,9 +76,292 @@ func decodeGenerate(data []byte) (generateRequest, error) {
 }
 
 func programText(p *prog.Prog) generatedProgram {
-	text := p.Serialize()
+	// Strict parsing requires explicit fields for some output structs.
+	text := p.SerializeVerbose()
 	sum := sha256.Sum256(text)
 	return generatedProgram{Text: string(text), Sha256: hex.EncodeToString(sum[:])}
+}
+
+type protocolChainSpec struct {
+	names      []string
+	entryIndex int
+}
+
+var protocolChains = map[string]protocolChainSpec{
+	"write$nfs41_bind_conn_to_session": {
+		names: []string{
+			"syz_open_nfs_lane_profile$client0_knfsd_v41",
+			"syz_socket_connect_nfs_lane$client0_knfsd_v41",
+			"write$nfs41_exchange_id",
+			"recvfrom$nfs41_exchange_id",
+			"write$nfs41_create_session",
+			"recvfrom$nfs41_create_session",
+			"write$nfs41_bind_conn_to_session",
+			"recvfrom$inet_nfs_fuzz_tcp",
+		},
+		entryIndex: 6,
+	},
+	"write$nfs41_reclaim_complete": {
+		names: []string{
+			"syz_open_nfs_lane_profile$client0_knfsd_v41",
+			"syz_socket_connect_nfs_lane$client0_knfsd_v41",
+			"write$nfs41_exchange_id",
+			"recvfrom$nfs41_exchange_id",
+			"write$nfs41_create_session",
+			"recvfrom$nfs41_create_session",
+			"write$nfs41_reclaim_complete",
+			"recvfrom$nfs41_reclaim_complete",
+		},
+		entryIndex: 6,
+	},
+}
+
+func resolveProtocolChain(target *prog.Target, meta *prog.Syscall,
+	usable map[*prog.Syscall]bool) ([]*prog.Syscall, error) {
+	spec, ok := protocolChains[meta.Name]
+	if !ok {
+		return nil, nil
+	}
+	chain := make([]*prog.Syscall, 0, len(spec.names))
+	for _, name := range spec.names {
+		call := target.SyscallMap[name]
+		if call == nil || call.Attrs.Disabled || !usable[call] {
+			return nil, errors.New("protocol_prerequisite_not_generatable: " + name)
+		}
+		chain = append(chain, call)
+	}
+	return chain, nil
+}
+
+func resourceName(arg *prog.ResultArg) string {
+	if typ, ok := arg.Type().(*prog.ResourceType); ok {
+		return typ.Desc.Name
+	}
+	return ""
+}
+
+func nestedField(arg prog.Arg, names ...string) (prog.Arg, bool) {
+	var ok bool
+	for _, name := range names {
+		arg, ok = fieldArg(arg, name)
+		if !ok {
+			return nil, false
+		}
+	}
+	return arg, true
+}
+
+func fixedFields(arg prog.Arg, fields map[string]uint64) bool {
+	for name, want := range fields {
+		got, ok := fieldValue(arg, name)
+		if !ok || got != want {
+			return false
+		}
+	}
+	return true
+}
+
+func structuredRequest(call *prog.Call) (prog.Arg, bool) {
+	if len(call.Args) < 2 || !call.Meta.Attrs.NoSquash {
+		return nil, false
+	}
+	ptr, ok := call.Args[1].(*prog.PointerArg)
+	want, typed := call.Meta.Args[1].Type.(*prog.PtrType)
+	if !ok || !typed || ptr.Res == nil || ptr.Res.Type() != want.Elem {
+		return nil, false
+	}
+	if _, squashed := ptr.Res.(*prog.DataArg); squashed {
+		return nil, false
+	}
+	return ptr.Res, true
+}
+
+func validStableAuthSys(record prog.Arg) bool {
+	cred, ok := nestedField(record, "msg", "cred")
+	if !ok || cred.Type().Name() != "rpc_auth_sys_stable" ||
+		!fixedFields(cred, map[string]uint64{"flavor": 1}) {
+		return false
+	}
+	data, ok := fieldArg(cred, "data")
+	if !ok || data.Type().Name() != "rpc_auth_sys_stable_data" ||
+		!fixedFields(data, map[string]uint64{
+			"stamp": 0, "uid": 0, "gid": 0, "gids_len": 0,
+		}) {
+		return false
+	}
+	machine, ok := fieldArg(data, "machinename")
+	return ok && machine.Type().Name() == "rpc_auth_sys_stable_machine_name" &&
+		fixedFields(machine, map[string]uint64{"length": 0})
+}
+
+// validProtocolSemantics keeps the session bootstrap executable while later
+// calls are mutated. These are server preconditions, not fuzzing dimensions.
+func validProtocolSemantics(p *prog.Prog) bool {
+	channel := map[string]uint64{
+		"headerpad": 0, "maxreqsize": 0x1000, "maxrespsize": 0x1000,
+		"maxresp_cached": 0, "maxops": 8, "maxreqs": 4, "rdma_ird_len": 0,
+	}
+	for _, call := range p.Calls {
+		switch call.Meta.Name {
+		case "write$nfs41_exchange_id":
+			record, ok := structuredRequest(call)
+			if !ok || !validStableAuthSys(record) {
+				return false
+			}
+			args, ok := nestedField(record, "msg", "op", "args")
+			if !ok || !fixedFields(args, map[string]uint64{"flags": 0}) {
+				return false
+			}
+		case "write$nfs41_create_session":
+			record, ok := structuredRequest(call)
+			if !ok || !validStableAuthSys(record) {
+				return false
+			}
+			args, ok := nestedField(record, "msg", "op", "args")
+			if !ok || !fixedFields(args, map[string]uint64{"flags": 0}) {
+				return false
+			}
+			for _, name := range []string{"fore", "back"} {
+				attrs, ok := fieldArg(args, name)
+				if !ok || attrs.Type().Name() != "nfs41_session_channel_attrs" ||
+					!fixedFields(attrs, channel) {
+					return false
+				}
+			}
+		case "write$nfs41_bind_conn_to_session":
+			request, ok := structuredRequest(call)
+			records, array := request.(*prog.GroupArg)
+			if !ok || !array || len(records.Inner) == 0 {
+				return false
+			}
+			for _, record := range records.Inner {
+				if !validStableAuthSys(record) {
+					return false
+				}
+				args, ok := nestedField(record, "msg", "op", "args")
+				if !ok || !fixedFields(args, map[string]uint64{"rdma_mode": 0}) {
+					return false
+				}
+			}
+		case "write$nfs41_reclaim_complete":
+			record, ok := structuredRequest(call)
+			if !ok || !validStableAuthSys(record) {
+				return false
+			}
+			args, ok := nestedField(record, "msg", "op2", "args")
+			if !ok || !fixedFields(args, map[string]uint64{"one_fs": 0}) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func protocolChain(target *prog.Target, names []string) ([]*prog.Syscall, bool) {
+	chain := make([]*prog.Syscall, 0, len(names))
+	for _, name := range names {
+		meta := target.SyscallMap[name]
+		if meta == nil {
+			return nil, false
+		}
+		chain = append(chain, meta)
+	}
+	return chain, true
+}
+
+// validRequiredProtocolChains requires every stateful entry call to be at its
+// fixed position in the complete request/reply chain. This is also applied to
+// parsed input, so a hand-written or mutated program cannot bypass the response
+// barrier that keeps remote coverage active through server-side processing.
+func validRequiredProtocolChains(p *prog.Prog) bool {
+	for at, call := range p.Calls {
+		spec, ok := protocolChains[call.Meta.Name]
+		if !ok {
+			continue
+		}
+		chain, ok := protocolChain(p.Target, spec.names)
+		if !ok || !validProtocolChainAt(p, chain, at-spec.entryIndex) {
+			return false
+		}
+	}
+	return true
+}
+
+// validProtocolChain proves that the generated request/reply sequence is
+// contiguous and that every state-bearing input references the matching
+// earlier reply on the same lane socket.
+func validProtocolChain(p *prog.Prog, chain []*prog.Syscall) bool {
+	for start := 0; start+len(chain) <= len(p.Calls); start++ {
+		if validProtocolChainAt(p, chain, start) {
+			return true
+		}
+	}
+	return false
+}
+
+func validProtocolChainAt(p *prog.Prog, chain []*prog.Syscall, start int) bool {
+	if start < 0 || start+len(chain) > len(p.Calls) {
+		return false
+	}
+	for i, meta := range chain {
+		if p.Calls[start+i].Meta != meta {
+			return false
+		}
+	}
+	open, socket := p.Calls[start].Ret, p.Calls[start+1].Ret
+	if open == nil || socket == nil {
+		return false
+	}
+	want := map[string]*prog.Call{
+		"nfs41_clientid":     p.Calls[start+3],
+		"nfs41_sequenceid":   p.Calls[start+3],
+		"nfs41_sessionid_hi": p.Calls[start+5],
+		"nfs41_sessionid_lo": p.Calls[start+5],
+	}
+	producer := map[*prog.ResultArg]*prog.Call{}
+	for _, call := range p.Calls[start : start+len(chain)] {
+		if call.Ret != nil {
+			producer[call.Ret] = call
+		}
+		prog.ForeachArg(call, func(arg prog.Arg, _ *prog.ArgCtx) {
+			if res, ok := arg.(*prog.ResultArg); ok && res.Dir() != prog.DirIn {
+				producer[res] = call
+			}
+		})
+	}
+	valid := true
+	for i, call := range p.Calls[start : start+len(chain)] {
+		prog.ForeachArg(call, func(arg prog.Arg, _ *prog.ArgCtx) {
+			res, ok := arg.(*prog.ResultArg)
+			if !ok || res.Dir() == prog.DirOut {
+				return
+			}
+			name := resourceName(res)
+			switch {
+			case i == 1 && name == "fd_nfs_dir":
+				valid = valid && res.Res == open
+			case i >= 2 && name == "sock_nfs_fuzz_tcp":
+				valid = valid && res.Res == socket
+			case want[name] != nil:
+				valid = valid && res.Res != nil && producer[res.Res] == want[name]
+			}
+		})
+	}
+	if valid {
+		return true
+	}
+	return false
+}
+
+func generateProtocolProgram(target *prog.Target, chain []*prog.Syscall, seed int64,
+	ct *prog.ChoiceTable) *prog.Prog {
+	for attempt := 0; attempt < maxGenerateAttempts; attempt++ {
+		p := target.GenerateCallSequence(rand.NewSource(seed+int64(attempt)), chain, ct)
+		if p != nil && validRequiredProtocolChains(p) && validProtocolSemantics(p) {
+			return p
+		}
+	}
+	return nil
 }
 
 // minimize cuts p after its first entry call whose input resources all
@@ -181,6 +464,7 @@ func generatePrograms(target *prog.Target, req generateRequest) (generatedProgra
 	}
 	usable, _ := target.TransitivelyEnabledCalls(enabled)
 	entry := map[*prog.Syscall]bool{}
+	entryChains := map[*prog.Syscall][]*prog.Syscall{}
 	var entries []*prog.Syscall
 	for _, name := range req.Entry {
 		meta, err := lookup(name)
@@ -195,6 +479,11 @@ func generatePrograms(target *prog.Target, req generateRequest) (generatedProgra
 			entry[meta] = true
 			entries = append(entries, meta)
 		}
+		chain, err := resolveProtocolChain(target, meta, usable)
+		if err != nil {
+			return out, err
+		}
+		entryChains[meta] = chain
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	ct := target.BuildChoiceTable(nil, usable)
@@ -203,11 +492,27 @@ func generatePrograms(target *prog.Target, req generateRequest) (generatedProgra
 	for i, meta := range entries {
 		// A choice table of the entry call and the enabled constructors
 		// of its resources; minimize keeps what the entry call needs.
-		only := target.BuildChoiceTable(nil, constructors(meta, usable))
+		onlyCalls := constructors(meta, usable)
+		if len(entryChains[meta]) != 0 {
+			onlyCalls = map[*prog.Syscall]bool{}
+			for _, call := range entryChains[meta] {
+				onlyCalls[call] = true
+			}
+		}
+		only := target.BuildChoiceTable(nil, onlyCalls)
 		made := 0
 		for attempt := 0; made < req.Minimal && attempt < maxGenerateAttempts*req.Minimal; attempt++ {
 			rs := rand.NewSource(req.Seed + int64(i)<<32 + int64(attempt))
-			p := minimize(target.Generate(rs, req.MaxCalls, only), meta)
+			var p *prog.Prog
+			if chain := entryChains[meta]; len(chain) != 0 {
+				if len(chain) > req.MaxCalls {
+					return out, errors.New("protocol_chain_too_long: " + meta.Name)
+				}
+				p = generateProtocolProgram(target, chain,
+					req.Seed+int64(i)<<32+int64(attempt)*maxGenerateAttempts, only)
+			} else {
+				p = minimize(target.Generate(rs, req.MaxCalls, only), meta)
+			}
 			if p == nil {
 				continue
 			}
@@ -233,6 +538,22 @@ func generatePrograms(target *prog.Target, req generateRequest) (generatedProgra
 			p.Mutate(rand.NewSource(rnd.Int63()), req.MaxCalls, ct, nil, minimal)
 		}
 		if !callsAny(p, entry) {
+			out.WithoutEntry++
+			continue
+		}
+		validEntry := false
+		for meta, chain := range entryChains {
+			if !entry[meta] {
+				continue
+			}
+			for _, call := range p.Calls {
+				if call.Meta == meta && (len(chain) == 0 ||
+					(validRequiredProtocolChains(p) && validProtocolSemantics(p))) {
+					validEntry = true
+				}
+			}
+		}
+		if !validEntry {
 			out.WithoutEntry++
 			continue
 		}

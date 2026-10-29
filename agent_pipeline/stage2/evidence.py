@@ -25,6 +25,8 @@ campaign
     ``crash-log``                       syz-manager's crash log, when a VM
                                         crashed (its last executing programs)
     ``generation-coverage/<lane>.<g>``  published PCs per program generation
+    ``generation-execution/<lane>.<g>`` host execution attestation paired with
+                                        generation coverage
     ``journal/<segment>``               the VM's host journal segments
 replay
     ``execprog.replay``                 syz-execprog output of the window
@@ -42,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..journal_sink import SEGMENT_SUFFIX
 from ..q2 import ConsoleLogCompleteness, Q2CollectionWindow, VmTermination
+from ..q1 import ExecutionCorrelation
 from ..semantic_delta import SealedJournal
 from ..semantic_replay import InvalidReason, Termination
 
@@ -59,6 +62,8 @@ NEUTRAL_COVERAGE_ID = "neutral-coverage"
 NEUTRAL_COVERAGE_TYPE = "application/vnd.knfsd.remote-kcov-neutral+json"
 GENERATION_COVERAGE_PREFIX = "generation-coverage/"
 GENERATION_COVERAGE_TYPE = "application/vnd.knfsd.remote-kcov-generation+json"
+GENERATION_EXECUTION_PREFIX = "generation-execution/"
+GENERATION_EXECUTION_TYPE = "application/vnd.knfsd.nfs-proxy-execution+json"
 CRASH_LOG_ID = "crash-log"
 CRASH_LOG_TYPE = "text/vnd.knfsd.syz-crash-log"
 
@@ -68,6 +73,23 @@ JournalName = Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]{1,64}$")]
 class _Record(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True,
                               revalidate_instances="always")
+
+
+class GenerationExecution(_Record):
+    """Host-captured syz-manager result for one proxy generation."""
+
+    schema_version: Literal["generation-execution.v1"] = \
+        "generation-execution.v1"
+    correlation: ExecutionCorrelation
+    execution_id: int
+    program_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    program_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    activation: str
+    activation_status: int = Field(ge=0, le=2**32 - 1)
+    deactivation: str
+    deactivation_status: int = Field(ge=0, le=2**32 - 1)
+    executed: bool
+    lease_cleared: bool
 
 
 def journal_identity(segment_name: str) -> str:

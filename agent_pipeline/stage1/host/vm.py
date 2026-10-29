@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,11 +57,22 @@ class VmConfig:
 
 
 class QemuGuest:
+    _port_lock = threading.Lock()
+    _reserved_ports: set[int] = set()
+
     def __init__(self, config: VmConfig) -> None:
         self.config = config
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            self.port = reservation.getsockname()[1]
+        # The kernel can return the same unbound ephemeral port to concurrent
+        # guests before QEMU starts listening, so reserve it in-process too.
+        with self._port_lock:
+            while True:
+                with socket.socket() as reservation:
+                    reservation.bind(("127.0.0.1", 0))
+                    port = reservation.getsockname()[1]
+                if port not in self._reserved_ports:
+                    self._reserved_ports.add(port)
+                    self.port = port
+                    break
         common = ["-F", "/dev/null", "-o", "UserKnownHostsFile=/dev/null",
                   "-o", "StrictHostKeyChecking=no", "-o", "IdentitiesOnly=yes",
                   "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
@@ -137,10 +149,14 @@ class QemuGuest:
                        check=True)
 
     def stop(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=VM_STOP_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=VM_STOP_TIMEOUT_S)
+        try:
+            if self.process is not None and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=VM_STOP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=VM_STOP_TIMEOUT_S)
+        finally:
+            with self._port_lock:
+                self._reserved_ports.discard(self.port)

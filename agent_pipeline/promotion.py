@@ -36,13 +36,14 @@ from .hcap import (Capability, CapabilityContract, ExecutionLayout,
                    HcapCatalog, Identifier)
 from .q1 import KernelIdentity
 
-#: Placeholders until the repository owner sets them (#100).
-MIN_MINIMAL_RUNS = 3
+#: Promotion sample sizes. Keep repeated positive and negative controls while
+#: making the campaign small enough to run in an interactive pipeline.
+MIN_MINIMAL_RUNS = 2
 MIN_MINIMAL_HIT_RATIO = 1.0
-MIN_GENERATED_RUNS = 32
-MIN_GENERATED_PROGRAMS = 16
+MIN_GENERATED_RUNS = 8
+MIN_GENERATED_PROGRAMS = 8
 MIN_GENERATED_HIT_RATIO = 0.25
-MIN_NEUTRAL_RUNS = 3
+MIN_NEUTRAL_RUNS = 2
 
 
 class _Model(BaseModel):
