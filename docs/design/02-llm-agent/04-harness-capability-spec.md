@@ -896,8 +896,9 @@ semantic capability registry
 - 여기서 promoted는 M7 gate를 통과해 job이 binding한 `hcap_revision`에 pin됐다는 뜻이다. 그 revision은 promoted
   revision일 수도 있고 Harness Generation이 만든 staged revision(§1.1)일 수도 있다. staged revision이 semantic
   subset을 담으려면 M7 1단계(crash survival을 뺀 항목, `03-nfs-proxy/06` §30)를 통과해야 하고, pin은 crash survival
-  pending으로 표시된다. crash survival은 자연 crash로만 확인하며 인위적으로 crash를 만들지 않는다. 공유 HCAP으로
-  올리는 promotion은 그 확인(M7 2단계) 뒤에만 한다. subset을 사람이 구현했는지 생성했는지는 구분하지 않는다.
+  pending으로 표시된다. 인위적으로 crash를 만들지 않는다. 공유 HCAP으로 올리는 promotion은 M7 2단계를 통과한 뒤에만
+  한다. 2단계는 build의 delta durability 검사(host에서 crash 없이 확인)나 자연 crash를 근거로 하고, 자연 crash 재현은
+  subset마다 `observed`/`not_observed`로 HCAP-10 entry에 적는다(`03-nfs-proxy/06` §30). subset을 사람이 구현했는지 생성했는지는 구분하지 않는다.
 - path, operator, transform 목록을 이 문서나 Agent·Proxy 설계 문서에 복제하지 않는다.
 
 promotion된 subset이 아직 없으므로 semantic mutation HCAP entry도 아직 없다. registry 생성과 promotion gate는

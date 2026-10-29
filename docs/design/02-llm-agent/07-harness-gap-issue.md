@@ -350,7 +350,8 @@ mutation_engine이면: 생성한 semantic subset이 M7 1단계(staged pin, 03-nf
 mutation_engine의 crash survival(guest crash 직전 MutationDelta가 남는가)은 여기서 보지 않는다(위 pin이 pending으로
 남긴다). 이를 보려고
 guest를 일부러 crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지). 실제 campaign에서
-자연히 생긴 crash로만 확인하며, 그 전까지 subset은 staged에 머문다(§5.3).
+자연히 생긴 crash로만 확인한다. 공유 HCAP promotion의 근거는 build의 delta durability 검사(host, crash 없음)나
+자연 crash이고, 검사만 있으면 `natural_crash_reproduction: not_observed`로 promotion한다(§5.3, `03-nfs-proxy/06` §30).
 
 통과하면 Controller는 staged `hcap_revision`(status `staged`, `04` §1.1)과 build가 바뀌었으면 새
 ExecutionHarnessIdentity를 만든다. 이 revision은 promoted HCAP과 구분되며, 그 위에서 만든 plan, verdict,
@@ -402,7 +403,8 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
 6. **회귀와 트리거 기준.** 기존 capability 회귀(§5.2)와 트리거 기준(`04` §3.2)을 통과해야 한다.
 7. **Stage 2(mutation_engine).** probe 도달 대신 M1 APPLIED와 M7 gate 통과로 본다
    (`semantic_promotion.promote`, 그 결과로 만드는 semantic mutation 항목에는 contract가 없다). 이때도 후보 밖 program으로
-   본다. M7 2단계(자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를 통과할 때까지 promotion하지 않는다.
+   본다. M7 2단계(build의 delta durability 검사나 자연 crash로 얻은 crash survival 증거, 03-nfs-proxy/06 §30)를
+   통과할 때까지 promotion하지 않는다.
    사람이 구현한 subset과 같은 기준이다. 그 전까지 staged revision으로 job은 계속 진행하고 issue는 `resolved`가
    되지 않는다.
    - 구현: gate의 두 단계는 `semantic_promotion.pin`(crash survival pending)과 `promote`다. Runner 검증은 생성한

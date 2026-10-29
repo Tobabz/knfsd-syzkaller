@@ -30,6 +30,8 @@ from agent_pipeline.semantic_replay import (
     Termination, evaluate,
 )
 
+from agent_pipeline import live_probe
+
 from . import test_journal_live as live_mod
 from .test_journal_live import (
     CHANNEL, DIGEST, LANE, SESSION, VM, Live, _build_proxy, rule_set,
@@ -107,7 +109,8 @@ def _crash_log(first_generation: int) -> str:
 def _replay(binary, tmp, plan, script, monkeypatch) -> SealedJournal:
     # The Proxy is started with the plan's recorded bytes, not a rule set
     # built here, and records on a journal of its own.
-    monkeypatch.setattr(live_mod, "rule_set", lambda: plan.rule_set)
+    monkeypatch.setattr(live_probe, "rule_set",
+                        lambda schema_id=None: plan.rule_set)
     tmp.mkdir()
     journal = _journal(tmp / "journal", plan.rule_set)
     _run(binary, tmp, journal, script, crash=True)

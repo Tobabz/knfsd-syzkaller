@@ -29,6 +29,7 @@ from agent_pipeline.replay_runner import (
 )
 from agent_pipeline.semantic_delta import SealedJournal
 from agent_pipeline.semantic_promotion import (
+    RegistryError,
     UNPROMOTED_GAP_ID, GuestValidationRun, PromotedSemanticCapabilityRegistry,
     PromotionRefused, SemanticSubset, UnreproducibleCrash, ValidationItem,
     check_runtime, describe_rule_set, dynamic_originals, main, pin, promote,
@@ -39,6 +40,8 @@ from agent_pipeline.semantic_promotion import (
 from agent_pipeline.semantic_replay import (
     ReplayVerdict, Termination, evaluate,
 )
+
+from agent_pipeline import live_probe
 
 from . import test_journal_live as live_mod
 from .test_journal_live import VM, LANE, _build_proxy, _rule, _schema_id, _xdr_string
@@ -159,7 +162,7 @@ def test_describe_rules_uses_the_runtime_parser(proxy_binary, tmp_path):
 
 def _production(binary, tmp, rules: bytes):
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(live_mod, "rule_set", lambda: rules)
+        mp.setattr(live_probe, "rule_set", lambda schema_id=None: rules)
         journal = _journal(tmp / "journal", rules)
         # g1: slot 5 -> r1, slot 2 no match.  g2 (crash): slot 4 -> r1.
         _run(binary, tmp, journal, [(1, [5, 2]), (2, [4])], crash=True)
@@ -363,6 +366,132 @@ def test_a_crash_without_its_delta_refuses_the_subset(build, run, store):
         lost, build, subset(), crash=False)
 
 
+def _durability(store, build, **change) -> str:
+    """A ``DeltaDurabilityCheck`` for ``build``, as the host probe writes it."""
+    from agent_pipeline.delta_durability import DeltaDurabilityCheck
+    facts = dict(proxy_sha256=build.proxy_sha256,
+                 registry_digest=build.registry_digest, exposures=1,
+                 mutated_forwards=1, intent_before_forward=True,
+                 cuts_checked=40, prefix_keeps_exposure=True)
+    return put_record(store, DeltaDurabilityCheck(**{**facts, **change}))
+
+
+def test_a_durability_check_promotes_without_a_natural_crash(build, run, store):
+    clean = put_record(store, _ended(run))
+    check = _durability(store, build)
+    promoted = promote(store, build, subset(), (clean,), durability_ref=check)
+    (entry,) = promoted.subsets
+    assert entry.crash_survival == "passed" and promoted.pending == ()
+    assert entry.natural_crash_reproduction == "not_observed"
+    assert promoted.not_observed == (subset().subset_id,)
+    assert entry.durability_ref == check
+    assert entry.validation_items == required_items(
+        subset(), crash=False, durability=True)
+    assert ValidationItem.DELTA_DURABILITY in entry.validation_items
+    assert ValidationItem.DELTA_CRASH_SURVIVAL not in entry.validation_items
+    ref = put_record(store, promoted)
+    assert load_record(store, ref, PromotedSemanticCapabilityRegistry) == promoted
+    # Without the check the same run is still refused.
+    with pytest.raises(PromotionRefused, match="did not end in a guest crash"):
+        promote(store, build, subset(), (clean,))
+
+
+def test_a_natural_crash_beside_the_check_is_observed(build, run, store):
+    check = _durability(store, build)
+    promoted = promote(store, build, subset(), (put_record(store, run),),
+                       durability_ref=check)
+    (entry,) = promoted.subsets
+    assert entry.natural_crash_reproduction == "observed"
+    assert promoted.not_observed == ()
+    assert entry.durability_ref == check
+    assert entry.validation_items == tuple(sorted(
+        {*required_items(subset(), crash=False, durability=True),
+         ValidationItem.DELTA_CRASH_SURVIVAL}, key=lambda i: i.value))
+    dumped = promoted.model_dump(mode="json")["subsets"][0]
+    assert "natural_crash_reproduction" not in dumped
+
+
+def test_a_subset_without_a_check_keeps_its_earlier_bytes(build, run, store):
+    promoted = promote(store, build, subset(), (put_record(store, run),))
+    dumped = promoted.model_dump(mode="json")["subsets"][0]
+    assert not {"crash_survival", "natural_crash_reproduction",
+                "durability_ref"} & set(dumped)
+
+
+@pytest.mark.parametrize("change, reason", [
+    ({"intent_before_forward": False}, "EXPOSURE_INTENT was stored"),
+    ({"prefix_keeps_exposure": False}, "lost an exposure"),
+    ({"proxy_sha256": "9" * 64}, "another Proxy build"),
+])
+def test_a_failed_or_foreign_durability_check_refuses(build, run, store,
+                                                      change, reason):
+    check = _durability(store, build, **change)
+    with pytest.raises(PromotionRefused, match=reason):
+        promote(store, build, subset(), (put_record(store, _ended(run)),),
+                durability_ref=check)
+
+
+def test_a_crash_without_its_delta_is_refused_beside_the_check(build, run, store):
+    lost = _ended(run, Termination.GUEST_CRASH, delta=False)
+    ref = put_record(store, lost)
+    with pytest.raises(PromotionRefused) as refused:
+        promote(store, build, subset(), (ref,),
+                durability_ref=_durability(store, build))
+    assert refused.value.unreproducible == (ref,)
+
+
+def test_a_natural_crash_upgrades_a_not_observed_subset(build, run, store):
+    check = _durability(store, build)
+    clean = put_record(store, _ended(run))
+    first = promote(store, build, subset(), (clean,), durability_ref=check)
+    crashed = put_record(store, run)
+    upgraded = promote(store, build, subset(), (crashed,), first)
+    (entry,) = upgraded.subsets
+    assert entry.natural_crash_reproduction == "observed"
+    assert entry.durability_ref == check
+    assert entry.evidence_refs == tuple(sorted((clean, crashed)))
+    # Observed stays observed when the check is given again with new runs.
+    again = promote(store, build, subset(), (clean,), upgraded,
+                    durability_ref=check)
+    assert again.subsets[0].natural_crash_reproduction == "observed"
+
+
+def test_the_check_promotes_a_pinned_subset(build, run, store):
+    clean = put_record(store, _ended(run))
+    pinned = pin(store, build, subset(), (clean,))
+    promoted = promote(store, build, subset(), (clean,), pinned,
+                       durability_ref=_durability(store, build))
+    assert promoted.pending == ()
+    assert promoted.not_observed == (subset().subset_id,)
+
+
+def test_not_observed_needs_a_durability_check():
+    from pydantic import ValidationError
+    from agent_pipeline.semantic_promotion import PromotedSubset
+    with pytest.raises(ValidationError, match="durability check"):
+        PromotedSubset(subset=subset(), validation_items=required_items(
+            subset(), crash=False), evidence_refs=("a" * 64,),
+            natural_crash_reproduction="not_observed")
+
+
+def test_the_hcap_entry_says_no_natural_crash_was_observed(build, run, store):
+    check = _durability(store, build)
+    promoted = promote(store, build, subset(),
+                       (put_record(store, _ended(run)),), durability_ref=check)
+    catalog = with_semantic_capability(_catalog(),
+                                       put_record(store, promoted), promoted)
+    entry = next(c for c in catalog.capabilities if c.id == "HCAP-10")
+    assert any("Natural crash reproduction not observed" in c
+               for c in entry.constraints)
+    assert check in entry.evidence_refs
+    # An observed subset says nothing of the kind.
+    observed = promote(store, build, subset(), (put_record(store, run),))
+    plain = with_semantic_capability(_catalog(), put_record(store, observed),
+                                     observed)
+    assert not any("not observed" in c for cap in plain.capabilities
+                   if cap.id == "HCAP-10" for c in cap.constraints)
+
+
 def test_a_pending_subset_marks_its_hcap_revision_staged(build, run, store):
     pinned = pin(store, build, subset(), (put_record(store, _ended(run)),))
     ref = put_record(store, pinned)
@@ -564,3 +693,39 @@ def test_cli_records_and_promotes(proxy_binary, build, tmp_path, capsys):
         mode="json")))
     assert main(["promote", "--store", str(store_dir), "--build", build_ref,
                  "--subset", str(subset_path), "--run", run_ref, "--hcap", hcap_ref]) == 3
+
+
+def test_cli_durability_then_promote_without_a_natural_crash(
+        proxy_binary, build, run, tmp_path, capsys):
+    store_dir = tmp_path / "artifacts"
+    store = ArtifactStore(store_dir)
+    subset_path = tmp_path / "subset.json"
+    subset_path.write_text(json.dumps(subset().model_dump(mode="json")))
+    assert main(["registry", "--proxy", str(proxy_binary),
+                 "--store", str(store_dir)]) == 0
+    build_ref = capsys.readouterr().out.split()[0].removeprefix("build=")
+    assert main(["durability", "--proxy", str(proxy_binary),
+                 "--store", str(store_dir)]) == 0
+    out = dict(item.split("=") for item in capsys.readouterr().out.split())
+    assert out["passed"] == "true" and int(out["cuts"]) > 20
+    clean_ref = put_record(store, _ended(run))
+    hcap_ref = put_record(store, _catalog())
+    args = ["--store", str(store_dir), "--build", build_ref, "--subset",
+            str(subset_path), "--run", clean_ref, "--hcap", hcap_ref]
+    # No natural crash, no check: refused.
+    assert main(["promote", *args]) == 3
+    capsys.readouterr()
+    assert main(["promote", *args, "--durability", out["durability"]]) == 0
+    done = dict(item.split("=") for item in capsys.readouterr().out.split())
+    catalog = ArtifactHcapChecker(store).load_catalog(done["hcap_revision"])
+    promoted = promoted_registry(store, catalog)
+    assert promoted.not_observed == (subset().subset_id,)
+    assert promoted.pending == ()
+
+
+def test_cli_durability_refuses_a_binary_without_a_registry(tmp_path):
+    fake = tmp_path / "nfs-proxy"
+    fake.write_text("#!/bin/sh\nexit 1\n")
+    fake.chmod(0o755)
+    with pytest.raises(RegistryError):
+        main(["durability", "--proxy", str(fake), "--store", str(tmp_path / "s")])

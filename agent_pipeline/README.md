@@ -223,7 +223,11 @@ and obtains exact selector values and canonical operation paths only through
 the bounded `lookup_semantic_paths` view of those promoted schemas.
 `semantic_promotion.py` is the M7 gate that promotes them from KVM
 validation runs (`tools/nfs-proxy/README.md` "Capability registry and
-promotion"), and its `rule_set_scope` is the Compiler's scope check.
+promotion"), and its `rule_set_scope` is the Compiler's scope check. A run
+need not be a natural guest crash when the Proxy build passed the host-side
+`DeltaDurabilityCheck` (`delta_durability.py`, driven through the loopback
+harness in `live_probe.py`, no guest crash): the subset is then promoted
+with `natural_crash_reproduction: not_observed`.
 
 `rule_compiler.py` is the Mutation Rule Compiler (08 §12 "구현"). It reads
 the HCAP revision's promoted registry, requires the configured Proxy binary

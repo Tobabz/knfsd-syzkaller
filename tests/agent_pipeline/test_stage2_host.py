@@ -444,6 +444,24 @@ def test_a_shared_binding_takes_no_pending_subset(tmp_path):
         _shared_registry(store, HcapCatalog(capabilities=(), missing_capability_ids=()), "a" * 64)
 
 
+def test_a_shared_binding_takes_a_subset_promoted_on_the_durability_check(
+        tmp_path):
+    # #142: not_observed is promoted, unlike a staged pin: the preflight's
+    # authority check passes and the HCAP-10 entry says no crash was seen.
+    store = ArtifactStore(tmp_path / "cas")
+    _, promoted = _build()
+    unobserved = promoted.model_copy(update={"subsets": tuple(
+        s.model_copy(update={"natural_crash_reproduction": "not_observed",
+                             "durability_ref": "d" * 64})
+        for s in promoted.subsets)})
+    catalog = with_semantic_capability(
+        HcapCatalog(capabilities=(), missing_capability_ids=()),
+        put_record(store, unobserved), unobserved)
+    assert _shared_registry(store, catalog, "a" * 64) == unobserved
+    entry = next(c for c in catalog.capabilities if c.id == "HCAP-10")
+    assert any("not observed" in c for c in entry.constraints)
+
+
 def test_operator_start_and_placeholder_thresholds_are_warnings():
     checks = _Checks()
     _check_policies((policy(),), checks)
