@@ -152,6 +152,20 @@ def test_legacy_attribution_error_is_migrated_to_campaign_warning(
     assert decision.attribution_warnings == (legacy,)
 
 
+def test_verdict_without_attribution_keeps_its_earlier_id(sample):
+    # The id main computed for this evidence before attribution existed.
+    decision = evaluate(sample)
+    assert decision.attribution_quality == "none"
+    assert decision.verdict_id == (
+        "6a43a1c394bd0c3b97752d683993222788580757fc64570f419f95dab6f5220e")
+    assert "attribution_quality" not in decision.as_result().model_dump(
+        mode="json")
+    graded = evaluate(with_evidence(
+        sample, attribution_quality="campaign",
+        attribution_warnings=("exact_generation_unavailable",)))
+    assert graded.verdict_id != decision.verdict_id
+
+
 def test_legacy_foreign_execution_is_ambiguous_but_still_observed(sample):
     legacy = "foreign_program_execution:19"
     inputs = with_evidence(

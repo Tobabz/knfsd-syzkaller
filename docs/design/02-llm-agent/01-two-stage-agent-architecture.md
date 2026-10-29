@@ -660,6 +660,13 @@ sanitizer/crash oracle로 판정하되, crash site나 stack이 candidate 경로 
 human/root-cause review를 묶어 나중에 평가한다. "stack에 candidate symbol이 있음" 같은 deterministic
 heuristic은 triage metadata로만 기록하며 oracle verdict가 아니다.
 
+Q2 결과는 crash의 귀속 정도를 `attribution_quality`(`exact`: 마지막 crash-context entry가 생성한 execution 하나와
+정확히 맞음, `campaign`: campaign 안에서만 확인됨, `ambiguous`: 승인된 program이 아닌 실행이나 여러 lane이 섞임,
+`none`: report 없음)와 진단용 `attribution_warnings`로 따로 기록한다. 귀속이 부족해도 분류된 report가 있으면
+`OBSERVED`이고, 그 사실이 `invalid_evidence`가 되지 않는다. 아래 판정 순서 1행의 "내부 모순"은 증거 무결성과
+collector 일관성 실패만 뜻한다. replay와 minimization은 `exact`일 때 쓰고, 그 밖의 귀속은 crash 보존과 campaign 수준의
+mutation context 용도다. 귀속 값이 없는 증거의 `verdict_id`와 직렬화는 이 필드가 생기기 전과 같다.
+
 ### 8.1 CrashContextWindow
 
 lane의 knfsd state(client, session, open/lock state)는 program 사이에 유지된다. generation G의

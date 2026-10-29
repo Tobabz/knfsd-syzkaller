@@ -282,8 +282,10 @@ class Q2Evidence(_Record):
     collection_window: Q2CollectionWindow
     internal_errors: tuple[Text, ...] = ()
     candidate_association: CandidateAssociation | None = None
-    attribution_quality: AttributionQuality = "none"
-    attribution_warnings: tuple[Text, ...] = ()
+    attribution_quality: AttributionQuality = Field(
+        default="none", exclude_if=lambda value: value == "none")
+    attribution_warnings: tuple[Text, ...] = Field(
+        default=(), exclude_if=lambda value: not value)
 
 
 class Q2Input(_Record):
@@ -317,8 +319,10 @@ class Q2Result(_Record):
     signals: tuple[Q2Signal, ...]
     vm_termination: VmTermination
     candidate_association: CandidateAssociation | None = None
-    attribution_quality: AttributionQuality = "none"
-    attribution_warnings: tuple[Text, ...] = ()
+    attribution_quality: AttributionQuality = Field(
+        default="none", exclude_if=lambda value: value == "none")
+    attribution_warnings: tuple[Text, ...] = Field(
+        default=(), exclude_if=lambda value: not value)
 
 
 class Q2Decision(_Record):
@@ -336,8 +340,10 @@ class Q2Decision(_Record):
     signals: tuple[Q2Signal, ...]
     vm_termination: VmTermination
     candidate_association: CandidateAssociation | None
-    attribution_quality: AttributionQuality = "none"
-    attribution_warnings: tuple[Text, ...] = ()
+    attribution_quality: AttributionQuality = Field(
+        default="none", exclude_if=lambda value: value == "none")
+    attribution_warnings: tuple[Text, ...] = Field(
+        default=(), exclude_if=lambda value: not value)
     observations: tuple[Text, ...]
 
     def as_result(self) -> Q2Result:
@@ -402,7 +408,8 @@ def evaluate(inputs: Q2Input) -> Q2Decision:
             observations=(diagnostic,),
         )
         identity_fields = {
-            **fields,
+            **{key: value for key, value in fields.items()
+               if not key.startswith("attribution_")},
             "correlation": data.expected_correlation.model_dump(mode="json"),
             "status": status.value,
             "signals": tuple(item.model_dump(mode="json") for item in signals),
@@ -410,9 +417,12 @@ def evaluate(inputs: Q2Input) -> Q2Decision:
                 evidence.candidate_association.model_dump(mode="json")
                 if evidence.candidate_association is not None else None
             ),
-            "attribution_quality": attribution_quality,
-            "attribution_warnings": attribution_warnings,
         }
+        # Attribution joins the identity only when there is some, so a
+        # verdict on evidence without it keeps the id it always had.
+        if attribution_quality != "none" or attribution_warnings:
+            identity_fields["attribution_quality"] = attribution_quality
+            identity_fields["attribution_warnings"] = attribution_warnings
         return Q2Decision(verdict_id=_digest(identity_fields), **fields)
 
     def inconclusive(reason: str, diagnostic: str) -> Q2Decision:
