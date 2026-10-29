@@ -129,6 +129,10 @@ class NfsProxyExecution(BaseModel):
         max_length=1 << 20)
 
 
+CampaignMode = Literal["fuzz", "proxy_only"]
+CAMPAIGN_MODES = ("fuzz", "proxy_only")
+
+
 @dataclass(frozen=True)
 class StepOptions:
     #: The manager config; None when ``variant_managers`` picks one.
@@ -142,8 +146,16 @@ class StepOptions:
     #: (sanitizer, manager config) pairs of a host with several variants
     #: (#81 D10): a lease runs the manager of its descriptor's sanitizer.
     variant_managers: tuple[tuple[Sanitizer, Path], ...] = ()
+    #: ``fuzz``: syz-manager mutates programs and the Proxy applies the rule
+    #: set (01 §8).  ``proxy_only``: the manager replays the approved
+    #: program unchanged and only the Proxy mutates, so every execution
+    #: belongs to one program.
+    campaign_mode: CampaignMode = "fuzz"
 
     def __post_init__(self) -> None:
+        if self.campaign_mode not in CAMPAIGN_MODES:
+            raise ValueError(
+                f"campaign_mode must be one of {sorted(CAMPAIGN_MODES)}")
         if (self.manager is None) == (not self.variant_managers):
             raise ValueError("give one manager or variant managers")
         sanitizers = [sanitizer for sanitizer, _ in self.variant_managers]
@@ -684,10 +696,14 @@ def _seedless_syzkaller(source: Path, work: Path) -> Path:
     return view
 
 
-def _manager_command(binary: Path, config: Path) -> list[str]:
-    """Run only corpus records, without syzkaller program mutation."""
-    return [str(binary), "-config", str(config),
-            "-mode", "corpus-run", "-debug"]
+def _manager_command(binary: Path, config: Path,
+                     mode: CampaignMode = "fuzz") -> list[str]:
+    """``proxy_only`` runs only corpus records, without syzkaller program
+    mutation."""
+    command = [str(binary), "-config", str(config)]
+    if mode == "proxy_only":
+        command += ["-mode", "corpus-run"]
+    return [*command, "-debug"]
 
 
 def _foreign_campaign_execution(
@@ -1283,12 +1299,16 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     spool.mkdir()
     program = (inputs.root / "program.syz").read_bytes()
     program_sha256 = hashlib.sha256(program).hexdigest()
-    # Only the Proxy mutates this campaign. Keep syzkaller on the approved
-    # program so both mutation layers cannot mix in one generation.
-    manager["syzkaller"] = str(_seedless_syzkaller(
-        Path(str(manager["syzkaller"])), work))
-    manager["reproduce"] = False
-    manager["enable_syscalls"] = program_calls(program)
+    proxy_only = options.campaign_mode == "proxy_only"
+    if proxy_only:
+        # Only the Proxy mutates this campaign.  Keep syzkaller on the
+        # approved program so both mutation layers cannot mix in one
+        # generation.  The manager runs a narrower config than the one
+        # preflight checked: the program's own calls only.
+        manager["syzkaller"] = str(_seedless_syzkaller(
+            Path(str(manager["syzkaller"])), work))
+        manager["reproduce"] = False
+        manager["enable_syscalls"] = program_calls(program)
     _corpus(workdir / "corpus.db", program)
     vm = _vm_id(inputs.execution, "campaign")
     prefixes = tuple(f"cl{lane}-{uuid.uuid4().hex}"
@@ -1316,7 +1336,7 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         try:
             with manager_log.open("wb") as log:
                 process = subprocess.Popen(
-                    _manager_command(manager_binary, config),
+                    _manager_command(manager_binary, config, options.campaign_mode),
                     stdin=subprocess.DEVNULL, stdout=log,
                     stderr=subprocess.STDOUT, start_new_session=True)
                 deadline = time.monotonic() + options.campaign_timeout_s
@@ -1324,8 +1344,8 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
                     records = _spool(spool)
                     _, campaign_records = _campaign_records(records)
                     reports, crash_log = _crash_files(workdir)
-                    if (_foreign_campaign_execution(records, program_sha256)
-                            is not None or
+                    if (proxy_only and _foreign_campaign_execution(
+                            records, program_sha256) is not None or
                             len(campaign_records) >= options.campaign_executions or
                             reports or crash_log is not None):
                         break

@@ -220,6 +220,26 @@ def test_direct_execprog_slowdown_is_explicit_and_bounded(tmp_path):
         )
 
 
+def test_campaign_mode_defaults_to_fuzz_and_runs_the_manager_to_match(tmp_path):
+    from agent_pipeline.stage2.kvm import _manager_command
+    options = StepOptions(
+        manager=tmp_path / "manager.json",
+        collector=tmp_path / "collector.json")
+    assert options.campaign_mode == "fuzz"
+    binary, config = Path("/bin/syz-manager"), Path("/m.json")
+    assert _manager_command(binary, config) == [
+        str(binary), "-config", str(config), "-debug"]
+    assert _manager_command(binary, config, "proxy_only") == [
+        str(binary), "-config", str(config), "-mode", "corpus-run",
+        "-debug"]
+    with pytest.raises(ValueError, match="campaign_mode"):
+        StepOptions(
+            manager=tmp_path / "manager.json",
+            collector=tmp_path / "collector.json",
+            campaign_mode="corpus",
+        )
+
+
 def test_a_lease_runs_the_manager_of_its_variant(tmp_path):
     # #81 D10: a host with several variants names one manager each.
     kasan, kcsan = tmp_path / "kasan.json", tmp_path / "kcsan.json"
@@ -365,7 +385,7 @@ kernel console output (not intermixed with test programs):
     assert warnings == ()
 
 
-def test_campaign_manager_runs_only_the_approved_corpus(tmp_path):
+def test_proxy_only_campaign_manager_runs_only_the_approved_corpus(tmp_path):
     source = tmp_path / "syzkaller"
     (source / "bin").mkdir(parents=True)
     (source / "sys/linux/test").mkdir(parents=True)
@@ -374,7 +394,7 @@ def test_campaign_manager_runs_only_the_approved_corpus(tmp_path):
     assert (view / "bin").resolve() == (source / "bin").resolve()
     assert list((view / "sys/linux/test").iterdir()) == []
     assert _manager_command(tmp_path / "syz-manager",
-                            tmp_path / "manager.json") == [
+                            tmp_path / "manager.json", "proxy_only") == [
         str(tmp_path / "syz-manager"), "-config",
         str(tmp_path / "manager.json"), "-mode", "corpus-run", "-debug"]
 

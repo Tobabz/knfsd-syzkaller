@@ -504,7 +504,13 @@ class Stage2BackendSpec(_Spec):
     resource_key: str | None = Field(default=None, min_length=1,
                                      max_length=256)
     timeout_s: float = Field(default=86_400, gt=0, le=86_400)
-    #: ``step --campaign-executions``.
+    #: ``step --campaign-mode``.  ``fuzz`` (01 §8): syz-manager mutates
+    #: programs and the Proxy applies the rule set.  ``proxy_only``: the
+    #: manager replays the approved program unchanged and only the Proxy
+    #: mutates, which attributes every execution to one program.
+    campaign_mode: Literal["fuzz", "proxy_only"] = "fuzz"
+    #: ``step --campaign-executions``.  At most 96: each generation seals a
+    #: coverage and an execution artifact, and a segment holds 255.
     campaign_executions: int = Field(default=96, ge=1, le=96)
     #: At most ``stage2.nfs_proxy_window``.
     crash_window_bound: int = Field(default=4, ge=1, le=64)
@@ -1767,6 +1773,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             argv=(python, "-m", "agent_pipeline.stage2.host", "step",
                   *chosen, "--collector", str(collector_path),
                   "--campaign-executions", str(backend.campaign_executions),
+                  *(("--campaign-mode", backend.campaign_mode)
+                    if backend.campaign_mode != "fuzz" else ()),
                   "{input}", "{output}"),
             cwd=REPO, env=command_env,
             resource_key=backend.resource_key or spec.engine.resource_key,

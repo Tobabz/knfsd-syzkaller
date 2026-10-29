@@ -1961,6 +1961,19 @@ def _with_backend(host, *, mutate=True, **backend):
 
 
 @needs_gcc
+def test_stage2_backend_campaign_mode_is_passed_only_when_not_fuzz(host):
+    _with_backend(host, campaign_mode="proxy_only")
+    argv = Stage1Config.load(generate(host.spec).stage1_config).stage2.argv
+    assert argv[argv.index("--campaign-mode") + 1] == "proxy_only"
+    _with_backend(host, campaign_mode="fuzz")
+    argv = Stage1Config.load(generate(host.spec).stage1_config).stage2.argv
+    assert "--campaign-mode" not in argv
+    _with_backend(host, campaign_mode="corpus")
+    with pytest.raises(ValidationError):
+        generate(host.spec)
+
+
+@needs_gcc
 def test_generate_writes_the_stage2_backend_for_a_mutate_policy(host):
     # #81 D16: stage2.backend sets Stage1Config.stage2 and nfs_proxy.
     from agent_pipeline.m1 import M1JudgeProfile

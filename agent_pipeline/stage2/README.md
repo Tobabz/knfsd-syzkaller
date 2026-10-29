@@ -118,6 +118,13 @@ must not exceed syzkaller's `experimental.nfs_proxy_window`.
 The step command limits one syz-manager invocation to 96 completed programs
 by default so its paired coverage and execution artifacts fit the 255-artifact
 segment bound.
+`--campaign-mode` is `fuzz` by default: syz-manager mutates programs and the
+Proxy applies the rule set (design 01 §8). `proxy_only` runs the manager with
+`-mode corpus-run`, a seedless syzkaller view, `reproduce: false` and
+`enable_syscalls` narrowed to the approved program's calls, so only the Proxy
+mutates; the first execution of any other program ends the campaign. Both
+modes stop at 96 executions: each generation seals a coverage and an execution
+artifact, and a segment holds 255.
 The Controller starts further campaign tasks until policy routes the job.
 `--exec-slowdown` is the bounded syz-execprog slowdown for direct gate and
 replay guests. Left out, it is the collector's `exec_slowdown`: 1 under KVM,
@@ -170,7 +177,7 @@ it, generation writes both, so a mutate policy can be generated:
 build. The step command is `agent_pipeline.stage2.host step` with the
 generated manager (`--manager`), or one `--variant-manager SANITIZER=PATH`
 per variant, and a lease runs the manager of its descriptor's sanitizer.
-`campaign_executions` (96), `timeout_s` (86400), `crash_window_bound` (4,
+`campaign_mode` (`fuzz`, or `proxy_only`), `campaign_executions` (96), `timeout_s` (86400), `crash_window_bound` (4,
 at most `nfs_proxy_window`) and `resource_key` (the engine's) may be set.
 The judge profiles default to `M1JudgeProfile` `m1-default`/1,
 `q2.default_q2_profile()` and `ReplayJudgeProfile` `replay-default`/1,

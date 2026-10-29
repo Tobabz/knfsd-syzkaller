@@ -808,6 +808,12 @@ def main(argv: list[str] | None = None) -> int:
                                "lease runs its harness's (repeatable)")
     step.add_argument("--collector", type=Path, required=True)
     step.add_argument("--campaign-executions", type=int, default=96)
+    step.add_argument("--campaign-mode", choices=("fuzz", "proxy_only"),
+                      default="fuzz",
+                      help="fuzz: syz-manager mutates programs and the "
+                           "Proxy applies rules; proxy_only: the manager "
+                           "replays the approved program and only the "
+                           "Proxy mutates")
     step.add_argument("--campaign-timeout", type=float, default=1800)
     step.add_argument("--manager-stop-timeout", type=float, default=45)
     step.add_argument("--exec-slowdown", type=int, default=None,
@@ -821,6 +827,7 @@ def main(argv: list[str] | None = None) -> int:
         run_step(StepOptions(
             manager=args.manager, collector=args.collector,
             campaign_executions=args.campaign_executions,
+            campaign_mode=args.campaign_mode,
             campaign_timeout_s=args.campaign_timeout,
             manager_stop_timeout_s=args.manager_stop_timeout,
             exec_slowdown=args.exec_slowdown,
