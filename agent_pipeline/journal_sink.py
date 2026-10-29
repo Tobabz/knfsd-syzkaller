@@ -1218,10 +1218,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     rule_set_id = hashlib.sha256(session["rule_set"]).hexdigest()  # type: ignore[arg-type]
     server = ChannelServer(args.socket, journal, ChannelIdentity(args.vm, args.channel))
-    print(f"journal sink ready: {state} {named} "
-          f"rule_set_id={rule_set_id} socket={args.socket}", flush=True)
+    # Before "ready": whoever reads that line may signal at once.
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    print(f"journal sink ready: {state} {named} "
+          f"rule_set_id={rule_set_id} socket={args.socket}", flush=True)
     try:
         stop.wait()
     except KeyboardInterrupt:
