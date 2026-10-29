@@ -190,12 +190,13 @@ The promoted semantic subset is HCAP-10 of the bound HCAP revision.
 that `python -m agent_pipeline.semantic_promotion promote` printed
 (`promoted=REF`, `tools/nfs-proxy/README.md` "Capability registry and
 promotion"), run with `--store` on this spec's `artifact_root`. Generation
-refuses a registry for another Proxy build than `nfs_proxy`, one with a
-subset pinned with crash survival pending (`pin`), and an HCAP-10 among the
-spec's `capabilities`. Every variant's HCAP then carries the registry as
+refuses a registry for another Proxy build than `nfs_proxy` and an HCAP-10
+among the spec's `capabilities`. A registry with a subset pinned with crash
+survival pending (`pin`) is carried; the `preflight` reports an
+`unpromoted_semantic` warning for it (#144). Every variant's HCAP then carries the registry as
 HCAP-10, and `generated.json` records it under `stage2_semantic_registry`.
-Without it the HCAP has no HCAP-10: the preflight's `authority` check fails
-("has no promoted semantic subset"), and a rule set no promoted subset
+Without it the HCAP has no HCAP-10: the preflight warns
+("pins no promoted semantic subset"), and a rule set no promoted subset
 covers is a `mutation_engine` gap, which Harness Generation fills (07 §5).
 A subset promoted on the build's durability check (`promote --durability`,
 `natural_crash_reproduction: not_observed`) passes the `authority` check like

@@ -2086,11 +2086,17 @@ def test_stage2_backend_carries_the_promoted_semantic_registry(host):
 
 
 @needs_gcc
+def test_stage2_backend_takes_a_pending_semantic_registry(host):
+    # #144: a staged pin is carried; the Stage 2 preflight warns.
+    proxy = _with_backend(host)
+    ref = _promoted_for(proxy, pending=True)
+    _with_backend(host, semantic_registry=ref)
+    assert generate(host.spec).digests["stage2_semantic_registry"] == ref
+
+
+@needs_gcc
 def test_stage2_backend_semantic_registry_errors(host):
     proxy = _with_backend(host)
-    _with_backend(host, semantic_registry=_promoted_for(proxy, pending=True))
-    with pytest.raises(GenerationError, match="crash survival pending"):
-        generate(host.spec)
     ref = _promoted_for(proxy)
     proxy.write_text("#!/bin/sh\n# another build\n")
     _with_backend(host, semantic_registry=ref)

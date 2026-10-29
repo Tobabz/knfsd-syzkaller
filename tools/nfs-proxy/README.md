@@ -527,8 +527,8 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
 6. Pin (06 §30 stage 1): `python -m agent_pipeline.semantic_promotion pin` with the arguments of
    `promote` below checks everything but crash survival and prints `pinned=REF hcap_revision=REF`.
    The registry marks the subset `crash_survival: pending`, and the HCAP-10 entry says the revision
-   is staged. Bind it only to a staged harness: the Stage 2 preflight refuses a configured binding
-   whose HCAP pins a pending subset. Jobs on the staged harness use the subset; their campaigns are
+   is staged. A configured binding whose HCAP pins a pending subset still runs: the Stage 2 preflight
+   reports an `unpromoted_semantic` warning instead of refusing it. Jobs on the staged harness use the subset; their campaigns are
    where the natural crash of step 3 comes from.
 7. Promote (stage 2): `python -m agent_pipeline.semantic_promotion promote --store ARTIFACTS --build REF
    --subset SUBSET.json --run REF [--run REF ...] --hcap HCAP_REVISION [--previous PROMOTED_REF]

@@ -409,7 +409,7 @@ Harness Generation이 만든 capability에 똑같이 적용한다. host spec에�
    되지 않는다.
    - 구현: gate의 두 단계는 `semantic_promotion.pin`(crash survival pending)과 `promote`다. Runner 검증은 생성한
      subset을 pin한다(§5.2). staged harness의 Stage 2 campaign은 staged 파일로 syz-manager를 띄운다
-     (`stage2/kvm.py`). 공유 binding의 HCAP에 pending subset이 있으면 Stage 2 preflight가 거부한다.
+     (`stage2/kvm.py`). 공유 binding의 HCAP에 pending subset이 있으면 Stage 2 preflight가 `unpromoted_semantic` warning을 남긴다(#144).
    - Controller의 M7 2단계: 통과한 mutation_engine generation은 `semantic` promotion을 만든다. probe campaign과
      후보 program 보류는 없고, staged revision의 pending subset마다 항목 하나를 둔다(`collecting`). staged
      binding의 job이 Stage 2 campaign의 자연 crash를 replay해 판정을 받으면(`crash_review`나 replay evidence

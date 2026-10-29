@@ -1116,8 +1116,9 @@ Harness Capability Specification을 갱신한다(§21).
   끝났다면 crash cut의 MutationDelta가 있어야 한다. 통과한 subset은 `PromotedSubset.crash_survival: pending`으로
   기록되고(passed이면 필드를 쓰지 않아 이전 registry의 digest가 그대로다), `with_semantic_capability`의 HCAP-10
   entry는 그 revision이 staged라고 적는다. `promoted_registry`는 pending subset을 그 표시와 함께 돌려주므로 그
-  revision을 binding한 job은 subset을 쓴다. 설정된(공유) binding의 HCAP이 pending subset을 pin하면 Stage 2
-  preflight가 거부한다. `promote`에 `previous`로 pin한 registry를 주면 자연 crash run으로 pending subset을 passed로
+  revision을 binding한 job은 subset을 쓴다. 설정된(공유) binding의 HCAP이 pending subset을 pin해도 Stage 2
+  preflight는 거부하지 않고 `unpromoted_semantic` warning을 남긴다(#144). 그 결과는 HCAP-10 entry의 staged 표시와
+  함께 기록되고 READY 판정은 그대로다. `promote`에 `previous`로 pin한 registry를 주면 자연 crash run으로 pending subset을 passed로
   올리고 pin의 evidence를 유지한다. 이미 promotion된 subset은 다시 pin하지 않는다. 자연 crash에서 MutationDelta가
   남지 않은 run이 있으면 두 gate 모두 subset을 거부하고 CLI는 그 run들을 `UnreproducibleCrash`로 기록한다.
   CLI는 `pin`, `promote`다.
