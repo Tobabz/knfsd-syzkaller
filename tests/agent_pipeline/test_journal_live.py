@@ -150,7 +150,18 @@ def proxy_binary_faults(tmp_path_factory) -> Path:
     return _build_proxy(tmp_path_factory, "-DNFSP_TARGET_FAULT_INJECT")
 
 
+_PROXY_BUILDS: dict[tuple[str, ...], Path] = {}
+
+
 def _build_proxy(tmp_path_factory, *defines: str) -> Path:
+    """One build per define set per process: the sanitized build takes ~13 s
+    and several modules ask for the same binary (it is only ever executed)."""
+    if defines not in _PROXY_BUILDS:
+        _PROXY_BUILDS[defines] = _compile_proxy(tmp_path_factory, *defines)
+    return _PROXY_BUILDS[defines]
+
+
+def _compile_proxy(tmp_path_factory, *defines: str) -> Path:
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if cc is None:
         pytest.fail("a C compiler is required to build the Proxy")
