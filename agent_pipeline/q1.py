@@ -91,6 +91,16 @@ class KernelIdentity(_Record):
             raise ValueError("disabled KASLR requires a zero relocation")
         return self
 
+    def same_kernel(self, other: "KernelIdentity") -> bool:
+        """Whether both name the kernel a target-PC mapping depends on: the
+        source commit, the instrumentation, the vmlinux and its relocation.
+        ``execution_harness_id`` is left out: a changed image, lane script
+        or executor does not move a target PC (#136)."""
+        return (self.kernel_commit, self.instrumentation_sha256,
+                self.vmlinux_sha256, self.kaslr_enabled, self.kaslr_offset) == (
+            other.kernel_commit, other.instrumentation_sha256,
+            other.vmlinux_sha256, other.kaslr_enabled, other.kaslr_offset)
+
 
 class ExecutionCorrelation(_Record):
     """Host-stamped execution position, compared in full with observation."""
@@ -447,7 +457,7 @@ def evaluate(inputs: Q1Input) -> Q1Decision:
 
     # 2. External mapping availability and binding, including resolved range.
     mapping = data.mapping
-    if mapping is not None and (mapping.target != data.candidate or mapping.identity != identity):
+    if mapping is not None and (mapping.target != data.candidate or not mapping.identity.same_kernel(identity)):
         return unknown("evidence", "mapping_target_or_build_mismatch")
     if mapping is None or not mapping.verified or not mapping.target_pcs:
         return unknown("mapping", "target_pc_mapping_unavailable", valid=True)

@@ -28,7 +28,15 @@ Controller ─► DurableRunner ◄── RunnerWorker ─► StepRoutingBackend
   Runner's bundle record, the sealing receipt (which carries the full
   `RunnerInput`), the execution harness descriptor, an operator-registered
   verified target mapping and the configured judge profiles. A gate's Q1
-  authority passes the same materialization checks as a Stage 1 run.
+  authority passes the same materialization checks as a Stage 1 run, and only
+  the gate needs the mapping: a campaign or replay without one is published as
+  `stage2-execution.v2` with `mapping_ref: null` (#136). Its crash still gets
+  Q2 and its replay still runs; the campaign segment reports
+  `m1_status: inconclusive_mapping` with zero generation counts, and the
+  campaign tally counts it in `m1_unevaluated` instead of as a target missed.
+  A mapping is found by the target and the kernel (`KernelIdentity.same_kernel`:
+  commit, instrumentation, vmlinux and relocation), not by the whole execution
+  harness: a rebuilt image, lane script or executor keeps it.
 - `judge.ArtifactStage2Judge` is `components.Stage2Judge` over a snapshot
   of that authority. A bundle without published authority raises (the
   Controller retries); malformed or miscorrelated evidence is INCONCLUSIVE

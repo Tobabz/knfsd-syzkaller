@@ -221,7 +221,7 @@ class RunnerQ1ReceiptBridge:
         if context.mapping_ref is None:
             raise Q1AuthorityPending("trusted target mapping is not available")
         mapping = self._record(context.mapping_ref, TargetPcMapping)
-        _require(mapping.target == _target(context) and mapping.identity == context.identity,
+        _require(mapping.target == _target(context) and mapping.identity.same_kernel(context.identity),
                  "target mapping identity mismatch")
         if not mapping.verified:
             raise Q1AuthorityPending("target mapping is not verified")

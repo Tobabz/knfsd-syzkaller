@@ -377,6 +377,44 @@ def test_reached_job_runs_stage2_to_crash_review(tmp_path, build):
         assert publication.task_input.step == "gate"
 
 
+def test_campaign_and_replay_are_judged_without_a_target_mapping(
+        tmp_path, build):
+    # #136: only the gate's Q1 needs the mapping.  Once the gate passed, the
+    # mapping goes away: the crash still reaches Q2 and the replay, and the
+    # campaign's M1 is inconclusive_mapping, not a target missed.
+    with make_stage2_service(tmp_path, build) as service:
+        job_id = submit(service, build)
+        ref = register_mapping(service, build, job_id)
+        service.start_worker(idle_s=0.05)
+
+        def drop(_report):
+            path = service.mappings.index_dir / ref
+            if service.job(job_id).state is JobState.S2_CAMPAIGN and \
+                    path.exists():
+                path.unlink()
+
+        assert service.run(until(service, job_id, *WAITS), interval_s=0.05,
+                           timeout_s=120, on_step=drop)
+        job = service.job(job_id)
+        assert job.state is JobState.CRASH_REVIEW, (
+            job.state, job.state_reason, service.worker_errors)
+        assert job.gate_runs[0].q1.status.value == "reached"
+        tally = job.campaign.tally
+        assert (tally.reached_generations, tally.hypothesis_applied) == (0, 0)
+        assert (tally.m1_unevaluated, tally.applied_crashes) == (1, 1)
+        assert job.triage[0].q2_status == "observed"
+        assert job.triage[0].crash_window_applied == (RULE_ID,)
+        assert job.replay.outcome.status == "replay_equivalent"
+        campaign = service.stage2_store.publication(
+            job.triage[0].bundle_ref).execution
+        assert (campaign.schema_version, campaign.mapping_ref) == (
+            "stage2-execution.v2", None)
+        gate = service.stage2_store.publication(
+            job.gate_runs[0].bundle_ref).execution
+        assert (gate.schema_version, gate.mapping_ref is not None) == (
+            "stage2-execution.v1", True)
+
+
 def test_incompatible_recorded_rule_set_is_judged_replay_invalid(
         tmp_path, build):
     check = Compatibility(False, InvalidReason.RULE_SET_INCOMPATIBLE,

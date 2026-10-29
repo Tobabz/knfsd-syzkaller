@@ -131,14 +131,15 @@ class MappingCatalog:
 
     def lookup(self, target: CandidateTarget,
                identity: KernelIdentity) -> str | None:
-        """The first verified mapping for exactly this target and build."""
+        """The first verified mapping for exactly this target and kernel (the
+        vmlinux, its instrumentation and relocation: ``same_kernel``)."""
         for ref in self.refs():
             try:
                 mapping = load_record(self.artifacts, ref, TargetPcMapping)
             except (OSError, ValueError):
                 continue
             if mapping.verified and mapping.target == target and \
-                    mapping.identity == identity:
+                    mapping.identity.same_kernel(identity):
                 return ref
         return None
 
