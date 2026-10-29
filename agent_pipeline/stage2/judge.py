@@ -334,13 +334,20 @@ class ArtifactStage2Judge:
             attestation.deactivation_status == 0 and \
             attestation.executed and attestation.lease_cleared
 
+    # NFSv4.1 session setup: EXCHANGE_ID, CREATE_SESSION, SEQUENCE,
+    # RECLAIM_COMPLETE.  A failed one means the session was never
+    # established, whatever candidate the program serves.
+    _SESSION_OPCODES = frozenset({42, 43, 53, 58})
+
     @staticmethod
-    def _a053_generation_valid(
+    def _generation_sound(
             x: Stage2Execution, session: SessionDelta | None,
             generation: GenerationDelta | None,
             attestation: GenerationExecution) -> bool:
-        if x.candidate.candidate_id != "A-053":
-            return True
+        """Evidence of one generation is intact and its session came up.
+
+        Candidate-independent.  Whether a rule applied is not decided here:
+        the rule set and hypotheses declare that, and M1 judges it."""
         if session is None or generation is None or \
                 attestation.program_sha256 != x.program_ref or \
                 session.rejections or session.inconsistent or \
@@ -352,38 +359,11 @@ class ArtifactStage2Judge:
                 summary.closure.reason != "drained" or \
                 summary.closure.reply_unresolved_count != 0:
             return False
-        mutation = False
-        for exposure in generation.exposures:
-            context = exposure.record_context
-            if context is None or context.direction != "c2s" or \
-                    context.message_type != "call" or \
-                    context.program != 100003 or context.version != 4 or \
-                    context.procedure != 1 or exposure.terminal != "complete":
-                continue
-            for application in exposure.applications:
-                if application.rule_id == "r000" and \
-                        application.semantic_path == (
-                            "nfs4.request.EXCHANGE_ID.args.eia_clientowner."
-                            "co_ownerid") and \
-                        len(application.original_value) == 32 and \
-                        application.mutated_value == "61":
-                    mutation = True
-        if not mutation:
-            return False
-        statuses: dict[int, list[int]] = {}
-        for reply in generation.protocol_replies:
-            context = reply.record_context
-            if reply.minor_version != 1 or context.direction != "s2c" or \
-                    context.message_type != "reply" or \
-                    context.program != 100003 or context.version != 4 or \
-                    context.procedure != 1:
-                return False
-            for operation in reply.operations:
-                if operation.opcode in (42, 43, 53, 58):
-                    statuses.setdefault(operation.opcode, []).append(
-                        operation.status)
-        return all(statuses.get(opcode) and not any(statuses[opcode])
-                   for opcode in (42, 43, 53, 58))
+        return not any(
+            operation.status != 0
+            for reply in generation.protocol_replies
+            for operation in reply.operations
+            if operation.opcode in ArtifactStage2Judge._SESSION_OPCODES)
 
     @staticmethod
     def _valid_generation(
@@ -392,7 +372,7 @@ class ArtifactStage2Judge:
             attestation: GenerationExecution) -> bool:
         return ArtifactStage2Judge._execution_valid(
             attestation, generation) and \
-            ArtifactStage2Judge._a053_generation_valid(
+            ArtifactStage2Judge._generation_sound(
                 x, session, generation, attestation)
 
     # ------------------------------------------------------------ M1 window

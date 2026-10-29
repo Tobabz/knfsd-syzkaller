@@ -1,4 +1,4 @@
-"""A-053's program, mutation, protocol and execution generation gate."""
+"""The candidate-independent generation gate of the Stage 2 judge."""
 
 from types import SimpleNamespace
 
@@ -82,7 +82,7 @@ def _generation(*, statuses=None, mutation=True, complete=True):
     return generation
 
 
-def _execution(candidate="A-053"):
+def _execution(candidate="VC-1"):
     return SimpleNamespace(
         candidate=SimpleNamespace(candidate_id=candidate),
         program_ref=PROGRAM)
@@ -135,32 +135,46 @@ def _generation_evidence(*, coverage=True, execution=True,
     return SimpleNamespace(bundle=SimpleNamespace(artifacts=artifacts))
 
 
-def test_exact_program_mutation_and_all_protocol_statuses_pass():
+def test_exact_program_and_established_session_pass():
     generation = _generation()
     attestation = _attestation()
     assert ArtifactStage2Judge._execution_valid(attestation, generation)
-    assert ArtifactStage2Judge._a053_generation_valid(
+    assert ArtifactStage2Judge._generation_sound(
         _execution(), _session(), generation, attestation)
 
 
 @pytest.mark.parametrize("statuses", [
     {42: 0, 43: 1, 53: 0, 58: 0},
     {42: 0, 43: 0, 53: 0, 58: 10054},
-    {42: 0, 43: 0, 53: 0},
 ])
-def test_failed_or_missing_protocol_status_refuses_generation(statuses):
-    assert not ArtifactStage2Judge._a053_generation_valid(
+def test_failed_session_operation_refuses_generation(statuses):
+    assert not ArtifactStage2Judge._generation_sound(
         _execution(), _session(), _generation(statuses=statuses),
         _attestation())
 
 
-def test_missing_mutation_or_changed_program_refuses_generation():
-    assert not ArtifactStage2Judge._a053_generation_valid(
-        _execution(), _session(), _generation(mutation=False),
+def test_other_operation_failures_do_not_refuse_generation():
+    """A mutated request may legitimately be refused by the server."""
+    assert ArtifactStage2Judge._generation_sound(
+        _execution(), _session(),
+        _generation(statuses={42: 0, 43: 0, 53: 0, 58: 0, 25: 22}),
         _attestation())
-    assert not ArtifactStage2Judge._a053_generation_valid(
+
+
+def test_mutation_outcome_is_not_decided_by_the_gate():
+    """Whether a rule applied is M1's verdict, for every candidate."""
+    for candidate in ("VC-1", "VC-2"):
+        assert ArtifactStage2Judge._valid_generation(
+            _execution(candidate), _session(), _generation(mutation=False),
+            _attestation())
+
+
+def test_changed_program_or_dirty_session_refuses_generation():
+    assert not ArtifactStage2Judge._generation_sound(
         _execution(), _session(), _generation(),
         _attestation(program_sha256="8" * 64))
+    assert not ArtifactStage2Judge._generation_sound(
+        _execution(), _session(rejections=1), _generation(), _attestation())
 
 
 def test_digest_mismatch_or_incomplete_generation_refuses_execution():
@@ -168,23 +182,8 @@ def test_digest_mismatch_or_incomplete_generation_refuses_execution():
         _attestation(program_digest="6" * 64), _generation())
     generation = _generation(complete=False)
     assert ArtifactStage2Judge._execution_valid(_attestation(), generation)
-    assert not ArtifactStage2Judge._a053_generation_valid(
+    assert not ArtifactStage2Judge._generation_sound(
         _execution(), _session(), generation, _attestation())
-
-
-def test_pre_mutation_generation_is_invalid_but_later_valid_generation_passes():
-    invalid = _generation(mutation=False)
-    valid = _generation()
-    assert not ArtifactStage2Judge._valid_generation(
-        _execution(), _session(), invalid, _attestation())
-    assert ArtifactStage2Judge._valid_generation(
-        _execution(), _session(), valid, _attestation())
-
-
-def test_non_a053_candidates_only_require_execution_attestation():
-    assert ArtifactStage2Judge._valid_generation(
-        _execution("VC-1"), _session(), _generation(mutation=False),
-        _attestation())
 
 
 @pytest.mark.parametrize(("coverage", "execution"), [
