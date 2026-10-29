@@ -24,11 +24,23 @@ The gate has two stages (§30).  ``pin`` is stage 1, the staged pin: the
 same checks without crash survival, so a run need not end in a guest crash.
 Its subset is marked ``crash_survival: pending`` and may only sit in a
 staged ``hcap_revision``; the jobs bound to that revision use it.  Guests
-are never crashed on purpose, so the evidence for stage 2 (``promote``) is
-a crash a campaign with the subset met by itself.  A run whose production
-ended in such a crash without the crash-cut MutationDelta cannot be
-reproduced by replay: either stage refuses the subset over it and the CLI
-records an ``UnreproducibleCrash``.
+are never crashed on purpose.  ``promote`` is stage 2.  It takes either
+
+- the Proxy build's ``DeltaDurabilityCheck`` (``durability``, produced on
+  the host without a guest crash by ``delta_durability.probe``): the
+  mutation record is stored before the peer sees the bytes and every
+  journal prefix after it still holds the exposure.  The subset is promoted
+  with ``natural_crash_reproduction: not_observed``; or
+- no such check, and runs that end in a crash a campaign with the subset
+  met by itself, as before, which is ``natural_crash_reproduction:
+  observed`` (so does a counted run that is such a crash alongside the
+  check).
+
+``not_observed`` is a stated limit, never a crash validation: what a real
+kernel death does to data the guest Proxy still held is only shown by a
+natural crash.  A run whose production ended in a crash without the
+crash-cut MutationDelta cannot be reproduced by replay: either stage
+refuses the subset over it and the CLI records an ``UnreproducibleCrash``.
 
 Content addressing establishes byte integrity, not provenance.  That a run
 came from a KVM guest with the real executor and knfsd is the operator's
@@ -51,6 +63,7 @@ from pydantic import (ConfigDict, Field, field_validator, model_serializer,
 from .artifacts import ArtifactStore
 from .contracts import Record, Sha256
 from .data import canonical_json, load_record, put_record
+from .delta_durability import DeltaDurabilityCheck, ProbeError, probe
 from .hcap import AuthorityRef, Capability, CapabilityInterface, HcapCatalog
 from .semantic_replay import (JournalIntegrity, ReplayJudgeInput, ReplayResult,
                               ReplayVerdict, Termination, evaluate)
@@ -311,6 +324,9 @@ class ValidationItem(str, enum.Enum):
     PRESERVE_BEHAVIOR = "preserve_behavior"
     RAW_BEHAVIOR = "raw_behavior"
     DELTA_CRASH_SURVIVAL = "semantic_delta_crash_survival"
+    #: The build's host-side check (``delta_durability``), the stage 2
+    #: stand-in for a natural crash that was not observed.
+    DELTA_DURABILITY = "semantic_delta_durability"
     DYNAMIC_ORIGINAL_REPLAY = "dynamic_original_semantic_replay"
 
 
@@ -330,11 +346,15 @@ def _items_of_rule(rule: RuleDescription) -> set[ValidationItem]:
     return items
 
 
-def required_items(subset: SemanticSubset, *, crash: bool = True
-                   ) -> tuple[ValidationItem, ...]:
+def required_items(subset: SemanticSubset, *, crash: bool = True,
+                   durability: bool = False) -> tuple[ValidationItem, ...]:
     """Crash survival and replay always; the rest when the subset has them.
-    ``crash=False`` is the staged pin's list, without crash survival."""
+    ``crash=False`` is the staged pin's list, without crash survival.
+    ``durability`` asks for the build's host-side check instead of a
+    natural crash (``crash=False`` with it)."""
     items = {ValidationItem.DYNAMIC_ORIGINAL_REPLAY}
+    if durability:
+        items.add(ValidationItem.DELTA_DURABILITY)
     if crash:
         items.add(ValidationItem.DELTA_CRASH_SURVIVAL)
     if "call" in subset.message_types:
@@ -567,12 +587,33 @@ class PromotedSubset(_Strict):
     #: staged ``hcap_revision``.  Omitted when passed, so subsets promoted
     #: before the field keep their canonical bytes.
     crash_survival: Literal["passed", "pending"] = "passed"
+    #: ``not_observed``: promoted on the build's ``DeltaDurabilityCheck``,
+    #: no natural crash recorded.  Omitted when observed, so subsets
+    #: promoted before the field keep their canonical bytes: each was
+    #: promoted on a natural crash.
+    natural_crash_reproduction: Literal["observed", "not_observed"] = \
+        "observed"
+    #: The ``DeltaDurabilityCheck`` the subset was promoted on, if any.
+    durability_ref: Sha256 | None = None
+
+    @model_validator(mode="after")
+    def _durability(self) -> PromotedSubset:
+        if self.natural_crash_reproduction == "not_observed" and (
+                self.durability_ref is None
+                or self.crash_survival != "passed"):
+            raise ValueError("not_observed needs a durability check and a "
+                             "promoted subset")
+        return self
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.crash_survival == "passed":
             data.pop("crash_survival", None)
+        if self.natural_crash_reproduction == "observed":
+            data.pop("natural_crash_reproduction", None)
+        if self.durability_ref is None:
+            data.pop("durability_ref", None)
         return data
 
 
@@ -595,6 +636,13 @@ class PromotedSemanticCapabilityRegistry(_Strict):
         if ids != _sorted_unique(ids, "subset_id"):
             raise ValueError("subsets must be in subset_id order")
         return self
+
+    @property
+    def not_observed(self) -> tuple[str, ...]:
+        """The promoted subsets no natural crash has been recorded for:
+        their crash survival rests on the build's host-side check."""
+        return tuple(p.subset.subset_id for p in self.subsets
+                     if p.natural_crash_reproduction == "not_observed")
 
     @property
     def pending(self) -> tuple[str, ...]:
@@ -639,18 +687,34 @@ def pin(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
 def promote(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
             run_refs: tuple[str, ...],
             previous: PromotedSemanticCapabilityRegistry | None = None,
+            durability_ref: str | None = None,
             ) -> PromotedSemanticCapabilityRegistry:
     """Run the M7 gate for one subset; raise PromotionRefused with every
     reason it fails.  ``previous`` keeps the subsets already promoted on the
-    same build; a subset it pins pending is passed, its evidence kept."""
-    return _gate(store, build, subset, run_refs, previous, crash=True)
+    same build; a subset it pins pending is passed, its evidence kept.
+    ``durability_ref`` is the build's ``DeltaDurabilityCheck``: runs then
+    need not end in a guest crash, and the subset is promoted with its
+    natural crash reproduction ``not_observed`` unless a counted run is
+    one.  Without it, the runs must be a natural crash."""
+    return _gate(store, build, subset, run_refs, previous, crash=True,
+                 durability_ref=durability_ref)
 
 
 def _gate(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
           run_refs: tuple[str, ...],
           previous: PromotedSemanticCapabilityRegistry | None, *,
-          crash: bool) -> PromotedSemanticCapabilityRegistry:
+          crash: bool, durability_ref: str | None = None
+          ) -> PromotedSemanticCapabilityRegistry:
     problems = subset_problems(subset, build.registry)
+    if durability_ref is not None:
+        check = load_record(store, durability_ref, DeltaDurabilityCheck)
+        if (check.proxy_sha256, check.registry_digest) != (
+                build.proxy_sha256, build.registry_digest):
+            problems.append("the durability check is for another Proxy "
+                            "build")
+        problems += [f"durability check: {p}" for p in check.problems()]
+    # With a durability check the runs need not be a natural crash.
+    runs_crash = crash and durability_ref is None
     if previous is not None and (previous.proxy_sha256, previous.registry_digest
                                  ) != (build.proxy_sha256,
                                        build.registry_digest):
@@ -666,7 +730,7 @@ def _gate(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
     lost: list[str] = []
     for ref in run_refs:
         run = load_record(store, ref, GuestValidationRun)
-        found = run_problems(run, build, subset, crash=crash)
+        found = run_problems(run, build, subset, crash=runs_crash)
         if unreproducible(run):
             lost.append(ref)
             found.append("a natural guest crash left no MutationDelta at "
@@ -675,7 +739,8 @@ def _gate(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
         problems += [f"run {ref[:12]}: {p}" for p in found]
         if found:
             continue
-        if crash:
+        crashed, delta = _crash_cut(run)
+        if runs_crash or (crash and crashed and delta):
             passed.add(ValidationItem.DELTA_CRASH_SURVIVAL)
         used = _exercised(run)
         # Equivalent on the same originals proves nothing dynamic.
@@ -702,7 +767,16 @@ def _gate(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
         missing = sorted(set(getattr(subset, name)) - covered[name])
         if missing:
             problems.append(f"no guest evidence exercises {name} {missing}")
-    required = required_items(subset, crash=crash)
+    # A durability check that fails already raised its problems above.
+    if durability_ref is not None:
+        passed.add(ValidationItem.DELTA_DURABILITY)
+    required = required_items(subset, crash=runs_crash,
+                              durability=durability_ref is not None)
+    observed = ValidationItem.DELTA_CRASH_SURVIVAL in passed
+    if observed:
+        required = tuple(sorted({*required,
+                                 ValidationItem.DELTA_CRASH_SURVIVAL},
+                                key=lambda i: i.value))
     missing_items = [i.value for i in required if i not in passed]
     if missing_items:
         problems.append(f"validation items not covered: {missing_items}")
@@ -718,10 +792,29 @@ def _gate(store: ArtifactStore, build: BuildRegistry, subset: SemanticSubset,
     if problems:
         raise PromotionRefused(problems, tuple(lost))
     refs = set(run_refs) | set(old.evidence_refs if old else ())
+    extra: dict = {}
+    if not crash:
+        extra["crash_survival"] = "pending"
+    else:
+        # A natural crash seen now, or the one this subset was promoted on
+        # before, keeps the reproduction observed; the build's durability
+        # check alone leaves it not_observed.
+        natural = observed or (old is not None
+                               and old.crash_survival == "passed"
+                               and old.natural_crash_reproduction
+                               == "observed")
+        standing = durability_ref or (old.durability_ref if old else None)
+        if natural:
+            required = tuple(sorted(
+                {*required, ValidationItem.DELTA_CRASH_SURVIVAL},
+                key=lambda i: i.value))
+        else:
+            extra["natural_crash_reproduction"] = "not_observed"
+        if standing is not None:
+            extra["durability_ref"] = standing
     kept[subset.subset_id] = PromotedSubset(
         subset=subset, validation_items=required,
-        evidence_refs=tuple(sorted(refs)),
-        **({} if crash else {"crash_survival": "pending"}))
+        evidence_refs=tuple(sorted(refs)), **extra)
     return PromotedSemanticCapabilityRegistry(
         proxy_sha256=build.proxy_sha256, registry_digest=build.registry_digest,
         registry=build.registry,
@@ -751,15 +844,25 @@ def with_semantic_capability(catalog: HcapCatalog, promoted_ref: str,
     place of the probe campaign (07 §5.3 item 7), so the entry carries no
     contract.  The rest of the catalog, its gap contracts included, is kept.
     A subset pinned with crash survival pending (``pin``) makes the revision
-    a staged one: the entry says so, and no shared catalog takes it.
+    a staged one: the entry says so, and no shared catalog takes it.  A
+    subset promoted on the build's durability check says that no natural
+    crash was observed for it, and references the check as evidence.
     """
     ids = tuple(p.subset.subset_id for p in promoted.subsets)
-    evidence = tuple(sorted({r for p in promoted.subsets
-                             for r in p.evidence_refs}))
+    evidence = tuple(sorted(
+        {r for p in promoted.subsets for r in p.evidence_refs}
+        | {p.durability_ref for p in promoted.subsets
+           if p.durability_ref is not None}))
     pending = (
         (f"Crash survival pending for {', '.join(promoted.pending)}: a "
          "staged pin (M7 stage 1); this revision is staged, not shared.",)
         if promoted.pending else ())
+    pending += (
+        (f"Natural crash reproduction not observed for "
+         f"{', '.join(promoted.not_observed)}: Delta survival was checked "
+         "on the host for this Proxy build (delta durability), not on a "
+         "crashed guest.",)
+        if promoted.not_observed else ())
     entry = Capability(
         id=capability_id, name="Promoted semantic mutation",
         purpose=("Semantic NFS/RPC mutation of Stage 1 traffic through the "
@@ -901,6 +1004,9 @@ def main(argv: list[str] | None = None) -> int:
     """Operator entry for M7 (``tools/nfs-proxy/README.md`` "Promotion").
 
     registry: print the BuildRegistry of a Proxy binary (store it with --store).
+    durability: check one Proxy build on the host, without a guest crash
+              (write-ahead order, journal prefixes) and store the
+              DeltaDurabilityCheck; ``promote --durability`` takes it.
     record:   turn one KVM validation (replay plan, both journals, the
               execprog output) into a GuestValidationRun record.
     pin:      M7 stage 1: the gate without crash survival; write the
@@ -925,6 +1031,9 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("registry")
     r.add_argument("--proxy", type=Path, required=True)
     r.add_argument("--store", type=Path)
+    d = sub.add_parser("durability")
+    d.add_argument("--proxy", type=Path, required=True)
+    d.add_argument("--store", type=Path, required=True)
     c = sub.add_parser("record")
     c.add_argument("--store", type=Path, required=True)
     c.add_argument("--subset", type=Path, required=True)
@@ -954,6 +1063,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="the HCAP revision to extend")
         p.add_argument("--previous", help="promoted registry ref on this build")
         p.add_argument("--capability-id", default=DEFAULT_CAPABILITY_ID)
+        if name == "promote":
+            p.add_argument("--durability",
+                           help="the build's DeltaDurabilityCheck ref: runs "
+                                "need not be a natural crash")
     args = parser.parse_args(argv)
 
     if args.command == "registry":
@@ -962,6 +1075,30 @@ def main(argv: list[str] | None = None) -> int:
             print(f"build={put_record(ArtifactStore(args.store), build)}")
         print(canonical_json(build).decode())
         return 0
+
+    if args.command == "durability":
+        import tempfile
+        build = read_build_registry(args.proxy)
+        schema = next((i for i in build.registry.schema_ids
+                       if i.startswith("nfs4.1/")), None)
+        if schema is None:
+            print("durability: the build has no nfs4.1 schema",
+                  file=sys.stderr)
+            return 3
+        with tempfile.TemporaryDirectory(prefix="durability-") as work:
+            try:
+                check = probe(args.proxy, proxy_sha256=build.proxy_sha256,
+                              registry_digest=build.registry_digest,
+                              schema_id=schema, workdir=Path(work))
+            except ProbeError as error:
+                print(f"durability: no evidence: {error}", file=sys.stderr)
+                return 3
+        ref = put_record(ArtifactStore(args.store), check)
+        print(f"durability={ref} passed={str(check.passed).lower()} "
+              f"cuts={check.cuts_checked}")
+        for problem in check.problems():
+            print(f"  does not count: {problem}", file=sys.stderr)
+        return 0 if check.passed else 3
 
     store = ArtifactStore(args.store)
     subset = SemanticSubset.model_validate_json(args.subset.read_bytes())
@@ -1004,9 +1141,12 @@ def main(argv: list[str] | None = None) -> int:
     previous = (load_record(store, args.previous,
                             PromotedSemanticCapabilityRegistry)
                 if args.previous else None)
-    gate = pin if args.command == "pin" else promote
     try:
-        promoted = gate(store, build, subset, tuple(args.runs), previous)
+        if args.command == "pin":
+            promoted = pin(store, build, subset, tuple(args.runs), previous)
+        else:
+            promoted = promote(store, build, subset, tuple(args.runs),
+                               previous, args.durability)
     except PromotionRefused as refused:
         for problem in refused.problems:
             print(f"{args.command} refused: {problem}", file=sys.stderr)
@@ -1028,7 +1168,7 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "BuildRegistry", "CapabilityRegistry", "DEFAULT_CAPABILITY_ID",
-    "DIMENSIONS", "DynamicOriginals", "GuestValidationRun", "PromotedSemanticCapabilityRegistry",
+    "DIMENSIONS", "DeltaDurabilityCheck", "DynamicOriginals", "GuestValidationRun", "PromotedSemanticCapabilityRegistry",
     "PromotedSubset", "PromotionRefused", "RegistryError", "RuleDescription",
     "RuleSetDescription", "ScopeCheck", "SemanticSubset", "StagedProxies",
     "UNPROMOTED_GAP_ID",

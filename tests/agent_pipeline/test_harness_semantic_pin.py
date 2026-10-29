@@ -22,6 +22,8 @@ from agent_pipeline.semantic_replay import Termination
 from agent_pipeline.stage1.host.semantic import (
     SemanticRefused, SideRun, pinned_hcap, read_inputs, staged_pin)
 
+from agent_pipeline import live_probe
+
 from . import test_journal_live as live_mod
 from .test_journal_live import VM
 from .test_semantic_promotion import (  # noqa: F401  (fixtures)
@@ -43,7 +45,7 @@ class LiveGuest:
     def _side(self, work, rules, generation, slots) -> None:
         work.mkdir(parents=True)
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(live_mod, "rule_set", lambda: rules)
+            mp.setattr(live_probe, "rule_set", lambda schema_id=None: rules)
             journal = _journal(work / "journal", rules)
             _run(self.binary, work, journal, [(generation, list(slots))],
                  crash=False)

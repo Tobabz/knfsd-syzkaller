@@ -197,6 +197,9 @@ HCAP-10, and `generated.json` records it under `stage2_semantic_registry`.
 Without it the HCAP has no HCAP-10: the preflight's `authority` check fails
 ("has no promoted semantic subset"), and a rule set no promoted subset
 covers is a `mutation_engine` gap, which Harness Generation fills (07 §5).
+A subset promoted on the build's durability check (`promote --durability`,
+`natural_crash_reproduction: not_observed`) passes the `authority` check like
+any promoted subset; its HCAP-10 entry says no natural crash was observed.
 Run `preflight` with each manager before the first mutate job.
 
 ### Validated layouts (#99)

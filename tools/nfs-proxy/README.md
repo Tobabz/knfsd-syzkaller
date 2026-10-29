@@ -451,14 +451,30 @@ constraints between them. Implemented is not usable. The Agent uses only a *prom
 Proxy binary cover every element of it:
 
 - the run's `ReplayResult` is `REPLAY_EQUIVALENT` and is the judgment of its own sealed input;
-- production ended in a guest crash and the crash-cut position's MutationDelta was read back;
+- either the build passed the host-side durability check (below), or production ended in a guest
+  crash and the crash-cut position's MutationDelta was read back. A run that did end in a crash
+  must have left that MutationDelta either way;
 - every rule of the run's rule set is inside the subset, and an element counts once a rule using it
   completed forwarding in production and in replay at the same window position;
 - dynamic-original replay counts only when such a rule replaced, at one position, original values in
   replay that production never had (`record` reads them from both journals): replay the window on
   other dynamic state, not a copy of production's;
 - the 06 §30 items the subset calls for are covered (request or response mutation, dynamic value,
-  backchannel, preserve or raw, plus crash survival and replay always).
+  backchannel, preserve or raw, plus delta durability or crash survival, and replay, always).
+
+Crash survival has two parts (06 §30). *Delta durability* belongs to the Proxy build and the host
+sink, not to a subset: the write-ahead `EXPOSURE_INTENT` is stored before the peer receives the
+mutated bytes, and a journal that ends at any byte after it still reads back with the exposure.
+`python -m agent_pipeline.semantic_promotion durability --proxy GUEST_PROXY --store ARTIFACTS` checks
+both on the host, once per build, with no guest crash: it runs the build in target mode on loopback
+against the real `HostJournal`, then reads back every frame boundary of the journal, a byte either
+side of it, and every 61st byte. It prints `durability=REF passed=true|false` and exits 3 when the
+build fails or cannot be driven (no evidence either way). *Natural crash reproduction* belongs to a
+crash: a campaign crash left a MutationDelta at the crash cut and its replay was `REPLAY_EQUIVALENT`.
+A subset promoted on the durability check carries `natural_crash_reproduction: not_observed`, and
+its HCAP-10 entry says so; it is promoted, not crash-validated. What a real kernel death does to
+data the guest Proxy still held is only shown by a natural crash. A subset promoted on a natural
+crash, or upgraded by one later, is `observed`.
 
 The gate writes a `PromotedSemanticCapabilityRegistry` and a new HCAP revision whose `HCAP-10` entry
 (`usable_by: [agent_stage2]`) references it by digest. Only that entry makes the registry Agent scope,
@@ -489,8 +505,10 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
 3. Production: boot a target-mode lane with that rule set ("Target mode" above) and run until the
    guest crashes with those rules firing in the crash window. The crash must come from the campaign
    itself: never crash the guest on purpose (sysrq panic, NMI, forced reset) to get one (06 §30). The
-   crash-cut program must have a mutation recorded. Until such a crash exists the subset is not
-   promoted; step 6's `pin` keeps it in a staged revision with crash survival pending meanwhile.
+   crash-cut program must have a mutation recorded. Without such a crash, run the durability check
+   above and promote with `--durability` in step 7 (`not_observed`); step 6's `pin` keeps a subset in
+   a staged revision with crash survival pending meanwhile. A run that ends in a clean teardown
+   (`--production-end vm_teardown`) is enough with `--durability`.
 4. Replay: `replay_runner plan`, then boot a fresh VM on another journal directory and run
    `syz-execprog -procs=1 -repeat=1` over `REPLAY/programs.log` ("Semantic replay" above).
 5. Record the run instead of `replay_runner judge`:
@@ -504,7 +522,8 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
    ```
 
    It prints `run=REF` and the verdict, and exits 3 with the reasons when the run does not count.
-   A run whose window ended without a crash (`--production-end vm_teardown`) counts only for `pin`.
+   A run whose window ended without a crash (`--production-end vm_teardown`) counts for `pin` and for
+   `promote --durability`.
 6. Pin (06 §30 stage 1): `python -m agent_pipeline.semantic_promotion pin` with the arguments of
    `promote` below checks everything but crash survival and prints `pinned=REF hcap_revision=REF`.
    The registry marks the subset `crash_survival: pending`, and the HCAP-10 entry says the revision
@@ -512,9 +531,12 @@ host runs the same binary for `--capability-registry` and `--describe-rules`.
    whose HCAP pins a pending subset. Jobs on the staged harness use the subset; their campaigns are
    where the natural crash of step 3 comes from.
 7. Promote (stage 2): `python -m agent_pipeline.semantic_promotion promote --store ARTIFACTS --build REF
-   --subset SUBSET.json --run REF [--run REF ...] --hcap HCAP_REVISION [--previous PROMOTED_REF]`
-   prints `promoted=REF hcap_revision=REF`, or every reason it refuses. `--previous` is the pinned
-   registry: its pending subset passes and keeps the pin's evidence. For Stage 2 to use it, give
+   --subset SUBSET.json --run REF [--run REF ...] --hcap HCAP_REVISION [--previous PROMOTED_REF]
+   [--durability DURABILITY_REF]` prints `promoted=REF hcap_revision=REF`, or every reason it refuses.
+   `--durability` is the build's check: the runs then need not be a natural crash, and the subset is
+   `not_observed` unless a counted run is one. `--previous` is the pinned (or `not_observed`)
+   registry: its pending subset passes, a natural crash in the new runs makes it `observed`, and it
+   keeps the earlier evidence. For Stage 2 to use it, give
    `promoted=REF` as `stage2.backend.semantic_registry` in the host spec and run `generate`, which
    writes HCAP-10 into every variant's HCAP revision (`agent_pipeline/stage2/README.md` "Stage 2
    backend").

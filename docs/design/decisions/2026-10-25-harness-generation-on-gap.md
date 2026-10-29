@@ -38,7 +38,14 @@
    campaign에서 자연히 생긴 crash로만 확인한다. guest를 일부러 crash시키는 것(sysrq panic, NMI, 강제 reset)은
    인위적 동작이므로 쓰지 않는다. 그 확인이 생길 때까지 subset은 crash survival pending으로 staged revision에만
    pin되고 공유 HCAP promotion은 미룬다(`03-nfs-proxy/06` §30, `07` §5.2, §5.3). subset을 사람이 구현했는지
-   생성했는지는 구분하지 않는다.
+   생성했는지는 구분하지 않는다. 자연 crash만으로 확인한다는 부분은 아래 5-1이 수정한다.
+   - **5-1. 수정 (사용자 결정, 2026-10-29, issue #142).** crash survival을 둘로 나눈다. *Delta durability*(mutation
+     기록이 peer가 mutated bytes를 받기 전에 host sink에 저장되고, 그 뒤 어느 byte에서 끊긴 journal도 exposure를
+     읽을 수 있다)는 Proxy build의 성질이므로 build마다 host에서 guest crash 없이 확인하고
+     (`delta_durability.probe`), 그 `DeltaDurabilityCheck`가 `promote --durability`의 근거다. *자연 crash 재현*은
+     subset의 `natural_crash_reproduction: observed | not_observed`로 기록하며 promotion 조건이 아니다.
+     `not_observed`는 promoted이지 crash 검증이 아니다(실제 커널이 죽는 순간 guest Proxy의 buffer는 자연 crash로만
+     드러난다). 인위적 crash 금지, crash cut에 MutationDelta가 없는 자연 crash의 거부, staged pin은 그대로다.
 6. **`blocked_harness_gap`은 fallback이다.** 생성 Agent가 `infeasible`을 내거나 `harness_generation` budget을 다
    쓰면 job은 기존처럼 issue를 기다린다. operator는 `retry_generation`으로 생성을 다시 시작할 수 있다.
 

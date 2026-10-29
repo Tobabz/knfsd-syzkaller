@@ -1094,14 +1094,14 @@ Harness Capability Specification을 갱신한다(§21).
   받아들인 NFSPRUL1 set의 각 rule을 같은 어휘로 기술하므로 gate는 runtime 자신의 parser로 evidence를 분류한다.
 - subset: scope label 하나와 차원별 허용 값 집합(`agent_pipeline/semantic_promotion.py` `SemanticSubset`).
 - gate(`promote`): subset이 registry 안에 있고, 같은 binary의 KVM validation run이 subset의 모든 원소를 덮을 때만
-  promotion한다. run은 sealed judge input을 다시 판정한 `ReplayResult`가 `REPLAY_EQUIVALENT`이고, production이 guest
-  crash로 끝나 crash cut 위치의 MutationDelta가 남았고(semantic Delta crash survival), rule set의 모든 rule이 subset
-  안일 때 센다. 원소는 그것을 쓰는 rule의 batch가 같은 window 위치에서 production과 replay 모두 FORWARD_COMPLETE일
+  promotion한다. run은 sealed judge input을 다시 판정한 `ReplayResult`가 `REPLAY_EQUIVALENT`이고, build가 host의
+  delta durability 검사를 통과했거나(아래 M7 2단계) production이 guest crash로 끝나 crash cut 위치의 MutationDelta가
+  남았고(semantic Delta crash survival), rule set의 모든 rule이 subset 안일 때 센다. 원소는 그것을 쓰는 rule의 batch가 같은 window 위치에서 production과 replay 모두 FORWARD_COMPLETE일
   때 덮인다. dynamic-original replay는 그런 rule이 같은 위치에서 production에 없던 original value만 replay에서
   바꿨을 때만 덮인다(`record`가 두 journal의 EXPOSURE_INTENT `original_value` digest를 기록한다). 위 검증 항목은
   subset 내용에서 정해진다(request/response mutation, dynamic value, `S2C` CALL이면
-  backchannel, preserve/raw, 그리고 항상 crash survival과 dynamic-original replay). host test와 test double 결과는
-  run으로 기록하지 않는다. run이 KVM guest에서 왔다는 것은 기록하는 operator의 진술이다.
+  backchannel, preserve/raw, 그리고 항상 delta durability 또는 crash survival과 dynamic-original replay). host test와
+  test double 결과는 run으로 기록하지 않는다. delta durability 검사는 run이 아니라 build의 검사 기록이다. run이 KVM guest에서 왔다는 것은 기록하는 operator의 진술이다.
 - 결과: `PromotedSemanticCapabilityRegistry`(registry, build identity, subset별 evidence)와, 그것을
   `authority_refs`로 참조하는 HCAP-10(`usable_by: [agent_stage2]`, `validated_subset`, scope = promoted subset id)을
   가진 새 HCAP revision. Agent scope는 그 HCAP-10 entry(`agent_stage2`, validated)가 참조하는 registry의
@@ -1121,6 +1121,19 @@ Harness Capability Specification을 갱신한다(§21).
   올리고 pin의 evidence를 유지한다. 이미 promotion된 subset은 다시 pin하지 않는다. 자연 crash에서 MutationDelta가
   남지 않은 run이 있으면 두 gate 모두 subset을 거부하고 CLI는 그 run들을 `UnreproducibleCrash`로 기록한다.
   CLI는 `pin`, `promote`다.
+- M7 2단계의 delta durability (#142): crash survival은 둘로 나뉜다. *Delta durability*는 Proxy build와 host sink의
+  성질이다. `EXPOSURE_INTENT`가 peer가 mutated bytes를 받기 전에 sink에 저장되고, 그 뒤 어느 byte에서 끊긴 journal도
+  exposure와 적용 내용을 읽을 수 있다. `delta_durability.probe`가 build를 loopback에서 target mode로 실제
+  `HostJournal`에 대고 돌려 순서를 보고, 기록한 journal을 모든 frame 경계와 그 앞뒤 byte, 61 byte마다 잘라
+  `SealedJournal`로 읽어 본다. guest를 건드리지 않고 build마다 한 번 하며 `DeltaDurabilityCheck`를 CAS에 둔다
+  (`semantic_promotion durability`). 이 검사를 구동할 수 없는 build는 증거가 없는 것이다. `promote`에
+  `durability_ref`를 주면 run이 자연 crash일 필요가 없고, subset은 `DELTA_DURABILITY`를 통과한 것으로 기록되며
+  `PromotedSubset.natural_crash_reproduction`은 `not_observed`다(passed인 `crash_survival`과 별개). 센 run 중
+  자연 crash가 있으면 `observed`이고, 나중에 자연 crash run으로 `promote`하면 `not_observed`가 `observed`로 오른다.
+  `not_observed`인 subset의 HCAP-10 entry는 그 사실과 검사 기록을 evidence로 적는다. 자연 crash 재현이
+  없다는 것은 실제 커널이 죽는 순간 guest Proxy의 buffer에 있던 기록이 어떻게 되는지는 보지 못했다는 뜻이다.
+  인위적 crash 금지는 그대로다. 두 필드가 없는 registry의 canonical bytes와 digest는 이전과 같다(기존 promoted
+  subset은 모두 자연 crash로 promotion했으므로 `observed`).
 - staged harness의 Stage 2: KVM step은 그 harness의 파일로 syz-manager를 띄운다. `verify_pins`가 collector의 `staged_files`에서 고른
   파일로 manager 설정의 bzImage, image, vmlinux, lane template을 바꾸고, syzkaller binary가 staged이면 pin된
   binary에 대한 link 디렉터리를 `staged_files` 아래 만들어 `syzkaller`로 쓴다(`stage2/kvm.py` `_staged_manager`).
@@ -1144,8 +1157,8 @@ Harness Capability Specification을 갱신한다(§21).
   `test_rule_compiler.py`와 `test_stage2_service.py`.
 
 남은 것:
-- subset마다 자연 crash가 생긴 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는
-  일(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
+- subset마다 production과 replay를 `semantic_promotion record`/`promote`로 기록해 promotion하는 일. build의 delta
+  durability 검사(`durability`)가 있으면 자연 crash 없이 `not_observed`로, 자연 crash가 있으면 `observed`로 한다(`tools/nfs-proxy/README.md` "Capability registry and promotion"). 인위적 crash는 쓰지 않는다. Mutation Rule
 Compiler(`agent_pipeline/rule_compiler.py`)는 모든 intent가 runtime 검증을 통과한 뒤 `rule_set_scope`로 set 전체가
 한 subset에 맞는지 확인한다(`../02-llm-agent/08-mutation-rule-set.md` §12 "구현").
 
