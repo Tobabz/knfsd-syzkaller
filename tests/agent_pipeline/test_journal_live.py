@@ -51,6 +51,22 @@ LANE = 0
 DIGEST = hashlib.sha256(b"program").digest()
 OP_SEQUENCE = 53
 
+#: The events these tests are about: what the Proxy owes the host before it
+#: lets a mutated record out and before it ends a session (01 §16).  The
+#: Proxy may record further event types; the sink admits them and
+#: ``journal.rejections()`` is still checked.  Orders and counts below are
+#: over these events only, so a Proxy that records one more kind of event
+#: does not break them.
+CORE_EVENTS = frozenset({
+    "RULESET", "GENERATION_OPEN", "GENERATION_DRAINING", "EXPOSURE_INTENT",
+    "APPLY_REFUSAL", "FORWARD_COMPLETE", "FORWARD_FAILED",
+    "GENERATION_COMPLETE", "RUN_COMPLETE",
+})
+
+
+def core(events):
+    return [e for e in events if e.request.event_type in CORE_EVENTS]
+
 
 def _xdr_string(s: bytes) -> bytes:
     return struct.pack(">I", len(s)) + s + b"\0" * (-len(s) % 4)
@@ -240,16 +256,23 @@ class Live:
         self.client.sendall(compound_call(xid, slotid))
         return _recv_record(self.client) if expect_reply else None
 
+    def all_types(self) -> list[str]:
+        return [e.request.event_type for e in self.journal.events(SESSION)]
+
     def wait_event(self, event_type: str, timeout: float = 10.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if event_type in self.types():
+            if event_type in self.all_types():
                 return
             time.sleep(0.02)
-        raise AssertionError(f"{event_type} never stored: {self.types()}")
+        raise AssertionError(f"{event_type} never stored: {self.all_types()}")
+
+    def events(self):
+        """The stored events these tests are about (``CORE_EVENTS``)."""
+        return core(self.journal.events(SESSION))
 
     def types(self) -> list[str]:
-        return [e.request.event_type for e in self.journal.events(SESSION)]
+        return [e.request.event_type for e in self.events()]
 
     def stop(self) -> str:
         self.client.close()
@@ -302,7 +325,7 @@ def test_mutation_reaches_peer_only_after_its_exposure_is_stored(proxy_binary, t
     finally:
         if live.proc.poll() is None:
             live.proc.kill()
-    events = journal.events(SESSION)
+    events = live.events()
     types = [e.request.event_type for e in events]
     assert types == ["RULESET", "GENERATION_OPEN", "EXPOSURE_INTENT", "FORWARD_COMPLETE",
                      "APPLY_REFUSAL", "APPLY_REFUSAL", "GENERATION_DRAINING",
@@ -412,7 +435,7 @@ def test_unanswered_call_closes_at_the_drain_bound(proxy_binary, tmp_path):
     finally:
         if live.proc.poll() is None:
             live.proc.kill()
-    summary = [e for e in journal.events(SESSION)
+    summary = [e for e in live.events()
                if e.request.event_type == "GENERATION_COMPLETE"][0].request.payload
     assert summary.closure.reason == "reply_unresolved"
     assert summary.closure.reply_unresolved_count == 1
@@ -460,9 +483,9 @@ def test_shutdown_drains_owed_events_before_any_run_complete(proxy_binary, tmp_p
     assert journal.rejections() == []
     # Generation 1 never closed: the session is not clean, so no RUN_COMPLETE.
     assert live.types() == ["RULESET", "GENERATION_OPEN", "EXPOSURE_INTENT", "FORWARD_FAILED"]
-    failed = journal.events(SESSION)[-1].request.payload
+    failed = live.events()[-1].request.payload
     assert (failed.reason, failed.bytes_written) == ("connection_closed", 0)
-    assert delivery_state(journal.events(SESSION), 0) == "forward_failed"
+    assert delivery_state(live.events(), 0) == "forward_failed"
     assert "run_complete=skipped" in out
 
 
@@ -486,7 +509,7 @@ def test_local_submit_failure_skips_run_complete(proxy_binary_faults, tmp_path):
     assert journal.rejections() == []
     assert live.types() == ["RULESET", "GENERATION_OPEN", "GENERATION_DRAINING",
                             "GENERATION_COMPLETE"]
-    summary = journal.events(SESSION)[-1].request.payload
+    summary = live.events()[-1].request.payload
     assert (summary.exposure_batch_count, summary.evidence_path_failures) == (0, 1)
     assert journal.session_state(SESSION)["ended"] is None
     assert "evidence_path_failures=1 evidence_path_degraded=1" in out
