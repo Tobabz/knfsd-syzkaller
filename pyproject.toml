@@ -16,6 +16,7 @@ package = false
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pytest-xdist>=3.6",
     "pydantic-ai-slim[openai]==2.55.0",
 ]
 

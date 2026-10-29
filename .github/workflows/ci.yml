@@ -32,7 +32,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked
-      - run: uv run pytest -q
+      # Tests are per-test tmp_path isolated; setup dominates, so xdist scales.
+      - run: uv run pytest -q -n auto
 
   syzkaller-bridge:
     # Build the parser from this checkout; bridge-backed tests must not pass
@@ -60,7 +61,7 @@ jobs:
             --source "$RUNNER_TEMP/syzkaller" \
             --output "$RUNNER_TEMP/syz-bridge" --go "$(command -v go)"
           KNFSD_SYZ_BUNDLE="$RUNNER_TEMP/syz-bridge/bundle" \
-            uv run pytest -q tests/agent_pipeline/syzkaller
+            uv run pytest -q -n auto tests/agent_pipeline/syzkaller
 
   lane-inputs:
     # Lane dependency assembly and bake inputs, and the lane script's
