@@ -48,7 +48,8 @@ def publication(n: int) -> Stage2Publication:
                          "instrumentation_sha256": sha("instrumentation"),
                          "vmlinux_sha256": sha("vmlinux"),
                          "kaslr_enabled": False, "kaslr_offset": 0},
-            "mapping_ref": sha("mapping"), "crash_bundle_ref": sha("crash"),
+            "mapping_ref": sha("mapping"), "program_ref": sha("program"),
+            "crash_bundle_ref": sha("crash"),
             "crash_window_bound": 4, "m1_profile_ref": sha("m1"),
             "q2_profile_ref": sha("q2"), "replay_profile_ref": sha("replay")},
     }))

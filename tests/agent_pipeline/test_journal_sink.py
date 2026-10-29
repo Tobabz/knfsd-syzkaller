@@ -18,6 +18,7 @@ from agent_pipeline.journal_sink import (
     ChannelIdentity, ChannelServer, HostJournal, JournalSinkError, decode_reject,
     delivery_state, serve_channel,
 )
+from agent_pipeline.semantic_delta import SealedJournal
 
 CHANNEL = ChannelIdentity("vm-1", "nfspj-0")
 SESSION = "proxy-1"
@@ -80,6 +81,18 @@ def exposure(gen, batch, message_type="call"):
         "semantic_signature": [{"count": 1, "kind": "replace", "part": "value",
                                 "rule_id": "r1",
                                 "semantic_path": "nfs4.request.OPEN.args.seqid"}]}
+
+
+def protocol_reply(gen, *, record_context=None, minor_version=1, operations=None):
+    return {
+        "correlation": corr(gen),
+        "record_context": record_context or ctx("reply", direction="s2c"),
+        "minor_version": minor_version,
+        "operations": operations or [
+            {"index": 0, "name": "EXCHANGE_ID", "opcode": 42, "status": 0},
+            {"index": 1, "name": "CREATE_SESSION", "opcode": 43, "status": 0},
+        ],
+    }
 
 
 def summary(gen, reason="drained"):
@@ -231,6 +244,82 @@ def test_draining_refuses_call_context_and_accepts_reply(journal):
     accepted(g.send("EXPOSURE_INTENT", exposure(1, 1, "reply"))[1])
     refusal["record_context"] = ctx("reply")
     accepted(g.send("APPLY_REFUSAL", refusal)[1])
+
+
+def test_nfs41_compound_reply_is_admitted_for_the_open_generation(journal):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1),
+                                        "draining_generations": []})[1])
+    accepted(g.send("NFS_COMPOUND_REPLY", protocol_reply(1))[1])
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"direction": "c2s"},
+        {"message_type": "call"},
+        {"program": 100005},
+        {"version": 3},
+        {"procedure": 0},
+    ],
+)
+def test_compound_reply_rejects_non_nfs41_reply_context(journal, changes):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1),
+                                        "draining_generations": []})[1])
+    context = ctx("reply", direction="s2c")
+    context.update(changes)
+    payload = protocol_reply(1, record_context=context)
+    refused(g.send("NFS_COMPOUND_REPLY", payload)[1],
+            "protocol_context_mismatch")
+
+
+def test_compound_reply_rejects_other_minor_version_and_operation_order(journal):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1),
+                                        "draining_generations": []})[1])
+    refused(g.send("NFS_COMPOUND_REPLY",
+                   protocol_reply(1, minor_version=0))[1],
+            "protocol_context_mismatch")
+    operations = [
+        {"index": 1, "name": "SEQUENCE", "opcode": 53, "status": 0},
+    ]
+    refused(g.send("NFS_COMPOUND_REPLY",
+                   protocol_reply(1, operations=operations))[1],
+            "protocol_operation_order")
+
+
+def test_compound_reply_is_refused_after_generation_close(journal):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1),
+                                        "draining_generations": []})[1])
+    accepted(g.send("GENERATION_DRAINING", {"correlation": corr(1)})[1])
+    accepted(g.send("GENERATION_COMPLETE",
+                    dict(summary(1), exposure_batch_count=0))[1])
+    refused(g.send("NFS_COMPOUND_REPLY", protocol_reply(1))[1],
+            "generation_closed")
+
+
+def test_semantic_index_preserves_protocol_status_and_mutation_values(
+        journal, tmp_path):
+    g = started(journal)
+    accepted(g.send("GENERATION_OPEN", {"correlation": corr(1),
+                                        "draining_generations": []})[1])
+    accepted(g.send("EXPOSURE_INTENT", exposure(1, 0))[1])
+    operations = [
+        {"index": 0, "name": "SEQUENCE", "opcode": 53, "status": 10054},
+    ]
+    accepted(g.send("NFS_COMPOUND_REPLY",
+                    protocol_reply(1, operations=operations))[1])
+
+    generation = SealedJournal(tmp_path / "journal", "lane0").sessions[
+        SESSION].generations[1]
+    assert [(op.name, op.opcode, op.status)
+            for op in generation.protocol_replies[0].operations] == [
+                ("SEQUENCE", 53, 10054)]
+    application = generation.exposures[0].applications[0]
+    assert application.original_value == "00000000"
+    assert application.mutated_value == "00000001"
 
 
 def test_batch_lifecycle_and_summary_closure(journal):

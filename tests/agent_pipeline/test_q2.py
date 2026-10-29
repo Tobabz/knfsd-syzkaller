@@ -115,6 +115,87 @@ def test_nonfatal_report_is_observed_without_vm_crash(sample):
     assert decision.vm_termination == "runner_stopped"
 
 
+@pytest.mark.parametrize("quality", ["campaign", "ambiguous", "none"])
+def test_attribution_quality_never_suppresses_a_classified_signal(
+        sample, quality):
+    inputs = with_evidence(
+        sample,
+        manager_crash_reports=(report(
+            "report", "BUG: KASAN: slab-out-of-bounds in worker\n"),),
+        attribution_quality=quality,
+        attribution_warnings=("exact_generation_unavailable",),
+    )
+    decision = evaluate(inputs)
+    assert decision.status is Q2Status.OBSERVED
+    assert decision.attribution_quality == quality
+    assert decision.attribution_warnings == (
+        "exact_generation_unavailable",)
+    assert decision.as_result().attribution_quality == quality
+
+
+@pytest.mark.parametrize("legacy", [
+    "crash_before_generation_attributed_campaign_execution",
+    "report_before_generation_attributed_campaign_execution",
+    "uncorrelated_program_results:1",
+])
+def test_legacy_attribution_error_is_migrated_to_campaign_warning(
+        sample, legacy):
+    inputs = with_evidence(
+        sample,
+        manager_crash_reports=(report(
+            "report", "BUG: KASAN: slab-out-of-bounds in worker\n"),),
+        internal_errors=(legacy,),
+    )
+    decision = evaluate(inputs)
+    assert decision.status is Q2Status.OBSERVED
+    assert decision.attribution_quality == "campaign"
+    assert decision.attribution_warnings == (legacy,)
+
+
+def test_verdict_without_attribution_keeps_its_earlier_id(sample):
+    # The id main computed for this evidence before attribution existed.
+    decision = evaluate(sample)
+    assert decision.attribution_quality == "none"
+    assert decision.verdict_id == (
+        "6a43a1c394bd0c3b97752d683993222788580757fc64570f419f95dab6f5220e")
+    assert "attribution_quality" not in decision.as_result().model_dump(
+        mode="json")
+    graded = evaluate(with_evidence(
+        sample, attribution_quality="campaign",
+        attribution_warnings=("exact_generation_unavailable",)))
+    assert graded.verdict_id != decision.verdict_id
+
+
+def test_legacy_foreign_execution_is_ambiguous_but_still_observed(sample):
+    legacy = "foreign_program_execution:19"
+    inputs = with_evidence(
+        sample,
+        manager_crash_reports=(report(
+            "report", "BUG: KASAN: slab-out-of-bounds in worker\n"),),
+        internal_errors=(legacy,),
+    )
+    decision = evaluate(inputs)
+    assert decision.status is Q2Status.OBSERVED
+    assert decision.attribution_quality == "ambiguous"
+    assert decision.attribution_warnings == (legacy,)
+
+
+def test_legacy_attribution_warning_does_not_hide_integrity_error(sample):
+    legacy = "crash_before_generation_attributed_campaign_execution"
+    inputs = with_evidence(
+        sample,
+        manager_crash_reports=(report(
+            "report", "BUG: KASAN: slab-out-of-bounds in worker\n"),),
+        internal_errors=(legacy, "collector contradiction"),
+    )
+    decision = evaluate(inputs)
+    assert decision.status is Q2Status.INCONCLUSIVE
+    assert decision.reason == "invalid_evidence"
+    assert decision.signals == ()
+    assert decision.attribution_quality == "campaign"
+    assert decision.attribution_warnings == (legacy,)
+
+
 @pytest.mark.parametrize("flavor", ["rcu", "rcu_preempt", "rcu_sched", "rcu_bh"])
 @pytest.mark.parametrize("header", [
     "detected stalls on CPUs/tasks:",

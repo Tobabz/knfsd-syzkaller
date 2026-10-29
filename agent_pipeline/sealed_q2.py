@@ -23,7 +23,7 @@ from .artifacts import ArtifactStore
 from .data import canonical_json, load_record, parse_json
 from .evidence import (ArtifactType, EvidenceStore,
                        ExecutionCorrelation, Identifier, VerifiedBundle)
-from .q2 import (CandidateAssociation, ConsoleLogCompleteness, Digest,
+from .q2 import (AttributionQuality, CandidateAssociation, ConsoleLogCompleteness, Digest,
                  ManagerCrashReport, Q2CollectionWindow, Q2Decision, Q2Evidence,
                  Q2Input, Q2JudgeProfile, Q2Result, VmTermination, evaluate)
 
@@ -66,6 +66,10 @@ class SealedQ2Evidence(_Record):
     collection_window: Q2CollectionWindow
     internal_errors: tuple[Annotated[str, Field(min_length=1)], ...] = ()
     candidate_association: CandidateAssociation | None = None
+    attribution_quality: AttributionQuality = Field(
+        default="none", exclude_if=lambda value: value == "none")
+    attribution_warnings: tuple[Annotated[str, Field(min_length=1)], ...] = Field(
+        default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def _unique_artifacts(self) -> Self:
@@ -246,6 +250,8 @@ class ArtifactQ2Judge:
             collection_window=receipt.collection_window,
             internal_errors=observation.internal_errors,
             candidate_association=observation.candidate_association,
+            attribution_quality=observation.attribution_quality,
+            attribution_warnings=observation.attribution_warnings,
         )
         return Q2Input(
             evidence_manifest_sha256=bundle.manifest_sha256,

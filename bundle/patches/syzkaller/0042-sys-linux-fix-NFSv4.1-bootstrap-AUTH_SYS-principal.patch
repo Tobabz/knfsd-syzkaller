@@ -1,0 +1,102 @@
+From ecc64bd1c34bbb806aa7120963310aee18123637 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 29 Oct 2026 11:11:56 +0900
+Subject: [PATCH] sys/linux: fix NFSv4.1 bootstrap AUTH_SYS principal
+
+---
+ sys/linux/nfs_fuzz_test.go    | 20 +++++++++++++++++---
+ sys/linux/socket_inet_nfs.txt | 24 ++++++++++++++++++++++--
+ 2 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index a98e0e13e..57525f401 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -412,6 +412,20 @@ func TestNFSLiveSession(t *testing.T) {
+ 	exchange := requireStruct(t, requireNFSFuzzCall(t, target,
+ 		"write$nfs41_exchange_id"), "nfs41_exchange_id_args")
+ 	requireConst(t, requireField(t, exchange, "flags").Type, 0, "EXCHANGE_ID flags")
++	for _, name := range []string{"write$nfs41_exchange_id", "write$nfs41_create_session",
++		"write$nfs41_reclaim_complete"} {
++		call := requireNFSFuzzCall(t, target, name)
++		cred := requireStruct(t, call, "rpc_auth_sys_nfs41")
++		requireConst(t, requireField(t, cred, "flavor").Type, 1, name+" AUTH_SYS flavor")
++		data := requireStruct(t, call, "rpc_auth_sys_nfs41_data")
++		for _, field := range []string{"stamp", "uid", "gid", "gids_len"} {
++			requireConst(t, requireField(t, data, field).Type, 0,
++				name+" AUTH_SYS "+field)
++		}
++		machine := requireStruct(t, call, "nfs41_empty_machine_name")
++		requireConst(t, requireField(t, machine, "length").Type, 0,
++			name+" AUTH_SYS machinename length")
++	}
+ 	create := requireStruct(t, requireNFSFuzzCall(t, target,
+ 		"write$nfs41_create_session"), "nfs41_create_session_args")
+ 	requireConst(t, requireField(t, create, "flags").Type, 0, "CREATE_SESSION flags")
+@@ -471,11 +485,11 @@ func TestNFSLiveSession(t *testing.T) {
+ 
+ 	const text = `r0 = syz_open_nfs_lane_profile$client0_knfsd_v41(0x2, 0x0)
+ r1 = syz_socket_connect_nfs_lane$client0_knfsd_v41(r0, 0x0, 0x0)
+-write$nfs41_exchange_id(r1, &(0x7f0000000000)={AUTO, AUTO, AUTO, {0x42490001, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {"42494e4452434521", AUTO, "62696e646c697665726f756e64000000", 0x0, AUTO, AUTO}}}}, AUTO)
++write$nfs41_exchange_id(r1, &(0x7f0000000000)={AUTO, AUTO, AUTO, {0x42490001, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {AUTO, {AUTO}, AUTO, AUTO, AUTO}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {"42494e4452434521", AUTO, "62696e646c697665726f756e64000000", 0x0, AUTO, AUTO}}}}, AUTO)
+ recvfrom$nfs41_exchange_id(r1, &(0x7f0000001000)={{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, <r2=>0x0, <r3=>0x0, ""/1024}, AUTO, AUTO, AUTO, AUTO)
+-write$nfs41_create_session(r1, &(0x7f0000000000)={AUTO, AUTO, AUTO, {0x42490002, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r2, r3, 0x0, {0x0, 0x1000, 0x1000, 0x0, 0x8, 0x4, AUTO}, {0x0, 0x1000, 0x1000, 0x0, 0x8, 0x4, AUTO}, 0x40000000, AUTO}}}}, AUTO)
++write$nfs41_create_session(r1, &(0x7f0000000000)={AUTO, AUTO, AUTO, {0x42490002, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {AUTO, {AUTO}, AUTO, AUTO, AUTO}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r2, r3, 0x0, {0x0, 0x1000, 0x1000, 0x0, 0x8, 0x4, AUTO}, {0x0, 0x1000, 0x1000, 0x0, 0x8, 0x4, AUTO}, 0x40000000, AUTO}}}}, AUTO)
+ recvfrom$nfs41_create_session(r1, &(0x7f0000001000)={{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, <r4=>0x0, <r5=>0x0, ""/256}, AUTO, AUTO, AUTO, AUTO)
+-write$nfs41_bind_conn_to_session(r1, &(0x7f0000002000)=[{AUTO, AUTO, AUTO, {0x42490010, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r4, r5, 0x3, AUTO}}}}, {AUTO, AUTO, AUTO, {0x42490011, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {0x0, {AUTO, "62696e646c697665"}, 0x0, 0x0, AUTO, []}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r4, r5, 0x3, AUTO}}}}], AUTO)
++write$nfs41_bind_conn_to_session(r1, &(0x7f0000002000)=[{AUTO, AUTO, AUTO, {0x42490010, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {AUTO, {AUTO}, AUTO, AUTO, AUTO}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r4, r5, 0x3, AUTO}}}}, {AUTO, AUTO, AUTO, {0x42490011, AUTO, AUTO, AUTO, AUTO, AUTO, {AUTO, AUTO, {AUTO, {AUTO}, AUTO, AUTO, AUTO}}, {AUTO, AUTO}, AUTO, AUTO, AUTO, {AUTO, {r4, r5, 0x3, AUTO}}}}], AUTO)
+ recvfrom$inet_nfs_fuzz_tcp(r1, &(0x7f0000001000)=""/256, 0x100, 0x0, 0x0, 0x0)
+ setsockopt$sock_linger(r1, 0x1, 0xd, &(0x7f0000000000)={0x1, 0x0}, 0x8)
+ close(r1)
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index c37564b8d..3f933a518 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -1110,6 +1110,26 @@ resource nfs41_sequenceid[int32]
+ resource nfs41_sessionid_hi[int64]
+ resource nfs41_sessionid_lo[int64]
+ 
++# EXCHANGE_ID establishes the client principal. CREATE_SESSION and every
++# session request must use the same AUTH_SYS identity to confirm that client.
++rpc_auth_sys_nfs41 {
++	flavor	const[1, int32be]
++	length	len[data, int32be]
++	data	rpc_auth_sys_nfs41_data
++} [packed]
++
++rpc_auth_sys_nfs41_data {
++	stamp		const[0, int32be]
++	machinename	nfs41_empty_machine_name
++	uid		const[0, int32be]
++	gid		const[0, int32be]
++	gids_len	const[0, int32be]
++} [packed]
++
++nfs41_empty_machine_name {
++	length	const[0, int32be]
++} [packed]
++
+ syz_socket_connect_nfs_lane$client0_knfsd_v41(fd fd_nfs_dir, client const[0], backend const[0]) sock_nfs_fuzz_tcp
+ write$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_exchange_id], len bytesize[buf]) (no_squash)
+ recvfrom$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_exchange_id_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+@@ -1125,7 +1145,7 @@ type rpc_nfs41_call_t[OPNUM, ARGS] {
+ 	prog		const[100003, int32be]
+ 	vers		const[4, int32be]
+ 	proc		const[1, int32be]
+-	cred		rpc_auth_sys
++	cred		rpc_auth_sys_nfs41
+ 	verf		rpc_auth_none
+ 	tag		const[0, int32be]
+ 	minorversion	const[1, int32be]
+@@ -1155,7 +1175,7 @@ type rpc_nfs41_compound2_call_t[OPNUM1, ARGS1, OPNUM2, ARGS2] {
+ 	prog		const[100003, int32be]
+ 	vers		const[4, int32be]
+ 	proc		const[1, int32be]
+-	cred		rpc_auth_sys
++	cred		rpc_auth_sys_nfs41
+ 	verf		rpc_auth_none
+ 	tag		const[0, int32be]
+ 	minorversion	const[1, int32be]
+-- 
+2.34.1
+

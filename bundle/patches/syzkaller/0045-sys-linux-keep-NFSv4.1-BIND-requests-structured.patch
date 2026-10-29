@@ -1,0 +1,39 @@
+From 59125621377bdf4ec8b445f3b57aa189ca064449 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 29 Oct 2026 17:15:00 +0900
+Subject: [PATCH] sys/linux: keep NFSv4.1 BIND requests structured
+
+---
+ sys/linux/nfs_fuzz_test.go    | 2 +-
+ sys/linux/socket_inet_nfs.txt | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index d5dfc231d..8216b7cca 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -420,7 +420,7 @@ func TestNFSLiveSession(t *testing.T) {
+ 		"write$nfs41_exchange_id"), "nfs41_exchange_id_args")
+ 	requireConst(t, requireField(t, exchange, "flags").Type, 0, "EXCHANGE_ID flags")
+ 	for _, name := range []string{"write$nfs41_exchange_id", "write$nfs41_create_session",
+-		"write$nfs41_reclaim_complete"} {
++		"write$nfs41_bind_conn_to_session", "write$nfs41_reclaim_complete"} {
+ 		call := requireNFSFuzzCall(t, target, name)
+ 		cred := requireStruct(t, call, "rpc_auth_sys_stable")
+ 		requireConst(t, requireField(t, cred, "flavor").Type, 1, name+" AUTH_SYS flavor")
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index 7de75c184..ff5752f6a 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -1137,7 +1137,7 @@ write$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_exchange
+ recvfrom$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_exchange_id_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+ write$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_create_session], len bytesize[buf]) (no_squash)
+ recvfrom$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_create_session_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+-write$nfs41_bind_conn_to_session(fd sock_nfs_fuzz_tcp, buf ptr[in, array[rpc_tcp_nfs41_bind_conn_to_session, 1:64]], len bytesize[buf])
++write$nfs41_bind_conn_to_session(fd sock_nfs_fuzz_tcp, buf ptr[in, array[rpc_tcp_nfs41_bind_conn_to_session, 1:64]], len bytesize[buf]) (no_squash)
+ write$nfs41_reclaim_complete(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_reclaim_complete], len bytesize[buf]) (no_squash)
+ recvfrom$nfs41_reclaim_complete(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_reclaim_complete_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+ 
+-- 
+2.34.1
+

@@ -611,7 +611,8 @@ def test_template_spec_is_valid():
     assert generate_module.promoted_by_criteria(spec) == ()
     live = HostSpec.model_validate_json(
         (REPO / "stage1-host-live/host-spec.json").read_bytes())
-    assert generate_module.promoted_by_criteria(live) == ()
+    assert tuple(c.id for c in generate_module.promoted_by_criteria(live)) == (
+        "HCAP-15",)
     assert live.stage2 is not None and live.stage2.procs == 1
     live_layouts = {cap.id: cap.layout() for cap in live.capabilities}
     assert all(live_layouts[capability_id] ==
@@ -1957,6 +1958,19 @@ def _with_backend(host, *, mutate=True, **backend):
             mode="json")]
     host.spec.write_text(json.dumps(spec, indent=1))
     return proxy
+
+
+@needs_gcc
+def test_stage2_backend_campaign_mode_is_passed_only_when_not_fuzz(host):
+    _with_backend(host, campaign_mode="proxy_only")
+    argv = Stage1Config.load(generate(host.spec).stage1_config).stage2.argv
+    assert argv[argv.index("--campaign-mode") + 1] == "proxy_only"
+    _with_backend(host, campaign_mode="fuzz")
+    argv = Stage1Config.load(generate(host.spec).stage1_config).stage2.argv
+    assert "--campaign-mode" not in argv
+    _with_backend(host, campaign_mode="corpus")
+    with pytest.raises(ValidationError):
+        generate(host.spec)
 
 
 @needs_gcc

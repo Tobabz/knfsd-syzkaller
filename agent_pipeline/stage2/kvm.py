@@ -44,7 +44,8 @@ from ..materializer import (ExecutionHarnessDescriptor, ReachabilityHarness,
 from ..q1 import ExecutionCorrelation, KernelIdentity
 from ..q2 import Q2CollectionWindow
 from ..qemu_accel import Accel, accel_of
-from ..replay_runner import PlanError, parse_execprog_barriers
+from ..replay_runner import (PlanError, parse_crash_context,
+                             parse_execprog_barriers)
 from ..sealed_q1 import COVERAGE_TYPE, OBSERVATION_ID, OBSERVATION_TYPE, PublishedCoverage
 from ..sealed_q2 import (CONSOLE_LOG_TYPE, MANAGER_REPORT_TYPE, Q2_EVIDENCE_ID,
                          Q2_EVIDENCE_TYPE, SealedArtifactRef, SealedQ2Evidence)
@@ -62,6 +63,8 @@ from ..stage1.host.vm import (GUEST_COMMAND_TIMEOUT_S,
                               Guest, QemuGuest, VmConfig)
 from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
                        GENERATION_COVERAGE_PREFIX, GENERATION_COVERAGE_TYPE,
+                       GENERATION_EXECUTION_PREFIX, GENERATION_EXECUTION_TYPE,
+                       GenerationExecution,
                        JOURNAL_TYPE, NEUTRAL_COVERAGE_ID,
                        NEUTRAL_COVERAGE_TYPE, NEUTRAL_EXECPROG_ID,
                        REPLAY_EXECPROG_ID, SCENARIO_EXECPROG_ID,
@@ -126,12 +129,16 @@ class NfsProxyExecution(BaseModel):
         max_length=1 << 20)
 
 
+CampaignMode = Literal["fuzz", "proxy_only"]
+CAMPAIGN_MODES = ("fuzz", "proxy_only")
+
+
 @dataclass(frozen=True)
 class StepOptions:
     #: The manager config; None when ``variant_managers`` picks one.
     manager: Path | None
     collector: Path
-    campaign_executions: int = 128
+    campaign_executions: int = 96
     campaign_timeout_s: float = 1800
     manager_stop_timeout_s: float = 45
     #: None takes the collector's ``exec_slowdown`` (TCG hosts scale it).
@@ -139,15 +146,23 @@ class StepOptions:
     #: (sanitizer, manager config) pairs of a host with several variants
     #: (#81 D10): a lease runs the manager of its descriptor's sanitizer.
     variant_managers: tuple[tuple[Sanitizer, Path], ...] = ()
+    #: ``fuzz``: syz-manager mutates programs and the Proxy applies the rule
+    #: set (01 §8).  ``proxy_only``: the manager replays the approved
+    #: program unchanged and only the Proxy mutates, so every execution
+    #: belongs to one program.
+    campaign_mode: CampaignMode = "fuzz"
 
     def __post_init__(self) -> None:
+        if self.campaign_mode not in CAMPAIGN_MODES:
+            raise ValueError(
+                f"campaign_mode must be one of {sorted(CAMPAIGN_MODES)}")
         if (self.manager is None) == (not self.variant_managers):
             raise ValueError("give one manager or variant managers")
         sanitizers = [sanitizer for sanitizer, _ in self.variant_managers]
         if len(set(sanitizers)) != len(sanitizers):
             raise ValueError("a sanitizer has two variant managers")
-        if not 1 <= self.campaign_executions <= 192:
-            raise ValueError("campaign_executions must be in [1, 192]")
+        if not 1 <= self.campaign_executions <= 96:
+            raise ValueError("campaign_executions must be in [1, 96]")
         if (not all(math.isfinite(value) for value in (
                 self.campaign_timeout_s, self.manager_stop_timeout_s))
                 or self.campaign_timeout_s <= 0
@@ -668,6 +683,38 @@ def _check_program_calls(program: bytes, manager: dict) -> None:
             + ", ".join(disabled))
 
 
+def _seedless_syzkaller(source: Path, work: Path) -> Path:
+    """Expose the pinned manager binaries without built-in test seeds."""
+    source = source.absolute()
+    bin_dir = source / "bin"
+    if not bin_dir.is_dir():
+        raise Stage2StepError(
+            f"manager syzkaller tree has no bin directory: {source}")
+    view = work / "syzkaller-seedless"
+    (view / "sys" / "linux" / "test").mkdir(parents=True)
+    (view / "bin").symlink_to(bin_dir, target_is_directory=True)
+    return view
+
+
+def _manager_command(binary: Path, config: Path,
+                     mode: CampaignMode = "fuzz") -> list[str]:
+    """``proxy_only`` runs only corpus records, without syzkaller program
+    mutation."""
+    command = [str(binary), "-config", str(config)]
+    if mode == "proxy_only":
+        command += ["-mode", "corpus-run"]
+    return [*command, "-debug"]
+
+
+def _foreign_campaign_execution(
+        records: list[NfsProxyExecution], program_sha256: str
+        ) -> NfsProxyExecution | None:
+    """Return the first campaign execution that is not the approved seed."""
+    return next((record for record in records
+                 if record.campaign
+                 and record.program_sha256 != program_sha256), None)
+
+
 def _manager_path(options: StepOptions,
                   descriptor: ExecutionHarnessDescriptor) -> Path:
     if options.manager is not None:
@@ -1137,6 +1184,45 @@ def _campaign_records(records: list[NfsProxyExecution]) -> tuple[
     return campaign, [record for record in campaign if _correlated(record)]
 
 
+def _crash_attribution(
+        *, report_seen: bool, crash_log: str | None, vm: str, procs: int,
+        campaign: list[NfsProxyExecution],
+        correlated: list[NfsProxyExecution],
+        foreign: NfsProxyExecution | None
+        ) -> tuple[str, tuple[str, ...]]:
+    """Grade crash attribution without changing the sanitizer oracle."""
+    if not report_seen:
+        return "none", ()
+    if crash_log is not None:
+        try:
+            window = parse_crash_context(
+                crash_log, vm_instance_id=vm, bound=64)
+            current = window.entries[-1]
+            matches = [record for record in correlated
+                       if record.execution_id == current.exec_id
+                       and record.lane == current.lane_id
+                       and current.barrier is not None
+                       and record.generation
+                       == current.barrier.kcov_generation
+                       and record.program_digest
+                       == current.barrier.program_digest]
+            if len(matches) == 1:
+                return "exact", ()
+        except PlanError:
+            pass
+    warnings = ["exact_generation_unavailable"]
+    if foreign is not None:
+        warnings.append(f"foreign_program_execution:{foreign.execution_id}")
+    uncorrelated = len(campaign) - len(correlated)
+    if uncorrelated:
+        warnings.append(f"uncorrelated_program_results:{uncorrelated}")
+    if procs == 1 and foreign is None:
+        return "campaign", tuple(warnings)
+    if procs > 1:
+        warnings.append(f"multiple_active_lanes:{procs}")
+    return "ambiguous", tuple(warnings)
+
+
 def _crash_files(workdir: Path) -> tuple[list[Path], Path | None]:
     root = workdir / "crashes"
     reports = sorted(root.glob("*/report*")) if root.is_dir() else []
@@ -1212,6 +1298,17 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
     workdir.mkdir()
     spool.mkdir()
     program = (inputs.root / "program.syz").read_bytes()
+    program_sha256 = hashlib.sha256(program).hexdigest()
+    proxy_only = options.campaign_mode == "proxy_only"
+    if proxy_only:
+        # Only the Proxy mutates this campaign.  Keep syzkaller on the
+        # approved program so both mutation layers cannot mix in one
+        # generation.  The manager runs a narrower config than the one
+        # preflight checked: the program's own calls only.
+        manager["syzkaller"] = str(_seedless_syzkaller(
+            Path(str(manager["syzkaller"])), work))
+        manager["reproduce"] = False
+        manager["enable_syscalls"] = program_calls(program)
     _corpus(workdir / "corpus.db", program)
     vm = _vm_id(inputs.execution, "campaign")
     prefixes = tuple(f"cl{lane}-{uuid.uuid4().hex}"
@@ -1239,7 +1336,7 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         try:
             with manager_log.open("wb") as log:
                 process = subprocess.Popen(
-                    [str(manager_binary), "-config", str(config), "-debug"],
+                    _manager_command(manager_binary, config, options.campaign_mode),
                     stdin=subprocess.DEVNULL, stdout=log,
                     stderr=subprocess.STDOUT, start_new_session=True)
                 deadline = time.monotonic() + options.campaign_timeout_s
@@ -1247,7 +1344,9 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
                     records = _spool(spool)
                     _, campaign_records = _campaign_records(records)
                     reports, crash_log = _crash_files(workdir)
-                    if (len(campaign_records) >= options.campaign_executions or
+                    if (proxy_only and _foreign_campaign_execution(
+                            records, program_sha256) is not None or
+                            len(campaign_records) >= options.campaign_executions or
                             reports or crash_log is not None):
                         break
                     if process.poll() is not None:
@@ -1289,6 +1388,7 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
                 "syz-manager produced no generation-attributed campaign execution")
         seen: set[tuple[int, int]] = set()
         coverage_artifacts: list[_Artifact] = []
+        execution_artifacts: list[_Artifact] = []
         for record in correlated:
             _check_evidence_deadline(seal_deadline)
             key = (record.lane, record.generation)
@@ -1302,6 +1402,20 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
             coverage_artifacts.append(_Artifact(
                 f"{GENERATION_COVERAGE_PREFIX}{record.lane}.{record.generation}",
                 GENERATION_COVERAGE_TYPE, canonical_json(coverage)))
+            execution = GenerationExecution(
+                correlation=inputs.correlation(
+                    vm, record.lane, record.generation),
+                execution_id=record.execution_id,
+                program_sha256=record.program_sha256,
+                program_digest=record.program_digest,
+                activation=record.activation,
+                activation_status=record.activation_status,
+                deactivation=record.deactivation,
+                deactivation_status=record.deactivation_status,
+                executed=record.executed, lease_cleared=record.lease_cleared)
+            execution_artifacts.append(_Artifact(
+                f"{GENERATION_EXECUTION_PREFIX}{record.lane}.{record.generation}",
+                GENERATION_EXECUTION_TYPE, canonical_json(execution)))
         report_artifacts: list[_Artifact] = []
         report_refs: list[SealedArtifactRef] = []
         for number, path in enumerate(reports):
@@ -1322,16 +1436,15 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
         if unexpected_exit and not guest_crashed:
             returncode = process.returncode if process is not None else None
             internal.append(f"manager_exited_unexpectedly:{returncode}")
-        if not correlated:
-            internal.append(
-                "crash_before_generation_attributed_campaign_execution"
-                if guest_crashed else
-                "report_before_generation_attributed_campaign_execution")
         if _KCSAN_REPORT.search(console) and not reports:
             internal.append("kcsan_console_report_missing_from_manager_reports")
-        uncorrelated = len(campaign_span) - len(correlated)
-        if uncorrelated:
-            internal.append(f"uncorrelated_program_results:{uncorrelated}")
+        foreign = _foreign_campaign_execution(records, program_sha256)
+        attribution_quality, attribution_warnings = _crash_attribution(
+            report_seen=report_seen,
+            crash_log=(crash_log.read_text(errors="replace")
+                       if crash_log is not None else None),
+            vm=vm, procs=int(manager["procs"]), campaign=campaign_span,
+            correlated=correlated, foreign=foreign)
         completeness = "complete" if complete else "truncated"
         termination = "guest_crashed" if guest_crashed else (
             "lost" if unexpected_exit else
@@ -1346,12 +1459,15 @@ def _campaign(inputs: _Inputs, output: Path, options: StepOptions) -> None:
             console_log_completeness=completeness,
             manager_crash_reports=tuple(report_refs),
             vm_termination=termination, collection_window=window,
-            internal_errors=tuple(internal))
+            internal_errors=tuple(internal),
+            attribution_quality=attribution_quality,
+            attribution_warnings=attribution_warnings)
         artifacts = [
             _Artifact(Q2_EVIDENCE_ID, Q2_EVIDENCE_TYPE, canonical_json(q2)),
             _Artifact(console_identity, CONSOLE_LOG_TYPE, console),
             *report_artifacts,
             *coverage_artifacts,
+            *execution_artifacts,
         ]
         if crash_log is not None:
             _check_evidence_deadline(seal_deadline)

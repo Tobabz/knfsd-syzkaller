@@ -646,11 +646,26 @@ Stage 2 fuzzing은 `syz-manager`의 ordinary program mutation과 candidate-speci
 사용한다. rule set은 Runner가 설치하고 executor가 program generation마다 활성화하므로
 (`03-nfs-proxy/01` §16), syzkaller는 program을 변이시키지만 rule 내용은 변이시키지 않는다.
 
+Runner는 campaign 모드를 둘 중 하나로 실행한다. 기본값은 `fuzz`로 위의 동작이다. `proxy_only`는
+syz-manager를 `-mode corpus-run`으로 실행해 승인된 program 하나를 변이 없이 반복 실행하고, 변이는 Proxy의
+rule만 일으킨다. 이때 모든 실행이 한 program에 속하므로 crash를 generation에 정확히 귀속하기 쉽지만,
+탐색하는 program 범위는 승인된 program 하나로 좁아진다. `proxy_only`는 호스트 spec의
+`stage2.backend.campaign_mode`로만 선택하며, 승인된 program의 call만 `enable_syscalls`에 남기므로 manager가
+preflight가 검증한 config보다 좁은 config로 돈다. 어느 모드든 execution 수는 bundle당 96개 이하다
+(generation마다 coverage와 execution artifact가 하나씩 봉인되고 segment는 255개까지 담는다).
+
 Q2는 sanitizer/crash 신호만 판정하는 oracle이다. 단순 "crash file exists"가 아니라 reviewed
 sanitizer/crash oracle로 판정하되, crash site나 stack이 candidate 경로 안에 있는지를 Q2의 조건으로
 삼지 않는다. candidate와의 연관은 Stage 1 Q1, rule별 M1과 delivery state, crash report, replay,
 human/root-cause review를 묶어 나중에 평가한다. "stack에 candidate symbol이 있음" 같은 deterministic
 heuristic은 triage metadata로만 기록하며 oracle verdict가 아니다.
+
+Q2 결과는 crash의 귀속 정도를 `attribution_quality`(`exact`: 마지막 crash-context entry가 생성한 execution 하나와
+정확히 맞음, `campaign`: campaign 안에서만 확인됨, `ambiguous`: 승인된 program이 아닌 실행이나 여러 lane이 섞임,
+`none`: report 없음)와 진단용 `attribution_warnings`로 따로 기록한다. 귀속이 부족해도 분류된 report가 있으면
+`OBSERVED`이고, 그 사실이 `invalid_evidence`가 되지 않는다. 아래 판정 순서 1행의 "내부 모순"은 증거 무결성과
+collector 일관성 실패만 뜻한다. replay와 minimization은 `exact`일 때 쓰고, 그 밖의 귀속은 crash 보존과 campaign 수준의
+mutation context 용도다. 귀속 값이 없는 증거의 `verdict_id`와 직렬화는 이 필드가 생기기 전과 같다.
 
 ### 8.1 CrashContextWindow
 

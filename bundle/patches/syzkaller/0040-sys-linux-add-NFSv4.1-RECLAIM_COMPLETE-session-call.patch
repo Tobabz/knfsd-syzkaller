@@ -1,0 +1,174 @@
+From e7ed3dfe3656c84b2a4bb74ebd12639545eaf29f Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 29 Oct 2026 10:53:44 +0900
+Subject: [PATCH 1/2] sys/linux: add NFSv4.1 RECLAIM_COMPLETE session call
+
+---
+ sys/linux/nfs_fuzz_test.go    | 30 ++++++++++++++-
+ sys/linux/socket_inet_nfs.txt | 71 +++++++++++++++++++++++++++--------
+ 2 files changed, 84 insertions(+), 17 deletions(-)
+
+diff --git a/sys/linux/nfs_fuzz_test.go b/sys/linux/nfs_fuzz_test.go
+index f70dd2066..a98e0e13e 100644
+--- a/sys/linux/nfs_fuzz_test.go
++++ b/sys/linux/nfs_fuzz_test.go
+@@ -399,12 +399,38 @@ func TestNFSLiveSession(t *testing.T) {
+ 
+ 	// Requests carry a byte-spelled last-fragment record marker.
+ 	for _, name := range []string{"write$nfs41_exchange_id", "write$nfs41_create_session",
+-		"write$nfs41_bind_conn_to_session"} {
++		"write$nfs41_bind_conn_to_session", "write$nfs41_reclaim_complete"} {
+ 		call := requireNFSFuzzCall(t, target, name)
+-		record := requireStruct(t, call, "rpc_tcp_nfs41_record_t")
++		recordName := "rpc_tcp_nfs41_record_t"
++		if name == "write$nfs41_reclaim_complete" {
++			recordName = "rpc_tcp_nfs41_compound2_record_t"
++		}
++		record := requireStruct(t, call, recordName)
+ 		requireConst(t, requireField(t, record, "last_frag").Type, 0x80, name+" last_frag")
+ 		requireConst(t, requireField(t, record, "frag_len_hi").Type, 0, name+" frag_len_hi")
+ 	}
++	exchange := requireStruct(t, requireNFSFuzzCall(t, target,
++		"write$nfs41_exchange_id"), "nfs41_exchange_id_args")
++	requireConst(t, requireField(t, exchange, "flags").Type, 0, "EXCHANGE_ID flags")
++	create := requireStruct(t, requireNFSFuzzCall(t, target,
++		"write$nfs41_create_session"), "nfs41_create_session_args")
++	requireConst(t, requireField(t, create, "flags").Type, 0, "CREATE_SESSION flags")
++	for _, field := range []string{"fore", "back"} {
++		channel, ok := requireField(t, create, field).Type.(*prog.StructType)
++		if !ok || channel.TemplateName() != "nfs41_session_channel_attrs" {
++			t.Fatalf("CREATE_SESSION %s channel is %v", field, channel)
++		}
++		for name, want := range map[string]uint64{
++			"headerpad": 0, "maxreqsize": 0x1000, "maxrespsize": 0x1000,
++			"maxresp_cached": 0, "maxops": 8, "maxreqs": 4, "rdma_ird_len": 0,
++		} {
++			requireConst(t, requireField(t, channel, name).Type, want,
++				"CREATE_SESSION "+field+" "+name)
++		}
++	}
++	reclaim := requireStruct(t, requireNFSFuzzCall(t, target,
++		"write$nfs41_reclaim_complete"), "nfs41_reclaim_complete_args")
++	requireConst(t, requireField(t, reclaim, "one_fs").Type, 0, "RECLAIM_COMPLETE one_fs")
+ 	bind := requireNFSFuzzCall(t, target, "write$nfs41_bind_conn_to_session")
+ 	records, ok := bind.Args[1].Type.(*prog.PtrType).Elem.(*prog.ArrayType)
+ 	if !ok || records.RangeBegin != 1 || records.RangeEnd != 64 {
+diff --git a/sys/linux/socket_inet_nfs.txt b/sys/linux/socket_inet_nfs.txt
+index 86103ac72..c37564b8d 100644
+--- a/sys/linux/socket_inet_nfs.txt
++++ b/sys/linux/socket_inet_nfs.txt
+@@ -1111,11 +1111,12 @@ resource nfs41_sessionid_hi[int64]
+ resource nfs41_sessionid_lo[int64]
+ 
+ syz_socket_connect_nfs_lane$client0_knfsd_v41(fd fd_nfs_dir, client const[0], backend const[0]) sock_nfs_fuzz_tcp
+-write$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_exchange_id], len bytesize[buf])
++write$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_exchange_id], len bytesize[buf]) (no_squash)
+ recvfrom$nfs41_exchange_id(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_exchange_id_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+-write$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_create_session], len bytesize[buf])
++write$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_create_session], len bytesize[buf]) (no_squash)
+ recvfrom$nfs41_create_session(fd sock_nfs_fuzz_tcp, buf ptr[out, nfs41_create_session_reply], len bytesize[buf], f const[0], addr const[0], addrlen const[0])
+ write$nfs41_bind_conn_to_session(fd sock_nfs_fuzz_tcp, buf ptr[in, array[rpc_tcp_nfs41_bind_conn_to_session, 1:64]], len bytesize[buf])
++write$nfs41_reclaim_complete(fd sock_nfs_fuzz_tcp, buf ptr[in, rpc_tcp_nfs41_reclaim_complete], len bytesize[buf]) (no_squash)
+ 
+ type rpc_nfs41_call_t[OPNUM, ARGS] {
+ 	xid		int32be
+@@ -1146,36 +1147,62 @@ type rpc_tcp_nfs41_exchange_id rpc_tcp_nfs41_record_t[42, nfs41_exchange_id_args
+ type rpc_tcp_nfs41_create_session rpc_tcp_nfs41_record_t[43, nfs41_create_session_args]
+ type rpc_tcp_nfs41_bind_conn_to_session rpc_tcp_nfs41_record_t[41, nfs41_bind_conn_to_session_args]
+ 
++# A session request must put SEQUENCE first in a multi-operation COMPOUND.
++type rpc_nfs41_compound2_call_t[OPNUM1, ARGS1, OPNUM2, ARGS2] {
++	xid		int32be
++	mtype		const[0, int32be]
++	rpcvers		const[2, int32be]
++	prog		const[100003, int32be]
++	vers		const[4, int32be]
++	proc		const[1, int32be]
++	cred		rpc_auth_sys
++	verf		rpc_auth_none
++	tag		const[0, int32be]
++	minorversion	const[1, int32be]
++	argarray_len	const[2, int32be]
++	op1		nfs4_op_t[OPNUM1, ARGS1]
++	op2		nfs4_op_t[OPNUM2, ARGS2]
++} [packed]
++
++type rpc_tcp_nfs41_compound2_record_t[OPNUM1, ARGS1, OPNUM2, ARGS2] {
++	last_frag	const[0x80, int8]
++	frag_len_hi	const[0, int8]
++	frag_len	bytesize[msg, int16be]
++	msg		rpc_nfs41_compound2_call_t[OPNUM1, ARGS1, OPNUM2, ARGS2]
++} [packed]
++
++type rpc_tcp_nfs41_reclaim_complete rpc_tcp_nfs41_compound2_record_t[53, nfs41_sequence_args, 58, nfs41_reclaim_complete_args]
++
+ # RFC 8881 18.35: verifier, client owner, flags, SP4_NONE and an empty
+ # implementation id list.
+ nfs41_exchange_id_args {
+ 	verifier	array[int8, 8]
+ 	owner_len	len[owner, int32be]
+ 	owner		array[int8, 16]
+-	flags		flags[nfs4_exchange_id_flags, int32be]
++	flags		const[0, int32be]
+ 	state_protect	const[0, int32be]
+ 	impl_id_len	const[0, int32be]
+ } [packed]
+ 
+-nfs41_channel_attrs {
+-	headerpad	int32be
+-	maxreqsize	int32be
+-	maxrespsize	int32be
+-	maxresp_cached	int32be
+-	maxops		int32be
+-	maxreqs		int32be
++# A bootstrap session needs channels large enough for KNFSD's mandatory
++# operations. Keep these values immutable while mutating later requests.
++nfs41_session_channel_attrs {
++	headerpad	const[0, int32be]
++	maxreqsize	const[0x1000, int32be]
++	maxrespsize	const[0x1000, int32be]
++	maxresp_cached	const[0, int32be]
++	maxops		const[8, int32be]
++	maxreqs		const[4, int32be]
+ 	rdma_ird_len	const[0, int32be]
+ } [packed]
+ 
+-nfs41_create_session_flags = 0x1, 0x2, 0x4
+-
+ # RFC 8881 18.36 with no callback security parameters.
+ nfs41_create_session_args {
+ 	clientid	nfs41_clientid
+ 	sequenceid	nfs41_sequenceid
+-	flags		flags[nfs41_create_session_flags, int32be]
+-	fore		nfs41_channel_attrs
+-	back		nfs41_channel_attrs
++	flags		const[0, int32be]
++	fore		nfs41_session_channel_attrs
++	back		nfs41_session_channel_attrs
+ 	cb_program	int32be
+ 	sec_parms_len	const[0, int32be]
+ } [packed]
+@@ -1191,6 +1218,20 @@ nfs41_bind_conn_to_session_args {
+ 	rdma_mode	const[0, int32be]
+ } [packed]
+ 
++# This COMPOUND has no current filehandle, so use whole-server completion.
++nfs41_reclaim_complete_args {
++	one_fs	const[0, int32be]
++} [packed]
++
++nfs41_sequence_args {
++	sessionid_hi	nfs41_sessionid_hi
++	sessionid_lo	nfs41_sessionid_lo
++	seqid		const[1, int32be]
++	slotid		const[0, int32be]
++	highest_slotid	const[0, int32be]
++	cachethis	const[0, int32be]
++} [packed]
++
+ # Reply record marker, RPC accepted reply with an AUTH_NONE verifier, COMPOUND
+ # status, empty tag, result count, then the first op's opnum and status.
+ nfs41_reply_header {
+-- 
+2.34.1
+

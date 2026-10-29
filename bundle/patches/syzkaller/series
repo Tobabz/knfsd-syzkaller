@@ -36,3 +36,9 @@
 0037-executor-mount-lane-profile-aliases-without-a-contro.patch
 0038-executor-log-profile-opens-and-target-FINISH-outcome.patch
 0039-sys-linux-spell-the-plain-TCP-record-marker-as-bytes.patch
+0040-sys-linux-add-NFSv4.1-RECLAIM_COMPLETE-session-call.patch
+0041-prog-generate-ordered-calls-with-shared-resource-sta.patch
+0042-sys-linux-fix-NFSv4.1-bootstrap-AUTH_SYS-principal.patch
+0043-sys-linux-distinguish-mutable-and-stable-AUTH_SYS-c.patch
+0044-sys-linux-wait-for-RECLAIM_COMPLETE-reply.patch
+0045-sys-linux-keep-NFSv4.1-BIND-requests-structured.patch

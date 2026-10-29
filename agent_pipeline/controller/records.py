@@ -328,6 +328,8 @@ class TriageItem(Record):
     q2_reason: str | None = None
     m1_verdict_id: str
     crash_window_applied: tuple[str, ...] = ()
+    attribution_quality: Literal["exact", "campaign", "ambiguous", "none"] = "none"
+    attribution_warnings: tuple[str, ...] = ()
     late: bool = False
     routing: Literal["none", "replayed", "queued", "unrouted"] = "none"
 

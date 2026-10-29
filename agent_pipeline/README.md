@@ -159,7 +159,11 @@ adapter verifies every console/report byte before the pure `q2.evaluate`
 kernel classifies reports under the selected `Q2JudgeProfile`. Missing storage
 or a late receipt raises instead of creating a verdict, while malformed,
 miscorrelated or hash-invalid present evidence produces
-`INCONCLUSIVE(invalid_evidence)`.
+`INCONCLUSIVE(invalid_evidence)`. Crash attribution is separate from this
+signal oracle: a classified report remains `OBSERVED` at `exact`, `campaign`,
+`ambiguous`, or `none` attribution quality. Attribution warnings guide
+replay and minimization; only evidence-integrity or collector-consistency
+errors invalidate Q2.
 
 Content addressing establishes byte integrity, not provenance. The artifact
 root and its provisioning, catalog/profile selection, receipt registry, mapping

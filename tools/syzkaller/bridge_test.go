@@ -303,13 +303,16 @@ func TestDescribeCallShapes(t *testing.T) {
 			t.Fatalf("open file has a literal: %+v", leaf)
 		}
 	}
-	reply, err := describeCalls(target, []string{"recvfrom$nfs41_exchange_id"})
+	reply, err := describeCalls(target, []string{"recvfrom$nfs41_exchange_id",
+		"recvfrom$nfs41_reclaim_complete"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, leaf := range reply.Calls[0].Leaves {
-		if strings.HasPrefix(leaf.Path, "buf.") {
-			t.Fatalf("an output buffer position: %+v", leaf)
+	for _, call := range reply.Calls {
+		for _, leaf := range call.Leaves {
+			if strings.HasPrefix(leaf.Path, "buf.") {
+				t.Fatalf("an output buffer position: %+v", leaf)
+			}
 		}
 	}
 	// A one-value flag set still admits 0, so it is no literal.

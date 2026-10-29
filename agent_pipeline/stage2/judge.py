@@ -74,6 +74,8 @@ from ..semantic_replay import (InvalidReason, ReplayJudgeInput,
                               ReplayJudgeProfile, evaluate as replay_evaluate)
 from .evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE, EXECPROG_TYPE,
                        GENERATION_COVERAGE_PREFIX, GENERATION_COVERAGE_TYPE,
+                       GENERATION_EXECUTION_PREFIX, GENERATION_EXECUTION_TYPE,
+                       GenerationExecution,
                        HOST_FACTS_ID, HOST_FACTS_TYPE, NEUTRAL_COVERAGE_ID,
                        NEUTRAL_COVERAGE_TYPE, NEUTRAL_EXECPROG_ID,
                        REPLAY_EXECPROG_ID, SCENARIO_EXECPROG_ID,
@@ -107,6 +109,7 @@ class Stage2Execution(Record):
     compiled: CompiledRuleSet
     identity: KernelIdentity
     mapping_ref: Sha256
+    program_ref: Sha256
     plan_ref: Sha256 | None = None
     q1: TrustedQ1Execution | None = None
     q2: TrustedQ2Execution | None = None
@@ -243,6 +246,134 @@ class ArtifactStage2Judge:
                 mapping.target != x.candidate:
             raise ValueError("target mapping does not fit this execution")
         return frozenset(mapping.target_pcs)
+
+    @staticmethod
+    def _generation_key(identity: str, prefix: str) -> tuple[int, int]:
+        suffix = identity.removeprefix(prefix)
+        lane_text, separator, generation_text = suffix.partition(".")
+        if not separator or not lane_text.isdigit() or \
+                not generation_text.isdigit():
+            raise ValueError(f"invalid generation artifact {identity!r}")
+        lane, generation = int(lane_text), int(generation_text)
+        if identity != f"{prefix}{lane}.{generation}":
+            raise ValueError(f"non-canonical generation artifact {identity!r}")
+        return lane, generation
+
+    def _generation_artifacts(
+            self, x: Stage2Execution, ev: _Evidence
+            ) -> dict[tuple[int, int], tuple[PublishedCoverage,
+                                             GenerationExecution]]:
+        """Pair every generation's coverage with its host execution record."""
+        coverage: dict[tuple[int, int], PublishedCoverage] = {}
+        executions: dict[tuple[int, int], GenerationExecution] = {}
+        for item in ev.bundle.artifacts:
+            identity, artifact_type = (item.descriptor.identity,
+                                       item.descriptor.type)
+            if identity.startswith(GENERATION_COVERAGE_PREFIX):
+                if artifact_type != GENERATION_COVERAGE_TYPE:
+                    raise ValueError("generation coverage has another type")
+                key = self._generation_key(identity,
+                                           GENERATION_COVERAGE_PREFIX)
+                if key in coverage:
+                    raise ValueError("duplicate generation coverage")
+                coverage[key] = PublishedCoverage.model_validate_json(
+                    item.data)
+            elif artifact_type == GENERATION_COVERAGE_TYPE:
+                raise ValueError("generation coverage without its prefix")
+            if identity.startswith(GENERATION_EXECUTION_PREFIX):
+                if artifact_type != GENERATION_EXECUTION_TYPE:
+                    raise ValueError("generation execution has another type")
+                key = self._generation_key(identity,
+                                           GENERATION_EXECUTION_PREFIX)
+                if key in executions:
+                    raise ValueError("duplicate generation execution")
+                executions[key] = GenerationExecution.model_validate_json(
+                    item.data)
+            elif artifact_type == GENERATION_EXECUTION_TYPE:
+                raise ValueError("generation execution without its prefix")
+        if coverage.keys() != executions.keys():
+            raise ValueError("coverage and execution generations differ")
+        own = x.correlation
+        execution_ids: set[int] = set()
+        paired = {}
+        for key in sorted(coverage):
+            c, a = coverage[key].correlation, executions[key].correlation
+            expected = (own.job_id, own.task_id, own.execution_harness_id,
+                        own.vm_instance_id, *key)
+            if (c.job_id, c.task_id, c.execution_harness_id, c.vm_instance_id,
+                    c.lane, c.generation_id) != expected or c != a:
+                raise ValueError("generation artifact correlation mismatch")
+            if executions[key].execution_id in execution_ids:
+                raise ValueError("generation execution ID is reused")
+            execution_ids.add(executions[key].execution_id)
+            paired[key] = coverage[key], executions[key]
+        return paired
+
+    @staticmethod
+    def _journal_generation(
+            x: Stage2Execution, ev: _Evidence, lane: int, generation: int
+            ) -> tuple[SessionDelta, GenerationDelta] | None:
+        found = [(session, session.generations[generation])
+                 for session in ev.journal.sessions.values()
+                 if session.binding.vm_instance_id
+                 == x.correlation.vm_instance_id
+                 and session.lane_id == lane
+                 and generation in session.generations]
+        if len(found) > 1:
+            raise ValueError("a generation matches two journal sessions")
+        return found[0] if found else None
+
+    @staticmethod
+    def _execution_valid(attestation: GenerationExecution,
+                         generation: GenerationDelta | None) -> bool:
+        return generation is not None and \
+            attestation.program_digest == generation.program_digest and \
+            attestation.activation == "Acked" and \
+            attestation.activation_status == 0 and \
+            attestation.deactivation == "Acked" and \
+            attestation.deactivation_status == 0 and \
+            attestation.executed and attestation.lease_cleared
+
+    # NFSv4.1 session setup: EXCHANGE_ID, CREATE_SESSION, SEQUENCE,
+    # RECLAIM_COMPLETE.  A failed one means the session was never
+    # established, whatever candidate the program serves.
+    _SESSION_OPCODES = frozenset({42, 43, 53, 58})
+
+    @staticmethod
+    def _generation_sound(
+            x: Stage2Execution, session: SessionDelta | None,
+            generation: GenerationDelta | None,
+            attestation: GenerationExecution) -> bool:
+        """Evidence of one generation is intact and its session came up.
+
+        Candidate-independent.  Whether a rule applied is not decided here:
+        the rule set and hypotheses declare that, and M1 judges it."""
+        if session is None or generation is None or \
+                attestation.program_sha256 != x.program_ref or \
+                session.rejections or session.inconsistent or \
+                generation.refusals or generation.summary is None:
+            return False
+        summary = generation.summary
+        if summary.evidence_path_failures != 0 or \
+                summary.outside_activation_window != 0 or \
+                summary.closure.reason != "drained" or \
+                summary.closure.reply_unresolved_count != 0:
+            return False
+        return not any(
+            operation.status != 0
+            for reply in generation.protocol_replies
+            for operation in reply.operations
+            if operation.opcode in ArtifactStage2Judge._SESSION_OPCODES)
+
+    @staticmethod
+    def _valid_generation(
+            x: Stage2Execution, session: SessionDelta | None,
+            generation: GenerationDelta | None,
+            attestation: GenerationExecution) -> bool:
+        return ArtifactStage2Judge._execution_valid(
+            attestation, generation) and \
+            ArtifactStage2Judge._generation_sound(
+                x, session, generation, attestation)
 
     # ------------------------------------------------------------ M1 window
 
@@ -503,7 +634,9 @@ class ArtifactStage2Judge:
                              evidence=self.evidence).judge(
             bundle_ref, x.q2_profile_ref)
         fields = dict(bundle_ref=bundle_ref, q2_verdict_id=q2.verdict_id,
-                      q2_status=q2.status.value, q2_reason=q2.reason)
+                      q2_status=q2.status.value, q2_reason=q2.reason,
+                      attribution_quality=q2.attribution_quality,
+                      attribution_warnings=q2.attribution_warnings)
         stack: list = []
         executions = 0
         try:
@@ -540,40 +673,28 @@ class ArtifactStage2Judge:
                            m1_rules: M1RuleSet) -> tuple[dict, list[str]]:
         """01 §3, §12: hypothesis M1 of every reached program generation."""
         targets = self._target_pcs(x)
-        own = x.correlation
         reached = applied = not_applied = inconclusive = 0
         ids: list[str] = []
-        for item in sorted(ev.bundle.artifacts,
-                           key=lambda a: a.descriptor.identity):
-            if item.descriptor.type != GENERATION_COVERAGE_TYPE:
-                continue
-            if not item.descriptor.identity.startswith(
-                    GENERATION_COVERAGE_PREFIX):
-                raise ValueError("generation coverage without its prefix")
-            coverage = PublishedCoverage.model_validate_json(item.data)
+        for (lane, generation_id), (coverage, attestation) in \
+                self._generation_artifacts(x, ev).items():
             c = coverage.correlation
-            if (c.job_id, c.task_id, c.execution_harness_id,
-                    c.vm_instance_id) != (own.job_id, own.task_id,
-                                          own.execution_harness_id,
-                                          own.vm_instance_id):
-                raise ValueError("generation coverage of another execution")
             if not targets & set(coverage.pcs):
                 continue
-            found = [(s, s.generations[c.generation_id])
-                     for s in ev.journal.sessions.values()
-                     if s.binding.vm_instance_id == own.vm_instance_id
-                     and s.lane_id == c.lane
-                     and c.generation_id in s.generations]
-            if len(found) > 1:
-                raise ValueError("a reached generation matches two sessions")
+            pair = self._journal_generation(
+                x, ev, lane, generation_id)
             reached += 1
-            window = self._window(x, ev.journal, [(None, found[0] if found
-                                                    else None)], lane=c.lane,
+            window = self._window(x, ev.journal, [(None, pair)], lane=c.lane,
                                   rule_set_id=m1_rules.rule_set_id)
             decision = self._m1(x, ev, m1_rules, window)
-            ids.append(decision.verdict_id)
+            valid = self._valid_generation(
+                x, pair[0] if pair else None, pair[1] if pair else None,
+                attestation)
+            ids.append(_lineage(kind="campaign_generation",
+                                m1=decision.verdict_id, valid=valid))
             statuses = [h.status for h in decision.window_hypothesis_results]
-            if M1Status.APPLIED in statuses:
+            if not valid:
+                inconclusive += 1
+            elif M1Status.APPLIED in statuses:
                 applied += 1
             elif statuses and all(s is M1Status.NOT_APPLIED for s in statuses):
                 not_applied += 1

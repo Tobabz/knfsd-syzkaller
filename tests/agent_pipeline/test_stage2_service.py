@@ -62,7 +62,8 @@ from agent_pipeline.sealed_q2 import (CONSOLE_LOG_TYPE, MANAGER_REPORT_TYPE,
     Q2_EVIDENCE_ID, Q2_EVIDENCE_TYPE, SealedArtifactRef, SealedQ2Evidence)
 from agent_pipeline.q2 import Q2CollectionWindow
 from agent_pipeline.stage2.evidence import (CRASH_LOG_ID, CRASH_LOG_TYPE,
-    EXECPROG_TYPE, GENERATION_COVERAGE_TYPE, JOURNAL_TYPE,
+    EXECPROG_TYPE, GENERATION_COVERAGE_TYPE, GENERATION_EXECUTION_TYPE,
+    GenerationExecution, JOURNAL_TYPE,
     NEUTRAL_COVERAGE_ID, NEUTRAL_COVERAGE_TYPE, NEUTRAL_EXECPROG_ID,
     REPLAY_EXECPROG_ID, SCENARIO_EXECPROG_ID)
 from tests.agent_pipeline.stage2_host import (KASAN_REPORT, crash_log,
@@ -170,6 +171,11 @@ elif step == "campaign":
             sha256=hashlib.sha256(KASAN_REPORT).hexdigest()),),
         vm_termination="guest_crashed", collection_window=window)
     reached = PublishedCoverage(correlation=correlation(vm, 5), pcs=pcs)
+    attestation = GenerationExecution(
+        correlation=correlation(vm, 5), execution_id=1,
+        program_sha256=harness["program_ref"], program_digest=D5,
+        activation="Acked", activation_status=0, deactivation="Acked",
+        deactivation_status=0, executed=True, lease_cleared=True)
     segment(0, vm, {
         "journal_name": "campaign", "executions": 100,
         "console_log_identity": "console",
@@ -183,6 +189,8 @@ elif step == "campaign":
         (CRASH_LOG_ID, CRASH_LOG_TYPE, crash_log(0, 5, D5).encode()),
         ("generation-coverage/0.5", GENERATION_COVERAGE_TYPE,
          canonical_json(reached)),
+        ("generation-execution/0.5", GENERATION_EXECUTION_TYPE,
+         canonical_json(attestation)),
     ] + journal("campaign", vm, [(5, D5, True)]))
 else:
     plan = json.loads((inp / "replay" / "plan.json").read_text())

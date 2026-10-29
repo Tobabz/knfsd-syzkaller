@@ -504,8 +504,14 @@ class Stage2BackendSpec(_Spec):
     resource_key: str | None = Field(default=None, min_length=1,
                                      max_length=256)
     timeout_s: float = Field(default=86_400, gt=0, le=86_400)
-    #: ``step --campaign-executions``.
-    campaign_executions: int = Field(default=128, ge=1, le=192)
+    #: ``step --campaign-mode``.  ``fuzz`` (01 §8): syz-manager mutates
+    #: programs and the Proxy applies the rule set.  ``proxy_only``: the
+    #: manager replays the approved program unchanged and only the Proxy
+    #: mutates, which attributes every execution to one program.
+    campaign_mode: Literal["fuzz", "proxy_only"] = "fuzz"
+    #: ``step --campaign-executions``.  At most 96: each generation seals a
+    #: coverage and an execution artifact, and a segment holds 255.
+    campaign_executions: int = Field(default=96, ge=1, le=96)
     #: At most ``stage2.nfs_proxy_window``.
     crash_window_bound: int = Field(default=4, ge=1, le=64)
     #: CAS digests of other judge profiles.  Left out, generation stores
@@ -1035,8 +1041,10 @@ def _stage2_procs(spec: HostSpec, profile) -> int:
                     if layout.covers(n))
     wanted = spec.stage2.procs
     if wanted is None:
-        catalog = HcapCatalog(capabilities=spec.capabilities,
-                              missing_capability_ids=())
+        catalog = HcapCatalog(
+            capabilities=spec.capabilities,
+            missing_capability_ids=_gap_vocabulary(spec),
+            gap_contracts=spec.gap_contracts)
         admitted = {e.call for e in profile.entries}
         return max(n for n in range(1, validated + 1)
                    if n == 1 or calls_in_layout(catalog, profile.entries, n)
@@ -1056,8 +1064,10 @@ def _stage2_calls(spec: HostSpec, profile, table: SyzkallerCallTable,
     refused unless the given calls leave it out by name, so a candidate
     program's call is not dropped from the manager unnoticed.  Given calls
     must include the rest and none of those."""
-    catalog = HcapCatalog(capabilities=spec.capabilities,
-                          missing_capability_ids=())
+    catalog = HcapCatalog(
+        capabilities=spec.capabilities,
+        missing_capability_ids=_gap_vocabulary(spec),
+        gap_contracts=spec.gap_contracts)
     refusals = layout_refusals(catalog, profile.entries, enabled_calls=(),
                                runtime_features=("remote_cover",),
                                procs=procs)
@@ -1763,6 +1773,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             argv=(python, "-m", "agent_pipeline.stage2.host", "step",
                   *chosen, "--collector", str(collector_path),
                   "--campaign-executions", str(backend.campaign_executions),
+                  *(("--campaign-mode", backend.campaign_mode)
+                    if backend.campaign_mode != "fuzz" else ()),
                   "{input}", "{output}"),
             cwd=REPO, env=command_env,
             resource_key=backend.resource_key or spec.engine.resource_key,

@@ -45,9 +45,13 @@ def shapes(*leaves: ArgumentLeaf, call: str = CALL) -> CallShapes:
 
 # --- contract shape -------------------------------------------------------
 
-def test_contract_entry_points_are_the_interface_calls():
+def test_contract_entry_points_are_exposed_by_the_interface():
     assert capability(contract()).contract.syz_calls() == (CALL,)
-    with pytest.raises(ValidationError, match="interface's syz calls"):
+    dependent = "recvfrom$nfs41_reclaim_complete"
+    cap = capability(contract(), interface={"syz_calls": [CALL, dependent]})
+    assert cap.contract.syz_calls() == (CALL,)
+    assert cap.interface.syz_calls == (CALL, dependent)
+    with pytest.raises(ValidationError, match="exposed by the interface"):
         capability(contract(entry_points=[
             {"kind": "syz_call", "name": "close"}]))
 
@@ -137,7 +141,7 @@ IDENTITY = KernelIdentity(execution_harness_id="1" * 64,
                           kaslr_enabled=False, kaslr_offset=0)
 
 
-GENERATED = [f"{n:064x}" for n in range(16)]
+GENERATED = [f"{n:064x}" for n in range(8)]
 
 
 def evidence(value: CapabilityContract | None = None, **change):
@@ -155,11 +159,11 @@ def evidence(value: CapabilityContract | None = None, **change):
         "accelerator": "kvm", "exec_slowdown": 1,
         "probes": probes,
         "probe_mapping_sha256": {p: "6" * 64 for p in probes},
-        "minimal": {"program_sha256s": ["7" * 64], "runs": 3,
-                    "runs_hitting": 3, "probes_hit": probes},
-        "generated": {"program_sha256s": GENERATED, "runs": 40,
-                      "runs_hitting": 10, "probes_hit": probes},
-        "neutral": {"program_sha256s": ["9" * 64], "runs": 3,
+        "minimal": {"program_sha256s": ["7" * 64], "runs": 2,
+                    "runs_hitting": 2, "probes_hit": probes},
+        "generated": {"program_sha256s": GENERATED, "runs": 8,
+                      "runs_hitting": 2, "probes_hit": probes},
+        "neutral": {"program_sha256s": ["9" * 64], "runs": 2,
                     "runs_hitting": 0, "probes_hit": []},
         "generated_without_entry_call": 0, "crash_signature_count": 0,
         "shareable_result_contains_target_metadata_or_addresses": False,
@@ -169,39 +173,39 @@ def evidence(value: CapabilityContract | None = None, **change):
 
 
 @pytest.mark.parametrize(("change", "message"), [
-    ({"minimal": {"program_sha256s": ["7" * 64], "runs": 3,
-                  "runs_hitting": 2,
+    ({"minimal": {"program_sha256s": ["7" * 64], "runs": 2,
+                  "runs_hitting": 1,
                   "probes_hit": ["nfsd_break_deleg_cb", "nfsd4_exchange_id"]}},
      "minimal runs reached the probes"),
-    ({"generated": {"program_sha256s": GENERATED, "runs": 40,
-                    "runs_hitting": 9,
+    ({"generated": {"program_sha256s": GENERATED, "runs": 8,
+                    "runs_hitting": 1,
                     "probes_hit": ["nfsd_break_deleg_cb",
                                    "nfsd4_exchange_id"]}},
      "generated runs reached the probes"),
-    ({"generated": {"program_sha256s": GENERATED, "runs": 31,
-                    "runs_hitting": 31,
+    ({"generated": {"program_sha256s": GENERATED[:7], "runs": 7,
+                    "runs_hitting": 7,
                     "probes_hit": ["nfsd_break_deleg_cb",
                                    "nfsd4_exchange_id"]}},
-     "fewer than 32 generated runs"),
-    ({"generated": {"program_sha256s": GENERATED, "runs": 40,
-                    "runs_hitting": 40, "probes_hit": ["nfsd4_exchange_id"]}},
+     "fewer than 8 generated runs"),
+    ({"generated": {"program_sha256s": GENERATED, "runs": 8,
+                    "runs_hitting": 8, "probes_hit": ["nfsd4_exchange_id"]}},
      "generated runs missed a probe"),
-    ({"neutral": {"program_sha256s": ["9" * 64], "runs": 3,
+    ({"neutral": {"program_sha256s": ["9" * 64], "runs": 2,
                   "runs_hitting": 1, "probes_hit": ["nfsd4_exchange_id"]}},
      "neutral control run reached a probe"),
     # One program repeated is no generality evidence.
-    ({"generated": {"program_sha256s": ["8" * 64], "runs": 40,
-                    "runs_hitting": 40,
+    ({"generated": {"program_sha256s": ["8" * 64], "runs": 8,
+                    "runs_hitting": 8,
                     "probes_hit": ["nfsd_break_deleg_cb",
                                    "nfsd4_exchange_id"]}},
-     "fewer than 16 distinct generated programs"),
-    ({"generated": {"program_sha256s": GENERATED + GENERATED[:1], "runs": 40,
-                    "runs_hitting": 40,
+     "fewer than 8 distinct generated programs"),
+    ({"generated": {"program_sha256s": GENERATED + GENERATED[:1], "runs": 9,
+                    "runs_hitting": 9,
                     "probes_hit": ["nfsd_break_deleg_cb",
                                    "nfsd4_exchange_id"]}},
      "duplicate program"),
-    ({"generated": {"program_sha256s": GENERATED, "runs": 15,
-                    "runs_hitting": 15,
+    ({"generated": {"program_sha256s": GENERATED, "runs": 7,
+                    "runs_hitting": 7,
                     "probes_hit": ["nfsd_break_deleg_cb",
                                    "nfsd4_exchange_id"]}},
      "more programs than runs"),

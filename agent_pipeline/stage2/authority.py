@@ -369,6 +369,11 @@ class Stage2AuthorityPublisher:
                  "sealed host facts name another step")
 
         harness_id = task_input.execution_harness_id
+        harness = load_record(self.artifacts, task_input.harness_ref,
+                              ReachabilityHarness)
+        _require(harness.execution_harness_id == harness_id
+                 and harness.candidate_id == snapshot.candidate.candidate_id,
+                 "dispatched harness does not match the execution")
         descriptor = load_record(self.artifacts, harness_id,
                                  ExecutionHarnessDescriptor)
         identity = self.identities.identity(descriptor, harness_id)
@@ -405,7 +410,7 @@ class Stage2AuthorityPublisher:
             bundle_ref=fact.bundle_ref, step=task_input.step, index=fact.index,
             lease_generation=fact.generation, correlation=receipt.correlation,
             candidate=target, compiled=d.compiled, identity=identity,
-            mapping_ref=mapping_ref,
+            mapping_ref=mapping_ref, program_ref=harness.program_ref,
             plan_ref=snapshot.plan_ref if task_input.step == "gate" else None,
             q1=q1, q2=q2, crash_bundle_ref=task_input.crash_bundle_ref,
             crash_window_bound=p.crash_window_bound,

@@ -1,0 +1,72 @@
+From dba111f71ed810038eb7e2333ba2a1278fdb53dc Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Thu, 29 Oct 2026 10:53:45 +0900
+Subject: [PATCH 2/2] prog: generate ordered calls with shared resource state
+
+---
+ prog/generation.go | 23 +++++++++++++++++++++++
+ prog/rand.go       | 10 ++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/prog/generation.go b/prog/generation.go
+index 09240e858..48979fac1 100644
+--- a/prog/generation.go
++++ b/prog/generation.go
+@@ -33,3 +33,26 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Pro
+ 	p.debugValidate()
+ 	return p
+ }
++
++// GenerateCallSequence generates the requested calls in order while sharing
++// resource state between them. Every input resource must come from an earlier
++// requested call, so the result does not gain implicit constructors or special
++// resource values.
++func (target *Target) GenerateCallSequence(rs rand.Source, calls []*Syscall, ct *ChoiceTable) *Prog {
++	p := &Prog{Target: target}
++	r := newRand(target, rs)
++	s := newState(target, ct, nil)
++	r.genExistingResource = true
++	for _, meta := range calls {
++		r.missingResource = false
++		generated := r.generateParticularCall(s, meta)
++		if r.missingResource || len(generated) != 1 || generated[0].Meta != meta {
++			return nil
++		}
++		s.analyze(generated[0])
++		p.Calls = append(p.Calls, generated[0])
++	}
++	p.sanitizeFix()
++	p.debugValidate()
++	return p
++}
+diff --git a/prog/rand.go b/prog/rand.go
+index 1f6480375..8b10e2aee 100644
+--- a/prog/rand.go
++++ b/prog/rand.go
+@@ -43,6 +43,8 @@ type randGen struct {
+ 	genKFuzzTest          bool
+ 	recDepth              map[Type]int
+ 	genDefaultResource    bool
++	genExistingResource   bool
++	missingResource       bool
+ }
+ 
+ func newRand(target *Target, rs rand.Source) *randGen {
+@@ -788,6 +790,14 @@ func (r *randGen) generateArgImpl(s *state, typ Type, dir Dir, ignoreSpecial boo
+ }
+ 
+ func (a *ResourceType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
++	if r.genExistingResource {
++		arg = r.existingResource(s, a, dir)
++		if arg == nil {
++			r.missingResource = true
++			arg = a.DefaultArg(dir)
++		}
++		return
++	}
+ 	canRecurse := false
+ 	if !r.inGenerateResource {
+ 		// Don't allow recursion for resourceCentric/createResource.
+-- 
+2.34.1
+

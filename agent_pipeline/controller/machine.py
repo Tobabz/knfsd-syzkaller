@@ -1782,6 +1782,8 @@ class Machine:
             q2_status=seg.q2_status, q2_reason=seg.q2_reason,
             m1_verdict_id=seg.m1_verdict_id,
             crash_window_applied=seg.crash_window_applied, late=late,
+            attribution_quality=seg.attribution_quality,
+            attribution_warnings=seg.attribution_warnings,
             routing=routing)
 
     @staticmethod

@@ -38,6 +38,7 @@ enum {
 	CK_EXPOSURE,
 	CK_REFUSAL,
 	CK_FORWARD,
+	CK_PROTOCOL,
 	CK_COMPLETE,
 	CK_RUN
 };
@@ -56,6 +57,9 @@ struct tgen {
 	uint64_t open_seq, complete_seq;
 	uint64_t drain_deadline;
 	uint64_t exposures, evidence_failures, open_batches;
+	uint64_t pending_protocol_events;
+	uint64_t *protocol_seqs;
+	size_t nprotocol_seqs, protocol_seqs_cap;
 	uint64_t *counts;	/* nrules * NCOUNT */
 	uint8_t *refusal;	/* per rule: an APPLY_REFUSAL was queued */
 	uint64_t *refusal_seq;
@@ -205,6 +209,7 @@ static int retire_gen(struct nfsp_target *t, uint64_t generation)
 	free(t->gens[i].counts);
 	free(t->gens[i].refusal);
 	free(t->gens[i].refusal_seq);
+	free(t->gens[i].protocol_seqs);
 	if (i + 1u < t->ngens) {
 		memmove(&t->gens[i], &t->gens[i + 1u],
 			(t->ngens - i - 1u) * sizeof(*t->gens));
@@ -494,6 +499,28 @@ static void on_journal(void *arg, uint64_t seq, uint64_t cookie,
 		if (outcome != NFSP_JOURNAL_ACKED)
 			gen_failure(t, id);
 		break;
+	case CK_PROTOCOL: {
+		struct tgen *g = NULL;
+
+		for (size_t i = 0; i < t->ngens && g == NULL; i++)
+			for (size_t k = 0; k < t->gens[i].nprotocol_seqs; k++)
+				if (t->gens[i].protocol_seqs[k] == seq) {
+					g = &t->gens[i];
+					t->gens[i].protocol_seqs[k] =
+						t->gens[i].protocol_seqs[
+							t->gens[i].nprotocol_seqs - 1u];
+					t->gens[i].nprotocol_seqs--;
+					break;
+				}
+		if (g == NULL || g->pending_protocol_events == 0) {
+			gen_failure(t, id);
+			break;
+		}
+		g->pending_protocol_events--;
+		if (outcome != NFSP_JOURNAL_ACKED)
+			gen_failure(t, g->generation);
+		break;
+	}
 	case CK_COMPLETE: {
 		uint64_t generation = 0;
 
@@ -553,6 +580,7 @@ static struct tgen *add_gen(struct nfsp_target *t, uint64_t generation,
 		free(g->counts);
 		free(g->refusal);
 		free(g->refusal_seq);
+		free(g->protocol_seqs);
 		return NULL;
 	}
 	t->ngens++;
@@ -737,7 +765,8 @@ static void lifecycle(struct nfsp_target *t)
 		}
 		/* No summary for a generation that never closed (a barrier
 		 * failed): the session end leaves it without one (01 §16). */
-		if (s.state != NFSP_GENERATION_CLOSED || g->open_batches != 0)
+		if (s.state != NFSP_GENERATION_CLOSED || g->open_batches != 0 ||
+		    g->pending_protocol_events != 0)
 			continue;
 		complete_generation(t, g, &s);
 	}
@@ -1207,6 +1236,84 @@ static void decoded(const struct nfsp_semantic_event *ev, void *arg)
 					     NFSP_ACTIVATION_REPLY_RESOLVED) !=
 	    NFSP_ACTIVATION_OK)
 		return;
+	if (ev->entry->program == 100003 && ev->entry->version == 4 &&
+	    ev->entry->procedure == 1 && ev->msg != NULL &&
+	    ev->msg->status == NFSP_DECODE_DECODED && ev->msg->has_minor &&
+	    ev->msg->minor_version == 1) {
+		struct tgen *g = find_gen(t, ev->entry->activation_generation);
+		struct nfsp_jbuf b;
+		struct context ctx;
+		uint64_t seq = 0;
+		int valid = g != NULL && ev->msg->nops != 0;
+
+		for (uint32_t i = 0; valid && i < ev->msg->nops; i++)
+			valid = ev->msg->ops[i].has_status &&
+				ev->msg->ops[i].sequence_index == i;
+		if (!valid) {
+			gen_failure(t, ev->entry->activation_generation);
+		} else {
+			if (g->nprotocol_seqs == g->protocol_seqs_cap) {
+				size_t cap = g->protocol_seqs_cap ?
+					g->protocol_seqs_cap * 2u : 4u;
+				uint64_t *grown = realloc(g->protocol_seqs,
+					cap * sizeof(*grown));
+
+				if (grown == NULL) {
+					gen_failure(t, g->generation);
+					g = NULL;
+				} else {
+					g->protocol_seqs = grown;
+					g->protocol_seqs_cap = cap;
+				}
+			}
+			if (g != NULL) {
+				memset(&ctx, 0, sizeof(ctx));
+				ctx.backend = ev->record->conn.backend;
+				ctx.client = ev->record->conn.client;
+				ctx.connection_id = ev->record->conn.connection_id;
+				ctx.direction = ev->record->direction;
+				ctx.reply = 1;
+				ctx.program = ev->entry->program;
+				ctx.version = ev->entry->version;
+				ctx.procedure = ev->entry->procedure;
+				ctx.xid = ev->rpc->xid;
+				nfsp_jb_init(&b, NFSP_JOURNAL_MAX_PAYLOAD);
+				nfsp_jb_raw(&b, "{");
+				j_correlation(t, &b, g, 1);
+				nfsp_jb_key(&b, "minor_version", 0);
+				nfsp_jb_u64(&b, ev->msg->minor_version);
+				nfsp_jb_key(&b, "operations", 0);
+				nfsp_jb_raw(&b, "[");
+				for (uint32_t i = 0; i < ev->msg->nops; i++) {
+					const struct nfsp_decoded_op *op = &ev->msg->ops[i];
+
+					if (i)
+						nfsp_jb_raw(&b, ",");
+					nfsp_jb_raw(&b, "{");
+					nfsp_jb_key(&b, "index", 1);
+					nfsp_jb_u64(&b, op->sequence_index);
+					nfsp_jb_key(&b, "name", 0);
+					nfsp_jb_str(&b, op->name);
+					nfsp_jb_key(&b, "opcode", 0);
+					nfsp_jb_u64(&b, op->opcode);
+					nfsp_jb_key(&b, "status", 0);
+					nfsp_jb_u64(&b, op->status);
+					nfsp_jb_raw(&b, "}");
+				}
+				nfsp_jb_raw(&b, "]");
+				j_context(&b, &ctx, 0);
+				nfsp_jb_raw(&b, "}");
+				if (submit(t, "NFS_COMPOUND_REPLY", &b,
+					   COOKIE(CK_PROTOCOL, g->generation), &seq) != 0) {
+					gen_failure(t, g->generation);
+				} else {
+					g->protocol_seqs[g->nprotocol_seqs++] = seq;
+					g->pending_protocol_events++;
+				}
+				nfsp_jb_free(&b);
+			}
+		}
+	}
 	eligible(t, ev, ev->entry->activation_generation, ev->entry);
 }
 
@@ -2182,6 +2289,7 @@ void nfsp_target_close(struct nfsp_target *t)
 		free(t->gens[i].counts);
 		free(t->gens[i].refusal);
 		free(t->gens[i].refusal_seq);
+		free(t->gens[i].protocol_seqs);
 	}
 	free(t->gens);
 	for (size_t i = 0; i < t->nbatches; i++)

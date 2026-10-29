@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -90,6 +91,7 @@ class CampaignConfig(BaseModel):
         default=math.ceil(MIN_GENERATED_RUNS / MIN_GENERATED_PROGRAMS),
         ge=1, le=16)
     neutral_runs: int = Field(default=MIN_NEUTRAL_RUNS, ge=1, le=64)
+    parallel_runs: int = Field(default=4, ge=1, le=16)
     max_calls: int = Field(default=8, ge=1, le=64)
 
     @classmethod
@@ -134,6 +136,7 @@ class Campaign:
         except End as end:
             report = {"result": end.result, "reason": end.reason,
                       "detail": end.detail[:4000]}
+        self.runs.sort(key=lambda item: item["label"])
         report["runs"] = len(self.runs)
         report.update(self.counts)
         (self.out / "runs.json").write_text(
@@ -186,9 +189,16 @@ class Campaign:
 
         def runs(kind: str, items: list[tuple[str, bytes]]) -> dict:
             hitting, hit = 0, set()
-            for i, (digest, text) in enumerate(items):
-                reached = self._run(f"{kind}-{i}", digest, text, selection,
-                                    descriptor, collector, files, probes)
+
+            def execute(item: tuple[int, tuple[str, bytes]]) -> set[str]:
+                i, (digest, text) = item
+                return self._run(f"{kind}-{i}", digest, text, selection,
+                                 descriptor, collector, files, probes)
+
+            workers = min(c.parallel_runs, len(items))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                reached_runs = executor.map(execute, enumerate(items))
+            for reached in reached_runs:
                 hitting += bool(reached)
                 hit |= reached
             return {"program_sha256s": sorted({d for d, _ in items}),
