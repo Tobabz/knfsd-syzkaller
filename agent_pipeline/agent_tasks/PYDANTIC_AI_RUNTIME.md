@@ -83,6 +83,12 @@ redirect this adapter. The SDK uses `max_retries=0`, `store=False` and
 errors propagate once to the executor; the Controller owns task retry
 decisions.
 
+Configuration comes from the process environment only; the code loads no
+`.env` file. `OPENAI_API_KEY` is read by the OpenAI SDK and
+`KNFSD_OPENAI_BASE_URL` by the runtime. Copy `.env.example` to `.env` (ignored
+by git, never commit it) and let the launcher or a service
+`EnvironmentFile=` export it, e.g. `set -a; . ./.env; set +a`.
+
 Call the synchronous runtime from a worker without an active asyncio event
 loop. A host may inject `model_factory: Callable[[AgentModelPolicy], Model]`
 to use another reviewed PydanticAI model/provider or local test model. The
