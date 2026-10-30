@@ -31,7 +31,7 @@ uv sync --locked --no-dev --extra agent-openai
 python -m agent_pipeline.stage1 --config stage1.json add-mapping mapping.json
 python -m agent_pipeline.stage1 --config stage1.json submit \
     --commit <kernel commit> --path fs/nfsd/nfs4proc.c --symbol nfsd4_open \
-    --policy kasan-default
+    --policy kasan-default-gpt56
 python -m agent_pipeline.stage1 --config stage1.json run --job <job id>
 ```
 

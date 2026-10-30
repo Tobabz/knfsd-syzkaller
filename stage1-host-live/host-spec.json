@@ -662,7 +662,7 @@
   },
   "policies": [
     {
-      "policy_id": "kasan-default",
+      "policy_id": "kasan-default-gpt56",
       "sanitizer": "kasan",
       "approval_required": false,
       "stage1_repair_budget": 3,
@@ -671,16 +671,16 @@
       "stage1_agents": {
         "candidate_analysis": {
           "provider": "openai",
-          "model": "gpt-5"
+          "model": "gpt-5.6-sol"
         },
         "reachability_planning": {
           "provider": "openai",
-          "model": "gpt-5"
+          "model": "gpt-5.6-sol"
         }
       }
     },
     {
-      "policy_id": "kasan-agent-effort",
+      "policy_id": "kasan-agent-effort-gpt56",
       "sanitizer": "kasan",
       "approval_required": false,
       "stage1_repair_budget": 3,
@@ -689,13 +689,13 @@
       "stage1_agents": {
         "candidate_analysis": {
           "provider": "openai",
-          "model": "gpt-5",
+          "model": "gpt-5.6-sol",
           "max_output_tokens": 32768,
           "reasoning_effort": "medium"
         },
         "reachability_planning": {
           "provider": "openai",
-          "model": "gpt-5",
+          "model": "gpt-5.6-sol",
           "max_output_tokens": 32768,
           "reasoning_effort": "high"
         }

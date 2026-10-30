@@ -1,8 +1,11 @@
 """A candidate is immutable and can have many jobs (02 §7, owner decision
 2026-10-13), and the JobPolicy defaults."""
 
-from agent_pipeline.contracts import (HarnessBinding, JobPolicy, LocationKind,
-                                      Q1Status, Sanitizer)
+import pytest
+
+from agent_pipeline.contracts import (AgentModelPolicy, HarnessBinding,
+                                      JobPolicy, LocationKind, Q1Status,
+                                      Sanitizer)
 from agent_pipeline.controller.records import JobState
 from agent_pipeline.intake import IntakeRejected
 
@@ -71,3 +74,17 @@ def test_policy_defaults():
         "openai:gpt-5.6-sol"
     assert p.harness_generation_agent.requested_model_id == \
         "openai:gpt-5.6-sol"
+
+
+def test_a_model_default_change_needs_a_new_policy_id(world):
+    job_id = world.submit()
+    stored = world.store.policy("p1")
+    pending = world.job(job_id).pending_task
+    changed = stored.model_copy(update={
+        "stage1_agents": stored.stage1_agents.model_copy(update={
+            "candidate_analysis": AgentModelPolicy(
+                provider="openai", model="another-model")})})
+    with pytest.raises(ValueError, match="already exists with other values"):
+        world.store.save_policy(changed)
+    assert world.store.policy("p1") == stored
+    assert world.job(job_id).pending_task == pending

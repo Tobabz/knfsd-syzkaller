@@ -304,16 +304,22 @@ def test_reasoning_effort_is_left_out_unless_set():
     assert "reasoning_effort" not in Stage1AgentPolicy().model_dump_json()
 
 
-def test_host_template_adds_an_effort_policy_without_changing_default():
+def test_host_template_uses_new_ids_for_gpt56_policies():
     import json
     spec = json.loads((REPO / "agent_pipeline" / "stage1" / "host" /
                        "template" / "host-spec.json").read_text())
     policies = {p["policy_id"]: p for p in spec["policies"]}
-    default = policies["kasan-default"]["stage1_agents"]
+    assert "kasan-default" not in policies
+    assert "kasan-agent-effort" not in policies
+    default = policies["kasan-default-gpt56"]["stage1_agents"]
     assert "reasoning_effort" not in default["reachability_planning"]
-    effort = policies["kasan-agent-effort"]["stage1_agents"]
+    assert {entry["model"] for entry in default.values()} == {
+        "gpt-5.6-sol"}
+    effort = policies["kasan-agent-effort-gpt56"]["stage1_agents"]
     assert AgentModelPolicy.model_validate(
         effort["reachability_planning"]).reasoning_effort == "high"
+    assert {entry["model"] for entry in effort.values()} == {
+        "gpt-5.6-sol"}
 
 
 def test_controller_keeps_usage_on_the_attempt_only(world):

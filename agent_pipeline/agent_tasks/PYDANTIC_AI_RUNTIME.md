@@ -68,16 +68,21 @@ to `on_agent_failure`, and the failed attempt keeps it too.
 `AgentModelPolicy.reasoning_effort`, when set, is sent to an OpenAI model as
 `openai_reasoning_effort`; unset leaves the provider default and is left out
 of the policy's encoding, so stored task digests do not change. The host
-template keeps `kasan-default` as it was and adds `kasan-agent-effort`
-(32768 output tokens; medium effort for Analysis, high for Planning).
+template uses new `kasan-default-gpt56` and `kasan-agent-effort-gpt56` policy
+IDs so databases that already pin the immutable `gpt-5` policies keep
+loading. The effort policy uses 32768 output tokens, medium effort for
+Analysis and high effort for Planning.
 
 The default factory accepts only trusted `provider="openai"` policy and
 passes its model name to `OpenAIResponsesModel`. It uses the SDK's host
-credentials, the explicit `https://api.openai.com/v1` origin, SDK
-`max_retries=0`, `store=False` and `background=False`. `OPENAI_BASE_URL`
-does not silently redirect this default adapter. Each run closes its SDK
-client on success or failure. Provider errors propagate once to the
-executor; the Controller owns task retry decisions.
+credentials and defaults to the explicit `https://api.openai.com/v1` origin.
+An operator may select a reviewed endpoint with `KNFSD_OPENAI_BASE_URL`; it
+must use HTTPS, loopback HTTP, or an IP in Tailscale's `100.64.0.0/10` range.
+An empty value uses the default. Generic `OPENAI_BASE_URL` does not silently
+redirect this adapter. The SDK uses `max_retries=0`, `store=False` and
+`background=False`. Each run closes its client on success or failure. Provider
+errors propagate once to the executor; the Controller owns task retry
+decisions.
 
 Call the synchronous runtime from a worker without an active asyncio event
 loop. A host may inject `model_factory: Callable[[AgentModelPolicy], Model]`
