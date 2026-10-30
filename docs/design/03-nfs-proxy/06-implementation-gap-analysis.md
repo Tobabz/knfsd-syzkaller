@@ -1068,7 +1068,8 @@ M7은 subset 단위로 반복하는 promotion gate다(issue #8). semantic subset
 전체 semantic runtime의 guest/runtime validation은 최소 semantic request/response mutation, dynamic
 state value, v4.1+ backchannel correlation, preserve/raw behavior, semantic Delta crash survival,
 dynamic-original semantic replay를 포함해야 한다. 모든 subset은 semantic Delta crash survival과
-semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능에 해당할 때 통과한다.
+semantic replay를 통과하고, 나머지 항목은 subset이 다루는 기능에 해당할 때 통과한다. dynamic-original
+replay는 `copy`, `target` 밖의 value source, predicate 중 하나가 있는 subset에 해당한다(#137).
 crash survival 증거는 campaign에서 자연히 생긴 guest crash로만 얻는다. 검증을 위해 guest를 일부러
 crash시키지 않는다(sysrq panic, NMI 주입, 강제 reset 같은 인위적 동작 금지).
 
@@ -1100,7 +1101,8 @@ Harness Capability Specification을 갱신한다(§21).
   때 덮인다. dynamic-original replay는 그런 rule이 같은 위치에서 production에 없던 original value만 replay에서
   바꿨을 때만 덮인다(`record`가 두 journal의 EXPOSURE_INTENT `original_value` digest를 기록한다). 위 검증 항목은
   subset 내용에서 정해진다(request/response mutation, dynamic value, `S2C` CALL이면
-  backchannel, preserve/raw, 그리고 항상 delta durability 또는 crash survival과 dynamic-original replay). host test와
+  backchannel, preserve/raw, dynamic-original replay는 `copy`, `target` 밖의 value source, predicate 중 하나가 있는
+  subset만(#137), 그리고 항상 delta durability 또는 crash survival). host test와
   test double 결과는 run으로 기록하지 않는다. delta durability 검사는 run이 아니라 build의 검사 기록이다. run이 KVM guest에서 왔다는 것은 기록하는 operator의 진술이다.
 - 결과: `PromotedSemanticCapabilityRegistry`(registry, build identity, subset별 evidence)와, 그것을
   `authority_refs`로 참조하는 HCAP-10(`usable_by: [agent_stage2]`, `validated_subset`, scope = promoted subset id)을

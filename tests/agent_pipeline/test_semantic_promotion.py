@@ -254,6 +254,46 @@ def test_replay_on_the_same_originals_is_not_dynamic(proxy_binary, build, tmp_pa
         "validation items not covered: ['dynamic_original_semantic_replay']"]
 
 
+def _literal_rule(rule_id: str, value: int) -> bytes:
+    """r1's layout without its predicate: slotid -> `value` for every match."""
+    with_predicate = live_probe._rule(rule_id, 4, 3, value)
+    predicate = struct.pack(">I", 1) + struct.pack(">I", 0) + _xdr_string(b"") \
+        + struct.pack(">I", 4) + struct.pack(">I", 0) + struct.pack(">I", 1) \
+        + struct.pack(">I", 3)
+    assert predicate in with_predicate
+    return with_predicate.replace(predicate, struct.pack(">I", 0), 1)
+
+
+def test_dynamic_original_replay_is_asked_only_of_a_value_dependent_subset():
+    # #137: a literal replacement with no predicate reads nothing the VMs
+    # could give differently.
+    dynamic = ValidationItem.DYNAMIC_ORIGINAL_REPLAY
+    assert dynamic not in required_items(subset(predicate_ops=()))
+    assert dynamic in required_items(subset(predicate_ops=("gt",)))
+    assert dynamic in required_items(subset(predicate_ops=(), transforms=("copy",)))
+    assert dynamic in required_items(subset(
+        predicate_ops=(), value_sources=("target", "current_message")))
+
+
+def test_a_literal_subset_promotes_on_the_same_originals(
+        proxy_binary, build, tmp_path, store):
+    # Replay saw production's slot values again: nothing dynamic to show, and
+    # nothing asked for, because the rule has no predicate.
+    literal = subset(predicate_ops=(), value_sources=())
+    rules = _set(_literal_rule("r1", 7))
+    same = _record(proxy_binary, build, tmp_path, rules, literal,
+                   replay_script=[(11, [5, 2]), (12, [4])])
+    assert run_problems(same, build, literal) == []
+    first = same.original_values.positions[0]
+    assert first.production == first.replay
+    promoted = promote(store, build, literal, (put_record(store, same),))
+    (entry,) = promoted.subsets
+    assert ValidationItem.DYNAMIC_ORIGINAL_REPLAY not in entry.validation_items
+    # The same run is still refused for a subset with a predicate.
+    with pytest.raises(PromotionRefused):
+        promote(store, build, subset(), (put_record(store, same),))
+
+
 def test_original_values_must_come_from_the_judged_journals(build, run):
     moved = run.model_copy(update={"original_values": run.original_values.model_copy(
         update={"replay_evidence_manifest_sha256": "0" * 64})})

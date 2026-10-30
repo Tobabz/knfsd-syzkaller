@@ -458,9 +458,11 @@ Proxy binary cover every element of it:
   completed forwarding in production and in replay at the same window position;
 - dynamic-original replay counts only when such a rule replaced, at one position, original values in
   replay that production never had (`record` reads them from both journals): replay the window on
-  other dynamic state, not a copy of production's;
+  other dynamic state, not a copy of production's. It is asked for only when the subset has a rule that
+  can depend on a runtime value (the `copy` transform, a value source other than `target`, or a predicate);
+  a subset of literal replacements without a predicate is not asked for it;
 - the 06 §30 items the subset calls for are covered (request or response mutation, dynamic value,
-  backchannel, preserve or raw, plus delta durability or crash survival, and replay, always).
+  backchannel, preserve or raw, plus delta durability or crash survival, always).
 
 Crash survival has two parts (06 §30). *Delta durability* belongs to the Proxy build and the host
 sink, not to a subset: the write-ahead `EXPOSURE_INTENT` is stored before the peer receives the
