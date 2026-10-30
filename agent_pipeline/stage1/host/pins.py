@@ -96,6 +96,11 @@ class PinCache:
         return self.entries[key]
 
 
+REBUILT_HINT = ("if the file was rebuilt, run `python -m "
+                "agent_pipeline.stage1.host generate SPEC` to pin it; "
+                "`check-pins` lists every stale file")
+
+
 def verify_file(pin: HostFilePin, path: Path,
                 cache: PinCache | None = None) -> None:
     path = Path(path)
@@ -105,4 +110,5 @@ def verify_file(pin: HostFilePin, path: Path,
     digest = (cache or PinCache(None)).sha256(path)
     if size != pin.size or digest != pin.sha256:
         raise PinError(f"{pin.name}: {path} does not match its pin "
-                       f"(sha256 {digest}, pinned {pin.sha256})")
+                       f"(sha256 {digest}, pinned {pin.sha256}); "
+                       f"{REBUILT_HINT}")

@@ -93,6 +93,20 @@ uv run python -m agent_pipeline.stage1 --config $S status <job id>
 uv run python -m agent_pipeline.stage1 --config $S replay <job id>
 ```
 
+After rebuilding a kernel, image, syzkaller binary or lane script, a pinned
+file no longer matches its descriptor and the run stops with a `PinError`
+(`does not match its pin`): this fails closed on purpose. Run `check-pins`
+to list every stale file and `generate SPEC` to pin the new bytes as a new
+harness (the old descriptor stays as history):
+
+```
+uv run python -m agent_pipeline.stage1.host check-pins --stage1 stage1-state/stage1.json
+uv run python -m agent_pipeline.stage1.host generate stage1-host/host-spec.json
+```
+
+`check-pins` is read-only; its exit status is 1 when a pinned file is stale
+or missing. A file that matches only a staged copy reports `staged`.
+
 `run` stops at `s1_reached`, at a state that needs a person, or at the end.
 If it stops at `s1_approval`, approve the job and run it again. `replay`
 in a new process is the restart check. Keep `stage1-state/` whole: it
