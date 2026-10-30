@@ -801,6 +801,8 @@ def test_direct_qemu_appends_trusted_journal_arguments(tmp_path):
     argv = guest.qemu_argv()
     assert argv[-2:] == ["-device", "test-device"]
     assert argv[1:4] == ["-enable-kvm", "-cpu", "host"]
+    smp = argv.index("-smp")
+    assert argv[smp:smp + 2] == ["-smp", "2"]
     guest.config = replace(config, accel="tcg")
     assert guest.qemu_argv()[1:5] == [
         "-accel", "tcg,thread=multi", "-cpu", "max"]

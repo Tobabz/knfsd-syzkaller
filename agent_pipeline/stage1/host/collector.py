@@ -94,7 +94,7 @@ class CollectorConfig(BaseModel):
     ssh_key: Path
     qemu: str = "qemu-system-x86_64"
     memory_mb: int = Field(4096, ge=512)
-    cpus: int = Field(4, ge=1)
+    cpus: int = Field(2, ge=1)
     boot_timeout_s: float = Field(300, gt=0)
     fixture_timeout_s: float = Field(180, gt=0)
     grace_s: float = Field(11, ge=0)

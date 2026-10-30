@@ -118,7 +118,7 @@ class CollectorSpec(_Spec):
     #: are scaled by ``qemu_accel.TCG_SLOWDOWN``.
     accel: AccelChoice = "auto"
     memory_mb: int = 4096
-    cpus: int = 4
+    cpus: int = 2
     boot_timeout_s: float = 300
     fixture_timeout_s: float = 180
     grace_s: float = 11

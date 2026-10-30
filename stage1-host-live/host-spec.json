@@ -708,7 +708,7 @@
   },
   "collector": {
     "memory_mb": 4096,
-    "cpus": 4,
+    "cpus": 2,
     "boot_timeout_s": 300,
     "grace_s": 11,
     "drain_s": 10,

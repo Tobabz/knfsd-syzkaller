@@ -49,7 +49,7 @@ class VmConfig:
     cmdline: str
     console_log: Path
     memory_mb: int = 4096
-    cpus: int = 4
+    cpus: int = 2
     boot_timeout_s: float = 300
     accel: Accel = "kvm"
     #: Trusted host-only QEMU arguments, used by Stage 2 journal channels.

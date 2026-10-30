@@ -355,6 +355,7 @@ def test_generate_pins_files_and_writes_consistent_configs(host):
         "syz-execprog", "syz-executor", "syz-manager", "vm-image"]
     assert "nokaslr" in d.guest_kernel_command_line.split()
     collector = CollectorConfig.load(result.collector_config)
+    assert collector.cpus == 2
     assert config.engine.argv[-2:] == ("{input}", "{output}")
     assert Path(config.engine.argv[0]).is_absolute()
     assert set(collector.files) == {"bzimage", "kernel", "vm-image",
@@ -542,6 +543,7 @@ def test_template_spec_is_valid():
     template = REPO / "agent_pipeline/stage1/host/template"
     spec = HostSpec.model_validate_json(
         (template / "host-spec.json").read_bytes())
+    assert spec.collector.cpus == 2
     for item in spec.neutral_controls:
         assert (template / item.program).is_file()
     calls = {e.call for e in spec.admission_source.entries}
@@ -611,6 +613,7 @@ def test_template_spec_is_valid():
     assert generate_module.promoted_by_criteria(spec) == ()
     live = HostSpec.model_validate_json(
         (REPO / "stage1-host-live/host-spec.json").read_bytes())
+    assert live.collector.cpus == 2
     assert tuple(c.id for c in generate_module.promoted_by_criteria(live)) == (
         "HCAP-15",)
     assert live.stage2 is not None and live.stage2.procs == 1
