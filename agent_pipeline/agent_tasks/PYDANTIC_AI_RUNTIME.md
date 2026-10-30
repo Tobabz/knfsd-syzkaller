@@ -70,7 +70,10 @@ to `on_agent_failure`, and the failed attempt keeps it too.
 of the policy's encoding, so stored task digests do not change. The host
 template uses `gpt-5.6-sol` for `kasan-default` and `kasan-agent-effort`. The
 effort policy uses 32768 output tokens, medium effort for Analysis and high
-effort for Planning.
+effort for Planning. Job policies are immutable by ID in a local Controller
+database, so do not reuse a pre-change state directory with these updated
+checked-in policy values; start a fresh state directory. Runtime state
+directories are ignored and are not shipped in the repository.
 
 The default factory accepts only trusted `provider="openai"` policy and
 passes its model name to `OpenAIResponsesModel`. It uses the SDK's host
