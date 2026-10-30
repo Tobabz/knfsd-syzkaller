@@ -28,7 +28,7 @@ def prepare_program_policy(candidate: VulnerabilityCandidate) -> bytes:
 
     payload = (
         f"policy {candidate.candidate_id} {SCHEMA_VERSION} 1 80 20 1\n"
-        f"rule {location.symbol} {scope} 8 3000\n"
+        f"rule {location.symbol} {scope} 10 3000\n"
     ).encode("ascii")
     if len(payload) > 4096:
         raise ValueError("KCSAN payload exceeds the kernel limit")

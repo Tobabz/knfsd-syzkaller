@@ -1,59 +1,75 @@
-From 4ca4eb782f02069b3a93005bc6d16dd23291c93a Mon Sep 17 00:00:00 2001
+From d4e51992fa1479b73ad0e824ab85da1909a98985 Mon Sep 17 00:00:00 2001
 From: knfsd-fuzz <knfsd-fuzz@localhost>
 Date: Thu, 22 Oct 2026 20:28:11 +0900
-Subject: [PATCH 4/4] kcsan: weight candidate subsystem policy directly
+Subject: [PATCH 4/4] kcsan: prioritize candidate and sample subsystem
 
 Summary:
-- Remove the uniform and weighted lane split and its policy skip knob.
-- Apply the policy default weight across the candidate subsystem and let
-  matching rules override it.
-- Cap policy weights at eight and expose default and rule selections.
+- Select maximum-weight candidate rules for every eligible access.
+- Sample other accesses in the candidate subsystem with an independent,
+  randomized policy skip counter.
+- Keep policy sampling from resetting the regular KCSAN skip counter.
 
 Rationale:
-- Prioritize the candidate without preventing related subsystem accesses
-  from installing watchpoints.
-- Keep sampling rates in the policy payload instead of a second module
-  parameter.
+- Candidate accesses should consistently anchor race detection while related
+  subsystem accesses continue to receive random watchpoint opportunities.
+- A separate counter prevents frequent candidate selections from starving
+  background policy probes.
 
 Tests:
 - make -j8 bzImage
+- Snapshot VM nfsd_svc: 11 candidates, selections, setups, and delays
+- Snapshot VM background sampling: 5 default selections, no capacity loss
 
 Co-authored-by: Codex <codex@openai.com>
 ---
- kernel/kcsan/core.c    | 35 +++++++++++------------------------
- kernel/kcsan/debugfs.c |  3 +--
- kernel/kcsan/kcsan.h   |  3 +--
- kernel/kcsan/policy.c  |  5 +++--
- kernel/kcsan/policy.h  |  5 +----
- 5 files changed, 17 insertions(+), 34 deletions(-)
+ kernel/kcsan/core.c    | 67 +++++++++++++++++++++++++-----------------
+ kernel/kcsan/debugfs.c |  3 +-
+ kernel/kcsan/kcsan.h   |  3 +-
+ kernel/kcsan/policy.c  |  5 ++--
+ kernel/kcsan/policy.h  |  5 +---
+ 5 files changed, 46 insertions(+), 37 deletions(-)
 
 diff --git a/kernel/kcsan/core.c b/kernel/kcsan/core.c
-index a9327f010..753f1037c 100644
+index a9327f010..e8f2c96c5 100644
 --- a/kernel/kcsan/core.c
 +++ b/kernel/kcsan/core.c
-@@ -95,8 +95,6 @@ static bool kcsan_early_enable = IS_ENABLED(CONFIG_KCSAN_EARLY_ENABLE);
+@@ -95,7 +95,7 @@ static bool kcsan_early_enable = IS_ENABLED(CONFIG_KCSAN_EARLY_ENABLE);
  unsigned int kcsan_udelay_task = CONFIG_KCSAN_UDELAY_TASK;
  unsigned int kcsan_udelay_interrupt = CONFIG_KCSAN_UDELAY_INTERRUPT;
  static long kcsan_skip_watch = CONFIG_KCSAN_SKIP_WATCH;
 -/* Policy reference rate; independent of the no-policy KCSAN skip counter. */
--static unsigned int kcsan_policy_skip_watch = 38;
++/* Keep background sampling denser than the no-policy KCSAN default. */
+ static unsigned int kcsan_policy_skip_watch = 38;
  static bool kcsan_interrupt_watcher = IS_ENABLED(CONFIG_KCSAN_INTERRUPT_WATCHER);
  
- #ifdef MODULE_PARAM_PREFIX
-@@ -107,7 +105,6 @@ module_param_named(early_enable, kcsan_early_enable, bool, 0);
- module_param_named(udelay_task, kcsan_udelay_task, uint, 0644);
- module_param_named(udelay_interrupt, kcsan_udelay_interrupt, uint, 0644);
- module_param_named(skip_watch, kcsan_skip_watch, long, 0644);
--module_param_named(policy_skip_watch, kcsan_policy_skip_watch, uint, 0644);
- module_param_named(interrupt_watcher, kcsan_interrupt_watcher, bool, 0444);
+@@ -175,6 +175,8 @@ static atomic_long_t watchpoints[CONFIG_KCSAN_NUM_WATCHPOINTS + NUM_SLOTS-1];
+  * per-CPU counter to avoid excessive contention.
+  */
+ static DEFINE_PER_CPU(long, kcsan_skip);
++/* Independent so candidate attempts cannot starve background policy probes. */
++static DEFINE_PER_CPU(long, kcsan_policy_skip);
  
- #ifdef CONFIG_KCSAN_WEAK_MEMORY
-@@ -385,33 +382,23 @@ static u32 kcsan_prandom_u32_max(u32 ep_ro)
+ /* For kcsan_prandom_u32_max(). */
+ static DEFINE_PER_CPU(u32, kcsan_rand_state);
+@@ -385,33 +387,46 @@ static u32 kcsan_prandom_u32_max(u32 ep_ro)
  	return state % ep_ro;
  }
  
 -/* Policy mode samples accesses in the candidate subsystem. */
-+/* Policy mode weights accesses in the candidate subsystem. */
++static __always_inline void reset_kcsan_policy_skip(u8 weight)
++{
++	u32 skip = clamp_val(READ_ONCE(kcsan_policy_skip_watch), 1U, 1000000U);
++	long skip_count;
++
++	/* Higher default weights shorten the interval between background probes. */
++	skip = max_t(u32, skip / weight, 1U);
++	skip_count = skip -
++		(IS_ENABLED(CONFIG_KCSAN_SKIP_WATCH_RANDOMIZE) ?
++			 kcsan_prandom_u32_max(skip) : 0);
++	this_cpu_write(kcsan_policy_skip, skip_count);
++}
++
++/* Policy mode prioritizes rules and samples the rest of their subsystem. */
  static __always_inline bool
  should_watch_policy(struct kcsan_ctx *ctx, const volatile void *ptr,
  		    size_t size, int type, unsigned long ip,
@@ -82,13 +98,38 @@ index a9327f010..753f1037c 100644
 -	else
 -		threshold = 0;
 +
-+	/* Each weight unit adds 10%, capped at 80%. */
-+	threshold = min_t(u32, 800000U,
++	if (!decision->rule) {
++		if (!decision->weight ||
++		    this_cpu_dec_return(kcsan_policy_skip) >= 0)
++			return false;
++		reset_kcsan_policy_skip(decision->weight);
++		return true;
++	}
++
++	/* A maximum-weight candidate is selected deterministically. */
++	threshold = min_t(u32, 1000000U,
 +			      (u32)decision->weight * 100000U);
++	if (threshold == 1000000U)
++		return true;
  	return kcsan_prandom_u32_max(1000000U) < threshold;
  }
  
-@@ -669,14 +656,14 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type,
+@@ -656,11 +671,9 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type,
+ 	unsigned long irq_flags = 0;
+ 	bool is_reorder_access;
+ 
+-	/*
+-	 * Always reset kcsan_skip counter in slow-path to avoid underflow; see
+-	 * should_watch().
+-	 */
+-	reset_kcsan_skip();
++	/* Policy mode maintains a separate background-sampling counter. */
++	if (!decision)
++		reset_kcsan_skip();
+ 
+ 	/* A registered candidate narrows installations in every context. */
+ 	if (!kcsan_nfs_scope_contains_inline(kcsan_policy_watch_scope(), ip)) {
+@@ -669,14 +682,14 @@ kcsan_setup_watchpoint(const volatile void *ptr, size_t size, int type,
  	}
  	atomic_long_inc(&kcsan_counters[KCSAN_COUNTER_NFS_SCOPE_ALLOWED]);
  	if (decision) {
@@ -160,14 +201,14 @@ index 1cd9113f5..c22af2226 100644
  	    policy->default_task_delay_us > KCSAN_POLICY_MAX_DELAY_US ||
  	    parse_u32(&line, &policy->default_interrupt_delay_us) ||
 diff --git a/kernel/kcsan/policy.h b/kernel/kcsan/policy.h
-index 4ca8e58f6..e8de3cc73 100644
+index 4ca8e58f6..788367c74 100644
 --- a/kernel/kcsan/policy.h
 +++ b/kernel/kcsan/policy.h
 @@ -13,6 +13,7 @@
  
  #define KCSAN_POLICY_SCHEMA_VERSION	5
  #define KCSAN_POLICY_MAX_RULES		64
-+#define KCSAN_POLICY_MAX_WEIGHT		8U
++#define KCSAN_POLICY_MAX_WEIGHT		10U
  #define KCSAN_POLICY_MAX_DELAY_US	30000U
  #define KCSAN_POLICY_MAX_PAYLOAD	4096U
  #define KCSAN_POLICY_CANDIDATE_ID_LEN	KCOV_POLICY_CANDIDATE_ID_LEN
