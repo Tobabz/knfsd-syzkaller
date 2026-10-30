@@ -207,6 +207,12 @@ class Stage1Config(_Config):
     #: Compiler (08 §12).  Unset, a Stage 2 rule set waits in
     #: blocked_operator(stage2_compiler_unavailable).
     nfs_proxy: Path | None = None
+    #: Let the Compiler lower a rule set that no promoted semantic subset
+    #: covers, and let the Mutation Strategy Agent write one. The Proxy
+    #: loader (``--check-rules``) and the promoted build still apply; the
+    #: compiled record names the rule set as outside every promoted subset.
+    #: Set false to keep the promoted-subset gate (#150).
+    allow_unpromoted_rules: bool = True
     stage2: Stage2Config | None = None
     #: Unset: one execution at a time on ``engine.resource_key``.
     slots: SlotsConfig | None = None

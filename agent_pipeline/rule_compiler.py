@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_serializer
 
 from .agent_tasks.mutation import (BuiltinTransform, CopyTransform,
                                    EnumLiteral, LiteralTransform,
@@ -129,7 +129,14 @@ class CompiledMutationRuleSet(Record):
     harness_ref: Sha256
     hcap_revision: str
     promoted_registry_ref: Sha256
-    subset_id: Visible
+    #: The promoted subset the set fits; None when it fits none and the
+    #: host allowed that (``allow_unpromoted``), with the reasons in
+    #: ``unpromoted_problems``. Both are left out of the encoding when the
+    #: set fits a subset, so earlier records keep their bytes.
+    subset_id: Visible | None = None
+    unpromoted_problems: tuple[Annotated[str, Field(min_length=1,
+                                                    max_length=512)],
+                               ...] = Field(default=(), max_length=16)
     proxy_sha256: Sha256
     registry_digest: Sha256
     schema_id: Visible
@@ -137,6 +144,15 @@ class CompiledMutationRuleSet(Record):
     candidate_id: Visible
     rules: tuple[CompiledRule, ...] = Field(min_length=1, max_length=256)
     nfsprul1_ref: Sha256
+
+    @model_serializer(mode="wrap")
+    def _omit_unpromoted(self, handler):
+        data = handler(self)
+        if data.get("subset_id") is None:
+            data.pop("subset_id", None)
+        if not data.get("unpromoted_problems"):
+            data.pop("unpromoted_problems", None)
+        return data
 
 
 # ---------------------------------------------------------------- NFSPRUL1
@@ -475,7 +491,9 @@ class ArtifactMutationRuleCompiler:
 
     def __init__(self, store: ArtifactStore, proxy: Path, workdir: Path, *,
                  schema_root: Path = SCHEMA_ROOT,
-                 staged: StagedProxies | None = None) -> None:
+                 staged: StagedProxies | None = None,
+                 allow_unpromoted: bool = False) -> None:
+        self.allow_unpromoted = allow_unpromoted
         self.store = store
         self.proxy = Path(proxy)
         self.workdir = Path(workdir)
@@ -563,9 +581,16 @@ class ArtifactMutationRuleCompiler:
         if subset is None or schema.schema_id not in subset.schema_ids:
             problems = scope.problems or (
                 f"{schema.schema_id} is outside the subset",)
-            return CompileRejected(
-                reason=_GAP, missing_capability_id=UNPROMOTED_GAP_ID,
-                detail="; ".join(problems)[:1024])
+            if not self.allow_unpromoted:
+                return CompileRejected(
+                    reason=_GAP, missing_capability_id=UNPROMOTED_GAP_ID,
+                    detail="; ".join(problems)[:1024])
+            # Outside every promoted subset: the Proxy loader accepted each
+            # rule, and the record says nothing validated the set as a whole.
+            subset = None
+            outside = tuple(x[:512] for x in problems[:16])
+        else:
+            outside = ()
 
         blob = encode_rule_set(schema.schema_id, rule_set.candidate_id,
                                lowered)
@@ -576,7 +601,8 @@ class ArtifactMutationRuleCompiler:
             rule_set_ref=rule_set_ref, harness_ref=harness_ref,
             hcap_revision=binding.hcap_revision,
             promoted_registry_ref=_promoted_ref(catalog),
-            subset_id=subset.subset_id, proxy_sha256=build.proxy_sha256,
+            subset_id=None if subset is None else subset.subset_id,
+            unpromoted_problems=outside, proxy_sha256=build.proxy_sha256,
             registry_digest=build.registry_digest, schema_id=schema.schema_id,
             semantic_runtime_version=SEMANTIC_RUNTIME_VERSION,
             candidate_id=rule_set.candidate_id,

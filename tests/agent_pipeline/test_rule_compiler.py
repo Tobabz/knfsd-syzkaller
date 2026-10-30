@@ -332,6 +332,27 @@ def test_outside_the_promoted_subset_is_a_gap(tmp_path, proxy, build):
     assert "directions 'S2C'" in r.detail
 
 
+def test_outside_the_promoted_subset_compiles_when_the_host_allows_it(
+        tmp_path, proxy, build):
+    world = World(tmp_path, proxy, build, subset(directions=("C2S",)))
+    world.compiler.allow_unpromoted = True
+    r = world.compile(call_intent(), reply_intent())
+    record, blob = load_compiled(world.store, r)
+    assert record.subset_id is None
+    assert any("directions 'S2C'" in x for x in record.unpromoted_problems)
+    assert blob
+
+
+def test_a_set_inside_a_subset_keeps_its_record_bytes(tmp_path, proxy, build):
+    world = World(tmp_path, proxy, build)
+    world.compiler.allow_unpromoted = True
+    r = world.compile(call_intent())
+    record, _ = load_compiled(world.store, r)
+    assert record.subset_id == subset().subset_id
+    encoded = record.model_dump(mode="json")
+    assert "unpromoted_problems" not in encoded
+
+
 def test_without_promotion_nothing_is_supported(tmp_path, proxy, build):
     world = World(tmp_path, proxy, build, promote=False)
     world.compiler.proxy = tmp_path / "no-such-proxy"     # never run

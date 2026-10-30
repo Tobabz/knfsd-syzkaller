@@ -116,6 +116,7 @@ class Stage1Parts:
     worker_id: str = "stage1-worker"
     lease_duration_ns: int = 120_000_000_000
     agent_workers: int = 2
+    allow_unpromoted_rules: bool = False
     #: Runner worker threads: one per KVM slot of the engines' pool.
     runner_workers: int = 1
     issues: IssueTracker | None = None
@@ -218,7 +219,8 @@ class Stage1Service:
                 knowledge=HarnessKnowledge(self.artifacts))
             self.agents = QueuedAgentExecutor(
                 parts.runtime, self.artifacts, tools, sink=None,
-                max_workers=parts.agent_workers)
+                max_workers=parts.agent_workers,
+                allow_unpromoted_rules=parts.allow_unpromoted_rules)
         else:
             self.agents = _DeferredAgents()
         self.generator = None
