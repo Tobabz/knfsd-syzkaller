@@ -74,6 +74,7 @@ processes at once, or after a later one is ignored.
 | `execution_harness_approvals` | `ExecutionHarnessApproval` digests |
 | `syzkaller_bundle`, `syzkaller_identity` | parser bundle from `tools/syzkaller/build.py` and its host-approved identity |
 | `policies` | `JobPolicy` records; model provider and model per Agent Task |
+| `allow_unpromoted_rules` | default true: the Rule Compiler lowers, and the Mutation Strategy Agent may write, a rule set outside every promoted semantic subset (see `../README.md`) |
 | `judge_versions` | fallback `Q1AdmissibilityProfile` / `RemoteKcovSupportBoundary` digests |
 | `vmlinux_artifact_name`, `instrumentation_artifact_name` | descriptor build-artifact names used for the kernel identity |
 | `engine` | the host command, its cwd, environment, resource key and timeout |

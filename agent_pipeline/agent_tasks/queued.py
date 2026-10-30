@@ -61,10 +61,13 @@ class QueuedAgentExecutor:
 
     def __init__(self, runtime: AgentRuntime, artifacts: ArtifactStore,
                  tools: ToolboxFactory, sink: AgentResultSink, *,
-                 max_workers: int = 2) -> None:
+                 max_workers: int = 2,
+                 allow_unpromoted_rules: bool = False) -> None:
         self._results: queue.SimpleQueue = queue.SimpleQueue()
         self._inner = Stage1AgentExecutor(runtime, artifacts, tools,
-                                          _QueueSink(self._results))
+                                          _QueueSink(self._results),
+                                          allow_unpromoted_rules=
+                                          allow_unpromoted_rules)
         self._pool = ThreadPoolExecutor(max_workers=max_workers,
                                         thread_name_prefix="stage1-agent")
         self.sink = sink

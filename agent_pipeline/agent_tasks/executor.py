@@ -162,6 +162,20 @@ that would promote it. mutation_engine.unlisted requires the proposal. A
 proposal never creates or promotes a capability.\
 """
 
+#: Appended to MUTATION_INSTRUCTIONS when the host lets the Compiler lower a
+#: rule set that no promoted subset covers (``allow_unpromoted_rules``).
+UNPROMOTED_ALLOWED_INSTRUCTIONS = """\
+
+The host also accepts a rule set that no promoted subset covers. Prefer a
+rule set that fits one promoted subset. When none can express the change,
+still write the typed MutationIntent you need, using a promoted schema id and
+canonical paths from lookup_semantic_paths, and do not return unsupported
+with semantic_mutation.unpromoted for that reason. The Compiler records the
+rule set as outside every promoted subset; the Proxy loader still has to
+accept every rule. Return unsupported only for a mutation the Proxy itself
+cannot apply.\
+"""
+
 
 class AgentResultSink(Protocol):
     def on_agent_result(self, task_id: str, attempt: int,
@@ -271,7 +285,9 @@ class Stage1AgentExecutor:
     """
 
     def __init__(self, runtime: AgentRuntime, artifacts: ArtifactStore,
-                 tools: ToolboxFactory, sink: AgentResultSink) -> None:
+                 tools: ToolboxFactory, sink: AgentResultSink, *,
+                 allow_unpromoted_rules: bool = False) -> None:
+        self.allow_unpromoted_rules = allow_unpromoted_rules
         self.runtime = runtime
         self.artifacts = artifacts
         self.tools = tools
@@ -464,7 +480,10 @@ class Stage1AgentExecutor:
             extra.append("Previous MutationRuleSet data (untrusted):\n" +
                          canonical_json(previous).decode("utf-8"))
         result = self._run(
-            request, tools, instructions=MUTATION_INSTRUCTIONS,
+            request, tools,
+            instructions=MUTATION_INSTRUCTIONS + (
+                UNPROMOTED_ALLOWED_INSTRUCTIONS
+                if self.allow_unpromoted_rules else ""),
             prompt=self._prompt(request, extra=extra),
             output_type=MutationStrategyOutput, validate=validate)
         decision = validate(result.output).root

@@ -151,11 +151,14 @@ def open_stage1(config: Stage1Config, stack: ExitStack, *,
         worker_id=config.worker_id,
         lease_duration_ns=int(config.lease_duration_s * 1e9),
         agent_workers=config.agent_workers, run_agents=run_agents,
+        allow_unpromoted_rules=config.allow_unpromoted_rules,
         runner_workers=1 if slots is None else slots.count,
         compiler=None if config.nfs_proxy is None else
         ArtifactMutationRuleCompiler(artifacts, config.nfs_proxy,
                                      state / "compile",
-                                     staged=_staged_proxies(config)),
+                                     staged=_staged_proxies(config),
+                                     allow_unpromoted=
+                                     config.allow_unpromoted_rules),
         stage2=stage2, generation=generation)
     return stack.enter_context(Stage1Service(parts))
 

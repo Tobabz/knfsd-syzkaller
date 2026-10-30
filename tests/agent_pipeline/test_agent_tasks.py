@@ -313,6 +313,16 @@ def test_planning_instructions_require_client_side_triggers():
     assert "S2C change for a malicious NFS server" in mutation
 
 
+def test_unpromoted_rule_sets_are_offered_only_when_the_host_allows_them():
+    from agent_pipeline.agent_tasks.executor import (
+        MUTATION_INSTRUCTIONS, UNPROMOTED_ALLOWED_INSTRUCTIONS)
+    text = " ".join(UNPROMOTED_ALLOWED_INSTRUCTIONS.split())
+    assert "no promoted subset covers" in text
+    assert "do not return unsupported with semantic_mutation.unpromoted" in text
+    assert "Proxy loader still has to accept every rule" in text
+    assert text not in " ".join(MUTATION_INSTRUCTIONS.split())
+
+
 def test_actual_model_id_is_required_and_never_filled_from_policy(tmp_path):
     runtime = DeterministicFunctionRuntime(
         [analysis_data()], actual_model="requested-model")

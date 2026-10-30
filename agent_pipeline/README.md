@@ -238,7 +238,15 @@ lowers it to an NFSPRUL1 rule that the Proxy's own loader
 (`nfs-proxy --check-rules`) must accept. Its refusals are the 08 §12
 reasons; a rule set outside every promoted subset, or anything the runtime
 cannot apply, is `unsupported_capability` with the
-`semantic_mutation.unpromoted` gap id. The stored
+`semantic_mutation.unpromoted` gap id.
+With `Stage1Config.allow_unpromoted_rules` (default true) a rule set that no
+promoted subset covers is still lowered once the Proxy loader accepts each
+rule and the whole set: the `CompiledMutationRuleSet` then has no `subset_id`
+and lists the reasons in `unpromoted_problems`, the Mutation Strategy Agent
+is told it may write such a set, and nothing validated that set as a
+whole. A host with no promoted registry at all, or a Proxy that is not the
+promoted build, is still refused. Set it false to keep the promoted-subset
+gate. The stored
 `CompiledMutationRuleSet` names the NFSPRUL1 bytes the Runner installs.
 Without `nfs_proxy` a rule set waits in
 `blocked_operator(stage2_compiler_unavailable)`.
