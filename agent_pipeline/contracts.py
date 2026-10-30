@@ -123,20 +123,23 @@ class AgentUsage(Record):
     output_tokens: int = Field(ge=0)
 
 
+DEFAULT_AGENT_MODEL = "gpt-5.6-sol"
+
+
 class Stage1AgentPolicy(Record):
     """Task-specific model policy selected by the trusted Controller."""
 
     candidate_analysis: AgentModelPolicy = Field(default_factory=lambda:
-        AgentModelPolicy(provider="openai", model="gpt-5"))
+        AgentModelPolicy(provider="openai", model=DEFAULT_AGENT_MODEL))
     reachability_planning: AgentModelPolicy = Field(default_factory=lambda:
-        AgentModelPolicy(provider="openai", model="gpt-5"))
+        AgentModelPolicy(provider="openai", model=DEFAULT_AGENT_MODEL))
 
 
 class Stage2AgentPolicy(Record):
     """Model policy of the Stage 2 Agent Task (08 §1)."""
 
     mutation_strategy: AgentModelPolicy = Field(default_factory=lambda:
-        AgentModelPolicy(provider="openai", model="gpt-5"))
+        AgentModelPolicy(provider="openai", model=DEFAULT_AGENT_MODEL))
 
 
 class CampaignMode(str, enum.Enum):
@@ -217,7 +220,7 @@ class JobPolicy(Record):
     harness_generation_budget: int = Field(default=3, ge=0)
     harness_generation_agent: AgentModelPolicy = Field(
         default_factory=lambda: AgentModelPolicy(provider="openai",
-                                                 model="gpt-5"))
+                                                 model=DEFAULT_AGENT_MODEL))
 
     @model_validator(mode="before")
     @classmethod
