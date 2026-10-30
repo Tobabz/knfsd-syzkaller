@@ -78,6 +78,7 @@ class _ApprovedHarness:
     #: Each bound HCAP revision with its call admission profile; a manager
     #: must stay inside their capabilities' validated layouts (#99).
     authorities: tuple[tuple[HcapCatalog, CallAdmissionProfile], ...] = ()
+    sanitizer: Sanitizer = Sanitizer.KASAN
 
     def pin(self, name: str) -> HostFilePin:
         try:
@@ -249,7 +250,8 @@ def _approved_harness(
         harness_id=harness_id,
         command_line=tuple(descriptor.guest_kernel_command_line.split()),
         pins=tuple(pins),
-        fixtures=_stage2_fixtures(descriptor.allowed_runtime_selections))
+        fixtures=_stage2_fixtures(descriptor.allowed_runtime_selections),
+        sanitizer=descriptor.sanitizer)
 
 
 def _stage2_fixtures(selections) -> frozenset[tuple[str, str]]:
@@ -620,6 +622,14 @@ def _check_manager(
     if type(procs) is not int or not 1 <= procs <= 64:
         raise PreflightError("target-mode campaign requires procs in [1, 64]")
     harnesses = _manager_harnesses(value, vm, harnesses)
+    expected_cpus = {collector.cpus_for(harness.sanitizer)
+                     for harness in harnesses}
+    if len(expected_cpus) != 1:
+        raise PreflightError("approved harnesses disagree on the VM CPU count")
+    expected_cpu = expected_cpus.pop()
+    if vm.get("cpu") != expected_cpu:
+        raise PreflightError(
+            f"manager VM cpu must be {expected_cpu} for its sanitizer")
     _check_layout(value, procs, harnesses)
     cmdline = str(vm.get("cmdline", "")).split()
     _check_approved_command_line(cmdline, harnesses)

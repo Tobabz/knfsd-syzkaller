@@ -15,7 +15,7 @@ from agent_pipeline.admission import SyzkallerTargetIdentity
 from agent_pipeline.artifacts import ArtifactStore
 from agent_pipeline.data import put_record
 from agent_pipeline.hcap import HcapCatalog
-from agent_pipeline.contracts import JudgeVersions
+from agent_pipeline.contracts import JudgeVersions, Sanitizer
 from agent_pipeline.runner.process_supervisor import ProcessLimits
 from agent_pipeline.semantic_promotion import (
     BuildRegistry, CapabilityRegistry, PromotedSemanticCapabilityRegistry,
@@ -247,7 +247,7 @@ def _manager_config(tmp_path: Path):
         "kernel_obj": str(kernel_obj), "syzkaller": str(syzkaller),
         "image": str(assets["vm-image"]), "sshkey": str(ssh_key),
         "experimental": {"remote_cover": True, "nfs_proxy_window": 8},
-        "vm": {"count": 1, "kernel": str(assets["bzimage"]),
+        "vm": {"count": 1, "cpu": 2, "kernel": str(assets["bzimage"]),
                "cmdline": ("root=/dev/sda console=ttyS0 nokaslr "
                            "nfs.localio_enabled=N "
                            "koov.nfs_version=4.1 koov.nfs_target=1 "
@@ -321,6 +321,21 @@ def test_manager_accelerator_matches_the_collector(tmp_path):
     assert "TCG" in _check_accel(tcg, tmp_path / "absent-kvm")
     with pytest.raises(PreflightError, match="unavailable"):
         _check_accel(collector, tmp_path / "absent-kvm")
+
+
+def test_manager_cpu_matches_the_sanitizer_variant(tmp_path):
+    values = _manager_config(tmp_path)
+    path, manager, lane, collector, harnesses, command = values
+    collector = collector.model_copy(update={
+        "variant_cpus": {Sanitizer.KASAN: 1, Sanitizer.KCSAN: 2}})
+    manager["vm"]["cpu"] = 1
+    path.write_text(json.dumps(manager))
+    assert "approved assets" in _manager_check(
+        path, collector, harnesses, command)
+    manager["vm"]["cpu"] = 2
+    path.write_text(json.dumps(manager))
+    with pytest.raises(PreflightError, match="must be 1 for its sanitizer"):
+        _manager_check(path, collector, harnesses, command)
 
 
 def test_manager_config_binds_window_lane_script_and_all_proc_journals(

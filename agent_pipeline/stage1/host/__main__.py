@@ -173,7 +173,8 @@ def cmd_probe(args) -> int:
         ssh_key=collector.ssh_key,
         cmdline=guest_cmdline(descriptor, selection, lane.sha256),
         console_log=args.out / "console.log",
-        memory_mb=collector.memory_mb, cpus=collector.cpus,
+        memory_mb=collector.memory_mb,
+        cpus=collector.cpus_for(descriptor.sanitizer),
         boot_timeout_s=collector.boot_timeout_s))
     result: dict = {"selection": selection.model_dump(mode="json")}
     try:

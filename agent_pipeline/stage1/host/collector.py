@@ -30,7 +30,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Annotated, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -95,6 +95,8 @@ class CollectorConfig(BaseModel):
     qemu: str = "qemu-system-x86_64"
     memory_mb: int = Field(4096, ge=512)
     cpus: int = Field(2, ge=1)
+    variant_cpus: dict[Sanitizer, Annotated[int, Field(ge=1, le=256)]] = Field(
+        default_factory=dict)
     boot_timeout_s: float = Field(300, gt=0)
     fixture_timeout_s: float = Field(180, gt=0)
     grace_s: float = Field(11, ge=0)
@@ -113,6 +115,9 @@ class CollectorConfig(BaseModel):
     #: ``<staged_files>/<sha256>/<file name>``.  A descriptor whose pin a
     #: configured file does not match boots the staged file instead.
     staged_files: Path | None = None
+
+    def cpus_for(self, sanitizer: Sanitizer) -> int:
+        return self.variant_cpus.get(sanitizer, self.cpus)
 
     @classmethod
     def load(cls, path: Path) -> CollectorConfig:
@@ -496,7 +501,8 @@ def collect(config: CollectorConfig, inp: Path, out: Path, *,
         qemu=config.qemu, bzimage=files["bzimage"], image=files["vm-image"],
         lane_dir=files["lane-script"].parent, ssh_key=config.ssh_key,
         cmdline=cmdline, console_log=console, memory_mb=config.memory_mb,
-        cpus=config.cpus, boot_timeout_s=config.boot_timeout_s,
+        cpus=config.cpus_for(descriptor.sanitizer),
+        boot_timeout_s=config.boot_timeout_s,
         accel=config.accel))
     result: dict = {"schema_version": "stage1-collector-result.v1",
                     "vm_instance_id": vm_instance_id, "cmdline": cmdline,
