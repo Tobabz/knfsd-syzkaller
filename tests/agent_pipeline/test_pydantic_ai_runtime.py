@@ -549,6 +549,25 @@ def test_default_openai_http_mock_has_no_retries_or_model_fallback(monkeypatch, 
     assert clients[0].is_closed()
 
 
+def test_default_openai_accepts_explicit_pipeline_base_url(monkeypatch):
+    import openai
+
+    captured = {}
+    real_client = openai.AsyncOpenAI
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return real_client(api_key="local-test", **kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", factory)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://untrusted.invalid/v1")
+    monkeypatch.setenv("KNFSD_OPENAI_BASE_URL", "https://reviewed.invalid/v1")
+    _, client = PydanticAIRuntime._openai_model(
+        AgentModelPolicy(provider="openai", model="requested-model"))
+    assert str(captured["base_url"]) == "https://reviewed.invalid/v1"
+    asyncio.run(client.close())
+
+
 def test_validate_program_tool_is_registered_and_dispatched():
     from agent_pipeline.agent_tasks.tools import ProgramValidation
     from .test_agent_tasks import planning_data

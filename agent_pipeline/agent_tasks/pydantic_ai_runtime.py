@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import math
+import os
 import re
 from typing import Callable
 
@@ -34,6 +35,8 @@ from .tools import (BackendBoundaryError, Stage1Toolbox, ToolBoundaryError,
                     known_tool_set)
 
 OUTPUT_TOOL = "stage1_result"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_BASE_URL_ENV = "KNFSD_OPENAI_BASE_URL"
 ModelFactory = Callable[[AgentModelPolicy], Model]
 
 
@@ -273,9 +276,10 @@ class PydanticAIRuntime:
         from pydantic_ai.models.openai import OpenAIResponsesModel
         from pydantic_ai.providers.openai import OpenAIProvider
 
-        # Credentials use the SDK's standard host configuration. Pin the API
-        # origin explicitly instead of accepting OPENAI_BASE_URL implicitly.
-        client = AsyncOpenAI(max_retries=0, base_url="https://api.openai.com/v1")
+        # OPENAI_BASE_URL remains untrusted. Operators may explicitly select
+        # another reviewed OpenAI-compatible endpoint for this pipeline.
+        base_url = os.environ.get(OPENAI_BASE_URL_ENV, DEFAULT_OPENAI_BASE_URL)
+        client = AsyncOpenAI(max_retries=0, base_url=base_url)
         model = OpenAIResponsesModel(
             policy.model, provider=OpenAIProvider(openai_client=client),
             settings={"openai_store": False, "openai_background": False})
