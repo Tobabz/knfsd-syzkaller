@@ -571,7 +571,9 @@ def test_default_openai_accepts_explicit_pipeline_base_url(monkeypatch):
 
 @pytest.mark.parametrize("configured, expected", [
     ("", DEFAULT_OPENAI_BASE_URL),
+    ("http://localhost:4000/v1", "http://localhost:4000/v1"),
     ("http://127.0.0.1:4000/v1", "http://127.0.0.1:4000/v1"),
+    ("http://[::1]:4000/v1", "http://[::1]:4000/v1"),
     ("http://100.99.59.97:4000/v1", "http://100.99.59.97:4000/v1"),
     ("http://localhost:4000/v1", "http://localhost:4000/v1"),
     ("http://[::1]:4000/v1", "http://[::1]:4000/v1"),
@@ -584,6 +586,7 @@ def test_pipeline_base_url_allows_empty_and_trusted_http(
 
 @pytest.mark.parametrize("configured", [
     "http://example.com/v1", "ftp://127.0.0.1/v1",
+    "https:///v1",
     "https://user@example.com/v1", "https://example.com/v1?redirect=1",
     "https:///v1",
 ])
