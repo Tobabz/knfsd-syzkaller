@@ -29,3 +29,7 @@ tools/nfs-proxy/build/
 stage1-host/
 stage1-state/
 syz-bridge/
+# --- Local secrets: API key / endpoint for the Agent runtime (.env.example) ---
+.env
+.env.*
+!.env.example

@@ -355,7 +355,7 @@ def test_controller_records_runtime_model_id_not_requested_model(world):
     attempt = world.store.attempt(queued.task_id, queued.attempt)
     assert attempt.status == "succeeded"
     assert attempt.model_id == "function-model:provider-resolved-2026-10-14"
-    assert queued.model_policy.requested_model_id == "openai:gpt-5"
+    assert queued.model_policy.requested_model_id == "openai:gpt-5.6-sol"
 
 
 def test_controller_selects_model_policy_per_agent_task(make_world):

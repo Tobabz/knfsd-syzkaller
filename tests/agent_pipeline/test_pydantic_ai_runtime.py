@@ -28,8 +28,8 @@ from pydantic_ai.usage import RequestUsage
 from agent_pipeline.agent_tasks.analysis import CandidateAnalysis
 from agent_pipeline.agent_tasks.executor import Stage1AgentExecutor
 from agent_pipeline.agent_tasks.pydantic_ai_runtime import (
-    OUTPUT_TOOL, TOOL_RETRIES, PydanticAIRuntime, PydanticAIRuntimeError,
-    RuntimeLimits)
+    DEFAULT_OPENAI_BASE_URL, OUTPUT_TOOL, TOOL_RETRIES, PydanticAIRuntime,
+    PydanticAIRuntimeError, RuntimeLimits, _openai_base_url)
 from agent_pipeline.agent_tasks.runtime import (OutputRejected, RuntimeRequest,
                                               failure_usage)
 from agent_pipeline.agent_tasks.tools import (BackendBoundaryError,
@@ -531,6 +531,7 @@ def test_default_openai_http_mock_has_no_retries_or_model_fallback(monkeypatch, 
 
     monkeypatch.setattr(openai, "AsyncOpenAI", factory)
     monkeypatch.setenv("OPENAI_BASE_URL", "https://untrusted.invalid/v1")
+    monkeypatch.delenv("KNFSD_OPENAI_BASE_URL", raising=False)
     with override_allow_model_requests(True):
         if status == 200:
             result = PydanticAIRuntime().run(runtime_request(max_tokens=1024))
@@ -547,6 +548,49 @@ def test_default_openai_http_mock_has_no_retries_or_model_fallback(monkeypatch, 
     assert body["background"] is False
     assert {tool["name"] for tool in body["tools"]} == set(toolbox().names) | {OUTPUT_TOOL}
     assert clients[0].is_closed()
+
+
+def test_default_openai_accepts_explicit_pipeline_base_url(monkeypatch):
+    import openai
+
+    captured = {}
+    real_client = openai.AsyncOpenAI
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return real_client(api_key="local-test", **kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", factory)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://untrusted.invalid/v1")
+    monkeypatch.setenv("KNFSD_OPENAI_BASE_URL", "https://reviewed.invalid/v1")
+    _, client = PydanticAIRuntime._openai_model(
+        AgentModelPolicy(provider="openai", model="requested-model"))
+    assert str(captured["base_url"]) == "https://reviewed.invalid/v1"
+    asyncio.run(client.close())
+
+
+@pytest.mark.parametrize("configured, expected", [
+    ("", DEFAULT_OPENAI_BASE_URL),
+    ("http://localhost:4000/v1", "http://localhost:4000/v1"),
+    ("http://127.0.0.1:4000/v1", "http://127.0.0.1:4000/v1"),
+    ("http://[::1]:4000/v1", "http://[::1]:4000/v1"),
+    ("http://100.99.59.97:4000/v1", "http://100.99.59.97:4000/v1"),
+])
+def test_pipeline_base_url_allows_empty_and_trusted_http(
+        monkeypatch, configured, expected):
+    monkeypatch.setenv("KNFSD_OPENAI_BASE_URL", configured)
+    assert _openai_base_url() == expected
+
+
+@pytest.mark.parametrize("configured", [
+    "http://example.com/v1", "ftp://127.0.0.1/v1",
+    "https:///v1",
+    "https://user@example.com/v1", "https://example.com/v1?redirect=1",
+])
+def test_pipeline_base_url_rejects_untrusted_forms(monkeypatch, configured):
+    monkeypatch.setenv("KNFSD_OPENAI_BASE_URL", configured)
+    with pytest.raises(PydanticAIRuntimeError, match="KNFSD_OPENAI_BASE_URL"):
+        _openai_base_url()
 
 
 def test_validate_program_tool_is_registered_and_dispatched():

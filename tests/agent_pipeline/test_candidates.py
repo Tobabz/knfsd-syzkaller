@@ -64,6 +64,10 @@ def test_policy_defaults():
     assert p.approval_required is False
     assert p.run_stage2 is False
     assert p.stage1_agents.candidate_analysis.requested_model_id == \
-        "openai:gpt-5"
+        "openai:gpt-5.6-sol"
     assert p.stage1_agents.reachability_planning.requested_model_id == \
-        "openai:gpt-5"
+        "openai:gpt-5.6-sol"
+    assert p.stage2_agents.mutation_strategy.requested_model_id == \
+        "openai:gpt-5.6-sol"
+    assert p.harness_generation_agent.requested_model_id == \
+        "openai:gpt-5.6-sol"
