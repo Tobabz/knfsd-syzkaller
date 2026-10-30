@@ -14,7 +14,9 @@ through this gate:
   the subset.  A rule is exercised when a batch naming it completed
   forwarding in both production and replay at one window position;
 - dynamic-original replay is covered only when an exercised rule replaced,
-  at one position, original values in replay that production never had;
+  at one position, original values in replay that production never had.  It
+  is asked for only when a rule can depend on a runtime value (``copy``, a
+  value source other than ``target``, or a predicate);
 - the §30 validation items the subset's contents call for are covered.
 
 The gate writes a ``PromotedSemanticCapabilityRegistry`` and the HCAP entry
@@ -348,11 +350,17 @@ def _items_of_rule(rule: RuleDescription) -> set[ValidationItem]:
 
 def required_items(subset: SemanticSubset, *, crash: bool = True,
                    durability: bool = False) -> tuple[ValidationItem, ...]:
-    """Crash survival and replay always; the rest when the subset has them.
+    """Crash survival always; the rest when the subset has them.
     ``crash=False`` is the staged pin's list, without crash survival.
     ``durability`` asks for the build's host-side check instead of a
-    natural crash (``crash=False`` with it)."""
-    items = {ValidationItem.DYNAMIC_ORIGINAL_REPLAY}
+    natural crash (``crash=False`` with it).  Dynamic-original replay is
+    asked for when a rule can depend on a runtime value: ``copy``, a value
+    source other than ``target``, or a predicate (a literal replacement of
+    a field the VMs give the same value shows no difference to replay)."""
+    items = set()
+    if (("copy" in subset.transforms or set(subset.value_sources) - {"target"}
+         or subset.predicate_ops)):
+        items.add(ValidationItem.DYNAMIC_ORIGINAL_REPLAY)
     if durability:
         items.add(ValidationItem.DELTA_DURABILITY)
     if crash:
