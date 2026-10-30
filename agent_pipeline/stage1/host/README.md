@@ -81,7 +81,7 @@ uv run python -m agent_pipeline.stage1.host check-pcs \
 S=stage1-state/stage1.json
 uv run python -m agent_pipeline.stage1 --config $S submit \
     --commit "$(git -C env/linux rev-parse HEAD)" \
-    --path fs/nfsd/nfs4proc.c --symbol nfsd4_open --policy kasan-default-gpt56
+    --path fs/nfsd/nfs4proc.c --symbol nfsd4_open --policy kasan-default
 uv run python -m agent_pipeline.stage1.host target-pcs --stage1 $S \
     --job <job id> --out stage1-state/mapping.json
 uv run python -m agent_pipeline.stage1 --config $S add-mapping stage1-state/mapping.json

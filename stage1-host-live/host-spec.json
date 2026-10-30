@@ -662,7 +662,7 @@
   },
   "policies": [
     {
-      "policy_id": "kasan-default-gpt56",
+      "policy_id": "kasan-default",
       "sanitizer": "kasan",
       "approval_required": false,
       "stage1_repair_budget": 3,
@@ -680,7 +680,7 @@
       }
     },
     {
-      "policy_id": "kasan-agent-effort-gpt56",
+      "policy_id": "kasan-agent-effort",
       "sanitizer": "kasan",
       "approval_required": false,
       "stage1_repair_budget": 3,

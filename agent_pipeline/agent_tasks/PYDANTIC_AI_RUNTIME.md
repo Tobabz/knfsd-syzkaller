@@ -68,10 +68,9 @@ to `on_agent_failure`, and the failed attempt keeps it too.
 `AgentModelPolicy.reasoning_effort`, when set, is sent to an OpenAI model as
 `openai_reasoning_effort`; unset leaves the provider default and is left out
 of the policy's encoding, so stored task digests do not change. The host
-template uses new `kasan-default-gpt56` and `kasan-agent-effort-gpt56` policy
-IDs so databases that already pin the immutable `gpt-5` policies keep
-loading. The effort policy uses 32768 output tokens, medium effort for
-Analysis and high effort for Planning.
+template uses `gpt-5.6-sol` for `kasan-default` and `kasan-agent-effort`. The
+effort policy uses 32768 output tokens, medium effort for Analysis and high
+effort for Planning.
 
 The default factory accepts only trusted `provider="openai"` policy and
 passes its model name to `OpenAIResponsesModel`. It uses the SDK's host
