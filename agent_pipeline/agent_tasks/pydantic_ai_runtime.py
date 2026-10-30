@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import ipaddress
 import math
+import os
 import re
 from typing import Callable
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
@@ -34,11 +37,39 @@ from .tools import (BackendBoundaryError, Stage1Toolbox, ToolBoundaryError,
                     known_tool_set)
 
 OUTPUT_TOOL = "stage1_result"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_BASE_URL_ENV = "KNFSD_OPENAI_BASE_URL"
 ModelFactory = Callable[[AgentModelPolicy], Model]
 
 
 class PydanticAIRuntimeError(RuntimeError):
     """A model response violates the runtime boundary."""
+
+
+def _openai_base_url() -> str:
+    configured = os.environ.get(OPENAI_BASE_URL_ENV)
+    if not configured:
+        return DEFAULT_OPENAI_BASE_URL
+    parsed = urlsplit(configured)
+    if (not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.query or parsed.fragment):
+        raise PydanticAIRuntimeError(
+            f"{OPENAI_BASE_URL_ENV} is not a valid API base URL")
+    if parsed.scheme == "https":
+        return configured
+    if parsed.scheme == "http":
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            local = parsed.hostname == "localhost"
+        else:
+            local = address.is_loopback or address in ipaddress.ip_network(
+                "100.64.0.0/10")
+        if local:
+            return configured
+    raise PydanticAIRuntimeError(
+        f"{OPENAI_BASE_URL_ENV} must use HTTPS, loopback HTTP, or "
+        "Tailscale HTTP")
 
 
 @dataclass(frozen=True)
@@ -273,9 +304,9 @@ class PydanticAIRuntime:
         from pydantic_ai.models.openai import OpenAIResponsesModel
         from pydantic_ai.providers.openai import OpenAIProvider
 
-        # Credentials use the SDK's standard host configuration. Pin the API
-        # origin explicitly instead of accepting OPENAI_BASE_URL implicitly.
-        client = AsyncOpenAI(max_retries=0, base_url="https://api.openai.com/v1")
+        # OPENAI_BASE_URL remains untrusted. Operators may explicitly select
+        # another reviewed OpenAI-compatible endpoint for this pipeline.
+        client = AsyncOpenAI(max_retries=0, base_url=_openai_base_url())
         model = OpenAIResponsesModel(
             policy.model, provider=OpenAIProvider(openai_client=client),
             settings={"openai_store": False, "openai_background": False})
