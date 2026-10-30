@@ -276,7 +276,8 @@ class KvmSemanticGuest:
             qemu=c.qemu, bzimage=self.files["bzimage"],
             image=self.files["vm-image"], lane_dir=lane, ssh_key=c.ssh_key,
             cmdline=self.cmdline, console_log=work / "console.log",
-            memory_mb=c.memory_mb, cpus=c.cpus,
+            memory_mb=c.memory_mb,
+            cpus=c.cpus_for(self.descriptor.sanitizer),
             boot_timeout_s=c.boot_timeout_s, accel=c.accel,
             extra_args=channels.qemu_args(controller=True)))
         return vm, channels, guest

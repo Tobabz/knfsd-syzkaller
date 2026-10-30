@@ -963,7 +963,9 @@ def _direct_guest(inputs: _Inputs, lane_dir: Path, console: Path,
         qemu=c.qemu, bzimage=inputs.files["bzimage"],
         image=inputs.files["vm-image"], lane_dir=lane_dir,
         ssh_key=c.ssh_key, cmdline=inputs.cmdline, console_log=console,
-        memory_mb=c.memory_mb, cpus=c.cpus, boot_timeout_s=c.boot_timeout_s,
+        memory_mb=c.memory_mb,
+        cpus=c.cpus_for(inputs.descriptor.sanitizer),
+        boot_timeout_s=c.boot_timeout_s,
         accel=c.accel, extra_args=extra_args))
 
 

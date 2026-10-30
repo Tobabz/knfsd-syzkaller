@@ -39,6 +39,13 @@ runbook does.
 - The capability and policy statements in the spec. The template is a
   starting point that the operator approves, not a fact this code checks.
 
+`collector.cpus` is the guest-vCPU fallback. A multi-sanitizer spec can set
+`collector.variant_cpus` to override it per descriptor, for example KASAN on
+one vCPU and KCSAN on two. Stage 1 collection and validation, direct probes,
+Stage 2 gates and campaigns, and generated syz-manager configs all use the
+selected variant value. The KVM slot pool reserves for the largest configured
+variant.
+
 ## Run
 
 From the repository root, on the VM host, at the commit under test:

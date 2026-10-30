@@ -356,6 +356,8 @@ def test_generate_pins_files_and_writes_consistent_configs(host):
     assert "nokaslr" in d.guest_kernel_command_line.split()
     collector = CollectorConfig.load(result.collector_config)
     assert collector.cpus == 2
+    assert collector.variant_cpus == {}
+    assert collector.cpus_for(Sanitizer.KASAN) == 2
     assert config.engine.argv[-2:] == ("{input}", "{output}")
     assert Path(config.engine.argv[0]).is_absolute()
     assert set(collector.files) == {"bzimage", "kernel", "vm-image",
@@ -544,6 +546,8 @@ def test_template_spec_is_valid():
     spec = HostSpec.model_validate_json(
         (template / "host-spec.json").read_bytes())
     assert spec.collector.cpus == 2
+    assert spec.collector.variant_cpus == {
+        Sanitizer.KASAN: 1, Sanitizer.KCSAN: 2}
     for item in spec.neutral_controls:
         assert (template / item.program).is_file()
     calls = {e.call for e in spec.admission_source.entries}
@@ -614,6 +618,8 @@ def test_template_spec_is_valid():
     live = HostSpec.model_validate_json(
         (REPO / "stage1-host-live/host-spec.json").read_bytes())
     assert live.collector.cpus == 2
+    assert live.collector.variant_cpus == {
+        Sanitizer.KASAN: 1, Sanitizer.KCSAN: 2}
     assert tuple(c.id for c in generate_module.promoted_by_criteria(live)) == (
         "HCAP-15",)
     assert live.stage2 is not None and live.stage2.procs == 1
@@ -1589,6 +1595,19 @@ def test_one_spec_generates_a_harness_per_variant(host):
 
 
 @needs_gcc
+def test_collector_boots_each_sanitizer_with_its_configured_cpus(host, tmp_path):
+    _two_variants(host)
+    spec = json.loads(host.spec.read_text())
+    spec.setdefault("collector", {})["variant_cpus"] = {
+        "kasan": 1, "kcsan": 2}
+    host.spec.write_text(json.dumps(spec, indent=1))
+    kasan = _collect(host, tmp_path / "kasan", approval=0, pcs=["0x401000"])
+    kcsan = _collect(host, tmp_path / "kcsan", approval=1, pcs=["0x401000"])
+    assert kasan.guest.config.cpus == 1
+    assert kcsan.guest.config.cpus == 2
+
+
+@needs_gcc
 def test_capability_evidence_belongs_to_its_variant(host):
     _two_variants(host)
     identity, lane_sha256 = _generated_identity(host, "kcsan")
@@ -1958,13 +1977,22 @@ def test_stage2_manager_boots_a_spec_runtime_selection(host):
 @needs_gcc
 def test_each_variant_gets_its_own_stage2_manager(host):
     _two_variants(host)
+    spec = json.loads(host.spec.read_text())
+    spec.setdefault("collector", {})["variant_cpus"] = {
+        "kasan": 1, "kcsan": 2}
+    host.spec.write_text(json.dumps(spec, indent=1))
     _with_stage2(host)
     result = generate(host.spec)
     assert set(result.stage2_managers) == {"kasan", "kcsan"}
+    collector = CollectorConfig.load(result.collector_config)
+    assert collector.variant_cpus == {
+        Sanitizer.KASAN: 1, Sanitizer.KCSAN: 2}
+    assert Stage1Config.load(result.stage1_config).slots.vm_cpus == 2
     kernels = set()
     for name, path in result.stage2_managers.items():
         assert path.name == f"stage2-manager-{name}.json"
         manager = json.loads(path.read_text())
+        assert manager["vm"]["cpu"] == {"kasan": 1, "kcsan": 2}[name]
         kernels.add(manager["vm"]["kernel"])
         # The preflight matches the manager to its own variant.
         assert "approved assets" in _preflight_manager(host, result, path)

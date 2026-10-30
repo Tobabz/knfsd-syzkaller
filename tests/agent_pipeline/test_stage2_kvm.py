@@ -806,3 +806,11 @@ def test_direct_qemu_appends_trusted_journal_arguments(tmp_path):
     guest.config = replace(config, accel="tcg")
     assert guest.qemu_argv()[1:5] == [
         "-accel", "tcg,thread=multi", "-cpu", "max"]
+
+
+def test_collector_selects_cpus_by_sanitizer(tmp_path):
+    collector = CollectorConfig(
+        artifact_root=tmp_path, files={}, ssh_key=tmp_path / "id",
+        cpus=2, variant_cpus={Sanitizer.KASAN: 1, Sanitizer.KCSAN: 2})
+    assert collector.cpus_for(Sanitizer.KASAN) == 1
+    assert collector.cpus_for(Sanitizer.KCSAN) == 2

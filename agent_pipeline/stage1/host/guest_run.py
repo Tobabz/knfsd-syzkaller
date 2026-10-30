@@ -58,7 +58,8 @@ def run_program(program: Path, selection: RuntimeSelection,
         qemu=collector.qemu, bzimage=files["bzimage"],
         image=files["vm-image"], lane_dir=files["lane-script"].parent,
         ssh_key=collector.ssh_key, cmdline=cmdline, console_log=console,
-        memory_mb=collector.memory_mb, cpus=collector.cpus,
+        memory_mb=collector.memory_mb,
+        cpus=collector.cpus_for(descriptor.sanitizer),
         boot_timeout_s=collector.boot_timeout_s, accel=collector.accel))
     result: dict = {}
     try:

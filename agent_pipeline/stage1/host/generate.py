@@ -37,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -119,11 +119,16 @@ class CollectorSpec(_Spec):
     accel: AccelChoice = "auto"
     memory_mb: int = 4096
     cpus: int = 2
+    variant_cpus: dict[Sanitizer, Annotated[int, Field(ge=1, le=256)]] = Field(
+        default_factory=dict)
     boot_timeout_s: float = 300
     fixture_timeout_s: float = 180
     grace_s: float = 11
     drain_s: float = 10
     exec_timeout_s: float = 600
+
+    def cpus_for(self, sanitizer: Sanitizer) -> int:
+        return self.variant_cpus.get(sanitizer, self.cpus)
 
 
 class GenerationSpec(_Spec):
@@ -1150,7 +1155,8 @@ def _stage2_manager(spec: HostSpec, *, accel: Accel,
         "enable_syscalls": list(calls),
         "experimental": {"remote_cover": True,
                          "nfs_proxy_window": s2.nfs_proxy_window},
-        "vm": {"count": 1, "cpu": spec.collector.cpus,
+        "vm": {"count": 1,
+               "cpu": spec.collector.cpus_for(descriptor.sanitizer),
                "mem": spec.collector.memory_mb, "qemu": spec.collector.qemu,
                "kernel": str(files["bzimage"]), "cmdline": cmdline,
                "qemu_args": " ".join(qemu_args)},
@@ -1794,7 +1800,8 @@ def generate(spec_path: Path, *, python: str = sys.executable,
             timeout_s=spec.engine.timeout_s * scale,
             max_output_bytes=spec.engine.max_output_bytes),
         slots=SlotsConfig(
-            vm_cpus=spec.collector.cpus,
+            vm_cpus=max(spec.collector.cpus_for(v.sanitizer)
+                        for v in variants),
             vm_memory_mb=spec.collector.memory_mb,
             reserve_cpus=spec.engine.reserve_cpus,
             reserve_memory_mb=spec.engine.reserve_memory_mb,
