@@ -9,6 +9,7 @@
 ``probe --stage1 S --program P --out D``  boot and run one program, no service
 ``target-pcs --stage1 S --job J --out F``  verified TargetPcMapping for a job
 ``check-pcs --stage1 S --coverage F``  are published PCs coverage call sites?
+``check-pins --stage1 S``   does every pinned host file still match its pin?
 """
 
 from __future__ import annotations
@@ -20,11 +21,12 @@ from pathlib import Path
 
 from ...artifacts import ArtifactStore
 from ...data import load_record
-from ...materializer import ExecutionHarnessApproval, ExecutionHarnessDescriptor
+from ...materializer import (ExecutionHarnessApproval, ExecutionHarnessDescriptor,
+                            descriptor_id)
 from ...q1 import CandidateTarget, KernelIdentity
 from ..config import Stage1Config
 from .collector import CollectorConfig, CollectorError, collect, pinned_path
-from .pins import HostFilePin, PinCache
+from .pins import REBUILT_HINT, HostFilePin, PinCache, PinError
 
 
 def _collector(args) -> CollectorConfig:
@@ -61,6 +63,47 @@ def _vmlinux(config: Stage1Config, collector: CollectorConfig,
                        collector.files_for(descriptor.sanitizer)[name],
                        PinCache(collector.pin_cache))
     return path, pin
+
+
+def check_pins(config: Stage1Config, collector: CollectorConfig
+               ) -> list[tuple[str, str, str, str]]:
+    """(harness, file, status, detail) for every file a configured
+    approved descriptor pins and the collector has a path for.  ``ok``: the
+    configured file matches; ``staged``: a staged copy of the pinned digest
+    does; ``stale``: neither does; ``missing``: no file."""
+    store = ArtifactStore(config.artifact_root)
+    cache = PinCache(collector.pin_cache)
+    rows = []
+    for ref in config.execution_harness_approvals:
+        descriptor = load_record(store, ref, ExecutionHarnessApproval).descriptor
+        harness = f"{descriptor.sanitizer.value}:{descriptor_id(descriptor)[:12]}"
+        builds = {a.name: a.artifact_ref for a in descriptor.build_artifacts}
+        for name, path in sorted(collector.files_for(descriptor.sanitizer).items()):
+            if name not in builds:
+                rows.append((harness, name, "stale",
+                             "not a build artifact of the descriptor"))
+                continue
+            pin = load_record(store, builds[name], HostFilePin)
+            try:
+                used = pinned_path(collector, pin, path, cache)
+            except PinError as exc:
+                status = "missing" if not Path(path).is_file() else "stale"
+                rows.append((harness, name, status, str(exc)))
+            else:
+                rows.append((harness, name, "ok" if used == path else "staged",
+                             str(used)))
+    return rows
+
+
+def cmd_check_pins(args) -> int:
+    rows = check_pins(Stage1Config.load(args.stage1), _collector(args))
+    for harness, name, status, detail in rows:
+        print(f"{status:7} {harness} {name}: {detail}")
+    bad = [r for r in rows if r[2] in ("stale", "missing")]
+    if bad:
+        print(f"{len(bad)} pinned file(s) differ: {REBUILT_HINT}",
+              file=sys.stderr)
+    return 1 if bad else 0
 
 
 def cmd_generate(args) -> int:
@@ -243,12 +286,12 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument("--config", type=Path, required=True,
                     help="a campaign.CampaignConfig")
     pc.add_argument("output", type=Path)
-    for name in ("probe", "target-pcs", "check-pcs"):
+    for name in ("probe", "target-pcs", "check-pcs", "check-pins"):
         p = sub.add_parser(name)
         p.add_argument("--stage1", type=Path, required=True)
         p.add_argument("--collector", type=Path)
-        if name != "target-pcs":
-            # target-pcs takes the job's own harness.
+        if name not in ("target-pcs", "check-pins"):
+            # target-pcs takes the job's own harness; check-pins checks all.
             p.add_argument("--variant", help="sanitizer of the approved "
                            "harness to use (default: the first)")
         if name == "probe":
@@ -261,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--job", required=True)
             p.add_argument("--out", type=Path, required=True)
             p.add_argument("--cache", type=Path)
-        else:
+        elif name == "check-pcs":
             p.add_argument("--coverage", type=Path, required=True,
                            help="coverage.json or a cover_prog*.extra file")
             p.add_argument("--cache", type=Path)
@@ -269,7 +312,8 @@ def main(argv: list[str] | None = None) -> int:
     return {"generate": cmd_generate, "collect": cmd_collect,
             "validate": cmd_validate, "probe-campaign": cmd_probe_campaign,
             "probe": cmd_probe, "target-pcs": cmd_target_pcs,
-            "check-pcs": cmd_check_pcs}[args.command](args)
+            "check-pcs": cmd_check_pcs,
+            "check-pins": cmd_check_pins}[args.command](args)
 
 
 if __name__ == "__main__":

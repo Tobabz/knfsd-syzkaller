@@ -1174,6 +1174,29 @@ def test_generated_host_runs_a_candidate_to_reached(host, tmp_path, warning):
                       "--coverage", str(coverage)]) == 0
 
 
+@needs_gcc
+def test_check_pins_names_the_files_a_rebuild_made_stale(host, capsys):
+    # #136: a rebuilt file fails closed; check-pins says which, and how to
+    # pin it again.
+    result = generate(host.spec)
+    stage1 = str(result.stage1_config)
+    assert host_main(["check-pins", "--stage1", stage1]) == 0
+    assert "stale" not in capsys.readouterr().out
+    collector = CollectorConfig.load(
+        Path(Stage1Config.load(result.stage1_config).state_dir)
+        / "collector.json")
+    name = "kernel"
+    path = Path(collector.files_for(Sanitizer.KASAN)[name])
+    path.write_bytes(path.read_bytes() + b"rebuilt")
+    assert host_main(["check-pins", "--stage1", stage1]) == 1
+    captured = capsys.readouterr()
+    assert f"stale   kasan:" in captured.out and f" {name}:" in captured.out
+    assert "generate SPEC" in captured.err
+    # The spec's generate pins the new bytes again.
+    generate(host.spec)
+    assert host_main(["check-pins", "--stage1", stage1]) == 0
+
+
 def _symbol_range(binary: Path, name: str) -> tuple[int, int]:
     out = subprocess.run(["nm", "-S", str(binary)], check=True,
                          capture_output=True, text=True).stdout
