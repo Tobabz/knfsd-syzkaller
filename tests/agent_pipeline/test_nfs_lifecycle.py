@@ -120,6 +120,24 @@ def test_admin_context_binds_mapping_to_verified_harness_without_leaking_target(
         assert private not in shareable
 
 
+def test_admin_vm_uses_the_descriptor_sanitizer_cpu_count(tmp_path, monkeypatch):
+    values = write_identity_inputs(tmp_path)
+    runner, config_path, descriptor_path, mapping_path, _ = values
+    config = CollectorConfig.load(config_path).model_copy(update={
+        "variant_cpus": {Sanitizer.KASAN: 1, Sanitizer.KCSAN: 2}})
+    config_path.write_text(config.model_dump_json(indent=2))
+    context = runner.load_admin_context(config_path, descriptor_path, mapping_path)
+    seen = []
+
+    class FakeQemuGuest:
+        def __init__(self, vm):
+            seen.append(vm)
+
+    monkeypatch.setattr(runner, "QemuGuest", FakeQemuGuest)
+    runner.make_admin_vm(context, tmp_path / "output")
+    assert seen[0].cpus == 1
+
+
 def test_admin_context_refuses_mapping_from_another_harness(tmp_path):
     runner, config, descriptor, mapping_path, mapping = write_identity_inputs(
         tmp_path)
